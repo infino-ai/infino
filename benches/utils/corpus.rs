@@ -201,13 +201,16 @@ pub const SYNTHETIC_DIM: usize = 1024;
 ///
 /// Specs:
 ///
-/// * `synthetic` — the seeded planted-cluster generator (the default).
+/// * `synthetic` — the seeded planted-cluster generator with the uniform
+///   text flavour (fixed-length docs from a closed 10K vocabulary). The
+///   default for every cell except the two FTS cells.
 /// * `realistic` — the same generator with the text column switched to
 ///   the realistic flavour ([`text_gen::TextFlavor::Realistic`]:
 ///   variable-length, open-vocabulary, bursty docs calibrated to real
 ///   text). Vectors and SQL columns are unchanged; only the text
 ///   generator differs, so this is a text flavour of `synthetic`, not a
-///   separate source.
+///   separate source. The default for the two FTS cells
+///   ([`default_text_flavor_for_fts`]).
 /// * `annb:<slug>` — a published ann-benchmarks dataset
 ///   (`annb:glove-100-angular`). One HDF5 file carries corpus rows, the
 ///   official query set, and official top-k neighbour ids, so ground
@@ -242,14 +245,58 @@ pub enum CorpusSource {
 /// Where downloaded corpora are staged, set alongside the spec.
 static SOURCE: OnceLock<CorpusSource> = OnceLock::new();
 
-/// Text flavour of the synthetic source; [`TextFlavor::Uniform`] until
-/// `corpus=realistic` sets it. Only consulted when the source is
-/// [`CorpusSource::Synthetic`] — a real corpus brings its own text.
+/// Text flavour of the synthetic source requested on the command line:
+/// `corpus=realistic` or `corpus=synthetic` (the uniform flavour). Only
+/// consulted when the source is [`CorpusSource::Synthetic`] — a real
+/// corpus brings its own text. An explicit request beats a cell's
+/// default ([`DEFAULT_TEXT_FLAVOR`]).
 static TEXT_FLAVOR: OnceLock<TextFlavor> = OnceLock::new();
 
-/// The synthetic text flavour for this process.
+/// The flavour a cell asks for when the command line names none. The FTS
+/// cells set it to [`TextFlavor::Realistic`] ([`default_text_flavor_for_fts`]):
+/// BM25 quality and speed are measured on text-shaped term and length
+/// distributions, not on the uniform flavour's fixed-length, closed-
+/// vocabulary docs, whose "common-word" phrases pair near-universal terms
+/// with degenerate idf. Every other cell keeps the uniform flavour, so
+/// the SQL and combined shapes' history stays comparable.
+static DEFAULT_TEXT_FLAVOR: OnceLock<TextFlavor> = OnceLock::new();
+
+/// The synthetic text flavour for this process: the command line's
+/// choice, else the running cell's default, else uniform.
 pub fn text_flavor() -> TextFlavor {
-    *TEXT_FLAVOR.get_or_init(|| TextFlavor::Uniform)
+    TEXT_FLAVOR
+        .get()
+        .copied()
+        .unwrap_or_else(|| *DEFAULT_TEXT_FLAVOR.get_or_init(|| TextFlavor::Uniform))
+}
+
+/// Make the realistic flavour this process's default text corpus. The
+/// FTS cells call it first thing, before any corpus is generated; an
+/// explicit `corpus=synthetic` still selects the uniform flavour. First
+/// call wins, like every other process-wide corpus setting.
+pub fn default_text_flavor_for_fts() {
+    let _ = DEFAULT_TEXT_FLAVOR.set(TextFlavor::Realistic);
+}
+
+/// Install the corpus source from a process's positional arguments — the
+/// `corpus=<spec>` and `corpus-dir=<path>` tokens, in any position — so a
+/// child process re-executing this binary with its parent's arguments
+/// resolves the same corpus. A spec that fails to parse is returned as
+/// the error string [`set_source`] produces.
+pub fn install_source_from_args(args: impl IntoIterator<Item = String>) -> Result<(), String> {
+    let mut spec: Option<String> = None;
+    let mut dir: Option<String> = None;
+    for arg in args {
+        match arg.split_once('=') {
+            Some(("corpus", s)) => spec = Some(s.to_string()),
+            Some(("corpus-dir", d)) => dir = Some(d.to_string()),
+            _ => {}
+        }
+    }
+    match spec {
+        Some(spec) => set_source(&spec, dir.as_deref()),
+        None => Ok(()),
+    }
 }
 
 /// Parse and install the corpus source for this process. First call wins,
@@ -263,7 +310,10 @@ pub fn set_source(spec: &str, dir: Option<&str>) -> Result<(), String> {
             .ok_or_else(|| format!("corpus={spec} needs corpus-dir=<path> to stage {what}"))
     };
     let source = match spec.split_once(':') {
-        None if spec == "synthetic" => CorpusSource::Synthetic,
+        None if spec == "synthetic" => {
+            let _ = TEXT_FLAVOR.set(TextFlavor::Uniform);
+            CorpusSource::Synthetic
+        }
         None if spec == "realistic" => {
             let _ = TEXT_FLAVOR.set(TextFlavor::Realistic);
             CorpusSource::Synthetic

@@ -61,7 +61,7 @@ use infino::{
 
 use crate::{
     cold_store::{self, ColdStoreMeasurement, STEADY_COLD_SAMPLES},
-    corpus::dim,
+    corpus::{self, dim},
     cost, cpu,
     executors::p50,
     ingest::supertable::{self, Modality, modality_label},
@@ -214,6 +214,16 @@ fn run_child_shape(key: &str) {
             std::process::exit(2);
         }
     };
+    // The child is re-executed with its parent's `corpus=` tokens (see
+    // `build_shape_isolated`) and resolves the corpus the same way; the
+    // FTS shape takes the FTS cells' realistic default.
+    if let Err(err) = corpus::install_source_from_args(std::env::args().skip(1)) {
+        eprintln!("[supertable] child process: {err}");
+        std::process::exit(2);
+    }
+    if modality == Modality::Fts {
+        corpus::default_text_flavor_for_fts();
+    }
 
     eprintln!(
         "[supertable] child process: ingesting {} shape ({} docs)...",
@@ -262,6 +272,14 @@ fn build_shape_isolated(key: &str) -> Option<ShapeMetrics> {
     // Forward a CLI-set dataset prefix; the child only inherits the env.
     if let Some(prefix) = crate::dataset::dataset_prefix() {
         cmd.env(crate::dataset::PREFIX_ENV, prefix);
+    }
+    // The corpus selector is process-wide state installed from the
+    // arguments; a child that did not receive it would silently ingest
+    // the default corpus under the parent's label.
+    for arg in std::env::args().skip(1) {
+        if arg.starts_with("corpus=") || arg.starts_with("corpus-dir=") {
+            cmd.arg(arg);
+        }
     }
     let output = cmd
         .stdout(Stdio::piped())
@@ -1753,6 +1771,9 @@ pub mod fts {
             eprintln!("[supertable_fts] skipped: {reason}");
             return;
         }
+        // Before any corpus is generated: BM25 is measured on text-shaped
+        // distributions unless the command line says `corpus=synthetic`.
+        corpus::default_text_flavor_for_fts();
 
         let n_docs = supertable::n_docs();
         let mut report = Report::load("supertable_fts");

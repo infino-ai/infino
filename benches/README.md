@@ -24,7 +24,8 @@ Raw logs: Actions artifacts on that run.
 ```sh
 cargo bench                              # all cells
 cargo bench -- supertable fts            # one cell
-cargo bench -- supertable fts quality corpus=realistic   # BM25 top-k parity vs oracle
+cargo bench -- supertable fts quality    # BM25 top-k parity vs oracle (10M, 16 commits)
+cargo bench -- superfile fts quality     # the same on one 1M-doc superfile
 cargo bench -- superfile sql cold        # phases: build | warm | cold
 INFINO_BENCH_SUPERFILE_DOCS=100000 \
   cargo bench -- superfile fts warm      # plain ints only (no 100K suffix)
@@ -52,14 +53,16 @@ surface; the measured tables are unaffected). Pass `--debug` for the full
 engine diagnostics (`info,infino=debug`); an explicit `RUST_LOG` overrides
 both.
 
-Synthetic FTS corpus: seed `1`, 200 Zipfian tokens/doc, 10K vocab.
-`corpus=realistic` swaps the text generator for one calibrated to English
-Wikipedia — log-normal doc lengths (median 89 tokens, 13% under 16, a 1%
-tail past 3000), an open Zipf vocabulary over 1M ranks (rank 1 in ~84% of
-docs), ~56% within-doc repeated tokens, and mixed-case / punctuation /
-digit surface forms — same seed, same `term{rank}` names, so the batteries
-apply to both. The quality table below is measured on it; the speed tables
-stay on the uniform corpus.
+Generated text corpus, seed `1`, in two flavours. The FTS cells default to
+`realistic`: a generator calibrated to English Wikipedia — log-normal doc
+lengths (median 89 tokens, 13% under 16, a 1% tail past 3000), an open Zipf
+vocabulary over 1M ranks (rank 1 in ~84% of docs), ~56% within-doc repeated
+tokens, and mixed-case / punctuation / digit surface forms. `corpus=synthetic`
+selects the uniform historical flavour (200 Zipfian tokens/doc, 10K vocab),
+which the SQL and combined shapes still use by default. Same seed, same
+`term{rank}` names, so the batteries apply to both. The FTS quality tables
+and, from the switch on, the FTS speed tables are measured on the realistic
+flavour; tables recorded earlier name the uniform corpus in their titles.
 Synthetic vectors: cosine, **1024-d**, seed `1` (archived tables below used 384-d).
 
 ### Object store
@@ -186,6 +189,83 @@ JSON metrics land in `target/infino-bench/<bench>.json` (local only).
 | two_mid_or_common_neg | 4.55 ms |
 | two_mid_and_common_neg | 5.15 ms |
 <!-- END: bench/fts/superfile/negation -->
+
+<!-- BEGIN: bench/fts/superfile/quality -->
+### Superfile FTS — BM25 top-k parity vs textbook oracle (1M docs, realistic corpus)
+
+_Host: unknown CPU · 16C/16T · macos/aarch64_
+
+Engine top-k graded against a streaming BM25 oracle over the whole corpus, tie-aware (a hit is any returned doc scoring at least the oracle's k-th score). `recall vs BM25` = textbook BM25 with exact doc lengths and the corpus-wide average length — the user-facing quality, which pays for the one-byte length quantization and for each file normalizing with the average it declares. `recall vs engine BM25` = BM25 with the engine's stored (quantized) lengths and the file's own declared average, both read back from the file and verified against the oracle's own tokenization — gated at 1.0: a miss is a document the kernels' own formula would not have returned. `max score Δ` = largest relative gap between an engine score and that reference for the same doc — gated at 0.10%, f32 arithmetic noise.
+
+**k = 10**
+
+| Query | matches | recall vs BM25 | recall vs engine BM25 | max score Δ |
+| --- | --- | --- | --- | --- |
+| stopword | 836.8K | 0.8000 | 1.0000 | 0.0000% |
+| common | 214.3K | 1.0000 | 1.0000 | 0.0000% |
+| mid | 5.8K | 1.0000 | 1.0000 | 0.0000% |
+| rare | 65 | 1.0000 | 1.0000 | 0.0000% |
+| singleton | 1 | 1.0000 | 1.0000 | 0.0000% |
+| stopword_common_or | 841.2K | 1.0000 | 1.0000 | 0.0000% |
+| stopword_rare_or | 836.8K | 1.0000 | 1.0000 | 0.0000% |
+| three_stopword_or | 908.4K | 0.9000 | 1.0000 | 0.0000% |
+| three_mid_or | 17.0K | 1.0000 | 1.0000 | 0.0000% |
+| ten_common_or | 619.3K | 0.8000 | 1.0000 | 0.0000% |
+| stopword_rare_and | 64 | 1.0000 | 1.0000 | 0.0000% |
+| common_mid_and | 3.8K | 1.0000 | 1.0000 | 0.0000% |
+| three_mid_and | 44 | 1.0000 | 1.0000 | 0.0000% |
+| must_rare_should_common | 65 | 1.0000 | 1.0000 | 0.0000% |
+| must_two_should_two | 102.5K | 1.0000 | 1.0000 | 0.0000% |
+| common_not_stopword | 4.5K | 0.9000 | 1.0000 | 0.0000% |
+| phrase_stopwords | 275.5K | 1.0000 | 1.0000 | 0.0000% |
+| phrase_common_mid | 22 | 1.0000 | 1.0000 | 0.0000% |
+
+**k = 100**
+
+| Query | matches | recall vs BM25 | recall vs engine BM25 | max score Δ |
+| --- | --- | --- | --- | --- |
+| stopword | 836.8K | 0.9000 | 1.0000 | 0.0000% |
+| common | 214.3K | 0.9700 | 1.0000 | 0.0000% |
+| mid | 5.8K | 0.9800 | 1.0000 | 0.0000% |
+| rare | 65 | 1.0000 | 1.0000 | 0.0000% |
+| singleton | 1 | 1.0000 | 1.0000 | 0.0000% |
+| stopword_common_or | 841.2K | 0.9500 | 1.0000 | 0.0000% |
+| stopword_rare_or | 836.8K | 0.9800 | 1.0000 | 0.0000% |
+| three_stopword_or | 908.4K | 0.8800 | 1.0000 | 0.0000% |
+| three_mid_or | 17.0K | 0.9600 | 1.0000 | 0.0000% |
+| ten_common_or | 619.3K | 0.9200 | 1.0000 | 0.0000% |
+| stopword_rare_and | 64 | 1.0000 | 1.0000 | 0.0000% |
+| common_mid_and | 3.8K | 0.9700 | 1.0000 | 0.0000% |
+| three_mid_and | 44 | 1.0000 | 1.0000 | 0.0000% |
+| must_rare_should_common | 65 | 1.0000 | 1.0000 | 0.0000% |
+| must_two_should_two | 102.5K | 0.9800 | 1.0000 | 0.0000% |
+| common_not_stopword | 4.5K | 1.0000 | 1.0000 | 0.0000% |
+| phrase_stopwords | 275.5K | 0.9600 | 1.0000 | 0.0000% |
+| phrase_common_mid | 22 | 1.0000 | 1.0000 | 0.0000% |
+
+**k = 1000**
+
+| Query | matches | recall vs BM25 | recall vs engine BM25 | max score Δ |
+| --- | --- | --- | --- | --- |
+| stopword | 836.8K | 0.9510 | 1.0000 | 0.0000% |
+| common | 214.3K | 0.9830 | 1.0000 | 0.0000% |
+| mid | 5.8K | 0.9920 | 1.0000 | 0.0000% |
+| rare | 65 | 1.0000 | 1.0000 | 0.0000% |
+| singleton | 1 | 1.0000 | 1.0000 | 0.0000% |
+| stopword_common_or | 841.2K | 0.9790 | 1.0000 | 0.0000% |
+| stopword_rare_or | 836.8K | 0.9370 | 1.0000 | 0.0000% |
+| three_stopword_or | 908.4K | 0.9000 | 1.0000 | 0.0000% |
+| three_mid_or | 17.0K | 0.9890 | 1.0000 | 0.0000% |
+| ten_common_or | 619.3K | 0.9120 | 1.0000 | 0.0000% |
+| stopword_rare_and | 64 | 1.0000 | 1.0000 | 0.0000% |
+| common_mid_and | 3.8K | 0.9850 | 1.0000 | 0.0000% |
+| three_mid_and | 44 | 1.0000 | 1.0000 | 0.0000% |
+| must_rare_should_common | 65 | 1.0000 | 1.0000 | 0.0000% |
+| must_two_should_two | 102.5K | 0.9570 | 1.0000 | 0.0000% |
+| common_not_stopword | 4.5K | 1.0000 | 1.0000 | 0.0000% |
+| phrase_stopwords | 275.5K | 0.9810 | 1.0000 | 0.0000% |
+| phrase_common_mid | 22 | 1.0000 | 1.0000 | 0.0000% |
+<!-- END: bench/fts/superfile/quality -->
 
 ### Supertable FTS
 

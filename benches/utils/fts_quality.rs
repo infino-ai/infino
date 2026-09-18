@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! FTS quality — BM25 top-k parity of the supertable search path against a
-//! textbook oracle, at bench scale.
+//! FTS quality — BM25 top-k parity of the search path against a textbook
+//! oracle, at bench scale, on both tiers: the supertable ([`run`]) and a
+//! single superfile ([`run_superfile`]).
 //!
 //! The speed cells time `bm25_search` and discard what it returns. This
 //! module grades what it returns: for every shape in [`QUALITY_BATTERY`]
@@ -20,29 +21,33 @@
 //!   (`stored_len`): exact below 16 tokens, truncated downward by up to
 //!   one bucket above. On a corpus with realistic length variation this
 //!   reorders near-ties.
-//! * **Sharded statistics.** Under [`Bm25Stats::PerSuperfile`]
-//!   each superfile scores with its own document count and term
-//!   frequencies; [`Bm25Stats::Global`] uses table-wide idf but still each
-//!   superfile's own average document length.
+//! * **Statistics scope.** Under [`Bm25Stats::PerSuperfile`] each
+//!   superfile scores with its own document count and term frequencies.
+//!   Under [`Bm25Stats::Global`] idf is table-wide, and each superfile
+//!   normalizes lengths with the average it *declares*: the table-wide
+//!   average as of its commit (every superfile already committed plus its
+//!   own documents), rounded to the fixed point the file stores. A file
+//!   from the first commit therefore scores at its own average; a file
+//!   from the last at nearly the corpus-wide one.
 //!
 //! So the oracle scores every matching document twice from the same
-//! statistics: **T**, textbook BM25 with the exact length, and **Q**, the
-//! BM25 the engine is specified to compute, with the stored length. The
-//! table then reports, per query and `k`:
+//! statistics: **T**, textbook BM25 with the exact length and the
+//! corpus-wide average, and **Q**, the BM25 the engine is specified to
+//! compute, with the stored length and the declared average of the
+//! superfile that holds the document. The table then reports, per query
+//! and `k`:
 //!
 //! | column | definition |
 //! |---|---|
-//! | recall vs BM25 | engine top-k under `Global` graded against T — the user-facing quality, including the quantization and avgdl costs |
+//! | recall vs BM25 | engine top-k under `Global` graded against T — the user-facing quality, including the quantization and average-length costs |
 //! | recall (per-superfile stats) | the same under `PerSuperfile` — the opt-in mode's sharded-idf drift |
-//! | recall vs engine BM25 | engine top-k under `Global` graded against Q, a hit allowed to fall short of the k-th score by the avgdl residual — must be ≈ 1.0; a drop is a kernel or pruning bug. **Gated.** |
-//! | max score Δ | largest relative gap between an engine score and Q for the same document (`Global`). **Gated** at the avgdl residual. |
+//! | recall vs engine BM25 | engine top-k under `Global` graded against Q — must be 1.0; a drop is a kernel or pruning bug. **Gated.** |
+//! | max score Δ | largest relative gap between an engine score and Q for the same document (`Global`). **Gated** at f32 noise. |
 //!
-//! Q is exact except for one input: the engine normalizes with each
-//! superfile's own average document length, the oracle with the
-//! corpus-wide one. That residual is a sampling error that shrinks as
-//! `1/sqrt(docs per superfile)` — 5% is the gate at the 10M reference
-//! scale and it widens accordingly on smaller smoke-test corpora
-//! ([`residual_tolerance`]).
+//! Q is exact, so its gates are tight. Making it exact needs the row-to-
+//! superfile mapping and each superfile's declared average: [`Layout`]
+//! recovers both from the table itself and verifies the mapping against
+//! the stored document lengths (§ [`Layout::recover`]).
 //!
 //! Recall is **tie-aware**: a returned document counts as a hit when its
 //! oracle score is at least the oracle's k-th score (within a rounding
@@ -61,25 +66,30 @@
 //! parse with the table's own tokenizer, so tokenization and clause
 //! semantics cannot diverge by construction.
 
-use std::{borrow::Cow, cmp::Ordering, collections::HashMap, time::Instant};
+use std::{borrow::Cow, cmp::Ordering, collections::HashMap, sync::Arc, time::Instant};
 
 use arrow_array::{Array, Float32Array, LargeStringArray, RecordBatch, StringArray};
 use infino::{
     Bm25SearchOptions,
-    superfile::fts::{
-        bm25::stored_len,
-        reader::{Bm25Stats, BoolMode},
-        tokenize::Tokenizer,
+    superfile::{
+        SuperfileReader,
+        format::fts::DOC_LENGTH_STORED_MAX,
+        fts::{
+            bm25::{stored_avgdl, stored_len},
+            reader::{Bm25Stats, BoolMode, ColumnLengthStats, FtsReader},
+            tokenize::Tokenizer,
+        },
     },
-    supertable::SupertableReader,
+    supertable::{SupertableReader, manifest::SuperfileEntry},
     test_helpers::default_tokenizer,
 };
 use rayon::prelude::*;
 
 use crate::{
-    corpus::{self, TextFlavor, for_each_doc_in_chunk, generated_chunk_count},
+    corpus::{self, TextFlavor, block_on_inmem, for_each_doc_in_chunk, generated_chunk_count},
     markdown::fmt_count,
     report::{Better, Block, Cell, Report, Section, context, metric, text},
+    tiers,
 };
 
 /// The `k` values graded. `10` is the speed cell's top-k, `1000` its
@@ -99,32 +109,24 @@ const B: f64 = 0.75;
 const TIE_TOLERANCE: f64 = 1e-4;
 
 /// Gate: every query × k must reach this recall against the engine-model
-/// reference (Q) under `Global` statistics. Below it the kernels are
-/// returning documents the formula they implement would not.
-const MIN_ENGINE_MODEL_RECALL: f64 = 0.99;
+/// reference (Q) under `Global` statistics. Q is exact, so every expected
+/// slot must be filled; a miss is a document the formula the kernels
+/// implement would not have returned.
+const MIN_ENGINE_MODEL_RECALL: f64 = 1.0;
 
-/// Gate at the reference scale: the largest relative gap between an engine
-/// score and Q over the returned documents, under `Global`. The one input
-/// the oracle cannot reproduce is the per-superfile average document
-/// length the engine normalizes with (the oracle uses the corpus-wide
-/// value). That residual is a sampling error of the mean over one
-/// superfile's docs, so it scales with `1/sqrt(docs per superfile)`; with
-/// the fixed 16-commit ingest shape that is `1/sqrt(n_docs)`, and the
-/// ceiling is widened accordingly below the reference scale
-/// ([`residual_tolerance`]). The same tolerance is what the engine-model
-/// hit test allows a returned document to fall short of the k-th score by.
-const MAX_SCORE_DELTA_AT_REFERENCE: f64 = 0.05;
-/// Doc count the gates are calibrated at — the supertable cell's default.
-const REFERENCE_DOCS: usize = 10_000_000;
-/// Widest the scale-adjusted tolerance may grow (tiny smoke-test corpora).
-const MAX_RESIDUAL_TOLERANCE: f64 = 0.5;
+/// Gate: the largest relative gap between an engine score and Q over the
+/// returned documents, under `Global`. Q reproduces every input the engine
+/// scores with (table-wide idf, the stored length, the declared average),
+/// so what remains is f32 arithmetic: idf and the length normalizer held
+/// as `f32`, the per-term sum accumulated in `f32`. Those are parts per
+/// million; the ceiling leaves three orders of magnitude of headroom and
+/// still fails on any mismatched input.
+const MAX_SCORE_DELTA: f64 = 1e-3;
 
-/// The per-superfile avgdl residual the gates allow at `n_docs`: 5% at 10M,
-/// growing as `sqrt(REFERENCE_DOCS / n_docs)` below it.
-fn residual_tolerance(n_docs: usize) -> f64 {
-    let scale = (REFERENCE_DOCS as f64 / n_docs.max(1) as f64).sqrt();
-    (MAX_SCORE_DELTA_AT_REFERENCE * scale).min(MAX_RESIDUAL_TOLERANCE)
-}
+/// Relative tolerance when checking a superfile's declared average against
+/// the value the commit rule predicts. Both sides round to the same fixed
+/// point from the same totals; this only absorbs the `f64` → `f32` step.
+const DECLARED_AVGDL_TOLERANCE: f64 = 1e-6;
 
 /// Guard against a degenerate oracle score in a relative-delta denominator.
 const MIN_SCORE_FOR_RELATIVE_DELTA: f64 = 1e-9;
@@ -258,6 +260,214 @@ struct ResolvedQuery {
     negatives: Vec<Atom>,
 }
 
+/// One superfile's slice of the corpus and the average length it scores at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SuperfileSpan {
+    /// First corpus row this superfile holds; its rows are contiguous.
+    pub first_row: u32,
+    pub n_docs: u32,
+    /// The average document length the superfile declares, which is what
+    /// its norm table decodes with.
+    pub avgdl: f64,
+}
+
+/// The row-to-superfile mapping of the graded table, with each
+/// superfile's declared average length — the one input to Q that varies
+/// by superfile.
+#[derive(Clone, Debug)]
+pub struct Layout {
+    /// Ascending by `first_row`, covering `0..n_docs` without gaps.
+    spans: Vec<SuperfileSpan>,
+    /// How many commits the superfiles fell into (see [`Self::recover`]).
+    n_commits: usize,
+}
+
+impl Layout {
+    /// One superfile holding every row, scoring at `avgdl`: the superfile
+    /// tier, and the oracle's default before a table layout is recovered.
+    pub fn single(n_docs: usize, avgdl: f64) -> Self {
+        Self {
+            spans: vec![SuperfileSpan {
+                first_row: 0,
+                n_docs: u32::try_from(n_docs).expect("row count fits u32"),
+                avgdl,
+            }],
+            n_commits: 1,
+        }
+    }
+
+    /// Recover the layout of the table behind `reader` for FTS column
+    /// `column`, given the oracle's exact per-row token counts `dl`.
+    ///
+    /// Rows reach a superfile in append order: the writer splits a
+    /// commit's buffered rows into contiguous, row-ordered shards, and the
+    /// id column is assigned monotonically at append, so ordering the
+    /// manifest by `id_min` orders superfiles by first row and each holds
+    /// its `n_docs` rows contiguously. That is an inference about the
+    /// writer, so it is **verified**, not assumed: every superfile's
+    /// stored document lengths are read back and must equal the oracle's
+    /// lengths for the rows assigned to it, element for element (both
+    /// saturated at the format's stored maximum). A mismatch is a hard
+    /// error naming the superfile and row.
+    ///
+    /// Each superfile's declared average is read from its reader. It is
+    /// then checked against the commit rule the writer implements — the
+    /// table-wide totals of every superfile committed before it, plus its
+    /// own, rounded to the stored fixed point. Superfiles built by one
+    /// commit share the same "committed before" totals, and the manifest
+    /// does not record commit boundaries, so they are derived: a superfile
+    /// whose declared average matches the rule with every earlier
+    /// superfile counted as committed starts a new commit; one that
+    /// matches only with the current commit's earlier files excluded
+    /// continues it. Neither matching is an error.
+    pub fn recover(reader: &SupertableReader, column: &str, dl: &[u32]) -> Self {
+        let manifest = reader.manifest();
+        let mut entries: Vec<Arc<SuperfileEntry>> = manifest.get_all_superfiles().to_vec();
+        if entries.is_empty() {
+            for part_entry in manifest.get_all_list_entries() {
+                let part = tiers::block_on(manifest.get_part_by_id(part_entry.part_id))
+                    .expect("load manifest part for the quality layout");
+                entries.extend(part.superfiles.iter().cloned());
+            }
+        }
+        entries.sort_by_key(|e| e.id_min);
+        let n_rows: u64 = entries.iter().map(|e| e.n_docs).sum();
+        assert_eq!(
+            n_rows,
+            dl.len() as u64,
+            "manifest row count differs from the oracle's corpus"
+        );
+
+        let mut spans = Vec::with_capacity(entries.len());
+        let mut committed = ColumnLengthStats::default();
+        let mut commit = ColumnLengthStats::default();
+        let mut n_commits = 0usize;
+        let mut first_row = 0usize;
+        for (i, entry) in entries.iter().enumerate() {
+            let n_docs = usize::try_from(entry.n_docs).expect("superfile row count fits usize");
+
+            let superfile = reader.open_superfile(entry).unwrap_or_else(|e| {
+                panic!(
+                    "open superfile {i} ({:?}) for the quality layout: {e}",
+                    entry.uri
+                )
+            });
+            let fts = superfile.fts().unwrap_or_else(|| {
+                panic!("superfile {i} ({:?}) has no full-text index", entry.uri)
+            });
+            let stored = fts
+                .column_doc_lengths(column)
+                .unwrap_or_else(|e| panic!("superfile {i}: read doc lengths of {column:?}: {e}"));
+            assert_eq!(
+                stored.len(),
+                n_docs,
+                "superfile {i}: doc-length array holds {} rows, manifest says {n_docs}",
+                stored.len()
+            );
+            let label = format!("superfile {i} ({:?})", entry.uri);
+            verify_doc_lengths(&stored, dl, first_row, &label);
+            let declared = declared_avgdl(fts, column);
+
+            // The commit rule, under both hypotheses about where this
+            // superfile's commit begins.
+            let own = ColumnLengthStats::from_lengths(stored.iter().copied());
+            let mut all_earlier = committed;
+            all_earlier.merge_with(&commit);
+            let as_new_commit = declared_under(&all_earlier, &own);
+            let as_same_commit = declared_under(&committed, &own);
+            if close_enough(declared, as_new_commit) {
+                committed = all_earlier;
+                commit = own;
+                n_commits += 1;
+            } else if close_enough(declared, as_same_commit) {
+                commit.merge_with(&own);
+            } else {
+                panic!(
+                    "superfile {i} ({:?}) declares avgdl {declared} but the commit rule predicts \
+                     {as_new_commit} (first file of a commit) or {as_same_commit} (later file of \
+                     the current commit)",
+                    entry.uri
+                );
+            }
+
+            spans.push(SuperfileSpan {
+                first_row: u32::try_from(first_row).expect("row fits u32"),
+                n_docs: u32::try_from(n_docs).expect("row count fits u32"),
+                avgdl: declared,
+            });
+            first_row += n_docs;
+        }
+        Self { spans, n_commits }
+    }
+
+    pub fn n_superfiles(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn n_commits(&self) -> usize {
+        self.n_commits
+    }
+
+    /// The declared average of the superfile holding `row`.
+    fn avgdl_of(&self, row: u32) -> f64 {
+        let i = self.spans.partition_point(|s| s.first_row <= row);
+        debug_assert!(i > 0, "row {row} precedes the first span");
+        self.spans[i - 1].avgdl
+    }
+}
+
+/// The average a superfile declares when `own` joins a table whose
+/// committed totals are `committed`: the merged average, rounded as the
+/// writer stores it.
+fn declared_under(committed: &ColumnLengthStats, own: &ColumnLengthStats) -> f64 {
+    let mut table = *committed;
+    table.merge_with(own);
+    f64::from(stored_avgdl(table.avgdl()))
+}
+
+fn close_enough(declared: f64, predicted: f64) -> bool {
+    (declared - predicted).abs()
+        <= DECLARED_AVGDL_TOLERANCE * predicted.abs().max(f64::MIN_POSITIVE)
+}
+
+/// Check that `stored`, one file's document-length array, equals the
+/// oracle's lengths for the rows starting at `first_row`, element for
+/// element (the oracle's saturated at the format's stored maximum, as
+/// the build saturates). `label` names the file in the failure.
+fn verify_doc_lengths(stored: &[u32], dl: &[u32], first_row: usize, label: &str) {
+    let end = first_row + stored.len();
+    assert!(
+        end <= dl.len(),
+        "{label}: holds {} rows from row {first_row}, past the corpus ({} rows)",
+        stored.len(),
+        dl.len()
+    );
+    let expected = &dl[first_row..end];
+    if let Some(bad) =
+        (0..stored.len()).find(|&j| stored[j] != expected[j].min(DOC_LENGTH_STORED_MAX))
+    {
+        panic!(
+            "{label} does not hold rows {first_row}..{end}: local doc {bad} has stored length {} \
+             but corpus row {} has {}. The row-to-file mapping the oracle infers is wrong for \
+             this table.",
+            stored[bad],
+            first_row + bad,
+            expected[bad]
+        );
+    }
+}
+
+/// The average document length `column` is scored at in one file: what
+/// its norm table decodes with.
+fn declared_avgdl(fts: &FtsReader, column: &str) -> f64 {
+    f64::from(
+        fts.fts_columns_config()
+            .find(|c| c.name == column)
+            .unwrap_or_else(|| panic!("column {column:?} has no full-text index in this file"))
+            .avgdl(),
+    )
+}
+
 /// Textbook BM25 statistics over the whole corpus, restricted to the
 /// battery's atoms.
 pub struct Oracle {
@@ -275,7 +485,12 @@ pub struct Oracle {
     row_start: Vec<u32>,
     /// Documents containing each atom at least once.
     df: Vec<u32>,
+    /// Corpus-wide average length: T normalizes with it.
     avgdl: f64,
+    /// Where each row lives and the average its superfile scores at: Q
+    /// normalizes with it. One span at the corpus average until
+    /// [`Self::set_layout`].
+    layout: Layout,
 }
 
 /// One document's scores under both references.
@@ -431,11 +646,23 @@ impl Oracle {
             row_start,
             df,
             avgdl,
+            layout: Layout::single(n_docs, avgdl),
         }
     }
 
     pub fn n_docs(&self) -> usize {
         self.n_docs
+    }
+
+    /// The exact token count of every row, in row order.
+    pub fn doc_lengths(&self) -> &[u32] {
+        &self.dl
+    }
+
+    /// Install the graded table's layout, which decides the average
+    /// length Q normalizes each row with.
+    pub fn set_layout(&mut self, layout: Layout) {
+        self.layout = layout;
     }
 
     /// `ln(1 + (N - df + 0.5) / (df + 0.5))`; a phrase's idf is the sum of
@@ -453,9 +680,9 @@ impl Oracle {
         (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
     }
 
-    fn tf_factor(&self, tf: u32, dl: u32) -> f64 {
+    fn tf_factor(tf: u32, dl: u32, avgdl: f64) -> f64 {
         let tf = f64::from(tf);
-        let norm = 1.0 - B + B * f64::from(dl) / self.avgdl.max(f64::MIN_POSITIVE);
+        let norm = 1.0 - B + B * f64::from(dl) / avgdl.max(f64::MIN_POSITIVE);
         tf / (tf + K1 * norm)
     }
 
@@ -493,8 +720,10 @@ impl Oracle {
     }
 
     /// Score one row's cells under both references, or `None` when the row
-    /// does not match the query.
-    fn score_cells(&self, cells: &[Entry], dl: u32, q: &ResolvedQuery) -> Option<(f64, f64)> {
+    /// does not match the query. T normalizes with the corpus average and
+    /// the exact length; Q with the declared average of the row's
+    /// superfile and the length as the file stores it.
+    fn score_cells(&self, cells: &[Entry], row: u32, q: &ResolvedQuery) -> Option<(f64, f64)> {
         let tf_of = |atom: Atom| -> Option<u32> {
             cells
                 .binary_search_by_key(&atom, |e| e.atom)
@@ -504,13 +733,15 @@ impl Oracle {
         if q.negatives.iter().any(|&a| tf_of(a).is_some()) {
             return None;
         }
+        let dl = self.dl[row as usize];
+        let dl_q = stored_len(dl.min(DOC_LENGTH_STORED_MAX));
+        let avgdl_q = self.layout.avgdl_of(row);
         let mut textbook = 0.0f64;
         let mut engine_model = 0.0f64;
-        let dl_q = stored_len(dl);
         let mut add = |atom: Atom, tf: u32| {
             let idf = self.idf(atom);
-            textbook += idf * self.tf_factor(tf, dl);
-            engine_model += idf * self.tf_factor(tf, dl_q);
+            textbook += idf * Self::tf_factor(tf, dl, self.avgdl);
+            engine_model += idf * Self::tf_factor(tf, dl_q, avgdl_q);
         };
         for &a in &q.musts {
             add(a, tf_of(a)?);
@@ -535,7 +766,7 @@ impl Oracle {
             return None;
         }
         let cells = &self.entries[self.row_start[r] as usize..self.row_start[r + 1] as usize];
-        self.score_cells(cells, self.dl[r], q)
+        self.score_cells(cells, row, q)
     }
 
     /// Every matching document, scored under both references.
@@ -549,10 +780,10 @@ impl Oracle {
                 if lo == hi {
                     return None;
                 }
-                let (textbook, engine_model) =
-                    self.score_cells(&self.entries[lo..hi], self.dl[r], q)?;
+                let row = r as u32;
+                let (textbook, engine_model) = self.score_cells(&self.entries[lo..hi], row, q)?;
                 Some(Scored {
-                    row: r as u32,
+                    row,
                     textbook,
                     engine_model,
                 })
@@ -636,11 +867,17 @@ struct EngineHit {
     score: f64,
 }
 
-/// Run `query` through the public search path and map each hit to its
-/// corpus row via the per-doc unique `doc{id:07}` token the generated
-/// corpora plant as the first token — cheaper than a 10M-row `_id` scan
-/// and independent of `_id` assignment order.
-fn engine_hits(
+/// How a tier answers one battery query: its hits at `k`, scored under
+/// `stats`. The supertable tier maps each hit to its row through the doc
+/// token of the returned text; on the superfile tier the local doc id is
+/// the row and the statistics scope is moot.
+type HitSource<'a> = dyn Fn(&QualityQuery, usize, Bm25Stats) -> Vec<EngineHit> + 'a;
+
+/// Run `query` through the supertable's public search path and map each
+/// hit to its corpus row via the per-doc unique `doc{id:07}` token the
+/// generated corpora plant as the first token — cheaper than a 10M-row
+/// `_id` scan and independent of `_id` assignment order.
+fn supertable_hits(
     reader: &SupertableReader,
     column: &str,
     q: &QualityQuery,
@@ -699,11 +936,28 @@ fn row_text(batch: &RecordBatch, idx: usize, i: usize) -> &str {
     panic!("text column is neither LargeUtf8 nor Utf8");
 }
 
+/// Run `query` through one superfile's string search path. The fixture
+/// is built in corpus order, so the local doc id is the corpus row.
+fn superfile_hits(
+    reader: &SuperfileReader,
+    column: &str,
+    q: &QualityQuery,
+    k: usize,
+) -> Vec<EngineHit> {
+    block_on_inmem(reader.bm25_hits_async(column, q.query, k, q.mode))
+        .expect("quality bm25_hits_async")
+        .into_iter()
+        .map(|(doc, score)| EngineHit {
+            row: doc,
+            score: f64::from(score),
+        })
+        .collect()
+}
+
 /// Tie-aware recall: the fraction of the `expected` slots filled by a
 /// returned document whose oracle score reaches the k-th oracle score,
-/// less a relative `tolerance` (the tie rounding for the textbook columns,
-/// the avgdl residual for the engine-model column). A query with no
-/// matches scores 1.0 only if the engine also returned nothing.
+/// less a relative `tolerance` for rounding. A query with no matches
+/// scores 1.0 only if the engine also returned nothing.
 fn tie_aware_recall(
     hits: &[EngineHit],
     expected: usize,
@@ -722,65 +976,54 @@ fn tie_aware_recall(
 }
 
 /// One graded `(query, k)` cell of the report.
-struct GradedRow {
-    name: &'static str,
-    k: usize,
-    n_matches: usize,
-    recall_textbook: f64,
-    recall_per_superfile_stats: f64,
-    recall_engine_model: f64,
-    max_delta: f64,
+pub struct GradedRow {
+    pub name: &'static str,
+    pub k: usize,
+    pub n_matches: usize,
+    pub recall_textbook: f64,
+    /// `None` on the superfile tier, where statistics have one scope.
+    pub recall_per_superfile_stats: Option<f64>,
+    pub recall_engine_model: f64,
+    pub max_delta: f64,
 }
 
-/// Build the oracle for the configured corpus, grade every battery shape
-/// through `reader`, emit the section under `bench/fts/supertable/quality`
-/// and fail loudly if a gate is missed.
-pub fn run(
-    report: &mut Report,
-    reader: &SupertableReader,
-    column: &str,
-    n_docs: usize,
-    text_seed: u64,
-    log_prefix: &str,
-) {
-    corpus::require_synthetic(&format!("{log_prefix} quality"));
-    let flavor = corpus::text_flavor();
-    let tokenizer = default_tokenizer();
+impl GradedRow {
+    /// Whether this cell passes both gates.
+    pub fn passes(&self) -> bool {
+        self.recall_engine_model >= MIN_ENGINE_MODEL_RECALL && self.max_delta <= MAX_SCORE_DELTA
+    }
 
-    eprintln!(
-        "[{log_prefix}] quality: streaming {} {} docs into the BM25 oracle...",
-        fmt_count(n_docs),
-        flavor.label()
-    );
-    let t = Instant::now();
-    let oracle = Oracle::build(
-        n_docs,
-        text_seed,
-        flavor,
-        tokenizer.as_ref(),
-        QUALITY_BATTERY,
-    );
-    eprintln!(
-        "[{log_prefix}] quality: oracle ready in {:.1}s ({} cells, avgdl {:.1})",
-        t.elapsed().as_secs_f64(),
-        fmt_count(oracle.entries.len()),
-        oracle.avgdl
-    );
+    fn failure(&self) -> String {
+        format!(
+            "{} k={}: recall vs engine BM25 {:.4} (floor {MIN_ENGINE_MODEL_RECALL}), max score Δ {:.4}% (ceiling {:.4}%)",
+            self.name,
+            self.k,
+            self.recall_engine_model,
+            self.max_delta * 100.0,
+            MAX_SCORE_DELTA * 100.0
+        )
+    }
+}
 
-    let resolved: Vec<ResolvedQuery> = QUALITY_BATTERY
-        .iter()
-        .map(|q| oracle.resolve(tokenizer.as_ref(), q))
-        .collect();
-    let tolerance = residual_tolerance(n_docs);
+/// Grade every `battery` shape at every `k` against `oracle`, whose
+/// layout must already be the graded table's, taking hits from `hits`.
+/// `per_superfile_stats` adds the opt-in statistics scope's column.
+fn grade_with(
+    oracle: &Oracle,
+    tokenizer: &dyn Tokenizer,
+    battery: &[QualityQuery],
+    hits: &HitSource<'_>,
+    per_superfile_stats: bool,
+) -> Vec<GradedRow> {
     let mut rows: Vec<GradedRow> = Vec::new();
-    for (q, rq) in QUALITY_BATTERY.iter().zip(&resolved) {
-        let top = oracle.top_k(rq);
+    for q in battery {
+        let rq = oracle.resolve(tokenizer, q);
+        let top = oracle.top_k(&rq);
         for (ki, &k) in QUALITY_KS.iter().enumerate() {
             let expected = k.min(top.n_matches);
-            let global = engine_hits(reader, column, q, k, Bm25Stats::Global);
-            let per_superfile = engine_hits(reader, column, q, k, Bm25Stats::PerSuperfile);
-            let textbook_of = |row| oracle.score_row(row, rq).map(|(t, _)| t);
-            let engine_model_of = |row| oracle.score_row(row, rq).map(|(_, e)| e);
+            let global = hits(q, k, Bm25Stats::Global);
+            let textbook_of = |row| oracle.score_row(row, &rq).map(|(t, _)| t);
+            let engine_model_of = |row| oracle.score_row(row, &rq).map(|(_, e)| e);
             let recall_textbook = tie_aware_recall(
                 &global,
                 expected,
@@ -788,18 +1031,21 @@ pub fn run(
                 TIE_TOLERANCE,
                 textbook_of,
             );
-            let recall_per_superfile_stats = tie_aware_recall(
-                &per_superfile,
-                expected,
-                top.textbook_kth[ki],
-                TIE_TOLERANCE,
-                textbook_of,
-            );
+            let recall_per_superfile_stats = per_superfile_stats.then(|| {
+                let per_superfile = hits(q, k, Bm25Stats::PerSuperfile);
+                tie_aware_recall(
+                    &per_superfile,
+                    expected,
+                    top.textbook_kth[ki],
+                    TIE_TOLERANCE,
+                    textbook_of,
+                )
+            });
             let recall_engine_model = tie_aware_recall(
                 &global,
                 expected,
                 top.engine_model_kth[ki],
-                tolerance,
+                TIE_TOLERANCE,
                 engine_model_of,
             );
             let max_delta = global
@@ -820,22 +1066,82 @@ pub fn run(
             });
         }
     }
+    rows
+}
 
-    emit(report, n_docs, flavor, tolerance, &rows);
+/// Grade through a supertable reader's public search path, under both
+/// statistics scopes.
+pub fn grade(
+    oracle: &Oracle,
+    reader: &SupertableReader,
+    column: &str,
+    tokenizer: &dyn Tokenizer,
+    battery: &[QualityQuery],
+) -> Vec<GradedRow> {
+    grade_with(
+        oracle,
+        tokenizer,
+        battery,
+        &|q, k, stats| supertable_hits(reader, column, q, k, stats),
+        true,
+    )
+}
 
+/// Grade through one superfile's search path.
+pub fn grade_superfile(
+    oracle: &Oracle,
+    reader: &SuperfileReader,
+    column: &str,
+    tokenizer: &dyn Tokenizer,
+    battery: &[QualityQuery],
+) -> Vec<GradedRow> {
+    grade_with(
+        oracle,
+        tokenizer,
+        battery,
+        &|q, k, _| superfile_hits(reader, column, q, k),
+        false,
+    )
+}
+
+/// The oracle for this process's synthetic corpus at `n_docs`, with the
+/// flavour and tokenizer both sides use. Logs the build.
+fn build_oracle(
+    n_docs: usize,
+    text_seed: u64,
+    log_prefix: &str,
+) -> (Oracle, TextFlavor, Arc<dyn Tokenizer>) {
+    corpus::require_synthetic(&format!("{log_prefix} quality"));
+    let flavor = corpus::text_flavor();
+    let tokenizer = default_tokenizer();
+    eprintln!(
+        "[{log_prefix}] quality: streaming {} {} docs into the BM25 oracle...",
+        fmt_count(n_docs),
+        flavor.label()
+    );
+    let t = Instant::now();
+    let oracle = Oracle::build(
+        n_docs,
+        text_seed,
+        flavor,
+        tokenizer.as_ref(),
+        QUALITY_BATTERY,
+    );
+    eprintln!(
+        "[{log_prefix}] quality: oracle ready in {:.1}s ({} cells, avgdl {:.1})",
+        t.elapsed().as_secs_f64(),
+        fmt_count(oracle.entries.len()),
+        oracle.avgdl
+    );
+    (oracle, flavor, tokenizer)
+}
+
+/// Fail loudly on any graded cell outside the gates.
+fn assert_gates(rows: &[GradedRow], log_prefix: &str) {
     let failures: Vec<String> = rows
         .iter()
-        .filter(|r| r.recall_engine_model < MIN_ENGINE_MODEL_RECALL || r.max_delta > tolerance)
-        .map(|r| {
-            format!(
-                "{} k={}: recall vs engine BM25 {:.4} (floor {MIN_ENGINE_MODEL_RECALL}), max score Δ {:.2}% (ceiling {:.1}%)",
-                r.name,
-                r.k,
-                r.recall_engine_model,
-                r.max_delta * 100.0,
-                tolerance * 100.0
-            )
-        })
+        .filter(|r| !r.passes())
+        .map(GradedRow::failure)
         .collect();
     assert!(
         failures.is_empty(),
@@ -849,67 +1155,175 @@ pub fn run(
     );
 }
 
+/// Build the oracle for the configured corpus, recover the table's
+/// layout, grade every battery shape through `reader`, emit the section
+/// under `bench/fts/supertable/quality` and fail loudly if a gate is
+/// missed.
+pub fn run(
+    report: &mut Report,
+    reader: &SupertableReader,
+    column: &str,
+    n_docs: usize,
+    text_seed: u64,
+    log_prefix: &str,
+) {
+    let (mut oracle, flavor, tokenizer) = build_oracle(n_docs, text_seed, log_prefix);
+
+    let t = Instant::now();
+    let layout = Layout::recover(reader, column, oracle.doc_lengths());
+    eprintln!(
+        "[{log_prefix}] quality: layout verified in {:.1}s: {} superfiles from {} commits, \
+         every stored doc length matches the oracle's",
+        t.elapsed().as_secs_f64(),
+        layout.n_superfiles(),
+        layout.n_commits()
+    );
+    let n_superfiles = layout.n_superfiles();
+    oracle.set_layout(layout);
+
+    let rows = grade(&oracle, reader, column, tokenizer.as_ref(), QUALITY_BATTERY);
+    emit(
+        report,
+        "bench/fts/supertable/quality",
+        format!(
+            "Supertable FTS — BM25 top-k parity vs textbook oracle ({} docs, {} corpus, {n_superfiles} superfiles)",
+            fmt_count(n_docs),
+            flavor.label()
+        ),
+        "each superfile's declared average, both read back from the table and verified against \
+         the oracle's own tokenization",
+        &rows,
+        true,
+    );
+    assert_gates(&rows, log_prefix);
+}
+
+/// The superfile tier's quality phase: one file holding every row of the
+/// configured corpus, built in corpus order. Verifies the file's stored
+/// document lengths and declared average against the oracle, grades the
+/// battery through the string search path, emits the section under
+/// `bench/fts/superfile/quality` and fails loudly if a gate is missed.
+/// With one file the declared average is the file's own, so Q is exact
+/// by construction; this is where a kernel change is graded first.
+pub fn run_superfile(
+    report: &mut Report,
+    reader: &SuperfileReader,
+    column: &str,
+    n_docs: usize,
+    text_seed: u64,
+    log_prefix: &str,
+) {
+    let (mut oracle, flavor, tokenizer) = build_oracle(n_docs, text_seed, log_prefix);
+
+    let fts = reader
+        .fts()
+        .expect("the graded superfile has a full-text index");
+    let stored = fts
+        .column_doc_lengths(column)
+        .unwrap_or_else(|e| panic!("read doc lengths of {column:?}: {e}"));
+    verify_doc_lengths(&stored, oracle.doc_lengths(), 0, "the superfile");
+    let declared = declared_avgdl(fts, column);
+    let own = ColumnLengthStats::from_lengths(stored.iter().copied());
+    let predicted = declared_under(&ColumnLengthStats::default(), &own);
+    assert!(
+        close_enough(declared, predicted),
+        "the superfile declares avgdl {declared} but its own lengths average to {predicted}"
+    );
+    eprintln!(
+        "[{log_prefix}] quality: superfile verified: {} stored doc lengths match the oracle's, \
+         declared avgdl {declared:.3}",
+        fmt_count(n_docs)
+    );
+    oracle.set_layout(Layout::single(n_docs, declared));
+
+    let rows = grade_superfile(&oracle, reader, column, tokenizer.as_ref(), QUALITY_BATTERY);
+    emit(
+        report,
+        "bench/fts/superfile/quality",
+        format!(
+            "Superfile FTS — BM25 top-k parity vs textbook oracle ({} docs, {} corpus)",
+            fmt_count(n_docs),
+            flavor.label()
+        ),
+        "the file's own declared average, both read back from the file and verified against the \
+         oracle's own tokenization",
+        &rows,
+        false,
+    );
+    assert_gates(&rows, log_prefix);
+}
+
+/// Emit one tier's quality section. `engine_avgdl` names the average
+/// length Q normalizes with on that tier, for the note; `per_superfile`
+/// adds the opt-in statistics scope's column.
 fn emit(
     report: &mut Report,
-    n_docs: usize,
-    flavor: TextFlavor,
-    tolerance: f64,
+    anchor: &str,
+    title: String,
+    engine_avgdl: &str,
     rows: &[GradedRow],
+    per_superfile: bool,
 ) {
+    let mut headers = vec![
+        "Query".to_string(),
+        "matches".to_string(),
+        "recall vs BM25".to_string(),
+    ];
+    if per_superfile {
+        headers.push("recall (per-superfile stats)".to_string());
+    }
+    headers.push("recall vs engine BM25".to_string());
+    headers.push("max score Δ".to_string());
     let blocks = QUALITY_KS
         .iter()
         .map(|&k| Block {
             subtitle: format!("k = {k}"),
-            headers: vec![
-                "Query".into(),
-                "matches".into(),
-                "recall vs BM25".into(),
-                "recall (per-superfile stats)".into(),
-                "recall vs engine BM25".into(),
-                "max score Δ".into(),
-            ],
+            headers: headers.clone(),
             rows: rows
                 .iter()
                 .filter(|r| r.k == k)
                 .map(|r| {
-                    vec![
+                    let mut cells = vec![
                         text(r.name),
                         text(fmt_count(r.n_matches)),
                         recall_cell(r.recall_textbook, false),
-                        recall_cell(r.recall_per_superfile_stats, false),
-                        recall_cell(r.recall_engine_model, true),
-                        metric(
-                            r.max_delta,
-                            format!("{:.2}%", r.max_delta * 100.0),
-                            Better::Lower,
-                        ),
-                    ]
+                    ];
+                    if let Some(per_superfile_stats) = r.recall_per_superfile_stats {
+                        cells.push(recall_cell(per_superfile_stats, false));
+                    }
+                    cells.push(recall_cell(r.recall_engine_model, true));
+                    cells.push(metric(
+                        r.max_delta,
+                        format!("{:.4}%", r.max_delta * 100.0),
+                        Better::Lower,
+                    ));
+                    cells
                 })
                 .collect(),
         })
         .collect();
+    let per_superfile_note = if per_superfile {
+        " `recall (per-superfile stats)` = the same under segment-local `PerSuperfile` idf (the \
+         pre-0.7 default)."
+    } else {
+        ""
+    };
     report.emit(&Section {
-        anchor: "bench/fts/supertable/quality".into(),
-        title: format!(
-            "Supertable FTS — BM25 top-k parity vs textbook oracle ({} docs, {} corpus)",
-            fmt_count(n_docs),
-            flavor.label()
-        ),
+        anchor: anchor.into(),
+        title,
         note: format!(
             "Engine top-k graded against a streaming BM25 oracle over the whole corpus, \
              tie-aware (a hit is any returned doc scoring at least the oracle's k-th score). \
-             `recall vs BM25` = `Bm25Stats::Global` against textbook BM25 with exact doc \
-             lengths — the user-facing quality, which pays for the one-byte length \
-             quantization and per-superfile avgdl. `recall (per-superfile stats)` = the same under \
-             segment-local `PerSuperfile` idf (the pre-0.7 default). `recall vs engine BM25` = `Global` against BM25 \
-             with the engine's stored (quantized) lengths, a hit allowed to fall short of the \
-             k-th score by the avgdl residual ({tol:.1}% at this scale: the oracle normalizes \
-             with the corpus-wide average length, the engine with each superfile's own) — \
-             gated at {floor}: below it the kernels disagree with their own formula. \
-             `max score Δ` = largest relative gap between an engine score and that reference \
-             for the same doc — gated at the same {tol:.1}%.",
-            tol = tolerance * 100.0,
-            floor = MIN_ENGINE_MODEL_RECALL
+             `recall vs BM25` = textbook BM25 with exact doc lengths and the corpus-wide average \
+             length — the user-facing quality, which pays for the one-byte length quantization \
+             and for each file normalizing with the average it declares.{per_superfile_note} \
+             `recall vs engine BM25` = BM25 with the engine's stored (quantized) lengths and \
+             {engine_avgdl} — gated at {floor:.1}: a miss is a document the kernels' own formula \
+             would not have returned. `max score Δ` = largest relative gap between an engine \
+             score and that reference for the same doc — gated at {ceiling:.2}%, f32 arithmetic \
+             noise.",
+            floor = MIN_ENGINE_MODEL_RECALL,
+            ceiling = MAX_SCORE_DELTA * 100.0
         ),
         blocks,
     });
@@ -928,7 +1342,14 @@ fn recall_cell(recall: f64, gate: bool) -> Cell {
 mod tests {
     use std::sync::Mutex;
 
-    use infino::test_helpers::brute_force_bm25::BruteForceBm25;
+    use infino::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        superfile::{builder::FtsConfig, fts::tokenize::Phrase},
+        supertable::{Supertable, SupertableOptions},
+        test_helpers::{brute_force_bm25::BruteForceBm25, build_title_batch, schema_id_title},
+    };
+    use rayon::ThreadPoolBuilder;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::corpus::for_each_generated_doc;
@@ -939,6 +1360,12 @@ mod tests {
     const TEST_DOCS: usize = 600;
     const TEST_K: usize = 10;
     const SCORE_TOLERANCE: f64 = 1e-4;
+    /// Commits the fragmented test table is ingested in.
+    const TEST_COMMITS: usize = 3;
+    /// Writer threads: with the byte split target disabled each commit
+    /// splits into this many shard superfiles, so the layout recovery sees
+    /// files of one commit that share their "committed before" totals.
+    const TEST_WRITER_THREADS: usize = 2;
 
     fn corpus_rows(flavor: TextFlavor) -> Vec<(u64, String)> {
         let rows = Mutex::new(Vec::with_capacity(TEST_DOCS));
@@ -977,8 +1404,8 @@ mod tests {
                 let owned = |v: &[Cow<'_, str>]| -> Vec<String> {
                     v.iter().map(|c| c.to_string()).collect()
                 };
-                let owned_phrases = |v: &[Vec<Cow<'_, str>>]| -> Vec<Vec<String>> {
-                    v.iter().map(|p| owned(p)).collect()
+                let owned_phrases = |v: &[Phrase<Cow<'_, str>>]| -> Vec<Phrase<String>> {
+                    v.iter().map(|p| p.map(|c| c.to_string())).collect()
                 };
                 let expected = reference.top_k_atoms(
                     &owned(&clauses.musts),
@@ -1022,9 +1449,9 @@ mod tests {
         }
     }
 
-    /// The engine-model reference differs from textbook only through the
-    /// stored length: identical for short docs, lower length (higher score)
-    /// for long ones.
+    /// With a single-span layout at the corpus average, the engine-model
+    /// reference differs from textbook only through the stored length:
+    /// identical for short docs, lower length (higher score) for long ones.
     #[test]
     fn engine_model_uses_stored_length() {
         let tokenizer = default_tokenizer();
@@ -1056,6 +1483,136 @@ mod tests {
             saw_exact && saw_quantized,
             "realistic corpus spans both length regions"
         );
+    }
+
+    /// Ingest the realistic test corpus into a table in several commits
+    /// with a multi-thread writer, so the manifest holds several
+    /// superfiles per commit, each declaring the running table-wide
+    /// average as of its commit.
+    fn fragmented_table() -> (TempDir, Supertable) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(TEST_WRITER_THREADS)
+                .build()
+                .expect("writer pool"),
+        );
+        let options = SupertableOptions::new(
+            schema_id_title(),
+            vec![FtsConfig::new("title").positions(true)],
+            vec![],
+        )
+        .expect("options")
+        .with_writer_pool(pool)
+        // Shard every commit across the whole pool regardless of its
+        // size; the default byte target would keep a 200-row commit whole.
+        .with_superfile_buffer_split_mb(0)
+        .with_storage(storage);
+        let st = Supertable::create(options).expect("create");
+        let rows = corpus_rows(TextFlavor::Realistic);
+        let chunk = TEST_DOCS.div_ceil(TEST_COMMITS);
+        let mut w = st.writer().expect("writer");
+        for commit in rows.chunks(chunk) {
+            let titles: Vec<&str> = commit.iter().map(|(_, t)| t.as_str()).collect();
+            w.append(&build_title_batch(&titles)).expect("append");
+            w.commit().expect("commit");
+        }
+        drop(w);
+        (dir, st)
+    }
+
+    /// The layout recovery assigns every row to the superfile that holds
+    /// it (verified against the stored lengths), derives the commit
+    /// grouping from the declared averages, and with that layout Q is
+    /// exact: every battery shape reaches full recall against it and the
+    /// engine's scores match it to f32 noise. The corpus-wide average
+    /// would not: on a three-commit table the first commit's files score
+    /// at a third of the corpus, and the gap shows in the score deltas.
+    #[test]
+    fn recovered_layout_makes_the_engine_model_exact() {
+        let tokenizer = default_tokenizer();
+        let (_dir, st) = fragmented_table();
+        let reader = st.reader().expect("reader");
+        let mut oracle = Oracle::build(
+            TEST_DOCS,
+            TEST_SEED,
+            TextFlavor::Realistic,
+            tokenizer.as_ref(),
+            QUALITY_BATTERY,
+        );
+
+        // The corpus-wide average is measurably wrong for this table.
+        let single = grade(
+            &oracle,
+            &reader,
+            "title",
+            tokenizer.as_ref(),
+            QUALITY_BATTERY,
+        );
+        let worst_single = single.iter().map(|r| r.max_delta).fold(0.0, f64::max);
+        assert!(
+            worst_single > MAX_SCORE_DELTA,
+            "a fragmented table must expose the corpus-wide average as inexact (worst Δ {worst_single})"
+        );
+
+        let layout = Layout::recover(&reader, "title", oracle.doc_lengths());
+        assert_eq!(layout.n_commits(), TEST_COMMITS);
+        assert!(
+            layout.n_superfiles() > TEST_COMMITS,
+            "the multi-thread writer splits a commit into several superfiles"
+        );
+        let covered: u64 = layout.spans.iter().map(|s| u64::from(s.n_docs)).sum();
+        assert_eq!(covered, TEST_DOCS as u64);
+        oracle.set_layout(layout);
+
+        let rows = grade(
+            &oracle,
+            &reader,
+            "title",
+            tokenizer.as_ref(),
+            QUALITY_BATTERY,
+        );
+        let failures: Vec<String> = rows
+            .iter()
+            .filter(|r| !r.passes())
+            .map(GradedRow::failure)
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert!(
+            rows.iter().any(|r| r.n_matches > 0),
+            "the battery matched nothing on the test table"
+        );
+    }
+
+    #[test]
+    fn layout_lookup_maps_rows_to_their_span() {
+        let layout = Layout {
+            spans: vec![
+                SuperfileSpan {
+                    first_row: 0,
+                    n_docs: 3,
+                    avgdl: 10.0,
+                },
+                SuperfileSpan {
+                    first_row: 3,
+                    n_docs: 2,
+                    avgdl: 20.0,
+                },
+                SuperfileSpan {
+                    first_row: 5,
+                    n_docs: 1,
+                    avgdl: 30.0,
+                },
+            ],
+            n_commits: 2,
+        };
+        assert_eq!(layout.avgdl_of(0), 10.0);
+        assert_eq!(layout.avgdl_of(2), 10.0);
+        assert_eq!(layout.avgdl_of(3), 20.0);
+        assert_eq!(layout.avgdl_of(4), 20.0);
+        assert_eq!(layout.avgdl_of(5), 30.0);
     }
 
     #[test]
