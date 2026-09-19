@@ -1042,6 +1042,13 @@ impl FtsReader {
                 screen_ub = others_ub;
                 screen_end = window_end;
             }
+            // The screen can only ever reject when the bar sits above what the
+            // other terms alone could contribute; below that every leader doc
+            // clears it and the test is pure cost. A must+should walk lowers
+            // its own bar by the shoulds' ceiling, so that is exactly where it
+            // never bites — and where paying a lookup and a divide per leader
+            // doc showed up as a few percent.
+            let screen_on = sink.needs_score() && bar - screen_ub > 0.0;
 
             // Align every non-leader cursor to >= leader's current doc.
             // Largest landing-doc becomes the new alignment target if
@@ -1098,7 +1105,7 @@ impl FtsReader {
                 // the position store-back that the profile puts at a sixth of
                 // this kernel. The leader's tf is already decoded, so the screen
                 // is one table lookup and one divide.
-                if a <= screen_end && sink.needs_score() {
+                if screen_on && a <= screen_end {
                     let norm = dl_norm_k1.get(a);
                     let s = bm25::score_with_dl_norm_k1(c0.idf_weight, lt[i], norm);
                     if s + screen_ub <= bar {
