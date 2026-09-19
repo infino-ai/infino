@@ -28,4 +28,5 @@ Supertable::vector_search	covered	(&self, &str, &[f32], usize, Option<VectorFilt
 connect	covered	(impl AsRef<str>) -> Result<Connection, InfinoError>
 connect_with	covered	(impl AsRef<str>, ConnectOptions) -> Result<Connection, InfinoError>
 
-Connection::update_storage_credentials	exempt	Rotates an object-store credential in place; Rust-embedder API, not part of the language-binding operation surface.
+Connection::update_storage_credentials	exempt	Rotates an object-store credential in place; Rust-embedder API, not part of the language-binding operation surface
+Supertable::tokenize	exempt	How the index reads a text; Rust-embedder API for a caller judging its own texts against a column's terms, not a data operation the bindings wrap.

@@ -2245,6 +2245,32 @@ impl Supertable {
             .map_err(InfinoError::from)
             .map_err(|e| e.with_context("count", None))
     }
+
+    /// `text` as the full-text index on `column` tokenizes it: the terms the
+    /// column's text was indexed under and a query over it is parsed into —
+    /// the column's analyzer with its stopword and stemmer filters — in
+    /// order, repeats kept. Two texts that share a token here are texts a
+    /// token match on `column` finds together, so a caller judging one text
+    /// against another — a question against the rows a query returned —
+    /// asks this instead of comparing spellings; its own copy of the rule
+    /// drifts from the index the moment a column is declared with another
+    /// analyzer. `column` must carry a full-text index: without one there is
+    /// no analyzer to tokenize with, and the error names the columns that
+    /// have one.
+    pub fn tokenize(&self, column: &str, text: &str) -> Result<Vec<String>, InfinoError> {
+        let reader = self.reader()?;
+        let options = reader.options();
+        let Some(tokenizer) = options.try_fts_tokenizer_for(column) else {
+            return Err(
+                InfinoError::from(QueryError::InvalidQuery(no_fts_index_message(
+                    column,
+                    &options.fts_columns,
+                )))
+                .with_context("tokenize", None),
+            );
+        };
+        Ok(tokenizer.tokenize(text).collect())
+    }
 }
 
 #[cfg(test)]

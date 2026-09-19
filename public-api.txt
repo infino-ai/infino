@@ -478,6 +478,7 @@ pub fn infino::Supertable::hybrid_search(&self, &str, &str, infino::BoolMode, &s
 pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
 pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::tokenize(&self, &str, &str) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
 pub fn infino::Supertable::update(&self, datafusion_expr::expr::Expr, &arrow_array::record_batch::RecordBatch) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, core::option::Option<infino::VectorFilter<'_>>, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl core::clone::Clone for infino::Supertable
