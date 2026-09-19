@@ -35,7 +35,7 @@
 
 use std::{
     collections::HashMap,
-    env, fmt,
+    env, fmt, fs, io,
     path::{Path, PathBuf},
     sync::OnceLock,
     time::Duration,
@@ -186,6 +186,25 @@ pub fn global() -> &'static Config {
             Config::default()
         }
     })
+}
+
+/// Resolve the root used for temporary scratch space.
+///
+/// This function only resolves the path;
+/// callers that need to create files should use [`ensure_scratch_root`].
+pub(crate) fn scratch_root() -> PathBuf {
+    global()
+        .storage
+        .scratch_root
+        .clone()
+        .unwrap_or_else(env::temp_dir)
+}
+
+/// Create and return the configured runtime scratch root.
+pub(crate) fn ensure_scratch_root() -> io::Result<PathBuf> {
+    let root = scratch_root();
+    fs::create_dir_all(&root)?;
+    Ok(root)
 }
 
 /// Supertable subsection of [`Config`]. Keeps supertable-
@@ -1029,6 +1048,8 @@ pub struct StorageSettings {
     pub backend: StorageBackend,
     /// Local filesystem root when `backend: local_fs`.
     pub local_root: Option<PathBuf>,
+    /// Configurable root directory for temporary scratch files.
+    pub scratch_root: Option<PathBuf>,
     /// Object-store bucket name (used by the `s3` backend).
     pub bucket: Option<String>,
     /// Credentials/tuning for the backend, keyed by `object_store`
@@ -1074,6 +1095,7 @@ impl Default for StorageSettings {
         Self {
             backend: StorageBackend::None,
             local_root: None,
+            scratch_root: Some(PathBuf::from(DEFAULT_SCRATCH_DIR_ROOT)),
             bucket: None,
             storage_options: HashMap::new(),
             prefix: String::new(),
@@ -1089,7 +1111,8 @@ impl Default for StorageSettings {
         }
     }
 }
-
+/// Default tmp dir to be used
+const DEFAULT_SCRATCH_DIR_ROOT: &str = "/opt/private/tmp";
 /// Default disk-cache byte budget exposed in the shipped config (10 GiB).
 const DEFAULT_DISK_BUDGET_BYTES: u64 = 10 * (1 << 30);
 /// Default manifest-part cache byte budget (2 GiB). Parts are small
@@ -1661,6 +1684,30 @@ supertable:
         assert_eq!(cfg.storage.backend, StorageBackend::None);
         assert_eq!(cfg.storage.bucket, None);
         assert_eq!(cfg.storage.disk_cache_root, None);
+        assert_eq!(
+            cfg.storage.scratch_root.as_deref(),
+            Some(Path::new("/opt/private/tmp"))
+        );
+    }
+
+    #[test]
+    fn storage_scratch_root_parses_yaml() {
+        let yaml = r#"
+storage:
+  scratch_root: /opt/private/tmp
+"#;
+
+        let cfg = Config::from_figment(
+            Figment::new()
+                .merge(Yaml::string(EMBEDDED_DEFAULT))
+                .merge(Yaml::string(yaml)),
+        )
+        .expect("parse config");
+
+        assert_eq!(
+            cfg.storage.scratch_root.as_deref(),
+            Some(Path::new("/opt/private/tmp"))
+        );
     }
 
     #[test]
@@ -1686,6 +1733,7 @@ storage:
             cfg.storage.disk_cache_root.as_deref(),
             Some(Path::new("/tmp/infino-cache"))
         );
+
         assert_eq!(
             cfg.storage.cold_fetch_mode,
             StorageColdFetchMode::LazyForegroundWithBackgroundFill

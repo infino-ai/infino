@@ -2287,12 +2287,16 @@ fn stream_index_blobs_to_scratch(
     cell_posting_builder: Option<CellPostingBuilder>,
     prebuilt_multi_cell: Option<Vec<(u32, MergedIvfSubsection)>>,
 ) -> Result<(NamedTempFile, NamedTempFile), BuildError> {
-    let fts_file = NamedTempFile::new().map_err(BuildError::Io)?;
-    let vec_file = NamedTempFile::new().map_err(BuildError::Io)?;
+    let scratch_root = crate::config::ensure_scratch_root()?;
+
+    let fts_file = NamedTempFile::new_in(&scratch_root)?;
+    let vec_file = NamedTempFile::new_in(&scratch_root)?;
+
     let fts_write = fts_file.reopen().map_err(BuildError::Io)?;
     let vec_write = vec_file.reopen().map_err(BuildError::Io)?;
     let mut fw = BufWriter::new(fts_write);
     let mut vw = BufWriter::new(vec_write);
+
     finish_index_blobs_streamed(
         fts_builder,
         vec_builder,
@@ -2301,8 +2305,10 @@ fn stream_index_blobs_to_scratch(
         &mut fw,
         &mut vw,
     )?;
+
     fw.flush().map_err(BuildError::Io)?;
     vw.flush().map_err(BuildError::Io)?;
+
     Ok((fts_file, vec_file))
 }
 

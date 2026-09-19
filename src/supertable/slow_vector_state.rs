@@ -87,6 +87,8 @@ pub(crate) enum SlowVectorStateError {
     HashMismatch,
     #[error("state parse: {0}")]
     Parse(String),
+    #[error("IO error")]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -434,7 +436,9 @@ pub(crate) async fn fetch_centroid_section(
             meta.size
         )));
     }
-    let spill = NamedTempFile::new().map_err(io_err)?;
+
+    let scratch_root = crate::config::ensure_scratch_root()?;
+    let spill = NamedTempFile::new_in(&scratch_root)?;
     let mut hasher = blake3::Hasher::new();
     // Same striping policy as [`fetch_blob_striped`]: parallel range-GETs,
     // bounded in flight. `buffered` yields chunks in range order, so each

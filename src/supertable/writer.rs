@@ -52,7 +52,7 @@ use std::sync::Mutex as StdMutex;
 use std::{
     cmp,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
-    env, fmt, fs,
+    fmt, fs,
     fs::File,
     io::{self, BufReader, BufWriter, Read, Write},
     marker::PhantomData,
@@ -2522,6 +2522,8 @@ fn build_one_shard_with_layout(
     let scalar_batches: Vec<&RecordBatch> = slice.iter().map(|b| &b.scalar).collect();
     let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &scalar_batches);
 
+    let scratch_root = crate::config::ensure_scratch_root()?;
+
     // Stream the assembled superfile to a temp file, then mmap it back as
     // zero-copy `Bytes`, rather than materializing the whole superfile as an
     // anon `Vec<u8>` (which, on a corpus-sized single-shard build, is the
@@ -2529,7 +2531,7 @@ fn build_one_shard_with_layout(
     // pages are file-backed and reclaimable; the downstream publish path takes
     // `Bytes` unchanged and streams large superfiles via `put_multipart`. Same
     // temp-file → mmap idiom the drain packed-shard path uses.
-    let mut output = NamedTempFile::new()
+    let mut output = NamedTempFile::new_in(&scratch_root)
         .map_err(|error| BuildError::Store(format!("shard temp create: {error}")))?;
     {
         let mut writer = BufWriter::new(output.as_file_mut());
@@ -3614,7 +3616,9 @@ fn drain_epoch_id(
 }
 
 fn drain_scratch_dir(epoch_id: &str) -> PathBuf {
-    env::temp_dir().join("infino-drain").join(epoch_id)
+    crate::config::scratch_root()
+        .join("infino-drain")
+        .join(epoch_id)
 }
 
 fn drain_local_checkpoint_path(scratch: &Path) -> PathBuf {
@@ -5982,11 +5986,14 @@ fn build_one_shard_from_packed_cells(
     let id_max = stable_ids.iter().copied().max().unwrap_or(0);
     let n_docs = stable_ids.len() as u64;
     let scalar_stats = ScalarStatsAgg::from_batches(&options.scalar_schema(), &[&scalar]);
+
+    let scratch_root = crate::config::ensure_scratch_root()?;
+
     // Stream the compacted superfile to a temp file, then mmap it back as
     // zero-copy `Bytes` (same idiom as the append-commit build path) instead of
     // materializing the merged superfile as an anon `Vec<u8>` — the merge
     // output is corpus-sized and OOMs a memory-tight host during compaction.
-    let mut output = NamedTempFile::new()
+    let mut output = NamedTempFile::new_in(&scratch_root)
         .map_err(|error| BuildError::Store(format!("compacted shard temp create: {error}")))?;
     {
         let mut writer = BufWriter::new(output.as_file_mut());
@@ -6530,11 +6537,13 @@ fn build_one_packed_shard_via_drain(
         .map(|g| (g.cell_id, g.subsection))
         .collect();
     builder.set_prebuilt_multi_cell_ivfs(subsections)?;
+
+    let scratch_root = crate::config::ensure_scratch_root()?;
     // Stream the compacted superfile to a temp file, then mmap it back as
     // zero-copy `Bytes` (same idiom as the append-commit build path) instead of
     // materializing the merged superfile as an anon `Vec<u8>` — the merge
     // output is corpus-sized and OOMs a memory-tight host during compaction.
-    let mut output = NamedTempFile::new()
+    let mut output = NamedTempFile::new_in(&scratch_root)
         .map_err(|error| BuildError::Store(format!("compacted shard temp create: {error}")))?;
     {
         let mut writer = BufWriter::new(output.as_file_mut());
@@ -6889,7 +6898,7 @@ fn pending_metadata_schema(metadata: &[u8]) -> Option<u32> {
 /// controls placement). Removed on success; an aborted pass leaves
 /// local-disk garbage only.
 fn repack_scratch_dir() -> PathBuf {
-    env::temp_dir()
+    crate::config::scratch_root()
         .join("infino-repack")
         .join(Uuid::new_v4().to_string())
 }
