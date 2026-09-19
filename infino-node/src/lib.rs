@@ -48,8 +48,8 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
-    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions, Stemmer,
-    Stopwords,
+    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
+    RecalibratePolicy, Stemmer, Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -488,6 +488,11 @@ pub struct OptimizeOptions {
     /// How old a sealed tombstone sidecar has to be, in milliseconds,
     /// before compaction treats its owner as dead and takes over.
     pub stale_seal_timeout_ms: Option<u32>,
+    /// When to recalibrate the vector probe laws (the O(N) query-serving
+    /// calibration): `"auto"` (default — only when membership changed or the
+    /// rerank pool lags), `"force"` (always), or `"skip"` (never; storage
+    /// compaction still runs). Omit for `"auto"`.
+    pub recalibrate: Option<String>,
 }
 
 /// Row counts from an `update` / `delete`.
@@ -1071,6 +1076,7 @@ impl Table {
     #[napi]
     pub fn optimize(&self, settings: Option<OptimizeOptions>) -> Result<()> {
         let mut s = CompactionSettings::default();
+        let mut recalibrate = RecalibratePolicy::default();
         if let Some(o) = settings {
             if let Some(v) = o.max_memory_mb {
                 s.max_memory_mb = v as u64;
@@ -1084,8 +1090,20 @@ impl Table {
             if let Some(v) = o.stale_seal_timeout_ms {
                 s.stale_seal_timeout_ms = v as u64;
             }
+            if let Some(v) = o.recalibrate.as_deref() {
+                recalibrate = match v.to_ascii_lowercase().as_str() {
+                    "auto" => RecalibratePolicy::Auto,
+                    "force" => RecalibratePolicy::Force,
+                    "skip" => RecalibratePolicy::Skip,
+                    _ => {
+                        return Err(Error::from_reason(format!(
+                            "invalid recalibrate policy {v:?}: expected \"auto\", \"force\", or \"skip\""
+                        )));
+                    }
+                };
+            }
         }
-        let opts = InfinoOptimizeOptions::compact(s);
+        let opts = InfinoOptimizeOptions::compact(s).with_recalibrate(recalibrate);
         self.inner.optimize(&opts).map_err(optimize_err)
     }
 
