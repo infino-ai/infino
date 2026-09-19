@@ -8519,6 +8519,17 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // the maintenance pool (`vector.maintenance_threads`), and transient
     // memory stays bounded at one chunk of materialized cells.
     let chunk_cells = pool.current_num_threads().max(1);
+    // Two-pass 1-bit-gated sweep. Pass 1 shortlists survivors by the cheap
+    // 1-bit estimate over every live cell — keeping, per query, the top-CAP
+    // candidates (CAP well above the deepest law k) plus the rerank
+    // histogram. Pass 2 exact-rescores only those survivors, then observes
+    // fine ranks. This replaces an exhaustive fp32 score of every row: the
+    // estimate does the culling, the exact scorer runs only on the shortlist,
+    // and the laws still come from the same `cal.finish` (proven identical to
+    // the exhaustive score by the parity test).
+    //
+    // Pass 1: cheap 1-bit estimate over every live cell -> per-query top-CAP
+    // shortlist (also feeds the rerank histogram).
     for (entry, cells) in &work {
         for chunk in cells.chunks(chunk_cells) {
             let mut loaded: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::with_capacity(chunk.len());
@@ -8534,29 +8545,62 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 loaded.push((cell, rows));
             }
             let chunk_cal = Arc::clone(&cal);
-            run_on_pool(Some(pool), "recalibration score", move || {
-                let result = loaded
+            run_on_pool(Some(pool), "recalibration shortlist", move || {
+                loaded
                     .par_iter()
-                    .try_for_each(|(cell, rows)| chunk_cal.score_rows(*cell, rows));
-                // Release the shared handle BEFORE returning — the oneshot
-                // send follows the return, and the awaiting side unwraps
-                // the Arc after the final recv (a send-then-drop order
-                // raced it: the \"state still shared\" failure under test
-                // parallelism).
+                    .for_each(|(cell, rows)| chunk_cal.shortlist_rows(*cell, rows));
                 drop(chunk_cal);
-                result
             })
             .await
-            .map_err(|e| BuildError::Store(format!("recalibration score: {e}")))??;
+            .map_err(|e| BuildError::Store(format!("recalibration shortlist: {e}")))?;
         }
-        // The fine observation reads subsection/stable-id bytes
-        // SYNCHRONOUSLY (`cell_fine_calibration_views` resolves through
-        // `try_get_range_sync`), and the lazy query opener only exposes
-        // sync bytes after a BACKGROUND mmap promotion — a fresh
-        // post-compaction output racing that promotion would silently
-        // skip its depth observation and keep the previous law, the
-        // staleness this pass exists to fix. Open the way compaction
-        // opens its own inputs: resident bytes guaranteed.
+    }
+    // Pass 2: exact-rescore only the survivors, then observe fine ranks
+    // (which read the now-populated `tops`).
+    let survivors = Arc::new(cal.survivors_by_cell());
+    for (entry, cells) in &work {
+        for chunk in cells.chunks(chunk_cells) {
+            let mut loaded: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::with_capacity(chunk.len());
+            for &(cell, _) in chunk {
+                // A cell with no survivor contributes nothing to any query's
+                // top-k — skip its reload entirely.
+                if !survivors.contains_key(&cell) {
+                    continue;
+                }
+                let rows = load_materialized_rows_from_ivf_superfile(
+                    inner,
+                    entry,
+                    &column,
+                    now,
+                    Some(&[cell]),
+                )
+                .await?;
+                loaded.push((cell, rows));
+            }
+            if !loaded.is_empty() {
+                let chunk_cal = Arc::clone(&cal);
+                let chunk_survivors = Arc::clone(&survivors);
+                run_on_pool(Some(pool), "recalibration rescore", move || {
+                    loaded.par_iter().for_each(|(cell, rows)| {
+                        if let Some(s) = chunk_survivors.get(cell) {
+                            chunk_cal.score_survivors(*cell, rows, s);
+                        }
+                    });
+                    drop(chunk_cal);
+                })
+                .await
+                .map_err(|e| BuildError::Store(format!("recalibration rescore: {e}")))?;
+            }
+        }
+        // Depth observation runs once per entry, after all its chunks have
+        // rescored (so `tops` is fully populated for this entry's cells). The
+        // fine observation reads subsection/stable-id bytes SYNCHRONOUSLY
+        // (`cell_fine_calibration_views` resolves through `try_get_range_sync`),
+        // and the lazy query opener only exposes sync bytes after a BACKGROUND
+        // mmap promotion — a fresh post-compaction output racing that promotion
+        // would silently skip its depth observation and keep the previous law,
+        // the staleness this pass exists to fix. Open the way compaction opens
+        // its own inputs: resident bytes guaranteed.
         let reader = open_compaction_input(
             &inner.options.store,
             inner.options.disk_cache.as_ref(),
