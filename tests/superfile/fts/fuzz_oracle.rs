@@ -80,13 +80,13 @@ const MAX_DOC_LEN_HARD: usize = 15;
 const PINNED_KS: [usize; 3] = [1, 128, 129];
 
 /// Tier weights of the tiered vocabulary, per token draw. Relative to
-/// each other they set the document frequency each drawn tier lands at:
-/// at the default corpus size the first is in nearly every document, the
-/// second in most, the third in about a third, and the fourth in a few.
+/// each other they set the document frequency each *drawn* tier lands
+/// at: at the default corpus size the first is in most documents, the
+/// second in about a third, and the third in a few.
 ///
 /// Every drawn tier dense enough to fill a block is also dense enough
 /// for its block to store presence bits more cheaply than deltas, so the
-/// first three are all **bitset** and only the fourth is short-form. A
+/// denser ones are all **bitset** and only the sparsest is short-form. A
 /// weight cannot separate them: lowering one until its deltas pack
 /// narrower than a bitset drops its document frequency below the
 /// short-form cap on the way. Random placement is the reason — the
@@ -94,11 +94,18 @@ const PINNED_KS: [usize; 3] = [1, 128, 129];
 /// these densities that gap is wide. The delta-coded formats therefore
 /// come from planted strides instead ([`TIER_PACKED`],
 /// [`TIER_PATCHED`]), whose gaps are regular by construction.
-const TIER_WEIGHT_DENSE: u32 = 40;
 const TIER_WEIGHT_MULTI_BLOCK: u32 = 12;
 const TIER_WEIGHT_ONE_BLOCK: u32 = 4;
 const TIER_WEIGHT_SHORT: u32 = 1;
 /// Vocabulary index of each tier's token.
+///
+/// Planted in **every** document rather than drawn, so its posting count
+/// is exactly the corpus size. Drawing it left the count a few percent
+/// short of the documents — enough that in the large tier its list came
+/// out just under the single-term walk's seed floor and the tier missed
+/// the path it exists to reach. A planted term makes the block count
+/// arithmetic, so [`LARGE_TIER_MIN_DOCS`] can be sized against the floor
+/// instead of hoping a draw clears it.
 const TIER_DENSE: usize = 0;
 const TIER_MULTI_BLOCK: usize = 1;
 const TIER_ONE_BLOCK: usize = 2;
@@ -132,9 +139,11 @@ const TIER_PATCHED_OUTLIER_EVERY: usize = 24;
 const TIER_PATCHED_JUMP: usize = 200;
 
 /// Tokens [`tiered_corpus_strategy`] plants into a document on top of
-/// its drawn ones. Drawn lengths leave room for these, so planting never
-/// evicts a token another tier just planted.
-const PLANTED_TOKENS_PER_DOC: usize = 3;
+/// its drawn ones — the dense tier in every document, and at most the
+/// singleton, the packed and the patched tiers on top. Drawn lengths
+/// leave room for these, so planting never evicts a token another tier
+/// just planted.
+const PLANTED_TOKENS_PER_DOC: usize = 4;
 
 /// Smallest corpus the tiered lane draws. [`TIER_PACKED`] is long form
 /// only once its stride has laid down more than the short-form cap of
@@ -147,11 +156,26 @@ const TIERED_MIN_DOCS: usize = TIER_PACKED_STRIDE * (BLOCK_POSTINGS + 1);
 /// note above reads on its own.
 const BLOCK_POSTINGS: usize = 128;
 
-/// Smallest corpus of the large tiered tier: past the single-term
-/// walk's seed floor of 256 blocks (32 768 postings), so the dense
-/// tier's list is seeded from its coarse table and skipped span by
-/// span, which no default-size case reaches.
-const LARGE_TIER_MIN_DOCS: usize = 33_000;
+/// Postings the single-term ranked walk wants before it seeds its
+/// threshold from the coarse block-max table: 256 blocks' worth. Stated
+/// here rather than imported so that moving the walk's floor fails this
+/// lane loudly instead of silently un-covering the seeded path.
+const SEED_FLOOR_POSTINGS: usize = 256 * BLOCK_POSTINGS;
+
+/// Blocks of headroom the large tier keeps over the seed floor. The
+/// count is exact now that the dense tier is planted, so one block would
+/// technically do; several keeps the lane covering the seeded path
+/// through a modest change to the floor or to how a partial block is
+/// counted, instead of falling off it silently again.
+const SEED_FLOOR_HEADROOM_BLOCKS: usize = 8;
+
+/// Smallest corpus of the large tiered tier. [`TIER_DENSE`] is planted
+/// in every document, so its posting count is the corpus size: this
+/// clears [`SEED_FLOOR_POSTINGS`] by [`SEED_FLOOR_HEADROOM_BLOCKS`]
+/// rather than landing near it, and the walk seeds from the coarse table
+/// and skips span by span, which no default-size case reaches.
+const LARGE_TIER_MIN_DOCS: usize =
+    SEED_FLOOR_POSTINGS + SEED_FLOOR_HEADROOM_BLOCKS * BLOCK_POSTINGS;
 /// Documents the large tier may add past its minimum.
 const LARGE_TIER_DOC_SPREAD: usize = 256;
 /// Default cases of the large tier (`INFINO_FTS_FUZZ_LARGE_CASES`
@@ -226,18 +250,18 @@ fn skewed_corpus_strategy() -> impl Strategy<Value = Vec<Vec<usize>>> {
     prop::collection::vec(doc, 1..=max_docs())
 }
 
-/// A corpus whose vocabulary spans every posting form at once. Four
-/// terms are drawn per token, weighted by [`TIER_WEIGHT_DENSE`] down to
-/// [`TIER_WEIGHT_SHORT`]; three more are planted after generation — the
-/// singleton in the first document, and the two strided tiers across the
-/// corpus. The remaining vocabulary never appears, so a query naming it
-/// hits the absent-term paths.
+/// A corpus whose vocabulary spans every posting form at once. Three
+/// terms are drawn per token, weighted by [`TIER_WEIGHT_MULTI_BLOCK`]
+/// down to [`TIER_WEIGHT_SHORT`]; four more are planted after generation
+/// — the dense tier in every document, the singleton in the first, and
+/// the two strided tiers across the corpus. The remaining vocabulary
+/// never appears, so a query naming it hits the absent-term paths.
 ///
 /// What each form comes from, at the default corpus size:
 ///
 /// | form | term | how |
 /// |---|---|---|
-/// | bitset, several blocks | the three denser drawn tiers | drawn densely enough that presence bits cost no more than deltas |
+/// | bitset, several blocks | [`TIER_DENSE`], and the denser drawn tiers | dense enough that presence bits cost no more than deltas |
 /// | short (one bodiless block) | the sparsest drawn tier, and [`TIER_PATCHED`] | under the 128-posting cap |
 /// | packed, two blocks | [`TIER_PACKED`] | planted at a uniform stride, so its deltas pack narrower than the span's presence words |
 /// | inline df=1 | [`TIER_SINGLETON`] | planted in one document |
@@ -263,7 +287,6 @@ fn tiered_corpus_strategy(
     n_docs: impl Strategy<Value = usize>,
 ) -> impl Strategy<Value = Vec<Vec<usize>>> {
     let token = prop_oneof![
-        TIER_WEIGHT_DENSE => Just(TIER_DENSE),
         TIER_WEIGHT_MULTI_BLOCK => Just(TIER_MULTI_BLOCK),
         TIER_WEIGHT_ONE_BLOCK => Just(TIER_ONE_BLOCK),
         TIER_WEIGHT_SHORT => Just(TIER_SHORT),
@@ -280,6 +303,9 @@ fn tiered_corpus_strategy(
             // drawing is what makes their gaps uniform, and uniform gaps
             // are what the delta-coded formats need — see the tier
             // weights' note.
+            for doc in docs.iter_mut() {
+                doc.push(TIER_DENSE);
+            }
             if let Some(first) = docs.first_mut() {
                 first.push(TIER_SINGLETON);
             }
@@ -694,5 +720,48 @@ async fn the_jumped_tier_is_patched_once_its_blocks_span_far_enough() {
     assert!(
         layout.patched_blocks > 0,
         "the jumped tier should patch its outlier lanes at this size, got {layout:?}"
+    );
+}
+
+/// The large tier's dense list crosses the single-term walk's seed
+/// floor, which is the path that tier exists to reach.
+///
+/// It did not before: the dense term was drawn rather than planted, so
+/// it missed a few percent of documents and its list came out at ~248
+/// blocks against a floor of 256 — close enough to read as covered and
+/// never actually seeded. Planting makes the count arithmetic, and this
+/// asserts the arithmetic against the built index.
+#[tokio::test]
+#[ignore = "large corpus; run explicitly"]
+async fn the_dense_tier_crosses_the_walks_seed_floor() {
+    let docs: Vec<Vec<usize>> = (0..LARGE_TIER_MIN_DOCS).map(|_| vec![TIER_DENSE]).collect();
+    let owned: Vec<(u64, String)> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, tokens)| {
+            let text = tokens
+                .iter()
+                .map(|&t| VOCAB[t])
+                .collect::<Vec<_>>()
+                .join(" ");
+            (i as u64, text)
+        })
+        .collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, t)| (*i, t.as_str())).collect();
+    let reader = build_infino_superfile_positional(&refs);
+    let layout = reader
+        .fts()
+        .expect("full-text index")
+        .term_layout("title", VOCAB[TIER_DENSE])
+        .await
+        .expect("term layout")
+        .expect("the dense tier is present");
+    let floor_blocks = SEED_FLOOR_POSTINGS / BLOCK_POSTINGS;
+    assert!(
+        layout.num_blocks > floor_blocks,
+        "the dense tier should span more than the walk's {floor_blocks}-block seed floor, \
+         got {} blocks ({:?})",
+        layout.num_blocks,
+        layout
     );
 }
