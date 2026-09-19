@@ -80,12 +80,20 @@ const MAX_DOC_LEN_HARD: usize = 15;
 const PINNED_KS: [usize; 3] = [1, 128, 129];
 
 /// Tier weights of the tiered vocabulary, per token draw. Relative to
-/// each other they set the document frequency each tier lands at; at
-/// the default corpus size the first tier is in nearly every document
-/// (bitset blocks), the second in most (several packed blocks), the
-/// third in about a third (one long-form block past the short-form
-/// cap), the fourth in a few (a short-form list), and the fifth token
-/// is planted in one document only (the inline df=1 form).
+/// each other they set the document frequency each drawn tier lands at:
+/// at the default corpus size the first is in nearly every document, the
+/// second in most, the third in about a third, and the fourth in a few.
+///
+/// Every drawn tier dense enough to fill a block is also dense enough
+/// for its block to store presence bits more cheaply than deltas, so the
+/// first three are all **bitset** and only the fourth is short-form. A
+/// weight cannot separate them: lowering one until its deltas pack
+/// narrower than a bitset drops its document frequency below the
+/// short-form cap on the way. Random placement is the reason — the
+/// widest gap in a block sets the delta width for all 128 lanes, and at
+/// these densities that gap is wide. The delta-coded formats therefore
+/// come from planted strides instead ([`TIER_PACKED`],
+/// [`TIER_PATCHED`]), whose gaps are regular by construction.
 const TIER_WEIGHT_DENSE: u32 = 40;
 const TIER_WEIGHT_MULTI_BLOCK: u32 = 12;
 const TIER_WEIGHT_ONE_BLOCK: u32 = 4;
@@ -96,6 +104,48 @@ const TIER_MULTI_BLOCK: usize = 1;
 const TIER_ONE_BLOCK: usize = 2;
 const TIER_SHORT: usize = 3;
 const TIER_SINGLETON: usize = 4;
+/// Planted at a regular [`TIER_PACKED_STRIDE`], so every delta is the
+/// same small number and the block packs them narrower than a presence
+/// bitset over the same span: the **packed** form.
+const TIER_PACKED: usize = 5;
+/// Planted at [`TIER_PATCHED_STRIDE`] with a wider jump every
+/// [`TIER_PATCHED_OUTLIER_EVERY`] postings, so a few lanes per block
+/// need more bits than the rest: the **patched** form, which packs the
+/// narrow majority and lists the outliers as exceptions.
+const TIER_PATCHED: usize = 6;
+
+/// Stride of [`TIER_PACKED`]. Three is the narrowest stride a block of
+/// it packs into fewer bytes than a presence bitset over the same span:
+/// at stride two the 128 postings span 254 documents, which is four
+/// 64-bit presence words — exactly what two-bit deltas cost — and the
+/// encoder keeps the bitset on a tie.
+const TIER_PACKED_STRIDE: usize = 3;
+/// Base stride of [`TIER_PATCHED`], between its wider jumps.
+const TIER_PATCHED_STRIDE: usize = 3;
+/// Postings between [`TIER_PATCHED`]'s wider jumps: a handful of
+/// exception lanes per 128-lane block, which is where patching pays.
+const TIER_PATCHED_OUTLIER_EVERY: usize = 24;
+/// [`TIER_PATCHED`]'s wider jump. Wide enough that a block's span costs
+/// more as presence words than its deltas do packed, so the bitset does
+/// not claim the block, while the lanes needing that width stay few
+/// enough for the exception list to beat widening all 128.
+const TIER_PATCHED_JUMP: usize = 200;
+
+/// Tokens [`tiered_corpus_strategy`] plants into a document on top of
+/// its drawn ones. Drawn lengths leave room for these, so planting never
+/// evicts a token another tier just planted.
+const PLANTED_TOKENS_PER_DOC: usize = 3;
+
+/// Smallest corpus the tiered lane draws. [`TIER_PACKED`] is long form
+/// only once its stride has laid down more than the short-form cap of
+/// 128 postings, so a corpus under `3 x 129` documents cannot show the
+/// packed form at all. The other lanes vary the corpus size; this one
+/// exists to span the posting formats, so it draws from the range where
+/// they are all present.
+const TIERED_MIN_DOCS: usize = TIER_PACKED_STRIDE * (BLOCK_POSTINGS + 1);
+/// Postings a full block holds, mirrored from the format so the sizing
+/// note above reads on its own.
+const BLOCK_POSTINGS: usize = 128;
 
 /// Smallest corpus of the large tiered tier: past the single-term
 /// walk's seed floor of 256 blocks (32 768 postings), so the dense
@@ -176,15 +226,39 @@ fn skewed_corpus_strategy() -> impl Strategy<Value = Vec<Vec<usize>>> {
     prop::collection::vec(doc, 1..=max_docs())
 }
 
-/// A corpus whose vocabulary spans every posting encoding at once:
-/// per token draw the first four vocabulary terms are weighted by
-/// [`TIER_WEIGHT_DENSE`] down to [`TIER_WEIGHT_SHORT`], and the fifth
-/// is planted once, in the first document, after generation. The rest
-/// of the vocabulary never appears, so a query naming it hits the
-/// absent-term paths. `n_docs` sets the scale: at the CI default the
-/// tiers land on bitset, packed multi-block, single long-form block,
-/// short form and inline df=1; at the large tier the dense list runs
-/// past the seed floor and spans several coarse tables.
+/// A corpus whose vocabulary spans every posting form at once. Four
+/// terms are drawn per token, weighted by [`TIER_WEIGHT_DENSE`] down to
+/// [`TIER_WEIGHT_SHORT`]; three more are planted after generation — the
+/// singleton in the first document, and the two strided tiers across the
+/// corpus. The remaining vocabulary never appears, so a query naming it
+/// hits the absent-term paths.
+///
+/// What each form comes from, at the default corpus size:
+///
+/// | form | term | how |
+/// |---|---|---|
+/// | bitset, several blocks | the three denser drawn tiers | drawn densely enough that presence bits cost no more than deltas |
+/// | short (one bodiless block) | the sparsest drawn tier, and [`TIER_PATCHED`] | under the 128-posting cap |
+/// | packed, two blocks | [`TIER_PACKED`] | planted at a uniform stride, so its deltas pack narrower than the span's presence words |
+/// | inline df=1 | [`TIER_SINGLETON`] | planted in one document |
+///
+/// **Patched blocks are out of reach at this size**, and no weighting
+/// fixes that. Patching pays when a few lanes are far wider than the
+/// rest, but a block whose lanes are that uneven spans enough documents
+/// for its presence bits to be cheaper still, so the bitset claims it
+/// first. Escaping that needs a span of several hundred documents per
+/// block *and* 128 postings to fill it, which a corpus of a few hundred
+/// documents cannot supply at once — [`TIER_PATCHED`] is short form here
+/// and only reaches the patched form in the large tier. The planted
+/// corpora in `boundaries.rs` cover patched blocks exactly, including
+/// the exception-count limit, so the fuzz lane is not the only coverage.
+///
+/// [`tiered_vocabulary_spans_the_posting_forms`] asserts this table
+/// against the built index rather than trusting it.
+///
+/// At the large tier the dense list additionally runs past the
+/// single-term walk's seed floor and spans several coarse tables, and
+/// [`TIER_PATCHED`]'s jumps finally buy it the patched form.
 fn tiered_corpus_strategy(
     n_docs: impl Strategy<Value = usize>,
 ) -> impl Strategy<Value = Vec<Vec<usize>>> {
@@ -194,17 +268,33 @@ fn tiered_corpus_strategy(
         TIER_WEIGHT_ONE_BLOCK => Just(TIER_ONE_BLOCK),
         TIER_WEIGHT_SHORT => Just(TIER_SHORT),
     ];
-    let doc = prop::collection::vec(token, 1..=max_doc_len());
+    // Drawn lengths leave room for the planted tokens, so a document at
+    // the cap does not lose one tier's token to the next tier's plant.
+    let drawn_len = max_doc_len().saturating_sub(PLANTED_TOKENS_PER_DOC).max(1);
+    let doc = prop::collection::vec(token, 1..=drawn_len);
     n_docs
         .prop_flat_map(move |n| prop::collection::vec(doc.clone(), n))
         .prop_map(|mut docs| {
-            // The singleton goes in the first document, replacing its
-            // last draw when the document is already at the length cap.
+            // The singleton goes in the first document; the strided
+            // tiers at their own regular intervals. Planting rather than
+            // drawing is what makes their gaps uniform, and uniform gaps
+            // are what the delta-coded formats need — see the tier
+            // weights' note.
             if let Some(first) = docs.first_mut() {
-                if first.len() >= max_doc_len() {
-                    first.pop();
-                }
                 first.push(TIER_SINGLETON);
+            }
+            for doc in docs.iter_mut().step_by(TIER_PACKED_STRIDE) {
+                doc.push(TIER_PACKED);
+            }
+            let mut at = 0usize;
+            let mut planted = 0usize;
+            while at < docs.len() {
+                docs[at].push(TIER_PATCHED);
+                planted += 1;
+                at += match planted.is_multiple_of(TIER_PATCHED_OUTLIER_EVERY) {
+                    true => TIER_PATCHED_JUMP,
+                    false => TIER_PATCHED_STRIDE,
+                };
             }
             docs
         })
@@ -216,6 +306,15 @@ fn k_strategy(max_docs: usize) -> impl Strategy<Value = usize> {
         1 => prop::sample::select(PINNED_KS.to_vec()),
         3 => 1usize..=(max_docs + 16),
     ]
+}
+
+/// Corpus sizes the default tiered lane draws from: at least
+/// [`TIERED_MIN_DOCS`], so every case shows every form the lane claims.
+/// Clamped when `INFINO_FTS_FUZZ_MAX_DOCS` is set below that, which
+/// trades the packed form for the smaller corpus the caller asked for.
+fn tiered_docs() -> impl Strategy<Value = usize> {
+    let max = max_docs();
+    TIERED_MIN_DOCS.min(max)..=max
 }
 
 /// Cases of the large tiered tier.
@@ -442,7 +541,7 @@ proptest! {
     /// shapes and graded against the same reference.
     #[test]
     fn fuzz_bm25_tiered_vocab_matches_brute_force(
-        corpus in tiered_corpus_strategy(1usize..=max_docs()),
+        corpus in tiered_corpus_strategy(tiered_docs()),
         atoms in atoms_strategy(),
         and_mode in any::<bool>(),
         k in k_strategy(max_docs()),
@@ -472,4 +571,128 @@ proptest! {
     ) {
         run_case(&corpus, &atoms, and_mode, k)?;
     }
+}
+
+/// Corpora sampled when checking the tiered lane's posting forms.
+const TIER_FORM_SAMPLES: usize = 4;
+
+/// The tiered vocabulary lands on the posting forms
+/// [`tiered_corpus_strategy`]'s table claims, checked against the built
+/// index rather than argued from the weights.
+///
+/// The table is easy to get wrong and was: an earlier version claimed
+/// packed and patched blocks from weighting alone, and the lane built
+/// neither — every drawn tier dense enough to fill a block was dense
+/// enough for the bitset to claim it, so the lane covered exactly what
+/// the two older lanes already did. This test is what makes the claim
+/// worth reading.
+#[tokio::test]
+async fn tiered_vocabulary_spans_the_posting_forms() {
+    use proptest::{strategy::ValueTree, test_runner::TestRunner};
+
+    let mut runner = TestRunner::deterministic();
+    for sample in 0..TIER_FORM_SAMPLES {
+        let docs = tiered_corpus_strategy(tiered_docs())
+            .new_tree(&mut runner)
+            .expect("tiered corpus")
+            .current();
+        let owned: Vec<(u64, String)> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, tokens)| {
+                let text = tokens
+                    .iter()
+                    .map(|&t| VOCAB[t])
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (i as u64, text)
+            })
+            .collect();
+        let refs: Vec<(u64, &str)> = owned.iter().map(|(i, t)| (*i, t.as_str())).collect();
+        let reader = build_infino_superfile_positional(&refs);
+        let fts = reader.fts().expect("full-text index");
+        let layout = async |tier: usize| {
+            fts.term_layout("title", VOCAB[tier])
+                .await
+                .expect("term layout")
+                .unwrap_or_else(|| panic!("sample {sample}: {} is absent", VOCAB[tier]))
+        };
+
+        let dense = layout(TIER_DENSE).await;
+        assert!(
+            dense.bitset_blocks > 0,
+            "sample {sample}: the densest drawn tier should store presence bits, got {dense:?}"
+        );
+        let packed = layout(TIER_PACKED).await;
+        assert!(
+            packed.packed_blocks > 0 && !packed.short,
+            "sample {sample}: the strided tier should pack its deltas, got {packed:?}"
+        );
+        let short = layout(TIER_SHORT).await;
+        assert!(
+            short.short,
+            "sample {sample}: the sparsest drawn tier should take the short form, got {short:?}"
+        );
+        let singleton = layout(TIER_SINGLETON).await;
+        assert!(
+            singleton.inline && singleton.df == 1,
+            "sample {sample}: the singleton should be inline, got {singleton:?}"
+        );
+        // Patched blocks need a span this corpus size cannot supply —
+        // see the strategy's note. Pinning the fallback keeps the note
+        // honest: if a format change ever makes patching reachable here,
+        // this fails and the note gets rewritten.
+        let patched = layout(TIER_PATCHED).await;
+        assert!(
+            patched.patched_blocks == 0 && patched.short,
+            "sample {sample}: the jumped tier is short form at this size, got {patched:?}"
+        );
+    }
+}
+
+/// The jumped tier reaches the patched form once the corpus is large
+/// enough to give its blocks a wide span, which is the other half of
+/// [`tiered_corpus_strategy`]'s claim and the reason the tier exists at
+/// all. Opt-in with the rest of the large tier: it indexes tens of
+/// thousands of documents.
+#[tokio::test]
+#[ignore = "large corpus; run explicitly"]
+async fn the_jumped_tier_is_patched_once_its_blocks_span_far_enough() {
+    let docs: Vec<Vec<usize>> = (0..LARGE_TIER_MIN_DOCS).map(|_| Vec::new()).collect();
+    let mut docs = docs;
+    let mut at = 0usize;
+    let mut planted = 0usize;
+    while at < docs.len() {
+        docs[at].push(TIER_PATCHED);
+        planted += 1;
+        at += match planted.is_multiple_of(TIER_PATCHED_OUTLIER_EVERY) {
+            true => TIER_PATCHED_JUMP,
+            false => TIER_PATCHED_STRIDE,
+        };
+    }
+    let owned: Vec<(u64, String)> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, tokens)| {
+            let text = tokens
+                .iter()
+                .map(|&t| VOCAB[t])
+                .collect::<Vec<_>>()
+                .join(" ");
+            (i as u64, text)
+        })
+        .collect();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, t)| (*i, t.as_str())).collect();
+    let reader = build_infino_superfile_positional(&refs);
+    let layout = reader
+        .fts()
+        .expect("full-text index")
+        .term_layout("title", VOCAB[TIER_PATCHED])
+        .await
+        .expect("term layout")
+        .expect("the jumped tier is present");
+    assert!(
+        layout.patched_blocks > 0,
+        "the jumped tier should patch its outlier lanes at this size, got {layout:?}"
+    );
 }
