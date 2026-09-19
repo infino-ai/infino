@@ -989,7 +989,12 @@ impl FtsReader {
             // doc can't beat the bar, skip to the smallest block boundary
             // across all cursors (past which a bound may rise). See
             // `block_max_and_bound`.
-            let bar = sink.bar();
+            let mut bar = sink.bar();
+            // Non-leader bound and the doc range it holds over, kept for the
+            // per-doc screen in the merge below. `INFINITY` / `0` leave the
+            // screen shut when there is no live bar to screen against.
+            let mut screen_ub = f32::INFINITY;
+            let mut screen_end = 0u32;
             if bar > f32::NEG_INFINITY {
                 let leader_doc = cursors[0].current_doc_id();
                 let leader_block_max = cursors[0].current_block_max_bm25();
@@ -1000,6 +1005,8 @@ impl FtsReader {
                     cursors[0].skip_to(window_end.saturating_add(1));
                     continue;
                 }
+                screen_ub = others_ub;
+                screen_end = window_end;
             }
 
             // Align every non-leader cursor to >= leader's current doc.
@@ -1047,6 +1054,25 @@ impl FtsReader {
             while i < lb_n {
                 let a = ld[i];
 
+                // Screen the leader doc on its own score before touching any
+                // other cursor. `screen_ub` bounds every other term over
+                // `[.., screen_end]`, so a leader doc that cannot reach the bar
+                // with all of them at their block maxima cannot make the top-k.
+                // What this saves is not the other cursors' pointer walk, which
+                // the next kept doc would have to cover anyway, but the
+                // per-doc-per-term bookkeeping around it — the slice rebuild and
+                // the position store-back that the profile puts at a sixth of
+                // this kernel. The leader's tf is already decoded, so the screen
+                // is one table lookup and one divide.
+                if a <= screen_end && sink.needs_score() {
+                    let norm = dl_norm_k1.get(a);
+                    let s = bm25::score_with_dl_norm_k1(c0.idf_weight, lt[i], norm);
+                    if s + screen_ub <= bar {
+                        i += 1;
+                        continue;
+                    }
+                }
+
                 // For each non-leader, walk its `pos` forward through
                 // the decoded block until block_doc_ids[pos] >= a (or
                 // the block exhausts). If any block exhausts, break
@@ -1091,6 +1117,9 @@ impl FtsReader {
                         0.0
                     };
                     sink.emit(a, score);
+                    // An admitted doc raises the k-th best, so the screen above
+                    // tightens for the rest of this block, not at the next one.
+                    bar = sink.bar();
                     i += 1;
                     for o in others.iter_mut() {
                         o.pos += 1;
