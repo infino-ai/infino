@@ -5150,7 +5150,7 @@ const MAX_EFFECTIVE_FILTERED_RERANK_MULT: usize = 16_384;
 const UNFILTERED_SELECTIVITY_MULT: usize = 1;
 /// Multiplier for a present-but-empty allow-set: no row can match, so
 /// callers should return an empty result without probing.
-const EMPTY_FILTER_SELECTIVITY_MULT: usize = 0;
+pub(crate) const EMPTY_FILTER_SELECTIVITY_MULT: usize = 0;
 /// Population count for an empty allow-set or empty column.
 const EMPTY_FILTER_POPULATION: u64 = 0;
 /// Numerator for the inverse-selectivity multiplier (`1 / selectivity`).
@@ -5165,11 +5165,17 @@ fn filter_selectivity_mult(allow: &Option<Arc<RoaringBitmap>>, n_docs: u32) -> u
     let Some(bm) = allow.as_ref() else {
         return UNFILTERED_SELECTIVITY_MULT;
     };
-    let allowed = bm.len();
+    selectivity_mult_from_counts(bm.len(), n_docs as u64)
+}
+
+/// Count-based core of [`filter_selectivity_mult`]: inverse-selectivity
+/// multiplier for `allowed` rows out of `n`, capped at
+/// [`MAX_FILTER_SELECTIVITY_MULT`]. Shared by superfile and supertable
+/// routing — the two must not drift.
+pub(crate) fn selectivity_mult_from_counts(allowed: u64, n: u64) -> usize {
     if allowed == EMPTY_FILTER_POPULATION {
         return EMPTY_FILTER_SELECTIVITY_MULT;
     }
-    let n = n_docs as u64;
     if n == EMPTY_FILTER_POPULATION {
         return UNFILTERED_SELECTIVITY_MULT;
     }

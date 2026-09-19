@@ -114,7 +114,10 @@ use crate::{
             flat::Sq4FlatIndex,
             hnsw::{self, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
-            reader::{ProbeTally, ScanCandidate, ScanOutcome},
+            reader::{
+                EMPTY_FILTER_SELECTIVITY_MULT, ProbeTally, ScanCandidate, ScanOutcome,
+                selectivity_mult_from_counts,
+            },
         },
     },
     supertable::{
@@ -5249,13 +5252,34 @@ impl SupertableReader {
                     base
                 }
             } else if filtered {
-                // Filtered UNDRAINED-tail fan: the default user-table
-                // search with a small fixed floor
-                // ([`FILTERED_USER_CELL_NPROBE`]) — the nearest MATCHING
-                // rows sit deeper than the fine-first single cell reaches.
+                // Filtered UNDRAINED-tail fan: cell routing follows the QUERY,
+                // but a sparse predicate's matches sit wherever they sit — so
+                // widen the [`FILTERED_USER_CELL_NPROBE`] floor by the filter's
+                // inverse selectivity (same capped math as the superfile tier's
+                // `selectivity_mult_from_counts`). Dense filters keep the floor.
+                // Count over THIS fan's superfiles only: the allow map still
+                // carries drained superfiles' entries, and mixing their
+                // matches into `allowed` overstates selectivity for the tail.
+                let allowed: u64 = allow
+                    .as_ref()
+                    .map(|m| {
+                        superfiles
+                            .iter()
+                            .filter_map(|e| m.get(&e.uri))
+                            .map(|bm| bm.len())
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                let population: u64 = superfiles.iter().map(|e| e.n_docs).sum();
+                let mult = selectivity_mult_from_counts(allowed, population);
+                if mult == EMPTY_FILTER_SELECTIVITY_MULT {
+                    // No tail row matches the filter: nothing to probe.
+                    return Ok(Vec::new());
+                }
+                let width = FILTERED_USER_CELL_NPROBE.saturating_mul(mult);
                 CellRoutingParams {
-                    nprobe_min: FILTERED_USER_CELL_NPROBE,
-                    nprobe_max: FILTERED_USER_CELL_NPROBE,
+                    nprobe_min: width,
+                    nprobe_max: width,
                     ..CellRoutingParams::default()
                 }
             } else {
