@@ -224,27 +224,30 @@ fn count_and_intersect_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
     acc.iter().map(|w| w.count_ones() as u64).sum()
 }
 
-/// Block-Max-AND upper bound at the leader's doc, valid over
-/// `[leader_doc, window_end]` where `window_end` is the smallest block boundary
-/// across all cursors. Each non-leader is bounded by the single block that
-/// *contains* `leader_doc`, not a max over every block under the leader's whole
-/// (possibly wide) block — the looser range-max collapsed to a common term's
-/// global max on rare∧common queries, so the skip rarely fired. Leader block
-/// max/end are passed in (callers hold the leader split off for the flat-merge).
+/// Block-Max-AND bound on the **non-leader** terms at the leader's doc, valid
+/// over `[leader_doc, window_end]` where `window_end` is the smallest block
+/// boundary across all cursors. Each non-leader is bounded by the single block
+/// that *contains* `leader_doc`, not a max over every block under the leader's
+/// whole (possibly wide) block — the looser range-max collapsed to a common
+/// term's global max on rare∧common queries, so the skip rarely fired. The
+/// leader's block end is passed in (callers hold the leader split off for the
+/// flat-merge); its block max is added by the caller, which also needs the two
+/// halves apart: the others' half alone bounds what a leader doc's own score
+/// must beat, which is what the per-doc screen in `and_membership_scored`
+/// tests against.
 fn block_max_and_bound(
-    leader_block_max: f32,
     leader_block_end: u32,
     others: &mut [TermCursor],
     leader_doc: u32,
 ) -> (f32, u32) {
-    let mut ub = leader_block_max;
+    let mut others_ub = 0.0;
     let mut window_end = leader_block_end;
     for c in others.iter_mut() {
         c.shallow_advance_block_to(leader_doc);
-        ub += c.inspect_block_max_bm25();
+        others_ub += c.inspect_block_max_bm25();
         window_end = window_end.min(c.inspect_block_last_doc_id());
     }
-    (ub, window_end)
+    (others_ub, window_end)
 }
 
 /// Route a ranked AND to the membership walk ([`FtsReader::and_membership_scored`])
@@ -755,27 +758,52 @@ impl FtsReader {
             // window; otherwise process every driver doc up to `window_end`
             // before recomputing, so a sparse driver pays the bound per block,
             // not per doc.
-            let window_end = if sink.bar() > f32::NEG_INFINITY {
-                let (ub, window_end) = block_max_and_bound(
-                    driver.current_block_max_bm25(),
-                    driver.current_block_last_doc_id(),
-                    &mut others,
-                    doc,
-                );
-                if ub <= sink.bar() {
+            let mut bar = sink.bar();
+            let (others_ub, window_end) = if bar > f32::NEG_INFINITY {
+                let (others_ub, window_end) =
+                    block_max_and_bound(driver.current_block_last_doc_id(), &mut others, doc);
+                if driver.current_block_max_bm25() + others_ub <= bar {
                     driver.skip_to(window_end.saturating_add(1));
                     continue;
                 }
-                window_end
+                (others_ub, window_end)
             } else {
                 // No live bar (heap not yet full, or an unranked sink): nothing to
                 // prune against. Bound the batch to the driver's current block;
-                // the probes cross the others' blocks on their own.
-                driver.current_block_last_doc_id()
+                // the probes cross the others' blocks on their own. An infinite
+                // others' bound leaves the per-doc screen below permanently open.
+                (f32::INFINITY, driver.current_block_last_doc_id())
             };
 
             loop {
                 let d = driver.current_doc_id();
+                // Screen the driver doc on its **own** score before probing anyone.
+                // `others_ub` bounds every other term's contribution over this
+                // window, so a driver doc whose score cannot reach the bar even
+                // with all of them at their block maxima cannot make the top-k —
+                // and is dropped without a single membership probe. The driver's
+                // tf is already decoded and the norm is a byte load plus an
+                // L1 lookup, so the screen costs a fraction of the two-plus probes
+                // it replaces; on a doc that survives, both feed the full score
+                // below rather than being recomputed. This is the tight half of
+                // the window bound above, which can only see the driver's whole
+                // block: a rare, high-idf driver's per-doc score varies by an idf
+                // across one block, and the bar at small k sits well inside that
+                // spread.
+                let mut score = 0.0;
+                let mut norm = 0.0;
+                if need_score {
+                    norm = dl_norm_k1.get(d);
+                    score =
+                        bm25::score_with_dl_norm_k1(driver.idf_weight, driver.current_tf(), norm);
+                    if score + others_ub <= bar {
+                        driver.next();
+                        if driver.is_exhausted() || driver.current_doc_id() > window_end {
+                            break;
+                        }
+                        continue;
+                    }
+                }
                 // Cheap presence pass: bitset bit-test every other, short-circuit
                 // on the first miss. No tf is read here — a miss after k matching
                 // common terms would waste k popcount-rank + tf decodes.
@@ -787,25 +815,19 @@ impl FtsReader {
                     }
                 }
                 if all_match {
-                    let score = if need_score {
-                        let norm = dl_norm_k1.get(d);
-                        let mut s = bm25::score_with_dl_norm_k1(
-                            driver.idf_weight,
-                            driver.current_tf(),
-                            norm,
-                        );
+                    if need_score {
                         // Full match: now read each tf (bit-test + popcount-rank,
                         // no doc-id decode). `contains` already positioned each
                         // cursor on `d`'s block, so this doesn't re-seek.
                         for o in others.iter_mut() {
                             let tf = o.tf_at_contained(d);
-                            s += bm25::score_with_dl_norm_k1(o.idf_weight, tf, norm);
+                            score += bm25::score_with_dl_norm_k1(o.idf_weight, tf, norm);
                         }
-                        s
-                    } else {
-                        0.0
-                    };
+                    }
                     sink.emit(d, score);
+                    // An admitted doc raises the k-th best, so the screen tightens
+                    // for the rest of the window rather than at its next boundary.
+                    bar = sink.bar();
                 }
                 driver.next();
                 if driver.is_exhausted() || driver.current_doc_id() > window_end {
@@ -972,13 +994,9 @@ impl FtsReader {
                 let leader_doc = cursors[0].current_doc_id();
                 let leader_block_max = cursors[0].current_block_max_bm25();
                 let leader_block_end = cursors[0].current_block_last_doc_id();
-                let (ub, window_end) = block_max_and_bound(
-                    leader_block_max,
-                    leader_block_end,
-                    &mut cursors[1..],
-                    leader_doc,
-                );
-                if ub <= bar {
+                let (others_ub, window_end) =
+                    block_max_and_bound(leader_block_end, &mut cursors[1..], leader_doc);
+                if leader_block_max + others_ub <= bar {
                     cursors[0].skip_to(window_end.saturating_add(1));
                     continue;
                 }
@@ -1129,13 +1147,10 @@ impl FtsReader {
             let bar = sink.bar();
             if bar > f32::NEG_INFINITY {
                 let leader_doc = c0.current_doc_id();
-                let (ub, window_end) = block_max_and_bound(
-                    c0.current_block_max_bm25(),
-                    c0.current_block_last_doc_id(),
-                    from_mut(c1),
-                    leader_doc,
-                );
-                if ub <= bar {
+                let leader_block_max = c0.current_block_max_bm25();
+                let (others_ub, window_end) =
+                    block_max_and_bound(c0.current_block_last_doc_id(), from_mut(c1), leader_doc);
+                if leader_block_max + others_ub <= bar {
                     c0.skip_to(window_end.saturating_add(1));
                     continue;
                 }
@@ -3106,6 +3121,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn and_membership_screen_agrees_with_the_flat_merge() {
+        // A rare driver whose per-doc score spans most of its idf inside a
+        // single block, AND-ed with a dense (bitset) term and a mid-density
+        // one. The window bound can only see the driver's block max, so what
+        // rejects the driver's low-tf, long-document postings here is the
+        // per-doc screen. The flat merge walks the same intersection with no
+        // screen, so a doc the screen drops wrongly surfaces as a top-k
+        // mismatch. The k ladder brackets a bar that bites from the first
+        // window (k = 1) through one that never fills (k above the 128
+        // matching docs, leaving the screen shut).
+        const N_DOCS: u32 = 128 * 40;
+        const DRIVER_EVERY: u32 = 32;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::new();
+            for _ in 0..(1 + i % 3) {
+                text.push_str("the ");
+            }
+            if !i.is_multiple_of(5) {
+                for _ in 0..(1 + i % 2) {
+                    text.push_str("of ");
+                }
+            }
+            if i.is_multiple_of(DRIVER_EVERY) {
+                let nth = i / DRIVER_EVERY;
+                for _ in 0..(1 + nth % 8) {
+                    text.push_str("book ");
+                }
+                // Pad a slice of the driver's docs so the length norm, not
+                // the tf alone, spreads their scores across one block.
+                for _ in 0..(nth % 5) * 7 {
+                    text.push_str("filler ");
+                }
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+        let norms = &r.columns[col as usize].dl_norm_k1;
+        let terms = ["book", "the", "of"];
+        let build = async || {
+            r.build_term_cursors(col, &terms, None, false, None, None)
+                .await
+                .expect("cursors")
+        };
+        assert!(
+            and_prefer_membership(r.has_bitset_blocks, &build().await),
+            "this corpus must route to the membership walk for the screen to be under test"
+        );
+        for k in [1usize, 5, 10, 50, 200] {
+            let mut walk_heap = BinaryHeap::new();
+            let mut walk_sink = ScoreSink {
+                heap: &mut walk_heap,
+                k,
+                filter: None,
+                floor_eff: f32::NEG_INFINITY,
+            };
+            r.and_membership_scored(build().await, norms, &mut walk_sink);
+            let walk = drain_top_k_desc(walk_heap);
+
+            let mut merge_heap = BinaryHeap::new();
+            let mut merge_sink = ScoreSink {
+                heap: &mut merge_heap,
+                k,
+                filter: None,
+                floor_eff: f32::NEG_INFINITY,
+            };
+            let mut merge_cursors = build().await;
+            merge_cursors.sort_by_key(|c| c.block_count());
+            r.and_flat_merge(&mut merge_cursors, norms, &mut merge_sink);
+            let merge = drain_top_k_desc(merge_heap);
+
+            assert_eq!(walk.len(), merge.len(), "hit count k={k}");
+            for ((dw, sw), (dm, sm)) in walk.iter().zip(merge.iter()) {
+                assert_eq!(dw, dm, "doc mismatch k={k}: walk={dw} merge={dm}");
+                assert!((sw - sm).abs() < 1e-4, "score mismatch k={k}: {sw} vs {sm}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn windowed_maxscore_ranged_agrees_with_bmm_range() {
         // The ranged fan-out entry now runs this same kernel over a doc-id
         // sub-window. Driven over explicit sub-ranges (including a
@@ -3672,12 +3772,10 @@ mod tests {
                 };
                 while !lead.is_exhausted() {
                     let doc = lead.current_doc_id();
-                    let (ub, window_end) = block_max_and_bound(
-                        lead.current_block_max_bm25(),
-                        lead.current_block_last_doc_id(),
-                        others,
-                        doc,
-                    );
+                    let lead_block_max = lead.current_block_max_bm25();
+                    let (others_ub, window_end) =
+                        block_max_and_bound(lead.current_block_last_doc_id(), others, doc);
+                    let ub = lead_block_max + others_ub;
                     prop_assert!(window_end >= doc, "window end precedes the leader doc");
                     for d in doc..=window_end.min(BOUND_DOCS - 1) {
                         if let (Some(lt), Some(ot)) = (lead_tf[d as usize], other_tf[d as usize]) {
