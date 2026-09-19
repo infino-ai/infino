@@ -300,7 +300,19 @@ fn and_prefer_membership(has_bitset_blocks: bool, cursors: &[TermCursor]) -> boo
         } else {
             (&cursors[1], &cursors[0])
         };
-        return common.is_bitset_dense() && !rare.is_bitset_dense();
+        if common.is_bitset_dense() && !rare.is_bitset_dense() {
+            return true;
+        }
+        // A very sparse rarest term is worth driving even when the common
+        // term's blocks are packed, so a probe costs a decode and a locate
+        // rather than a bit test. The driver's per-doc screen rejects most of
+        // its list before any probe is issued, and what remains is far shorter
+        // than the common term's whole list, which the merge walks in full.
+        return !rare.is_bitset_dense()
+            && rare
+                .df
+                .saturating_mul(AND_MEMBERSHIP_ALWAYS_DIVISOR)
+                < u64::from(max_doc);
     }
     let min_df = cursors.iter().map(|c| c.df).min().unwrap_or(0);
     // Very sparse rarest term: always cheaper to drive it, whatever the others.

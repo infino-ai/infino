@@ -367,9 +367,11 @@ pub(super) const OR_COUNT_BITSET_DENSITY_DIVISOR: u64 = 16;
 pub(super) const AND_MEMBERSHIP_ALWAYS_DIVISOR: u64 = 64;
 
 /// Upper sparsity bound for the density-gated middle routing tier — see
-/// [`AND_MEMBERSHIP_ALWAYS_DIVISOR`]. A rarest term denser than `1/16` of the
-/// corpus never routes to the membership walk.
-pub(super) const AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR: u64 = 16;
+/// [`AND_MEMBERSHIP_ALWAYS_DIVISOR`]. A rarest term denser than this fraction of
+/// the corpus never routes to the membership walk: past it the driver list is
+/// long enough that iterating it costs more than the block decode the walk
+/// avoids, screen or no screen.
+pub(super) const AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR: u64 = 8;
 
 /// Density guard for the middle routing tier: the *other* terms must be
 /// collectively at least this many times denser than the driver (their combined
@@ -380,10 +382,14 @@ pub(super) const AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR: u64 = 16;
 /// block decode is already cheap and its block-max skip prunes the driver, so it
 /// wins — routing such a query to the walk regressed it. Sparsity alone can't
 /// tell the two apart (same rarest term, different companions), so this ratio is
-/// the discriminator. Calibrated on the ranked-AND intersection set: middle-tier
-/// wins sit at ≥ ~38× and the one regression at ~4.5×, so `8` separates them
-/// with margin on both sides. (The very-sparse tier skips this check.)
-pub(super) const AND_MEMBERSHIP_OTHERS_DENSITY_MULT: u64 = 8;
+/// the discriminator. It was first calibrated on the ranked-AND intersection set
+/// against a walk that probed every driver doc: wins sat at ≥ ~38× and the one
+/// regression at ~4.5×, so `8` separated them with margin. The walk now screens
+/// each driver doc on its own score and probes only the survivors, which roughly
+/// halved its cost on the shapes it already served, so the break-even against
+/// the flat-merge moved down with it and the guard follows. (The very-sparse
+/// tier skips this check.)
+pub(super) const AND_MEMBERSHIP_OTHERS_DENSITY_MULT: u64 = 4;
 
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
