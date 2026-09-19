@@ -759,6 +759,9 @@ impl FtsReader {
         // already excludes. Order is irrelevant to the score (Σ is commutative).
         others.sort_by_key(|c| c.df);
         let need_score = sink.needs_score();
+        // Scratch for the per-window suffix bounds; one slot per other term
+        // plus the zero terminator.
+        let mut suffix = vec![0.0f32; others.len() + 1];
         while !driver.is_exhausted() {
             let doc = driver.current_doc_id();
 
@@ -786,6 +789,14 @@ impl FtsReader {
                 // others' bound leaves the per-doc screen below permanently open.
                 (f32::INFINITY, driver.current_block_last_doc_id())
             };
+            // `suffix[i]` bounds the terms from `i` on, in probe order, over this
+            // window: `suffix[0]` is the whole-others bound the screen uses and
+            // `suffix[n]` is zero. Rebuilt per window, which is one pass over a
+            // handful of block maxima the bound above already advanced to.
+            suffix[others.len()] = 0.0;
+            for i in (0..others.len()).rev() {
+                suffix[i] = suffix[i + 1] + others[i].inspect_block_max_bm25();
+            }
 
             loop {
                 let d = driver.current_doc_id();
@@ -816,26 +827,37 @@ impl FtsReader {
                         continue;
                     }
                 }
-                // Cheap presence pass: bitset bit-test every other, short-circuit
-                // on the first miss. No tf is read here — a miss after k matching
-                // common terms would waste k popcount-rank + tf decodes.
+                // Presence pass, short-circuiting on the first miss. When the
+                // sink scores, each term's own contribution is folded in as its
+                // presence is confirmed and the running total is re-tested
+                // against `suffix[i]`, the block-max bound on the terms not yet
+                // probed. A doc that has already fallen too far behind the bar
+                // is abandoned without probing the rest — the same argument as
+                // the screen above, applied between terms instead of before
+                // them, and it bites hardest where the screen is weakest: when
+                // the companions are themselves discriminating, their combined
+                // bound is loose but each confirmed term collapses a real share
+                // of it. `others` is ordered rarest-first, which is both the
+                // fewest probes to a miss and the fastest convergence here,
+                // since a rarer term carries the larger idf.
                 let mut all_match = true;
-                for o in others.iter_mut() {
+                for (i, o) in others.iter_mut().enumerate() {
                     if !o.contains(d) {
                         all_match = false;
                         break;
                     }
-                }
-                if all_match {
                     if need_score {
-                        // Full match: now read each tf (bit-test + popcount-rank,
-                        // no doc-id decode). `contains` already positioned each
-                        // cursor on `d`'s block, so this doesn't re-seek.
-                        for o in others.iter_mut() {
-                            let tf = o.tf_at_contained(d);
-                            score += bm25::score_with_dl_norm_k1(o.idf_weight, tf, norm);
+                        // `contains` left the cursor on `d`'s block, so this is a
+                        // bit test plus a popcount rank, not a re-seek.
+                        let tf = o.tf_at_contained(d);
+                        score += bm25::score_with_dl_norm_k1(o.idf_weight, tf, norm);
+                        if score + suffix[i + 1] <= bar {
+                            all_match = false;
+                            break;
                         }
                     }
+                }
+                if all_match {
                     sink.emit(d, score);
                     // An admitted doc raises the k-th best, so the screen tightens
                     // for the rest of the window rather than at its next boundary.
