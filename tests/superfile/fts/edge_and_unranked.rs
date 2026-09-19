@@ -22,18 +22,11 @@ use infino::{
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
 };
 
+use super::corpus_truth::docs_with;
 use crate::fts::brute_force_oracle::{build_infino_superfile, corpus};
 
 const SCORE_ABS_TOLERANCE: f32 = 1e-3;
 const K_ALL: usize = 64;
-
-/// Doc-ids whose text contains `term` as a whitespace token.
-fn docs_with(corp: &[(u64, &str)], term: &str) -> HashSet<u64> {
-    corp.iter()
-        .filter(|(_, t)| t.split_whitespace().any(|w| w == term))
-        .map(|(i, _)| *i)
-        .collect()
-}
 
 async fn ranked_ids(reader: &SuperfileReader, query: &str, k: usize, mode: BoolMode) -> Vec<u64> {
     reader

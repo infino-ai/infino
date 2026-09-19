@@ -29,10 +29,10 @@
 //! Token vocabulary:
 //!   tier        : `superfile` | `supertable`        (omitted => both)
 //!   modality    : `fts` | `vector` | `sql`          (omitted => all three)
-//!   phase       : `build` | `warm` | `cold` | `quality` | `search` (= warm+cold)
+//!   phase       : `build` | `warm` | `cold` | `quality` | `search` (= warm+cold+quality)
 //!                 (`quality` = FTS BM25 top-k parity vs a textbook oracle;
-//!                 supertable fts only, other cells ignore it)
-//!                 (omitted => all three phases)
+//!                 the two fts cells only, other cells ignore it)
+//!                 (omitted => every phase)
 //!   `all`       : explicit "every tier × modality × phase" (the default).
 //!                 Matrix only — diagnostics are NEVER implied by `all` or
 //!                 by a bare `cargo bench`.
@@ -139,8 +139,8 @@ impl Modality {
 fn run_cell(tier: Tier, modality: Modality, phases: Phases) {
     let label = format!("{}_{}", tier.token(), modality.token());
     eprintln!(
-        "[bench] === {label} (build={}, warm={}, cold={}) ===",
-        phases.build, phases.warm, phases.cold
+        "[bench] === {label} (build={}, warm={}, cold={}, quality={}) ===",
+        phases.build, phases.warm, phases.cold, phases.quality
     );
     match (tier, modality) {
         (Tier::Superfile, Modality::Fts) => infino_bench_utils::superfile::fts::run(phases),
@@ -258,6 +258,7 @@ fn run_dataset_command(tokens: &[String]) {
             "search" => {
                 warm = true;
                 cold = true;
+                quality = true;
             }
             other if prefix.is_none() => prefix = Some(other),
             other => {
@@ -332,19 +333,23 @@ fn print_usage_and_exit(code: i32) -> ! {
          \n\
          Tier      : superfile | supertable        (omitted => both)\n\
          Modality  : fts | vector | sql            (omitted => all three)\n\
-         Phase     : build | warm | cold | quality | search  (search = warm+cold; omitted => all;\n\
-         \x20           quality = FTS BM25 parity vs a textbook oracle, supertable fts only)\n\
+         Phase     : build | warm | cold | quality | search  (search = warm+cold+quality; omitted => all;\n\
+         \x20           quality = FTS BM25 parity vs a textbook oracle, the two fts cells only)\n\
          all       : every tier x modality x phase (the default for a bare\n\
          \x20           `cargo bench`); matrix only — never implies diagnostics\n\
          Diagnostic: scale | tombstone | update | sql-diag | fts-diag | object-store | concurrent | disk-warm | recall_while_ingest,\n\
          \x20           or `diagnostic` for the grouped set / `diagnostic <names>` for a subset\n\
          \n\
-         corpus=<spec>     : corpus source (default synthetic). Vector cells\n\
+         corpus=<spec>     : corpus source. Default: `realistic` for the two fts\n\
+         \x20                   cells, `synthetic` for every other cell. Vector cells\n\
          \x20                   always consume it; supertable fts/sql consume its\n\
          \x20                   text (the dataset must carry a text column); the\n\
          \x20                   superfile sql cell ingests its schema; superfile\n\
-         \x20                   fts is synthetic-only and refuses it.\n\
-         \x20   synthetic          seeded planted-cluster generator\n\
+         \x20                   fts takes only the two generated flavours.\n\
+         \x20   synthetic          seeded planted-cluster generator, uniform text\n\
+         \x20                      (200 tokens/doc from a closed 10K vocabulary)\n\
+         \x20   realistic          the same generator with text calibrated to real\n\
+         \x20                      articles (log-normal lengths, open vocabulary)\n\
          \x20   annb:<slug>        published ann-benchmarks dataset; ships official\n\
          \x20                      queries + top-k neighbours (glove-100-angular,\n\
          \x20                      sift-128-euclidean, deep-image-96-angular, ...)\n\
@@ -439,6 +444,7 @@ fn parse_args() -> Selection {
             "search" => {
                 warm = true;
                 cold = true;
+                quality = true;
             }
             "scale" => diagnostics.push(Diagnostic::Scale),
             "tombstone" | "tombstone-overhead" => diagnostics.push(Diagnostic::Tombstone),

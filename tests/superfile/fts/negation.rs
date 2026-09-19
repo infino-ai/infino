@@ -17,6 +17,7 @@ use infino::superfile::{
     fts::{reader::BoolMode, tokenize::Phrase},
 };
 
+use super::corpus_truth::{docs_with, docs_with_phrase};
 use crate::fts::brute_force_oracle::{
     build_infino_superfile, build_infino_superfile_positional, build_multi_block_corpus,
     build_multi_block_reader, corpus,
@@ -27,14 +28,6 @@ use crate::fts::brute_force_oracle::{
 // The planted superfile has user `doc_id` == row index, so the reader's
 // `local_doc_id` is the user id. "Term in doc" = whitespace-token match,
 // which equals the tokenizer's view for this all-lowercase corpus.
-
-/// Doc-ids whose text contains `term` as a whitespace token.
-fn docs_with(corp: &[(u64, &str)], term: &str) -> HashSet<u64> {
-    corp.iter()
-        .filter(|(_, t)| t.split_whitespace().any(|w| w == term))
-        .map(|(i, _)| *i)
-        .collect()
-}
 
 /// Docs matching ANY of `terms` (the OR positive set).
 fn or_match(corp: &[(u64, &str)], terms: &[&str]) -> HashSet<u64> {
@@ -54,17 +47,6 @@ fn and_match(corp: &[(u64, &str)], terms: &[&str]) -> HashSet<u64> {
 fn exclude(base: HashSet<u64>, corp: &[(u64, &str)], negatives: &[&str]) -> HashSet<u64> {
     let drop: HashSet<u64> = or_match(corp, negatives);
     base.difference(&drop).copied().collect()
-}
-
-/// Doc-ids whose text contains `phrase` as a contiguous, in-order token run.
-fn docs_with_phrase(corp: &[(u64, &str)], phrase: &[&str]) -> HashSet<u64> {
-    corp.iter()
-        .filter(|(_, t)| {
-            let toks: Vec<&str> = t.split_whitespace().collect();
-            toks.windows(phrase.len()).any(|w| w == phrase)
-        })
-        .map(|(i, _)| *i)
-        .collect()
 }
 
 /// A phrase as the `&[Phrase<String>]` the count/search API expects.

@@ -24,9 +24,12 @@
 //! Result invariants match the optimized search path:
 //! top-k by descending score, ties broken by ascending doc_id.
 
-use std::{cmp::Ordering, collections::HashMap};
+use std::{borrow::Cow, cmp::Ordering, collections::HashMap};
 
-use crate::superfile::fts::tokenize::{Phrase, Tokenizer};
+use crate::superfile::fts::{
+    reader::BoolMode,
+    tokenize::{Phrase, Tokenizer},
+};
 
 /// Standard BM25 default parameters. Match the constants used by
 /// the production scoring path.
@@ -181,6 +184,45 @@ impl BruteForceBm25 {
     pub fn with_params(mut self, params: OracleBm25Params) -> Self {
         self.params = params;
         self
+    }
+
+    /// Normalize lengths with `avgdl` instead of this corpus's own
+    /// average. The engine scores every document of a superfile at the
+    /// average that file declares — the table-wide average as of the
+    /// file's commit — while idf stays table-wide; an oracle indexed
+    /// over the whole table and re-pointed at one file's average scores
+    /// that file's documents exactly as the engine does.
+    pub fn with_avgdl(mut self, avgdl: f32) -> Self {
+        self.avgdl = avgdl;
+        self
+    }
+
+    /// Top-k for `query` under the clause model, split into clauses by
+    /// `tokenizer` exactly as the reader splits it — so a difference in
+    /// how a query parses can never masquerade as a scoring difference.
+    /// `Phrase::map` carries each member's offset across, so a phrase is
+    /// graded at the spacing the parser derived.
+    pub fn top_k_query(
+        &self,
+        query: &str,
+        mode: BoolMode,
+        tokenizer: &dyn Tokenizer,
+        k: usize,
+    ) -> Vec<(u64, f32)> {
+        let clauses = tokenizer.parse(query).into_clauses(mode);
+        let own = |v: &[Cow<'_, str>]| -> Vec<String> { v.iter().map(|c| c.to_string()).collect() };
+        let own_ph = |v: &[Phrase<Cow<'_, str>>]| -> Vec<Phrase<String>> {
+            v.iter().map(|p| p.map(|t| t.to_string())).collect()
+        };
+        self.top_k_atoms(
+            &own(&clauses.musts),
+            &own_ph(&clauses.must_phrases),
+            &own(&clauses.shoulds),
+            &own_ph(&clauses.should_phrases),
+            &own(&clauses.negatives),
+            &own_ph(&clauses.negative_phrases),
+            k,
+        )
     }
 
     /// Brute-force top-k for a multi-term OR-mode BM25 query.

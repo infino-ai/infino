@@ -1051,6 +1051,20 @@ impl FtsReader {
         Some(self.columns[id as usize].length_stats)
     }
 
+    test_visible! {
+    /// A column's stored per-document lengths, one per local doc id: the
+    /// array the norm table is quantized from, as the build wrote it
+    /// (saturated at the format's stored maximum). A benchmark oracle
+    /// compares it against its own tokenization of the rows it believes a
+    /// superfile holds, which pins the row-to-superfile mapping exactly
+    /// rather than assuming it from ingest order. Errors if `column` is not
+    /// a registered FTS column.
+    fn column_doc_lengths(&self, column: &str) -> Result<Vec<u32>, FtsError> {
+        let id = self.resolve_column_id(column)?;
+        self.read_doc_lengths(id)
+    }
+    }
+
     /// Tokenizer configured for `column`, for tokenizing query text so
     /// it matches how the column was indexed. Errors if `column` is not
     /// a registered FTS column.

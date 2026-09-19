@@ -30,7 +30,9 @@
 
 use std::{
     cmp::{Ordering, Reverse},
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    iter::repeat_n,
+    ops::Range,
     slice::from_ref,
     sync::{Arc, LazyLock},
 };
@@ -41,17 +43,23 @@ use infino::{
     superfile::{
         builder::FtsConfig,
         fts::{
-            reader::{Bm25Stats, BoolMode},
+            bm25::stored_avgdl,
+            reader::{Bm25Stats, BoolMode, ColumnLengthStats},
             tokenize::Phrase,
         },
     },
-    supertable::{Supertable, SupertableOptions, query::SuperfileHit},
+    supertable::{
+        Supertable, SupertableOptions,
+        manifest::{SuperfileEntry, SuperfileUri},
+        query::SuperfileHit,
+    },
     test_helpers::{
         brute_force_bm25::{BruteForceBm25, OracleBm25Params},
-        default_tokenizer, schema_id_title,
+        build_title_batch, default_tokenizer, schema_id_title,
     },
 };
 use rand::{SeedableRng, rngs::StdRng};
+use rayon::ThreadPoolBuilder;
 
 /// Fixed planted corpus, 60 docs. Sharded into 4 superfiles of 15
 /// docs each.
@@ -1091,4 +1099,387 @@ fn single_term_global_idf_skip_matches_a_single_superfile() {
 /// Ids from a per-superfile-statistics search, for the contrast check.
 fn st_hits_per_superfile(st: &Supertable, k: usize, chunk_size: usize) -> Vec<u64> {
     supertable_search_stats(st, "common", k, chunk_size, Bm25Stats::PerSuperfile)
+}
+
+// ---- the running table-wide average, one declared value per file ------
+//
+// Under global statistics idf is table-wide, but the average document
+// length a superfile normalizes with is the one it declares: the table's
+// token and document totals as of the file's commit — every file already
+// committed, plus its own rows — rounded to the stored fixed point. Files
+// flushed earlier in the same commit are not yet committed and do not
+// count. A reference scoring the whole table at one average cannot grade
+// this; the one below re-points a whole-table oracle (table-wide idf) at
+// each file's declared average and scores that file's rows with it.
+
+/// Commits of the running-average fixture.
+const RUNNING_COMMITS: usize = 4;
+/// Rows per commit. With two files per commit each holds 450 rows, so
+/// `every` spans four posting blocks in every file.
+const RUNNING_DOCS_PER_COMMIT: usize = 900;
+/// Filler tokens added per commit index, so each commit's own average
+/// differs from every earlier one and the running average moves at
+/// every commit.
+const RUNNING_PAD_PER_COMMIT: usize = 2;
+/// Rows per length band inside a commit: the band index cycles through
+/// `0..RUNNING_LEN_BANDS` filler tokens, so lengths vary inside a
+/// commit *and* the two halves of a commit average differently — which
+/// is what makes "an earlier file of the same commit is not counted"
+/// observable in the second file's declared average.
+const RUNNING_LEN_BAND_ROWS: u64 = 150;
+const RUNNING_LEN_BANDS: u64 = 5;
+/// Planting periods of the fixture's terms.
+const RUNNING_ALPHA_PERIOD: u64 = 3;
+const RUNNING_BETA_PERIOD: u64 = 4;
+const RUNNING_GAMMA_PERIOD: u64 = 7;
+const RUNNING_NEG_PERIOD: u64 = 5;
+/// Score tolerance between the two scorers (f32 accumulation order).
+const RUNNING_SCORE_TOLERANCE: f32 = 1e-3;
+/// Relative tolerance on a declared average against the commit rule
+/// (the `f64` to `f32` step; both sides round to the same fixed point).
+const RUNNING_AVGDL_TOLERANCE: f32 = 1e-6;
+/// Truncated top-k, graded by score multiset.
+const RUNNING_TOP_K: usize = 10;
+/// Query shapes graded under `Or`: single term, union, intersection by
+/// sigil, negation of a term and of a phrase, must with should, phrase.
+const RUNNING_OR_QUERIES: [&str; 9] = [
+    "alpha",
+    "alpha beta",
+    "+alpha +beta",
+    "alpha -neg",
+    "+gamma alpha",
+    "\"alpha beta\"",
+    "beta -\"alpha beta\"",
+    "every -neg",
+    "+every gamma -neg",
+];
+/// Query shapes graded under `And`.
+const RUNNING_AND_QUERIES: [&str; 2] = ["alpha beta -neg", "gamma every"];
+
+/// The fixture corpus. `alpha beta` is adjacent wherever both occur.
+/// Longest document: five planted terms, four filler, six pad — under
+/// the length quantizer's exact region, so scores compare by value.
+fn running_average_corpus() -> Vec<(u64, String)> {
+    let n = (RUNNING_COMMITS * RUNNING_DOCS_PER_COMMIT) as u64;
+    (0..n)
+        .map(|d| {
+            let commit = d as usize / RUNNING_DOCS_PER_COMMIT;
+            let band =
+                ((d % RUNNING_DOCS_PER_COMMIT as u64) / RUNNING_LEN_BAND_ROWS) % RUNNING_LEN_BANDS;
+            let mut t = vec!["every"];
+            if d.is_multiple_of(RUNNING_ALPHA_PERIOD) {
+                t.push("alpha");
+            }
+            if d.is_multiple_of(RUNNING_BETA_PERIOD) {
+                t.push("beta");
+            }
+            if d.is_multiple_of(RUNNING_GAMMA_PERIOD) {
+                t.push("gamma");
+            }
+            if d.is_multiple_of(RUNNING_NEG_PERIOD) {
+                t.push("neg");
+            }
+            t.extend(repeat_n("fill", band as usize));
+            t.extend(repeat_n("pad", commit * RUNNING_PAD_PER_COMMIT));
+            (d, t.join(" "))
+        })
+        .collect()
+}
+
+/// Ingest the corpus in [`RUNNING_COMMITS`] commits with a writer pool
+/// of `files_per_commit` threads and the byte split target disabled, so
+/// every commit is sharded across the whole pool into that many files.
+fn build_running_average_table(corpus: &[(u64, String)], files_per_commit: usize) -> Supertable {
+    let pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(files_per_commit)
+            .build()
+            .expect("pool"),
+    );
+    let opts = SupertableOptions::new(
+        schema_id_title(),
+        vec![FtsConfig::new("title").positions(true)],
+        vec![],
+    )
+    .expect("opts")
+    .with_writer_pool(pool)
+    .with_superfile_buffer_split_mb(0);
+    let st = Supertable::create(opts).expect("create");
+    let mut w = st.writer().expect("writer");
+    for chunk in corpus.chunks(RUNNING_DOCS_PER_COMMIT) {
+        let titles: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
+        w.append(&build_title_batch(&titles)).expect("append");
+        w.commit().expect("commit");
+    }
+    drop(w);
+    st
+}
+
+/// One file of the fixture: which rows it holds and the average it
+/// declares.
+struct RunningSpan {
+    uri: SuperfileUri,
+    rows: Range<u64>,
+    declared_avgdl: f32,
+}
+
+/// The average a file declares when it joins a table whose committed
+/// totals are `committed`: the merged totals' average, rounded as the
+/// writer stores it. Both sides of the comparison run on the engine's own
+/// [`ColumnLengthStats`], so the test cannot drift from the writer's
+/// arithmetic the way a private copy of these two numbers would.
+fn declared_under(committed: ColumnLengthStats, own: &ColumnLengthStats) -> f32 {
+    let mut merged = committed;
+    merged.merge_with(own);
+    stored_avgdl(merged.avgdl())
+}
+
+/// Recover the fixture's files in row order and check each one against
+/// the corpus and the commit rule.
+///
+/// Rows reach files in append order (a commit's buffer is split into
+/// row-ordered shards and ids are assigned monotonically), so the
+/// manifest ordered by first id gives contiguous row ranges. The
+/// mapping is verified rather than assumed: each file's stored document
+/// lengths must equal the corpus's for the rows assigned to it. Each
+/// file's declared average is then checked against the rule — the
+/// totals of every file of *earlier commits* plus its own — and, for a
+/// file that is not the first of its commit, checked to differ from
+/// what counting the same commit's earlier file would have given, so
+/// the exclusion is pinned by a value that would fail, not by an
+/// arithmetic identity.
+fn running_spans(st: &Supertable, corpus: &[(u64, String)]) -> Vec<RunningSpan> {
+    let tok = default_tokenizer();
+    let dl: Vec<u32> = corpus
+        .iter()
+        .map(|(_, t)| {
+            let mut n = 0u32;
+            tok.tokenize_each(t, &mut |_| n += 1);
+            n
+        })
+        .collect();
+    let reader = st.reader().expect("reader");
+    let mut entries: Vec<Arc<SuperfileEntry>> = reader.manifest().superfiles.to_vec();
+    entries.sort_by_key(|e| e.id_min);
+
+    let mut spans = Vec::with_capacity(entries.len());
+    let mut committed = ColumnLengthStats::default();
+    let mut same_commit = ColumnLengthStats::default();
+    let mut start = 0u64;
+    for entry in &entries {
+        let rows = start..start + entry.n_docs;
+        let file = reader.open_superfile(entry).expect("open superfile");
+        let fts = file.fts().expect("full-text index");
+        let stored = fts.column_doc_lengths("title").expect("stored doc lengths");
+        assert_eq!(
+            stored,
+            dl[rows.start as usize..rows.end as usize],
+            "file {:?} does not hold rows {rows:?}: manifest order is not row order",
+            entry.uri
+        );
+        let declared = fts
+            .fts_columns_config()
+            .find(|c| c.name == "title")
+            .expect("title column")
+            .avgdl();
+
+        let first_of_commit = (start as usize).is_multiple_of(RUNNING_DOCS_PER_COMMIT);
+        if first_of_commit {
+            committed.merge_with(&same_commit);
+            same_commit = ColumnLengthStats::default();
+        }
+        let own = ColumnLengthStats::from_lengths(stored.iter().copied());
+        let expected = declared_under(committed, &own);
+        assert!(
+            (declared - expected).abs() <= RUNNING_AVGDL_TOLERANCE * expected,
+            "file at rows {rows:?} declares avgdl {declared}, the commit rule predicts {expected}"
+        );
+        if !first_of_commit {
+            let mut with_earlier_flush = committed;
+            with_earlier_flush.merge_with(&same_commit);
+            let counting_earlier_flush = declared_under(with_earlier_flush, &own);
+            assert!(
+                (declared - counting_earlier_flush).abs() > RUNNING_AVGDL_TOLERANCE * expected,
+                "fixture cannot tell whether an earlier file of the same commit was counted \
+                 ({declared} vs {counting_earlier_flush}); vary the lengths across a commit"
+            );
+        }
+        same_commit.merge_with(&own);
+        spans.push(RunningSpan {
+            uri: entry.uri,
+            rows,
+            declared_avgdl: declared,
+        });
+        start += entry.n_docs;
+    }
+    assert_eq!(
+        start as usize,
+        corpus.len(),
+        "files do not cover the corpus"
+    );
+    spans
+}
+
+/// The reference for `query`: every file's rows scored with table-wide
+/// idf at that file's declared average, merged by score then id.
+fn running_expected(
+    corpus: &[(u64, String)],
+    spans: &[RunningSpan],
+    query: &str,
+    mode: BoolMode,
+    k: usize,
+) -> Vec<(u64, f32)> {
+    let refs: Vec<(u64, &str)> = corpus.iter().map(|(i, t)| (*i, t.as_str())).collect();
+    let tok = default_tokenizer();
+    let mut all: Vec<(u64, f32)> = Vec::new();
+    for span in spans {
+        let oracle = BruteForceBm25::index(&refs, tok.as_ref()).with_avgdl(span.declared_avgdl);
+        all.extend(
+            oracle
+                .top_k_query(query, mode, tok.as_ref(), usize::MAX)
+                .into_iter()
+                .filter(|(d, _)| span.rows.contains(d)),
+        );
+    }
+    all.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    all.truncate(k);
+    all
+}
+
+/// The engine's hits for `query` under global statistics, as
+/// `(global row, score)`.
+fn running_engine_hits(
+    st: &Supertable,
+    spans: &[RunningSpan],
+    query: &str,
+    mode: BoolMode,
+    k: usize,
+) -> Vec<(u64, f32)> {
+    st.reader()
+        .expect("reader")
+        .bm25_hits(
+            "title",
+            query,
+            k,
+            Bm25SearchOptions::new()
+                .with_mode(mode)
+                .with_stats(Bm25Stats::Global),
+        )
+        .expect("bm25 search")
+        .into_iter()
+        .map(|h| {
+            let span = spans
+                .iter()
+                .find(|s| s.uri == h.superfile)
+                .expect("hit from a known file");
+            (span.rows.start + u64::from(h.local_doc_id), h.score)
+        })
+        .collect()
+}
+
+/// Grade one shape: with `k` covering every match, identical match
+/// sets and per-row scores; with a truncated `k`, identical score
+/// multisets (ties may reorder rows across files, never scores).
+fn assert_running_shape(
+    st: &Supertable,
+    corpus: &[(u64, String)],
+    spans: &[RunningSpan],
+    query: &str,
+    mode: BoolMode,
+    k: usize,
+) {
+    let want = running_expected(corpus, spans, query, mode, k);
+    let got = running_engine_hits(st, spans, query, mode, k);
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{query:?} ({mode:?}, k={k}): hit count"
+    );
+    if k >= corpus.len() {
+        let want_scores: HashMap<u64, f32> = want.iter().copied().collect();
+        for (d, s) in &got {
+            let w = want_scores
+                .get(d)
+                .unwrap_or_else(|| panic!("{query:?} ({mode:?}): row {d} is not a match"));
+            assert!(
+                (s - w).abs() <= RUNNING_SCORE_TOLERANCE,
+                "{query:?} ({mode:?}): row {d} scored {s}, reference {w}"
+            );
+        }
+    }
+    let mut got_scores: Vec<f32> = got.iter().map(|(_, s)| *s).collect();
+    let mut want_scores: Vec<f32> = want.iter().map(|(_, s)| *s).collect();
+    got_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
+    want_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
+    for (g, w) in got_scores.iter().zip(&want_scores) {
+        assert!(
+            (g - w).abs() <= RUNNING_SCORE_TOLERANCE,
+            "{query:?} ({mode:?}, k={k}): score {g} in the top-k, reference {w}"
+        );
+    }
+}
+
+/// One arm of the running-average fixture: `files_per_commit` files per
+/// commit, every shape at full and truncated depth, plus the check that
+/// a single-average reference would have disagreed.
+fn run_running_average_arm(files_per_commit: usize) {
+    let corpus = running_average_corpus();
+    let st = build_running_average_table(&corpus, files_per_commit);
+    let spans = running_spans(&st, &corpus);
+    assert_eq!(
+        spans.len(),
+        RUNNING_COMMITS * files_per_commit,
+        "every commit must produce {files_per_commit} file(s)"
+    );
+
+    for q in RUNNING_OR_QUERIES {
+        assert_running_shape(&st, &corpus, &spans, q, BoolMode::Or, corpus.len());
+        assert_running_shape(&st, &corpus, &spans, q, BoolMode::Or, RUNNING_TOP_K);
+    }
+    for q in RUNNING_AND_QUERIES {
+        assert_running_shape(&st, &corpus, &spans, q, BoolMode::And, corpus.len());
+        assert_running_shape(&st, &corpus, &spans, q, BoolMode::And, RUNNING_TOP_K);
+    }
+
+    // The fixture distinguishes the declared averages from one
+    // table-wide average: scoring every row at the corpus average
+    // disagrees with the engine on at least one row by more than the
+    // tolerance, so the agreement above is not a coincidence of the
+    // corpus.
+    let refs: Vec<(u64, &str)> = corpus.iter().map(|(i, t)| (*i, t.as_str())).collect();
+    let tok = default_tokenizer();
+    let single: HashMap<u64, f32> = BruteForceBm25::index(&refs, tok.as_ref())
+        .top_k_query("alpha", BoolMode::Or, tok.as_ref(), usize::MAX)
+        .into_iter()
+        .collect();
+    let engine = running_engine_hits(&st, &spans, "alpha", BoolMode::Or, corpus.len());
+    assert!(
+        engine
+            .iter()
+            .any(|(d, s)| (s - single[d]).abs() > RUNNING_SCORE_TOLERANCE),
+        "a single-average reference agrees with every score; the fixture's commits do not \
+         differ enough in length to exercise the declared averages"
+    );
+}
+
+/// One file per commit: each file declares the running table-wide
+/// average as of its commit, and the engine scores it there.
+#[test]
+fn running_average_with_one_file_per_commit_matches_the_reference() {
+    run_running_average_arm(1);
+}
+
+/// Two files per commit: the second file of a commit declares the
+/// average *without* the first file's rows — the manifest the writer
+/// reads has not been advanced yet — and both are scored at what they
+/// declare. A writer that folded the earlier flush in, or a reader that
+/// scored every file of a commit at one value, fails the declared-average
+/// check or the score comparison.
+#[test]
+fn running_average_with_two_files_per_commit_matches_the_reference() {
+    run_running_average_arm(2);
 }
