@@ -1197,15 +1197,11 @@ impl FtsReader {
             while i < lb_n && j < rb_n {
                 let a = ld[i];
                 let b = rd[j];
-                // One branch per step, not two. Which of the two blocks is
-                // behind is a coin flip on interleaved lists, so the
-                // `a < b` / `a > b` pair mispredicted on a large share of
-                // steps; whether the two agree is heavily biased towards
-                // "no" on any selective intersection, so it predicts well.
-                // The advances become conditional moves: the cursor that
-                // is at or behind the other steps, which advances both on
-                // a hit and exactly one otherwise — the same walk.
-                if a == b {
+                if a < b {
+                    i += 1;
+                } else if a > b {
+                    j += 1;
+                } else {
                     let score = if sink.needs_score() {
                         let norm = dl_norm_k1.get(a);
                         bm25::score_with_dl_norm_k1(c0_idf, lt[i], norm)
@@ -1214,9 +1210,9 @@ impl FtsReader {
                         0.0
                     };
                     sink.emit(a, score);
+                    i += 1;
+                    j += 1;
                 }
-                i += usize::from(a <= b);
-                j += usize::from(b <= a);
             }
             c0.pos = i;
             c1.pos = j;
