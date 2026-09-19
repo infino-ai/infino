@@ -309,10 +309,7 @@ fn and_prefer_membership(has_bitset_blocks: bool, cursors: &[TermCursor]) -> boo
         // its list before any probe is issued, and what remains is far shorter
         // than the common term's whole list, which the merge walks in full.
         return !rare.is_bitset_dense()
-            && rare
-                .df
-                .saturating_mul(AND_MEMBERSHIP_ALWAYS_DIVISOR)
-                < u64::from(max_doc);
+            && rare.df.saturating_mul(AND_MEMBERSHIP_ALWAYS_DIVISOR) < u64::from(max_doc);
     }
     let min_df = cursors.iter().map(|c| c.df).min().unwrap_or(0);
     // Very sparse rarest term: always cheaper to drive it, whatever the others.
