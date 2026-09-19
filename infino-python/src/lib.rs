@@ -33,8 +33,8 @@ use pyo3::types::{PyDict, PyList};
 
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
-    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, Stemmer, Stopwords,
-    VectorFilter,
+    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
+    Stemmer, Stopwords, VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
 // the engine's public API and reachable only under `infino/test-helpers`.
@@ -558,23 +558,26 @@ struct CompactOptions {
     min_fill_percent: Option<u8>,
     target_superfile_size_mb: Option<u64>,
     stale_seal_timeout_ms: Option<u64>,
+    recalibrate: Option<String>,
 }
 
 #[pymethods]
 impl CompactOptions {
     #[new]
-    #[pyo3(signature = (*, max_memory_mb=None, min_fill_percent=None, target_superfile_size_mb=None, stale_seal_timeout_ms=None))]
+    #[pyo3(signature = (*, max_memory_mb=None, min_fill_percent=None, target_superfile_size_mb=None, stale_seal_timeout_ms=None, recalibrate=None))]
     fn new(
         max_memory_mb: Option<u64>,
         min_fill_percent: Option<u8>,
         target_superfile_size_mb: Option<u64>,
         stale_seal_timeout_ms: Option<u64>,
+        recalibrate: Option<String>,
     ) -> Self {
         Self {
             max_memory_mb,
             min_fill_percent,
             target_superfile_size_mb,
             stale_seal_timeout_ms,
+            recalibrate,
         }
     }
 }
@@ -1012,6 +1015,7 @@ impl Table {
     #[pyo3(signature = (settings=None))]
     fn optimize(&self, py: Python<'_>, settings: Option<&CompactOptions>) -> PyResult<()> {
         let mut s = CompactionSettings::default();
+        let mut recalibrate = RecalibratePolicy::default();
         if let Some(o) = settings {
             if let Some(v) = o.max_memory_mb {
                 s.max_memory_mb = v;
@@ -1025,8 +1029,20 @@ impl Table {
             if let Some(v) = o.stale_seal_timeout_ms {
                 s.stale_seal_timeout_ms = v;
             }
+            if let Some(v) = o.recalibrate.as_deref() {
+                recalibrate = match v.to_ascii_lowercase().as_str() {
+                    "auto" => RecalibratePolicy::Auto,
+                    "force" => RecalibratePolicy::Force,
+                    "skip" => RecalibratePolicy::Skip,
+                    _ => {
+                        return Err(PyValueError::new_err(format!(
+                            "invalid recalibrate policy {v:?}: expected \"auto\", \"force\", or \"skip\""
+                        )));
+                    }
+                };
+            }
         }
-        let opts = OptimizeOptions::compact(s);
+        let opts = OptimizeOptions::compact(s).with_recalibrate(recalibrate);
         py.detach(|| self.inner.optimize(&opts))
             .map_err(optimize_err)
     }

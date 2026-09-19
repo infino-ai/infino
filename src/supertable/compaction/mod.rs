@@ -36,7 +36,7 @@ use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::CompactionSettings,
+    config::{CompactionSettings, RecalibratePolicy},
     runtime_bridge::bridge_on_runtime,
     superfile::{
         builder::SuperfileBuilder,
@@ -254,10 +254,33 @@ impl Supertable {
     /// selects compaction jobs, then for each job seals every input
     /// superfile's tombstone sidecar so no concurrent deletes can land
     /// during the merge window.
+    /// Compaction with the historical `Auto` recalibration behavior. Used by
+    /// tests; production goes through [`compact_with`] from the optimize entry
+    /// point so the caller's [`RecalibratePolicy`] is honored.
+    #[cfg(test)]
     pub(crate) fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
-        bridge_on_runtime(self.compact_async(cfg), &self.inner().query_runtime())
+        self.compact_with(cfg, RecalibratePolicy::Auto)
     }
 
+    /// Like [`compact`], but with an explicit recalibration policy. `compact`
+    /// keeps the historical `Auto` behavior for its many call sites; the
+    /// optimize entry point threads the caller's `OptimizeOptions.recalibrate`
+    /// through here so a repeated-optimize ingest loop can skip the O(N)
+    /// recalibration.
+    pub(crate) fn compact_with(
+        &self,
+        cfg: &CompactionSettings,
+        recalibrate: RecalibratePolicy,
+    ) -> Result<(), CompactionError> {
+        bridge_on_runtime(
+            self.compact_async_with(cfg, recalibrate),
+            &self.inner().query_runtime(),
+        )
+    }
+
+    /// Async compaction with the historical `Auto` recalibration behavior.
+    /// Used by tests; production goes through [`compact_async_with`].
+    #[cfg(test)]
     #[cfg_attr(
         feature = "detailed-tracing",
         tracing::instrument(name = "compact", skip_all, fields(role = self.role().as_str()))
@@ -266,7 +289,19 @@ impl Supertable {
         &self,
         cfg: &CompactionSettings,
     ) -> Result<(), CompactionError> {
-        Self::compact_one_table(self, cfg).await?;
+        self.compact_async_with(cfg, RecalibratePolicy::Auto).await
+    }
+
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "compact", skip_all, fields(role = self.role().as_str()))
+    )]
+    pub(crate) async fn compact_async_with(
+        &self,
+        cfg: &CompactionSettings,
+        recalibrate: RecalibratePolicy,
+    ) -> Result<(), CompactionError> {
+        Self::compact_one_table(self, cfg, recalibrate).await?;
         if matches!(
             self.inner().manifest.load().get_partition_strategy(),
             PartitionStrategy::VectorCell { .. }
@@ -275,7 +310,12 @@ impl Supertable {
                 .await
                 .map_err(|error| CompactionError::Refresh(error.to_string()))?;
         } else if let Some(hidden) = self.inner().vector_index_table.as_ref() {
-            Self::compact_one_table(hidden, &hidden_vector_index_compaction_settings()).await?;
+            Self::compact_one_table(
+                hidden,
+                &hidden_vector_index_compaction_settings(),
+                recalibrate,
+            )
+            .await?;
             // The hidden pass settled vector membership (merges + finalize +
             // any cell splits); its `update`s cleared the slow-CAS ref, so
             // republish the entry blob and restamp. Hidden tables have no
@@ -295,6 +335,7 @@ impl Supertable {
     pub(crate) async fn compact_one_table(
         table: &Supertable,
         cfg: &CompactionSettings,
+        recalibrate: RecalibratePolicy,
     ) -> Result<(), CompactionError> {
         let inner = table.inner();
 
@@ -466,7 +507,17 @@ impl Supertable {
             }
             _ => false,
         };
-        if hidden_ivf && (snapshot_ids() != pre_pass_ids || rerank_lags()) {
+        // Recalibration is the O(N) query-serving calibration — gate it by the
+        // caller's policy (default Auto). Skip runs no recalibration; Force always
+        // runs it; Auto keeps the changed-or-lagging condition. Storage work above
+        // already ran regardless of the policy.
+        let run_recalibrate = hidden_ivf
+            && match recalibrate {
+                RecalibratePolicy::Skip => false,
+                RecalibratePolicy::Force => true,
+                RecalibratePolicy::Auto => snapshot_ids() != pre_pass_ids || rerank_lags(),
+            };
+        if run_recalibrate {
             recalibrate_probe_laws(inner)
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;

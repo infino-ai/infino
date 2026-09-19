@@ -6706,6 +6706,191 @@ mod tests {
         );
     }
 
+    /// The recalibration policy gates the O(N) probe-law sweep without touching
+    /// the storage work: with a lagging law planted (the exact state
+    /// `optimize_repairs_a_rerank_law_cleared_beyond_its_pool` proves `Auto`
+    /// repairs), `Skip` must leave the law lagging, and a following `Force` must
+    /// repair it — so the gate defers recalibration on demand and can still be
+    /// forced back on.
+    #[test]
+    fn optimize_recalibrate_policy_skip_defers_and_force_runs() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            config::{OptimizeOptions, RecalibratePolicy},
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                manifest::list::PartitionStrategy,
+                opann,
+                writer::{CommitListMetadata, persist_commit_async},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig::new("title")],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        const N: usize = 6;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let flat = Float32Array::from(vec![1.0f32; N * dim]);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let read_routing = |hidden: &Supertable| match hidden
+            .reader()
+            .expect("hidden reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell { routing, .. } => routing,
+            other => panic!("hidden index must be VectorCell, got {other:?}"),
+        };
+
+        // Plant the same lagging-law shape the repair test uses.
+        const STALE_WIDE: u32 = 5;
+        const PLANTED_POOL: u32 = 2;
+        let PartitionStrategy::VectorCell {
+            clusters,
+            column,
+            routing: mut planted,
+        } = hidden
+            .reader()
+            .expect("hidden reader")
+            .manifest()
+            .get_partition_strategy()
+        else {
+            panic!("hidden index must be VectorCell");
+        };
+        planted.width_for_k = [STALE_WIDE, 0, 0, 0];
+        planted.rerank_for_k = [0; 4];
+        planted.rerank_pool_cells = [PLANTED_POOL; 4];
+        let list_metadata = CommitListMetadata {
+            partition_strategy: Some(PartitionStrategy::VectorCell {
+                column,
+                clusters,
+                routing: planted,
+            }),
+            drained_ranges: None,
+            global_vector_index: None,
+            superseded_cells_additions: None,
+            split_checks_additions: None,
+            graph_ref: None,
+        };
+        let hidden_storage = hidden
+            .inner()
+            .options
+            .storage
+            .clone()
+            .expect("hidden table has storage");
+        let planted_manifest = hidden
+            .block_on_query(persist_commit_async(
+                hidden.inner(),
+                hidden_storage,
+                Vec::new(),
+                &Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                list_metadata,
+            ))
+            .expect("plant cleared law");
+        hidden.inner().manifest.store(Arc::new(planted_manifest));
+        let achievable = |hidden: &Supertable| {
+            let PartitionStrategy::VectorCell { clusters, .. } = hidden
+                .reader()
+                .expect("hidden reader")
+                .manifest()
+                .get_partition_strategy()
+            else {
+                panic!("hidden index must be VectorCell");
+            };
+            opann::rerank_pool_hint(&read_routing(hidden).width_for_k, clusters.n_cent as usize)
+                as u32
+        };
+        assert!(
+            read_routing(&hidden).rerank_law_lags_pool(achievable(&hidden)),
+            "the planted state must read as lagging"
+        );
+
+        // Skip: the law-repairing recalibration must NOT run — the lag stands.
+        st.optimize(&OptimizeOptions::default().with_recalibrate(RecalibratePolicy::Skip))
+            .expect("optimize (skip)");
+        assert!(
+            read_routing(&hidden).rerank_law_lags_pool(achievable(&hidden)),
+            "Skip must leave the lagging law untouched, got {:?}",
+            read_routing(&hidden)
+        );
+
+        // Force: recalibration runs and repairs the law.
+        st.optimize(&OptimizeOptions::default().with_recalibrate(RecalibratePolicy::Force))
+            .expect("optimize (force)");
+        let repaired = read_routing(&hidden);
+        assert!(
+            !repaired.rerank_law_lags_pool(achievable(&hidden)),
+            "Force must repair the cleared law, got {repaired:?}"
+        );
+        assert!(
+            repaired.width_for_k[0] < STALE_WIDE,
+            "Force recalibration replaced the stale width, got {:?}",
+            repaired.width_for_k
+        );
+    }
+
     /// End-to-end reclaim loop: a cell split appends its children and marks the
     /// parent cell superseded (no removal); a later merge drops those superseded
     /// blocks and reclaims the parent. Every doc must resolve exactly once at
