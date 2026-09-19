@@ -182,6 +182,32 @@ impl core::marker::Unpin for infino::OptimizeError
 impl core::marker::UnsafeUnpin for infino::OptimizeError
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeError
 impl !core::panic::unwind_safe::UnwindSafe for infino::OptimizeError
+pub enum infino::RecalibratePolicy
+pub infino::RecalibratePolicy::Auto
+pub infino::RecalibratePolicy::Force
+pub infino::RecalibratePolicy::Skip
+impl core::clone::Clone for infino::RecalibratePolicy
+pub fn infino::RecalibratePolicy::clone(&self) -> infino::RecalibratePolicy
+impl core::cmp::Eq for infino::RecalibratePolicy
+impl core::cmp::PartialEq for infino::RecalibratePolicy
+pub fn infino::RecalibratePolicy::eq(&self, &infino::RecalibratePolicy) -> bool
+impl core::default::Default for infino::RecalibratePolicy
+pub fn infino::RecalibratePolicy::default() -> infino::RecalibratePolicy
+impl core::fmt::Debug for infino::RecalibratePolicy
+pub fn infino::RecalibratePolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::RecalibratePolicy
+impl core::marker::StructuralPartialEq for infino::RecalibratePolicy
+impl serde_core::ser::Serialize for infino::RecalibratePolicy
+pub fn infino::RecalibratePolicy::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for infino::RecalibratePolicy
+pub fn infino::RecalibratePolicy::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for infino::RecalibratePolicy
+impl core::marker::Send for infino::RecalibratePolicy
+impl core::marker::Sync for infino::RecalibratePolicy
+impl core::marker::Unpin for infino::RecalibratePolicy
+impl core::marker::UnsafeUnpin for infino::RecalibratePolicy
+impl core::panic::unwind_safe::RefUnwindSafe for infino::RecalibratePolicy
+impl core::panic::unwind_safe::UnwindSafe for infino::RecalibratePolicy
 #[non_exhaustive] pub enum infino::Stemmer
 pub infino::Stemmer::English
 pub infino::Stemmer::None
@@ -452,6 +478,7 @@ pub struct infino::OptimizeOptions
 impl infino::OptimizeOptions
 pub fn infino::OptimizeOptions::compact(infino::CompactionSettings) -> Self
 pub fn infino::OptimizeOptions::with_gc(self, infino::GcSettings) -> Self
+pub fn infino::OptimizeOptions::with_recalibrate(self, infino::RecalibratePolicy) -> Self
 impl core::clone::Clone for infino::OptimizeOptions
 pub fn infino::OptimizeOptions::clone(&self) -> infino::OptimizeOptions
 impl core::default::Default for infino::OptimizeOptions
