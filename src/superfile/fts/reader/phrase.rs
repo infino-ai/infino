@@ -779,6 +779,7 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
         builder::FtsBuilder,
+        posting::BLOCK_LEN,
         reader::{FtsReader, core::ClauseLists},
         tokenize::{AsciiLowerTokenizer, Phrase},
     };
@@ -984,6 +985,102 @@ mod tests {
                     (sp - sa).abs() < 1e-4,
                     "score mismatch k={k} rank {i}: {sp} vs {sa}"
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_must_bound_is_refreshed_when_a_candidate_leaves_its_block() {
+        // A conjunction that carries a phrase bounds its required clauses
+        // once per block and reuses that bound until a candidate passes the
+        // block it was measured over. This corpus makes the reuse window
+        // decide the answer: every document in a block is shaped alike, so
+        // the bound equals the score it bounds, and each successive block
+        // repeats the phrase a little more in a slightly shorter document,
+        // so the best matches are the last ones the walk reaches. A bound
+        // that outlived its block would be an under-bound for all of them,
+        // and the moment the heap's bar climbed past it every later
+        // document would be skipped unscored.
+        //
+        // Half the documents hold the phrase's words in order and half hold
+        // them one token apart. The two spellings have the same length and
+        // the same per-word frequencies, so they are indistinguishable to
+        // the block maxima and only verification separates them.
+        const N_BLOCKS: u32 = 24;
+        const N_DOCS: u32 = BLOCK_LEN as u32 * N_BLOCKS;
+        /// Tokens per document, held constant so every document shares one
+        /// length norm and the ranking turns on the phrase count alone.
+        const DOC_LEN: u32 = 76;
+        /// Tokens each repetition of the phrase spelling costs.
+        const TOKENS_PER_REP: u32 = 3;
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        for d in 0..N_DOCS {
+            let block = d / BLOCK_LEN as u32;
+            let reps = 1 + block;
+            let pad = DOC_LEN - 1 - TOKENS_PER_REP * reps;
+            let mut text = String::new();
+            for _ in 0..reps {
+                match d.is_multiple_of(2) {
+                    true => text.push_str("alpha beta sep "),
+                    false => text.push_str("alpha sep beta "),
+                }
+            }
+            text.push_str("gamma ");
+            for i in 0..pad {
+                text.push_str(&format!("pad{i:02} "));
+            }
+            b.add_doc(0, d, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let ab = phrase(&["alpha", "beta"]);
+
+        // The phrase alone, and the phrase beside a term that every
+        // document carries: in the first the reuse window comes from the
+        // phrase's own members, in the second from whichever required
+        // clause ends its block first.
+        for (label, musts) in [("phrase", &[][..]), ("phrase + term", &["gamma"][..])] {
+            let clauses = || ClauseLists {
+                musts,
+                must_phrases: &ab,
+                ..ClauseLists::default()
+            };
+            // Above the match count the heap never fills, the bar stays at
+            // negative infinity and no bound is consulted: the oracle.
+            let mut all = r
+                .search_excluding("title", clauses(), N_DOCS as usize + 1, f32::NEG_INFINITY)
+                .await
+                .expect("unpruned");
+            assert_eq!(
+                all.len(),
+                N_DOCS as usize / 2,
+                "{label}: every even document matches"
+            );
+            all.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            // The best matches must come from the last block, or the corpus
+            // does not exercise what the test is for.
+            assert!(
+                all[0].0 >= N_DOCS - BLOCK_LEN as u32,
+                "{label}: best match {} is not in the last block",
+                all[0].0
+            );
+            for k in [1usize, 3, 10, 64, 200] {
+                let pruned = r
+                    .search_excluding("title", clauses(), k, f32::NEG_INFINITY)
+                    .await
+                    .expect("pruned");
+                assert_eq!(pruned.len(), k, "{label} k={k}");
+                for (i, ((dp, sp), (da, sa))) in pruned.iter().zip(all.iter()).enumerate() {
+                    assert_eq!(
+                        dp, da,
+                        "{label}: doc mismatch k={k} rank {i}: pruned={dp} oracle={da}"
+                    );
+                    assert!(
+                        (sp - sa).abs() < 1e-4,
+                        "{label}: score mismatch k={k} rank {i}: {sp} vs {sa}"
+                    );
+                }
             }
         }
     }
