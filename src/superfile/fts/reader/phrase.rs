@@ -624,6 +624,21 @@ impl PhraseCursor {
         }
         self.idf_weight * min_scaled
     }
+
+    /// [`Self::block_max_in_range`] at a single doc, plus the last doc it
+    /// holds for: the nearest end among the members' blocks holding `doc`.
+    /// Each member's inspect pointer sits on that block after the bound is
+    /// read, so the ends cost nothing further.
+    pub(super) fn block_bound_at(&mut self, doc: u32) -> (f32, u32) {
+        let mut min_scaled = f32::INFINITY;
+        let mut valid_to = u32::MAX;
+        for m in self.members.iter_mut() {
+            let b = m.cursor.block_max_in_range(doc, doc);
+            min_scaled = min_scaled.min(b / m.cursor.idf_weight);
+            valid_to = valid_to.min(m.cursor.inspect_block_last_doc_id());
+        }
+        (self.idf_weight * min_scaled, valid_to)
+    }
 }
 
 /// A query atom's cursor: a plain term or an exact phrase. The atom
@@ -741,12 +756,18 @@ impl AnyCursor {
         }
     }
 
-    /// Score upper bound over the doc range (see the cursors' docs).
-    #[inline]
-    pub(super) fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
+    /// The atom's block-max bound at `doc`, together with the last doc the
+    /// bound stays valid for: the end of the block holding `doc` (for a
+    /// phrase, the nearest such end across its members). A walk that visits
+    /// candidates in ascending order reuses the bound until a candidate
+    /// passes that doc, instead of re-deriving it per candidate.
+    pub(super) fn block_bound_at(&mut self, doc: u32) -> (f32, u32) {
         match self {
-            AnyCursor::Term(c) => c.block_max_in_range(range_start, range_end),
-            AnyCursor::Phrase(c) => c.block_max_in_range(range_start, range_end),
+            AnyCursor::Term(c) => {
+                let ub = c.block_max_in_range(doc, doc);
+                (ub, c.inspect_block_last_doc_id())
+            }
+            AnyCursor::Phrase(c) => c.block_bound_at(doc),
         }
     }
 }

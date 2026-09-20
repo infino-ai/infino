@@ -242,6 +242,14 @@ impl FtsReader {
             atom_slack(&shoulds, must_ub_total)
         };
         let mut target = 0u32;
+        // The musts' block-max bound at a candidate holds until the candidate
+        // passes the nearest end among their blocks, so it is re-derived only
+        // then. Per candidate it was a walk over every must's blocks — and a
+        // phrase must walks every member's — for an answer that almost never
+        // changed between neighbouring candidates.
+        let mut must_ub = 0.0f32;
+        let mut must_ub_holds_to = 0u32;
+        let mut have_must_ub = false;
         'docs: loop {
             let floor_live = floor_now();
             let bar = match heap.len() >= k {
@@ -272,10 +280,16 @@ impl FtsReader {
             // the incumbent kth-best on the ascending-doc-id tie-break.
             let scoring_needed = match bar > f32::NEG_INFINITY {
                 true => {
-                    let must_ub: f32 = musts
-                        .iter_mut()
-                        .map(|a| a.block_max_in_range(aligned, aligned))
-                        .sum();
+                    if !have_must_ub || aligned > must_ub_holds_to {
+                        must_ub = 0.0;
+                        must_ub_holds_to = u32::MAX;
+                        for a in musts.iter_mut() {
+                            let (ub, holds_to) = a.block_bound_at(aligned);
+                            must_ub += ub;
+                            must_ub_holds_to = must_ub_holds_to.min(holds_to);
+                        }
+                        have_must_ub = true;
+                    }
                     must_ub + should_ub >= bar
                 }
                 false => true,
