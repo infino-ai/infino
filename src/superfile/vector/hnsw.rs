@@ -1034,7 +1034,26 @@ impl Hnsw {
     /// shared, lock-guarded adjacency (see [`ParBuild`]). The result is a
     /// plain immutable graph — identical in shape/semantics to a serial
     /// build, just not bit-identical across runs.
+    ///
+    /// Prefer [`build_serial`] where placement must be reproducible run to run
+    /// (e.g. the drain-assign coarse router, whose cell membership feeds the
+    /// cold-read block layout), at the cost of parallelism.
     pub(crate) fn build<S: NodeScorer + Sync>(scorer: &S, params: HnswParams) -> Hnsw {
+        Self::build_impl(scorer, params, true)
+    }
+
+    /// Deterministic counterpart to [`build`]: inserts nodes serially in id
+    /// order on one thread, so the finished graph is bit-identical run to run.
+    /// The seeded layer tower and diversity heuristic are already
+    /// order-independent; the concurrent insert reordering is the only source
+    /// of run-to-run variance in [`build`], and a serial insert removes it.
+    /// Costs parallelism — intended for small graphs (e.g. a few thousand cell
+    /// centroids) where reproducible placement matters more than build speed.
+    pub(crate) fn build_serial<S: NodeScorer + Sync>(scorer: &S, params: HnswParams) -> Hnsw {
+        Self::build_impl(scorer, params, false)
+    }
+
+    fn build_impl<S: NodeScorer + Sync>(scorer: &S, params: HnswParams, parallel: bool) -> Hnsw {
         let n = scorer.len();
         if n == 0 {
             return Hnsw {
@@ -1080,14 +1099,24 @@ impl Hnsw {
             ef_construction: params.ef_construction,
         };
 
-        // Insert nodes 1..n concurrently. `for_each_init` calls `init` once per
-        // job (a contiguous run of items a worker processes), not once per
+        // Insert nodes 1..n. In parallel mode `for_each_init` calls `init` once
+        // per job (a contiguous run of items a worker processes), not once per
         // element, so the O(n) epoch buffer is amortized across many inserts
-        // rather than allocated per insert.
-        (1..n as u32).into_par_iter().for_each_init(
-            || VisitedSet::new(n),
-            |visited, node| builder.insert(scorer, node, visited),
-        );
+        // rather than allocated per insert. In serial mode nodes go in fixed id
+        // order on one thread, making the finished graph bit-identical run to
+        // run — the concurrent insert reordering is the only nondeterminism in
+        // the parallel path.
+        if parallel {
+            (1..n as u32).into_par_iter().for_each_init(
+                || VisitedSet::new(n),
+                |visited, node| builder.insert(scorer, node, visited),
+            );
+        } else {
+            let mut visited = VisitedSet::new(n);
+            for node in 1..n as u32 {
+                builder.insert(scorer, node, &mut visited);
+            }
+        }
 
         let entry = builder
             .entry
@@ -3287,7 +3316,7 @@ fn select_neighbors_heuristic<S: NodeScorer>(
 /// also the deterministic build the equality-sensitive tests use.
 #[cfg(test)]
 impl Hnsw {
-    fn build_serial<S: NodeScorer>(scorer: &S, params: HnswParams) -> Hnsw {
+    fn build_serial_reference<S: NodeScorer>(scorer: &S, params: HnswParams) -> Hnsw {
         let n = scorer.len();
         let mut g = Hnsw {
             neighbors: Vec::with_capacity(n),
@@ -3727,7 +3756,7 @@ mod tests {
         let scorer = Sq16Scorer::from_unit_vectors(&vectors, dim);
         let (m0_small, m0_max, efc) = (8usize, 64usize, 200usize);
 
-        let native = Hnsw::build_serial(
+        let native = Hnsw::build_serial_reference(
             &scorer,
             HnswParams {
                 m0: m0_small,
@@ -3735,7 +3764,7 @@ mod tests {
                 ..HnswParams::default()
             },
         );
-        let base = Hnsw::build_serial(
+        let base = Hnsw::build_serial_reference(
             &scorer,
             HnswParams {
                 m0: m0_max,
@@ -5012,7 +5041,7 @@ mod tests {
         let threads = rayon::current_num_threads();
 
         let t = Instant::now();
-        let serial = Hnsw::build_serial(&scorer, HnswParams::default());
+        let serial = Hnsw::build_serial_reference(&scorer, HnswParams::default());
         let serial_s = t.elapsed().as_secs_f64();
 
         let t = Instant::now();

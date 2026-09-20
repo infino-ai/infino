@@ -4577,10 +4577,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     } else if use_graph_assign {
                         // Graph-routed assign. Build the coarse centroid router
                         // ONCE for the drain, lazily on the first batch with
-                        // rows, INSIDE the writer pool so `Hnsw::build`'s rayon
-                        // par_iter stays on it. The result type is identical to
-                        // the shortlist path, so the spill/replica code below is
-                        // untouched.
+                        // rows. The build is serial + deterministic (see
+                        // `Hnsw::build_serial`) so cell placement is reproducible
+                        // run to run; the writer-pool install below is for the
+                        // per-row assignment fan-out. The result type is
+                        // identical to the shortlist path, so the spill/replica
+                        // code below is untouched.
                         // Cosine-only path (gated above), so ef is the cosine
                         // beam: max(16, round(sqrt(n_cent)/4)).
                         let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize, metric);

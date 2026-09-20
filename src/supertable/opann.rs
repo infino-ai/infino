@@ -400,7 +400,12 @@ pub(crate) fn build_coarse_router(
         node_to_cell.push(c as u32);
     }
     let scorer = Fp32Scorer::from_vectors(&centroids, dim, metric);
-    let graph = Hnsw::build(&scorer, HnswParams::default());
+    // Serial (deterministic) build: the coarse router decides drain-assign cell
+    // membership, and the parallel build's concurrent insert reordering shifts
+    // membership for a thin tail of boundary rows run to run, perturbing the
+    // post-drain cold-read block layout. A serial build over these few thousand
+    // centroids is negligible and makes placement reproducible.
+    let graph = Hnsw::build_serial(&scorer, HnswParams::default());
     (scorer, graph, node_to_cell)
 }
 
