@@ -1045,7 +1045,7 @@ impl FtsReader {
             // its own bar by the shoulds' ceiling, so that is exactly where it
             // never bites — and where paying a lookup and a divide per leader
             // doc showed up as a few percent.
-            let screen_on = sink.needs_score() && bar - screen_ub > 0.0;
+            let screen_on = sink.screenable() && sink.needs_score() && bar - screen_ub > 0.0;
 
             // Align every non-leader cursor to >= leader's current doc.
             // Largest landing-doc becomes the new alignment target if

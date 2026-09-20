@@ -144,6 +144,18 @@ pub(super) trait AndSink {
     /// unranked count over a large intersection cheaper than ranking it.
     fn needs_score(&self) -> bool;
 
+    /// Whether a leader doc's own score, tested against [`bar`](AndSink::bar),
+    /// is worth computing to reject the doc before the walk touches any other
+    /// term. True for a sink whose bar is the score a hit must actually beat.
+    ///
+    /// False for a sink that deliberately reports a bar *below* that, which no
+    /// leader-side screen can make up for: the gap between the two is exactly
+    /// the room the screen would have needed to reject anything, so it pays a
+    /// norm lookup and a divide per leader doc and rejects almost nothing.
+    fn screenable(&self) -> bool {
+        true
+    }
+
     /// Record one doc in the intersection. `score` is meaningful only
     /// when [`needs_score`](AndSink::needs_score) returns `true`;
     /// otherwise it is `0.0` and ignored.
@@ -226,6 +238,14 @@ impl AndSink for MustShouldSink<'_> {
 
     fn needs_score(&self) -> bool {
         true
+    }
+
+    /// The bar above is the k-th best lowered by every should term's maximum,
+    /// so that a doc carrying all the musts and no should is still reachable.
+    /// A must-only leader score tested against it is short by that same
+    /// discount, which is why the screen cannot pay here.
+    fn screenable(&self) -> bool {
+        false
     }
 
     fn emit(&mut self, doc: u32, must_score: f32) {
