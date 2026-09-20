@@ -910,6 +910,11 @@ impl Default for VectorSettings {
 pub struct DiagnosticsSettings {
     /// Accumulate per-phase timers during the vector drain build.
     pub drain_build_timers: bool,
+    /// Emit top-level optimize() phase timers ([optphase]: drain / split / merge
+    /// / recalibrate / settle / compact_total / router_cache) plus the merge
+    /// splice-vs-rebuild split ([optmerge]). Off by default; a measuring stick
+    /// for compaction scaling work.
+    pub optimize_phase_timers: bool,
     /// Emit the FTS builder's finish-phase profile.
     pub fts_profile: bool,
     /// Capture the object-store I/O timeline.

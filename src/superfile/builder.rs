@@ -1442,8 +1442,17 @@ impl SuperfileBuilder {
 
             let mut cell_ids: Vec<u32> = by_cell.keys().copied().collect();
             cell_ids.sort_unstable();
+            // [optmerge] per-phase split: cells taking the cheap byte-splice
+            // (I/O + memcpy) vs the full decode/re-cluster/re-encode rebuild, and
+            // the wall in each. Gated, off by default.
+            let __merge_timers = crate::config::global().diagnostics.optimize_phase_timers;
+            let mut __splice_cells = 0usize;
+            let mut __rebuild_cells = 0usize;
+            let mut __splice_ns: u128 = 0;
+            let mut __rebuild_ns: u128 = 0;
             for cell_id in cell_ids {
                 let sources = by_cell.remove(&cell_id).expect("cell present");
+                let __mt = std::time::Instant::now();
                 let same_shape = sources
                     .windows(2)
                     .all(|pair| pair[0].2.n_cent == pair[1].2.n_cent);
@@ -1486,6 +1495,8 @@ impl SuperfileBuilder {
                     }
                     all_stable_ids.extend_from_slice(&cell_ids_col);
                     packed_cells.push((cell_id, merged));
+                    __splice_ns += __mt.elapsed().as_nanos();
+                    __splice_cells += 1;
                     continue;
                 }
                 // Reached when the sources disagree on fine `n_cent` (a small
@@ -1521,6 +1532,17 @@ impl SuperfileBuilder {
                 }
                 all_stable_ids.extend_from_slice(&stable_ids);
                 packed_cells.push((cell_id, merged));
+                __rebuild_ns += __mt.elapsed().as_nanos();
+                __rebuild_cells += 1;
+            }
+            if __merge_timers {
+                eprintln!(
+                    "[optmerge] cells splice {} ({:.1}s)  rebuild {} ({:.1}s)",
+                    __splice_cells,
+                    __splice_ns as f64 / 1e9,
+                    __rebuild_cells,
+                    __rebuild_ns as f64 / 1e9,
+                );
             }
         }
 

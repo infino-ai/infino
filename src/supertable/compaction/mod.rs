@@ -301,14 +301,22 @@ impl Supertable {
         cfg: &CompactionSettings,
         recalibrate: RecalibratePolicy,
     ) -> Result<(), CompactionError> {
+        let phase_timers = crate::config::global().diagnostics.optimize_phase_timers;
         Self::compact_one_table(self, cfg, recalibrate).await?;
         if matches!(
             self.inner().manifest.load().get_partition_strategy(),
             PartitionStrategy::VectorCell { .. }
         ) {
-            refresh_slow_vector_state(self.inner())
-                .await
-                .map_err(|error| CompactionError::Refresh(error.to_string()))?;
+            let __st = std::time::Instant::now();
+            refresh_slow_vector_state(
+                self.inner(),
+                !matches!(recalibrate, RecalibratePolicy::Skip),
+            )
+            .await
+            .map_err(|error| CompactionError::Refresh(error.to_string()))?;
+            if phase_timers {
+                eprintln!("[optphase]   settle {:.1}s", __st.elapsed().as_secs_f64());
+            }
         } else if let Some(hidden) = self.inner().vector_index_table.as_ref() {
             Self::compact_one_table(
                 hidden,
@@ -321,9 +329,16 @@ impl Supertable {
             // republish the entry blob and restamp. Hidden tables have no
             // manifest parts, so publication is required for reopen and a
             // failure must be visible to the caller.
-            refresh_slow_vector_state(hidden.inner())
-                .await
-                .map_err(|error| CompactionError::Refresh(error.to_string()))?;
+            let __st = std::time::Instant::now();
+            refresh_slow_vector_state(
+                hidden.inner(),
+                !matches!(recalibrate, RecalibratePolicy::Skip),
+            )
+            .await
+            .map_err(|error| CompactionError::Refresh(error.to_string()))?;
+            if phase_timers {
+                eprintln!("[optphase]   settle {:.1}s", __st.elapsed().as_secs_f64());
+            }
         }
         Ok(())
     }
@@ -392,10 +407,16 @@ impl Supertable {
         } else {
             HashSet::new()
         };
+        // Optimize phase timers ([optphase]); gated, off by default.
+        let phase_timers = crate::config::global().diagnostics.optimize_phase_timers;
+        let mut __pt = Instant::now();
         if hidden_ivf {
             split_overflow_cells(Arc::clone(inner))
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
+        }
+        if phase_timers {
+            eprintln!("[optphase]   split {:.1}s", __pt.elapsed().as_secs_f64());
         }
 
         let manifest = inner.manifest.load_full();
@@ -479,12 +500,18 @@ impl Supertable {
                 jobs = jobs.len(),
                 "compaction jobs planned"
             );
+            if phase_timers {
+                __pt = Instant::now();
+            }
             for job in jobs {
                 table.run_compaction_job(job, stale_seal_timeout).await?;
                 table
                     .refresh()
                     .await
                     .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+            }
+            if phase_timers {
+                eprintln!("[optphase]   merge {:.1}s", __pt.elapsed().as_secs_f64());
             }
         }
 
@@ -518,9 +545,18 @@ impl Supertable {
                 RecalibratePolicy::Auto => snapshot_ids() != pre_pass_ids || rerank_lags(),
             };
         if run_recalibrate {
+            if phase_timers {
+                __pt = Instant::now();
+            }
             recalibrate_probe_laws(inner)
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
+            if phase_timers {
+                eprintln!(
+                    "[optphase]   recalibrate {:.1}s",
+                    __pt.elapsed().as_secs_f64()
+                );
+            }
         }
 
         let clamped_components = transcode_clamped_components() - transcode_clamp_baseline;
