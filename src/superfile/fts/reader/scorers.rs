@@ -1929,6 +1929,10 @@ impl FtsReader {
         let mut win_scores: Vec<f32> = Vec::with_capacity(OR_WINDOW as usize);
         // Per-window block-level upper bounds and their suffix sums, in the
         // same term-max order as `partial_max`.
+        // Non-essential block-max bound for the single-essential path, and its
+        // suffix sums, both rebuilt only when a candidate leaves the doc range
+        // the bound was measured over.
+        let mut noness_ub = vec![0.0_f32; n];
         let mut win_ub = vec![0.0_f32; n];
         let mut win_docs_est = vec![0.0_f32; n];
         let mut partial_win = vec![0.0_f32; n + 1];
@@ -1963,6 +1967,15 @@ impl FtsReader {
                 let block_end = cursors[0].current_block_last_doc_id();
                 let (ess, non_ess) = cursors.split_at_mut(1);
                 let c0 = &mut ess[0];
+                // The non-essentials' bound changes only when a candidate
+                // crosses one of their block boundaries, which for a rare
+                // essential term is far less often than once a candidate.
+                // Track the doc up to which the last measurement still holds
+                // and reuse it until then, instead of walking every
+                // non-essential per candidate.
+                let mut others_ub = 0.0f32;
+                let mut bound_holds_to = 0u32;
+                let mut have_bound = false;
                 while !c0.is_exhausted()
                     && c0.current_doc_id() <= block_end
                     && c0.current_doc_id() < doc_id_end
@@ -1984,10 +1997,17 @@ impl FtsReader {
                     // skip below fires on many more docs, dropping the completion
                     // probe + heap work — the dominant per-doc cost on a dense
                     // leader query.
-                    let mut others_ub = 0.0f32;
-                    for c in non_ess.iter_mut() {
-                        c.shallow_advance_block_to(candidate);
-                        others_ub += c.inspect_block_max_bm25();
+                    if !have_bound || candidate > bound_holds_to {
+                        others_ub = 0.0;
+                        bound_holds_to = u32::MAX;
+                        for (i, c) in non_ess.iter_mut().enumerate() {
+                            c.shallow_advance_block_to(candidate);
+                            let ub = c.inspect_block_max_bm25();
+                            noness_ub[i] = ub;
+                            others_ub += ub;
+                            bound_holds_to = bound_holds_to.min(c.inspect_block_last_doc_id());
+                        }
+                        have_bound = true;
                     }
                     if essential_score + others_ub <= threshold {
                         c0.next();
