@@ -3300,6 +3300,11 @@ mod tests {
         // MaxScore+BMM, including k = 1 (stopword non-essential outright) and
         // a k the heap never fills.
         const N_DOCS: u32 = OR_WINDOW * 3 + 500;
+        /// Where in each window's span the rare term sits. The common term
+        /// covers four docs in five, so its blocks end off the window cap and
+        /// one of them straddles it; this offset puts the rare doc inside that
+        /// block, past the cap.
+        const RARE_OFFSET: u32 = 200;
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
@@ -3316,7 +3321,11 @@ mod tests {
                     text.push_str("the ");
                 }
             }
-            if i == OR_WINDOW + 3 || i == 2 * OR_WINDOW + 1 || i == N_DOCS - 7 {
+            // Just past a window cap, inside the common term's block that
+            // straddles it: the block cannot be skipped on the sole-essential
+            // bound, which counts no other essential term, because this doc
+            // lies beyond the window that bound was taken over.
+            if i % OR_WINDOW == RARE_OFFSET {
                 text.push_str("incredibles ");
             }
             b.add_doc(0, i, text.trim()).expect("add doc");
@@ -3325,7 +3334,18 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         for terms in [&["the", "incredibles"], &["incredibles", "the"]] {
-            for k in [1usize, 3, 10, 128, 600, 1500, 3000, N_DOCS as usize + 1] {
+            for k in [
+                1usize,
+                3,
+                10,
+                50,
+                128,
+                200,
+                600,
+                1500,
+                3000,
+                N_DOCS as usize + 1,
+            ] {
                 let bmm = r
                     .search_with_algo_for_bench("body", terms, k, OrAlgo::Bmm)
                     .await
