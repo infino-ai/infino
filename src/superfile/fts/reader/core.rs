@@ -22,6 +22,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -96,6 +97,14 @@ pub(crate) struct ClauseLists<'a> {
     /// kth into it as their heaps fill. `None` on single-superfile
     /// entry points, where there is no fan-out to share with.
     pub live_floor: Option<&'a LiveFloor>,
+    /// The rows this search may rank at all, as this superfile's
+    /// `local_doc_id`s — a SQL `WHERE` pushed into the search and
+    /// resolved against the index. Every kernel admits a doc into its
+    /// heap only if the set holds it, so the top-k fills from allowed
+    /// rows instead of being a post-filtered global top-k that
+    /// underflows. `None` ranks every matching row. Owned (`Arc`), not
+    /// borrowed: the prepared clauses carry it into a `'static` kernel.
+    pub allow: Option<Arc<RoaringBitmap>>,
 }
 
 impl ClauseLists<'_> {

@@ -556,9 +556,11 @@ impl FtsReader {
                 + must_dict
                 + should_dict
                 + negative_dict;
-            let filter = match negative_atoms.is_empty() {
-                true => None,
-                false => Some(AtomExcludeFilter::new(negative_atoms)),
+            // The gate exists when there is anything to gate on: a negated
+            // atom, or a pushed-down row set.
+            let filter = match (negative_atoms.is_empty(), lists.allow.clone()) {
+                (true, None) => None,
+                (_, allow) => Some(AtomExcludeFilter::with_allow(negative_atoms, allow)),
             };
             // The atom walk is the whole kernel for phrase shapes —
             // `run_prepared` sees only the finished `Done` — so bracket
@@ -582,19 +584,25 @@ impl FtsReader {
             });
         }
 
-        let neg_filter = match lists.negatives {
-            [] => None,
-            // Negatives are a hard exclusion filter, not scored, so their
-            // idf is irrelevant — always build them with local stats.
-            _ => Some(ExcludeFilter::new(
-                self.build_term_cursors(column_id, lists.negatives, None, false, None, None)
-                    .await?,
-            )),
+        // Negatives are a hard exclusion filter, not scored, so their
+        // idf is irrelevant — always build them with local stats.
+        let neg_cursors = match lists.negatives {
+            [] => Vec::new(),
+            negatives => {
+                self.build_term_cursors(column_id, negatives, None, false, None, None)
+                    .await?
+            }
         };
         // FST-dictionary ranges the builds below request — one per
         // `build_term_cursors` call (the dictionary fetch is a real
         // byte-source range on every query, warm or cold).
-        let mut dict_ranges = u64::from(neg_filter.is_some());
+        let mut dict_ranges = u64::from(!lists.negatives.is_empty());
+        // The gate exists when there is anything to gate on: a negated
+        // term present in this superfile, or a pushed-down row set.
+        let neg_filter = match (neg_cursors.is_empty(), lists.allow.clone()) {
+            (true, None) => None,
+            (_, allow) => Some(ExcludeFilter::with_allow(neg_cursors, allow)),
+        };
 
         // Fold repeated MUST/SHOULD terms into one weighted cursor each: the
         // repeat count becomes a query-term-frequency multiplier on the term's
@@ -1719,9 +1727,13 @@ mod tests {
     use std::{collections::HashSet, sync::Arc};
 
     use bytes::Bytes;
+    use roaring::RoaringBitmap;
 
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
+    use crate::superfile::fts::{
+        builder::FtsBuilder,
+        tokenize::{AsciiLowerTokenizer, Phrase},
+    };
 
     #[tokio::test]
     async fn search_returns_exact_doc_ids_for_known_term() {
@@ -1910,6 +1922,127 @@ mod tests {
             .expect("search excluding");
         let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(ids, vec![1], "doc 0 excluded by negated 'async'");
+    }
+
+    /// A pushed-down allow-set bounds every clause shape the same way: the
+    /// single-term BMW fast path, a multi-term union, a must intersection,
+    /// and the phrase walk each rank only the allowed docs, and an
+    /// allow-set composes with a negated term.
+    #[tokio::test]
+    async fn allow_set_bounds_every_clause_shape() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let ids = |hits: &[(u32, f32)]| {
+            let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+            ids.sort_unstable();
+            ids
+        };
+        // "rust" is in docs 0 and 1; allow doc 1 only.
+        let only_one: Option<Arc<RoaringBitmap>> = Some(Arc::new([1u32].into_iter().collect()));
+        let single = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    shoulds: &["rust"],
+                    allow: only_one.clone(),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("single-term search");
+        assert_eq!(ids(&single), vec![1], "single-term path honours the set");
+
+        // "rust" OR "spring": docs 0, 1, 2 match; allow docs 0 and 2.
+        let zero_two: Option<Arc<RoaringBitmap>> = Some(Arc::new([0u32, 2].into_iter().collect()));
+        let union = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    shoulds: &["rust", "spring"],
+                    allow: zero_two.clone(),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("union search");
+        assert_eq!(ids(&union), vec![0, 2], "union path honours the set");
+
+        // "rust" AND "runtime": docs 0 and 1 match; allow docs 0 and 2.
+        let intersection = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    musts: &["rust", "runtime"],
+                    allow: zero_two.clone(),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("intersection search");
+        assert_eq!(ids(&intersection), vec![0], "must path honours the set");
+
+        // Allow-set plus a negated term: "rust" in docs 0, 1; allow 0 and
+        // 2; negate "async" (doc 0) — nothing survives both gates.
+        let gated = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    shoulds: &["rust"],
+                    negatives: &["async"],
+                    allow: zero_two,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("gated search");
+        assert!(gated.is_empty(), "allow-set and negation both apply");
+
+        // Phrase walk: "new york" matches docs 0, 2, 4 of the phrase
+        // corpus; allow docs 2 and 3.
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open phrase blob");
+        let phrases = vec![Phrase::adjacent(vec![
+            "new".to_string(),
+            "york".to_string(),
+        ])];
+        let phrase_hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    allow: Some(Arc::new([2u32, 3].into_iter().collect())),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        assert_eq!(ids(&phrase_hits), vec![2], "phrase walk honours the set");
+
+        // An empty allow-set ranks nothing, whatever matches.
+        let none = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    shoulds: &["new"],
+                    allow: Some(Arc::new(RoaringBitmap::new())),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("empty-set search");
+        assert!(none.is_empty());
     }
 
     #[tokio::test]

@@ -107,7 +107,7 @@ use crate::{
         },
     },
     supertable::{
-        SuperfileEntry,
+        SuperfileEntry, SupertableOptions,
         manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
@@ -393,41 +393,6 @@ impl SupertableProvider {
         merged
     }
 
-    /// Lower scalar predicates to prune leaves. Each predicate yields a
-    /// `Scalar` leaf; additionally, an equality on an FTS-indexed text
-    /// column also yields a `TermPresence` leaf so the superfile's term
-    /// bloom prunes it. Sound: a row matching `col = 'a b'` has a value
-    /// whose tokens include every token of the literal, so requiring all
-    /// of them possibly-present (`BoolMode::And`) never drops a match —
-    /// bloom false positives can only keep a superfile, never drop one.
-    fn predicates_to_prune_leaves(&self, predicates: Vec<ScalarPredicate>) -> Vec<PruneLeaf> {
-        let opts = &self.manifest.options;
-        let mut leaves = Vec::with_capacity(predicates.len());
-        for pred in predicates {
-            if pred.op == ScalarOp::Eq
-                && opts.fts_columns.iter().any(|c| c.column == pred.column)
-                && let Some(literal) = scalar_as_str(&pred.value)
-            {
-                // Per-column analyzer: prune with the tokenizer this column
-                // was indexed with, not a single table-wide default.
-                let Some(tok) = opts.try_fts_tokenizer_for(&pred.column) else {
-                    leaves.push(PruneLeaf::Scalar(pred));
-                    continue;
-                };
-                let terms: Vec<String> = tok.tokenize(literal).collect();
-                if !terms.is_empty() {
-                    leaves.push(PruneLeaf::TermPresence {
-                        column: pred.column.clone(),
-                        terms,
-                        mode: BoolMode::And,
-                    });
-                }
-            }
-            leaves.push(PruneLeaf::Scalar(pred));
-        }
-        leaves
-    }
-
     // Lower `filters` to prune leaves and select the superfiles that
     // survive the two-tier prune — per-part aggregates (ManifestPartEntry)
     // first, then per-superfile stats (SuperfileEntry).
@@ -435,25 +400,7 @@ impl SupertableProvider {
     // Pure manifest work: reads stats only, opens no superfile. Returns the
     // survivor entries; `scan` is what opens and reads them.
     async fn select_survivors(&self, filters: &[Expr]) -> DfResult<Vec<Arc<SuperfileEntry>>> {
-        let predicates = exprs_to_scalar_predicates(filters, &self.schema);
-        let mut leaves = self.predicates_to_prune_leaves(predicates);
-
-        let opts = &self.manifest.options;
-        leaves.extend(exprs_to_value_set_leaves(
-            filters,
-            &self.schema,
-            &self.fts_cols_set(),
-            &|col| opts.try_fts_tokenizer_for(col),
-        ));
-
-        // `LIKE` on an FTS column: a term bloom for the pattern's complete
-        // tokens and a lex-range check for a prefix token.
-        leaves.extend(like_prune_leaves(filters, &self.fts_cols_set(), &|col| {
-            opts.try_fts_tokenizer_for(col)
-        }));
-
-        leaves.extend(exprs_to_null_leaves(filters, &self.schema));
-
+        let leaves = prune_leaves_for_filters(&self.manifest.options, &self.schema, filters);
         let mut survivors = select_superfiles(self.manifest.as_ref(), &leaves)
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
@@ -1467,6 +1414,77 @@ fn selection_access_plan_from_counts(
         base += n;
     }
     plan
+}
+
+/// Lower scalar predicates to prune leaves. Each predicate yields a
+/// `Scalar` leaf; additionally, an equality on an FTS-indexed text
+/// column also yields a `TermPresence` leaf so the superfile's term
+/// bloom prunes it. Sound: a row matching `col = 'a b'` has a value
+/// whose tokens include every token of the literal, so requiring all
+/// of them possibly-present (`BoolMode::And`) never drops a match —
+/// bloom false positives can only keep a superfile, never drop one.
+fn scalar_predicates_to_prune_leaves(
+    options: &SupertableOptions,
+    predicates: Vec<ScalarPredicate>,
+) -> Vec<PruneLeaf> {
+    let mut leaves = Vec::with_capacity(predicates.len());
+    for pred in predicates {
+        if pred.op == ScalarOp::Eq
+            && options.fts_columns.iter().any(|c| c.column == pred.column)
+            && let Some(literal) = scalar_as_str(&pred.value)
+        {
+            // Per-column analyzer: prune with the tokenizer this column
+            // was indexed with, not a single table-wide default.
+            let Some(tok) = options.try_fts_tokenizer_for(&pred.column) else {
+                leaves.push(PruneLeaf::Scalar(pred));
+                continue;
+            };
+            let terms: Vec<String> = tok.tokenize(literal).collect();
+            if !terms.is_empty() {
+                leaves.push(PruneLeaf::TermPresence {
+                    column: pred.column.clone(),
+                    terms,
+                    mode: BoolMode::And,
+                });
+            }
+        }
+        leaves.push(PruneLeaf::Scalar(pred));
+    }
+    leaves
+}
+
+/// Every manifest prune leaf a `WHERE` clause yields: scalar min/max for
+/// `column <op> literal` conjuncts (plus a term bloom when the column is
+/// FTS-indexed), value sets for `IN` and same-column `OR`s of equalities,
+/// term blooms and lex ranges for `LIKE`, and null counts for `IS [NOT]
+/// NULL`. `schema` is the table's scalar schema, which names the columns
+/// a predicate may prune on.
+///
+/// Shared by the SQL scan and the search table functions, so a
+/// `WHERE path = 'x'` skips the same superfiles whether it sits over a
+/// plain scan or over `bm25_search` / `hybrid_search`. Pure manifest
+/// work: reads statistics only, opens no superfile.
+pub(crate) fn prune_leaves_for_filters(
+    options: &SupertableOptions,
+    schema: &SchemaRef,
+    filters: &[Expr],
+) -> Vec<PruneLeaf> {
+    let fts_cols: HashSet<&str> = options
+        .fts_columns
+        .iter()
+        .map(|c| c.column.as_str())
+        .collect();
+    let resolve = |col: &str| options.try_fts_tokenizer_for(col);
+    let mut leaves =
+        scalar_predicates_to_prune_leaves(options, exprs_to_scalar_predicates(filters, schema));
+    leaves.extend(exprs_to_value_set_leaves(
+        filters, schema, &fts_cols, &resolve,
+    ));
+    // `LIKE` on an FTS column: a term bloom for the pattern's complete
+    // tokens and a lex-range check for a prefix token.
+    leaves.extend(like_prune_leaves(filters, &fts_cols, &resolve));
+    leaves.extend(exprs_to_null_leaves(filters, schema));
+    leaves
 }
 
 /// Lower a conjunction of DataFusion filter `Expr`s into infino's

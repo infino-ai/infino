@@ -54,7 +54,11 @@
 //! with non-ASCII characters are not bounded under `ILIKE`. `NOT LIKE`
 //! stays `Unbounded`.
 
-use std::{collections::HashSet, mem, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    mem,
+    sync::Arc,
+};
 
 use datafusion::{
     logical_expr::{
@@ -77,10 +81,51 @@ use crate::{
     },
     supertable::{
         error::QueryError,
-        manifest::ManifestSnapshot,
+        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri},
         query::prune::{PruneLeaf, select_superfiles},
     },
 };
+
+/// What a SQL `WHERE` pushed into a search TVF admits, resolved once per
+/// query against the pinned snapshot and shared by every retriever the
+/// query runs (`hybrid_search` runs two): the superfiles that may hold a
+/// match, and — when the index can bound rows — the candidate rows in each.
+///
+/// Built by `SupertableReader::candidate_scope`. The superfile set is the
+/// intersection of the manifest's scalar / null / `IN` statistics pruning
+/// (the same leaves the SQL scan uses, so `path = 'x'` on a table whose
+/// superfiles are stats-disjoint on `path` opens only the file that can
+/// hold it) with the [`CandidatePlan`]'s term-bloom survival. The rows are
+/// the plan's per-superfile evaluation, tombstones already subtracted.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CandidateScope {
+    /// Superfiles a match may live in, in manifest order.
+    pub(crate) superfiles: Vec<Arc<SuperfileEntry>>,
+    /// Candidate `local_doc_id`s per superfile — a superset of the rows
+    /// satisfying the predicate, keyed by the superfile's URI; a superfile
+    /// absent from the map has no candidate row. `None` when the plan is
+    /// [`Unbounded`](CandidatePlan::Unbounded): the index bounds no row,
+    /// every row of every superfile above is a candidate, and the caller
+    /// fills its top-k by over-fetching under the exact predicate.
+    pub(crate) allow: Option<HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+}
+
+impl CandidateScope {
+    /// A scope that admits nothing: no superfile can hold a match.
+    pub(crate) fn empty() -> Self {
+        Self {
+            superfiles: Vec::new(),
+            allow: Some(HashMap::new()),
+        }
+    }
+
+    /// Whether `superfile` still has a candidate row under this scope.
+    pub(crate) fn admits_superfile(&self, superfile: &SuperfileEntry) -> bool {
+        self.allow
+            .as_ref()
+            .is_none_or(|allow| allow.contains_key(&superfile.uri))
+    }
+}
 
 /// Most indexed terms one `LIKE` fragment token may widen to before the
 /// index gives up on it. Each expanded term costs a df probe and a

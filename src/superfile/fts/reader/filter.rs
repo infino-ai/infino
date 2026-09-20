@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Negation gates: [`ExcludeFilter`] (term negatives) and its
+//! Admission gates: [`ExcludeFilter`] (term negatives) and its
 //! phrase-aware sibling [`AtomExcludeFilter`]. Both skip-probe their
 //! negated cursors against a monotonically increasing candidate doc, so
-//! a common negated list is never fully decoded. `pub(super)` within
+//! a common negated list is never fully decoded — and both can carry an
+//! **allow-set**, the rows a SQL `WHERE` pushed into the search admits at
+//! all, checked before any negated list is consulted. `pub(super)` within
 //! `reader/` (ExcludeFilter stays pub(crate) — PreparedClauses carries it).
+
+use std::sync::Arc;
+
+use roaring::RoaringBitmap;
 
 use super::{
     cursor::TermCursor,
@@ -14,20 +20,33 @@ use super::{
 };
 use crate::superfile::error::FtsError;
 
-/// Atom-walk exclusion gate: the heterogeneous sibling of
+/// Atom-walk admission gate: the heterogeneous sibling of
 /// [`ExcludeFilter`], additionally able to exclude docs containing a
-/// negated *phrase*. Same monotonic-doc contract.
+/// negated *phrase*. Same monotonic-doc contract, same allow-set.
 pub(super) struct AtomExcludeFilter {
     pub(super) atoms: Vec<AnyCursor>,
+    /// See [`ExcludeFilter::allow`].
+    pub(super) allow: Option<Arc<RoaringBitmap>>,
     pub(super) last_doc: u32,
 }
 
 impl AtomExcludeFilter {
     pub(super) fn new(atoms: Vec<AnyCursor>) -> Self {
-        Self { atoms, last_doc: 0 }
+        Self::with_allow(atoms, None)
     }
 
-    /// `false` iff `doc` matches any negated atom.
+    /// A gate over `atoms` that additionally admits only the docs in
+    /// `allow` (`None` admits every doc the atoms do not exclude).
+    pub(super) fn with_allow(atoms: Vec<AnyCursor>, allow: Option<Arc<RoaringBitmap>>) -> Self {
+        Self {
+            atoms,
+            allow,
+            last_doc: 0,
+        }
+    }
+
+    /// `false` iff `doc` is outside the allow-set or matches any negated
+    /// atom.
     pub(super) fn admits(&mut self, doc: u32) -> Result<bool, FtsError> {
         debug_assert!(
             doc >= self.last_doc,
@@ -35,6 +54,11 @@ impl AtomExcludeFilter {
             self.last_doc
         );
         self.last_doc = doc;
+        if let Some(allow) = &self.allow
+            && !allow.contains(doc)
+        {
+            return Ok(false);
+        }
         for a in &mut self.atoms {
             a.skip_to(doc)?;
             if !a.is_exhausted() && a.current_doc_id() == doc {
@@ -45,25 +69,46 @@ impl AtomExcludeFilter {
     }
 }
 
-/// Exclusion gate for negated (`-term`) clauses: holds one
-/// [`TermCursor`] per negated term, streamed with `skip_to` (a common
-/// negated list is never fully decoded). A doc is rejected if it appears
-/// in any negated term's list.
+/// Admission gate for negated (`-term`) clauses and for a pushed-down
+/// row set: holds one [`TermCursor`] per negated term, streamed with
+/// `skip_to` (a common negated list is never fully decoded), plus an
+/// optional allow-set. A doc is rejected if it is outside the allow-set
+/// or appears in any negated term's list.
 ///
-/// Kernels take `Option<&mut ExcludeFilter>` (`None` = no negation)
+/// Kernels take `Option<&mut ExcludeFilter>` (`None` = nothing to gate)
 /// rather than a generic filter parameter: monomorphizing the OR kernel
 /// measured 25-30% slower even with a no-op filter, while the `None`
-/// branch is constant per query, perfectly predicted, and free.
+/// branch is constant per query, perfectly predicted, and free. An
+/// allow-set rides inside the same gate for the same reason — every
+/// kernel already asks it about each candidate, so the row bound reaches
+/// every search shape through one `admits` call instead of a second
+/// parameter threaded through each walk.
 pub(crate) struct ExcludeFilter {
     pub(super) cursors: Vec<TermCursor>,
+    /// The rows the caller admits at all — a SQL `WHERE`'s candidate set,
+    /// resolved for this superfile as `local_doc_id`s. `None` admits every
+    /// doc the negated lists do not exclude. Checked first: a doc outside
+    /// the set never costs a negated-list probe.
+    pub(super) allow: Option<Arc<RoaringBitmap>>,
     /// Last doc-id passed to `admits`; guards the monotonic call order.
     pub(super) last_doc: u32,
 }
 
 impl ExcludeFilter {
+    /// A pure negation gate. The search path always builds through
+    /// [`Self::with_allow`] (it may or may not carry a row set), so this
+    /// shorthand is for the tests that exercise negation alone.
+    #[cfg(test)]
     pub(super) fn new(cursors: Vec<TermCursor>) -> Self {
+        Self::with_allow(cursors, None)
+    }
+
+    /// A gate over `cursors` that additionally admits only the docs in
+    /// `allow` (`None` admits every doc the cursors do not exclude).
+    pub(super) fn with_allow(cursors: Vec<TermCursor>, allow: Option<Arc<RoaringBitmap>>) -> Self {
         Self {
             cursors,
+            allow,
             last_doc: 0,
         }
     }
@@ -82,7 +127,7 @@ impl ExcludeFilter {
 }
 
 impl ExcludeFilter {
-    /// `false` iff `doc` is in any negated list.
+    /// `false` iff `doc` is outside the allow-set or in any negated list.
     ///
     /// `doc` must be non-decreasing across a search: `skip_to` only
     /// moves forward. Every kernel walks candidates ascending, so this
@@ -95,6 +140,11 @@ impl ExcludeFilter {
             self.last_doc
         );
         self.last_doc = doc;
+        if let Some(allow) = &self.allow
+            && !allow.contains(doc)
+        {
+            return false;
+        }
         for c in &mut self.cursors {
             c.skip_to(doc);
             if !c.is_exhausted() && c.current_doc_id() == doc {
@@ -107,8 +157,6 @@ impl ExcludeFilter {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use bytes::Bytes;
 
     use super::{super::test_util::*, *};
@@ -153,6 +201,56 @@ mod tests {
         assert!(f.admits(0));
         assert!(f.admits(1));
         assert!(f.admits(2));
+    }
+
+    /// The allow-set is the outer gate: a doc outside it is rejected
+    /// whether or not a negated list holds it, a doc inside it still
+    /// answers to the negated lists, and no cursors at all with an
+    /// allow-set is a pure row bound.
+    #[tokio::test]
+    async fn exclude_filter_allow_set_gates_before_negation() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let column_id = r.resolve_column_id("body").expect("column exists");
+        // Negate "rust" (docs 0 and 1); allow docs 1 and 2 only.
+        let cursors = r
+            .build_term_cursors(column_id, &["rust"], None, false, None, None)
+            .await
+            .expect("build cursors");
+        let allow: RoaringBitmap = [1u32, 2].into_iter().collect();
+        let mut f = ExcludeFilter::with_allow(cursors, Some(Arc::new(allow.clone())));
+        assert!(!f.admits(0), "outside the allow-set (and negated)");
+        assert!(!f.admits(1), "inside the allow-set but negated");
+        assert!(f.admits(2), "inside the allow-set, not negated");
+
+        // A bare row bound: no negated cursors at all.
+        let mut bound = ExcludeFilter::with_allow(Vec::new(), Some(Arc::new(allow)));
+        assert!(!bound.admits(0));
+        assert!(bound.admits(1));
+        assert!(bound.admits(2));
+        assert!(!bound.admits(3), "past the set is outside it");
+    }
+
+    /// The phrase-aware gate applies the same allow-set ahead of its atoms.
+    #[tokio::test]
+    async fn atom_exclude_filter_allow_set_gates_before_negation() {
+        let r = edge_reader();
+        let column_id = r.resolve_column_id("body").expect("column exists");
+        let (atoms, _) = r
+            .build_atom_cursors(column_id, &["neg"], &[], None, None)
+            .await
+            .expect("build atoms");
+        // `neg` is in every even row; allow rows 0..4 only.
+        let allow: RoaringBitmap = (0u32..4).collect();
+        let mut f = AtomExcludeFilter::with_allow(
+            atoms.into_iter().flatten().collect(),
+            Some(Arc::new(allow)),
+        );
+        assert!(!f.admits(0).expect("admits"), "allowed but negated");
+        assert!(f.admits(1).expect("admits"), "allowed, clean");
+        assert!(!f.admits(2).expect("admits"), "allowed but negated");
+        assert!(f.admits(3).expect("admits"), "allowed, clean");
+        assert!(!f.admits(5).expect("admits"), "clean but outside the set");
     }
 
     #[tokio::test]

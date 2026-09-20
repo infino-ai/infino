@@ -80,6 +80,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use arrow_schema::Schema;
+use datafusion::logical_expr::Expr;
 use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use roaring::RoaringBitmap;
 use tokio::{join, sync::OnceCell};
@@ -87,9 +88,10 @@ use uuid::Uuid;
 
 use super::{
     SuperfileHit,
-    candidate::CandidatePlan,
+    candidate::{CandidatePlan, CandidateScope},
     dispatch,
     exec::common::{SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source},
+    provider::prune_leaves_for_filters,
     prune::{PruneLeaf, select_superfiles},
 };
 pub use crate::superfile::reader::VectorSearchOptions;
@@ -4979,7 +4981,13 @@ impl SupertableReader {
         Ok(())
     }
 
-    async fn vector_fanout_over_superfiles(
+    /// kNN fan-out over exactly `superfiles`, optionally admitting only the
+    /// rows in `allow` (per superfile; a superfile absent from the map has
+    /// no admitted row). The user-table kernel behind both the plain
+    /// search and the filtered one; `hybrid_search`'s vector leg calls it
+    /// directly so a pushed-down `WHERE` scopes both of its retrievers to
+    /// the same superfiles and rows.
+    pub(crate) async fn vector_fanout_over_superfiles(
         &self,
         superfiles: Vec<Arc<SuperfileEntry>>,
         column: &str,
@@ -6487,6 +6495,44 @@ impl SupertableReader {
         }
         self.route_filtered_vector_hits_async(superfiles, allow, column, query, k, options)
             .await
+    }
+
+    /// Resolve what a SQL `WHERE` pushed into a search table function
+    /// admits — the superfiles that may hold a match and, under a bounded
+    /// `plan`, the candidate rows in each. See [`CandidateScope`].
+    ///
+    /// Superfile survival is the intersection of two gates on the pinned
+    /// manifest, both pure statistics reads: the prune leaves the SQL scan
+    /// itself lowers `filters` to (scalar min/max, value sets, `LIKE`
+    /// blooms and ranges, null counts — so a `path = 'x'` on a column with
+    /// no full-text index still skips every superfile whose `path` range
+    /// excludes `x`), and the plan's term-bloom survival. The candidate
+    /// rows are the plan's per-superfile evaluation, tombstones removed;
+    /// an [`Unbounded`](CandidatePlan::Unbounded) plan bounds no row and
+    /// leaves `allow` as `None`.
+    pub(crate) async fn candidate_scope(
+        &self,
+        filters: &[Expr],
+        plan: &CandidatePlan,
+    ) -> Result<CandidateScope, QueryError> {
+        let manifest = self.manifest();
+        let leaves =
+            prune_leaves_for_filters(&manifest.options, &self.options().scalar_schema(), filters);
+        let mut superfiles = select_superfiles(manifest, &leaves).await?;
+        if let Some(surviving) = plan.surviving_superfile_ids(manifest).await? {
+            superfiles.retain(|e| surviving.contains(&e.superfile_id.as_u128()));
+        }
+        if superfiles.is_empty() {
+            return Ok(CandidateScope::empty());
+        }
+        let allow = match plan {
+            CandidatePlan::Unbounded => None,
+            bounded => Some(
+                self.candidate_bitmaps_from_plan(&superfiles, bounded)
+                    .await?,
+            ),
+        };
+        Ok(CandidateScope { superfiles, allow })
     }
 
     /// Convert user-table allow bitmaps (local doc ids) to stable `_id`s.

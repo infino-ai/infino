@@ -15,16 +15,23 @@
 //!
 //! [`SuperfileReader::take_by_local_doc_ids`]: crate::superfile::SuperfileReader::take_by_local_doc_ids
 
-use std::{collections::HashSet, ops::Range, sync::Arc};
+use std::{collections::HashSet, future::Future, ops::Range, sync::Arc};
 
-use arrow::compute::{concat_batches, interleave_record_batch, take};
-use arrow_array::{ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions};
+use arrow::compute::{concat_batches, filter_record_batch, interleave_record_batch, take};
+use arrow_array::{
+    ArrayRef, BooleanArray, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use datafusion::{
+    common::{
+        Column, DFSchema,
+        tree_node::{Transformed, TreeNode},
+    },
     error::{DataFusionError, Result as DfResult},
-    execution::TaskContext,
+    execution::{TaskContext, context::ExecutionProps},
     logical_expr::Expr,
+    physical_expr::{PhysicalExpr, create_physical_expr},
     physical_plan::{ExecutionPlan, collect},
     scalar::ScalarValue,
 };
@@ -55,14 +62,20 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::SupertableReader,
-        manifest::SuperfileUri,
+        manifest::{ManifestSnapshot, SuperfileUri},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
-            SuperfileHit, exec::metered_exec::MeteredExec, superfile_reader::superfile_reader,
-            vector::row_id_from_manifest_entry,
+            SuperfileHit, candidate::CandidatePlan, exec::metered_exec::MeteredExec,
+            superfile_reader::superfile_reader, vector::row_id_from_manifest_entry,
         },
     },
 };
+
+/// Multiply a search's `k` by this each time the exact predicate leaves
+/// fewer than `k` rows standing (see [`fill_top_k`]). Doubling bounds the
+/// total work at about twice the final round's, whatever the predicate's
+/// selectivity turns out to be.
+const OVER_FETCH_GROWTH: usize = 2;
 
 /// Map a search TVF's `QueryError` into a DataFusion error at the
 /// execution-node boundary.
@@ -208,6 +221,179 @@ fn unknown_column_message(name: &str, output_schema: &SchemaRef) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("unknown column {name:?} in projection; valid columns: {available}")
+}
+
+/// Lower a search table function's pushed-down `WHERE` filters to the
+/// candidate plan its kernel ranks within: a token-match superset over
+/// the FTS-indexed columns, [`Unbounded`](CandidatePlan::Unbounded) when
+/// no filter is index-resolvable. One lowering for all three search
+/// functions, so a predicate bounds `vector_search`, `bm25_search` and
+/// `hybrid_search` identically.
+pub(crate) fn candidate_plan_for_filters(
+    manifest: &ManifestSnapshot,
+    filters: &[Expr],
+) -> CandidatePlan {
+    let fts_cols: HashSet<&str> = manifest
+        .options
+        .fts_columns
+        .iter()
+        .map(|c| c.column.as_str())
+        .collect();
+    CandidatePlan::from_filters(filters, &fts_cols, &|col| {
+        manifest.options.try_fts_tokenizer_for(col)
+    })
+}
+
+/// The exact `WHERE` a search table function was handed, ready to run
+/// over the function's own resolved rows.
+///
+/// What a kernel ranks within is a superset of the predicate: a token
+/// match stands in for a string equality, and a column with no full-text
+/// index bounds nothing at all. DataFusion's `FilterExec` above the
+/// function re-applies the exact predicate, so a function that returned
+/// exactly `k` rows can come out under `k` — silently, since the function
+/// never sees what the filter dropped. This is the same predicate compiled
+/// for the function to apply itself, so it can count the survivors and
+/// fetch more until `k` stand (see [`fill_top_k`]).
+pub(crate) struct PushedPredicate {
+    /// Indices into the function's output schema of the columns the
+    /// predicate reads.
+    columns: Vec<usize>,
+    /// The conjunction of the pushed filters, column references stripped
+    /// of their table qualifier so they resolve against the function's
+    /// own (unqualified) output schema.
+    conjunction: Expr,
+}
+
+impl PushedPredicate {
+    /// `None` when nothing was pushed, or when the predicate reads a
+    /// column the function's output does not carry — nothing here could
+    /// evaluate it, and the `FilterExec` above still applies it, exactly
+    /// as before the pushdown existed.
+    pub(crate) fn compile(filters: &[Expr], output_schema: &SchemaRef) -> Option<Self> {
+        let conjunction = unqualified(filters.iter().cloned().reduce(Expr::and)?).ok()?;
+        let mut columns = Vec::new();
+        for column in conjunction.column_refs() {
+            let index = output_schema.index_of(&column.name).ok()?;
+            if !columns.contains(&index) {
+                columns.push(index);
+            }
+        }
+        Some(Self {
+            columns,
+            conjunction,
+        })
+    }
+
+    /// Bind the predicate to `schema`, a projection of the output schema
+    /// that carries every column in `self.columns`.
+    fn bind(&self, schema: &SchemaRef) -> DfResult<Arc<dyn PhysicalExpr>> {
+        let df_schema = DFSchema::try_from(Arc::clone(schema))?;
+        create_physical_expr(&self.conjunction, &df_schema, &ExecutionProps::new())
+    }
+}
+
+/// `expr` with every column reference stripped of its table qualifier.
+/// DataFusion hands a table function its filters as the planner wrote
+/// them — `t.category = 'x'` under `FROM bm25_search(...) AS t` — while
+/// the function's output schema names bare columns.
+fn unqualified(expr: Expr) -> DfResult<Expr> {
+    expr.transform(|e| {
+        Ok(match e {
+            Expr::Column(c) if c.relation.is_some() => {
+                Transformed::yes(Expr::Column(Column::new_unqualified(c.name)))
+            }
+            other => Transformed::no(other),
+        })
+    })
+    .map(|t| t.data)
+}
+
+/// Resolve a search table function's top-`k` under its pushed-down
+/// `WHERE`, so the rows it emits are the `k` best *among rows satisfying
+/// the predicate*.
+///
+/// `search(want)` runs the kernel for `want` hits, already scoped to
+/// whatever the index could bound. Without a predicate that is the whole
+/// job: search `k`, resolve, done. With one, the resolved rows are
+/// checked against the exact predicate; when fewer than `k` survive and
+/// the kernel had more to give (it returned every hit asked for, and the
+/// table holds more rows than were asked), the search is rerun for
+/// [`OVER_FETCH_GROWTH`] times as many hits, until `k` survive or the
+/// table is exhausted. The survivors, in kernel rank order and cut to
+/// `k`, are the result — the `FilterExec` above re-checks them and drops
+/// nothing. Cost scales with the predicate's selectivity: an exact
+/// pushdown pays one round, a bare scalar predicate on a row in a
+/// million pays the log₂ of that.
+///
+/// The predicate's columns are decoded alongside the requested ones for
+/// the check and projected away before the batch is returned.
+pub(crate) async fn fill_top_k<F, Fut>(
+    reader: &SupertableReader,
+    k: usize,
+    predicate: Option<&PushedPredicate>,
+    scalar_schema: &SchemaRef,
+    output_schema: &SchemaRef,
+    projection: Option<&[usize]>,
+    search: F,
+) -> DfResult<RecordBatch>
+where
+    F: Fn(usize) -> Fut,
+    Fut: Future<Output = Result<Vec<SuperfileHit>, QueryError>>,
+{
+    let Some(predicate) = predicate else {
+        let hits = search(k).await.map_err(search_query_df_error)?;
+        return resolve_hits(reader, &hits, scalar_schema, output_schema, projection).await;
+    };
+    let requested: Vec<usize> = match projection {
+        Some(indices) => indices.to_vec(),
+        None => (0..output_schema.fields().len()).collect(),
+    };
+    // Decode the requested columns first, in order, then whatever else the
+    // predicate reads — so the requested projection is a prefix of the
+    // decoded batch and comes back out as its first columns.
+    let mut decoded = requested.clone();
+    for &column in &predicate.columns {
+        if !decoded.contains(&column) {
+            decoded.push(column);
+        }
+    }
+    let decoded_schema = Arc::new(
+        output_schema
+            .project(&decoded)
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+    );
+    let bound = predicate.bind(&decoded_schema)?;
+    let requested_positions: Vec<usize> = (0..requested.len()).collect();
+    let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
+    let mut want = k;
+    loop {
+        let hits = search(want).await.map_err(search_query_df_error)?;
+        let batch =
+            resolve_hits(reader, &hits, scalar_schema, output_schema, Some(&decoded)).await?;
+        let mask = bound.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let mask = mask
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "a pushed-down search predicate did not evaluate to a boolean".into(),
+                )
+            })?;
+        let kept = filter_record_batch(&batch, mask)
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        // The kernel returned fewer hits than asked, or was asked for the
+        // whole table: there is nothing more to fetch.
+        let exhausted = hits.len() < want || want >= total;
+        if kept.num_rows() >= k || exhausted {
+            let rows = kept.num_rows().min(k);
+            return kept
+                .slice(0, rows)
+                .project(&requested_positions)
+                .map_err(|e| DataFusionError::Execution(e.to_string()));
+        }
+        want = want.saturating_mul(OVER_FETCH_GROWTH).min(total);
+    }
 }
 
 /// Output column carrying the per-hit score (vector distance or BM25
@@ -904,10 +1090,10 @@ pub(crate) mod test_support {
 mod tests {
     use std::{thread::sleep, time::Duration};
 
-    use arrow_array::{Array, FixedSizeListArray, LargeStringArray};
+    use arrow_array::{Array, FixedSizeListArray, Int64Array, LargeStringArray};
     use arrow_schema::Field;
     use bytes::Bytes;
-    use datafusion::prelude::lit;
+    use datafusion::prelude::{col, lit};
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory, path::Path as ObjPath};
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
@@ -988,6 +1174,72 @@ mod tests {
         assert_eq!(out.fields().len(), 2);
         assert_eq!(out.field(1).name(), "score");
         assert_eq!(out.field(1).data_type(), &DataType::Float32);
+    }
+
+    /// The pushed predicate binds to the function's output by bare column
+    /// name — a table alias on the reference is dropped — and reports the
+    /// columns it reads; a reference to a column the output lacks, or no
+    /// filter at all, compiles to nothing.
+    #[test]
+    fn pushed_predicate_compiles_against_the_output_schema() {
+        let out = output_schema_with_score(&Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Int64, false),
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("bucket", DataType::Int64, false),
+        ])));
+        // Literals arrive type-coerced from the planner (a `LargeUtf8`
+        // column compares against a `LargeUtf8` literal), so the test hands
+        // over the same shape.
+        let qualified = [
+            col("t.bucket").eq(lit(1_i64)),
+            col("t.title").eq(lit(ScalarValue::LargeUtf8(Some("x".into())))),
+        ];
+        let predicate = PushedPredicate::compile(&qualified, &out).expect("compiles");
+        let mut columns = predicate.columns.clone();
+        columns.sort_unstable();
+        assert_eq!(columns, vec![1, 2], "title and bucket, by output index");
+        assert!(
+            predicate
+                .conjunction
+                .column_refs()
+                .iter()
+                .all(|c| c.relation.is_none()),
+            "qualifiers are stripped: {:?}",
+            predicate.conjunction
+        );
+        // Bound to a projection carrying its columns, it evaluates.
+        let projected = Arc::new(out.project(&[2, 1]).expect("project"));
+        let bound = predicate.bind(&projected).expect("binds");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&projected),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 1])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec!["x", "x", "y"])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let mask = bound
+            .evaluate(&batch)
+            .expect("evaluate")
+            .into_array(3)
+            .expect("array");
+        let mask = mask
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("boolean");
+        assert_eq!(
+            (0..3).map(|i| mask.value(i)).collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+
+        assert!(
+            PushedPredicate::compile(&[], &out).is_none(),
+            "nothing pushed"
+        );
+        assert!(
+            PushedPredicate::compile(&[col("elsewhere").eq(lit(1_i64))], &out).is_none(),
+            "a column the output lacks cannot be checked here"
+        );
     }
 
     // ---- harness exercising resolve_hits_named / resolve_ids_arithmetic /
