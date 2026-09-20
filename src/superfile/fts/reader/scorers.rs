@@ -2081,10 +2081,17 @@ impl FtsReader {
             // query. `current_block_last_doc_id` reads block metadata only,
             // no decode.
             let mut min_doc = u32::MAX;
+            let mut second_doc = u32::MAX;
             let mut block_bound = doc_id_end;
             for c in cursors.iter().take(f_essential) {
                 if !c.is_exhausted() {
-                    min_doc = min_doc.min(c.current_doc_id());
+                    let d = c.current_doc_id();
+                    if d < min_doc {
+                        second_doc = min_doc;
+                        min_doc = d;
+                    } else if d < second_doc {
+                        second_doc = d;
+                    }
                     block_bound = block_bound.min(c.current_block_last_doc_id().saturating_add(1));
                 }
             }
@@ -2095,10 +2102,24 @@ impl FtsReader {
             // the nearest essential block boundary (so the threshold updates
             // per-block and the essential set can collapse early), capped at the
             // score-buffer width.
+            //
+            // When every other essential term's next doc lies past the capped
+            // window, the window holds one essential's docs alone and the block
+            // boundary stops mattering: the others contribute nothing here, so
+            // the leader's blocks are bounded by the non-essentials only and
+            // skipped by their metadata, with the per-window bookkeeping paid
+            // once per cap instead of once per block. This is the shape of a
+            // stopword unioned with a rare term at large k: the rare term's
+            // postings are far apart and the stopword's blocks between them
+            // mostly sit under the bar.
             let base = min_doc & !63;
-            let window_end = block_bound
-                .min(base.saturating_add(OR_WINDOW))
-                .min(doc_id_end);
+            let cap_end = base.saturating_add(OR_WINDOW).min(doc_id_end);
+            let sole = second_doc >= cap_end;
+            let window_end = if sole {
+                cap_end
+            } else {
+                block_bound.min(cap_end)
+            };
 
             // Accumulate the essential terms' contributions into the window
             // (SIMD OR-sum; scalar tail). Identical to the windowed-union body,
@@ -2130,7 +2151,10 @@ impl FtsReader {
             // term's block: the estimate is by doc share, not block count.)
             // A window whose total bound is under the threshold holds no
             // competitive doc and is skipped whole regardless.
-            let f_win = if prune {
+            let f_win = if sole {
+                partial_win.copy_from_slice(&partial_max);
+                f_essential
+            } else if prune {
                 let win_last = window_end.saturating_sub(1);
                 let weakest = f_essential - 1;
                 let (weakest_ub, weakest_docs) =
@@ -2186,13 +2210,21 @@ impl FtsReader {
                     // accumulate so the dense OR-sum still prunes at small k.
                     // Never fires while the heap is filling, so a doc that must
                     // be admitted is never dropped.
+                    // In a sole-essential window the other essentials have no
+                    // docs before `window_end`, so the bound carries only the
+                    // non-essentials, and a block that reaches past the window
+                    // is scored up to it rather than skipped.
                     if prune && c.current_block != checked_block {
                         checked_block = c.current_block;
-                        let block_ub =
-                            c.current_block_max_bm25() + (total_term_ub - c.term_max_bm25);
-                        if block_ub <= threshold {
-                            let last = c.current_block_last_doc_id();
-                            c.skip_to(last.saturating_add(1));
+                        let others_ub = if sole {
+                            partial_max[f_essential]
+                        } else {
+                            total_term_ub - c.term_max_bm25
+                        };
+                        if c.current_block_max_bm25() + others_ub <= threshold
+                            && (!sole || c.current_block_last_doc_id() < window_end)
+                        {
+                            c.skip_blocks_under(others_ub, threshold, window_end);
                             continue;
                         }
                     }
@@ -2248,6 +2280,38 @@ impl FtsReader {
             let words = ((window_end - base) as usize)
                 .div_ceil(64)
                 .min(OR_WINDOW_WORDS);
+            if non_ess.is_empty() {
+                // Every term was accumulated, so a window score is final:
+                // admit straight off the presence bitmask, in doc order, and
+                // never build the candidate list. Most docs of a dense window
+                // fail the bar, and this way each costs one compare.
+                for (word_idx, word) in present[..words].iter_mut().enumerate() {
+                    let mut bits = *word;
+                    *word = 0;
+                    while bits != 0 {
+                        let b = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let local = (word_idx << 6) | b;
+                        let doc = base + local as u32;
+                        let score = std::mem::take(&mut scores[local]);
+                        if let Some(f) = filter.as_deref_mut()
+                            && !f.admits(doc)
+                        {
+                            continue;
+                        }
+                        if heap.len() < k {
+                            heap.push(TopKEntry(score, doc));
+                            if heap.len() == k {
+                                threshold = heap.peek().expect("non-empty").0.max(threshold);
+                            }
+                        } else if score > threshold {
+                            replace_worst(&mut heap, TopKEntry(score, doc));
+                            threshold = heap.peek().expect("non-empty").0.max(threshold);
+                        }
+                    }
+                }
+                continue;
+            }
             win_docs.clear();
             win_scores.clear();
             for (word_idx, word) in present[..words].iter_mut().enumerate() {
@@ -3200,6 +3264,68 @@ mod tests {
                 3000,
                 N_DOCS as usize + 1,
             ] {
+                let bmm = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Bmm)
+                    .await
+                    .expect("bmm");
+                let wms = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::WindowedMaxscore)
+                    .await
+                    .expect("wms");
+                assert_eq!(bmm.len(), wms.len(), "len {terms:?} k={k}");
+                for ((db, sb), (dw, sw)) in bmm.iter().zip(wms.iter()) {
+                    assert_eq!(db, dw, "doc mismatch {terms:?} k={k}: bmm={db} wms={dw}");
+                    assert!(
+                        (sb - sw).abs() < 1e-4,
+                        "score mismatch {terms:?} k={k}: {sb} vs {sw}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn windowed_maxscore_sole_essential_window_agrees_with_bmm() {
+        // A stopword in four docs out of five, hot (tf 3) in every eighth
+        // block, unioned with a term that occurs three times in the whole
+        // corpus, each occurrence just past a window-cap boundary. At k large
+        // enough that the threshold settles under the stopword's hot score,
+        // both terms stay essential, yet between the rare term's postings the
+        // stopword is the only essential with docs: those windows run to the
+        // cap, the stopword's cold blocks are skipped by their metadata, and
+        // the block that reaches past the cap is scored up to it, so the rare
+        // term's doc right after the cap still collects the stopword's
+        // contribution. With no non-essential term the window admits straight
+        // off the presence bitmask. Every k must match per-candidate
+        // MaxScore+BMM, including k = 1 (stopword non-essential outright) and
+        // a k the heap never fills.
+        const N_DOCS: u32 = OR_WINDOW * 3 + 500;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let hot = (i / 128).is_multiple_of(8);
+            let the_tf = match (hot, i % 4) {
+                (true, 0) => 3,
+                (true, _) => 2,
+                (false, _) => 1,
+            };
+            let mut text = String::new();
+            if i % 5 != 0 {
+                for _ in 0..the_tf {
+                    text.push_str("the ");
+                }
+            }
+            if i == OR_WINDOW + 3 || i == 2 * OR_WINDOW + 1 || i == N_DOCS - 7 {
+                text.push_str("incredibles ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        for terms in [&["the", "incredibles"], &["incredibles", "the"]] {
+            for k in [1usize, 3, 10, 128, 600, 1500, 3000, N_DOCS as usize + 1] {
                 let bmm = r
                     .search_with_algo_for_bench("body", terms, k, OrAlgo::Bmm)
                     .await
