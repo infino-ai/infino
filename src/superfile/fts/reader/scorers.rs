@@ -1933,6 +1933,7 @@ impl FtsReader {
         // suffix sums, both rebuilt only when a candidate leaves the doc range
         // the bound was measured over.
         let mut noness_ub = vec![0.0_f32; n];
+        let mut noness_suffix = vec![0.0_f32; n + 1];
         let mut win_ub = vec![0.0_f32; n];
         let mut win_docs_est = vec![0.0_f32; n];
         let mut partial_win = vec![0.0_f32; n + 1];
@@ -2007,6 +2008,14 @@ impl FtsReader {
                             others_ub += ub;
                             bound_holds_to = bound_holds_to.min(c.inspect_block_last_doc_id());
                         }
+                        // Suffix sums over the same measurement: `noness_suffix[i]`
+                        // bounds the clauses from `i` on, so a running score can be
+                        // tested against what is still unprobed.
+                        let m = non_ess.len();
+                        noness_suffix[m] = 0.0;
+                        for i in (0..m).rev() {
+                            noness_suffix[i] = noness_suffix[i + 1] + noness_ub[i];
+                        }
                         have_bound = true;
                     }
                     if essential_score + others_ub <= threshold {
@@ -2016,25 +2025,29 @@ impl FtsReader {
                     // Complete: probe each non-essential and SIMD-pack the
                     // matches (leader seeded as lane 0, so `score` is the full
                     // BM25 sum).
-                    let mut idfs = [c0.idf_weight, 0.0, 0.0, 0.0];
-                    let mut tfs = [c0.current_tf() as f32, 0.0, 0.0, 0.0];
-                    let mut packed = 1;
-                    let mut score = 0.0f32;
-                    for c in non_ess.iter_mut() {
+                    // Probe the non-essentials in term-max order, strongest
+                    // first, folding each contribution in as it is read and
+                    // re-testing against `noness_suffix`, the bound on the
+                    // clauses still unprobed. Resolving the largest uncertainty
+                    // first collapses that bound fastest, so a doc that cannot
+                    // reach the bar stops costing probes part-way rather than
+                    // paying for every clause. Probing dominates this loop and
+                    // scoring does not, which is why the running total is kept
+                    // scalar rather than packed four at a time.
+                    let mut score = essential_score;
+                    let mut abandoned = false;
+                    for (i, c) in non_ess.iter_mut().enumerate() {
                         if let Some(tf) = c.bitset_probe_tf(candidate) {
-                            idfs[packed] = c.idf_weight;
-                            tfs[packed] = tf as f32;
-                            packed += 1;
-                            if packed == 4 {
-                                score += bm25::score_simd_x4(idfs, tfs, norm);
-                                idfs = [0.0; 4];
-                                tfs = [0.0; 4];
-                                packed = 0;
-                            }
+                            score += bm25::score_with_dl_norm_k1(c.idf_weight, tf, norm);
+                        }
+                        if score + noness_suffix[i + 1] <= threshold {
+                            abandoned = true;
+                            break;
                         }
                     }
-                    if packed > 0 {
-                        score += bm25::score_simd_x4(idfs, tfs, norm);
+                    if abandoned {
+                        c0.next();
+                        continue;
                     }
                     let mut raised = false;
                     if heap.len() < k {
