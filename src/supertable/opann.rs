@@ -2282,14 +2282,10 @@ fn truncate_ascending(cand: &mut Vec<(f32, u32, i128, f32)>, cap: usize) {
     }
 }
 
-/// Keep the `cap` largest-estimate `(estimate, cell, stable id)` candidates —
-/// the 1-bit-gated width sweep's shortlist orientation (higher estimate =
-/// nearer), so `INFINITY`-keyed conservative admits are retained. Ties break on
-/// cell then id for a deterministic shortlist across runs.
 /// One pass-1 shortlist candidate, ordered by 1-bit estimate (higher = nearer).
-/// Total order (total_cmp then cell then id) so a bounded heap is deterministic
-/// across runs. `INFINITY` (unrankable/conservative admit) sorts to the top and
-/// is therefore always retained.
+/// Total order (`total_cmp` then cell then id) so the bounded shortlist heap is
+/// deterministic across runs. `INFINITY` (unrankable/conservative admit) sorts
+/// to the top and is therefore always retained.
 #[derive(Clone, Copy)]
 pub(crate) struct EstCand {
     est: f32,
