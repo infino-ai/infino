@@ -53,7 +53,6 @@ use crate::{
             lut_scan_supported,
         },
         reader::CellFineCalibrationView,
-        reservoir::Reservoir,
         rotation::RandomRotation,
         spill::SpilledCellRows,
     },
@@ -1046,7 +1045,7 @@ pub(crate) fn fanout_knee_from_recalls(
 /// the prefix INCLUDING its own bin — rank error is bounded by one bin's
 /// occupancy and always over-counts (a wider law, never a narrower one).
 const RERANK_LAW_EST_BINS: usize = 4096;
-/// Fixed seed for the calibration reservoir, so a re-drained identical
+/// Fixed seed for the calibration query min-hash, so a re-drained identical
 /// corpus stamps an identical law.
 const WIDTH_LAW_SAMPLE_SEED: u64 = 0x51ED_CA1B;
 /// Rows decoded per chunk while scoring a spilled cell.
@@ -1058,6 +1057,55 @@ const WIDTH_LAW_SCORE_CHUNK: usize = 1024;
 /// grows ~sqrt(N)); set generously here and validated by law-parity against
 /// the exhaustive sweep. Bounds pass-1 memory at `Q * CAP` candidates.
 const WIDTH_LAW_SHORTLIST_CAP: usize = 8192;
+
+/// Deterministic content hash of a decoded query vector — FNV-1a over the
+/// float bits, salted by [`WIDTH_LAW_SAMPLE_SEED`]. Depends only on the
+/// vector's contents, so it is invariant to the order rows are offered.
+fn width_law_query_hash(vec: &[f32]) -> u64 {
+    let mut h = WIDTH_LAW_SAMPLE_SEED ^ 0x1405_7B7E_F767_814F;
+    for &v in vec {
+        h = (h ^ v.to_bits() as u64).wrapping_mul(0x0100_0000_01B3);
+    }
+    h ^ (h >> 29)
+}
+
+/// One calibration-query candidate, kept by content min-hash so the sampled
+/// query set is a deterministic function of the offered rows' CONTENT — not
+/// of the order they were offered. The drain streams rows to the calibrator
+/// in an order that varies run to run (materialization/enumeration is not
+/// order-stable), which shifts a position-based reservoir sample and
+/// destabilizes the stamped law even though the corpus is identical.
+/// [`WidthLawCalibration`] keeps the [`WIDTH_LAW_QUERY_SAMPLE`] smallest-hash
+/// candidates in a bounded max-heap (each `pop` evicts the largest hash).
+/// Ties break on the vector bytes so distinct vectors that collide stay
+/// deterministic; the stable id is NOT a tie-break — it is a per-run
+/// snowflake, and two content-identical rows are interchangeable as queries.
+struct QueryCand {
+    hash: u64,
+    vec: Vec<f32>,
+    id: i128,
+}
+impl PartialEq for QueryCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for QueryCand {}
+impl PartialOrd for QueryCand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for QueryCand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.hash.cmp(&other.hash).then_with(|| {
+            self.vec
+                .iter()
+                .map(|v| v.to_bits())
+                .cmp(other.vec.iter().map(|v| v.to_bits()))
+        })
+    }
+}
 
 /// Frozen query sample: dequantized fp32 vectors + their stable ids
 /// (self-hit exclusion while scoring).
@@ -1095,10 +1143,10 @@ struct WidthLawQueries {
 pub(crate) struct WidthLawCalibration {
     dim: usize,
     metric: Metric,
-    reservoir: Reservoir,
-    /// Stable id of each reservoir slot, kept in lockstep through
-    /// [`Reservoir::update_traced`].
-    slot_ids: Vec<i128>,
+    /// Bounded content min-hash of offered rows: the [`WIDTH_LAW_QUERY_SAMPLE`]
+    /// smallest-hash candidates (see [`QueryCand`]). Order-independent, so the
+    /// sampled query set — and the stamped law — is reproducible run to run.
+    query_cands: std::collections::BinaryHeap<QueryCand>,
     dequant_scratch: Vec<f32>,
     frozen: Option<WidthLawQueries>,
     /// Per-query `(score, cell, stable id)` candidates, truncated to the
@@ -1503,8 +1551,7 @@ impl WidthLawCalibration {
         Self {
             dim,
             metric,
-            reservoir: Reservoir::new(WIDTH_LAW_QUERY_SAMPLE, dim, WIDTH_LAW_SAMPLE_SEED),
-            slot_ids: Vec::with_capacity(WIDTH_LAW_QUERY_SAMPLE),
+            query_cands: std::collections::BinaryHeap::with_capacity(WIDTH_LAW_QUERY_SAMPLE + 1),
             dequant_scratch: vec![0f32; dim],
             frozen: None,
             tops: Mutex::new(Vec::new()),
@@ -1521,12 +1568,22 @@ impl WidthLawCalibration {
     pub(crate) fn offer(&mut self, row: &MaterializedIvfRow) {
         debug_assert!(self.frozen.is_none(), "offer after freeze");
         dequantize_row_into(&row.encoded, &mut self.dequant_scratch);
-        if let Some(slot) = self.reservoir.update_traced(&self.dequant_scratch) {
-            if slot == self.slot_ids.len() {
-                self.slot_ids.push(row.stable_id);
-            } else {
-                self.slot_ids[slot] = row.stable_id;
-            }
+        let hash = width_law_query_hash(&self.dequant_scratch);
+        // Keep the WIDTH_LAW_QUERY_SAMPLE smallest-hash candidates. Skip the
+        // clone when the heap is full and this row's hash can't beat the
+        // current largest (its top); otherwise push and evict the max.
+        if self.query_cands.len() >= WIDTH_LAW_QUERY_SAMPLE
+            && self.query_cands.peek().map(|t| t.hash).unwrap_or(u64::MAX) < hash
+        {
+            return;
+        }
+        self.query_cands.push(QueryCand {
+            hash,
+            vec: self.dequant_scratch.clone(),
+            id: row.stable_id,
+        });
+        if self.query_cands.len() > WIDTH_LAW_QUERY_SAMPLE {
+            self.query_cands.pop();
         }
     }
 
@@ -1543,8 +1600,17 @@ impl WidthLawCalibration {
         self.pool_cells = pool_cells
             .max(RERANK_LAW_POOL_CELLS)
             .min((grid.n_cent as usize).max(1));
-        let queries = self.reservoir.sample().to_vec();
-        let ids = self.slot_ids.clone();
+        // Drain the min-hash candidates in ascending (hash, bytes) order — an
+        // order-independent query set the sampler produces identically for any
+        // offer order over the same rows.
+        let mut cands: Vec<QueryCand> = std::mem::take(&mut self.query_cands).into_vec();
+        cands.sort_unstable();
+        let mut queries: Vec<f32> = Vec::with_capacity(cands.len() * self.dim);
+        let mut ids: Vec<i128> = Vec::with_capacity(cands.len());
+        for c in &cands {
+            queries.extend_from_slice(&c.vec);
+            ids.push(c.id);
+        }
         let n_queries = ids.len();
         *self.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![Vec::new(); n_queries];
         *self.est_tops.lock().unwrap_or_else(PoisonError::into_inner) =
