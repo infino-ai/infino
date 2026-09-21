@@ -6,6 +6,8 @@
 //! dispatch, and the AND flat-merge intersection family. Split from the
 //! reader `core` as its own `impl FtsReader` block.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::{cmp::Ordering, collections::BinaryHeap, slice::from_mut};
 
 use super::{
@@ -123,6 +125,28 @@ unsafe fn filter_survivors_avx2(docs: &mut [u32], scores: &mut [f32], min_score:
         }
         out
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every block bound the ranked-union walk computed, with the doc range
+    /// it claims to cover. The walk drops a run of blocks when this bound
+    /// cannot beat the bar, so the bound must never fall below a real score
+    /// inside its range. That is a property of the bound alone: a bound a
+    /// little too small drops only docs that would not have placed, leaving
+    /// the returned top-k unchanged, so no comparison against a reference
+    /// walk can see it. The accompanying test checks the claims directly.
+    pub(super) static BOUND_CLAIMS: RefCell<Vec<BoundClaim>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// One bound and the `[from, to)` docs it is claimed to cover.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BoundClaim {
+    pub(super) from: u32,
+    pub(super) to: u32,
+    pub(super) bound: f32,
 }
 
 /// How many more docs a term must have in a union window than the
@@ -2221,6 +2245,21 @@ impl FtsReader {
                         } else {
                             total_term_ub - c.term_max_bm25
                         };
+                        #[cfg(test)]
+                        BOUND_CLAIMS.with(|v| {
+                            // Past the window a sole-essential bound claims
+                            // nothing, because it counts no other essential
+                            // term and those do have postings out there.
+                            let block_end = c.current_block_last_doc_id().saturating_add(1);
+                            v.borrow_mut().push(BoundClaim {
+                                from: c.current_doc_id(),
+                                to: match sole {
+                                    true => block_end.min(window_end),
+                                    false => block_end,
+                                },
+                                bound: c.current_block_max_bm25() + others_ub,
+                            })
+                        });
                         if c.current_block_max_bm25() + others_ub <= threshold
                             && (!sole || c.current_block_last_doc_id() < window_end)
                         {
@@ -2611,7 +2650,9 @@ impl FtsReader {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
+
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     use bytes::Bytes;
 
@@ -3364,6 +3405,148 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn no_window_bound_falls_below_a_real_score_it_covers() {
+        // The walk drops whole runs of blocks whose bound cannot beat the bar.
+        // Comparing the returned ranking against a reference walk does not test
+        // that bound: shrink it a little and the docs it wrongly drops are ones
+        // that would not have placed anyway, so every ranking still matches,
+        // and only a large cut reaches a doc that would have placed. Nor is it
+        // enough to check that a dropped doc scored under the bar, because a
+        // loose bound satisfies that with room to spare. So check the bound on
+        // its own terms: over the docs it covers, it must never fall below a
+        // real score.
+        //
+        // Randomised over several corpora, because the bound's slack depends on
+        // how far a block's maximum sits above the docs inside it, and that is
+        // what varying term frequency and document length control.
+        const N_DOCS: u32 = OR_WINDOW * 3 + 500;
+        const TRIALS: u64 = 6;
+        const SCORE_EPS: f32 = 1e-4;
+        /// In-block position of the planted document described below.
+        const SATURATED_SLOT: u32 = 7;
+        let mut checked_ranges = 0usize;
+        let mut checked_docs = 0usize;
+        for seed in 0..TRIALS {
+            let mut rng = StdRng::seed_from_u64(seed);
+            // The shape that drives the skip: a term in most documents whose
+            // blocks differ sharply in their maximum, so most of them fall
+            // under the bar, beside a term rare enough that whole windows hold
+            // none of it. The periods and frequencies are drawn per trial,
+            // since how far a block's maximum sits above the documents inside
+            // it is exactly what decides the bound's slack.
+            let hot_period = rng.random_range(4..12u32);
+            let hot_tf = rng.random_range(3..6u32);
+            let common_gap = rng.random_range(4..7u32);
+            let rare_period = rng.random_range(1500..4200u32);
+            let rare_offset = rng.random_range(0..1500u32);
+            let tok = Arc::new(AsciiLowerTokenizer);
+            let mut b = FtsBuilder::new(tok);
+            b.register_column("body".into(), false).expect("register");
+            for i in 0..N_DOCS {
+                let hot = (i / BLOCK_LEN as u32).is_multiple_of(hot_period);
+                let tf = match (hot, i % 4) {
+                    (true, 0) => hot_tf,
+                    (true, _) => 2,
+                    (false, _) => 1,
+                };
+                let mut text = String::new();
+                // One document per block carries the common term at its
+                // highest frequency and the weak term, in the shortest
+                // document in the corpus. Both terms therefore reach their
+                // maximum weight on the same document, so the bound over that
+                // block equals a real score instead of sitting above every one
+                // of them, and any shrink of it is immediately wrong. It holds
+                // neither of the other terms, so it does not stop a window
+                // from being a single essential term's own.
+                if i % BLOCK_LEN as u32 == SATURATED_SLOT {
+                    for _ in 0..hot_tf {
+                        text.push_str("alpha ");
+                    }
+                    text.push_str("delta");
+                    b.add_doc(0, i, text.trim()).expect("add doc");
+                    continue;
+                }
+                if !i.is_multiple_of(common_gap) {
+                    for _ in 0..tf {
+                        text.push_str("alpha ");
+                    }
+                }
+                if i % rare_period == rare_offset % rare_period {
+                    text.push_str("beta ");
+                }
+                if rng.random_range(0..50u32) == 0 {
+                    text.push_str("gamma ");
+                }
+                // A term in nearly every document, so its weight is the
+                // smallest and the rising bar makes it non-essential first.
+                // Without one the sole-essential bound, which sums exactly the
+                // non-essential weights, is zero in every window and a test
+                // cannot tell a correct one from a shrunken one.
+                if rng.random_range(0..10u32) != 0 {
+                    text.push_str("delta ");
+                }
+                // Every other document is longer, so the planted one keeps the
+                // shortest length and with it the highest weight per term.
+                for f in 0..=rng.random_range(0..6u32) {
+                    text.push_str(&format!("pad{f:02} "));
+                }
+                b.add_doc(0, i, text.trim()).expect("add doc");
+            }
+            let blob = Bytes::from(b.finish().expect("finish"));
+            let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+            let r = FtsReader::open(blob, json).expect("open");
+            for terms in [
+                &["alpha", "beta"][..],
+                &["beta", "alpha"][..],
+                &["alpha", "beta", "gamma"][..],
+                &["alpha", "beta", "delta"][..],
+                &["alpha", "beta", "gamma", "delta"][..],
+            ] {
+                // The unpruned ranking: above the match count the heap never
+                // fills, the bar stays at negative infinity and no bound is
+                // consulted, so these are the true scores.
+                let truth: HashMap<u32, f32> = r
+                    .search_with_algo_for_bench("body", terms, N_DOCS as usize + 1, OrAlgo::Bmm)
+                    .await
+                    .expect("truth")
+                    .into_iter()
+                    .collect();
+                for k in [1usize, 10, 100, 600, 1000, 3000] {
+                    BOUND_CLAIMS.with(|v| v.borrow_mut().clear());
+                    let _ = r
+                        .search_with_algo_for_bench("body", terms, k, OrAlgo::WindowedMaxscore)
+                        .await
+                        .expect("wms");
+                    let claims = BOUND_CLAIMS.with(|v| v.borrow().clone());
+                    checked_ranges += claims.len();
+                    for claim in claims {
+                        for doc in claim.from..claim.to {
+                            let Some(&score) = truth.get(&doc) else {
+                                continue;
+                            };
+                            checked_docs += 1;
+                            assert!(
+                                score <= claim.bound + SCORE_EPS,
+                                "seed {seed} {terms:?} k={k}: doc {doc} scores {score}, above \
+                                 the {} bound covering docs {}..{}",
+                                claim.bound,
+                                claim.from,
+                                claim.to
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // A bound that is never exercised proves nothing, so fail loudly if a
+        // future change stops the walk from dropping anything here.
+        assert!(
+            checked_ranges >= 20 && checked_docs >= 5_000,
+            "the corpora stopped exercising the bound: {checked_ranges} ranges, {checked_docs} docs"
+        );
     }
 
     #[tokio::test]
