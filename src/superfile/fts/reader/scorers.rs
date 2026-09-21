@@ -2652,9 +2652,8 @@ impl FtsReader {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use rand::{RngExt, SeedableRng, rngs::StdRng};
-
     use bytes::Bytes;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
