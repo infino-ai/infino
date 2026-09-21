@@ -40,6 +40,8 @@ fn make_disk_cache(storage: Arc<dyn StorageProvider>, cache_root: &Path) -> Arc<
         prefetch_concurrency: 8,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
+        // HybridWithPrefetch never runs the lazy fill; take the default.
+        promotion_defer_timeout: DiskCacheConfig::default().promotion_defer_timeout,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
     };

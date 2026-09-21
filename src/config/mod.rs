@@ -1095,6 +1095,15 @@ pub struct StorageSettings {
     /// `mmap_cold_threshold_secs` and not accessed since the
     /// previous sweep. Default: 75 s.
     pub mmap_sweep_interval_secs: u64,
+    /// How long a background superfile fill yields to foreground
+    /// queries holding the same superfile's lazy reader before it
+    /// downloads anyway. Default: 10 s. `0` promotes immediately;
+    /// a superfile under continuous query load would otherwise never
+    /// go idle, so the fill would never run and the reader would stay
+    /// in its heap-resident lazy state for the life of the process.
+    /// See
+    /// [`crate::supertable::reader_cache::DiskCacheConfig::promotion_defer_timeout`].
+    pub promotion_defer_timeout_secs: u64,
 }
 
 impl Default for StorageSettings {
@@ -1114,6 +1123,7 @@ impl Default for StorageSettings {
             prefetch_concurrency: DEFAULT_PREFETCH_CONCURRENCY,
             mmap_cold_threshold_secs: DEFAULT_MMAP_COLD_THRESHOLD_SECS,
             mmap_sweep_interval_secs: DEFAULT_MMAP_SWEEP_INTERVAL_SECS,
+            promotion_defer_timeout_secs: DEFAULT_PROMOTION_DEFER_TIMEOUT_SECS,
         }
     }
 }
@@ -1133,6 +1143,9 @@ pub(crate) const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 const DEFAULT_MMAP_COLD_THRESHOLD_SECS: u64 = 300;
 /// Default background mmap-sweep period (seconds).
 const DEFAULT_MMAP_SWEEP_INTERVAL_SECS: u64 = 75;
+/// Default window a background fill yields to same-superfile foreground
+/// queries before promoting anyway (seconds).
+const DEFAULT_PROMOTION_DEFER_TIMEOUT_SECS: u64 = 10;
 
 fn default_id_column() -> String {
     "_id".to_string()

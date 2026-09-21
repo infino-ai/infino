@@ -57,6 +57,11 @@ const BENCH_COLD_FETCH_STREAMS: usize = 8;
 const BENCH_COLD_FETCH_CHUNK_BYTES: u64 = 8 * MIB_BYTES;
 /// Mmap promotion timers disabled in benches (no idle eviction).
 const MMAP_TIMER_DISABLED_SECS: u64 = 0;
+/// How long a bench background fill yields to a foreground reader before
+/// promoting anyway. Longer than any single measurement, so deferral stays
+/// in force for the whole run and cold/warm phases measure the same states
+/// they always have.
+const BENCH_PROMOTION_DEFER_TIMEOUT: Duration = Duration::from_secs(3600);
 
 const SUPERFILE_BENCH_PREFIX: &str = "infino-superfile-bench";
 
@@ -809,6 +814,7 @@ fn fresh_disk_cache_with_mode(
         prefetch_concurrency: bench_prefetch_concurrency(),
         mmap_cold_threshold_secs: MMAP_TIMER_DISABLED_SECS,
         mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
+        promotion_defer_timeout: BENCH_PROMOTION_DEFER_TIMEOUT,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: false,
     };

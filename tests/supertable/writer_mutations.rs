@@ -110,6 +110,8 @@ fn make_disk_cache(
         prefetch_concurrency: PREFETCH_CONCURRENCY,
         mmap_cold_threshold_secs: MMAP_TIMER_DISABLED_SECS,
         mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
+        // HybridWithPrefetch never runs the lazy fill; take the default.
+        promotion_defer_timeout: DiskCacheConfig::default().promotion_defer_timeout,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
     };
