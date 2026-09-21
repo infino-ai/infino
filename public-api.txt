@@ -187,12 +187,12 @@ pub infino::RecalibratePolicy::Auto
 pub infino::RecalibratePolicy::Force
 pub infino::RecalibratePolicy::Skip
 impl core::clone::Clone for infino::RecalibratePolicy
-pub fn infino::RecalibratePolicy::clone(&self) -> infino::RecalibratePolicy
+pub fn infino::RecalibratePolicy::clone(&self) -> Self
 impl core::cmp::Eq for infino::RecalibratePolicy
 impl core::cmp::PartialEq for infino::RecalibratePolicy
-pub fn infino::RecalibratePolicy::eq(&self, &infino::RecalibratePolicy) -> bool
+pub fn infino::RecalibratePolicy::eq(&self, &Self) -> bool
 impl core::default::Default for infino::RecalibratePolicy
-pub fn infino::RecalibratePolicy::default() -> infino::RecalibratePolicy
+pub fn infino::RecalibratePolicy::default() -> Self
 impl core::fmt::Debug for infino::RecalibratePolicy
 pub fn infino::RecalibratePolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::RecalibratePolicy
