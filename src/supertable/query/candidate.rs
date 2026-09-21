@@ -119,11 +119,36 @@ impl CandidateScope {
         }
     }
 
-    /// Whether `superfile` still has a candidate row under this scope.
-    pub(crate) fn admits_superfile(&self, superfile: &SuperfileEntry) -> bool {
-        self.allow
-            .as_ref()
-            .is_none_or(|allow| allow.contains_key(&superfile.uri))
+    /// The scope's superfiles that still hold a candidate row: every one
+    /// under an unbounded plan, and under a bounded one those with an entry
+    /// in `allow` (a superfile whose candidate set came back empty has
+    /// none). The one place the two gates - statistics survival and row
+    /// survival - are read together, so a caller cannot ask about a file
+    /// outside the scope and be told yes.
+    pub(crate) fn admitted_superfiles(&self) -> impl Iterator<Item = &Arc<SuperfileEntry>> {
+        self.superfiles.iter().filter(move |entry| {
+            self.allow
+                .as_ref()
+                .is_none_or(|allow| allow.contains_key(&entry.uri))
+        })
+    }
+
+    /// Whether this scope narrows the *rows* of `kept` at all: false under
+    /// an unbounded plan, and false when every kept superfile's candidate
+    /// set is its whole row set - a bitmap that admits every row is no gate,
+    /// and a caller with a faster ungated kernel may use it. True as soon as
+    /// one kept superfile has an absent or partial set. Tombstones are
+    /// already subtracted from the sets, so a superfile with deleted rows
+    /// reads as bounded; that is the conservative side.
+    pub(crate) fn bounds_rows(&self, kept: &[Arc<SuperfileEntry>]) -> bool {
+        let Some(allow) = self.allow.as_ref() else {
+            return false;
+        };
+        kept.iter().any(|entry| {
+            allow
+                .get(&entry.uri)
+                .is_none_or(|rows| rows.len() < entry.n_docs)
+        })
     }
 }
 
@@ -1080,17 +1105,110 @@ mod tests {
         logical_expr::expr::InList,
         prelude::{col, lit},
     };
+    use uuid::Uuid;
 
     use super::*;
-    use crate::superfile::fts::{
-        analysis::{Base, Stemmer, Stopwords, chain_tokenizer},
-        tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER, StandardTokenizer},
+    use crate::superfile::{
+        fts::{
+            analysis::{Base, Stemmer, Stopwords, chain_tokenizer},
+            tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER, StandardTokenizer},
+        },
+        vector::layout::VectorLayout,
     };
 
     fn fts_cols() -> HashSet<&'static str> {
         let mut s = HashSet::new();
         s.insert("title");
         s
+    }
+
+    /// A manifest entry of `n_docs` rows with nothing else filled in: the
+    /// scope reads only `uri` and `n_docs` of it.
+    fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
+        Arc::new(SuperfileEntry {
+            superfile_id: Uuid::new_v4(),
+            uri: SuperfileUri::new_v4(),
+            stem: None,
+            n_docs,
+            id_min: 0,
+            id_max: n_docs as i128 - 1,
+            scalar_stats: Default::default(),
+            fts_summary: Default::default(),
+            vector_summary: Default::default(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            subsection_offsets: None,
+            vector_layout: VectorLayout::Ivf,
+            birth_version: 0,
+        })
+    }
+
+    /// The candidate rows `0..n` of a superfile.
+    fn rows(n: u32) -> Arc<RoaringBitmap> {
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert_range(0..n);
+        Arc::new(bitmap)
+    }
+
+    /// The admitted superfiles are the scope's own, less those a bounded
+    /// plan left without a candidate row; an unbounded plan admits every
+    /// one of the scope's superfiles, and an empty scope none.
+    #[test]
+    fn admitted_superfiles_reads_the_file_gate_and_the_row_gate_together() {
+        let (a, b, c) = (entry(4), entry(4), entry(4));
+        let uris = |admitted: Vec<&Arc<SuperfileEntry>>| -> Vec<SuperfileUri> {
+            admitted.into_iter().map(|e| e.uri).collect()
+        };
+        let bounded = CandidateScope {
+            superfiles: vec![Arc::clone(&a), Arc::clone(&b), Arc::clone(&c)],
+            // `b` evaluated to no candidate row and was dropped from the map.
+            allow: Some(HashMap::from([(a.uri, rows(2)), (c.uri, rows(4))])),
+        };
+        assert_eq!(
+            uris(bounded.admitted_superfiles().collect()),
+            vec![a.uri, c.uri],
+            "in scope order, without the file whose set is empty"
+        );
+        let unbounded = CandidateScope {
+            superfiles: vec![Arc::clone(&a), Arc::clone(&b)],
+            allow: None,
+        };
+        assert_eq!(
+            uris(unbounded.admitted_superfiles().collect()),
+            vec![a.uri, b.uri]
+        );
+        assert_eq!(CandidateScope::empty().admitted_superfiles().count(), 0);
+    }
+
+    /// A scope narrows the rows of the kept superfiles only when some kept
+    /// set is absent or smaller than the file: whole sets gate nothing, and
+    /// an unbounded plan has no sets at all.
+    #[test]
+    fn bounds_rows_only_when_a_kept_set_is_less_than_the_whole_file() {
+        let (whole, partial, missing) = (entry(4), entry(4), entry(4));
+        let scope = CandidateScope {
+            superfiles: vec![
+                Arc::clone(&whole),
+                Arc::clone(&partial),
+                Arc::clone(&missing),
+            ],
+            allow: Some(HashMap::from([
+                (whole.uri, rows(4)),
+                (partial.uri, rows(3)),
+            ])),
+        };
+        assert!(
+            !scope.bounds_rows(&[Arc::clone(&whole)]),
+            "a set holding every row of every kept file is no gate"
+        );
+        assert!(scope.bounds_rows(&[Arc::clone(&whole), Arc::clone(&partial)]));
+        assert!(scope.bounds_rows(&[Arc::clone(&missing)]));
+        assert!(!scope.bounds_rows(&[]), "nothing kept, nothing bounded");
+        let unbounded = CandidateScope {
+            superfiles: vec![Arc::clone(&partial)],
+            allow: None,
+        };
+        assert!(!unbounded.bounds_rows(&[partial]));
     }
 
     /// Resolver for the lowering tests: every column tokenizes with the

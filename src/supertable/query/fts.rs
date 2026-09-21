@@ -576,9 +576,7 @@ impl SupertableReader {
         // scoped query ranks on the same scale as an unscoped one.
         if let Some(scope) = scope {
             let admitted: HashSet<Uuid> = scope
-                .superfiles
-                .iter()
-                .filter(|e| scope.admits_superfile(e))
+                .admitted_superfiles()
                 .map(|e| e.superfile_id)
                 .collect();
             kept.retain(|e| admitted.contains(&e.superfile_id));
@@ -639,9 +637,13 @@ impl SupertableReader {
         // Phrase-bearing queries stay per-superfile: the ranged
         // kernel is the pure term-union fast path. So does a search
         // with a per-row scope — the ranged union kernel carries no
-        // admission gate, only the clause kernels do.
-        let per_row_scope: Option<Arc<HashMap<SuperfileUri, Arc<RoaringBitmap>>>> =
-            scope.and_then(|s| s.allow.clone()).map(Arc::new);
+        // admission gate, only the clause kernels do. A scope whose
+        // candidate sets admit every row of every kept superfile gates
+        // nothing, so it is dropped here and the fast path stays open.
+        let per_row_scope: Option<Arc<HashMap<SuperfileUri, Arc<RoaringBitmap>>>> = scope
+            .filter(|s| s.bounds_rows(&kept))
+            .and_then(|s| s.allow.clone())
+            .map(Arc::new);
         let fanout = match has_phrases || per_row_scope.is_some() {
             true => FanOut::PerSuperfile,
             false => fanout_for(musts.len(), shoulds.len(), !negatives.is_empty()),

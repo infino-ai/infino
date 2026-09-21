@@ -196,12 +196,7 @@ impl SupertableReader {
                     // Only superfiles that still hold a candidate row; the
                     // kernel treats a superfile absent from the allow map as
                     // having no admitted row, so none is handed to it.
-                    let superfiles: Vec<_> = scope
-                        .superfiles
-                        .iter()
-                        .filter(|e| scope.admits_superfile(e))
-                        .cloned()
-                        .collect();
+                    let superfiles: Vec<_> = scope.admitted_superfiles().cloned().collect();
                     if superfiles.is_empty() {
                         return Ok(Vec::new());
                     }
@@ -709,8 +704,8 @@ mod tests {
     use std::collections::HashSet;
 
     use arrow_array::{
-        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray,
-        RecordBatch, StringArray,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema};
     use rayon::ThreadPoolBuilder;
@@ -1577,6 +1572,24 @@ mod tests {
             ))
             .expect("filtered query_sql");
         assert_eq!(tags_of(&filtered), vec!["b", "b", "b"]);
+        // An aggregate over the filtered relation counts the matching rows,
+        // not the survivors of a global fused top-k — the same acceptance
+        // case `bm25_search` holds, on the fused function.
+        let count = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT COUNT(*) AS n FROM hybrid_search('title', 'rust', 'emb', '{qv}', {k}) \
+                 WHERE tag = 'b'"
+            ))
+            .expect("count query_sql");
+        let n = count[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count is int64")
+            .value(0);
+        assert_eq!(n, k as i64);
     }
 
     #[test]
