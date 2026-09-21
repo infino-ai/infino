@@ -17,8 +17,9 @@ const STREAM = "stream";
 
 // --- public types ---
 
-/** Vector distance metric. */
-export type Metric = "cosine" | "l2sq" | "negdot";
+/** Vector distance metric. `l2` and `dot` are accepted spellings of `l2sq`
+ * and `negdot`, matching the Python binding and the hosted API. */
+export type Metric = "cosine" | "l2sq" | "l2" | "negdot" | "dot";
 /** Boolean mode for multi-term FTS queries. */
 export type BoolMode = "or" | "and";
 /** BM25 statistics scope: corpus-wide `"global"` IDF across superfiles
@@ -118,6 +119,13 @@ export interface Bm25SearchOptions {
   stats?: Bm25Stats;
   /** Columns to return, e.g. `["_id", "score"]`; omit for full rows. */
   projection?: string[];
+  /** BM25 `k1` for this search only, overriding the column's declared value.
+   * Pass `k1` and `b` together or neither. Results stay exact; only pruning
+   * power is traded. A pair you mean to keep belongs on the column
+   * (`IndexSpec.fts`). */
+  k1?: number;
+  /** BM25 `b` for this search only; see {@link Bm25SearchOptions.k1}. */
+  b?: number;
   arrow?: boolean;
 }
 /** Text-predicate filter for `vectorSearch` (a pushdown pre-filter, not a
@@ -391,7 +399,9 @@ export class Table {
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions & { arrow: true }): arrow.Table;
   bm25Search(column: string, query: string, k: number, opts?: Bm25SearchOptions): RowRecord[];
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions = {}): RowRecord[] | arrow.Table {
-    const buf = guard(this.remote, () => this.inner.bm25Search(column, query, k, opts.mode, opts.stats, opts.projection));
+    const buf = guard(this.remote, () =>
+      this.inner.bm25Search(column, query, k, opts.mode, opts.stats, opts.projection, opts.k1, opts.b),
+    );
     return decode(buf, opts.arrow);
   }
 
