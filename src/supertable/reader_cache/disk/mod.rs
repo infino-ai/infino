@@ -626,13 +626,12 @@ mod test_support {
         time::{Duration, Instant},
     };
 
-    use tokio::time::sleep;
-
     use arrow_array::{LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
     use roaring::RoaringBitmap;
     use tempfile::TempDir;
+    use tokio::time::sleep;
 
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
