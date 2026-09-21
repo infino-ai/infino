@@ -93,7 +93,7 @@ use crate::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
                 PartitionStrategy,
             },
-            part::{ContentHash, ManifestPart, PartId},
+            part::{ContentHash, ManifestPart, OpenBlobBudget, PartId},
             partition::{assign_partition, encode_partition_key},
         },
         query::{hierarchical_iter, prune::PruneLeaf},
@@ -2279,6 +2279,16 @@ fn rebuild_part_and_entry(
 /// An optional [`ManifestDiskCache`] short-circuits the storage GET
 /// when the part's compressed bytes are already on local disk. Because
 /// parts are content-addressed, a cache hit can never be stale.
+/// Default ceiling on inline open-blob bytes a manifest snapshot keeps
+/// resident, shared across the whole load.
+///
+/// Sized so a compacted table keeps every blob it has today: a compacted
+/// superfile inlines only its 64 KiB parquet tail (its FTS ranges exceed the
+/// writer's inline cap), so this covers several thousand of them. A table of
+/// small, uncompacted superfiles inlines both FTS ranges per entry and would
+/// otherwise grow without limit — 19,980 such entries reached 86 GB.
+const DEFAULT_OPEN_BLOB_BUDGET_BYTES: u64 = 512 * (1 << 20);
+
 pub struct ManifestPartLoader {
     storage: Arc<dyn StorageProvider>,
     /// Maps `PartId → (expected content_hash, uri, routing sibling)`.
@@ -2294,6 +2304,10 @@ pub struct ManifestPartLoader {
     /// the list stamps one. Writer handles keep this off — part rebuilds
     /// re-encode the full form and need resident fp32.
     prefer_routing: bool,
+    /// Ceiling on the inline open blobs this snapshot's parts keep
+    /// resident, shared across every part of the load. See
+    /// [`OpenBlobBudget`].
+    open_blob_budget: Arc<OpenBlobBudget>,
 }
 
 impl ManifestPartLoader {
@@ -2331,6 +2345,7 @@ impl ManifestPartLoader {
             parts_index: idx,
             manifest_disk_cache,
             prefer_routing,
+            open_blob_budget: Arc::new(OpenBlobBudget::new(DEFAULT_OPEN_BLOB_BUDGET_BYTES)),
         }
     }
 
@@ -2388,7 +2403,9 @@ impl ManifestPartLoader {
         {
             record("cache_hit", true);
             record("bytes", bytes.len() as u64);
-            let parsed = decode_part_off_thread(Bytes::from(bytes)).await?;
+            let parsed =
+                decode_part_off_thread(Bytes::from(bytes), Arc::clone(&self.open_blob_budget))
+                    .await?;
             return Ok(Arc::new(parsed));
         }
         record("cache_hit", false);
@@ -2403,7 +2420,12 @@ impl ManifestPartLoader {
         // blake3 over a multi-hundred-MiB part is CPU the polling task
         // must not absorb (it serializes the nominally-concurrent part
         // fan exactly like the inline decode used to).
-        let parsed = verify_and_decode_part_off_thread(bytes.clone(), *expected_hash).await?;
+        let parsed = verify_and_decode_part_off_thread(
+            bytes.clone(),
+            *expected_hash,
+            Arc::clone(&self.open_blob_budget),
+        )
+        .await?;
         // Populate the cache for next time (best-effort; the hash was
         // verified above, satisfying `put`'s contract).
         if let Some(cache) = &self.manifest_disk_cache {
@@ -2472,8 +2494,15 @@ impl UserCentroidCache {
     feature = "detailed-tracing",
     tracing::instrument(name = "manifest.part_decode", skip_all, fields(bytes = bytes.len() as u64))
 )]
-async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLoadError> {
-    match spawn_blocking(carry_span(move || part::decode(&bytes))).await {
+async fn decode_part_off_thread(
+    bytes: Bytes,
+    budget: Arc<OpenBlobBudget>,
+) -> Result<ManifestPart, ManifestLoadError> {
+    match spawn_blocking(carry_span(move || {
+        part::decode_with_blob_budget(&bytes, &budget)
+    }))
+    .await
+    {
         Ok(result) => Ok(result?),
         Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
             format!("part decode task failed: {join_error}"),
@@ -2495,6 +2524,7 @@ async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLo
 async fn verify_and_decode_part_off_thread(
     bytes: Bytes,
     expected_hash: ContentHash,
+    budget: Arc<OpenBlobBudget>,
 ) -> Result<ManifestPart, ManifestLoadError> {
     let verify_then_decode = move || {
         let actual_hash = ContentHash::of(&bytes);
@@ -2504,7 +2534,7 @@ async fn verify_and_decode_part_off_thread(
                 actual: actual_hash.to_hex(),
             });
         }
-        part::decode(&bytes).map_err(ManifestLoadError::from)
+        part::decode_with_blob_budget(&bytes, &budget).map_err(ManifestLoadError::from)
     };
     match spawn_blocking(carry_span(verify_then_decode)).await {
         Ok(result) => result,
@@ -8691,9 +8721,10 @@ mod tests {
         };
         let bytes = part::encode(&part);
 
-        let decoded = decode_part_off_thread(Bytes::from(bytes))
-            .await
-            .expect("valid part decodes off-thread");
+        let decoded =
+            decode_part_off_thread(Bytes::from(bytes), Arc::new(OpenBlobBudget::unlimited()))
+                .await
+                .expect("valid part decodes off-thread");
         assert_eq!(decoded.part_id, part.part_id, "part_id round-trips");
         assert_eq!(decoded.superfiles.len(), 1);
         assert_eq!(decoded.superfiles[0].superfile_id, id);
@@ -8701,9 +8732,12 @@ mod tests {
         assert_eq!(decoded.superfiles[0].id_max, 7);
 
         // Garbage bytes surface a typed error, not a panic.
-        let err = decode_part_off_thread(Bytes::from_static(b"not-a-valid-part-blob"))
-            .await
-            .expect_err("garbage bytes must fail to decode");
+        let err = decode_part_off_thread(
+            Bytes::from_static(b"not-a-valid-part-blob"),
+            Arc::new(OpenBlobBudget::unlimited()),
+        )
+        .await
+        .expect_err("garbage bytes must fail to decode");
         assert!(
             matches!(err, ManifestLoadError::Parse(_)),
             "expected a parse error, got {err:?}"

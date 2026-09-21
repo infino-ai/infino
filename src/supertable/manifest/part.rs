@@ -15,7 +15,10 @@ use std::{
     collections::HashMap,
     fmt,
     io::Cursor,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use apache_avro::{
@@ -481,7 +484,62 @@ const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Verifies format-version compatibility (major must match
 /// the constant [`FORMAT_VERSION`]; minor differences are
 /// accepted).
+/// Shared ceiling on the `open_blob` bytes one manifest load keeps resident.
+///
+/// A blob inlines a superfile's open-time ranges — the parquet footer tail,
+/// and the FTS term dictionary and doc-lengths tail when each is small enough
+/// to be worth copying — so a cold open costs no GET against the superfile
+/// object. That is worth a few MiB on a table of a few hundred superfiles. It
+/// is not worth it unbounded: a table of small, not-yet-compacted superfiles
+/// inlines both FTS ranges into every entry, and the decoded blobs are then
+/// held for the life of every process that opens the manifest. At 19,980
+/// entries that reached 86 GB and could not be opened at all.
+///
+/// Past the ceiling an entry keeps its ranges and drops the inline bytes. Its
+/// first open then fetches those ranges over the wire in one parallel wave —
+/// the path a large superfile already takes, because its ranges exceed the
+/// writer's inline cap and were never in the blob to begin with.
+#[derive(Debug)]
+pub struct OpenBlobBudget(AtomicU64);
+
+impl OpenBlobBudget {
+    /// A budget of `bytes`, shared across every part of one load.
+    pub fn new(bytes: u64) -> Self {
+        Self(AtomicU64::new(bytes))
+    }
+
+    /// No ceiling — every blob is kept. The shape of [`decode`].
+    pub fn unlimited() -> Self {
+        Self(AtomicU64::new(u64::MAX))
+    }
+
+    /// Claim `bytes`, or report that the budget is spent. Never partially
+    /// claims: a blob is kept whole or not at all, because a partial blob
+    /// would leave the open path fetching the remainder anyway.
+    fn claim(&self, bytes: u64) -> bool {
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                (left >= bytes).then(|| left - bytes)
+            })
+            .is_ok()
+    }
+
+    /// Bytes still claimable. Observability and tests.
+    pub fn remaining(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// [`decode`] with no ceiling on retained `open_blob` bytes.
 pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
+    decode_with_blob_budget(bytes, &OpenBlobBudget::unlimited())
+}
+
+/// Decode a part, keeping inline open blobs only while `budget` allows.
+pub fn decode_with_blob_budget(
+    bytes: &[u8],
+    budget: &OpenBlobBudget,
+) -> Result<ManifestPart, PartParseError> {
     let legacy_decompressed;
     let avro_bytes: &[u8] = if bytes.starts_with(&ZSTD_FRAME_MAGIC) {
         legacy_decompressed =
@@ -533,7 +591,7 @@ pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
     };
     let mut superfiles = Vec::with_capacity(segs.len());
     for seg_val in segs {
-        superfiles.push(Arc::new(decode_superfile(seg_val)?));
+        superfiles.push(Arc::new(decode_superfile(seg_val, budget)?));
     }
 
     Ok(ManifestPart {
@@ -558,7 +616,10 @@ fn peek_format_version(bytes: &[u8]) -> Result<String, PartParseError> {
     }
 }
 
-fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
+fn decode_superfile(
+    v: AvroValue,
+    budget: &OpenBlobBudget,
+) -> Result<SuperfileEntry, PartParseError> {
     let fields = match v {
         AvroValue::Record(r) => r,
         _ => {
@@ -587,7 +648,7 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
     // None for older manifests so old parts decode losslessly
     // (the cold-open path falls back to the 2-RTT shape).
     let subsection_offsets = take_optional_bytes(&mut map, "subsection_offsets")?
-        .map(|b| decode_subsection_offsets(&b))
+        .map(|b| decode_subsection_offsets(&b, budget))
         .transpose()?;
     let vector_layout = take_optional_string(&mut map, "vector_layout")?
         .and_then(|s| VectorLayout::from_kv_value(&s))
@@ -814,7 +875,10 @@ fn encode_range_list(out: &mut Vec<u8>, ranges: &[(u64, u64)]) {
     }
 }
 
-fn decode_subsection_offsets(bytes: &[u8]) -> Result<SubsectionOffsets, PartParseError> {
+fn decode_subsection_offsets(
+    bytes: &[u8],
+    budget: &OpenBlobBudget,
+) -> Result<SubsectionOffsets, PartParseError> {
     let mut cur = bytes;
     let take = |cur: &mut &[u8], n: usize| -> Result<Vec<u8>, PartParseError> {
         if cur.len() < n {
@@ -863,7 +927,7 @@ fn decode_subsection_offsets(bytes: &[u8]) -> Result<SubsectionOffsets, PartPars
     // Version 3 appends the inline open-batch blob; version 2 has
     // none (and leaves `cur` empty here).
     let open_blob = if ver >= SUBSECTION_OFFSETS_VERSION_CURRENT {
-        decode_open_blob(&mut cur, &read_u64, &take)?
+        decode_open_blob(&mut cur, &read_u64, &take, budget)?
     } else {
         Vec::new()
     };
@@ -886,6 +950,7 @@ fn decode_open_blob(
     cur: &mut &[u8],
     read_u64: &impl Fn(&mut &[u8]) -> Result<u64, PartParseError>,
     take: &impl Fn(&mut &[u8], usize) -> Result<Vec<u8>, PartParseError>,
+    budget: &OpenBlobBudget,
 ) -> Result<Vec<(u64, Vec<u8>)>, PartParseError> {
     let count_bytes = take(cur, U32_BYTES)?;
     let count = u32::from_le_bytes(
@@ -904,6 +969,19 @@ fn decode_open_blob(
                 .try_into()
                 .map_err(|_| PartParseError::SchemaMismatch("open_blob len read".into()))?,
         ) as usize;
+        // Over budget: step past the payload without materializing it. The
+        // entry keeps its ranges, so the open path fetches them over the
+        // wire — `uncovered_ranges` already computes exactly that for a
+        // blob the writer left incomplete.
+        if !budget.claim(len as u64) {
+            if cur.len() < len {
+                return Err(PartParseError::SchemaMismatch(
+                    "open_blob payload runs past the buffer".into(),
+                ));
+            }
+            *cur = &cur[len..];
+            continue;
+        }
         let bytes = take(cur, len)?;
         blob.push((off, bytes));
     }
@@ -1111,6 +1189,100 @@ mod tests {
                 open_blob: vec![(12_345_614, vec![0xAB; 64]), (123_456, vec![0xCD; 96])],
             }),
         })
+    }
+
+    /// The blob budget is a ceiling on retained inline bytes, not on decoding:
+    /// entries past it keep every other field — including the ranges the open
+    /// path needs to fetch for itself — and only the inline payload is dropped.
+    #[test]
+    fn open_blob_budget_drops_inline_bytes_past_the_ceiling_and_keeps_the_ranges() {
+        let entries: Vec<_> = (0..3).map(|_| make_rich_superfile()).collect();
+        let blob_bytes: u64 = entries[0]
+            .subsection_offsets
+            .as_ref()
+            .expect("offsets")
+            .open_blob
+            .iter()
+            .map(|(_, b)| b.len() as u64)
+            .sum();
+        assert!(blob_bytes > 0, "the fixture must carry an inline blob");
+        let encoded = encode(&fresh_part(entries));
+
+        // Room for the first entry's blob and nothing after it.
+        let budget = OpenBlobBudget::new(blob_bytes);
+        let decoded = decode_with_blob_budget(&encoded, &budget).expect("decode");
+        assert_eq!(decoded.superfiles.len(), 3);
+
+        let first = decoded.superfiles[0]
+            .subsection_offsets
+            .as_ref()
+            .expect("first offsets");
+        assert!(
+            !first.open_blob.is_empty(),
+            "the first entry fits the budget and keeps its blob"
+        );
+        assert_eq!(budget.remaining(), 0, "the first entry spends the budget");
+
+        for (i, entry) in decoded.superfiles.iter().enumerate().skip(1) {
+            let off = entry.subsection_offsets.as_ref().expect("offsets");
+            assert!(
+                off.open_blob.is_empty(),
+                "entry {i} is past the ceiling and must drop its inline bytes"
+            );
+            // What the open path falls back on must survive.
+            assert_eq!(off.total_size, first.total_size, "entry {i} total_size");
+            assert_eq!(
+                off.fts_open_ranges, first.fts_open_ranges,
+                "entry {i} fts ranges"
+            );
+            assert_eq!(
+                off.vec_open_ranges, first.vec_open_ranges,
+                "entry {i} vec ranges"
+            );
+            assert_eq!(off.vec, first.vec, "entry {i} vec subsection");
+            assert_eq!(off.fts, first.fts, "entry {i} fts subsection");
+        }
+
+        // Skipping a payload must leave the cursor where the next field starts,
+        // so a skipped entry decodes identically to the unbudgeted decode of the
+        // same bytes apart from the inline blob itself.
+        let whole = decode(&encoded).expect("unbudgeted decode");
+        for i in 1..decoded.superfiles.len() {
+            assert_superfiles_equal(&decoded.superfiles[i], &whole.superfiles[i]);
+            assert!(
+                !whole.superfiles[i]
+                    .subsection_offsets
+                    .as_ref()
+                    .expect("offsets")
+                    .open_blob
+                    .is_empty(),
+                "the unbudgeted decode is the control and must keep entry {i}'s blob"
+            );
+        }
+    }
+
+    /// The default path keeps every blob — the budget is opt-in.
+    #[test]
+    fn unlimited_open_blob_budget_keeps_every_inline_blob() {
+        let entries: Vec<_> = (0..3).map(|_| make_rich_superfile()).collect();
+        let expected = entries[0]
+            .subsection_offsets
+            .as_ref()
+            .expect("offsets")
+            .open_blob
+            .clone();
+        let decoded = decode(&encode(&fresh_part(entries))).expect("decode");
+        for (i, entry) in decoded.superfiles.iter().enumerate() {
+            assert_eq!(
+                entry
+                    .subsection_offsets
+                    .as_ref()
+                    .expect("offsets")
+                    .open_blob,
+                expected,
+                "entry {i} must keep its blob when no ceiling is set"
+            );
+        }
     }
 
     fn assert_superfiles_equal(a: &SuperfileEntry, b: &SuperfileEntry) {
@@ -1535,7 +1707,8 @@ mod tests {
         let bytes = encode_subsection_offsets(&off);
         // First byte is the current version tag.
         assert_eq!(bytes[0], SUBSECTION_OFFSETS_VERSION_CURRENT);
-        let decoded = decode_subsection_offsets(&bytes).expect("decode helper");
+        let decoded =
+            decode_subsection_offsets(&bytes, &OpenBlobBudget::unlimited()).expect("decode helper");
         assert_eq!(decoded, off);
     }
 
@@ -1550,7 +1723,8 @@ mod tests {
             open_blob: vec![],
         });
         bytes[0] = 99; // not LEGACY (2) nor CURRENT (3)
-        let err = decode_subsection_offsets(&bytes).expect_err("unknown version");
+        let err = decode_subsection_offsets(&bytes, &OpenBlobBudget::unlimited())
+            .expect_err("unknown version");
         assert!(matches!(err, PartParseError::SchemaMismatch(_)));
     }
 
@@ -1565,7 +1739,8 @@ mod tests {
             open_blob: vec![],
         });
         // Lop off the tail so a length-prefixed read runs past the end.
-        let err = decode_subsection_offsets(&bytes[..3]).expect_err("truncated");
+        let err = decode_subsection_offsets(&bytes[..3], &OpenBlobBudget::unlimited())
+            .expect_err("truncated");
         assert!(matches!(err, PartParseError::SchemaMismatch(_)));
     }
 
@@ -1580,7 +1755,8 @@ mod tests {
             open_blob: vec![],
         });
         bytes.push(0xaa); // extra byte after a complete encoding
-        let err = decode_subsection_offsets(&bytes).expect_err("trailing");
+        let err =
+            decode_subsection_offsets(&bytes, &OpenBlobBudget::unlimited()).expect_err("trailing");
         assert!(matches!(err, PartParseError::SchemaMismatch(_)));
     }
 
@@ -1597,7 +1773,8 @@ mod tests {
         bytes.push(SUBSECTION_FLAG_ABSENT);
         bytes.extend_from_slice(&0u32.to_le_bytes()); // vec_open_ranges count
         bytes.extend_from_slice(&0u32.to_le_bytes()); // fts_open_ranges count
-        let decoded = decode_subsection_offsets(&bytes).expect("legacy decode");
+        let decoded =
+            decode_subsection_offsets(&bytes, &OpenBlobBudget::unlimited()).expect("legacy decode");
         assert_eq!(decoded.total_size, 777);
         assert!(decoded.open_blob.is_empty());
         assert!(decoded.vec.is_none());
@@ -1726,7 +1903,8 @@ mod tests {
     fn decode_superfile_rejects_non_record_value() {
         // A non-record Avro value where a SuperfileEntry record is
         // expected → SchemaMismatch.
-        let err = decode_superfile(AvroValue::Long(7)).expect_err("non-record");
+        let err = decode_superfile(AvroValue::Long(7), &OpenBlobBudget::unlimited())
+            .expect_err("non-record");
         assert!(
             matches!(err, PartParseError::SchemaMismatch(_)),
             "got {err:?}"
@@ -1741,7 +1919,7 @@ mod tests {
             "superfile_id".into(),
             AvroValue::String("not-a-uuid".into()),
         )]);
-        let err = decode_superfile(rec).expect_err("bad uuid");
+        let err = decode_superfile(rec, &OpenBlobBudget::unlimited()).expect_err("bad uuid");
         assert!(
             matches!(err, PartParseError::BadSuperfileId(_)),
             "got {err:?}"
@@ -1764,7 +1942,8 @@ mod tests {
         // Drop the trailing payload bytes so the declared length runs
         // past the end of the buffer.
         bytes.truncate(bytes.len() - 2);
-        let err = decode_subsection_offsets(&bytes).expect_err("truncated open_blob");
+        let err = decode_subsection_offsets(&bytes, &OpenBlobBudget::unlimited())
+            .expect_err("truncated open_blob");
         assert!(
             matches!(err, PartParseError::SchemaMismatch(_)),
             "got {err:?}"
@@ -1975,7 +2154,7 @@ mod tests {
             ),
             ("uri".into(), AvroValue::String("not-a-uuid".into())),
         ]);
-        let err = decode_superfile(rec).expect_err("bad uri uuid");
+        let err = decode_superfile(rec, &OpenBlobBudget::unlimited()).expect_err("bad uri uuid");
         assert!(
             matches!(err, PartParseError::BadSuperfileId(_)),
             "got {err:?}"
@@ -2019,7 +2198,8 @@ mod tests {
         });
         // Header is: ver(1) + total(8) + vec flag(1) + fts flag(1) = 11
         // bytes, then the vec_open_ranges u32 count. Cut into the count.
-        let err = decode_subsection_offsets(&bytes[..12]).expect_err("truncated range count");
+        let err = decode_subsection_offsets(&bytes[..12], &OpenBlobBudget::unlimited())
+            .expect_err("truncated range count");
         assert!(
             matches!(err, PartParseError::SchemaMismatch(_)),
             "got {err:?}"
