@@ -50,7 +50,7 @@ use arrow_array::*;
 use arrow_schema::{DataType, TimeUnit};
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::future;
+use futures::{future, stream, stream::StreamExt};
 /// Re-export the per-column skip aggregates so callers can refer to them as
 /// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
@@ -902,7 +902,10 @@ impl ManifestSnapshot {
                         async move { loader.load(pid).await }
                     })
                     .collect::<Vec<_>>();
-                let loaded = future::join_all(load_futs).await;
+                let loaded = stream::iter(load_futs)
+                    .buffered(MANIFEST_PART_LOAD_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await;
                 for (pid, result) in missing_part_ids.iter().zip(loaded) {
                     let part = result?;
                     let cell = OnceCell::new();
@@ -942,7 +945,10 @@ impl ManifestSnapshot {
                         async move { loader.load(pid).await }
                     })
                     .collect::<Vec<_>>();
-                let loaded = future::join_all(load_futs).await;
+                let loaded = stream::iter(load_futs)
+                    .buffered(MANIFEST_PART_LOAD_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await;
                 for (pid, result) in part_ids.iter().zip(loaded) {
                     let part = result?;
                     all_superfiles.extend(part.superfiles.iter().cloned());
@@ -2279,6 +2285,17 @@ fn rebuild_part_and_entry(
 /// An optional [`ManifestDiskCache`] short-circuits the storage GET
 /// when the part's compressed bytes are already on local disk. Because
 /// parts are content-addressed, a cache hit can never be stale.
+/// Manifest parts fetched + decoded concurrently during one snapshot load.
+///
+/// Each in-flight part holds its raw bytes, the Avro value tree decoded from
+/// them and the entries built out of that — a few times the part's own size —
+/// so loading every part at once makes the peak scale with the part count. A
+/// table of small superfiles has tens of thousands of parts, which is how an
+/// open reached tens of GB before it had answered anything. Bounded, the peak
+/// is a function of this number instead, and the fetches still overlap enough
+/// to keep the object store busy.
+const MANIFEST_PART_LOAD_CONCURRENCY: usize = 32;
+
 /// Default ceiling on inline open-blob bytes a manifest snapshot keeps
 /// resident, shared across the whole load.
 ///
