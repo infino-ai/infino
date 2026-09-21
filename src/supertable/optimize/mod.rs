@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
+use std::time::Instant;
+
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
@@ -33,29 +35,29 @@ impl Supertable {
         // Optimize phase timers ([optphase]); gated, off by default. A measuring
         // stick for compaction scaling — see DiagnosticsSettings.
         let phase_timers = crate::config::global().diagnostics.optimize_phase_timers;
-        let mut __t = std::time::Instant::now();
+        let mut __t = Instant::now();
         self.drain_hidden_vector_cells_sync()
             .map_err(|e| OptimizeError::Build(e.to_string()))?;
         if phase_timers {
-            eprintln!("[optphase] drain {:.1}s", __t.elapsed().as_secs_f64());
-            __t = std::time::Instant::now();
+            tracing::info!(secs = __t.elapsed().as_secs_f64(), "[optphase] drain");
+            __t = Instant::now();
         }
         self.compact_with(&opts.compaction, opts.recalibrate)?;
         if phase_timers {
-            eprintln!(
-                "[optphase] compact_total {:.1}s",
-                __t.elapsed().as_secs_f64()
+            tracing::info!(
+                secs = __t.elapsed().as_secs_f64(),
+                "[optphase] compact_total"
             );
-            __t = std::time::Instant::now();
+            __t = Instant::now();
         }
         // Centroids have settled at the final generation (drain + compaction);
         // pre-build the centroid-router graph so the next centroid-graph query
         // loads it instead of building on the hot path. Best-effort.
         self.refresh_centroid_router_cache();
         if phase_timers {
-            eprintln!(
-                "[optphase] router_cache {:.1}s",
-                __t.elapsed().as_secs_f64()
+            tracing::info!(
+                secs = __t.elapsed().as_secs_f64(),
+                "[optphase] router_cache"
             );
         }
         // Refresh the global term-stats sidecar over the post-merge

@@ -307,7 +307,7 @@ impl Supertable {
             self.inner().manifest.load().get_partition_strategy(),
             PartitionStrategy::VectorCell { .. }
         ) {
-            let __st = std::time::Instant::now();
+            let __st = Instant::now();
             refresh_slow_vector_state(
                 self.inner(),
                 !matches!(recalibrate, RecalibratePolicy::Skip),
@@ -315,7 +315,7 @@ impl Supertable {
             .await
             .map_err(|error| CompactionError::Refresh(error.to_string()))?;
             if phase_timers {
-                eprintln!("[optphase]   settle {:.1}s", __st.elapsed().as_secs_f64());
+                info!(secs = __st.elapsed().as_secs_f64(), "[optphase]   settle");
             }
         } else if let Some(hidden) = self.inner().vector_index_table.as_ref() {
             Self::compact_one_table(
@@ -329,7 +329,7 @@ impl Supertable {
             // republish the entry blob and restamp. Hidden tables have no
             // manifest parts, so publication is required for reopen and a
             // failure must be visible to the caller.
-            let __st = std::time::Instant::now();
+            let __st = Instant::now();
             refresh_slow_vector_state(
                 hidden.inner(),
                 !matches!(recalibrate, RecalibratePolicy::Skip),
@@ -337,7 +337,7 @@ impl Supertable {
             .await
             .map_err(|error| CompactionError::Refresh(error.to_string()))?;
             if phase_timers {
-                eprintln!("[optphase]   settle {:.1}s", __st.elapsed().as_secs_f64());
+                info!(secs = __st.elapsed().as_secs_f64(), "[optphase]   settle");
             }
         }
         Ok(())
@@ -416,7 +416,7 @@ impl Supertable {
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
         }
         if phase_timers {
-            eprintln!("[optphase]   split {:.1}s", __pt.elapsed().as_secs_f64());
+            info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   split");
         }
 
         let manifest = inner.manifest.load_full();
@@ -511,7 +511,7 @@ impl Supertable {
                     .map_err(|e| CompactionError::Refresh(e.to_string()))?;
             }
             if phase_timers {
-                eprintln!("[optphase]   merge {:.1}s", __pt.elapsed().as_secs_f64());
+                info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   merge");
             }
         }
 
@@ -552,9 +552,9 @@ impl Supertable {
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
             if phase_timers {
-                eprintln!(
-                    "[optphase]   recalibrate {:.1}s",
-                    __pt.elapsed().as_secs_f64()
+                info!(
+                    secs = __pt.elapsed().as_secs_f64(),
+                    "[optphase]   recalibrate"
                 );
             }
         }
