@@ -926,6 +926,7 @@ impl Supertable {
     /// membership (see `manifest::term_stats`). Not part of the public
     /// API — [`Supertable::optimize`] calls this after compaction so the
     /// artifact describes the post-merge superfile set.
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn refresh_term_stats_sync(&self) -> Result<(), BuildError> {
         self.block_on_query(super::writer::stamp_term_stats(&self.inner))
     }
@@ -934,6 +935,7 @@ impl Supertable {
     /// of the public API — [`Supertable::optimize`] calls this before compact;
     /// tests and benches may invoke it directly via
     /// [`Supertable::drain_vectors_to_cells_sync`].
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn drain_hidden_vector_cells_sync(&self) -> Result<(), BuildError> {
         let Some(hidden) = self.inner.vector_index_table.as_ref() else {
             return Ok(());
@@ -962,6 +964,7 @@ impl Supertable {
     /// standalone drain after the drain, `optimize` after its compaction — so
     /// the graph is built once, at the final generation, and an
     /// intermediate-generation graph is not built only to be superseded.
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn refresh_centroid_router_cache(&self) {
         let vcfg = &config::global().vector;
         let Some(column) = crate::supertable::query::vector::select_eager_router_column(
@@ -1275,6 +1278,7 @@ impl Supertable {
     /// Sync-bridged version of [`run_gc_sweep_once`], for callers (like
     /// [`Supertable::optimize`]) that aren't already inside an async
     /// context.
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn run_gc_sweep_once_blocking(&self) -> Result<gc::GcReport, gc::GcError> {
         bridge_on_runtime(self.run_gc_sweep_once(), &self.inner.query_runtime())
     }
