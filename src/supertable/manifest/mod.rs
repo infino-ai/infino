@@ -2158,16 +2158,38 @@ impl ManifestSnapshot {
                 opts.manifest_disk_cache.clone(),
             ))
         });
-        // Inherit only the cached parts the new list still
-        // references — entries for rewritten/removed parts are
-        // dropped rather than carried forward, so the in-memory
-        // parts cache can't grow without bound across commits.
-        // Surviving parts keep their warm cache entry (no refetch);
-        // the freshly-written parts are seeded below.
+        // Inherit only the cached parts the new list still references —
+        // entries for rewritten/removed parts are dropped rather than
+        // carried forward. That alone bounds nothing on an append-only
+        // table: nothing is ever removed, so every part stays live and the
+        // decoded set grows with the table. Each decoded part holds its
+        // entries' inline open blobs, so a long ingest accumulates them for
+        // the life of the writer.
+        //
+        // Carry forward only the tail the writer is about to touch. An
+        // append rewrites the newest part (and, across a split, the one
+        // before it), so the newest few cover the hot path with no refetch;
+        // everything older is left out of the map entirely and reloads on
+        // demand through `get_part_by_id`, which creates the cell and fills
+        // it from the loader. Those reads hit the manifest disk cache, so
+        // they are local, not an object-store round trip.
+        //
+        // Without a loader — an in-process table with no storage attached —
+        // nothing can reload, so everything live stays resident.
         let live_part_ids: HashSet<_> = new_list.parts.iter().map(|e| e.part_id).collect();
+        let carry_forward: HashSet<PartId> = match loader.is_some() {
+            true => new_list
+                .parts
+                .iter()
+                .rev()
+                .take(RESIDENT_PARTS_CARRIED_FORWARD)
+                .map(|e| e.part_id)
+                .collect(),
+            false => live_part_ids.clone(),
+        };
         let parts = DashMap::new();
         for kv in self.parts.iter() {
-            if live_part_ids.contains(kv.key()) {
+            if live_part_ids.contains(kv.key()) && carry_forward.contains(kv.key()) {
                 parts.insert(*kv.key(), kv.value().clone());
             }
         }
@@ -2279,6 +2301,16 @@ fn rebuild_part_and_entry(
 /// An optional [`ManifestDiskCache`] short-circuits the storage GET
 /// when the part's compressed bytes are already on local disk. Because
 /// parts are content-addressed, a cache hit can never be stale.
+/// Decoded manifest parts a commit carries into the next snapshot.
+///
+/// An append rewrites the newest part, and a split also touches the one
+/// before it, so a small tail covers what the writer actually reads without
+/// a refetch. Older parts are dropped from the resident map and reload on
+/// demand; the alternative — keeping every live part — grows with the table
+/// on an append-only ingest, because nothing is ever removed from the live
+/// set and each decoded part holds its entries' inline open blobs.
+const RESIDENT_PARTS_CARRIED_FORWARD: usize = 4;
+
 /// Manifest parts fetched + decoded concurrently during one snapshot load.
 ///
 /// Each in-flight part holds its raw bytes, the Avro value tree decoded from
@@ -5095,6 +5127,97 @@ mod tests {
         /// thousands on a table of small superfiles. Pin both halves of the
         /// contract: the cap is respected, and results still come back in the
         /// order the callers zip against.
+        /// A commit inherits the decoded parts its new list still references.
+        /// On an append-only table nothing is ever removed, so every part
+        /// stays live and the decoded set grows with the table — each one
+        /// holding its entries' inline open blobs. Carry forward only the
+        /// tail the writer is about to touch; older parts must drop out of
+        /// the resident map and still be readable on demand.
+        #[tokio::test]
+        async fn commit_carries_forward_only_a_bounded_tail_of_decoded_parts() {
+            let n_parts = RESIDENT_PARTS_CARRIED_FORWARD * 3;
+            let parts: Vec<ManifestPart> = (0..n_parts).map(|i| make_test_part(i as u8)).collect();
+            let (objects, entries) = encode_and_index(&parts);
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let list = fresh_list(entries);
+
+            // Storage-backed options: without a loader nothing could reload,
+            // and the commit is then required to keep every part resident.
+            let opts = Arc::new(
+                SupertableOptions::new(
+                    Arc::new(Schema::new(vec![Field::new(
+                        "title",
+                        DataType::LargeUtf8,
+                        false,
+                    )])),
+                    vec![],
+                    vec![],
+                )
+                .expect("opts")
+                .with_storage(Arc::clone(&storage) as Arc<dyn StorageProvider>),
+            );
+
+            // Every part starts decoded and resident, the state a long
+            // ingest reaches.
+            let parts_map = DashMap::new();
+            for part in &parts {
+                parts_map.insert(
+                    part.part_id,
+                    Arc::new(OnceCell::new_with(Some(Arc::new(part.clone())))),
+                );
+            }
+            let dropped = parts[0].part_id;
+            let before = ManifestSnapshot {
+                superfile_list: SuperfileList {
+                    manifest_id: 0,
+                    options: Arc::clone(&opts),
+                    superfiles: vec![],
+                    vector_index_storage_prefix: None,
+                    next_manifest_id_floor: 0,
+                },
+                list: Some(list.clone()),
+                parts: parts_map,
+                loader: Some(Arc::new(ManifestPartLoader::new(
+                    Arc::clone(&storage) as Arc<dyn StorageProvider>,
+                    &list,
+                ))),
+                stamped_partition_strategy: None,
+                stamped_global_vector_index: None,
+                stamped_drained_ranges: None,
+            };
+            assert_eq!(before.parts.len(), n_parts, "all parts start resident");
+
+            // `fresh_list` partitions by hash: the entry must carry a bucket
+            // hint, and must NOT carry a key — commit assigns that.
+            let added = super::make_superfile_entry_hinted(1, vec![], 0);
+            let (after, _encoded) = before
+                .update(from_ref(&added), &[])
+                .await
+                .expect("append commit");
+
+            // The freshly written part is seeded on top of the carried tail.
+            assert!(
+                after.parts.len() <= RESIDENT_PARTS_CARRIED_FORWARD + 1,
+                "a commit must not carry every decoded part forward; kept {} of {n_parts}",
+                after.parts.len()
+            );
+            assert!(
+                after.parts.len() > 1,
+                "the tail the writer is about to touch must stay resident"
+            );
+
+            // Dropping residency must not lose the part: it reloads.
+            assert!(
+                !after.parts.contains_key(&dropped),
+                "the oldest part must have been dropped from the resident map"
+            );
+            let reloaded = after
+                .get_part_by_id(dropped)
+                .await
+                .expect("a dropped part reloads on demand");
+            assert_eq!(reloaded.part_id, dropped);
+        }
+
         #[tokio::test]
         async fn part_load_is_bounded_and_order_preserving() {
             let in_flight = Arc::new(AtomicUsize::new(0));
