@@ -620,7 +620,7 @@ impl DiskCacheStore {
 }
 
 #[cfg(test)]
-mod test_support {
+pub(crate) mod test_support {
     use std::{
         sync::Arc,
         time::{Duration, Instant},
