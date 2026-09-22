@@ -4101,6 +4101,25 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 .cmp(&right.birth_version)
                 .then_with(|| left.superfile_id.cmp(&right.superfile_id))
         });
+        // Bound one drain epoch to a slice of the un-drained superfiles so the
+        // post-loop shard build's peak memory stays O(slice), not O(corpus): at
+        // 100M a single-epoch build peaks past host RAM. The rest is drained by
+        // the next sweep (the drained watermark advances per epoch). `0` or unset
+        // keeps the old unbounded behavior. Env-tunable so the cap can be sized
+        // to the host without a rebuild.
+        let epoch_cap = std::env::var("INFINO_DRAIN_MAX_SUPERFILES_PER_EPOCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|cap| *cap > 0);
+        if let Some(cap) = epoch_cap
+            && selected.len() > cap
+        {
+            info!(
+                "[supertable drain] bounding epoch to {cap} of {} un-drained superfile(s); the rest drain next sweep",
+                selected.len()
+            );
+            selected.truncate(cap);
+        }
         let source_refs: Vec<DrainCheckpointSource> = selected
             .iter()
             .map(|entry| drain_checkpoint_source(entry))
