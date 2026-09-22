@@ -233,15 +233,21 @@ pub(crate) async fn load(
 mod tests {
     use std::sync::Weak;
 
+    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
     use uuid::Uuid as TestUuid;
 
     use super::*;
     use crate::{
-        superfile::reader::SuperfileReader,
+        superfile::{
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+            reader::SuperfileReader,
+        },
         supertable::{
             manifest::{SuperfileUri, VectorLayout},
             reader_cache::disk::test_support::tiny_superfile_bytes,
         },
+        test_helpers::{decimal128_id_field, decimal128_ids},
     };
 
     fn entry() -> Arc<SuperfileEntry> {
@@ -300,6 +306,71 @@ mod tests {
             entries.len(),
             "the artifact must record every superfile it covers"
         );
+    }
+
+    /// Build a superfile carrying an FTS index, so the df walk actually runs.
+    /// `tiny_superfile_bytes` has no FTS blob and is skipped by the build.
+    fn indexed_superfile_bytes() -> Bytes {
+        let schema = Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(
+            Arc::clone(&schema),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let ids = decimal128_ids(vec![1u64, 2]);
+        let titles = LargeStringArray::from(vec!["rust async runtime", "rust embedded system"]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(b.finish().expect("finish"))
+    }
+
+    /// Dropping each reader before the next opens must not lose a
+    /// contribution: `df` is the sum over superfiles, so building over N
+    /// copies of the same superfile must report N times the single-superfile
+    /// figure, and must cover all N.
+    #[tokio::test]
+    async fn build_sums_df_across_superfiles() {
+        let open_indexed = |_e: &Arc<SuperfileEntry>| async {
+            SuperfileReader::open(indexed_superfile_bytes())
+                .map(Arc::new)
+                .map_err(|e| TermStatsError::Build(e.to_string()))
+        };
+
+        let one = vec![entry()];
+        let side_one = TermStatsSidecar::decode(Bytes::from(
+            build(&one, open_indexed).await.expect("build one"),
+        ))
+        .expect("decode one");
+        let df_one = side_one.df("title", "rust");
+        assert!(
+            df_one > 0,
+            "the fixture must contribute a df for the walked term"
+        );
+
+        let n = 4;
+        let many: Vec<Arc<SuperfileEntry>> = (0..n).map(|_| entry()).collect();
+        let side_many = TermStatsSidecar::decode(Bytes::from(
+            build(&many, open_indexed).await.expect("build many"),
+        ))
+        .expect("decode many");
+
+        assert_eq!(
+            side_many.df("title", "rust"),
+            df_one * n as u64,
+            "df must be the sum over superfiles, so every reader's contribution counts"
+        );
+        assert_eq!(
+            side_many.covered().len(),
+            n,
+            "every superfile must be recorded as covered"
+        );
+        assert_eq!(side_many.df("title", "absent"), 0);
     }
 
     /// An opener failure must surface rather than yield a sidecar that
