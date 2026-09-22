@@ -102,8 +102,7 @@ const OVER_FETCH_MAX_HITS: usize = 100_000;
 /// never above the table's row count.
 fn over_fetch_ceiling(k: usize, total: usize) -> usize {
     k.saturating_mul(OVER_FETCH_MAX_K_MULTIPLE)
-        .max(OVER_FETCH_MIN_CEILING)
-        .min(OVER_FETCH_MAX_HITS)
+        .clamp(OVER_FETCH_MIN_CEILING, OVER_FETCH_MAX_HITS)
         .max(k)
         .min(total)
 }
