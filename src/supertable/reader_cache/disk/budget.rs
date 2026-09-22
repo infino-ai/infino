@@ -16,6 +16,15 @@ use crate::supertable::{
     reader_cache::{config::EvictionCandidate, disk::*},
 };
 
+/// Whether dropping this entry would actually release memory: it must be a
+/// lazy entry (no mmap — its cost is anonymous heap that `madvise` cannot
+/// reclaim) and the cache must be its last holder (a reader a query still
+/// has in hand keeps the heap alive regardless, and re-opening costs that
+/// query a round trip).
+fn reclaimable_lazy_entry(entry: &CachedEntry) -> bool {
+    entry.mmap().is_none() && Arc::strong_count(&entry.reader) <= 1
+}
+
 impl DiskCacheStore {
     /// Run one pass of the `MADV_DONTNEED` sweep against
     /// currently-cached entries. Each entry with
@@ -101,8 +110,7 @@ impl DiskCacheStore {
             .cached
             .iter()
             .filter(|e| {
-                e.value().mmap().is_none()
-                    && Arc::strong_count(&e.value().reader) <= 1
+                reclaimable_lazy_entry(e.value())
                     && now_us.saturating_sub(e.value().last_access_us.load(Ordering::Acquire))
                         >= threshold_us
             })
@@ -112,9 +120,8 @@ impl DiskCacheStore {
             // Re-check under the shard guard: a query may have taken a
             // reference since the snapshot, in which case dropping the
             // entry would free nothing and cost that query a re-open.
-            self.cached.remove_if(&uri, |_, entry| {
-                entry.mmap().is_none() && Arc::strong_count(&entry.reader) <= 1
-            });
+            self.cached
+                .remove_if(&uri, |_, entry| reclaimable_lazy_entry(entry));
         }
     }
 

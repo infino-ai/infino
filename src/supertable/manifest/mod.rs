@@ -902,10 +902,7 @@ impl ManifestSnapshot {
                         async move { loader.load(pid).await }
                     })
                     .collect::<Vec<_>>();
-                let loaded = stream::iter(load_futs)
-                    .buffered(MANIFEST_PART_LOAD_CONCURRENCY)
-                    .collect::<Vec<_>>()
-                    .await;
+                let loaded = load_parts_bounded(load_futs).await;
                 for (pid, result) in missing_part_ids.iter().zip(loaded) {
                     let part = result?;
                     let cell = OnceCell::new();
@@ -945,10 +942,7 @@ impl ManifestSnapshot {
                         async move { loader.load(pid).await }
                     })
                     .collect::<Vec<_>>();
-                let loaded = stream::iter(load_futs)
-                    .buffered(MANIFEST_PART_LOAD_CONCURRENCY)
-                    .collect::<Vec<_>>()
-                    .await;
+                let loaded = load_parts_bounded(load_futs).await;
                 for (pid, result) in part_ids.iter().zip(loaded) {
                     let part = result?;
                     all_superfiles.extend(part.superfiles.iter().cloned());
@@ -2295,6 +2289,21 @@ fn rebuild_part_and_entry(
 /// is a function of this number instead, and the fetches still overlap enough
 /// to keep the object store busy.
 const MANIFEST_PART_LOAD_CONCURRENCY: usize = 32;
+
+/// Await `futs` with at most [`MANIFEST_PART_LOAD_CONCURRENCY`] in flight,
+/// returning the results in the order the futures were given.
+///
+/// Order matters: both callers zip the results back against their part-id
+/// list, so completion order would mis-attribute parts.
+async fn load_parts_bounded<F>(futs: Vec<F>) -> Vec<F::Output>
+where
+    F: Future,
+{
+    stream::iter(futs)
+        .buffered(MANIFEST_PART_LOAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+}
 
 /// Default ceiling on inline open-blob bytes a manifest snapshot keeps
 /// resident, shared across the whole load.
@@ -4841,7 +4850,7 @@ mod tests {
         use async_trait::async_trait;
         use bytes::Bytes;
         use dashmap::DashMap;
-        use tokio::spawn;
+        use tokio::{spawn, task::yield_now};
         use uuid::Uuid;
 
         use super::super::*;
@@ -5077,6 +5086,52 @@ mod tests {
                     fingerprint: 222,
                     version: 2,
                 })
+            );
+        }
+
+        /// A snapshot load fans out over every part, and each one in flight
+        /// holds its bytes, its decoded Avro tree and the entries built from
+        /// them. Unbounded, the peak scales with the part count — tens of
+        /// thousands on a table of small superfiles. Pin both halves of the
+        /// contract: the cap is respected, and results still come back in the
+        /// order the callers zip against.
+        #[tokio::test]
+        async fn part_load_is_bounded_and_order_preserving() {
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let n = MANIFEST_PART_LOAD_CONCURRENCY * 3 + 7;
+
+            let futs: Vec<_> = (0..n)
+                .map(|i| {
+                    let in_flight = Arc::clone(&in_flight);
+                    let peak = Arc::clone(&peak);
+                    async move {
+                        let now = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                        peak.fetch_max(now, Ordering::AcqRel);
+                        // Yield so every admitted future is genuinely
+                        // concurrent; without it each could finish before the
+                        // next is polled and the peak would read 1.
+                        yield_now().await;
+                        in_flight.fetch_sub(1, Ordering::AcqRel);
+                        i
+                    }
+                })
+                .collect();
+
+            let out = load_parts_bounded(futs).await;
+            assert_eq!(
+                out,
+                (0..n).collect::<Vec<_>>(),
+                "results must stay in submission order — callers zip them against part ids"
+            );
+            let observed = peak.load(Ordering::Acquire);
+            assert!(
+                observed <= MANIFEST_PART_LOAD_CONCURRENCY,
+                "at most {MANIFEST_PART_LOAD_CONCURRENCY} parts may decode at once, saw {observed}"
+            );
+            assert!(
+                observed > 1,
+                "the load must still overlap fetches, saw {observed} in flight"
             );
         }
 

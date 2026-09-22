@@ -167,7 +167,7 @@ const DEFAULT_MMAP_SWEEP_INTERVAL_SECS: u64 = 75;
 /// queries before promoting anyway. Long enough that a short burst of
 /// queries is served without a competing download; short enough that a
 /// sustained workload still reaches the mmap-backed state quickly.
-const DEFAULT_PROMOTION_DEFER_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const DEFAULT_PROMOTION_DEFER_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Default for DiskCacheConfig {
     fn default() -> Self {

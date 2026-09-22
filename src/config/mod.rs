@@ -51,6 +51,8 @@ use serde::{
     ser::Serializer,
 };
 
+use crate::supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT;
+
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
 
@@ -1145,7 +1147,12 @@ const DEFAULT_MMAP_COLD_THRESHOLD_SECS: u64 = 300;
 const DEFAULT_MMAP_SWEEP_INTERVAL_SECS: u64 = 75;
 /// Default window a background fill yields to same-superfile foreground
 /// queries before promoting anyway (seconds).
-const DEFAULT_PROMOTION_DEFER_TIMEOUT_SECS: u64 = 10;
+///
+/// Derived from the runtime-side default rather than restated, so the YAML
+/// default and [`DiskCacheConfig`]'s can never drift apart.
+///
+/// [`DiskCacheConfig`]: crate::supertable::reader_cache::DiskCacheConfig
+const DEFAULT_PROMOTION_DEFER_TIMEOUT_SECS: u64 = DEFAULT_PROMOTION_DEFER_TIMEOUT.as_secs();
 
 fn default_id_column() -> String {
     "_id".to_string()
