@@ -16,6 +16,15 @@ use crate::supertable::{
     reader_cache::{config::EvictionCandidate, disk::*},
 };
 
+/// Whether dropping this entry would actually release memory: it must be a
+/// lazy entry (no mmap — its cost is anonymous heap that `madvise` cannot
+/// reclaim) and the cache must be its last holder (a reader a query still
+/// has in hand keeps the heap alive regardless, and re-opening costs that
+/// query a round trip).
+fn reclaimable_lazy_entry(entry: &CachedEntry) -> bool {
+    entry.mmap().is_none() && Arc::strong_count(&entry.reader) <= 1
+}
+
 impl DiskCacheStore {
     /// Run one pass of the `MADV_DONTNEED` sweep against
     /// currently-cached entries. Each entry with
@@ -77,7 +86,43 @@ impl DiskCacheStore {
         if n_advised > 0 {
             self.n_madvise_calls.fetch_add(n_advised, Ordering::AcqRel);
         }
+        self.release_idle_paged_entries(threshold_us, now_us);
         n_advised
+    }
+
+    /// Drop idle lazy (`Residency::Paged`) entries from the cache.
+    ///
+    /// A lazy reader's cost is anonymous heap — the open-time ranges its
+    /// source holds — and `madvise` cannot touch that, so the mmap sweep
+    /// above sees nothing to do for these entries and their memory
+    /// accumulates with every superfile a process has ever opened.
+    /// Dropping the entry releases it: the cache holds the last `Arc`,
+    /// and the next reader for that URI re-opens.
+    ///
+    /// Only entries the cache alone holds are dropped. A reader a query
+    /// is still using has a live `Arc`, so removing it from the map would
+    /// free nothing and cost the next query a re-open; those are left
+    /// alone and revisited on the next tick. Promotion is the better
+    /// outcome for a busy entry and is what the background fill does, so
+    /// in practice this reclaims the ones promotion never reached.
+    fn release_idle_paged_entries(&self, threshold_us: u64, now_us: u64) {
+        let idle: Vec<SuperfileUri> = self
+            .cached
+            .iter()
+            .filter(|e| {
+                reclaimable_lazy_entry(e.value())
+                    && now_us.saturating_sub(e.value().last_access_us.load(Ordering::Acquire))
+                        >= threshold_us
+            })
+            .map(|e| *e.key())
+            .collect();
+        for uri in idle {
+            // Re-check under the shard guard: a query may have taken a
+            // reference since the snapshot, in which case dropping the
+            // entry would free nothing and cost that query a re-open.
+            self.cached
+                .remove_if(&uri, |_, entry| reclaimable_lazy_entry(entry));
+        }
     }
 
     /// Sum of mmap virtual sizes across all cached entries
@@ -455,15 +500,54 @@ impl<'a> Drop for Reservation<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use crate::supertable::{
         manifest::SuperfileUri,
         reader_cache::{
             block_source::CACHE_BLOCK_BYTES,
+            config::ColdFetchMode,
             disk::{budget::*, test_support::*},
         },
     };
+
+    /// A lazy reader's cost is anonymous heap, which `madvise` cannot
+    /// reclaim, so the idle sweep drops the entry instead. Only when the
+    /// cache is the last holder: a reader a query still has in hand must
+    /// survive, or the drop frees nothing and costs that query a re-open.
+    #[tokio::test]
+    async fn idle_sweep_releases_unheld_lazy_readers_and_spares_held_ones() {
+        // threshold 0 makes every entry immediately idle.
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.mmap_cold_threshold_secs = 0;
+            // Keep the entry lazy for the length of the test; promotion is
+            // the other way its memory goes away and would mask this one.
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        // Held by a "query": the sweep must leave it alone.
+        let held = store.reader(&uri).await.expect("lazy cold");
+        store.sweep_once();
+        assert!(
+            store.is_cached(&uri),
+            "a lazy reader a caller still holds must survive the sweep"
+        );
+
+        // Released: the cache is now the only holder, so the sweep reclaims it.
+        drop(held);
+        store.sweep_once();
+        assert!(
+            !store.is_cached(&uri),
+            "an idle lazy reader must be dropped — its heap is not madvise-able"
+        );
+
+        // And it is re-openable afterwards.
+        let again = store.reader(&uri).await.expect("re-open after release");
+        assert_eq!(again.n_docs(), 1);
+    }
 
     #[tokio::test]
     async fn auto_budget_is_raised_and_admits_previously_oversized_entry() {

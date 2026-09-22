@@ -488,6 +488,12 @@ diagnostics:
   # Accumulate per-phase timers during the vector drain build.
   drain_build_timers: false
 
+  # Emit top-level optimize() phase timers ([optphase]: drain / split / merge /
+  # recalibrate / settle / compact_total / router_cache) and the merge
+  # splice-vs-rebuild split ([optmerge]). A measuring stick for compaction
+  # scaling work.
+  optimize_phase_timers: false
+
   # Emit the FTS builder's finish-phase profile.
   fts_profile: false
 

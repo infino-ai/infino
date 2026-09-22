@@ -1466,6 +1466,24 @@ impl TermCursor {
         self.skip_to_cross_block(target);
     }
 
+    /// Skip whole blocks from the current one on, while each block's max
+    /// plus `others_ub` stays at or under `threshold` and the block ends
+    /// before `end_doc`. The caller has already found the current block
+    /// under that bar. Only block metadata is read on the way; the one
+    /// block the cursor lands on is decoded. A block reaching `end_doc` is
+    /// never skipped, because the bar may not hold past it.
+    pub(super) fn skip_blocks_under(&mut self, others_ub: f32, threshold: f32, end_doc: u32) {
+        debug_assert!(!self.is_exhausted());
+        let mut b = self.current_block;
+        while b + 1 < self.blocks.len()
+            && self.blocks[b + 1].block_max_bm25 + others_ub <= threshold
+            && self.blocks[b + 1].last_doc_id < end_doc
+        {
+            b += 1;
+        }
+        self.skip_to_cross_block(self.blocks[b].last_doc_id.saturating_add(1));
+    }
+
     /// Cross-block path of `skip_to`: target is past the current
     /// decoded block. Advances `current_block` via the skip table,
     /// decodes the new block (only when crossing), and scans pos.

@@ -32,6 +32,8 @@ def quickstart() -> None:
         ]
     )
 
+    docs.append_named([{"title": "a named batch", "body": "from one source"}], "crawler")
+
     hits = docs.bm25_search("title", "fox", k=10, mode="and")
     names: list[str] = hits.column_names
 

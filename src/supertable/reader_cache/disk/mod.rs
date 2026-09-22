@@ -620,14 +620,18 @@ impl DiskCacheStore {
 }
 
 #[cfg(test)]
-mod test_support {
-    use std::{sync::Arc, time::Duration};
+pub(crate) mod test_support {
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use arrow_array::{LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
     use roaring::RoaringBitmap;
     use tempfile::TempDir;
+    use tokio::time::sleep;
 
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
@@ -693,6 +697,34 @@ mod test_support {
     pub(crate) const PROMOTE_TIMEOUT: Duration = Duration::from_secs(10);
     /// Long enough to cover several background quiet-interval checks.
     pub(crate) const FOREGROUND_GUARD_HOLD: Duration = Duration::from_millis(50);
+    /// Long enough for a promotion to be observed if one were coming, short
+    /// enough to keep a "stays deferred" assertion quick.
+    pub(crate) const DEFER_OBSERVATION: Duration = Duration::from_millis(500);
+
+    /// Poll [`DiskCacheStore::is_mmap_promoted`] until it turns true or
+    /// `within` elapses.
+    ///
+    /// Deliberately not [`DiskCacheStore::wait_until_mmap_promoted`]: that
+    /// registers a promotion waiter, which is itself an override of the
+    /// fill's deferral, so a test using it cannot tell whether promotion
+    /// happened on its own.
+    pub(crate) async fn poll_until_mmap_promoted(
+        store: &Arc<DiskCacheStore>,
+        uri: &SuperfileUri,
+        within: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if store.is_mmap_promoted(uri) {
+                return true;
+            }
+            sleep(POLL_INTERVAL).await;
+        }
+        store.is_mmap_promoted(uri)
+    }
+
+    /// Gap between `is_mmap_promoted` polls.
+    const POLL_INTERVAL: Duration = Duration::from_millis(5);
     /// Large enough that one-byte sequential range reads cannot finish before
     /// the preemption test enters its foreground guard.
     pub(crate) const PREEMPT_TEST_BYTES: usize = 1 << 20;
