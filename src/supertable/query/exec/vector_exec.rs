@@ -213,10 +213,14 @@ impl TableProvider for VectorSearchTable {
     /// `FilterExec` drops nothing. Where it is not — a literal that is a
     /// sub-token of larger text, or a predicate no index bounds at all —
     /// the exec applies the exact predicate to its own rows and widens the
-    /// kNN until `k` survive (`fill_top_k`), so the function never comes
-    /// out short of `k` while matching rows exist. The exact,
-    /// no-`FilterExec` path is the Rust `Supertable::vector_search_filtered`
-    /// API.
+    /// kNN until `k` survive (`fill_top_k`). That fill is best-effort, not
+    /// a guarantee: it widens `k`, while the probe count comes from
+    /// `VectorSearchOptions::resolve` and does not move with it, so the
+    /// candidates stay those of the probed cells. A predicate satisfied
+    /// only by rows in cells the query never probes can still come out
+    /// short, and the fill is bounded in any case (see `fill_top_k`). The
+    /// exact, no-`FilterExec` path is the Rust
+    /// `Supertable::vector_search_filtered` API.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],

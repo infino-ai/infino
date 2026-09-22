@@ -490,6 +490,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
         superfile::builder::FtsConfig,
         supertable::{Supertable, SupertableOptions, query::candidate::CandidatePlan},
     };
@@ -758,6 +759,61 @@ mod tests {
             .expect("count is int64")
             .value(0);
         assert_eq!(n, k as i64);
+    }
+
+    /// Rows holding `rust` twice, which BM25 ranks above every weak row.
+    /// All of them are deleted in the test below, so they fill the first
+    /// round's kernel heap and are then subtracted from it.
+    const N_TOMBSTONED_STRONG: usize = 10;
+
+    /// Live rows the same query matches, more than `k` of them, every one
+    /// ranked below the tombstoned rows.
+    const N_LIVE_WEAK: usize = 12;
+
+    /// A short round does not mean the kernel is out of candidates:
+    /// tombstones are subtracted *after* each unit's `k`-sized heap
+    /// (`dispatch::fanout_local_hits`), so deleting the top-scoring hits
+    /// empties a round on its own. Reading that as exhaustion ended the
+    /// fill on round one and returned nothing — the same underflow the
+    /// pushdown exists to prevent, reached through the delete path.
+    #[test]
+    fn bm25_search_tvf_where_fills_past_a_round_emptied_by_tombstones() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_title_bucket().with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&title_bucket_batch(
+            st.options().schema.clone(),
+            N_TOMBSTONED_STRONG,
+            N_LIVE_WEAK,
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        drop(w); // release the writer slot so `delete` can acquire it
+
+        let stats = st
+            .delete(col("title").eq(lit("rust rust")))
+            .expect("delete");
+        assert_eq!(stats.matched() as usize, N_TOMBSTONED_STRONG);
+
+        // `k` equal to the tombstoned count is the exact case: round one
+        // asks for k, the kernel's heap is precisely the deleted rows, and
+        // the filter leaves nothing.
+        let k = N_TOMBSTONED_STRONG;
+        let rows = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT title, bucket, score FROM bm25_search('title', 'rust', {k}) \
+                 WHERE bucket = 1"
+            ))
+            .expect("filtered query_sql");
+        assert_eq!(
+            rows_of(&rows),
+            k,
+            "the fill must widen past a round the tombstones emptied"
+        );
     }
 
     /// A `WHERE` on a column with no index: nothing bounds the rows, so

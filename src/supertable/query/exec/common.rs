@@ -77,6 +77,37 @@ use crate::{
 /// selectivity turns out to be.
 const OVER_FETCH_GROWTH: usize = 2;
 
+/// How many times `k` a fill may grow to before it gives up and returns
+/// what it has (see [`over_fetch_ceiling`]). Without a ceiling the growth
+/// runs to the table's row count, so a predicate the index cannot bound
+/// and that almost nothing satisfies ends by asking the kernel for a heap
+/// the size of the table and resolving every match into one batch — an
+/// out-of-memory risk on a query that is cheap to state.
+const OVER_FETCH_MAX_K_MULTIPLE: usize = 64;
+
+/// The smallest ceiling a fill will use, whatever `k` is. A multiple
+/// alone would give a small `k` a tiny budget — 64 hits at `k = 1` — and
+/// a selective predicate needs to look past that before concluding its
+/// rows are not there.
+const OVER_FETCH_MIN_CEILING: usize = 10_000;
+
+/// The absolute ceiling on one fill's hit count, bounding the rows any
+/// single round resolves into memory. A caller asking for more than this
+/// still gets its `k`: [`over_fetch_ceiling`] never returns less.
+const OVER_FETCH_MAX_HITS: usize = 100_000;
+
+/// The most hits one fill will ask a kernel for: [`OVER_FETCH_MAX_K_MULTIPLE`]
+/// times `k`, floored at [`OVER_FETCH_MIN_CEILING`], capped at
+/// [`OVER_FETCH_MAX_HITS`], never below the `k` actually asked for, and
+/// never above the table's row count.
+fn over_fetch_ceiling(k: usize, total: usize) -> usize {
+    k.saturating_mul(OVER_FETCH_MAX_K_MULTIPLE)
+        .max(OVER_FETCH_MIN_CEILING)
+        .min(OVER_FETCH_MAX_HITS)
+        .max(k)
+        .min(total)
+}
+
 /// Map a search TVF's `QueryError` into a DataFusion error at the
 /// execution-node boundary.
 ///
@@ -317,14 +348,36 @@ fn unqualified(expr: Expr) -> DfResult<Expr> {
 /// whatever the index could bound. Without a predicate that is the whole
 /// job: search `k`, resolve, done. With one, the resolved rows are
 /// checked against the exact predicate; when fewer than `k` survive and
-/// the kernel had more to give (it returned every hit asked for, and the
-/// table holds more rows than were asked), the search is rerun for
-/// [`OVER_FETCH_GROWTH`] times as many hits, until `k` survive or the
-/// table is exhausted. The survivors, in kernel rank order and cut to
-/// `k`, are the result — the `FilterExec` above re-checks them and drops
-/// nothing. Cost scales with the predicate's selectivity: an exact
-/// pushdown pays one round, a bare scalar predicate on a row in a
-/// million pays the log₂ of that.
+/// the kernel had more to give, the search is rerun for
+/// [`OVER_FETCH_GROWTH`] times as many hits, until `k` survive, the
+/// kernel runs dry, or the fill hits its ceiling. The survivors, in
+/// kernel rank order and cut to `k`, are the result — the `FilterExec`
+/// above re-checks them and drops nothing. Cost scales with the
+/// predicate's selectivity: an exact pushdown pays one round, a bare
+/// scalar predicate on a row in a million pays the log₂ of that.
+///
+/// **The fill is bounded, so it may return fewer than `k` rows even
+/// though more satisfy the predicate.** Growth stops at
+/// [`over_fetch_ceiling`]; past that the survivors so
+/// far are the answer. The alternative is unbounded: a predicate no index
+/// can bound and almost no row satisfies would otherwise grow `want` to
+/// the table's row count and resolve every match into a single batch.
+/// Returning short is the deliberate trade, and it is still strictly more
+/// than the caller used to get — before the pushdown, `k` was applied
+/// table-wide and the `WHERE` ran afterwards, so the same query returned
+/// only whatever survived from one unfiltered top-`k`.
+///
+/// **Exhaustion is read from the hit count refusing to grow, not from a
+/// short round.** A round can come back short because tombstones are
+/// applied *after* each unit's `k`-sized kernel heap
+/// (`dispatch::fanout_local_hits`), so deleted rows alone can make a
+/// kernel with plenty left to give look spent — the same underflow this
+/// function exists to prevent, reached through the delete path. Asking
+/// for more can only return a superset, so a round that returns no more
+/// hits than the one before it is the honest signal that the kernel is
+/// dry. That costs one extra round when the fill genuinely runs out,
+/// which only happens on the unselective predicates the ceiling above
+/// already bounds.
 ///
 /// The predicate's columns are decoded alongside the requested ones for
 /// the check and projected away before the batch is returned.
@@ -366,7 +419,11 @@ where
     let bound = predicate.bind(&decoded_schema)?;
     let requested_positions: Vec<usize> = (0..requested.len()).collect();
     let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
-    let mut want = k;
+    let ceiling = over_fetch_ceiling(k, total);
+    let mut want = k.min(ceiling);
+    // Hits the previous round returned, to tell a kernel that is out of
+    // candidates from one whose heap was merely thinned by tombstones.
+    let mut previous_hits: Option<usize> = None;
     loop {
         let hits = search(want).await.map_err(search_query_df_error)?;
         let batch =
@@ -382,9 +439,12 @@ where
             })?;
         let kept = filter_record_batch(&batch, mask)
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-        // The kernel returned fewer hits than asked, or was asked for the
-        // whole table: there is nothing more to fetch.
-        let exhausted = hits.len() < want || want >= total;
+        // Nothing more to fetch: a wider ask returned no more hits than the
+        // last one (the kernel is out of candidates — a short round on its
+        // own means nothing, since tombstones are subtracted after each
+        // unit's heap), or the fill has reached its ceiling.
+        let stalled = previous_hits.is_some_and(|previous| hits.len() <= previous);
+        let exhausted = stalled || want >= ceiling;
         if kept.num_rows() >= k || exhausted {
             let rows = kept.num_rows().min(k);
             return kept
@@ -392,7 +452,8 @@ where
                 .project(&requested_positions)
                 .map_err(|e| DataFusionError::Execution(e.to_string()));
         }
-        want = want.saturating_mul(OVER_FETCH_GROWTH).min(total);
+        previous_hits = Some(hits.len());
+        want = want.saturating_mul(OVER_FETCH_GROWTH).min(ceiling);
     }
 }
 
@@ -1117,6 +1178,33 @@ mod tests {
 
     /// Force Snowflake ids in one committed superfile across an ms boundary.
     const ID_GAP_WAIT: Duration = Duration::from_millis(20);
+
+    /// A table far larger than any ceiling, so `total` is never the binding
+    /// limit in the ceiling tests below.
+    const HUGE_TABLE: usize = 100_000_000;
+
+    /// The over-fetch ceiling is bounded from above in every direction a
+    /// caller can push it, and never below the `k` that was asked for.
+    /// Before it existed the fill grew to the table's row count, so an
+    /// unbounded predicate that almost nothing satisfies ended by asking
+    /// the kernel for a table-sized heap.
+    #[test]
+    fn over_fetch_ceiling_is_bounded_and_never_below_k() {
+        // A small k takes the floor, not the (tiny) multiple.
+        assert_eq!(over_fetch_ceiling(1, HUGE_TABLE), OVER_FETCH_MIN_CEILING);
+        assert_eq!(over_fetch_ceiling(10, HUGE_TABLE), OVER_FETCH_MIN_CEILING);
+        // Once the multiple clears the floor it governs.
+        assert_eq!(over_fetch_ceiling(1_000, HUGE_TABLE), 64_000);
+        // ... until the absolute cap does.
+        assert_eq!(over_fetch_ceiling(5_000, HUGE_TABLE), OVER_FETCH_MAX_HITS);
+        // A caller asking for more than the cap still gets its own k: the
+        // ceiling bounds the over-fetch, never the request.
+        let big = OVER_FETCH_MAX_HITS * 2;
+        assert_eq!(over_fetch_ceiling(big, HUGE_TABLE), big);
+        // The table is always the last word.
+        assert_eq!(over_fetch_ceiling(10, 7), 7);
+        assert_eq!(over_fetch_ceiling(0, 0), 0);
+    }
 
     #[test]
     fn arg_to_string_accepts_utf8_literal_rejects_int() {

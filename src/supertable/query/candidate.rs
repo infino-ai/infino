@@ -97,7 +97,12 @@ use crate::{
 /// superfiles are stats-disjoint on `path` opens only the file that can
 /// hold it) with the [`CandidatePlan`]'s term-bloom survival. The rows are
 /// the plan's per-superfile evaluation, tombstones already subtracted.
-#[derive(Debug, Clone, Default)]
+// No `Default`: the derived one would pair an empty `superfiles` with
+// `allow: None`, which reads as "no files, but every row of every file is
+// admitted" — the opposite polarity from [`CandidateScope::empty`], and a
+// silent way for a future `..Default::default()` to drop the row bound.
+// Construct one through `empty()` or `SupertableReader::candidate_scope`.
+#[derive(Debug, Clone)]
 pub(crate) struct CandidateScope {
     /// Superfiles a match may live in, in manifest order.
     pub(crate) superfiles: Vec<Arc<SuperfileEntry>>,
