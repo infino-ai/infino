@@ -455,17 +455,24 @@ impl SuperfileReader {
             .parse()
             .map_err(|_| ReadError::MalformedKv(format!("{} not a u64", kv::N_DOCS)))?;
 
-        // 3. Parse the Parquet metadata once, with the page index, and
-        //    cache it on the reader. `Bytes` implements `ChunkReader`
-        //    directly so this is zero-copy, and every later
-        //    `take_by_local_doc_ids` reuses this `ArrowReaderMetadata`
-        //    instead of re-parsing the footer per call. The page index
-        //    lets `RowSelection` skip whole pages on targeted reads.
-        let arrow_meta = ArrowReaderMetadata::load(
-            &bytes,
-            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
-        )
-        .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
+        // 3. Parse the Parquet metadata once and cache it on the reader.
+        //    `Bytes` implements `ChunkReader` directly so this is
+        //    zero-copy, and every later `take_by_local_doc_ids` reuses
+        //    this `ArrowReaderMetadata` instead of re-parsing the footer
+        //    per call.
+        //
+        //    The page index — a decoded min/max pair per page, per column,
+        //    per row group — is deliberately NOT parsed here. It exists to
+        //    let `RowSelection` skip pages on targeted reads, and only the
+        //    take and SQL-scan paths use it; BM25 and COUNT never touch it.
+        //    Parsing it at open put tens of MiB on the heap per superfile
+        //    for every reader, including the fan-out readers that will
+        //    only ever count. `parquet_metadata_with_page_index` parses it
+        //    on first use instead, from these same resident bytes, so the
+        //    paths that need it see identical metadata and pay no I/O for
+        //    it either way.
+        let arrow_meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::new())
+            .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
         let schema = arrow_meta.schema().clone();
 
         // 4. If FTS keys present, slice + open FtsReader.
@@ -556,7 +563,8 @@ impl SuperfileReader {
         Ok(Self {
             bytes: Some(bytes),
             parquet_meta: Arc::clone(arrow_meta.metadata()),
-            page_index_meta: OnceCell::new_with(Some(Arc::clone(arrow_meta.metadata()))),
+            // Filled by `parquet_metadata_with_page_index` on first use.
+            page_index_meta: OnceCell::new(),
             arrow_meta: Some(arrow_meta),
             source: None,
             schema,
@@ -600,11 +608,27 @@ impl SuperfileReader {
             return Ok(Arc::clone(&self.parquet_meta));
         }
         let source = self.source.as_ref().map(Arc::clone);
+        let bytes = self.bytes.clone();
         let metadata = self
             .page_index_meta
             .get_or_try_init(|| async move {
                 let Some(source) = source else {
-                    return Ok::<Arc<ParquetMetaData>, ReadError>(Arc::clone(&self.parquet_meta));
+                    // Eager / mmap reader: the whole file is already
+                    // resident, so parse the index straight out of it
+                    // rather than going back to storage. Keeping this off
+                    // the metered DataFusion store is what makes page-byte
+                    // accounting independent of how the reader was opened.
+                    let Some(bytes) = bytes else {
+                        return Ok::<Arc<ParquetMetaData>, ReadError>(Arc::clone(
+                            &self.parquet_meta,
+                        ));
+                    };
+                    let indexed = ArrowReaderMetadata::load(
+                        &bytes,
+                        ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
+                    )
+                    .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
+                    return Ok(Arc::clone(indexed.metadata()));
                 };
                 let mut fetch = LazyMetadataFetch { source };
                 let mut loader =
@@ -2688,6 +2712,36 @@ mod tests {
                 n_docs: 4
             }
         ));
+    }
+
+    /// The page index is tens of MiB per superfile and only the take /
+    /// SQL-scan paths read it, so an eager open must not parse it. It must
+    /// still be available, and identical, on first demand — parsed from the
+    /// resident bytes, not fetched.
+    #[tokio::test]
+    async fn eager_open_defers_the_page_index_until_something_asks_for_it() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open_with(bytes, OpenOptions { verify_crc: false })
+            .expect("open eager");
+        assert!(
+            r.parquet_meta.offset_index().is_none(),
+            "an eager open must not parse the page index"
+        );
+        let indexed = r
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("page index on demand");
+        assert_eq!(
+            indexed.num_row_groups(),
+            r.parquet_meta.num_row_groups(),
+            "the on-demand parse must describe the same file"
+        );
+        // Cached: a second call returns the same allocation.
+        let again = r
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("page index cached");
+        assert!(Arc::ptr_eq(&indexed, &again), "the parse must happen once");
     }
 
     #[tokio::test]

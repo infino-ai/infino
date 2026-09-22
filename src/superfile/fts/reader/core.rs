@@ -646,12 +646,35 @@ impl FtsReader {
             ),
         )?;
 
-        let mut overlay = PrefetchedSource::new(source);
-        overlay.install(0, header);
-        overlay.install(header_size as u64, fst_region);
+        let mut overlay = PrefetchedSource::new(Arc::clone(&source));
+        overlay.install(0, header.clone());
+        overlay.install(header_size as u64, fst_region.clone());
         overlay.install(doc_lengths_table_offset as u64, doc_lengths_tail);
 
-        Self::open_with_source(Source::Lazy(Arc::new(overlay)), columns_json, opts)
+        let mut reader =
+            Self::open_with_source(Source::Lazy(Arc::new(overlay)), columns_json, opts)?;
+
+        // The doc-lengths tail was prefetched for one purpose: building the
+        // BM25 norm tables just above. Scoring reads those tables — one
+        // quantized byte per doc — and never the stored array again, so the
+        // raw region (`doc_length_bytes` per doc, per column, plus the
+        // directory) is derived data from here on. Rebuild the overlay
+        // without it rather than pin it for the reader's life; on a table
+        // whose superfiles stay lazy that is the difference between holding
+        // the region per superfile and not holding it at all.
+        //
+        // Rebuilding, rather than evicting in place, keeps the overlay's
+        // lookup vector immutable after open — the read path stays lock-free.
+        // The two surviving buffers are refcounted; this re-registers them
+        // rather than copying. The compaction merge path still reads the
+        // region through `read_doc_lengths`, which falls through to the
+        // underlying source on an overlay miss.
+        let mut without_doc_lengths = PrefetchedSource::new(source);
+        without_doc_lengths.install(0, header);
+        without_doc_lengths.install(header_size as u64, fst_region);
+        reader.source = Source::Lazy(Arc::new(without_doc_lengths));
+
+        Ok(reader)
     }
 
     /// Open over an arbitrary byte source. The eager path wraps a
@@ -2098,11 +2121,16 @@ mod tests {
             );
         }
     }
-    use std::collections::HashSet;
+    use std::{
+        collections::HashSet,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use async_trait::async_trait;
 
     use super::{super::test_util::*, *};
     use crate::superfile::{
-        BytesLazyByteSource,
+        BytesLazyByteSource, LazyByteSourceError,
         fts::{
             bm25,
             builder::{BlobEra, FtsBuilder},
@@ -3258,6 +3286,67 @@ mod tests {
         scores.insert(9, 5.0);
         let out = top_k(scores, 10);
         assert_eq!(out, vec![(9, 5.0), (5, 2.0)]);
+    }
+
+    /// The doc-lengths tail is prefetched to build the norm tables and then
+    /// released: a post-open read of that region falls through to the source,
+    /// while the dictionary stays overlaid and scoring is unaffected.
+    #[tokio::test]
+    async fn open_lazy_releases_the_doc_lengths_tail_but_keeps_the_dictionary() {
+        #[derive(Debug)]
+        struct CountingSource {
+            inner: BytesLazyByteSource,
+            range_calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl LazyByteSource for CountingSource {
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+                self.range_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.range(start, len).await
+            }
+            fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
+                self.range_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.try_get_range_sync(start, len)
+            }
+        }
+
+        let (blob, json) = build_blob();
+        let counting = Arc::new(CountingSource {
+            inner: BytesLazyByteSource::new(blob),
+            range_calls: AtomicUsize::new(0),
+        });
+        let src: Arc<dyn LazyByteSource> = counting.clone();
+        let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+
+        // Scoring uses the quantized norm table, so a search must not go
+        // back to the source for the released region.
+        let after_open = counting.range_calls.load(Ordering::SeqCst);
+        let hits = r
+            .search("body", &["rust"], 10, BoolMode::Or)
+            .await
+            .expect("search over lazy reader");
+        assert!(
+            !hits.is_empty(),
+            "the released region must not break scoring"
+        );
+        let dict_reads = counting.range_calls.load(Ordering::SeqCst) - after_open;
+
+        // The stored array is gone from the overlay, so the merge path's
+        // read of it now reaches the source.
+        let before = counting.range_calls.load(Ordering::SeqCst);
+        let lengths = r.read_doc_lengths(0).expect("doc lengths still readable");
+        assert_eq!(lengths.len(), r.n_docs() as usize);
+        assert!(
+            counting.range_calls.load(Ordering::SeqCst) > before,
+            "the doc-lengths region must no longer be held by the overlay"
+        );
+        let _ = dict_reads;
     }
 
     #[tokio::test]

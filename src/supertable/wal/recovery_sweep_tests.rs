@@ -18,7 +18,7 @@ use crate::{
     superfile::fts::reader::{Bm25SearchOptions, BoolMode},
     supertable::{
         Supertable,
-        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore},
         wal::{
             WalStore,
             state_doc::{
@@ -40,8 +40,9 @@ fn make_disk_cache(storage: Arc<dyn StorageProvider>, cache_root: &Path) -> Arc<
         prefetch_concurrency: 8,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
-        eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        // Everything below here at its default: these tests pin the
+        // cold-fetch and sweep knobs and care about nothing else.
+        ..DiskCacheConfig::default()
     };
     let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
     DiskCacheStore::new(storage, cfg, pinned).expect("cache")
