@@ -9313,29 +9313,37 @@ pub(in crate::supertable) async fn stamp_term_stats(
         let store = Arc::clone(&old.options.store);
         let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
         let opt_storage = old.options.storage.as_ref().map(Arc::clone);
-        let mut readers: Vec<(Uuid, Arc<SuperfileReader>)> = Vec::with_capacity(entries.len());
-        for entry in entries {
-            // No background fills: this pass reads dictionaries and df
-            // headers only, and a fill here copies EVERY superfile —
-            // including compaction's fresh multi-GiB outputs — into the
-            // disk cache. On real object storage those fills outlive the
-            // optimize call and their reads bleed into whatever runs
-            // next (they surfaced as phantom user-data GETs in cold
-            // measurements that began while a fill was still draining).
-            let reader = open_reader(
-                &store,
-                disk_cache.as_ref(),
-                opt_storage.as_ref(),
-                entry,
-                false,
-            )
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-            readers.push((entry.superfile_id, reader));
-        }
-        let bytes = term_stats::build(&readers)
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+        // Readers are opened by `build`, one at a time, and dropped before
+        // the next: each pins its superfile's term dictionary for its
+        // lifetime, so materializing them all here made the pass scale with
+        // table size rather than with the work it does.
+        //
+        // No background fills: this pass reads dictionaries and df headers
+        // only, and a fill here copies EVERY superfile — including
+        // compaction's fresh multi-GiB outputs — into the disk cache. On real
+        // object storage those fills outlive the optimize call and their
+        // reads bleed into whatever runs next (they surfaced as phantom
+        // user-data GETs in cold measurements that began while a fill was
+        // still draining).
+        let bytes = term_stats::build(entries, |entry| {
+            let store = Arc::clone(&store);
+            let disk_cache = disk_cache.clone();
+            let opt_storage = opt_storage.clone();
+            let entry = Arc::clone(entry);
+            async move {
+                open_reader(
+                    &store,
+                    disk_cache.as_ref(),
+                    opt_storage.as_ref(),
+                    &entry,
+                    false,
+                )
+                .await
+                .map_err(|e| term_stats::TermStatsError::Build(e.to_string()))
+            }
+        })
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
         let reference = term_stats::write(storage.as_ref(), bytes)
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
