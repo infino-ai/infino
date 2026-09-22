@@ -762,22 +762,26 @@ mod tests {
     }
 
     /// Rows holding `rust` twice, which BM25 ranks above every weak row.
-    /// All of them are deleted in the test below, so they fill the first
-    /// round's kernel heap and are then subtracted from it.
-    const N_TOMBSTONED_STRONG: usize = 10;
+    /// All of them are deleted in the test below. Deep enough to empty the
+    /// first TWO rounds at the `k` used there (10, then 20) — one empty
+    /// round catches a fill that reads a short round as exhaustion, two
+    /// catch one that reads a flat hit count as exhaustion, and neither
+    /// kernel has run out while the weak rows below are still live.
+    const N_TOMBSTONED_STRONG: usize = 20;
 
     /// Live rows the same query matches, more than `k` of them, every one
     /// ranked below the tombstoned rows.
     const N_LIVE_WEAK: usize = 12;
 
-    /// A short round does not mean the kernel is out of candidates:
-    /// tombstones are subtracted *after* each unit's `k`-sized heap
-    /// (`dispatch::fanout_local_hits`), so deleting the top-scoring hits
-    /// empties a round on its own. Reading that as exhaustion ended the
-    /// fill on round one and returned nothing — the same underflow the
-    /// pushdown exists to prevent, reached through the delete path.
+    /// Neither a short round nor a flat hit count means the kernel is out
+    /// of candidates: tombstones are subtracted *after* each unit's
+    /// `k`-sized heap (`dispatch::fanout_local_hits`), so deleting the
+    /// top-scoring hits empties a round on its own, and deleting enough of
+    /// them empties several in a row. Either reading ends the fill early
+    /// and returns nothing — the same underflow the pushdown exists to
+    /// prevent, reached through the delete path.
     #[test]
-    fn bm25_search_tvf_where_fills_past_a_round_emptied_by_tombstones() {
+    fn bm25_search_tvf_where_fills_past_rounds_emptied_by_tombstones() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -797,10 +801,10 @@ mod tests {
             .expect("delete");
         assert_eq!(stats.matched() as usize, N_TOMBSTONED_STRONG);
 
-        // `k` equal to the tombstoned count is the exact case: round one
-        // asks for k, the kernel's heap is precisely the deleted rows, and
-        // the filter leaves nothing.
-        let k = N_TOMBSTONED_STRONG;
+        // At this `k` the fill asks for 10 then 20, and every hit in both
+        // rounds is a deleted row, so both come back empty before the live
+        // rows below are ever reached.
+        let k = 10;
         let rows = st
             .reader()
             .expect("reader")

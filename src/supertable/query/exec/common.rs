@@ -366,17 +366,19 @@ fn unqualified(expr: Expr) -> DfResult<Expr> {
 /// table-wide and the `WHERE` ran afterwards, so the same query returned
 /// only whatever survived from one unfiltered top-`k`.
 ///
-/// **Exhaustion is read from the hit count refusing to grow, not from a
-/// short round.** A round can come back short because tombstones are
-/// applied *after* each unit's `k`-sized kernel heap
-/// (`dispatch::fanout_local_hits`), so deleted rows alone can make a
-/// kernel with plenty left to give look spent — the same underflow this
-/// function exists to prevent, reached through the delete path. Asking
-/// for more can only return a superset, so a round that returns no more
-/// hits than the one before it is the honest signal that the kernel is
-/// dry. That costs one extra round when the fill genuinely runs out,
-/// which only happens on the unselective predicates the ceiling above
-/// already bounds.
+/// **The ceiling is the only stopping condition besides finding `k`, and
+/// that is deliberate: the hit count carries no exhaustion signal.** A
+/// round can come back short, or no longer than the round before it,
+/// without the kernel having run out — tombstones are subtracted after
+/// each unit's `k`-sized heap (`dispatch::fanout_local_hits`), and fusion
+/// and stable-id de-duplication shrink a round too. Reading either as
+/// exhaustion returns early while matching rows remain, which is the
+/// underflow this function exists to prevent, reached through the delete
+/// path instead of the ranking one. So the fill keeps widening until `k`
+/// survive or the ceiling stops it, and pays extra rounds on a query that
+/// was going to come up short anyway. The signal that would end those
+/// rounds honestly is the kernel reporting its own saturation, before
+/// tombstones and fusion touch the hits; that is not plumbed today.
 ///
 /// The predicate's columns are decoded alongside the requested ones for
 /// the check and projected away before the batch is returned.
@@ -420,9 +422,6 @@ where
     let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
     let ceiling = over_fetch_ceiling(k, total);
     let mut want = k.min(ceiling);
-    // Hits the previous round returned, to tell a kernel that is out of
-    // candidates from one whose heap was merely thinned by tombstones.
-    let mut previous_hits: Option<usize> = None;
     loop {
         let hits = search(want).await.map_err(search_query_df_error)?;
         let batch =
@@ -438,12 +437,14 @@ where
             })?;
         let kept = filter_record_batch(&batch, mask)
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-        // Nothing more to fetch: a wider ask returned no more hits than the
-        // last one (the kernel is out of candidates — a short round on its
-        // own means nothing, since tombstones are subtracted after each
-        // unit's heap), or the fill has reached its ceiling.
-        let stalled = previous_hits.is_some_and(|previous| hits.len() <= previous);
-        let exhausted = stalled || want >= ceiling;
+        // The ceiling is the only stopping condition other than finding `k`.
+        // Nothing observable here distinguishes a kernel that is out of
+        // candidates from one whose hits were thinned after it ran: tombstones
+        // are subtracted after each unit's heap, and fusion and stable-id
+        // de-duplication also shrink a round. So neither a short round nor a
+        // round that returned no more than the last one is evidence, and
+        // treating either as exhaustion under-returns.
+        let exhausted = want >= ceiling;
         if kept.num_rows() >= k || exhausted {
             let rows = kept.num_rows().min(k);
             return kept
@@ -451,7 +452,6 @@ where
                 .project(&requested_positions)
                 .map_err(|e| DataFusionError::Execution(e.to_string()));
         }
-        previous_hits = Some(hits.len());
         want = want.saturating_mul(OVER_FETCH_GROWTH).min(ceiling);
     }
 }
