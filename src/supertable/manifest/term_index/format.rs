@@ -141,6 +141,27 @@ impl Location {
     }
 }
 
+impl Location {
+    /// The superfile dictionary value this location stands for, or `None`
+    /// when no location was carried.
+    pub(crate) fn to_dict_value(self) -> Option<FstValue> {
+        match self {
+            Self::None => None,
+            Self::Pfor { offset, len } => Some(FstValue::Pfor {
+                metadata_offset: offset,
+                postings_length_hint: Some(len),
+                short: false,
+            }),
+            Self::Short { offset, len } => Some(FstValue::Pfor {
+                metadata_offset: offset,
+                postings_length_hint: Some(len),
+                short: true,
+            }),
+            Self::Inline { doc_id, tf } => Some(FstValue::Inline { doc_id, tf }),
+        }
+    }
+}
+
 /// One `(term, superfile)` fact.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Posting {

@@ -74,6 +74,17 @@ pub(crate) struct FetchedTermMemo {
 }
 
 impl FetchedTermMemo {
+    /// A memo from slots resolved elsewhere — by the open wave, or from a
+    /// table-level term index that already knows where each term's
+    /// postings sit, so the cursor build needs no dictionary at all.
+    pub(crate) fn from_slots(
+        slots: impl IntoIterator<Item = (Box<str>, Option<FetchedTermSlot>)>,
+    ) -> Self {
+        Self {
+            map: slots.into_iter().collect(),
+        }
+    }
+
     /// `Some(entry)` when the open wave resolved this term (entry `None`
     /// = absent from this superfile); `None` when the term was not part
     /// of the fetch (e.g. a negated term — unscored, never gathered).
@@ -126,6 +137,56 @@ fn seed_blocks_for(k: usize) -> usize {
 }
 
 impl FtsReader {
+    /// Build a [`FetchedTermMemo`] for `terms` whose dictionary values are
+    /// already known — from a table-level term index — fetching only the
+    /// postings ranges those values name, never the dictionary. A value
+    /// whose length is unknown is left out and resolves through the
+    /// dictionary as usual.
+    pub(crate) async fn memo_from_dict_values(
+        &self,
+        terms: &[(&str, u64, FstValue)],
+    ) -> Result<FetchedTermMemo, FtsError> {
+        let mut ranges: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut order: Vec<(usize, u64, bool)> = Vec::new();
+        let mut slots: Vec<(Box<str>, Option<FetchedTermSlot>)> = Vec::with_capacity(terms.len());
+        for (i, (term, df, value)) in terms.iter().enumerate() {
+            match value {
+                FstValue::Inline { doc_id, tf } => slots.push((
+                    Box::from(*term),
+                    Some(FetchedTermSlot::Inline {
+                        doc_id: *doc_id,
+                        tf: *tf,
+                    }),
+                )),
+                FstValue::Pfor {
+                    metadata_offset,
+                    postings_length_hint: Some(len),
+                    short,
+                } => {
+                    ranges.push((*metadata_offset as usize, Some(*len as usize)));
+                    order.push((i, *df, *short));
+                }
+                FstValue::Pfor {
+                    postings_length_hint: None,
+                    ..
+                } => {}
+            }
+        }
+        let fetched = self.fetch_term_postings(&ranges).await?;
+        for ((i, df, short), bytes) in order.into_iter().zip(fetched) {
+            slots.push((
+                Box::from(terms[i].0),
+                Some(FetchedTermSlot::Pfor {
+                    bytes,
+                    header_probed: false,
+                    df,
+                    short,
+                }),
+            ));
+        }
+        Ok(FetchedTermMemo::from_slots(slots))
+    }
+
     /// Ranked search over heterogeneous atoms — the walk every
     /// phrase-bearing query takes. With musts, the match set is their
     /// intersection and shoulds are scoring-only (the clause model);

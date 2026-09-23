@@ -134,7 +134,7 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri},
+        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri, term_index},
         query::{
             SuperfileHit,
             candidate::CandidateScope,
@@ -145,6 +145,7 @@ use crate::{
         reader_cache::disk::ForegroundQueryGuard,
         tombstones::SidecarCache,
     },
+    utils::terms::FstValue,
 };
 
 /// Per-superfile open-wave fetches for one global-stats query, keyed by
@@ -671,6 +672,31 @@ impl SupertableReader {
                 |e: &Arc<SuperfileEntry>| c.get(&e.superfile_id).copied().unwrap_or(f32::INFINITY);
             kept.sort_by(|a, b| ceiling_of(b).total_cmp(&ceiling_of(a)));
         }
+        // The index also knows where each term's postings sit in every
+        // indexed superfile, so a cursor set can be built from those
+        // locations and the superfile's dictionary never read.
+        let index_locations: Arc<HashMap<Uuid, Arc<Vec<(String, u64, term_index::Location)>>>> =
+            match manifest.term_index().await {
+                Some(index) => {
+                    let mut all: Vec<&str> = musts
+                        .iter()
+                        .chain(shoulds.iter())
+                        .map(String::as_str)
+                        .collect();
+                    for p in must_phrases.iter().chain(should_phrases.iter()) {
+                        all.extend(p.iter().map(String::as_str));
+                    }
+                    all.sort_unstable();
+                    all.dedup();
+                    match index.locations(column, &all, &kept).await {
+                        Ok(map) => {
+                            Arc::new(map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect())
+                        }
+                        Err(_) => Arc::new(HashMap::new()),
+                    }
+                }
+                None => Arc::new(HashMap::new()),
+            };
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
         // Phrase-bearing queries stay per-superfile: the ranged
         // kernel is the pure term-union fast path. So does a search
@@ -766,6 +792,7 @@ impl SupertableReader {
             let tombstones = tombstones.clone();
             let global_idf = global_idf.clone();
             let prefetch_memos = prefetch_memos.clone();
+            let index_locations = Arc::clone(&index_locations);
             let op_stats = op_stats.clone();
             // This superfile's admitted rows under a bounded scope. `kept`
             // holds only superfiles the scope admits, so the lookup
@@ -781,7 +808,27 @@ impl SupertableReader {
                 // cursor builds below serve the scored terms from the memo
                 // instead of re-reading what the df wave already fetched.
                 let memo: Option<Arc<FetchedTermMemo>> =
-                    prefetch_memos.as_ref().and_then(|m| m.get(&suid)).cloned();
+                    match prefetch_memos.as_ref().and_then(|m| m.get(&suid)).cloned() {
+                        Some(memo) => Some(memo),
+                        // No open-wave memo: build one from the term index's
+                        // locations, fetching postings only. A failure here
+                        // costs the dictionary read, never the answer.
+                        None => match index_locations.get(&suid) {
+                            Some(locations) => {
+                                let pairs: Vec<(&str, u64, FstValue)> = locations
+                                    .iter()
+                                    .filter_map(|(t, df, loc)| {
+                                        loc.to_dict_value().map(|v| (t.as_str(), *df, v))
+                                    })
+                                    .collect();
+                                r.term_memo_from_dict_values(&pairs)
+                                    .await
+                                    .ok()
+                                    .map(Arc::new)
+                            }
+                            None => None,
+                        },
+                    };
                 // Share the global kth-best floor with every superfile —
                 // single-term queries included — so each prunes its scored
                 // scan against the running top-k instead of returning a full

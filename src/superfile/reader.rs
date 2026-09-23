@@ -62,8 +62,8 @@ use crate::{
         fts::{
             bm25::Bm25Params,
             reader::{
-                self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
-                PreparedClauses, TermPattern,
+                self as fts_reader, BoolMode, ClauseLists, FetchedTermMemo, FtsReader, MatchWork,
+                OrCursorSet, PreparedClauses, TermPattern,
             },
             tokenize::{Phrase, Tokenizer},
         },
@@ -1449,6 +1449,19 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts.term_df(column, token).await?)
+    }
+
+    /// A prefetched-term memo for terms whose dictionary values are already
+    /// known, fetching only their postings. Delegates to
+    /// [`FtsReader::memo_from_dict_values`].
+    pub(crate) async fn term_memo_from_dict_values(
+        &self,
+        terms: &[(&str, u64, FstValue)],
+    ) -> Result<FetchedTermMemo, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.memo_from_dict_values(terms).await?)
     }
 
     /// Upper bound on the BM25 score each of `tokens` can reach here, at

@@ -427,6 +427,36 @@ impl TermIndex {
         Ok(out)
     }
 
+    /// For each indexed superfile among `entries`, the `(term, df,
+    /// location)` of every one of `terms` it holds — what a reader needs
+    /// to build its cursors without reading the superfile's dictionary.
+    pub(crate) async fn locations(
+        &self,
+        column: &str,
+        terms: &[&str],
+        entries: &[Arc<SuperfileEntry>],
+    ) -> Result<HashMap<Uuid, Vec<(String, u64, Location)>>, TermIndexError> {
+        let live: HashSet<Uuid> = entries
+            .iter()
+            .map(|e| e.superfile_id)
+            .filter(|id| self.is_indexed(id))
+            .collect();
+        let mut out: HashMap<Uuid, Vec<(String, u64, Location)>> = HashMap::new();
+        for term in terms {
+            for p in self.postings(column, term).await? {
+                let Some(id) = self.superfile_id(p.superfile) else {
+                    continue;
+                };
+                if live.contains(&id) {
+                    out.entry(id)
+                        .or_default()
+                        .push(((*term).to_owned(), p.df, p.location));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The superfiles holding any term with `prefix` in `column`.
     pub(crate) async fn route_prefix(
         &self,
@@ -525,7 +555,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{storage::LocalFsStorageProvider, utils::terms::make_key};
+    use crate::{
+        storage::LocalFsStorageProvider,
+        utils::terms::{FstValue, make_key},
+    };
 
     fn contribution(dir: &TempDir, id: u128, terms: &[(&str, &str, u64)]) -> Contribution {
         let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(id)).expect("create");
@@ -1523,5 +1556,85 @@ mod tests {
             opened_5, 1,
             "five hits all sit in the tf-3 superfile; the others' ceilings stay below the floor"
         );
+    }
+    /// A memo built from the index's locations resolves exactly what the
+    /// superfile's own dictionary would: same `df`, same form, same postings
+    /// bytes — with the dictionary never consulted.
+    #[test]
+    fn memo_from_index_locations_matches_the_dictionary() {
+        use crate::superfile::{SuperfileReader, fts::reader::FetchedTermSlot};
+
+        let (dir, storage, st) = fresh_table();
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let reader = st.reader().expect("reader");
+        let entries = reader.manifest().get_all_superfiles().to_vec();
+        let terms = ["shared", "alpha", "beta", "s1d00", "absent"];
+        let by_sf = rt
+            .block_on(index.locations("title", &terms, &entries))
+            .expect("locations");
+        assert_eq!(
+            by_sf.len(),
+            entries.len(),
+            "every indexed superfile has locations"
+        );
+        for e in &entries {
+            let bytes =
+                std::fs::read(dir.path().join(e.uri.storage_path())).expect("superfile bytes");
+            let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+            let locs = &by_sf[&e.superfile_id];
+            assert!(
+                locs.iter().all(|(t, _, _)| t != "absent"),
+                "an absent term has no location"
+            );
+            let pairs: Vec<(&str, u64, FstValue)> = locs
+                .iter()
+                .filter_map(|(t, df, l)| l.to_dict_value().map(|v| (t.as_str(), *df, v)))
+                .collect();
+            let memo = rt
+                .block_on(sf.term_memo_from_dict_values(&pairs))
+                .expect("memo");
+            let names: Vec<&str> = pairs.iter().map(|(t, _, _)| *t).collect();
+            let (dfs, _) = rt.block_on(sf.term_dfs("title", &names)).expect("dfs");
+            let values = rt
+                .block_on(sf.term_locations("title", &names))
+                .expect("values");
+            for ((name, df), value) in names.iter().zip(dfs).zip(values) {
+                assert_eq!(
+                    memo.df(name),
+                    df,
+                    "{name}: df from the index equals the dictionary's"
+                );
+                let slot = memo.lookup(name).expect("in memo").expect("present");
+                match (slot, value.expect("dictionary has it")) {
+                    (
+                        FetchedTermSlot::Inline { doc_id, tf },
+                        FstValue::Inline { doc_id: d, tf: t },
+                    ) => {
+                        assert_eq!((doc_id, tf), (d, t));
+                    }
+                    (
+                        FetchedTermSlot::Pfor { bytes, short, .. },
+                        FstValue::Pfor {
+                            postings_length_hint,
+                            short: s,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(short, s);
+                        assert_eq!(
+                            Some(bytes.len() as u32),
+                            postings_length_hint,
+                            "{name}: fetched exactly the postings range"
+                        );
+                    }
+                    (_, value) => panic!("{name}: form mismatch against {value:?}"),
+                }
+            }
+        }
     }
 }
