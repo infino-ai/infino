@@ -37,7 +37,11 @@
 pub(crate) mod build;
 pub(crate) mod format;
 
-use std::{collections::HashMap, io, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    sync::Arc,
+};
 
 pub(crate) use build::{
     BuildPolicy, Built, Contribution, ContributionWriter, build, build_segment,
@@ -49,7 +53,8 @@ use uuid::Uuid;
 
 use crate::{
     storage::{StorageError, StorageProvider},
-    supertable::manifest::{RoutingRef, part::ContentHash},
+    superfile::fts::reader::BoolMode,
+    supertable::manifest::{RoutingRef, disk_cache::ManifestDiskCache, part::ContentHash},
     utils::terms::make_key,
 };
 
@@ -59,6 +64,11 @@ pub(crate) const STORAGE_PREFIX: &str = "term-index/";
 
 /// Objects at or above this size go through the multipart upload path.
 const MULTIPART_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Slices kept decoded in memory per loaded index. Beyond this the map is
+/// cleared and slices come back from the manifest disk cache, which is the
+/// tier meant to hold them; this is only the hot set of one query burst.
+const MAX_RESIDENT_SLICES: usize = 16;
 
 /// Errors from building, storing or reading the term index.
 #[derive(Debug, Error)]
@@ -173,19 +183,38 @@ pub(crate) async fn append_delta(
     write_root(storage, &root).await
 }
 
+/// Fetch a content-addressed object, through the manifest disk cache when
+/// one is attached: a hit is served from local disk; a miss is fetched,
+/// hash-verified, and written back best-effort. The hash check is the
+/// only integrity check either tier gets.
+async fn fetch_verified(
+    storage: &dyn StorageProvider,
+    disk_cache: Option<&ManifestDiskCache>,
+    uri: &str,
+    hash: &ContentHash,
+) -> Result<Bytes, TermIndexError> {
+    if let Some(cache) = disk_cache
+        && let Some(cached) = cache.get(hash).await
+        && ContentHash::of(&cached) == *hash
+    {
+        return Ok(Bytes::from(cached));
+    }
+    let (bytes, _meta) = storage.get(uri).await?;
+    if ContentHash::of(bytes.as_ref()) != *hash {
+        return Err(TermIndexError::HashMismatch);
+    }
+    if let Some(cache) = disk_cache {
+        cache.put(*hash, bytes.as_ref()).await;
+    }
+    Ok(bytes)
+}
+
 /// Fetch, hash-verify and parse the root a manifest references.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by the routing path, which lands next")
-)]
 pub(crate) async fn load_root(
     storage: &dyn StorageProvider,
     reference: &RoutingRef,
 ) -> Result<Root, TermIndexError> {
-    let (bytes, _meta) = storage.get(&reference.uri).await?;
-    if ContentHash::of(bytes.as_ref()) != reference.content_hash {
-        return Err(TermIndexError::HashMismatch);
-    }
+    let bytes = fetch_verified(storage, None, &reference.uri, &reference.content_hash).await?;
     Root::decode(&bytes)
 }
 
@@ -201,7 +230,14 @@ pub(crate) async fn load_root(
 )]
 pub(crate) struct TermIndex {
     root: Root,
+    /// The root's storage URI — the identity a manifest pins, and what a
+    /// cache compares to decide whether a loaded index is still current.
+    root_uri: String,
+    /// Every superfile the root lists. A live superfile absent from it was
+    /// committed before the index existed and is routed the old way.
+    indexed: HashSet<Uuid>,
     storage: Arc<dyn StorageProvider>,
+    disk_cache: Option<Arc<ManifestDiskCache>>,
     slices: tokio::sync::Mutex<HashMap<ContentHash, Bytes>>,
 }
 
@@ -211,12 +247,93 @@ pub(crate) struct TermIndex {
 )]
 impl TermIndex {
     /// Wrap a loaded root.
-    pub(crate) fn new(root: Root, storage: Arc<dyn StorageProvider>) -> Self {
+    pub(crate) fn new(
+        root: Root,
+        root_uri: String,
+        storage: Arc<dyn StorageProvider>,
+        disk_cache: Option<Arc<ManifestDiskCache>>,
+    ) -> Self {
+        let indexed = root.superfiles.iter().copied().collect();
         Self {
             root,
+            root_uri,
+            indexed,
             storage,
+            disk_cache,
             slices: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Fetch, verify and parse the root a manifest references, through the
+    /// manifest disk cache when one is attached.
+    pub(crate) async fn load(
+        storage: Arc<dyn StorageProvider>,
+        disk_cache: Option<Arc<ManifestDiskCache>>,
+        reference: &RoutingRef,
+    ) -> Result<Self, TermIndexError> {
+        let bytes = fetch_verified(
+            storage.as_ref(),
+            disk_cache.as_deref(),
+            &reference.uri,
+            &reference.content_hash,
+        )
+        .await?;
+        let root = Root::decode(&bytes)?;
+        Ok(Self::new(root, reference.uri.clone(), storage, disk_cache))
+    }
+
+    /// The root URI this index was loaded from.
+    pub(crate) fn root_uri(&self) -> &str {
+        &self.root_uri
+    }
+
+    /// Whether the root lists `superfile` — i.e. whether its postings are
+    /// in this index at all.
+    pub(crate) fn is_indexed(&self, superfile: &Uuid) -> bool {
+        self.indexed.contains(superfile)
+    }
+
+    /// The superfiles that can match `terms` in `column` under `mode`:
+    /// the union of the terms' posting sets for `Or`, their intersection
+    /// for `And`. Exact for indexed superfiles; the caller decides what to
+    /// do with live superfiles the root does not list. Ordinals that no
+    /// longer resolve are skipped.
+    pub(crate) async fn route(
+        &self,
+        column: &str,
+        terms: &[&str],
+        mode: BoolMode,
+    ) -> Result<HashSet<Uuid>, TermIndexError> {
+        let mut out: Option<HashSet<Uuid>> = None;
+        for term in terms {
+            let set: HashSet<Uuid> = self
+                .postings(column, term)
+                .await?
+                .iter()
+                .filter_map(|p| self.superfile_id(p.superfile))
+                .collect();
+            out = Some(match (out, mode) {
+                (None, _) => set,
+                (Some(acc), BoolMode::Or) => acc.union(&set).copied().collect(),
+                (Some(acc), BoolMode::And) => acc.intersection(&set).copied().collect(),
+            });
+        }
+        Ok(out.unwrap_or_default())
+    }
+
+    /// The superfiles holding any term with `prefix` in `column`.
+    pub(crate) async fn route_prefix(
+        &self,
+        column: &str,
+        prefix: &str,
+    ) -> Result<HashSet<Uuid>, TermIndexError> {
+        let mut out = HashSet::new();
+        self.for_each_prefix(column, prefix, |_, run| {
+            out.extend(run.iter().filter_map(|p| self.superfile_id(p.superfile)));
+            true
+        })
+        .await?;
+        Ok(out)
     }
 
     /// The resident root.
@@ -233,11 +350,18 @@ impl TermIndex {
         if let Some(b) = self.slices.lock().await.get(hash) {
             return Ok(b.clone());
         }
-        let (bytes, _meta) = self.storage.get(&slice_uri(hash)).await?;
-        if ContentHash::of(bytes.as_ref()) != *hash {
-            return Err(TermIndexError::HashMismatch);
+        let bytes = fetch_verified(
+            self.storage.as_ref(),
+            self.disk_cache.as_deref(),
+            &slice_uri(hash),
+            hash,
+        )
+        .await?;
+        let mut resident = self.slices.lock().await;
+        if resident.len() >= MAX_RESIDENT_SLICES {
+            resident.clear();
         }
-        self.slices.lock().await.insert(*hash, bytes.clone());
+        resident.insert(*hash, bytes.clone());
         Ok(bytes)
     }
 
@@ -490,7 +614,7 @@ mod tests {
         let reference = write_built(storage.as_ref(), built).await.expect("write");
         assert!(reference.uri.starts_with("term-index/root-"));
         let root = load_root(storage.as_ref(), &reference).await.expect("load");
-        let index = TermIndex::new(root, Arc::clone(&storage));
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         assert_eq!(
             index.root().superfiles,
             vec![Uuid::from_u128(7), Uuid::from_u128(8)]
@@ -684,7 +808,7 @@ mod tests {
                 segment + 1,
                 "one delta segment per commit"
             );
-            let index = TermIndex::new(root, Arc::clone(&storage));
+            let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
             let shared = rt
                 .block_on(index.postings("title", "shared"))
                 .expect("lookup");
@@ -711,7 +835,7 @@ mod tests {
         // Optimize folds every delta into one base segment with the same answers.
         let before: Vec<u64> = {
             let (_, root) = live_and_covered(&st, &storage, &rt);
-            let index = TermIndex::new(root, Arc::clone(&storage));
+            let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
             let mut v: Vec<u64> = rt
                 .block_on(index.postings("title", "alpha"))
                 .expect("lookup")
@@ -731,7 +855,7 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>(),
             live
         );
-        let index = TermIndex::new(root, Arc::clone(&storage));
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         let mut after: Vec<u64> = rt
             .block_on(index.postings("title", "alpha"))
             .expect("lookup")
@@ -779,7 +903,7 @@ mod tests {
             "a maintenance build is one base segment"
         );
 
-        let index = TermIndex::new(root, Arc::clone(&storage));
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         let shared = rt
             .block_on(index.postings("title", "shared"))
             .expect("lookup");
@@ -918,7 +1042,7 @@ mod tests {
 
         // The merged superfile's postings are right, and the removed
         // inputs' postings are still there to be filtered out by liveness.
-        let index = TermIndex::new(root_after, Arc::clone(&storage));
+        let index = TermIndex::new(root_after, String::new(), Arc::clone(&storage), None);
         let shared = rt
             .block_on(index.postings("title", "shared"))
             .expect("lookup");
@@ -944,6 +1068,124 @@ mod tests {
         assert!(
             shared.len() > live_after.len(),
             "the removed inputs' postings remain until the next fold"
+        );
+    }
+    /// Routing is exact: `Or` is the union of the terms' posting sets and
+    /// `And` their intersection, term by term, on random corpora.
+    #[test]
+    fn routing_is_exact_on_random_corpora() {
+        use proptest::prelude::*;
+
+        let alphabet: Vec<String> = (0..12).map(|i| format!("t{i:02}")).collect();
+        proptest!(ProptestConfig::with_cases(64), |(
+            corpus in prop::collection::vec(prop::collection::btree_set(0usize..12, 0..8), 1..6),
+        )| {
+            let dir = TempDir::new().expect("tempdir");
+            let contributions: Vec<Contribution> = corpus
+                .iter()
+                .enumerate()
+                .map(|(i, terms)| {
+                    let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(i as u128 + 1)).expect("create");
+                    for t in terms {
+                        w.push(&make_key("body", &alphabet[*t]), 1 + *t as u64, f32::INFINITY, Location::None).expect("push");
+                    }
+                    w.finish().expect("finish")
+                })
+                .collect();
+            let policy = BuildPolicy { slice_target_bytes: 512, range_max_superfiles: 3 };
+            let built = build(&contributions, &policy).expect("build");
+            let store_dir = TempDir::new().expect("store dir");
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
+            let rt = tokio::runtime::Runtime::new().expect("runtime");
+            let reference = rt.block_on(write_built(storage.as_ref(), built)).expect("write");
+            let index = rt.block_on(TermIndex::load(Arc::clone(&storage), None, &reference)).expect("load");
+            let holders = |t: usize| -> HashSet<Uuid> {
+                corpus.iter().enumerate().filter(|(_, s)| s.contains(&t)).map(|(i, _)| Uuid::from_u128(i as u128 + 1)).collect()
+            };
+            for a in 0..12 {
+                let single = rt.block_on(index.route("body", &[&alphabet[a]], BoolMode::Or)).expect("route");
+                prop_assert_eq!(&single, &holders(a));
+                for b in 0..12 {
+                    let pair = [alphabet[a].as_str(), alphabet[b].as_str()];
+                    let or = rt.block_on(index.route("body", &pair, BoolMode::Or)).expect("route");
+                    let and = rt.block_on(index.route("body", &pair, BoolMode::And)).expect("route");
+                    prop_assert_eq!(&or, &holders(a).union(&holders(b)).copied().collect::<HashSet<_>>());
+                    prop_assert_eq!(&and, &holders(a).intersection(&holders(b)).copied().collect::<HashSet<_>>());
+                }
+            }
+            let prefixed = rt.block_on(index.route_prefix("body", "t0")).expect("prefix");
+            let expect: HashSet<Uuid> = (0..10).flat_map(holders).collect();
+            prop_assert_eq!(prefixed, expect);
+            prop_assert!(rt.block_on(index.route("body", &["nope"], BoolMode::Or)).expect("route").is_empty());
+        });
+    }
+
+    /// Through the query path: superfile selection for a term is exactly
+    /// the set of live superfiles whose dictionary holds it — no more (the
+    /// bloom's false positives are gone) and no less.
+    #[test]
+    fn selection_routes_exactly_through_the_index() {
+        use crate::supertable::query::prune::{PruneLeaf, select_superfiles};
+
+        let (_dir, _storage, st) = fresh_table();
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        assert!(
+            rt.block_on(manifest.term_index()).is_some(),
+            "the snapshot exposes its index"
+        );
+        let select = |terms: &[&str], mode: BoolMode| -> HashSet<Uuid> {
+            let leaf = PruneLeaf::TermPresence {
+                column: "title".to_owned(),
+                terms: terms.iter().map(|t| (*t).to_owned()).collect(),
+                mode,
+            };
+            rt.block_on(select_superfiles(
+                manifest.as_ref(),
+                std::slice::from_ref(&leaf),
+            ))
+            .expect("select")
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect()
+        };
+        let live: HashSet<Uuid> = manifest
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        // Every title holds `shared` and `alpha` is in every segment.
+        assert_eq!(select(&["shared"], BoolMode::Or), live);
+        assert_eq!(select(&["alpha", "shared"], BoolMode::And), live);
+        // A term in no superfile: exact routing returns nothing, where a
+        // summary could only say "maybe".
+        assert!(select(&["absent"], BoolMode::Or).is_empty());
+        assert!(select(&["absent", "shared"], BoolMode::And).is_empty());
+        assert_eq!(select(&["absent", "shared"], BoolMode::Or), live);
+        // A segment-specific token (`s1d00` is only in segment 1's titles).
+        let s1: HashSet<Uuid> = select(&["s1d00"], BoolMode::Or);
+        assert_eq!(s1.len(), 1, "one superfile holds the token");
+        let prefix = PruneLeaf::Prefix {
+            column: "title".to_owned(),
+            prefix: b"s1d".to_vec(),
+        };
+        let by_prefix: HashSet<Uuid> = rt
+            .block_on(select_superfiles(
+                manifest.as_ref(),
+                std::slice::from_ref(&prefix),
+            ))
+            .expect("select")
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert_eq!(
+            by_prefix, s1,
+            "a prefix routes through the slices to the same superfile"
         );
     }
 }

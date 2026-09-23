@@ -34,6 +34,7 @@ pub mod options_hash;
 pub mod part;
 pub mod partition;
 pub(crate) mod term_index;
+use term_index::TermIndex;
 pub mod term_range;
 pub mod term_stats;
 
@@ -1326,6 +1327,13 @@ impl ManifestSnapshot {
         self.list.as_ref().and_then(|l| l.term_index.as_ref())
     }
 
+    /// The loaded term index for this snapshot, or `None` when the list
+    /// carries no reference, no storage is attached, or the load failed.
+    pub(crate) async fn term_index(&self) -> Option<Arc<TermIndex>> {
+        let reference = self.term_index_ref()?;
+        self.loader.as_ref()?.term_index(reference).await
+    }
+
     /// This manifest with the term-index root reference replaced, id
     /// unchanged — for a membership commit that publishes its delta in the
     /// same CAS as the entries it covers, mirroring
@@ -2423,6 +2431,11 @@ pub struct ManifestPartLoader {
     /// resident, shared across every part of the load. See
     /// [`OpenBlobBudget`].
     open_blob_budget: Arc<OpenBlobBudget>,
+    /// The term index the list references, loaded once per root and kept
+    /// for the loader's life. Keyed by root URI: a successor that carries
+    /// the same reference reuses it; a commit that published a delta has a
+    /// new root and loads that instead.
+    term_index: tokio::sync::Mutex<Option<Arc<TermIndex>>>,
 }
 
 impl ManifestPartLoader {
@@ -2461,6 +2474,37 @@ impl ManifestPartLoader {
             manifest_disk_cache,
             prefer_routing,
             open_blob_budget: Arc::new(OpenBlobBudget::new(DEFAULT_OPEN_BLOB_BUDGET_BYTES)),
+            term_index: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// The term index `reference` names, loaded on first use and reused
+    /// while the reference is unchanged. `None` when it cannot be loaded:
+    /// the caller routes the old way, trading latency for availability,
+    /// never correctness.
+    pub(crate) async fn term_index(&self, reference: &RoutingRef) -> Option<Arc<TermIndex>> {
+        let mut slot = self.term_index.lock().await;
+        if let Some(index) = slot.as_ref()
+            && index.root_uri() == reference.uri
+        {
+            return Some(Arc::clone(index));
+        }
+        match TermIndex::load(
+            Arc::clone(&self.storage),
+            self.manifest_disk_cache.clone(),
+            reference,
+        )
+        .await
+        {
+            Ok(index) => {
+                let index = Arc::new(index);
+                *slot = Some(Arc::clone(&index));
+                Some(index)
+            }
+            Err(e) => {
+                warn!(error = %e, uri = %reference.uri, "term index load failed; routing by manifest summaries instead");
+                None
+            }
         }
     }
 
