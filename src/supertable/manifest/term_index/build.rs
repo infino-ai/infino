@@ -339,12 +339,41 @@ pub(crate) struct Built {
     pub(crate) slices: Vec<(ContentHash, Vec<u8>)>,
 }
 
-/// Merge contributions into one segment of slices. Superfile ordinals
-/// follow the order of `contributions`.
+/// One merged segment: the superfiles it covers (in ordinal order, starting
+/// at the base the caller passed), its slice list, and the slice bytes.
+pub(crate) struct BuiltSegment {
+    /// Superfiles this segment's postings name, in ordinal order.
+    pub(crate) superfiles: Vec<Uuid>,
+    /// The segment's slices, in key order.
+    pub(crate) segment: Segment,
+    /// Slice bytes keyed by content hash, in key order.
+    pub(crate) slices: Vec<(ContentHash, Vec<u8>)>,
+}
+
+/// Merge contributions into a base root: one segment, ordinals from zero.
 pub(crate) fn build(
     contributions: &[Contribution],
     policy: &BuildPolicy,
 ) -> Result<Built, TermIndexError> {
+    let built = build_segment(contributions, policy, 0)?;
+    Ok(Built {
+        root: Root {
+            superfiles: built.superfiles,
+            segments: vec![built.segment],
+        },
+        slices: built.slices,
+    })
+}
+
+/// Merge contributions into one segment of slices. Superfile ordinals
+/// follow the order of `contributions`, offset by `ordinal_base` — the
+/// number of superfiles the root already names when this segment is a
+/// delta appended to it.
+pub(crate) fn build_segment(
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+    ordinal_base: u32,
+) -> Result<BuiltSegment, TermIndexError> {
     let mut readers = Vec::with_capacity(contributions.len());
     let mut heap: BinaryHeap<Reverse<Head>> = BinaryHeap::new();
     let mut pending: Vec<Option<Posting>> = Vec::with_capacity(contributions.len());
@@ -380,7 +409,7 @@ pub(crate) fn build(
             let mut p = pending[ordinal as usize]
                 .take()
                 .expect("pending posting for heap head");
-            p.superfile = ordinal;
+            p.superfile = ordinal_base + ordinal;
             run.push(p);
             if let Some(next) = readers[ordinal as usize].next()? {
                 heap.push(Reverse(Head {
@@ -435,11 +464,9 @@ pub(crate) fn build(
         slices.push(reference);
     }
 
-    Ok(Built {
-        root: Root {
-            superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
-            segments: vec![Segment { slices }],
-        },
+    Ok(BuiltSegment {
+        superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
+        segment: Segment { slices },
         slices: slice_bytes,
     })
 }

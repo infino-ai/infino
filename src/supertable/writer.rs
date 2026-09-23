@@ -122,7 +122,7 @@ use crate::{
     InfinoError,
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
     memory::{ConnectionMemoryBudget, Reservation},
-    runtime_bridge::{bridge_on_runtime, run_on_pool},
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, run_on_pool},
     runtime_metrics::{
         ingest::visible_array_bytes,
         op_stats::{self, OpStatsCollector},
@@ -178,7 +178,7 @@ use crate::{
             },
             options_hash,
             part::{self as part_mod, ContentHash, PartId},
-            term_index::{self, TermIndexError},
+            term_index::{self, Contribution as TermContribution, TermIndexError},
             term_stats,
         },
         query::{
@@ -2934,6 +2934,12 @@ pub(crate) struct PreparedSuperfile {
     /// address a superfile.
     pub(crate) bytes_for_storage: Option<(String, Bytes)>,
     pub(crate) bytes_for_cache: Option<(SuperfileUri, Bytes)>,
+    /// This superfile's term-index contribution — its dictionary walked
+    /// in key order with `df` and postings location per term — spilled to
+    /// a file from the in-memory reader at prepare time, so the commit that
+    /// publishes the entry can publish its postings in the same CAS without
+    /// reading the superfile back. `None` for a superfile with no FTS index.
+    pub(crate) term_contribution: Option<TermContribution>,
 }
 
 impl PreparedSuperfile {
@@ -3012,6 +3018,60 @@ pub(crate) fn build_fts_summary(
         );
     }
     out
+}
+
+/// Spill this superfile's term-index contribution from a reader over its
+/// in-memory bytes: every FTS column's terms in key order, each with its
+/// `df` and where its postings sit. The reader's source is the bytes just
+/// built, so the awaited calls resolve without I/O; the bridge only lends
+/// them an executor from this synchronous prepare path. Bounds are written
+/// as `+∞`, a valid ceiling, until the tightening pass replaces them.
+fn build_term_contribution(
+    reader: &SuperfileReader,
+    options: &SupertableOptions,
+    superfile_id: Uuid,
+) -> Result<Option<TermContribution>, BuildError> {
+    let Some(fts) = reader.fts() else {
+        return Ok(None);
+    };
+    let spill = env::temp_dir().join(format!("infino-term-index-{superfile_id}"));
+    let mut writer = term_index::ContributionWriter::create(&spill, superfile_id)
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+    let mut columns: Vec<&str> = options
+        .fts_columns
+        .iter()
+        .map(|c| c.column.as_str())
+        .collect();
+    columns.sort_unstable();
+    for column in columns {
+        let term_bytes = fts
+            .iter_column_terms(column)
+            .map_err(|e| BuildError::Store(format!("term walk: {e}")))?;
+        let terms: Vec<&str> = term_bytes
+            .iter()
+            .map(|t| from_utf8(t).map_err(|_| BuildError::Store("non-utf8 term".into())))
+            .collect::<Result<_, _>>()?;
+        for chunk in terms.chunks(TERM_INDEX_BATCH_TERMS) {
+            let (dfs, locations) = bridge_sync_to_async(async {
+                let (dfs, _work) = reader.term_dfs(column, chunk).await?;
+                let locations = reader.term_locations(column, chunk).await?;
+                Ok::<_, ReadError>((dfs, locations))
+            })
+            .map_err(|e| BuildError::Store(format!("term-index contribution: {e}")))?;
+            for ((term, df), location) in chunk.iter().zip(dfs).zip(locations) {
+                let location = location
+                    .map(term_index::Location::from_dict_value)
+                    .unwrap_or(term_index::Location::None);
+                writer
+                    .push(&make_key(column, term), df, f32::INFINITY, location)
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+            }
+        }
+    }
+    writer
+        .finish()
+        .map(Some)
+        .map_err(|e| BuildError::Store(e.to_string()))
 }
 
 pub(crate) fn build_column_vector_summary(
@@ -3146,11 +3206,13 @@ pub(super) fn prepare_superfile_named(
     });
 
     let storage_key = entry.storage_path();
+    let term_contribution = build_term_contribution(&reader, &inner.options, entry.superfile_id)?;
     Ok(Some(PreparedSuperfile {
         entry,
         bytes_for_store: bytes_for_store.map(|b| (uri, b)),
         bytes_for_storage: bytes_for_storage.map(|b| (storage_key, b)),
         bytes_for_cache: bytes_for_cache.map(|b| (uri, b)),
+        term_contribution,
     }))
 }
 
@@ -3199,6 +3261,9 @@ struct SuperfilePublishBatch {
     /// local) membership publish succeeds — inserting earlier leaves
     /// orphaned cache entries when the CAS fails (S12).
     pending_store_inserts: Vec<(SuperfileUri, Bytes)>,
+    /// One per superfile with an FTS index; published as a term-index delta
+    /// in the same CAS as the entries.
+    term_contributions: Vec<TermContribution>,
 }
 
 fn collect_prepared_superfiles(
@@ -3209,7 +3274,11 @@ fn collect_prepared_superfiles(
     let mut pending_storage_writes: Vec<(String, Bytes)> = Vec::new();
     let mut pending_cache_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
     let mut pending_store_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
+    let mut term_contributions: Vec<TermContribution> = Vec::new();
     for p in prepared {
+        if let Some(c) = p.term_contribution {
+            term_contributions.push(c);
+        }
         if let Some(t) = p.bytes_for_store {
             pending_store_inserts.push(t);
         }
@@ -3227,6 +3296,7 @@ fn collect_prepared_superfiles(
         pending_storage_writes,
         pending_cache_inserts,
         pending_store_inserts,
+        term_contributions,
     })
 }
 
@@ -3391,6 +3461,7 @@ fn prepare_user_superfile_batch_in_scope(
                             bytes_for_store: p.bytes_for_store,
                             bytes_for_storage: p.bytes_for_storage,
                             bytes_for_cache: p.bytes_for_cache,
+                            term_contribution: p.term_contribution,
                         }),
                     )
                 }
@@ -3434,6 +3505,7 @@ async fn persist_superfile_publish_batch_async(
             batch.pending_storage_writes,
             Vec::new(),
             list_metadata,
+            batch.term_contributions,
         )
         .await
         .map_err(BuildError::from)?;
@@ -5094,6 +5166,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             Vec::new(),
             Vec::new(),
             list_metadata,
+            Vec::new(),
         )
         .await
         .map_err(BuildError::from)?;
@@ -6034,6 +6107,7 @@ fn build_prepared_from_packed_cells(
         bytes_for_store: prepared.bytes_for_store,
         bytes_for_storage: prepared.bytes_for_storage,
         bytes_for_cache: prepared.bytes_for_cache,
+        term_contribution: prepared.term_contribution,
     })
 }
 
@@ -6138,6 +6212,7 @@ fn build_prepared_from_spilled_cells(
         bytes_for_store: prepared.bytes_for_store,
         bytes_for_storage: prepared.bytes_for_storage,
         bytes_for_cache: prepared.bytes_for_cache,
+        term_contribution: prepared.term_contribution,
     })
 }
 
@@ -6379,6 +6454,7 @@ fn commit_shards_via_drain(
                 bytes_for_store,
                 bytes_for_storage,
                 bytes_for_cache,
+                term_contribution,
             } = prepared;
             let entry = finish_superfile_entry(entry, Some(*shard_id))?;
             // `blocking_send`, not `send`: this runs on a rayon pool thread
@@ -6392,6 +6468,7 @@ fn commit_shards_via_drain(
                     bytes_for_store,
                     bytes_for_storage,
                     bytes_for_cache,
+                    term_contribution,
                 },
             ))
             .map_err(|_| BuildError::Store("pipelined commit uploader closed mid-build".into()))?;
@@ -7421,6 +7498,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         // children (the merge phase rewrites them shortly anyway).
         pending_cache_inserts: _,
         pending_store_inserts,
+        term_contributions,
     } = collect_prepared_superfiles(inner, all_prepared)?;
 
     // Pin the batch's children BEFORE any byte moves: the pin's entries are
@@ -7487,6 +7565,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         Vec::new(),
         Vec::new(),
         list_metadata,
+        term_contributions,
     )
     .await
     {
@@ -7917,6 +7996,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         // Parity with the batched split: no disk-cache warm fill.
         pending_cache_inserts: _,
         pending_store_inserts,
+        term_contributions,
     } = collect_prepared_superfiles(inner, prepared)?;
 
     // Pin every shard BEFORE any byte moves (entries are metadata): one
@@ -7971,6 +8051,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         Vec::new(),
         Vec::new(),
         list_metadata,
+        term_contributions,
     )
     .await
     {
@@ -8321,6 +8402,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
             Vec::new(),
             Vec::new(),
             list_metadata,
+            Vec::new(),
         )
         .await
         .map_err(BuildError::from)?;
@@ -8759,6 +8841,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             NewEntryBirthVersions::StampCommit,
             &mut Vec::new(),
             &mut Vec::new(),
+            &[],
         )
         .await
         {
@@ -9911,10 +9994,12 @@ pub(in crate::supertable) async fn persist_commit_async(
     mut pending_storage_writes: Vec<(String, Bytes)>,
     mut pending_storage_replaces: Vec<(String, Bytes)>,
     list_metadata: CommitListMetadata,
+    term_contributions: Vec<TermContribution>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
     let max_retries = opts.max_commit_retries.max(1);
+    let contributions: &[TermContribution] = &term_contributions;
     let drive = async move {
         let mut last_err: Option<SupertableCommitError> = None;
         let mut next_id_floor: u64 = 0;
@@ -9947,6 +10032,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 NewEntryBirthVersions::StampCommit,
                 pending_writes,
                 pending_replaces,
+                contributions,
             )
             .await
             {
@@ -9973,7 +10059,14 @@ pub(in crate::supertable) async fn persist_commit_async(
     // would serialize the `tokio::join!` in `commit` (the user + hidden publishes
     // are meant to overlap) and risk a nested-block_on panic. The sync→async
     // bridge lives only in the `persist_commit` wrapper below.
-    drive.await
+    let result = drive.await;
+    // Spill files are scratch for this commit; remove them whatever the
+    // outcome. A failed commit's postings are rebuilt from the superfile by
+    // the next maintenance pass.
+    for contribution in &term_contributions {
+        let _ = fs::remove_file(&contribution.path);
+    }
+    result
 }
 
 pub(in crate::supertable) fn persist_commit(
@@ -9993,6 +10086,7 @@ pub(in crate::supertable) fn persist_commit(
         pending_storage_writes,
         pending_storage_replaces,
         list_metadata,
+        Vec::new(),
     );
     let new_manifest = bridge_on_runtime(drive, &inner.query_runtime())?;
     inner.manifest.store(Arc::new(new_manifest));
@@ -10249,6 +10343,7 @@ pub(crate) async fn try_commit_attempt(
     birth_versions: NewEntryBirthVersions,
     pending_storage_writes: &mut Vec<(String, Bytes)>,
     pending_storage_replaces: &mut Vec<(String, Bytes)>,
+    term_contributions: &[TermContribution],
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
@@ -10324,6 +10419,33 @@ pub(crate) async fn try_commit_attempt(
         }
     }
 
+    // 2c. The term index: this commit's superfiles publish their postings
+    //     in the SAME CAS as their entries — a delta segment appended to
+    //     the root the current manifest references (which `update` carried
+    //     forward), then the new root's reference on this successor. So a
+    //     visible superfile always has postings, and a crash between these
+    //     writes and the CAS leaves only orphans for GC. On a lost CAS the
+    //     retry rebuilds against the winner's root; the slices are
+    //     content-addressed, so their re-PUTs are no-ops.
+    if !term_contributions.is_empty() {
+        let prior = match current_manifest.term_index_ref() {
+            Some(reference) => Some(
+                term_index::load_root(storage.as_ref(), reference)
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?,
+            ),
+            None => None,
+        };
+        let reference = term_index::append_delta(
+            storage.as_ref(),
+            prior,
+            term_contributions,
+            &term_index::BuildPolicy::default(),
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+        new_manifest = new_manifest.with_term_index_ref(reference);
+    }
     // 3. Read the prior pointer's etag for the CAS. Every storage-backed
     //    table has a pointer by now — `create` publishes one before any
     //    writer runs — so an absent pointer is not an initial commit but a
@@ -11045,6 +11167,7 @@ mod tests {
                 bytes_for_store: None,
                 bytes_for_storage: Some((uri.storage_path(), bytes)),
                 bytes_for_cache: None,
+                term_contribution: None,
             },
         )
     }

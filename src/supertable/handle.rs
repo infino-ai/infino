@@ -6199,6 +6199,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 list_metadata,
+                Vec::new(),
             ))
             .expect("plant stale law");
         hidden.inner().manifest.store(Arc::new(planted_manifest));
@@ -6397,6 +6398,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 list_metadata,
+                Vec::new(),
             ))
             .expect("plant stale law");
         hidden.inner().manifest.store(Arc::new(planted_manifest));
@@ -6472,6 +6474,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 zero_metadata,
+                Vec::new(),
             ))
             .expect("plant zero law");
         hidden.inner().manifest.store(Arc::new(zero_manifest));
@@ -6676,6 +6679,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 list_metadata,
+                Vec::new(),
             ))
             .expect("plant cleared law");
         hidden.inner().manifest.store(Arc::new(planted_manifest));
@@ -6856,6 +6860,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 list_metadata,
+                Vec::new(),
             ))
             .expect("plant cleared law");
         hidden.inner().manifest.store(Arc::new(planted_manifest));

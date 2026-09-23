@@ -39,7 +39,9 @@ pub(crate) mod format;
 
 use std::{collections::HashMap, io, sync::Arc};
 
-pub(crate) use build::{BuildPolicy, Built, ContributionWriter, build};
+pub(crate) use build::{
+    BuildPolicy, Built, Contribution, ContributionWriter, build, build_segment,
+};
 use bytes::Bytes;
 pub(crate) use format::{Location, Posting, Root, Slice};
 use thiserror::Error;
@@ -145,6 +147,30 @@ pub(crate) async fn write_built(
         debug_assert_eq!(reference.content_hash, hash);
     }
     write_root(storage, &built.root).await
+}
+
+/// Publish this commit's superfiles as a delta segment appended to `prior`
+/// (the root the current manifest references, or none): write the new
+/// slices, then a new root naming the prior segments plus this one, and
+/// return the root's reference for the manifest CAS. Ordinals continue
+/// from the prior root's superfile count, so earlier postings keep their
+/// meaning. Content-addressed throughout: a retry after a lost CAS
+/// re-derives the same slice hashes and re-PUTs them as no-ops.
+pub(crate) async fn append_delta(
+    storage: &dyn StorageProvider,
+    prior: Option<Root>,
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+) -> Result<RoutingRef, TermIndexError> {
+    let mut root = prior.unwrap_or_default();
+    let built = build_segment(contributions, policy, root.superfiles.len() as u32)?;
+    for (hash, bytes) in built.slices {
+        let reference = write_slice(storage, bytes).await?;
+        debug_assert_eq!(reference.content_hash, hash);
+    }
+    root.superfiles.extend(built.superfiles);
+    root.segments.push(built.segment);
+    write_root(storage, &root).await
 }
 
 /// Fetch, hash-verify and parse the root a manifest references.
@@ -268,7 +294,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{build::Contribution, *};
+    use super::*;
     use crate::{storage::LocalFsStorageProvider, utils::terms::make_key};
 
     fn contribution(dir: &TempDir, id: u128, terms: &[(&str, &str, u64)]) -> Contribution {
@@ -516,33 +542,28 @@ mod tests {
             Err(TermIndexError::HashMismatch)
         ));
     }
-    /// A fragmented three-segment FTS table on local-filesystem storage,
-    /// optimized with compaction disabled so only the maintenance passes
-    /// run. Every title holds `shared`; segment `s` holds `alpha` in the
-    /// titles whose index is a multiple of `s + 2`. Returns the storage
-    /// root, the table, and the per-segment `alpha` counts.
-    fn optimized_fragmented_table() -> (
-        TempDir,
-        Arc<dyn StorageProvider>,
-        crate::supertable::Supertable,
-        Vec<u64>,
-    ) {
-        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+    const DOCS_PER_SEGMENT: usize = 40;
+    const SEGMENTS: usize = 3;
+
+    fn title_schema() -> Arc<arrow_schema::Schema> {
         use arrow_schema::{DataType, Field, Schema};
-
-        use crate::{
-            CompactionSettings, OptimizeOptions,
-            superfile::builder::FtsConfig,
-            supertable::{Supertable, SupertableOptions},
-        };
-
-        const DOCS_PER_SEGMENT: usize = 40;
-        const SEGMENTS: usize = 3;
-        let schema = Arc::new(Schema::new(vec![Field::new(
+        Arc::new(Schema::new(vec![Field::new(
             "title",
             DataType::LargeUtf8,
             false,
-        )]));
+        )]))
+    }
+
+    /// An empty FTS table on local-filesystem storage.
+    fn fresh_table() -> (
+        TempDir,
+        Arc<dyn StorageProvider>,
+        crate::supertable::Supertable,
+    ) {
+        use crate::{
+            superfile::builder::FtsConfig,
+            supertable::{Supertable, SupertableOptions},
+        };
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
@@ -552,50 +573,175 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        let options = SupertableOptions::new(
-            Arc::clone(&schema),
-            vec![FtsConfig::new("title")],
-            Vec::new(),
-        )
-        .expect("options")
-        .with_writer_pool(pool)
-        .with_storage(Arc::clone(&storage));
-        let st = Supertable::create(options).expect("create");
+        let options =
+            SupertableOptions::new(title_schema(), vec![FtsConfig::new("title")], Vec::new())
+                .expect("options")
+                .with_writer_pool(pool)
+                .with_storage(Arc::clone(&storage));
+        (dir, storage, Supertable::create(options).expect("create"))
+    }
 
-        let mut alpha_per_segment: Vec<u64> = Vec::new();
-        for segment in 0..SEGMENTS {
-            let titles: Vec<String> = (0..DOCS_PER_SEGMENT)
-                .map(|i| {
-                    let topic = if i % (segment + 2) == 0 {
-                        "alpha"
-                    } else {
-                        "beta"
-                    };
-                    format!("{topic} shared s{segment}d{i:02}")
-                })
-                .collect();
-            alpha_per_segment.push(titles.iter().filter(|t| t.starts_with("alpha")).count() as u64);
-            let arr: ArrayRef = Arc::new(LargeStringArray::from(
-                titles.iter().map(String::as_str).collect::<Vec<_>>(),
-            ));
-            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![arr]).expect("batch");
-            let mut w = st.writer().expect("writer");
-            w.append(&batch).expect("append");
-            w.commit().expect("commit");
-        }
-        assert!(
-            st.reader().expect("reader").n_superfiles() >= SEGMENTS,
-            "fixture must stay fragmented"
-        );
-        // Compaction is a no-op at these settings, so optimize is the
-        // maintenance passes alone and the layout stays fragmented.
+    /// Commit one segment: every title holds `shared`; segment `s` holds
+    /// `alpha` in the titles whose index is a multiple of `s + 2`. Returns
+    /// the segment's `alpha` count.
+    fn commit_segment(st: &crate::supertable::Supertable, segment: usize) -> u64 {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        let titles: Vec<String> = (0..DOCS_PER_SEGMENT)
+            .map(|i| {
+                let topic = if i % (segment + 2) == 0 {
+                    "alpha"
+                } else {
+                    "beta"
+                };
+                format!("{topic} shared s{segment}d{i:02}")
+            })
+            .collect();
+        let alpha = titles.iter().filter(|t| t.starts_with("alpha")).count() as u64;
+        let arr: ArrayRef = Arc::new(LargeStringArray::from(
+            titles.iter().map(String::as_str).collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(title_schema(), vec![arr]).expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        alpha
+    }
+
+    /// Compaction-free optimize: the maintenance passes alone.
+    fn stats_only_optimize(st: &crate::supertable::Supertable) {
+        use crate::{CompactionSettings, OptimizeOptions};
         st.optimize(&OptimizeOptions::compact(CompactionSettings {
             min_fill_percent: 100,
             min_superfiles_for_merge: u64::MAX,
             ..CompactionSettings::default()
         }))
         .expect("optimize");
+    }
+
+    /// The live superfile ids and the root's covered set, for comparison.
+    fn live_and_covered(
+        st: &crate::supertable::Supertable,
+        storage: &Arc<dyn StorageProvider>,
+        rt: &tokio::runtime::Runtime,
+    ) -> (std::collections::HashSet<Uuid>, Root) {
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let live = manifest
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        let reference = manifest
+            .term_index_ref()
+            .cloned()
+            .expect("a term-index reference");
+        let root = rt
+            .block_on(load_root(storage.as_ref(), &reference))
+            .expect("root");
+        (live, root)
+    }
+
+    /// A fragmented three-segment FTS table, optimized with compaction
+    /// disabled so only the maintenance passes run. Returns the storage
+    /// root, the table, and the per-segment `alpha` counts.
+    fn optimized_fragmented_table() -> (
+        TempDir,
+        Arc<dyn StorageProvider>,
+        crate::supertable::Supertable,
+        Vec<u64>,
+    ) {
+        let (dir, storage, st) = fresh_table();
+        let alpha_per_segment: Vec<u64> = (0..SEGMENTS).map(|s| commit_segment(&st, s)).collect();
+        assert!(
+            st.reader().expect("reader").n_superfiles() >= SEGMENTS,
+            "fixture must stay fragmented"
+        );
+        stats_only_optimize(&st);
         (dir, storage, st, alpha_per_segment)
+    }
+
+    /// Every commit publishes its superfiles' postings in the same manifest
+    /// as the entries: after each commit the root covers exactly the live
+    /// set, one delta segment per commit, with per-superfile `df` right —
+    /// and a later optimize folds the deltas into one base segment that
+    /// answers identically.
+    #[test]
+    fn commit_publishes_postings_with_the_manifest() {
+        let (_dir, storage, st) = fresh_table();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let mut alphas = Vec::new();
+        for segment in 0..SEGMENTS {
+            alphas.push(commit_segment(&st, segment));
+            let (live, root) = live_and_covered(&st, &storage, &rt);
+            let covered: std::collections::HashSet<Uuid> =
+                root.superfiles.iter().copied().collect();
+            assert_eq!(
+                covered, live,
+                "after commit {segment}: every visible superfile has postings, and only those"
+            );
+            assert_eq!(
+                root.segments.len(),
+                segment + 1,
+                "one delta segment per commit"
+            );
+            let index = TermIndex::new(root, Arc::clone(&storage));
+            let shared = rt
+                .block_on(index.postings("title", "shared"))
+                .expect("lookup");
+            assert_eq!(
+                shared.len(),
+                live.len(),
+                "`shared` posts once per live superfile"
+            );
+            let n_docs: HashMap<Uuid, u64> = st
+                .reader()
+                .expect("reader")
+                .manifest()
+                .get_all_superfiles()
+                .iter()
+                .map(|e| (e.superfile_id, e.n_docs))
+                .collect();
+            for p in &shared {
+                let id = index
+                    .superfile_id(p.superfile)
+                    .expect("ordinal resolves across deltas");
+                assert_eq!(p.df, n_docs[&id]);
+            }
+        }
+        // Optimize folds every delta into one base segment with the same answers.
+        let before: Vec<u64> = {
+            let (_, root) = live_and_covered(&st, &storage, &rt);
+            let index = TermIndex::new(root, Arc::clone(&storage));
+            let mut v: Vec<u64> = rt
+                .block_on(index.postings("title", "alpha"))
+                .expect("lookup")
+                .iter()
+                .map(|p| p.df)
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        stats_only_optimize(&st);
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(root.segments.len(), 1, "optimize rebuilds one base segment");
+        assert_eq!(
+            root.superfiles
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            live
+        );
+        let index = TermIndex::new(root, Arc::clone(&storage));
+        let mut after: Vec<u64> = rt
+            .block_on(index.postings("title", "alpha"))
+            .expect("lookup")
+            .iter()
+            .map(|p| p.df)
+            .collect();
+        after.sort_unstable();
+        alphas.sort_unstable();
+        assert_eq!(after, before, "the fold changes layout, not answers");
+        assert_eq!(after, alphas, "and the answers are the fixture's");
     }
 
     /// Optimize publishes a term index over every live superfile, one
@@ -723,5 +869,81 @@ mod tests {
         }
         assert!(!orphan.exists(), "an unreferenced slice is swept");
         assert!(report.objects_deleted >= 1);
+    }
+    /// Compaction commits through the same path: the merged superfile's
+    /// postings publish as a delta in the commit that removes its inputs.
+    /// The root's superfile list is append-only, so the removed inputs stay
+    /// listed — a reader ignores postings for superfiles no longer live —
+    /// while every live superfile, the merged one included, is covered.
+    #[test]
+    fn compaction_publishes_the_merged_superfile_as_a_delta() {
+        use crate::CompactionSettings;
+
+        let (_dir, storage, st) = fresh_table();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        let (live_before, root_before) = live_and_covered(&st, &storage, &rt);
+        assert!(live_before.len() >= SEGMENTS);
+        let segments_before = root_before.segments.len();
+
+        st.compact(&CompactionSettings {
+            min_fill_percent: 1,
+            min_superfiles_for_merge: 2,
+            ..CompactionSettings::default()
+        })
+        .expect("compact");
+
+        let (live_after, root_after) = live_and_covered(&st, &storage, &rt);
+        assert!(
+            live_after.len() < live_before.len(),
+            "compaction must have merged"
+        );
+        let covered: std::collections::HashSet<Uuid> =
+            root_after.superfiles.iter().copied().collect();
+        assert!(
+            live_after.is_subset(&covered),
+            "every live superfile — the merged one included — has postings"
+        );
+        assert!(
+            covered.is_superset(&live_before),
+            "removed inputs stay listed; readers filter them by liveness"
+        );
+        assert_eq!(
+            root_after.segments.len(),
+            segments_before + 1,
+            "the compaction commit appended one delta"
+        );
+
+        // The merged superfile's postings are right, and the removed
+        // inputs' postings are still there to be filtered out by liveness.
+        let index = TermIndex::new(root_after, Arc::clone(&storage));
+        let shared = rt
+            .block_on(index.postings("title", "shared"))
+            .expect("lookup");
+        let n_docs: HashMap<Uuid, u64> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| (e.superfile_id, e.n_docs))
+            .collect();
+        let live_postings: Vec<_> = shared
+            .iter()
+            .filter(|p| live_after.contains(&index.superfile_id(p.superfile).expect("ordinal")))
+            .collect();
+        assert_eq!(live_postings.len(), live_after.len());
+        for p in live_postings {
+            assert_eq!(
+                p.df,
+                n_docs[&index.superfile_id(p.superfile).expect("ordinal")]
+            );
+        }
+        assert!(
+            shared.len() > live_after.len(),
+            "the removed inputs' postings remain until the next fold"
+        );
     }
 }

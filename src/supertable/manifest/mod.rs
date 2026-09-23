@@ -1326,6 +1326,27 @@ impl ManifestSnapshot {
         self.list.as_ref().and_then(|l| l.term_index.as_ref())
     }
 
+    /// This manifest with the term-index root reference replaced, id
+    /// unchanged — for a membership commit that publishes its delta in the
+    /// same CAS as the entries it covers, mirroring
+    /// [`Self::with_slow_vector_state_ref`].
+    pub(crate) fn with_term_index_ref(&self, reference: RoutingRef) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.term_index = Some(reference);
+            list
+        });
+        Self {
+            superfile_list: self.superfile_list.clone(),
+            list: new_list,
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+        }
+    }
+
     /// Successor manifest (bumped id) with the term-index root reference
     /// stamped — the maintenance publish, mirroring [`Self::with_term_stats`].
     pub(crate) fn with_term_index(&self, reference: RoutingRef) -> Self {

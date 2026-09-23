@@ -848,12 +848,14 @@ impl Supertable {
             bytes_for_store,
             bytes_for_cache,
             merged_superfile_id,
+            term_contributions,
         ) = match merged_segment {
             Some(PreparedSuperfile {
                 entry: merged_prepared,
                 bytes_for_store,
                 bytes_for_storage,
                 bytes_for_cache,
+                term_contribution,
             }) => {
                 let merged_entry = Arc::new(SuperfileEntry {
                     // Carry the OLDEST input's birth_version so a merge of
@@ -878,10 +880,11 @@ impl Supertable {
                     bytes_for_store,
                     bytes_for_cache,
                     id,
+                    term_contribution.into_iter().collect::<Vec<_>>(),
                 )
             }
             // Pure reclaim: remove the dead inputs, add no replacement.
-            None => (Vec::new(), Vec::new(), None, None, Uuid::nil()),
+            None => (Vec::new(), Vec::new(), None, None, Uuid::nil(), Vec::new()),
         };
 
         for attempt in 0..max_retries {
@@ -904,6 +907,7 @@ impl Supertable {
                 NewEntryBirthVersions::Preserve,
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
+                &term_contributions,
             )
             .await
             {
