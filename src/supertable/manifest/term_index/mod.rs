@@ -1704,4 +1704,34 @@ mod tests {
             .is_empty()
         );
     }
+    /// A committed superfile's open blob holds the parquet tail only: the
+    /// FTS open ranges are still recorded, so a cold open knows what to
+    /// fetch, but their bytes are no longer copied into the manifest.
+    #[test]
+    fn open_blob_no_longer_inlines_the_dictionary() {
+        let (_dir, _storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        let reader = st.reader().expect("reader");
+        for e in reader.manifest().get_all_superfiles() {
+            let offsets = e.subsection_offsets.as_ref().expect("offsets recorded");
+            assert!(
+                !offsets.fts_open_ranges.is_empty(),
+                "the ranges are still recorded"
+            );
+            // An inlined range is its own blob entry starting at the range's
+            // offset. (On a fixture this small the parquet tail spans the
+            // whole file, so "covered by some entry" would not distinguish.)
+            for &(off, _) in &offsets.fts_open_ranges {
+                assert!(
+                    !offsets.open_blob.iter().any(|(b_off, _)| *b_off == off),
+                    "an FTS open range must not be inlined into the manifest"
+                );
+            }
+            assert_eq!(
+                offsets.open_blob.len(),
+                1,
+                "only the parquet tail is inlined"
+            );
+        }
+    }
 }

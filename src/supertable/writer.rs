@@ -2619,7 +2619,15 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
     // footer tail + vector open ranges + FTS open ranges) so the
     // reader can resolve a superfile's open metadata straight from
     // the manifest part, issuing zero per-superfile open GETs.
-    let open_blob = build_open_blob(bytes, total_size, &vec_open_ranges, &fts_open_ranges);
+    // The FTS open ranges — the term dictionary and the doc-lengths tail —
+    // are recorded so a cold open knows what to fetch, but no longer copied
+    // into the manifest. They were most of a decoded manifest's bytes on a
+    // large uncompacted table (a copy of every superfile's dictionary,
+    // retained for the manifest's life), and the table-level term index now
+    // tells a routed query where a term's postings sit, so the dictionary is
+    // not read on that path at all. A path that still needs it fetches it
+    // once, lazily, through the disk cache.
+    let open_blob = build_open_blob(bytes, total_size, &vec_open_ranges, &[]);
 
     Some(SubsectionOffsets {
         total_size,
