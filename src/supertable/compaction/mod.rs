@@ -21,13 +21,10 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures::{
-    future::join_all,
-    stream::{self, StreamExt},
-};
+use futures::stream::{self, StreamExt};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
-use tokio::time;
+use tokio::{sync::Semaphore, task::JoinSet, time};
 #[cfg(not(feature = "detailed-tracing"))]
 use tracing::Span;
 #[cfg(feature = "detailed-tracing")]
@@ -71,6 +68,7 @@ impl Drop for CompactionSlot<'_> {
 }
 
 const MIB: u64 = 1024 * 1024;
+const MAX_CONCURRENT_INPUT_OPENS: usize = 64;
 
 /// Stats for one superfile. The caller fills these in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,21 +599,39 @@ impl Supertable {
             .try_reserve(estimated_bytes)
             .map_err(|e| BuildError::MemoryBudgetExceeded(e.to_string()))?;
 
-        let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
-        for entry in superfiles {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_INPUT_OPENS));
+        let mut superfile_readers_tasks = JoinSet::new();
+        for (idx, entry) in superfiles.iter().enumerate() {
             #[cfg(feature = "detailed-tracing")]
             let span = info_span!("compaction_input", superfile_id = %entry.superfile_id);
             #[cfg(not(feature = "detailed-tracing"))]
             let span = Span::none();
-            let open_fut = async {
-                let r = open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
-                    .await;
-                (entry.superfile_id, r)
+            let store = store.clone();
+            let disk_cache = disk_cache.clone();
+            let storage = storage.clone();
+            let entry = entry.clone();
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("should not be closed");
+            let open_fut = async move {
+                let _permit = permit;
+                let r = open_compaction_input(
+                    &store,
+                    disk_cache.as_ref(),
+                    storage.as_ref(),
+                    entry.as_ref(),
+                )
+                .await;
+                (idx, entry.superfile_id, r)
             }
             .instrument(span);
-            superfile_readers_fut.push(open_fut);
+
+            superfile_readers_tasks.spawn(open_fut);
         }
-        let readers = join_all(superfile_readers_fut).await;
+        let mut readers = superfile_readers_tasks.join_all().await;
+        readers.sort_unstable_by_key(|(idx, ..)| *idx);
 
         let now = Instant::now();
         if let Some(tombstone_cache) = &tombstone_cache {
@@ -630,7 +646,7 @@ impl Supertable {
         let superseded_map = manifest.get_superseded_cells();
         let mut readers_with_tombstones = Vec::with_capacity(readers.len());
         let mut superseded_per_reader = Vec::with_capacity(readers.len());
-        for (superfile_id, reader) in readers {
+        for (_idx, superfile_id, reader) in readers {
             let bitmap = tombstone_cache
                 .as_ref()
                 .map(|t| t.bitmap_for(superfile_id, now))
@@ -1066,7 +1082,9 @@ async fn seal_with_bounded_retry(
 mod tests {
     use std::{collections::HashSet, mem, str, sync::Arc};
 
-    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+    use arrow_array::{
+        ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
@@ -1077,7 +1095,7 @@ mod tests {
         Bm25Stats, BoolMode, VectorSearchOptions,
         config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         memory::ConnectionMemoryBudget,
-        superfile::{builder::FtsConfig, fts::reader::Bm25SearchOptions},
+        superfile::{builder::FtsConfig, fts::reader::Bm25SearchOptions, reader::SuperfileReader},
         supertable::{
             Supertable, SupertableOptions,
             error::CompactionError,
@@ -1880,6 +1898,79 @@ mod tests {
                 .unwrap_or_else(|_| panic!("token_match for '{term}'"));
             assert_eq!(hits.len(), 2, "term '{term}' should match exactly 2 docs");
         }
+    }
+
+    /// Stable ids of every row in `reader`, in row order.
+    fn read_ids(reader: &SuperfileReader) -> Vec<i128> {
+        let batch = reader.get_record_batch(None).expect("record batch");
+        batch
+            .column(
+                batch
+                    .schema()
+                    .index_of(reader.id_column())
+                    .expect("id column"),
+            )
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal ids")
+            .values()
+            .to_vec()
+    }
+
+    /// Inputs are opened concurrently, but the merged rows must still follow
+    /// the input order. Otherwise a merged file with a contiguous id span
+    /// maps local rows to the wrong `_id` via `id_min + local`. The first
+    /// inputs are the largest so they tend to finish opening last.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_superfiles_keeps_input_row_order() {
+        const N_INPUTS: usize = 8;
+        const ROWS_PER_STEP: usize = 500;
+
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        for i in 0..N_INPUTS {
+            let titles: Vec<String> = (0..(N_INPUTS - i) * ROWS_PER_STEP)
+                .map(|r| format!("doc {r}"))
+                .collect();
+            let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+            commit_titles(&st, &titles);
+        }
+
+        let superfiles: Vec<Arc<SuperfileEntry>> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .to_vec();
+        assert_eq!(superfiles.len(), N_INPUTS);
+
+        let merged = st
+            .merge_superfiles(&superfiles)
+            .await
+            .expect("merge_superfiles should succeed");
+        let merged_reader = merged
+            .open_reader()
+            .expect("merged superfile should have bytes")
+            .expect("open reader on merged superfile");
+
+        // Ids are not always contiguous within one commit, so read each
+        // input's ids from its own rows.
+        let storage = st
+            .inner()
+            .manifest
+            .load_full()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed table");
+        let mut expected = Vec::new();
+        for entry in &superfiles {
+            let (bytes, _) = storage.get(&entry.storage_path()).await.expect("get input");
+            let reader = SuperfileReader::open(bytes).expect("open input");
+            expected.extend(read_ids(&reader));
+        }
+        let ids = read_ids(&merged_reader);
+        assert_eq!(ids, expected, "merged rows must follow input order");
     }
 
     /// Ranked BM25 search must survive the k-way compaction merge. Two docs
