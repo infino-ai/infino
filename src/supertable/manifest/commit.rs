@@ -848,6 +848,7 @@ mod tests {
             slow_vector_state_centroid_graph: None,
             term_stats: None,
             term_index: None,
+            term_index_complete: false,
             parts: Vec::new(),
         };
         let res = write_manifest(storage.as_ref(), &list)

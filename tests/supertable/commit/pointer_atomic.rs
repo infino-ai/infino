@@ -191,6 +191,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
         slow_vector_state_centroid_graph: None,
         term_stats: None,
         term_index: None,
+        term_index_complete: false,
         parts,
     }
 }

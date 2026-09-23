@@ -2996,21 +2996,33 @@ pub(crate) fn build_fts_summary(
         // than a fixed 64 KiB, which is ~1000x over-provisioned for a
         // small superfile. Readers derive the block count from the byte
         // length, so heterogeneous sizes coexist across superfiles.
-        let mut bloom_builder = BloomBuilder::sized_for_terms(terms.len());
-        for term in &terms {
-            bloom_builder.insert(term);
-        }
         // Recorded here so table-wide BM25 statistics are a fold over the
         // manifest instead of a fan-out that reopens every superfile: the
         // reader summed them during the pass it already makes over the
         // doc-lengths array.
+        let term_bloom = options.storage.is_none().then(|| {
+            let mut bloom_builder = BloomBuilder::sized_for_terms(terms.len());
+            for term in &terms {
+                bloom_builder.insert(term);
+            }
+            bloom_builder.finish()
+        });
         let length_stats = fts_reader
             .column_length_stats(&fc.column)
             .expect("column just registered in this superfile's FTS index");
         out.insert(
             fc.column.clone(),
+            // A storage-backed table routes terms through the table-level
+            // term index, which answers membership exactly for every
+            // committed superfile (its postings publish in the same
+            // commit); a bloom sized for a large superfile's vocabulary
+            // saturates and prunes nothing, so none is written. Readers
+            // treat the absent bloom as no information and keep the
+            // superfile, so a manifest written before the index existed
+            // still routes by its blooms. An in-process table has no
+            // storage and so no index; it keeps the bloom.
             FtsSummaryAgg::new_with_params(
-                bloom_builder.finish(),
+                term_bloom,
                 n_terms_distinct,
                 (min_term, max_term),
                 length_stats,
@@ -3030,12 +3042,18 @@ fn build_term_contribution(
     reader: &SuperfileReader,
     options: &SupertableOptions,
     superfile_id: Uuid,
+    id_min: i128,
 ) -> Result<Option<TermContribution>, BuildError> {
     let Some(fts) = reader.fts() else {
         return Ok(None);
     };
+    // No storage, no term index to publish into: the spill would only be
+    // removed again after the commit.
+    if options.storage.is_none() {
+        return Ok(None);
+    }
     let spill = env::temp_dir().join(format!("infino-term-index-{superfile_id}"));
-    let mut writer = term_index::ContributionWriter::create(&spill, superfile_id)
+    let mut writer = term_index::ContributionWriter::create(&spill, superfile_id, id_min)
         .map_err(|e| BuildError::Store(e.to_string()))?;
     let mut columns: Vec<&str> = options
         .fts_columns
@@ -3212,7 +3230,8 @@ pub(super) fn prepare_superfile_named(
     });
 
     let storage_key = entry.storage_path();
-    let term_contribution = build_term_contribution(&reader, &inner.options, entry.superfile_id)?;
+    let term_contribution =
+        build_term_contribution(&reader, &inner.options, entry.superfile_id, entry.id_min)?;
     Ok(Some(PreparedSuperfile {
         entry,
         bytes_for_store: bytes_for_store.map(|b| (uri, b)),
@@ -3226,7 +3245,7 @@ pub(super) fn prepare_superfile_named(
 /// per-superfile summaries from the stored `SuperfileReader`, and
 /// publish all entries in one `ArcSwap` of the manifest.
 ///
-/// Per-shard work (reader open, FTS bloom build, vector summary,
+/// Per-shard work (reader open, FTS summary, vector summary,
 /// `SuperfileEntry` construction) runs in parallel across the
 /// writer pool — for an FTS supertable the bloom build alone is
 /// O(n_terms_distinct) per FTS column per shard, which at 10M
@@ -9571,7 +9590,8 @@ async fn collect_and_build_term_index(
         let reader = open_reader(store, disk_cache, opt_storage, entry, false)
             .await
             .map_err(|e| TermIndexError::Build(e.to_string()))?;
-        let mut writer = term_index::ContributionWriter::create(spill, entry.superfile_id)?;
+        let mut writer =
+            term_index::ContributionWriter::create(spill, entry.superfile_id, entry.id_min)?;
         if let Some(fts) = reader.fts() {
             let mut columns: Vec<String> =
                 fts.fts_columns_config().map(|c| c.name.clone()).collect();
@@ -10453,6 +10473,14 @@ pub(crate) async fn try_commit_attempt(
             ),
             None => None,
         };
+        // Complete when every live superfile is listed: a delta on top of a
+        // complete index stays complete; the first index on a table that
+        // already held superfiles covers only this commit's, and stays
+        // incomplete until a maintenance rebuild.
+        let complete = match prior.is_some() {
+            true => current_manifest.term_index_complete(),
+            false => current_manifest.get_all_superfiles().is_empty(),
+        };
         let reference = term_index::append_delta(
             storage.as_ref(),
             prior,
@@ -10461,7 +10489,7 @@ pub(crate) async fn try_commit_attempt(
         )
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
-        new_manifest = new_manifest.with_term_index_ref(reference);
+        new_manifest = new_manifest.with_term_index_ref(reference, complete);
     }
     // 3. Read the prior pointer's etag for the CAS. Every storage-backed
     //    table has a pointer by now — `create` publishes one before any

@@ -200,6 +200,11 @@ pub struct Manifest {
     /// per superfile, so a removal leaves it valid (a reader ignores
     /// postings for superfiles no longer live).
     pub term_index: Option<RoutingRef>,
+    /// Whether `term_index` lists every live superfile. A table whose first
+    /// index was built after it already held superfiles (an upgrade) is
+    /// incomplete until a maintenance rebuild; a query then routes parts
+    /// by their summaries rather than by the index.
+    pub term_index_complete: bool,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -1221,8 +1226,11 @@ impl FtsSummaryAgg {
     /// present (`Some`); the count widens `u32` → `u64`; and an empty
     /// `(min, max)` range (a 0-term column) becomes `None` — the same
     /// "no range" signal the pruner already understands.
+    /// `term_bloom` is `None` for a superfile whose term membership the
+    /// table-level term index answers exactly; readers treat an absent
+    /// bloom as "no info" and keep the superfile, so the two routes compose.
     pub fn new_with_params(
-        term_bloom: Bloom,
+        term_bloom: Option<Bloom>,
         n_terms_distinct: u32,
         term_range: (Vec<u8>, Vec<u8>),
         length_stats: ColumnLengthStats,
@@ -1233,7 +1241,7 @@ impl FtsSummaryAgg {
             Some(term_range)
         };
         Self {
-            term_bloom: Some(term_bloom),
+            term_bloom,
             n_terms_distinct: u64::from(n_terms_distinct),
             term_range,
             length_stats: Some(length_stats),
@@ -1368,6 +1376,8 @@ struct ManifestDto {
     term_index_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     term_index_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    term_index_complete: bool,
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1977,6 +1987,7 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
         term_stats_content_hash: l.term_stats.as_ref().map(|r| encode_hash(&r.content_hash)),
         term_index_uri: l.term_index.as_ref().map(|r| r.uri.clone()),
         term_index_content_hash: l.term_index.as_ref().map(|r| encode_hash(&r.content_hash)),
+        term_index_complete: l.term_index_complete,
         parts,
         tombstone_seqs: l
             .tombstone_seqs
@@ -2118,6 +2129,7 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
             }),
             _ => None,
         },
+        term_index_complete: d.term_index_complete,
         parts,
         tombstone_seqs: d
             .tombstone_seqs
@@ -2731,6 +2743,7 @@ mod tests {
             slow_vector_state_centroid_graph: None,
             term_stats: None,
             term_index: None,
+            term_index_complete: false,
             parts: vec![],
         }
     }
@@ -3724,7 +3737,7 @@ mod tests {
         let mut b = BloomBuilder::with_n_blocks(16);
         b.insert(b"alpha");
         let agg = FtsSummaryAgg::new_with_params(
-            b.finish(),
+            Some(b.finish()),
             7,
             (b"a".to_vec(), b"z".to_vec()),
             ColumnLengthStats::default(),
@@ -3741,13 +3754,16 @@ mod tests {
         // A 0-term column: empty (min, max) → `None` range, but a built bloom
         // is still present.
         let empty = FtsSummaryAgg::new_with_params(
-            BloomBuilder::with_n_blocks(16).finish(),
+            Some(BloomBuilder::with_n_blocks(16).finish()),
             0,
             (Vec::new(), Vec::new()),
             ColumnLengthStats::default(),
         );
         assert_eq!(empty.term_range, None);
-        assert!(empty.term_bloom.is_some());
+        assert!(
+            empty.term_bloom.is_some(),
+            "constructed with Some, kept as given"
+        );
     }
 
     #[test]

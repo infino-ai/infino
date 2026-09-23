@@ -410,6 +410,7 @@ mod tests {
             slow_vector_state_centroid_graph: None,
             term_stats: None,
             term_index: None,
+            term_index_complete: false,
             parts,
         }
     }
@@ -553,7 +554,7 @@ mod tests {
         fts.insert(
             "title".to_string(),
             FtsSummaryAgg::new_with_params(
-                bb.finish(),
+                Some(bb.finish()),
                 titles.len() as u32,
                 (mn.as_bytes().to_vec(), mx.as_bytes().to_vec()),
                 ColumnLengthStats::default(),
@@ -668,7 +669,7 @@ mod tests {
         fts.insert(
             "title".to_string(),
             FtsSummaryAgg::new_with_params(
-                bb.finish(),
+                Some(bb.finish()),
                 bloom_tokens.len() as u32,
                 term_range,
                 ColumnLengthStats::default(),

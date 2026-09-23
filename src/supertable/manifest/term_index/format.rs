@@ -7,7 +7,8 @@
 //! **Root** — small enough to stay resident at any table size:
 //!
 //! ```text
-//! magic "INFTIDX1" | version u32 | n_superfiles u32 | superfile uuid × n
+//! magic "INFTIDX1" | version u32 | n_superfiles u32
+//! | per superfile: uuid | smallest doc id i128 LE
 //! | n_segments u32 | per segment: n_slices u32
 //!     | per slice: first_key (u32 len + bytes) | last_key (u32 len + bytes)
 //!                | content hash (32 B) | slice byte length u64
@@ -15,8 +16,12 @@
 //!
 //! Superfiles are listed once; every posting names its superfile by
 //! *ordinal* into that list, so a posting is a few bytes rather than a
-//! uuid. Segments exist so a later commit can append a delta (its own
-//! slice list, appending to the superfile list) without rewriting the base.
+//! uuid. Each carries its smallest doc id: a manifest part's list entry
+//! records the id range its superfiles span, so a query that has routed
+//! to a set of superfiles can pick the parts to load without loading any
+//! — the id is the join key between the two. Segments exist so a later
+//! commit can append a delta (its own slice list, appending to the
+//! superfile list) without rewriting the base.
 //!
 //! **Slice** — one contiguous key range, fetched whole:
 //!
@@ -61,14 +66,16 @@ use crate::{
 pub(crate) const ROOT_MAGIC: &[u8; 8] = b"INFTIDX1";
 /// Identifies a slice file and its major layout family.
 pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
-/// Layout version of both root and slices. Bumped together: a reader that
-/// knows one knows the other.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+/// Layout version of the root. `2` added each superfile's smallest doc id.
+pub(crate) const ROOT_FORMAT_VERSION: u32 = 2;
+/// Layout version of a slice.
+pub(crate) const SLICE_FORMAT_VERSION: u32 = 1;
 
 const MAGIC_LEN: usize = 8;
 const U32_LEN: usize = 4;
 const U64_LEN: usize = 8;
 const UUID_LEN: usize = 16;
+const I128_LEN: usize = 16;
 /// blake3 digest width; asserted against `ContentHash` in tests.
 const HASH_LEN: usize = 32;
 const F32_LEN: usize = 4;
@@ -204,6 +211,8 @@ pub(crate) struct Root {
     /// Superfiles with postings in some segment; postings name them by
     /// ordinal. Never reordered — a delta appends.
     pub(crate) superfiles: Vec<Uuid>,
+    /// Each superfile's smallest doc id, parallel to `superfiles`.
+    pub(crate) id_mins: Vec<i128>,
     /// Base first, then deltas in commit order.
     pub(crate) segments: Vec<Segment>,
 }
@@ -252,15 +261,16 @@ impl<'a> Cursor<'a> {
 fn check_magic_version(
     c: &mut Cursor<'_>,
     magic: &[u8; 8],
+    expected: u32,
     what: &str,
 ) -> Result<(), TermIndexError> {
     if c.take(MAGIC_LEN, what)? != magic {
         return Err(malformed(&format!("{what}: bad magic")));
     }
     let version = c.u32(what)?;
-    if version != FORMAT_VERSION {
+    if version != expected {
         return Err(TermIndexError::Malformed(format!(
-            "{what}: unsupported version {version} (expected {FORMAT_VERSION})"
+            "{what}: unsupported version {version} (expected {expected})"
         )));
     }
     Ok(())
@@ -275,11 +285,13 @@ impl Root {
                 + U32_LEN
                 + self.segments.len() * U32_LEN,
         );
+        debug_assert_eq!(self.superfiles.len(), self.id_mins.len());
         out.extend_from_slice(ROOT_MAGIC);
-        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&ROOT_FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&(self.superfiles.len() as u32).to_le_bytes());
-        for id in &self.superfiles {
+        for (id, id_min) in self.superfiles.iter().zip(&self.id_mins) {
             out.extend_from_slice(id.as_bytes());
+            out.extend_from_slice(&id_min.to_le_bytes());
         }
         out.extend_from_slice(&(self.segments.len() as u32).to_le_bytes());
         for seg in &self.segments {
@@ -297,12 +309,15 @@ impl Root {
     /// Parse, refusing an unknown magic or version.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, TermIndexError> {
         let mut c = Cursor { bytes, at: 0 };
-        check_magic_version(&mut c, ROOT_MAGIC, "root")?;
+        check_magic_version(&mut c, ROOT_MAGIC, ROOT_FORMAT_VERSION, "root")?;
         let n_superfiles = c.u32("root superfile count")? as usize;
         let mut superfiles = Vec::with_capacity(n_superfiles);
+        let mut id_mins = Vec::with_capacity(n_superfiles);
         for _ in 0..n_superfiles {
             let raw = c.take(UUID_LEN, "root superfile id")?;
             superfiles.push(Uuid::from_bytes(raw.try_into().expect("16 bytes")));
+            let raw = c.take(I128_LEN, "root superfile id_min")?;
+            id_mins.push(i128::from_le_bytes(raw.try_into().expect("16 bytes")));
         }
         let n_segments = c.u32("root segment count")? as usize;
         let mut segments = Vec::with_capacity(n_segments);
@@ -329,6 +344,7 @@ impl Root {
         }
         Ok(Self {
             superfiles,
+            id_mins,
             segments,
         })
     }
@@ -481,7 +497,7 @@ pub(crate) fn decode_run(bytes: &[u8]) -> Result<Vec<Posting>, TermIndexError> {
 pub(crate) fn encode_slice(dict: &[u8], postings: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(SLICE_HEADER_LEN + dict.len() + postings.len());
     out.extend_from_slice(SLICE_MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&SLICE_FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&(dict.len() as u64).to_le_bytes());
     out.extend_from_slice(&(postings.len() as u64).to_le_bytes());
     out.extend_from_slice(dict);
@@ -499,7 +515,7 @@ impl<'a> Slice<'a> {
     /// Parse a slice, refusing an unknown magic or version.
     pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, TermIndexError> {
         let mut c = Cursor { bytes, at: 0 };
-        check_magic_version(&mut c, SLICE_MAGIC, "slice")?;
+        check_magic_version(&mut c, SLICE_MAGIC, SLICE_FORMAT_VERSION, "slice")?;
         let dict_len = c.u64("slice dict length")? as usize;
         let postings_len = c.u64("slice postings length")? as usize;
         let dict_bytes = c.take(dict_len, "slice dictionary")?;
@@ -680,6 +696,7 @@ mod tests {
     fn root_round_trips_and_rejects_bad_version() {
         let root = Root {
             superfiles: vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+            id_mins: vec![10, -20],
             segments: vec![
                 Segment {
                     slices: vec![slice_ref("a", "m", 1), slice_ref("n", "z", 2)],
@@ -691,6 +708,7 @@ mod tests {
         };
         let bytes = root.encode();
         assert_eq!(Root::decode(&bytes).expect("decode"), root);
+        assert_eq!(Root::decode(&bytes).expect("decode").id_mins, vec![10, -20]);
         let mut wrong = bytes.clone();
         wrong[MAGIC_LEN] = 9;
         assert!(
@@ -711,6 +729,7 @@ mod tests {
     fn root_routes_a_key_to_the_one_slice_per_segment_that_can_hold_it() {
         let root = Root {
             superfiles: vec![],
+            id_mins: vec![],
             segments: vec![
                 Segment {
                     slices: vec![slice_ref("a", "m", 1), slice_ref("n", "z", 2)],
@@ -744,6 +763,7 @@ mod tests {
     fn root_routes_a_prefix_to_every_intersecting_slice() {
         let root = Root {
             superfiles: vec![],
+            id_mins: vec![],
             segments: vec![Segment {
                 slices: vec![
                     slice_ref("aa", "ab", 1),

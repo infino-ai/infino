@@ -86,14 +86,20 @@ pub(crate) struct ContributionWriter {
     out: BufWriter<File>,
     path: PathBuf,
     superfile_id: Uuid,
+    id_min: i128,
     prev_key: Vec<u8>,
     n_terms: u64,
     record: Vec<u8>,
 }
 
 impl ContributionWriter {
-    /// Start a contribution for `superfile_id`, spilling under `dir`.
-    pub(crate) fn create(dir: &Path, superfile_id: Uuid) -> Result<Self, TermIndexError> {
+    /// Start a contribution for `superfile_id`, whose smallest doc id is
+    /// `id_min`, spilling under `dir`.
+    pub(crate) fn create(
+        dir: &Path,
+        superfile_id: Uuid,
+        id_min: i128,
+    ) -> Result<Self, TermIndexError> {
         fs::create_dir_all(dir)?;
         let path = dir.join(format!("{superfile_id}.terms"));
         let out = BufWriter::new(File::create(&path)?);
@@ -101,6 +107,7 @@ impl ContributionWriter {
             out,
             path,
             superfile_id,
+            id_min,
             prev_key: Vec::new(),
             n_terms: 0,
             record: Vec::new(),
@@ -148,6 +155,7 @@ impl ContributionWriter {
         self.out.flush()?;
         Ok(Contribution {
             superfile_id: self.superfile_id,
+            id_min: self.id_min,
             path: self.path,
         })
     }
@@ -158,6 +166,8 @@ impl ContributionWriter {
 pub(crate) struct Contribution {
     /// The superfile these terms came from.
     pub(crate) superfile_id: Uuid,
+    /// That superfile's smallest doc id.
+    pub(crate) id_min: i128,
     /// The spill file.
     pub(crate) path: PathBuf,
 }
@@ -344,6 +354,8 @@ pub(crate) struct Built {
 pub(crate) struct BuiltSegment {
     /// Superfiles this segment's postings name, in ordinal order.
     pub(crate) superfiles: Vec<Uuid>,
+    /// Their smallest doc ids, parallel to `superfiles`.
+    pub(crate) id_mins: Vec<i128>,
     /// The segment's slices, in key order.
     pub(crate) segment: Segment,
     /// Slice bytes keyed by content hash, in key order.
@@ -359,6 +371,7 @@ pub(crate) fn build(
     Ok(Built {
         root: Root {
             superfiles: built.superfiles,
+            id_mins: built.id_mins,
             segments: vec![built.segment],
         },
         slices: built.slices,
@@ -466,6 +479,7 @@ pub(crate) fn build_segment(
 
     Ok(BuiltSegment {
         superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
+        id_mins: contributions.iter().map(|c| c.id_min).collect(),
         segment: Segment { slices },
         slices: slice_bytes,
     })

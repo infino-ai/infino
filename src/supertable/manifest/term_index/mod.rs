@@ -181,6 +181,7 @@ pub(crate) async fn append_delta(
         debug_assert_eq!(reference.content_hash, hash);
     }
     root.superfiles.extend(built.superfiles);
+    root.id_mins.extend(built.id_mins);
     root.segments.push(built.segment);
     write_root(storage, &root).await
 }
@@ -293,6 +294,13 @@ impl TermIndex {
     /// in this index at all.
     pub(crate) fn is_indexed(&self, superfile: &Uuid) -> bool {
         self.indexed.contains(superfile)
+    }
+
+    /// The smallest doc id of a listed superfile — the key that finds its
+    /// manifest part from the part's recorded id range.
+    pub(crate) fn id_min_of(&self, superfile: &Uuid) -> Option<i128> {
+        let ordinal = self.root.superfiles.iter().position(|id| id == superfile)?;
+        self.root.id_mins.get(ordinal).copied()
     }
 
     /// The superfiles that can match `terms` in `column` under `mode`:
@@ -561,7 +569,8 @@ mod tests {
     };
 
     fn contribution(dir: &TempDir, id: u128, terms: &[(&str, &str, u64)]) -> Contribution {
-        let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(id)).expect("create");
+        let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(id), id as i128 * 1000)
+            .expect("create");
         let mut keyed: Vec<(Vec<u8>, u64)> = terms
             .iter()
             .map(|(c, t, df)| (make_key(c, t), *df))
@@ -590,7 +599,7 @@ mod tests {
     #[test]
     fn contribution_rejects_out_of_order_keys() {
         let dir = TempDir::new().expect("tempdir");
-        let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(1)).expect("create");
+        let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(1), 0).expect("create");
         w.push(b"b", 1, 1.0, Location::None).expect("first");
         assert!(matches!(
             w.push(b"a", 1, 1.0, Location::None),
@@ -1224,7 +1233,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, terms)| {
-                    let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(i as u128 + 1)).expect("create");
+                    let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(i as u128 + 1), i as i128).expect("create");
                     for t in terms {
                         w.push(&make_key("body", &alphabet[*t]), 1 + *t as u64, f32::INFINITY, Location::None).expect("push");
                     }
@@ -1636,5 +1645,63 @@ mod tests {
                 }
             }
         }
+    }
+    /// A superfile committed with the term index carries no per-superfile
+    /// term bloom, and the list carries no per-part union of them; term and
+    /// prefix selection is still exact through the index, and with the index
+    /// unavailable the absent bloom keeps every superfile — conservative,
+    /// never wrong.
+    #[test]
+    fn committed_superfiles_carry_no_term_bloom_and_still_route_exactly() {
+        use crate::supertable::query::{
+            prune::{PruneLeaf, select_superfiles},
+            skip::fts_bloom_skip,
+        };
+
+        let (_dir, _storage, st) = fresh_table();
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entries = manifest.get_all_superfiles();
+        for e in entries {
+            let summary = e.fts_summary.get("title").expect("summary");
+            assert!(
+                summary.term_bloom.is_none(),
+                "no per-superfile bloom is written"
+            );
+            assert!(
+                summary.term_range.is_some(),
+                "the term range is still recorded"
+            );
+            assert!(
+                summary.length_stats.is_some(),
+                "scoring statistics are still recorded"
+            );
+        }
+        for part in manifest.get_all_list_entries() {
+            if let Some(agg) = part.fts_summary_agg.get("title") {
+                assert!(agg.term_bloom.is_none(), "no per-part union bloom either");
+            }
+        }
+        // The manifest-summary answer alone keeps everything (no information).
+        let all_kept = fts_bloom_skip(entries, "title", &["absent"], BoolMode::Or);
+        assert!(all_kept.iter().all(|k| *k));
+        // The index makes it exact.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let leaf = PruneLeaf::TermPresence {
+            column: "title".to_owned(),
+            terms: vec!["absent".to_owned()],
+            mode: BoolMode::Or,
+        };
+        assert!(
+            rt.block_on(select_superfiles(
+                manifest.as_ref(),
+                std::slice::from_ref(&leaf)
+            ))
+            .expect("select")
+            .is_empty()
+        );
     }
 }
