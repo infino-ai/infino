@@ -40,12 +40,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arrow_array::Decimal128Array;
 use infino::{ReindexOptions, connect, superfile::format::fts::VERSION_CURRENT};
 use tempfile::TempDir;
 
-use crate::corpus_shapes::{
-    N_DOCS, TABLE, assert_scores_equivalent, blob_versions, copy_tree, corpus_dir, hits,
-    scores_by_id,
+use crate::{
+    corpus_shapes::{
+        N_DOCS, TABLE, assert_scores_equivalent, blob_versions, copy_tree, corpus_dir, hits,
+        scores_by_id,
+    },
+    reindex_invariance::{DELETED_DOCS, delete_leading_rows},
 };
 
 /// Directory the child reindexes. Set by the parent; its presence is what
@@ -293,4 +297,145 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
         &baseline,
         "the resumed migration",
     );
+}
+
+/// Killing a reindex on a table with deletions does not resurrect a row.
+///
+/// **The arm this harness existed without.** A rewrite now carries its
+/// input's rows and writes their tombstones onto the superfile that
+/// replaces them, and those are two durable steps with a window between:
+/// the sidecar is written first, the manifest swap publishes second. A
+/// crash lands somewhere in that sequence, and the one ordering that must
+/// never hold — a superfile published live before its tombstones are
+/// readable — is invisible to every test that only asks whether the live
+/// rows survived. The dead rows simply come back.
+///
+/// The kill is the same imprecise one the sibling test uses, for the same
+/// reasons, so this asserts what must hold at *every* point in the window
+/// rather than at a chosen byte.
+#[test]
+fn an_interrupted_reindex_never_resurrects_a_deleted_row() {
+    if dispatch_child_if_set().is_some() {
+        return;
+    }
+    let Some(src) = corpus_dir(CRASH_SHAPE) else {
+        return;
+    };
+
+    let victim = TempDir::new().expect("tempdir").keep();
+    copy_tree(&src, &victim);
+
+    // Tombstone rows, and record which, before anything is killed.
+    let deleted: Vec<i128> = {
+        let db = connect(victim.to_str().expect("utf-8 path")).expect("connect to the victim");
+        let table = db.open_table(TABLE).expect("open the victim");
+        let mut ids: Vec<i128> = delete_leading_rows(&db, &table).into_iter().collect();
+        ids.sort_unstable();
+        ids
+    };
+    let live_before = live_ids(&victim);
+    assert_eq!(
+        live_before.len(),
+        N_DOCS - DELETED_DOCS,
+        "the delete did not take before the crash run started"
+    );
+
+    let exe = env::current_exe().expect("current_exe");
+    let status = Command::new(&exe)
+        .args([
+            "--exact",
+            "--test-threads=1",
+            "reindex_crash::an_interrupted_reindex_never_resurrects_a_deleted_row",
+        ])
+        .env(ENV_DIR, &victim)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn child");
+    assert!(
+        !status.success(),
+        "the child exited cleanly, so the reindex finished before the kill and \
+         this asserted nothing about an interrupted one: {status:?}"
+    );
+
+    // The assertion the whole arm exists for, at whatever point in the
+    // window the kill happened to land.
+    let after_crash = live_ids(&victim);
+    assert!(
+        deleted.iter().all(|id| !after_crash.contains(id)),
+        "a deleted row came back across the crash"
+    );
+    assert_eq!(
+        after_crash, live_before,
+        "the live row set changed across the crash"
+    );
+
+    // And it still holds once the migration is driven to completion. The
+    // dead run's seal is taken over the way the sibling test establishes.
+    let db = connect(victim.to_str().expect("utf-8 path")).expect("the killed table reopens");
+    let table = db.open_table(TABLE).expect("the killed table opens");
+
+    // The kill landed mid-migration, so the assertions above were made
+    // about a half-migrated table rather than one the run never touched or
+    // had already finished — either of which would let this pass without
+    // exercising the window at all.
+    table.gc(Duration::ZERO).expect("collect orphans");
+    let after_crash_versions = blob_versions(&victim);
+    let migrated = after_crash_versions
+        .iter()
+        .filter(|v| **v == VERSION_CURRENT)
+        .count();
+    assert!(
+        (1..CRASH_SHAPE_SUPERFILES).contains(&migrated),
+        "the crash left the table either untouched or fully migrated, so the \
+         window this test is about was never open: {after_crash_versions:?}"
+    );
+
+    let takeover = ReindexOptions {
+        stale_seal_timeout_ms: 0,
+        ..ReindexOptions::default()
+    };
+    table
+        .reindex(&takeover)
+        .expect("a resume finishes a table with deletions");
+    table.gc(Duration::ZERO).expect("collect superseded bytes");
+
+    let after_resume = blob_versions(&victim);
+    assert!(
+        after_resume.iter().all(|v| *v == VERSION_CURRENT),
+        "the table is not fully migrated after the resume: {after_resume:?}"
+    );
+    let after_resume_ids = live_ids(&victim);
+    assert!(
+        deleted.iter().all(|id| !after_resume_ids.contains(id)),
+        "a deleted row came back across the resume"
+    );
+    assert_eq!(
+        after_resume_ids, live_before,
+        "the live row set changed across the resume"
+    );
+}
+
+/// Every `_id` the table reads as live, in id order.
+///
+/// Opens its own connection each call: the point is what a fresh reader
+/// resolves from what is durably on disk, not what a handle held open
+/// across the crash happens to have cached.
+fn live_ids(root: &Path) -> Vec<i128> {
+    let db = connect(root.to_str().expect("utf-8 path")).expect("connect for a live read");
+    let batches = db
+        .query_sql(&format!("SELECT _id FROM {TABLE} ORDER BY _id"))
+        .expect("select live ids");
+    let mut out = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id is Decimal128");
+        for i in 0..batch.num_rows() {
+            out.push(ids.value(i));
+        }
+    }
+    out
 }

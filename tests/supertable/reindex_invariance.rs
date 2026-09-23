@@ -114,7 +114,7 @@ const PROBE_OFF_AXIS: f32 = 0.05;
 /// Rows the deletion test removes. Enough to span more than one superfile
 /// so the tombstone carry is exercised per file, few enough to keep the
 /// predicate readable.
-const DELETED_DOCS: usize = 25;
+pub(crate) const DELETED_DOCS: usize = 25;
 
 /// One superfile's spliced regions, as `name -> bytes`.
 ///
@@ -250,12 +250,46 @@ fn vector_hits(table: &Supertable, probe: &[f32]) -> Vec<(i128, f32)> {
     out
 }
 
+/// Tombstone the first `DELETED_DOCS` rows by id order and return their
+/// `_id`s.
+///
+/// By id order rather than by any property of the text, so the choice does
+/// not depend on which superfile happens to hold what. Shared because
+/// several tests — here and in the crash harness — need the same table
+/// state, and a second copy of the predicate would be a second chance to
+/// delete something different.
+pub(crate) fn delete_leading_rows(db: &Connection, table: &Supertable) -> HashSet<i128> {
+    let victims: Vec<(i128, String)> = rows_by_id(db)
+        .into_iter()
+        .take(DELETED_DOCS)
+        .map(|(id, _body, title, _notes)| (id, title))
+        .collect();
+    assert_eq!(
+        victims.len(),
+        DELETED_DOCS,
+        "the fixture has fewer rows than this test deletes"
+    );
+
+    let predicate = victims
+        .iter()
+        .map(|(_, title)| col("title").eq(lit(title.clone())))
+        .reduce(Expr::or)
+        .expect("at least one row to delete");
+    let stats = table.delete(predicate).expect("delete rows");
+    assert_eq!(
+        stats.n_tombstoned(),
+        DELETED_DOCS,
+        "the delete did not tombstone the rows this test is about"
+    );
+    victims.into_iter().map(|(id, _)| id).collect()
+}
+
 /// Every row's id and text columns, ordered by id.
 ///
 /// The Parquet body's value-level counterpart to the byte check: a
 /// rewrite re-encodes these bytes legitimately, so what has to hold is
 /// that the rows come back identical and in the same order.
-fn rows_by_id(db: &Connection) -> Vec<(i128, String, String, Option<String>)> {
+pub(crate) fn rows_by_id(db: &Connection) -> Vec<(i128, String, String, Option<String>)> {
     let batches = db
         .query_sql(&format!(
             "SELECT _id, body, title, notes FROM {TABLE} ORDER BY _id"
@@ -578,32 +612,7 @@ fn a_rewrite_keeps_deleted_rows_deleted() {
     };
     let table = db.open_table(TABLE).expect("open corpus table");
 
-    // A deterministic slice, taken by id order so the choice does not
-    // depend on which superfile happens to hold what.
-    let victims: Vec<(i128, String)> = rows_by_id(&db)
-        .into_iter()
-        .take(DELETED_DOCS)
-        .map(|(id, _body, title, _notes)| (id, title))
-        .collect();
-    assert_eq!(
-        victims.len(),
-        DELETED_DOCS,
-        "the fixture has fewer rows than this test deletes"
-    );
-
-    let predicate = victims
-        .iter()
-        .map(|(_, title)| col("title").eq(lit(title.clone())))
-        .reduce(Expr::or)
-        .expect("at least one row to delete");
-    let stats = table.delete(predicate).expect("delete rows");
-    assert_eq!(
-        stats.n_tombstoned(),
-        DELETED_DOCS,
-        "the delete did not tombstone the rows this test is about"
-    );
-
-    let deleted: HashSet<i128> = victims.iter().map(|(id, _)| *id).collect();
+    let deleted = delete_leading_rows(&db, &table);
     let live_before: Vec<i128> = rows_by_id(&db).into_iter().map(|(id, ..)| id).collect();
     assert!(
         live_before.iter().all(|id| !deleted.contains(id)),
@@ -654,17 +663,7 @@ fn a_rewrite_carries_the_tombstone_sidecar_to_the_new_superfile() {
     };
     let table = db.open_table(TABLE).expect("open corpus table");
 
-    let victims: Vec<String> = rows_by_id(&db)
-        .into_iter()
-        .take(DELETED_DOCS)
-        .map(|(_id, _body, title, _notes)| title)
-        .collect();
-    let predicate = victims
-        .iter()
-        .map(|title| col("title").eq(lit(title.clone())))
-        .reduce(Expr::or)
-        .expect("at least one row to delete");
-    table.delete(predicate).expect("delete rows");
+    delete_leading_rows(&db, &table);
 
     let docs_before = total_docs(&root);
     let sidecars_before = tombstone_bit_counts(&root);
@@ -751,17 +750,7 @@ fn a_second_run_over_a_table_with_deletions_has_nothing_to_do() {
     };
     let table = db.open_table(TABLE).expect("open corpus table");
 
-    let victims: Vec<String> = rows_by_id(&db)
-        .into_iter()
-        .take(DELETED_DOCS)
-        .map(|(_id, _body, title, _notes)| title)
-        .collect();
-    let predicate = victims
-        .iter()
-        .map(|title| col("title").eq(lit(title.clone())))
-        .reduce(Expr::or)
-        .expect("at least one row to delete");
-    table.delete(predicate).expect("delete rows");
+    delete_leading_rows(&db, &table);
 
     rewrite(&table);
 
