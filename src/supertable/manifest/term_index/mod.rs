@@ -74,6 +74,14 @@ const MULTIPART_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
 /// only after it has fallen out.
 const RESIDENT_SLICE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
+/// Decoded posting runs kept per loaded index, keyed by `column \x1F term`.
+/// A ranked query asks for the same term's postings several times — to
+/// choose parts, to select superfiles, for ceilings, for locations — and
+/// the second and later asks are answered here without reopening a slice.
+/// Runs are small (one posting per containing superfile), so this is a
+/// count bound, not a byte budget.
+const RESIDENT_RUNS: usize = 4096;
+
 /// Errors from building, storing or reading the term index.
 #[derive(Debug, Error)]
 pub(crate) enum TermIndexError {
@@ -246,6 +254,37 @@ pub(crate) struct TermIndex {
     storage: Arc<dyn StorageProvider>,
     disk_cache: Option<Arc<ManifestDiskCache>>,
     slices: tokio::sync::Mutex<ResidentSlices>,
+    /// Decoded runs by key; see [`RESIDENT_RUNS`]. A std mutex: nothing
+    /// awaits while it is held.
+    runs: std::sync::Mutex<ResidentRuns>,
+}
+
+/// Decoded posting runs, least recently inserted first out. An absent
+/// term is remembered too (an empty run), since asking again costs the
+/// same slice open.
+#[derive(Default)]
+struct ResidentRuns {
+    order: std::collections::VecDeque<Vec<u8>>,
+    runs: HashMap<Vec<u8>, Arc<Vec<Posting>>>,
+}
+
+impl ResidentRuns {
+    fn get(&self, key: &[u8]) -> Option<Arc<Vec<Posting>>> {
+        self.runs.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: Vec<u8>, run: Arc<Vec<Posting>>) {
+        if self.runs.contains_key(&key) {
+            return;
+        }
+        while self.runs.len() >= RESIDENT_RUNS
+            && let Some(old) = self.order.pop_front()
+        {
+            self.runs.remove(&old);
+        }
+        self.order.push_back(key.clone());
+        self.runs.insert(key, run);
+    }
 }
 
 /// The resident slice set: insertion-ordered so eviction is least recently
@@ -305,6 +344,7 @@ impl TermIndex {
             storage,
             disk_cache,
             slices: tokio::sync::Mutex::new(ResidentSlices::default()),
+            runs: std::sync::Mutex::new(ResidentRuns::default()),
         }
     }
 
@@ -408,7 +448,7 @@ impl TermIndex {
         all_terms.dedup();
         for term in all_terms {
             let mut by_sf = HashMap::new();
-            for p in self.postings(column, term).await? {
+            for p in self.postings(column, term).await?.iter() {
                 let Some(id) = self.superfile_id(p.superfile) else {
                     continue;
                 };
@@ -492,7 +532,7 @@ impl TermIndex {
             .collect();
         let mut out: HashMap<Uuid, Vec<(String, u64, Location)>> = HashMap::new();
         for term in terms {
-            for p in self.postings(column, term).await? {
+            for p in self.postings(column, term).await?.iter() {
                 let Some(id) = self.superfile_id(p.superfile) else {
                     continue;
                 };
@@ -553,8 +593,11 @@ impl TermIndex {
         &self,
         column: &str,
         term: &str,
-    ) -> Result<Vec<Posting>, TermIndexError> {
+    ) -> Result<Arc<Vec<Posting>>, TermIndexError> {
         let key = make_key(column, term);
+        if let Some(run) = self.runs.lock().expect("resident runs lock").get(&key) {
+            return Ok(run);
+        }
         let mut out = Vec::new();
         let refs: Vec<_> = self.root.slices_for_key(&key).cloned().collect();
         for r in refs {
@@ -564,7 +607,12 @@ impl TermIndex {
                 out.extend(run);
             }
         }
-        Ok(out)
+        let run = Arc::new(out);
+        self.runs
+            .lock()
+            .expect("resident runs lock")
+            .insert(key, Arc::clone(&run));
+        Ok(run)
     }
 
     /// Visit every term in `column` with `prefix`, with its postings, until
@@ -1010,7 +1058,7 @@ mod tests {
                 .iter()
                 .map(|e| (e.superfile_id, e.n_docs))
                 .collect();
-            for p in &shared {
+            for p in shared.iter() {
                 let id = index
                     .superfile_id(p.superfile)
                     .expect("ordinal resolves across deltas");
@@ -1098,7 +1146,7 @@ mod tests {
             .iter()
             .map(|e| (e.superfile_id, e.n_docs))
             .collect();
-        for p in &shared {
+        for p in shared.iter() {
             let id = index.superfile_id(p.superfile).expect("ordinal resolves");
             assert_eq!(
                 p.df, n_docs_by_id[&id],
@@ -1993,5 +2041,34 @@ mod tests {
         assert!(r.total <= RESIDENT_SLICE_BUDGET_BYTES);
         r.insert(h(3), Bytes::from(vec![0u8; big]));
         assert_eq!(r.total, 2 * big, "re-inserting a resident slice is a no-op");
+    }
+    /// A term's decoded run is served from the resident set on later asks:
+    /// the same allocation comes back, so the several consultations a
+    /// ranked query makes cost one slice open, not four.
+    #[test]
+    fn repeated_postings_lookups_share_one_decoded_run() {
+        let (_dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let a = rt
+            .block_on(index.postings("title", "shared"))
+            .expect("first");
+        let b = rt
+            .block_on(index.postings("title", "shared"))
+            .expect("second");
+        assert!(Arc::ptr_eq(&a, &b), "the second ask is the resident run");
+        let absent = rt
+            .block_on(index.postings("title", "absent"))
+            .expect("absent");
+        assert!(absent.is_empty());
+        let again = rt
+            .block_on(index.postings("title", "absent"))
+            .expect("absent again");
+        assert!(
+            Arc::ptr_eq(&absent, &again),
+            "an absent term is remembered too"
+        );
     }
 }
