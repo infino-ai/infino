@@ -173,7 +173,8 @@ Rule of thumb for landing a change in the right place:
 | Vector distance kernel (incl. SIMD)         | `src/superfile/vector/distance.rs`                                    |
 | Tokenizer                                   | `src/superfile/fts/tokenize.rs`                                       |
 | Partition strategy                          | `src/supertable/manifest/partition.rs`                                |
-| Skip pruning (Bloom / min-max / term range) | `src/supertable/manifest/{bloom,aggregates,term_range,list_prune}.rs` |
+| Term routing (which superfiles hold a term, score ceilings, postings locations) | `src/supertable/manifest/term_index/` |
+| Skip pruning (min-max / term range; Bloom on storage-less tables) | `src/supertable/manifest/{bloom,aggregates,term_range,list_prune}.rs` |
 | Commit / writer slot / handle               | `src/supertable/writer.rs` + `src/supertable/handle.rs`               |
 | Hidden vector-index (OPANN) maintenance   | `src/supertable/opann.rs` + hidden-index path in `writer.rs`        |
 | Superfile merge / compaction                | `src/supertable/compaction/mod.rs`                                    |

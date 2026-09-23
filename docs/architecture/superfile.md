@@ -14,8 +14,10 @@ that composes many superfiles into one queryable table is described in
 ## Design
 
 - **Single file.** One superfile is one superfile: the columnar data and
-  its search indexes live in the same file, with no sidecars to keep
-  in sync.
+  its search indexes live in the same file, with no per-file sidecars to
+  keep in sync. (The *table* keeps derived indexes over its superfiles —
+  the term index and term statistics — but those are recomputable from
+  the superfiles and never needed to read one.)
 - **Parquet-compatible.** A superfile is a standards-compliant Parquet
   file. Any Parquet reader can open it and read the columnar data with
   no infino-specific support.
