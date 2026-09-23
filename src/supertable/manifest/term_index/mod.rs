@@ -1734,4 +1734,210 @@ mod tests {
             );
         }
     }
+    /// The old format keeps working under the new reader, and mixes with
+    /// the new format without changing an answer. The fixture is a table
+    /// written by the engine before the term index existed: blooms in its
+    /// parts, bloom unions in its list, a term-stats sidecar, no index.
+    ///
+    /// Four states of the same rows must answer every query identically:
+    /// the fixture as written (blooms route); the fixture after the current
+    /// writer appends a segment (index present but incomplete, so parts
+    /// still route by summaries and only the new superfile is indexed);
+    /// the fixture after a maintenance rebuild (index complete, blooms
+    /// ignored); and a fresh table holding the same rows written entirely
+    /// by the current writer.
+    #[test]
+    fn old_format_tables_read_and_mix_with_the_new_format() {
+        use std::{fs, path::Path};
+
+        use crate::{
+            Bm25SearchOptions,
+            superfile::{builder::FtsConfig, fts::reader::Bm25Stats},
+            supertable::{Supertable, SupertableOptions},
+        };
+
+        fn copy_dir(from: &Path, to: &Path) {
+            fs::create_dir_all(to).expect("mkdir");
+            for entry in fs::read_dir(from).expect("read_dir") {
+                let entry = entry.expect("entry");
+                let dest = to.join(entry.file_name());
+                if entry.file_type().expect("type").is_dir() {
+                    copy_dir(&entry.path(), &dest);
+                } else {
+                    fs::copy(entry.path(), dest).expect("copy");
+                }
+            }
+        }
+        fn open(dir: &Path) -> (Arc<dyn StorageProvider>, Supertable) {
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir).expect("local fs"));
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .build()
+                    .expect("pool"),
+            );
+            let options =
+                SupertableOptions::new(title_schema(), vec![FtsConfig::new("title")], Vec::new())
+                    .expect("options")
+                    .with_writer_pool(pool)
+                    .with_storage(Arc::clone(&storage));
+            (storage, Supertable::open(options).expect("open"))
+        }
+        let queries: [(&str, BoolMode); 6] = [
+            ("shared", BoolMode::Or),
+            ("alpha", BoolMode::Or),
+            ("alpha shared", BoolMode::And),
+            ("beta s1d00", BoolMode::Or),
+            ("s2d04", BoolMode::Or),
+            ("absent", BoolMode::Or),
+        ];
+        // Rows are matched by title, not `_id`: ids are minted at write time,
+        // so the fresh table's differ from the fixture's by construction.
+        fn titled_hits(batches: &[arrow_array::RecordBatch]) -> Vec<(String, f32)> {
+            use arrow_array::{Array, Float32Array, LargeStringArray};
+            let mut out = Vec::new();
+            for b in batches {
+                let titles = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("title");
+                let scores = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("score");
+                for i in 0..b.num_rows() {
+                    out.push((titles.value(i).to_owned(), scores.value(i)));
+                }
+            }
+            out
+        }
+        let answers = |st: &Supertable| -> Vec<Vec<(String, f32)>> {
+            let reader = st.reader().expect("reader");
+            queries
+                .iter()
+                .map(|(q, mode)| {
+                    let batches = reader
+                        .bm25_search(
+                            "title",
+                            q,
+                            DOCS_PER_SEGMENT * (SEGMENTS + 1),
+                            Bm25SearchOptions::new()
+                                .with_mode(*mode)
+                                .with_stats(Bm25Stats::Global),
+                            Some(&["title", "score"]),
+                        )
+                        .expect("search");
+                    let mut hits = titled_hits(&batches);
+                    hits.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                    hits
+                })
+                .collect()
+        };
+
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/old_format_fts_table");
+        let work = TempDir::new().expect("tempdir");
+        copy_dir(&fixture, work.path());
+
+        // Cell 1: the old table as written. Blooms present, no index.
+        let (_storage, st) = open(work.path());
+        {
+            let reader = st.reader().expect("reader");
+            let manifest = reader.manifest();
+            assert_eq!(manifest.get_all_superfiles().len(), SEGMENTS);
+            assert!(
+                manifest.term_index_ref().is_none(),
+                "the fixture predates the index"
+            );
+            assert!(
+                manifest.term_stats_blob().is_some(),
+                "the fixture carries the term-stats sidecar"
+            );
+            for e in manifest.get_all_superfiles() {
+                assert!(
+                    e.fts_summary["title"].term_bloom.is_some(),
+                    "old entries carry blooms"
+                );
+            }
+        }
+        let old_answers = answers(&st);
+        assert!(
+            old_answers[0].len() == SEGMENTS * DOCS_PER_SEGMENT,
+            "`shared` hits every row"
+        );
+        assert!(old_answers[5].is_empty());
+
+        // Cell 2: the current writer appends a segment. An index appears,
+        // covering only the new superfile; the list marks it incomplete;
+        // the old superfiles keep routing by their blooms.
+        commit_segment(&st, SEGMENTS);
+        {
+            let reader = st.reader().expect("reader");
+            let manifest = reader.manifest();
+            assert_eq!(manifest.get_all_superfiles().len(), SEGMENTS + 1);
+            assert!(
+                manifest.term_index_ref().is_some(),
+                "the commit published an index"
+            );
+            assert!(
+                !manifest.term_index_complete(),
+                "an upgraded table's first index is incomplete"
+            );
+            let rt = tokio::runtime::Runtime::new().expect("runtime");
+            let index = rt.block_on(manifest.term_index()).expect("index loads");
+            let indexed = manifest
+                .get_all_superfiles()
+                .iter()
+                .filter(|e| index.is_indexed(&e.superfile_id))
+                .count();
+            assert_eq!(indexed, 1, "only the new superfile is indexed");
+        }
+        let mixed_answers = answers(&st);
+
+        // Cell 3: a maintenance rebuild covers everything and flips the flag.
+        stats_only_optimize(&st);
+        {
+            let manifest = st.reader().expect("reader").manifest().clone();
+            assert!(
+                manifest.term_index_complete(),
+                "the rebuild lists every live superfile"
+            );
+        }
+        let rebuilt_answers = answers(&st);
+
+        // Cell 4: the same rows written entirely by the current writer.
+        let (_d, _s, fresh) = fresh_table();
+        for segment in 0..=SEGMENTS {
+            commit_segment(&fresh, segment);
+        }
+        let fresh_answers = answers(&fresh);
+
+        // The old three segments answer identically in every state; the
+        // four-segment states answer identically to each other and to the
+        // fresh table. Scores compare bitwise: the same rows, the same
+        // global statistics, the same arithmetic.
+        for (i, (q, _)) in queries.iter().enumerate() {
+            assert_eq!(
+                mixed_answers[i], rebuilt_answers[i],
+                "{q}: mixed vs rebuilt"
+            );
+            assert_eq!(
+                rebuilt_answers[i], fresh_answers[i],
+                "{q}: rebuilt vs fresh"
+            );
+            let old_titles: Vec<&str> = old_answers[i].iter().map(|(t, _)| t.as_str()).collect();
+            let surviving = mixed_answers[i]
+                .iter()
+                .filter(|(t, _)| old_titles.contains(&t.as_str()))
+                .count();
+            assert_eq!(
+                surviving,
+                old_titles.len(),
+                "{q}: every old hit survives the append"
+            );
+        }
+    }
 }
