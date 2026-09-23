@@ -321,6 +321,7 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
             parts: entries,
         }
     }

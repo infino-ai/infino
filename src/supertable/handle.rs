@@ -928,7 +928,10 @@ impl Supertable {
     /// artifact describes the post-merge superfile set.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn refresh_term_stats_sync(&self) -> Result<(), BuildError> {
-        self.block_on_query(super::writer::stamp_term_stats(&self.inner))
+        self.block_on_query(async {
+            super::writer::stamp_term_stats(&self.inner).await?;
+            super::writer::stamp_term_index(&self.inner).await
+        })
     }
 
     /// Route undrained user superfiles into the hidden per-cell index. Not part

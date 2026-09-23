@@ -481,6 +481,7 @@ mod tests {
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
                 term_stats: None,
+                term_index: None,
                 parts: vec![ManifestPartEntry {
                     part_id,
                     uri: format!("manifest-parts/part-{part_id}.avro.zst"),
@@ -558,6 +559,7 @@ mod tests {
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
                 term_stats: None,
+                term_index: None,
                 parts: Vec::new(),
             }),
         );
@@ -627,6 +629,7 @@ mod tests {
                     content_hash: centroid_graph_hash,
                 }),
                 term_stats: None,
+                term_index: None,
                 parts: Vec::new(),
             }),
         );

@@ -59,6 +59,7 @@ use std::{
     mem,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    str::from_utf8,
     sync::{Arc, Mutex, atomic::Ordering},
     thread::available_parallelism,
     time,
@@ -177,19 +178,21 @@ use crate::{
             },
             options_hash,
             part::{self as part_mod, ContentHash, PartId},
+            term_index::{self, TermIndexError},
             term_stats,
         },
         query::{
             dispatch::{open_compaction_input, open_reader},
             vector::{IndexOutcome, stable_ids_by_local_for_routing},
         },
-        reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
+        reader_cache::{DiskCacheStore, SuperfileReaderCache, disk::mmap_readonly_bytes},
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
         wal::{
             Lease,
             lease::{self, DEFAULT_LEASE_DURATION},
         },
     },
+    utils::terms::make_key,
 };
 
 /// Multipart chunk size for large superfile uploads.
@@ -9379,6 +9382,147 @@ pub(in crate::supertable) async fn stamp_term_stats(
         "term-stats publish lost every commit race".into(),
     ))
 }
+
+/// Build and publish the table-level term index over the CURRENT
+/// membership, stamping its root reference on a successor manifest (see
+/// `manifest::term_index`). Maintenance-only for now: optimize calls it
+/// after compaction so the base segment describes the post-merge superfile
+/// set. Readers are opened one at a time and each superfile's terms are
+/// spilled before the next opens, so the pass costs one superfile's
+/// open-time state plus one slice, whatever the table's size.
+///
+/// Bounds are written as `+∞`, a valid ceiling that prunes nothing; the
+/// tightening pass replaces them.
+pub(in crate::supertable) async fn stamp_term_index(
+    inner: &SupertableInner,
+) -> Result<(), BuildError> {
+    let Some(storage) = inner.options.storage.clone() else {
+        return Ok(());
+    };
+    if inner.options.fts_columns.is_empty() {
+        return Ok(());
+    }
+    let max_retries = inner.options.max_commit_retries.max(1);
+    let mut next_id_floor: u64 = 0;
+    for attempt in 0..max_retries {
+        let old = inner.manifest.load_full();
+        let old = if next_id_floor > 0 {
+            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
+        } else {
+            old
+        };
+        let entries = old.get_all_superfiles();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let store = Arc::clone(&old.options.store);
+        let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
+        let opt_storage = old.options.storage.as_ref().map(Arc::clone);
+        let spill = env::temp_dir().join(format!("infino-term-index-{}", Uuid::new_v4()));
+        let built = collect_and_build_term_index(
+            &store,
+            disk_cache.as_ref(),
+            opt_storage.as_ref(),
+            entries,
+            &spill,
+        )
+        .await;
+        // Spill files are scratch; remove them whatever the outcome.
+        let _ = fs::remove_dir_all(&spill);
+        let built = built.map_err(|e| BuildError::Store(e.to_string()))?;
+        let reference = term_index::write_built(storage.as_ref(), built)
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        if old.term_index_ref() == Some(&reference) {
+            return Ok(());
+        }
+        let new_manifest = old.with_term_index(reference);
+        let attempted_id = new_manifest.get_manifest_id();
+        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
+            .await
+            .inspect_err(|e| inner.note_commit_error(e))
+            .map_err(BuildError::from)?;
+        match new_manifest
+            .write(storage.as_ref(), prev_etag.as_deref(), &[])
+            .await
+        {
+            Ok(()) => {
+                inner.manifest.store(Arc::new(new_manifest));
+                return Ok(());
+            }
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                next_id_floor = next_id_floor.max(
+                    refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?,
+                );
+                sleep(backoff_delay(attempt)).await;
+            }
+            Err(e) => return Err(BuildError::Store(e.to_string())),
+        }
+    }
+    Err(BuildError::Store(
+        "term-index publish lost every commit race".into(),
+    ))
+}
+
+/// Walk every superfile's dictionary once, spilling a contribution per
+/// superfile under `spill`, then merge them into slices. Columns are
+/// visited in name order and a dictionary yields its terms sorted, so each
+/// contribution is in ascending key order as the merge requires.
+async fn collect_and_build_term_index(
+    store: &Arc<dyn SuperfileReaderCache>,
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+    opt_storage: Option<&Arc<dyn StorageProvider>>,
+    entries: &[Arc<SuperfileEntry>],
+    spill: &Path,
+) -> Result<term_index::Built, TermIndexError> {
+    let mut contributions = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let reader = open_reader(store, disk_cache, opt_storage, entry, false)
+            .await
+            .map_err(|e| TermIndexError::Build(e.to_string()))?;
+        let mut writer = term_index::ContributionWriter::create(spill, entry.superfile_id)?;
+        if let Some(fts) = reader.fts() {
+            let mut columns: Vec<String> =
+                fts.fts_columns_config().map(|c| c.name.clone()).collect();
+            columns.sort();
+            for column in &columns {
+                let term_bytes = fts
+                    .iter_column_terms(column)
+                    .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
+                let terms: Vec<&str> = term_bytes
+                    .iter()
+                    .map(|t| {
+                        from_utf8(t).map_err(|_| TermIndexError::Build("non-utf8 term".into()))
+                    })
+                    .collect::<Result<_, _>>()?;
+                for chunk in terms.chunks(TERM_INDEX_BATCH_TERMS) {
+                    let (dfs, _work) = reader
+                        .term_dfs(column, chunk)
+                        .await
+                        .map_err(|e| TermIndexError::Build(format!("df batch: {e}")))?;
+                    let locations = reader
+                        .term_locations(column, chunk)
+                        .await
+                        .map_err(|e| TermIndexError::Build(format!("location batch: {e}")))?;
+                    for ((term, df), location) in chunk.iter().zip(dfs).zip(locations) {
+                        let location = location
+                            .map(term_index::Location::from_dict_value)
+                            .unwrap_or(term_index::Location::None);
+                        writer.push(&make_key(column, term), df, f32::INFINITY, location)?;
+                    }
+                }
+            }
+        }
+        contributions.push(writer.finish()?);
+        drop(reader);
+    }
+    term_index::build(&contributions, &term_index::BuildPolicy::default())
+}
+
+/// Terms per batched df / location read during the term-index build.
+const TERM_INDEX_BATCH_TERMS: usize = 4096;
 
 /// Publish/refresh the slow-CAS serving state (Commit B, "settle").
 ///

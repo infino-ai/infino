@@ -1,0 +1,445 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! Building a term index from per-superfile *contributions*.
+//!
+//! A contribution is one superfile's dictionary walked in key order: for
+//! each `(column, term)` its `df`, its score bound and where its postings
+//! sit. Contributions are spilled to files as they are produced, so the
+//! build never holds more than one superfile's terms plus one slice in
+//! memory, however many superfiles the table has: the maintenance pass
+//! opens one reader at a time, writes its contribution, drops the reader,
+//! and only then merges. The merge is a k-way heap over the sorted files.
+//!
+//! Slices are cut at term boundaries once the pending slice reaches its
+//! target size, so every slice is one contiguous key range and a lookup
+//! fetches exactly one.
+
+use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
+    fs::{self, File},
+    io::{self, BufReader, BufWriter, Read, Write},
+    path::{Path, PathBuf},
+};
+
+use uuid::Uuid;
+
+use super::{
+    TermIndexError,
+    format::{
+        Location, Posting, Root, Segment, SliceRef, encode_run, encode_slice, push_posting,
+        read_posting,
+    },
+};
+use crate::{
+    supertable::manifest::part::ContentHash,
+    utils::{
+        terms::{DictLayout, FstValue, TermDictBuilder},
+        varint::{push_varint, read_varint},
+    },
+};
+
+/// Target slice size. A cold lookup fetches one slice, so this is the
+/// cold cost of a term; a smaller slice means a larger root. **Pending
+/// measurement** — the plan's first milestone replaces this with a
+/// measured value.
+pub(crate) const SLICE_TARGET_BYTES: usize = 8 * 1024 * 1024;
+
+/// Postings for a term in more superfiles than this carry no location: a
+/// query on such a term opens most of the table regardless, so skipping
+/// its dictionaries buys little, and the location is the widest field.
+/// **Pending measurement.**
+pub(crate) const RANGE_MAX_SUPERFILES: usize = 64;
+
+/// Bytes a front-coded dictionary entry costs beyond the key's unshared
+/// tail, used only to decide when a slice is full. Rough on purpose.
+const DICT_ENTRY_OVERHEAD_ESTIMATE: usize = 4;
+/// Share of a key the front-coded dictionary is assumed to keep.
+const DICT_KEY_SHARE_ESTIMATE_DIVISOR: usize = 3;
+
+/// Knobs the build takes from its caller.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BuildPolicy {
+    /// See [`SLICE_TARGET_BYTES`].
+    pub(crate) slice_target_bytes: usize,
+    /// See [`RANGE_MAX_SUPERFILES`].
+    pub(crate) range_max_superfiles: usize,
+}
+
+impl Default for BuildPolicy {
+    fn default() -> Self {
+        Self {
+            slice_target_bytes: SLICE_TARGET_BYTES,
+            range_max_superfiles: RANGE_MAX_SUPERFILES,
+        }
+    }
+}
+
+/// One superfile's terms, spilled to a file in key order.
+///
+/// Record: `record_len varint | key_len varint | key | posting`, where the
+/// posting's superfile ordinal is left zero — the merge assigns ordinals
+/// by the order contributions are handed to it. The outer length lets the
+/// reader take exactly one record from the stream.
+pub(crate) struct ContributionWriter {
+    out: BufWriter<File>,
+    path: PathBuf,
+    superfile_id: Uuid,
+    prev_key: Vec<u8>,
+    n_terms: u64,
+    record: Vec<u8>,
+}
+
+impl ContributionWriter {
+    /// Start a contribution for `superfile_id`, spilling under `dir`.
+    pub(crate) fn create(dir: &Path, superfile_id: Uuid) -> Result<Self, TermIndexError> {
+        fs::create_dir_all(dir)?;
+        let path = dir.join(format!("{superfile_id}.terms"));
+        let out = BufWriter::new(File::create(&path)?);
+        Ok(Self {
+            out,
+            path,
+            superfile_id,
+            prev_key: Vec::new(),
+            n_terms: 0,
+            record: Vec::new(),
+        })
+    }
+
+    /// Append one term. Keys must arrive in strictly ascending order.
+    pub(crate) fn push(
+        &mut self,
+        key: &[u8],
+        df: u64,
+        bound: f32,
+        location: Location,
+    ) -> Result<(), TermIndexError> {
+        if self.n_terms > 0 && key <= self.prev_key.as_slice() {
+            return Err(TermIndexError::Build(format!(
+                "contribution for {} is not in ascending key order",
+                self.superfile_id
+            )));
+        }
+        self.record.clear();
+        push_varint(&mut self.record, key.len() as u32);
+        self.record.extend_from_slice(key);
+        push_posting(
+            &mut self.record,
+            &Posting {
+                superfile: 0,
+                df,
+                bound,
+                location,
+            },
+        );
+        let mut frame = Vec::with_capacity(self.record.len() + 4);
+        push_varint(&mut frame, self.record.len() as u32);
+        self.out.write_all(&frame)?;
+        self.out.write_all(&self.record)?;
+        self.prev_key.clear();
+        self.prev_key.extend_from_slice(key);
+        self.n_terms += 1;
+        Ok(())
+    }
+
+    /// Flush and hand back the finished contribution.
+    pub(crate) fn finish(mut self) -> Result<Contribution, TermIndexError> {
+        self.out.flush()?;
+        Ok(Contribution {
+            superfile_id: self.superfile_id,
+            path: self.path,
+        })
+    }
+}
+
+/// A finished, spilled contribution.
+#[derive(Debug)]
+pub(crate) struct Contribution {
+    /// The superfile these terms came from.
+    pub(crate) superfile_id: Uuid,
+    /// The spill file.
+    pub(crate) path: PathBuf,
+}
+
+/// Sequential reader over one spilled contribution.
+struct ContributionReader {
+    rd: BufReader<File>,
+    buf: Vec<u8>,
+}
+
+/// One decoded record: the key and the posting (ordinal not yet set).
+struct Record {
+    key: Vec<u8>,
+    posting: Posting,
+}
+
+/// Read one LEB128 varint from a stream; `None` at a clean end of file
+/// *before* the first byte.
+fn read_varint_stream(rd: &mut impl Read) -> io::Result<Option<u64>> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    let mut first = true;
+    loop {
+        let mut b = [0u8; 1];
+        match rd.read(&mut b)? {
+            0 if first => return Ok(None),
+            0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "varint cut short",
+                ));
+            }
+            _ => {}
+        }
+        first = false;
+        value |= u64::from(b[0] & 0x7F) << shift;
+        if b[0] & 0x80 == 0 {
+            return Ok(Some(value));
+        }
+        shift += 7;
+        if shift > u64::BITS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint too long",
+            ));
+        }
+    }
+}
+
+impl ContributionReader {
+    fn open(path: &Path) -> Result<Self, TermIndexError> {
+        Ok(Self {
+            rd: BufReader::new(File::open(path)?),
+            buf: Vec::new(),
+        })
+    }
+
+    /// The next record, `None` at end of file.
+    fn next(&mut self) -> Result<Option<Record>, TermIndexError> {
+        let Some(record_len) = read_varint_stream(&mut self.rd)? else {
+            return Ok(None);
+        };
+        self.buf.clear();
+        self.buf.resize(record_len as usize, 0);
+        self.rd.read_exact(&mut self.buf)?;
+        let mut at = 0usize;
+        let key_len = read_varint(&self.buf, &mut at)
+            .ok_or_else(|| TermIndexError::Malformed("contribution key length".into()))?
+            as usize;
+        let key = self
+            .buf
+            .get(at..at + key_len)
+            .ok_or_else(|| TermIndexError::Malformed("contribution key".into()))?
+            .to_vec();
+        at += key_len;
+        let posting = read_posting(&self.buf, &mut at)?;
+        if at != self.buf.len() {
+            return Err(TermIndexError::Malformed(
+                "contribution record: trailing bytes".into(),
+            ));
+        }
+        Ok(Some(Record { key, posting }))
+    }
+}
+
+/// A heap entry: the record's key, and which contribution it came from.
+/// Ordered by key then ordinal so equal keys pop in ascending ordinal.
+struct Head {
+    key: Vec<u8>,
+    ordinal: u32,
+}
+
+impl PartialEq for Head {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.ordinal == other.ordinal
+    }
+}
+impl Eq for Head {}
+impl PartialOrd for Head {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Head {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key
+            .cmp(&other.key)
+            .then(self.ordinal.cmp(&other.ordinal))
+    }
+}
+
+/// The slice under construction.
+struct SliceBuilder {
+    dict: TermDictBuilder,
+    postings: Vec<u8>,
+    first_key: Option<Vec<u8>>,
+    last_key: Vec<u8>,
+    dict_estimate: usize,
+    n_terms: usize,
+}
+
+impl SliceBuilder {
+    fn new() -> Self {
+        Self {
+            dict: TermDictBuilder::new(DictLayout::Blocks),
+            postings: Vec::new(),
+            first_key: None,
+            last_key: Vec::new(),
+            dict_estimate: 0,
+            n_terms: 0,
+        }
+    }
+
+    fn add(&mut self, key: &[u8], run: &[u8]) {
+        self.dict.insert(
+            key,
+            FstValue::Pfor {
+                metadata_offset: self.postings.len() as u64,
+                postings_length_hint: Some(run.len() as u32),
+                short: false,
+            },
+        );
+        self.postings.extend_from_slice(run);
+        if self.first_key.is_none() {
+            self.first_key = Some(key.to_vec());
+        }
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
+        self.dict_estimate +=
+            key.len() / DICT_KEY_SHARE_ESTIMATE_DIVISOR + DICT_ENTRY_OVERHEAD_ESTIMATE;
+        self.n_terms += 1;
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.postings.len() + self.dict_estimate
+    }
+
+    fn finish(self) -> Option<(SliceRef, Vec<u8>)> {
+        let first_key = self.first_key?;
+        let bytes = encode_slice(&self.dict.finish(), &self.postings);
+        let content_hash = ContentHash::of(&bytes);
+        Some((
+            SliceRef {
+                first_key,
+                last_key: self.last_key,
+                content_hash,
+                len: bytes.len() as u64,
+            },
+            bytes,
+        ))
+    }
+}
+
+/// A finished build: the root and every slice, ready to be written.
+pub(crate) struct Built {
+    /// The root, not yet written.
+    pub(crate) root: Root,
+    /// Slice bytes keyed by content hash, in key order.
+    pub(crate) slices: Vec<(ContentHash, Vec<u8>)>,
+}
+
+/// Merge contributions into one segment of slices. Superfile ordinals
+/// follow the order of `contributions`.
+pub(crate) fn build(
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+) -> Result<Built, TermIndexError> {
+    let mut readers = Vec::with_capacity(contributions.len());
+    let mut heap: BinaryHeap<Reverse<Head>> = BinaryHeap::new();
+    let mut pending: Vec<Option<Posting>> = Vec::with_capacity(contributions.len());
+    for (ordinal, c) in contributions.iter().enumerate() {
+        let mut rd = ContributionReader::open(&c.path)?;
+        match rd.next()? {
+            Some(rec) => {
+                heap.push(Reverse(Head {
+                    key: rec.key,
+                    ordinal: ordinal as u32,
+                }));
+                pending.push(Some(rec.posting));
+            }
+            None => pending.push(None),
+        }
+        readers.push(rd);
+    }
+
+    let mut slices: Vec<SliceRef> = Vec::new();
+    let mut slice_bytes: Vec<(ContentHash, Vec<u8>)> = Vec::new();
+    let mut current = SliceBuilder::new();
+    let mut run: Vec<Posting> = Vec::new();
+
+    while let Some(Reverse(head)) = heap.pop() {
+        let key = head.key;
+        run.clear();
+        let take = |ordinal: u32,
+                    run: &mut Vec<Posting>,
+                    pending: &mut Vec<Option<Posting>>,
+                    readers: &mut Vec<ContributionReader>,
+                    heap: &mut BinaryHeap<Reverse<Head>>|
+         -> Result<(), TermIndexError> {
+            let mut p = pending[ordinal as usize]
+                .take()
+                .expect("pending posting for heap head");
+            p.superfile = ordinal;
+            run.push(p);
+            if let Some(next) = readers[ordinal as usize].next()? {
+                heap.push(Reverse(Head {
+                    key: next.key,
+                    ordinal,
+                }));
+                pending[ordinal as usize] = Some(next.posting);
+            }
+            Ok(())
+        };
+        take(
+            head.ordinal,
+            &mut run,
+            &mut pending,
+            &mut readers,
+            &mut heap,
+        )?;
+        while let Some(Reverse(peek)) = heap.peek() {
+            if peek.key != key {
+                break;
+            }
+            let Reverse(next) = heap.pop().expect("peeked");
+            take(
+                next.ordinal,
+                &mut run,
+                &mut pending,
+                &mut readers,
+                &mut heap,
+            )?;
+        }
+        // Field policy: a term in more superfiles than the threshold
+        // carries no locations.
+        if run.len() > policy.range_max_superfiles {
+            for p in &mut run {
+                p.location = Location::None;
+            }
+        }
+        let encoded = encode_run(&run);
+        if current.n_terms > 0
+            && current.estimated_bytes() + encoded.len() > policy.slice_target_bytes
+        {
+            let (reference, bytes) = std::mem::replace(&mut current, SliceBuilder::new())
+                .finish()
+                .expect("a slice with terms");
+            slice_bytes.push((reference.content_hash, bytes));
+            slices.push(reference);
+        }
+        current.add(&key, &encoded);
+    }
+    if let Some((reference, bytes)) = current.finish() {
+        slice_bytes.push((reference.content_hash, bytes));
+        slices.push(reference);
+    }
+
+    Ok(Built {
+        root: Root {
+            superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
+            segments: vec![Segment { slices }],
+        },
+        slices: slice_bytes,
+    })
+}

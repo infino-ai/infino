@@ -195,6 +195,11 @@ pub struct Manifest {
     /// attributed, so only a fresh maintenance pass may republish).
     /// Absent on older manifests and until the first maintenance pass.
     pub term_stats: Option<RoutingRef>,
+    /// The table-level term index root (`manifest::term_index`), when
+    /// one has been built. Carried across every commit: its postings are
+    /// per superfile, so a removal leaves it valid (a reader ignores
+    /// postings for superfiles no longer live).
+    pub term_index: Option<RoutingRef>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -1359,6 +1364,10 @@ struct ManifestDto {
     term_stats_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     term_stats_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    term_index_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    term_index_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1966,6 +1975,8 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .map(|r| encode_hash(&r.content_hash)),
         term_stats_uri: l.term_stats.as_ref().map(|r| r.uri.clone()),
         term_stats_content_hash: l.term_stats.as_ref().map(|r| encode_hash(&r.content_hash)),
+        term_index_uri: l.term_index.as_ref().map(|r| r.uri.clone()),
+        term_index_content_hash: l.term_index.as_ref().map(|r| encode_hash(&r.content_hash)),
         parts,
         tombstone_seqs: l
             .tombstone_seqs
@@ -2094,6 +2105,13 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
             _ => None,
         },
         term_stats: match (d.term_stats_uri, d.term_stats_content_hash.as_deref()) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
+        term_index: match (d.term_index_uri, d.term_index_content_hash.as_deref()) {
             (Some(uri), Some(hash)) => Some(RoutingRef {
                 uri,
                 content_hash: decode_hash(hash)?,
@@ -2712,6 +2730,7 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
             parts: vec![],
         }
     }
@@ -3449,6 +3468,41 @@ mod tests {
             decode(uri_only.as_bytes())
                 .expect("decode uri-only")
                 .term_stats
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn term_index_ref_round_trips_and_requires_both_halves() {
+        let mut list = empty_list();
+        list.term_index = Some(RoutingRef {
+            uri: "term-stats/stats-abc.bin".into(),
+            content_hash: ContentHash([7u8; 32]),
+        });
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.term_index, list.term_index);
+        // A manifest without the field decodes to None (older writers).
+        let empty_bytes = encode(&empty_list()).expect("encode empty");
+        let s = from_utf8(&empty_bytes).expect("utf8");
+        assert!(
+            !s.contains("term_index"),
+            "absent ref must not appear on the wire (older manifests stay byte-identical)"
+        );
+        assert!(
+            decode(&empty_bytes)
+                .expect("decode empty")
+                .term_index
+                .is_none()
+        );
+        // One half without the other is treated as no ref, like the
+        // centroid/graph refs.
+        let with_ref = from_utf8(&bytes).expect("utf8");
+        let uri_only = with_ref.replacen("term_index_content_hash", "term_index_ignored", 1);
+        assert!(
+            decode(uri_only.as_bytes())
+                .expect("decode uri-only")
+                .term_index
                 .is_none()
         );
     }

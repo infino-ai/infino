@@ -315,6 +315,28 @@ impl FtsReader {
     /// ranges into a minimal set of parallel GETs). This matters on the
     /// global-statistics path, where a superfile is probed for every
     /// scored term of a query at once.
+    /// Dictionary entry of each of `tokens` in `column`, in input order —
+    /// `None` for an absent token. One dictionary fetch, no postings read.
+    /// This is what a table-level term index records so a later query can
+    /// reach a term's postings without opening this dictionary.
+    pub(crate) async fn term_locations(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<Vec<Option<FstValue>>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fst_bytes = self.dict_bytes_async().await?;
+        let dict = self.open_dict(&fst_bytes)?;
+        let col_meta = &self.columns[column_id as usize];
+        Ok(tokens
+            .iter()
+            .map(|token| dict.lookup(&make_key(&col_meta.name, token)))
+            .collect())
+    }
+
     pub async fn term_dfs(
         &self,
         column: &str,

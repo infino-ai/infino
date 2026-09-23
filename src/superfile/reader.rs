@@ -74,6 +74,7 @@ use crate::{
         },
     },
     supertable::query::provider::tombstone_access_plan,
+    utils::terms::FstValue,
 };
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
@@ -1448,6 +1449,20 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts.term_df(column, token).await?)
+    }
+
+    /// Dictionary entry of each of `tokens` in `column`, in input order
+    /// (`None` for an absent token). Delegates to
+    /// [`FtsReader::term_locations`].
+    pub(crate) async fn term_locations(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<Vec<Option<FstValue>>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_locations(column, tokens).await?)
     }
 
     /// Document frequency of each of `tokens` in `column`, in input order
