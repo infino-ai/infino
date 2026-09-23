@@ -88,6 +88,11 @@ fn object_uri(kind: &str, hash: &ContentHash) -> String {
     format!("{STORAGE_PREFIX}{kind}-{}.bin", hash.to_hex())
 }
 
+/// Storage URI of the slice with this content hash.
+pub(crate) fn slice_uri(hash: &ContentHash) -> String {
+    object_uri("slice", hash)
+}
+
 async fn put_content_addressed(
     storage: &dyn StorageProvider,
     kind: &str,
@@ -202,7 +207,7 @@ impl TermIndex {
         if let Some(b) = self.slices.lock().await.get(hash) {
             return Ok(b.clone());
         }
-        let (bytes, _meta) = self.storage.get(&object_uri("slice", hash)).await?;
+        let (bytes, _meta) = self.storage.get(&slice_uri(hash)).await?;
         if ContentHash::of(bytes.as_ref()) != *hash {
             return Err(TermIndexError::HashMismatch);
         }
@@ -511,14 +516,17 @@ mod tests {
             Err(TermIndexError::HashMismatch)
         ));
     }
-    /// Optimize publishes a term index over every live superfile, one
-    /// contribution per superfile, with the artifact's `df` per superfile
-    /// equal to what the fixture put there — checked without opening a
-    /// superfile, from what the fixture makes true: every title holds
-    /// `shared`, and segment `s` holds `alpha` in exactly the titles whose
-    /// index is a multiple of `s + 2`.
-    #[test]
-    fn optimize_publishes_a_term_index_over_every_superfile() {
+    /// A fragmented three-segment FTS table on local-filesystem storage,
+    /// optimized with compaction disabled so only the maintenance passes
+    /// run. Every title holds `shared`; segment `s` holds `alpha` in the
+    /// titles whose index is a multiple of `s + 2`. Returns the storage
+    /// root, the table, and the per-segment `alpha` counts.
+    fn optimized_fragmented_table() -> (
+        TempDir,
+        Arc<dyn StorageProvider>,
+        crate::supertable::Supertable,
+        Vec<u64>,
+    ) {
         use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
         use arrow_schema::{DataType, Field, Schema};
 
@@ -575,13 +583,10 @@ mod tests {
             w.append(&batch).expect("append");
             w.commit().expect("commit");
         }
-        let reader = st.reader().expect("reader");
-        let n_superfiles = reader.n_superfiles();
         assert!(
-            n_superfiles >= SEGMENTS,
-            "fixture must stay fragmented; got {n_superfiles}"
+            st.reader().expect("reader").n_superfiles() >= SEGMENTS,
+            "fixture must stay fragmented"
         );
-
         // Compaction is a no-op at these settings, so optimize is the
         // maintenance passes alone and the layout stays fragmented.
         st.optimize(&OptimizeOptions::compact(CompactionSettings {
@@ -590,7 +595,16 @@ mod tests {
             ..CompactionSettings::default()
         }))
         .expect("optimize");
+        (dir, storage, st, alpha_per_segment)
+    }
 
+    /// Optimize publishes a term index over every live superfile, one
+    /// contribution per superfile, with the artifact's `df` per superfile
+    /// equal to what the fixture put there — checked without opening a
+    /// superfile.
+    #[test]
+    fn optimize_publishes_a_term_index_over_every_superfile() {
+        let (_dir, storage, st, mut alpha_per_segment) = optimized_fragmented_table();
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         let reference = manifest
@@ -662,5 +676,52 @@ mod tests {
                 .expect("lookup")
                 .is_empty()
         );
+    }
+    /// GC keeps the referenced root and every slice it names, and sweeps
+    /// a slice nothing references. The live set is read from the root, so
+    /// the slices survive even though the manifest never lists them.
+    #[test]
+    fn gc_keeps_the_term_index_and_sweeps_an_orphan_slice() {
+        use std::{fs, time::Duration};
+
+        let (dir, storage, st, _) = optimized_fragmented_table();
+        let reference = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned()
+            .expect("reference");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let root = rt
+            .block_on(load_root(storage.as_ref(), &reference))
+            .expect("root");
+        let slice_paths: Vec<_> = root
+            .segments
+            .iter()
+            .flat_map(|s| s.slices.iter())
+            .map(|s| dir.path().join(slice_uri(&s.content_hash)))
+            .collect();
+        assert!(!slice_paths.is_empty());
+        let orphan = dir
+            .path()
+            .join(slice_uri(&ContentHash::of(b"nothing references me")));
+        fs::write(&orphan, b"stray slice bytes").expect("plant orphan");
+
+        let report = st.gc(Duration::ZERO).expect("gc");
+
+        assert!(
+            dir.path().join(&reference.uri).exists(),
+            "the referenced root survives"
+        );
+        for p in &slice_paths {
+            assert!(
+                p.exists(),
+                "a slice the root names survives: {}",
+                p.display()
+            );
+        }
+        assert!(!orphan.exists(), "an unreferenced slice is swept");
+        assert!(report.objects_deleted >= 1);
     }
 }
