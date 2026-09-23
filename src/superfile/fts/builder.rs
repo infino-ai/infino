@@ -90,26 +90,31 @@ use memmap2::Mmap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use tracing::debug;
 
-use crate::superfile::{
-    BuildError,
-    bits::PackScratch,
-    format::{
-        self, FST_SEPARATOR,
-        checksum::{crc32c, crc32c_append},
-        fts::{BlobLayout, SkipLayout},
+use crate::{
+    superfile::{
+        BuildError,
+        bits::PackScratch,
+        format::{
+            self, FST_SEPARATOR,
+            checksum::{crc32c, crc32c_append},
+            fts::{BlobLayout, SkipLayout},
+        },
+        fts::{
+            analysis::ChainTokenizer,
+            bm25,
+            dict::{StreamingTermDictBuilder, TermDictBuilder},
+            fst_value::{FstValue, INLINE_TF_MAX},
+            positions::{encode_group, encode_run, skip_run},
+            posting::{
+                BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, block_encoding, encode_block,
+            },
+            reader::ColumnLengthStats,
+            short::{SHORT_MAX_DF, encode_short},
+            tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
+        },
+        varint::read_varint,
     },
-    fts::{
-        analysis::ChainTokenizer,
-        bm25,
-        dict::{StreamingTermDictBuilder, TermDictBuilder},
-        fst_value::{FstValue, INLINE_TF_MAX},
-        positions::{encode_group, encode_run, skip_run},
-        posting::{BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, block_encoding, encode_block},
-        reader::ColumnLengthStats,
-        short::{SHORT_MAX_DF, encode_short},
-        tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
-    },
-    varint::read_varint,
+    utils::trace::{detail_span, record},
 };
 
 /// Per-column term interner table.
@@ -2816,6 +2821,7 @@ impl FtsBuilder {
     /// reads them, and the per-column emit loop handles both
     /// variants (a spilled build can still have InRam columns whose
     /// accumulator stayed under threshold).
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     fn finish_to_spilled<W: Write>(self, mut w: W) -> Result<(), BuildError> {
         let FtsBuilder {
             default_tokenizer: _,
@@ -3052,6 +3058,12 @@ impl FtsBuilder {
                             partitions: parts, ..
                         } => parts.iter().map(|p| p.path.clone()).collect(),
                     };
+                    let sort_span = detail_span!(
+                        "fts_partition_sort",
+                        column = col_name.as_str(),
+                        partitions = partition_paths.len()
+                    )
+                    .entered();
                     for (partition_idx, partition_path) in partition_paths.iter().enumerate() {
                         let sorted_path = scratch_path.join(format!(
                             "fts_col{orig_col_idx}_part{partition_idx}.sorted.bin"
@@ -3078,6 +3090,7 @@ impl FtsBuilder {
                         }
                         sorted_files.push(sorted_path);
                     }
+                    drop(sort_span);
                     if let Some(t) = sort_start {
                         finish_profile.partition_sort += t.elapsed();
                     }
@@ -3122,6 +3135,17 @@ impl FtsBuilder {
                     let encode_skip_write_before = finish_profile.encode_skip_write;
                     let encode_block_write_before = finish_profile.encode_block_write;
                     let fst_insert_before = finish_profile.fst_insert;
+                    let emit_span = detail_span!(
+                        "fts_emit",
+                        column = col_name.as_str(),
+                        terms = tracing::field::Empty,
+                        encode_ms = tracing::field::Empty,
+                        gather_ms = tracing::field::Empty,
+                        block_build_ms = tracing::field::Empty,
+                        block_write_ms = tracing::field::Empty,
+                        fst_insert_ms = tracing::field::Empty,
+                    )
+                    .entered();
                     let n_emitted = match &partitions {
                         SpillStore::Plain(_) => merge_sorted_spill::<PLAIN_RECORD_LANES, _>(
                             &sorted_files,
@@ -3184,10 +3208,27 @@ impl FtsBuilder {
                         }
                     };
                     n_terms_total_usize += n_emitted;
+                    record("terms", n_emitted as u64);
                     if finish_profile.enabled {
                         let merge_total = merge_profile_start.elapsed();
                         let encode_total = finish_profile.encode_total - encode_total_before;
                         let non_encode = merge_total.saturating_sub(encode_total);
+                        record("encode_ms", encode_total.as_millis() as u64);
+                        record("gather_ms", non_encode.as_millis() as u64);
+                        record(
+                            "block_build_ms",
+                            (finish_profile.encode_block_build - encode_block_build_before)
+                                .as_millis() as u64,
+                        );
+                        record(
+                            "block_write_ms",
+                            (finish_profile.encode_block_write - encode_block_write_before)
+                                .as_millis() as u64,
+                        );
+                        record(
+                            "fst_insert_ms",
+                            (finish_profile.fst_insert - fst_insert_before).as_millis() as u64,
+                        );
                         debug!(
                             "[fts-profile] col='{}' merge_total={:.3}s non_encode_merge={:.3}s encode_total={:.3}s calls={} df1={} pfor={} block_build={:.3}s meta_write={:.3}s skip_write={:.3}s block_write={:.3}s fst_insert={:.3}s",
                             col_name,
@@ -3208,6 +3249,7 @@ impl FtsBuilder {
                             (finish_profile.fst_insert - fst_insert_before).as_secs_f64(),
                         );
                     }
+                    drop(emit_span);
 
                     // Sorted-partition scratch files are scoped to
                     // this column and only consumed by the k-way

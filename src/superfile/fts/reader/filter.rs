@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Negation gates: [`ExcludeFilter`] (term negatives) and its
+//! Admission gates: [`ExcludeFilter`] (term negatives) and its
 //! phrase-aware sibling [`AtomExcludeFilter`]. Both skip-probe their
 //! negated cursors against a monotonically increasing candidate doc, so
-//! a common negated list is never fully decoded. `pub(super)` within
+//! a common negated list is never fully decoded — and both can carry an
+//! **allow-set**, the rows a SQL `WHERE` pushed into the search admits at
+//! all, checked before any negated list is consulted. `pub(super)` within
 //! `reader/` (ExcludeFilter stays pub(crate) — PreparedClauses carries it).
+
+use std::sync::Arc;
+
+use roaring::RoaringBitmap;
 
 use super::{
     cursor::TermCursor,
@@ -14,20 +20,33 @@ use super::{
 };
 use crate::superfile::error::FtsError;
 
-/// Atom-walk exclusion gate: the heterogeneous sibling of
+/// Atom-walk admission gate: the heterogeneous sibling of
 /// [`ExcludeFilter`], additionally able to exclude docs containing a
-/// negated *phrase*. Same monotonic-doc contract.
+/// negated *phrase*. Same monotonic-doc contract, same allow-set.
 pub(super) struct AtomExcludeFilter {
     pub(super) atoms: Vec<AnyCursor>,
+    /// See [`ExcludeFilter::allow`].
+    pub(super) allow: Option<Arc<RoaringBitmap>>,
     pub(super) last_doc: u32,
 }
 
 impl AtomExcludeFilter {
     pub(super) fn new(atoms: Vec<AnyCursor>) -> Self {
-        Self { atoms, last_doc: 0 }
+        Self::with_allow(atoms, None)
     }
 
-    /// `false` iff `doc` matches any negated atom.
+    /// A gate over `atoms` that additionally admits only the docs in
+    /// `allow` (`None` admits every doc the atoms do not exclude).
+    pub(super) fn with_allow(atoms: Vec<AnyCursor>, allow: Option<Arc<RoaringBitmap>>) -> Self {
+        Self {
+            atoms,
+            allow,
+            last_doc: 0,
+        }
+    }
+
+    /// `false` iff `doc` is outside the allow-set or matches any negated
+    /// atom.
     pub(super) fn admits(&mut self, doc: u32) -> Result<bool, FtsError> {
         debug_assert!(
             doc >= self.last_doc,
@@ -35,6 +54,11 @@ impl AtomExcludeFilter {
             self.last_doc
         );
         self.last_doc = doc;
+        if let Some(allow) = &self.allow
+            && !allow.contains(doc)
+        {
+            return Ok(false);
+        }
         for a in &mut self.atoms {
             a.skip_to(doc)?;
             if !a.is_exhausted() && a.current_doc_id() == doc {
@@ -45,25 +69,46 @@ impl AtomExcludeFilter {
     }
 }
 
-/// Exclusion gate for negated (`-term`) clauses: holds one
-/// [`TermCursor`] per negated term, streamed with `skip_to` (a common
-/// negated list is never fully decoded). A doc is rejected if it appears
-/// in any negated term's list.
+/// Admission gate for negated (`-term`) clauses and for a pushed-down
+/// row set: holds one [`TermCursor`] per negated term, streamed with
+/// `skip_to` (a common negated list is never fully decoded), plus an
+/// optional allow-set. A doc is rejected if it is outside the allow-set
+/// or appears in any negated term's list.
 ///
-/// Kernels take `Option<&mut ExcludeFilter>` (`None` = no negation)
+/// Kernels take `Option<&mut ExcludeFilter>` (`None` = nothing to gate)
 /// rather than a generic filter parameter: monomorphizing the OR kernel
 /// measured 25-30% slower even with a no-op filter, while the `None`
-/// branch is constant per query, perfectly predicted, and free.
+/// branch is constant per query, perfectly predicted, and free. An
+/// allow-set rides inside the same gate for the same reason — every
+/// kernel already asks it about each candidate, so the row bound reaches
+/// every search shape through one `admits` call instead of a second
+/// parameter threaded through each walk.
 pub(crate) struct ExcludeFilter {
     pub(super) cursors: Vec<TermCursor>,
+    /// The rows the caller admits at all — a SQL `WHERE`'s candidate set,
+    /// resolved for this superfile as `local_doc_id`s. `None` admits every
+    /// doc the negated lists do not exclude. Checked first: a doc outside
+    /// the set never costs a negated-list probe.
+    pub(super) allow: Option<Arc<RoaringBitmap>>,
     /// Last doc-id passed to `admits`; guards the monotonic call order.
     pub(super) last_doc: u32,
 }
 
 impl ExcludeFilter {
+    /// A pure negation gate. The search path always builds through
+    /// [`Self::with_allow`] (it may or may not carry a row set), so this
+    /// shorthand is for the tests that exercise negation alone.
+    #[cfg(test)]
     pub(super) fn new(cursors: Vec<TermCursor>) -> Self {
+        Self::with_allow(cursors, None)
+    }
+
+    /// A gate over `cursors` that additionally admits only the docs in
+    /// `allow` (`None` admits every doc the cursors do not exclude).
+    pub(super) fn with_allow(cursors: Vec<TermCursor>, allow: Option<Arc<RoaringBitmap>>) -> Self {
         Self {
             cursors,
+            allow,
             last_doc: 0,
         }
     }
@@ -82,7 +127,7 @@ impl ExcludeFilter {
 }
 
 impl ExcludeFilter {
-    /// `false` iff `doc` is in any negated list.
+    /// `false` iff `doc` is outside the allow-set or in any negated list.
     ///
     /// `doc` must be non-decreasing across a search: `skip_to` only
     /// moves forward. Every kernel walks candidates ascending, so this
@@ -95,6 +140,11 @@ impl ExcludeFilter {
             self.last_doc
         );
         self.last_doc = doc;
+        if let Some(allow) = &self.allow
+            && !allow.contains(doc)
+        {
+            return false;
+        }
         for c in &mut self.cursors {
             c.skip_to(doc);
             if !c.is_exhausted() && c.current_doc_id() == doc {
@@ -107,8 +157,15 @@ impl ExcludeFilter {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::reader::FtsReader;
+    use crate::superfile::fts::{
+        builder::FtsBuilder,
+        posting::BLOCK_LEN,
+        reader::FtsReader,
+        tokenize::{AsciiLowerTokenizer, Phrase},
+    };
 
     // ── ExcludeFilter (negation gate) ─────────────────────────────────
     // `build_blob` plants: "rust" in docs 0 and 1, "java" in doc 2.
@@ -146,6 +203,56 @@ mod tests {
         assert!(f.admits(2));
     }
 
+    /// The allow-set is the outer gate: a doc outside it is rejected
+    /// whether or not a negated list holds it, a doc inside it still
+    /// answers to the negated lists, and no cursors at all with an
+    /// allow-set is a pure row bound.
+    #[tokio::test]
+    async fn exclude_filter_allow_set_gates_before_negation() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let column_id = r.resolve_column_id("body").expect("column exists");
+        // Negate "rust" (docs 0 and 1); allow docs 1 and 2 only.
+        let cursors = r
+            .build_term_cursors(column_id, &["rust"], None, false, None, None)
+            .await
+            .expect("build cursors");
+        let allow: RoaringBitmap = [1u32, 2].into_iter().collect();
+        let mut f = ExcludeFilter::with_allow(cursors, Some(Arc::new(allow.clone())));
+        assert!(!f.admits(0), "outside the allow-set (and negated)");
+        assert!(!f.admits(1), "inside the allow-set but negated");
+        assert!(f.admits(2), "inside the allow-set, not negated");
+
+        // A bare row bound: no negated cursors at all.
+        let mut bound = ExcludeFilter::with_allow(Vec::new(), Some(Arc::new(allow)));
+        assert!(!bound.admits(0));
+        assert!(bound.admits(1));
+        assert!(bound.admits(2));
+        assert!(!bound.admits(3), "past the set is outside it");
+    }
+
+    /// The phrase-aware gate applies the same allow-set ahead of its atoms.
+    #[tokio::test]
+    async fn atom_exclude_filter_allow_set_gates_before_negation() {
+        let r = edge_reader();
+        let column_id = r.resolve_column_id("body").expect("column exists");
+        let (atoms, _) = r
+            .build_atom_cursors(column_id, &["neg"], &[], None, None)
+            .await
+            .expect("build atoms");
+        // `neg` is in every even row; allow rows 0..4 only.
+        let allow: RoaringBitmap = (0u32..4).collect();
+        let mut f = AtomExcludeFilter::with_allow(
+            atoms.into_iter().flatten().collect(),
+            Some(Arc::new(allow)),
+        );
+        assert!(!f.admits(0).expect("admits"), "allowed but negated");
+        assert!(f.admits(1).expect("admits"), "allowed, clean");
+        assert!(!f.admits(2).expect("admits"), "allowed but negated");
+        assert!(f.admits(3).expect("admits"), "allowed, clean");
+        assert!(!f.admits(5).expect("admits"), "clean but outside the set");
+    }
+
     #[tokio::test]
     async fn exclude_filter_multiple_negated_terms() {
         let (blob, json) = build_blob();
@@ -169,5 +276,139 @@ mod tests {
         // the debug assertion catches the contract violation.
         let _ = f.admits(1);
         let _ = f.admits(0);
+    }
+
+    // ── Probes at block edges ─────────────────────────────────────────
+
+    /// Rows in the block-edge corpora: enough for the negated list to
+    /// span several full blocks and end in a partial one.
+    const EDGE_DOCS: u32 = 1000;
+    /// Every doc divisible by this carries both phrase words in the
+    /// wrong order, so it is the survivor of a negated phrase.
+    const REVERSED_EVERY: u32 = 7;
+
+    /// A positionless corpus where `neg` sits in every even row and
+    /// `pos` in every row: `neg`'s list is 500 postings, four blocks
+    /// with a partial last one.
+    fn edge_reader() -> FtsReader {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        for doc in 0..EDGE_DOCS {
+            let text = if doc % 2 == 0 { "pos neg" } else { "pos" };
+            b.add_doc(0, doc, text).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// A positional corpus where every row holds `a` and `b`, adjacent
+    /// in order except every `REVERSED_EVERY`th row, which holds them
+    /// reversed.
+    fn phrase_edge_reader() -> FtsReader {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), true).expect("register");
+        for doc in 0..EDGE_DOCS {
+            let text = if doc % REVERSED_EVERY == 0 {
+                "b a"
+            } else {
+                "a b"
+            };
+            b.add_doc(0, doc, text).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// The gate's answer at every block edge of the negated list: the
+    /// block's last doc (present, rejected), the doc after it (absent,
+    /// admitted), the next block's first doc (present, rejected), and
+    /// finally docs past the list (admitted). Each probe is a `skip_to`
+    /// that lands exactly on or just past a block boundary, where a
+    /// seek that overshoots by one would admit a negated doc or reject
+    /// a clean one.
+    #[tokio::test]
+    async fn exclude_filter_answers_correctly_at_every_block_edge() {
+        let r = edge_reader();
+        let column_id = r.resolve_column_id("body").expect("column exists");
+        let cursors = r
+            .build_term_cursors(column_id, &["neg"], None, false, None, None)
+            .await
+            .expect("build cursors");
+        let edges: Vec<u32> = cursors[0].blocks.iter().map(|b| b.last_doc_id).collect();
+        assert!(
+            edges.len() >= 4,
+            "premise: several blocks, got {}",
+            edges.len()
+        );
+        assert_eq!(
+            cursors[0].df as usize % BLOCK_LEN,
+            (EDGE_DOCS as usize / 2) % BLOCK_LEN,
+            "premise: the last block is partial"
+        );
+        let mut f = ExcludeFilter::new(cursors);
+        for (i, &last) in edges.iter().enumerate() {
+            assert_eq!(last % 2, 0, "block {i}: last doc is a planted even row");
+            assert!(!f.admits(last), "block {i}: its last doc {last} is negated");
+            assert!(f.admits(last + 1), "block {i}: doc {} is clean", last + 1);
+            if i + 1 < edges.len() {
+                let first_of_next = last + 2;
+                assert!(
+                    !f.admits(first_of_next),
+                    "block {}: its first doc {first_of_next} is negated",
+                    i + 1
+                );
+            }
+        }
+        let past = edges[edges.len() - 1] + 1;
+        assert!(f.admits(past), "doc {past} after the list is clean");
+        assert!(
+            f.admits(EDGE_DOCS + 5000),
+            "a doc far past the list is clean"
+        );
+    }
+
+    /// The phrase-aware gate rejects exactly the docs holding the
+    /// negated phrase in order, probed monotonically over every row,
+    /// which walks both dense members across every block boundary and
+    /// ends past the list. A term atom through the same gate agrees
+    /// with `ExcludeFilter`.
+    #[tokio::test]
+    async fn atom_exclude_filter_rejects_the_negated_phrase_across_blocks() {
+        let r = phrase_edge_reader();
+        let column_id = r.resolve_column_id("body").expect("column exists");
+        let phrases = vec![Phrase::adjacent(vec!["a".to_string(), "b".to_string()])];
+        let (atoms, _) = r
+            .build_atom_cursors(column_id, &[], &phrases, None, None)
+            .await
+            .expect("build atoms");
+        let atoms: Vec<AnyCursor> = atoms.into_iter().flatten().collect();
+        assert_eq!(atoms.len(), 1, "premise: one phrase atom");
+        assert!(
+            matches!(atoms[0], AnyCursor::Phrase(_)),
+            "premise: a phrase atom"
+        );
+        let mut f = AtomExcludeFilter::new(atoms);
+        for doc in 0..EDGE_DOCS {
+            let admitted = f.admits(doc).expect("admits");
+            assert_eq!(
+                admitted,
+                doc % REVERSED_EVERY == 0,
+                "doc {doc}: only reversed rows survive the negated phrase"
+            );
+        }
+        assert!(f.admits(EDGE_DOCS + 1).expect("admits"), "past the list");
+
+        // A term atom is the same gate as `ExcludeFilter`.
+        let r = edge_reader();
+        let column_id = r.resolve_column_id("body").expect("column exists");
+        let (atoms, _) = r
+            .build_atom_cursors(column_id, &["neg"], &[], None, None)
+            .await
+            .expect("build atoms");
+        let mut f = AtomExcludeFilter::new(atoms.into_iter().flatten().collect());
+        for doc in (0..EDGE_DOCS).step_by(3) {
+            assert_eq!(f.admits(doc).expect("admits"), doc % 2 == 1, "doc {doc}");
+        }
+        assert!(f.admits(EDGE_DOCS + 1).expect("admits"));
     }
 }

@@ -29,8 +29,8 @@ use crate::superfile::{
         bm25,
         builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{
-            BLOCK_LEN, BlockHeader, ENCODING_BITSET, block_encoding, decode_block,
-            decode_block_doc_ids, decode_block_tfs,
+            BLOCK_LEN, BlockHeader, ENCODING_BITSET, bitset_next_doc, bitset_tf_at, block_encoding,
+            decode_block, decode_block_doc_ids, decode_block_tfs,
         },
         short::decode_short,
     },
@@ -555,7 +555,29 @@ pub(crate) struct TermCursor {
     /// The parsed header of the block it names — the membership probes
     /// visit one block many times and must not re-parse it per probe.
     header_cache: Option<(usize, BlockHeader)>,
+    /// Set-bit index within the current block while the cursor sits on a
+    /// bitset block it entered by a skip and has not expanded: the decoded
+    /// buffers then hold exactly one doc (`block_n == 1`). `u32::MAX` when
+    /// the current block is fully decoded (or not a bitset block).
+    lazy_bit: u32,
+    /// Consecutive `advance_block` steps taken inside the lazy block. A
+    /// second one means the caller is walking the block, and the full
+    /// expansion is cheaper than one lane read per doc.
+    lazy_steps: u8,
+    /// Consecutive bitset blocks whose lazy probe had to give way to the
+    /// full expansion. Two in a row mean the caller is walking dense
+    /// blocks by skips, and later bitset blocks are expanded outright;
+    /// a skip that jumps past whole blocks, or leaves a block after its
+    /// single lazy doc, resets the streak.
+    dense_streak: u8,
+    /// Bitset blocks entered eagerly since the streak last saturated. Every
+    /// [`EAGER_RETRY_BLOCKS`] of them one lazy probe is tried again, so a
+    /// cursor whose caller turned sparse can leave eager mode.
+    eager_blocks: u8,
 }
+
+/// While a cursor is eager, retry a lazy probe once per this many blocks.
+const EAGER_RETRY_BLOCKS: u8 = 8;
 
 impl TermCursor {
     /// Parse one term's metadata + skip table out of its own postings
@@ -639,6 +661,10 @@ impl TermCursor {
             predecoded: false,
             layout: term_meta.block_layout,
             header_cache: None,
+            lazy_bit: u32::MAX,
+            lazy_steps: 0,
+            dense_streak: 0,
+            eager_blocks: 0,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -706,6 +732,10 @@ impl TermCursor {
             predecoded: true,
             layout: BlockLayout::Compact,
             header_cache: None,
+            lazy_bit: u32::MAX,
+            lazy_steps: 0,
+            dense_streak: 0,
+            eager_blocks: 0,
         })
     }
 
@@ -765,6 +795,10 @@ impl TermCursor {
             predecoded: true,
             layout: BlockLayout::Compact,
             header_cache: None,
+            lazy_bit: u32::MAX,
+            lazy_steps: 0,
+            dense_streak: 0,
+            eager_blocks: 0,
         }
     }
 
@@ -787,6 +821,15 @@ impl TermCursor {
 
     /// The current block's parsed header, cached across probes of the
     /// same block.
+    /// The current block's parsed header and its byte range within the
+    /// term's postings, for callers that read the block's raw bytes.
+    #[inline]
+    fn current_block_bytes(&mut self) -> (BlockHeader, Range<usize>) {
+        let block = self.blocks[self.current_block];
+        let hdr = self.current_header();
+        (hdr, block.block_byte_offset..block.block_byte_end)
+    }
+
     #[inline]
     fn current_header(&mut self) -> BlockHeader {
         let b = self.current_block;
@@ -800,8 +843,10 @@ impl TermCursor {
         hdr
     }
 
+    #[inline(never)]
     pub(super) fn decode_current_block(&mut self) {
         debug_assert!(!self.predecoded, "a pre-decoded cursor has no block bytes");
+        self.lazy_bit = u32::MAX;
         let block = self.blocks[self.current_block];
         // Borrow in place rather than clone an owned `Bytes` (disjoint from the
         // `&mut self.block_*` decode targets, which are separate fields).
@@ -864,10 +909,115 @@ impl TermCursor {
             if self.decoded_block != self.current_block {
                 self.decode_current_block();
             }
+            // A bisection, measured against a scan from the last probe's
+            // position: the driver's docs land far apart in another term's
+            // block, so the scan's steps cost more than the halvings here
+            // (the opposite of the tf probe's dense completion pass).
             self.block_doc_ids[..self.block_n]
                 .binary_search(&doc)
                 .is_ok()
         }
+    }
+
+    /// Keep, in place, the docs of the ascending list `docs` that this term
+    /// contains. The block-at-a-time form of [`Self::contains`]: the block
+    /// cursor advances forward once per block, a bitset block is bit-tested
+    /// with its header parsed once, and a packed block is decoded once and
+    /// merged against the list. Like `contains` it moves `current_block`,
+    /// so a cursor filtered this way must not also be iterated; the
+    /// callers keep a separate cursor for the walk.
+    pub(super) fn retain_contained(&mut self, docs: &mut Vec<u32>) {
+        let n = docs.len();
+        let mut w = 0usize;
+        let mut r = 0usize;
+        if self.predecoded {
+            let ids = &self.block_doc_ids[..self.block_n];
+            let mut p = 0usize;
+            while r < n {
+                let d = docs[r];
+                while p < ids.len() && ids[p] < d {
+                    p += 1;
+                }
+                if p < ids.len() && ids[p] == d {
+                    docs[w] = d;
+                    w += 1;
+                }
+                r += 1;
+            }
+            docs.truncate(w);
+            return;
+        }
+        while r < n {
+            let doc = docs[r];
+            while self.current_block < self.blocks.len()
+                && self.blocks[self.current_block].last_doc_id < doc
+            {
+                self.current_block += 1;
+            }
+            if self.current_block >= self.blocks.len() {
+                break;
+            }
+            let block = self.blocks[self.current_block];
+            let block_last = block.last_doc_id;
+            let hdr = self.current_header();
+            if hdr.encoding == ENCODING_BITSET {
+                let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+                let words = &raw[hdr.payload()..raw.len() - hdr.tfs_size()];
+                while r < n && docs[r] <= block_last {
+                    let d = docs[r];
+                    r += 1;
+                    let Some(bit) = d.checked_sub(hdr.base) else {
+                        continue;
+                    };
+                    let wi = (bit as usize / 64) * 8;
+                    if wi + 8 > words.len() {
+                        continue;
+                    }
+                    let word = u64::from_le_bytes(words[wi..wi + 8].try_into().expect("8 bytes"));
+                    if (word >> (bit % 64)) & 1 == 1 {
+                        docs[w] = d;
+                        w += 1;
+                    }
+                }
+            } else {
+                if self.decoded_block != self.current_block {
+                    self.decode_current_block();
+                }
+                let ids = &self.block_doc_ids[..self.block_n];
+                let mut p = 0usize;
+                while r < n && docs[r] <= block_last {
+                    let d = docs[r];
+                    r += 1;
+                    while p < ids.len() && ids[p] < d {
+                        p += 1;
+                    }
+                    if p < ids.len() && ids[p] == d {
+                        docs[w] = d;
+                        w += 1;
+                    }
+                }
+                self.pos = p.min(ids.len().saturating_sub(1));
+            }
+        }
+        docs.truncate(w);
+    }
+
+    /// Move the block cursor to the block that holds `doc`, without a
+    /// decode or a presence test: for a doc a probe cursor over the same
+    /// postings has already confirmed, ahead of [`Self::materialize_at`]
+    /// or [`Self::tf_at_contained`]. Like the probes it moves
+    /// `current_block`, so the cursor must not also be iterated.
+    #[inline]
+    pub(super) fn seek_block(&mut self, doc: u32) {
+        while self.current_block < self.blocks.len()
+            && self.blocks[self.current_block].last_doc_id < doc
+        {
+            self.current_block += 1;
+        }
+        debug_assert!(
+            self.current_block < self.blocks.len(),
+            "doc confirmed present"
+        );
     }
 
     /// Materialize a `contains`-probed cursor at `doc`: ensure the current
@@ -938,6 +1088,36 @@ impl TermCursor {
         rank + (word & below).count_ones()
     }
 
+    /// The tf at `rank` of the current bitset block for a probe. Normally
+    /// the block's tf array is unpacked once (doc order) and reused across
+    /// a run of probes into the same block — the union and intersection
+    /// kernels probe a dense block many times, and one 128-lane unpack
+    /// beats a bit-field read per probe (measured: reading the single lane
+    /// cost union 7% and intersection 5%). While the block is held lazily,
+    /// though, `block_tfs[0]` is the published doc's tf and `pos` names
+    /// it; unpacking the block over it would make `current_tf()` report
+    /// rank 0's tf for the published doc, so a probe then reads its lane
+    /// alone and leaves the buffers as they are.
+    #[inline]
+    fn bitset_tf_for_probe(
+        lazy: bool,
+        current_block: usize,
+        tf_decoded_block: &mut usize,
+        block_tfs: &mut [u32],
+        raw: &[u8],
+        hdr: &BlockHeader,
+        rank: usize,
+    ) -> u32 {
+        if lazy {
+            return bitset_tf_at(raw, hdr, rank);
+        }
+        if *tf_decoded_block != current_block {
+            decode_block_tfs(raw, hdr, block_tfs);
+            *tf_decoded_block = current_block;
+        }
+        block_tfs[rank]
+    }
+
     pub(super) fn bitset_probe_tf(&mut self, doc: u32) -> Option<u32> {
         while self.current_block < self.blocks.len()
             && self.blocks[self.current_block].last_doc_id < doc
@@ -957,7 +1137,13 @@ impl TermCursor {
         let block = self.blocks[self.current_block];
         let hdr = self.current_header();
         if hdr.encoding != ENCODING_BITSET {
-            // PACKED: no rank shortcut — decode + locate like the old path.
+            // PACKED: no rank shortcut — decode + locate like a skip. The
+            // in-block step is a linear scan from the cursor's position on
+            // purpose: a completion pass probes a block a few docs apart,
+            // and every search that bisects (whole block, after a few
+            // linear steps, or galloping) measured a quarter slower on a
+            // long query — the predictable scan beats the mispredicted
+            // halving for gaps under a block.
             self.skip_to(doc);
             return if self.current_doc_id() == doc {
                 Some(self.current_tf())
@@ -972,16 +1158,15 @@ impl TermCursor {
         }
         // Present: the r-th set bit (doc) maps to the r-th tf in doc order.
         let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
-        // Decode this block's tf array once (doc order), reused across a run of
-        // candidates in the same block; the doc ids are never expanded. The
-        // union and intersection kernels probe a dense block many times, so
-        // one 128-lane unpack beats a bit-field read per probe (measured:
-        // reading the single lane cost union 7% and intersection 5%).
-        if self.tf_decoded_block != self.current_block {
-            decode_block_tfs(raw, &hdr, &mut self.block_tfs);
-            self.tf_decoded_block = self.current_block;
-        }
-        Some(self.block_tfs[rank as usize])
+        Some(Self::bitset_tf_for_probe(
+            self.lazy_bit != u32::MAX,
+            self.current_block,
+            &mut self.tf_decoded_block,
+            &mut self.block_tfs,
+            raw,
+            &hdr,
+            rank as usize,
+        ))
     }
 
     pub(super) fn is_exhausted(&self) -> bool {
@@ -1017,6 +1202,10 @@ impl TermCursor {
     #[inline(always)]
     pub(super) fn current_tf(&self) -> u32 {
         debug_assert!(!self.is_exhausted() && self.pos < self.block_n);
+        debug_assert!(
+            self.lazy_bit == u32::MAX || self.tf_decoded_block != self.current_block,
+            "a lazily held block's tf buffer was replaced by a whole-block unpack"
+        );
         self.block_tfs[self.pos]
     }
 
@@ -1076,6 +1265,23 @@ impl TermCursor {
     /// a hint pointer so monotonically-advancing leader ranges amortize
     /// to O(1) amortized per call.
     pub(super) fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
+        self.block_max_and_density_in_range(range_start, range_end)
+            .0
+    }
+
+    /// [`Self::block_max_in_range`] together with an estimate of this
+    /// term's docs in the range: the overlapping blocks hold
+    /// [`BLOCK_LEN`] docs each over their combined doc-id span, so the
+    /// range's share of that span is its share of those docs. `0` when the
+    /// cursor is exhausted.
+    pub(super) fn block_max_and_density_in_range(
+        &mut self,
+        range_start: u32,
+        range_end: u32,
+    ) -> (f32, f32) {
+        if self.is_exhausted() {
+            return (0.0, 0.0);
+        }
         // Advance inspect_block to the first block whose last_doc_id
         // could intersect the range. shallow_advance_block_to lands on
         // the first block with last_doc_id >= range_start, which is
@@ -1102,7 +1308,18 @@ impl TermCursor {
             }
             i += 1;
         }
-        max
+        let first = self.inspect_block;
+        if i == first {
+            return (max, 0.0);
+        }
+        let span_start = match first {
+            0 => 0u32,
+            _ => self.blocks[first - 1].last_doc_id.saturating_add(1),
+        };
+        let span = f64::from(self.blocks[i - 1].last_doc_id) - f64::from(span_start) + 1.0;
+        let range = f64::from(range_end.max(range_start)) - f64::from(range_start) + 1.0;
+        let docs = (i - first) as f64 * BLOCK_LEN as f64 * (range / span).clamp(0.0, 1.0);
+        (max, docs as f32)
     }
 
     /// Block-max-BM25 at the inspect-block pointer. Pair with
@@ -1156,8 +1373,11 @@ impl TermCursor {
 
     /// Move to and decode the next posting block, or mark the cursor
     /// exhausted when the current block is the last one.
-    #[inline(always)]
+    #[inline(never)]
     pub(super) fn advance_block(&mut self) {
+        if self.lazy_bit != u32::MAX && self.step_within_lazy_block() {
+            return;
+        }
         self.current_block += 1;
         if self.current_block > self.inspect_block {
             self.inspect_block = self.current_block;
@@ -1165,6 +1385,55 @@ impl TermCursor {
         if self.current_block < self.blocks.len() {
             self.decode_current_block();
         }
+    }
+
+    /// Continue inside a bitset block the cursor entered by a skip. One
+    /// more doc is published lazily; on the second consecutive step the
+    /// block is expanded and the cursor positioned after the current doc,
+    /// since a caller walking the block is better served by the arrays.
+    /// Returns `false` when the block holds no further doc.
+    fn step_within_lazy_block(&mut self) -> bool {
+        let cur = self.block_doc_ids[0];
+        let (hdr, range) = self.current_block_bytes();
+        let raw = &self.bytes[range];
+        if self.lazy_steps == 0 {
+            self.lazy_steps = 1;
+            return match bitset_next_doc(raw, &hdr, cur.saturating_add(1)) {
+                Some((doc, rank)) => {
+                    self.publish_lazy(doc, rank);
+                    true
+                }
+                None => false,
+            };
+        }
+        self.dense_streak = self.dense_streak.saturating_add(1);
+        self.decode_current_block();
+        while self.pos < self.block_n && self.block_doc_ids[self.pos] <= cur {
+            self.pos += 1;
+        }
+        self.pos < self.block_n
+    }
+
+    /// Publish one doc of the current bitset block as the whole decoded
+    /// block. The tf is one lane read (skipped for a count-only cursor);
+    /// the arrays are marked undecoded so `materialize_at`, positions and
+    /// the tf probes expand the block if they need it.
+    fn publish_lazy(&mut self, doc: u32, rank: usize) {
+        let (hdr, range) = self.current_block_bytes();
+        let raw = &self.bytes[range];
+        self.block_doc_ids[0] = doc;
+        if !self.count_only {
+            self.block_tfs[0] = bitset_tf_at(raw, &hdr, rank);
+        }
+        self.block_n = 1;
+        self.pos = 0;
+        self.lazy_bit = doc - hdr.base;
+        // The buffers now hold one doc, not the block: anything that needs
+        // the whole block — `materialize_at`, the phrase path's pair index
+        // and tf run, the tf probes' unpack — must see it as undecoded and
+        // expand. `decode_current_positions` asserts this on entry.
+        self.decoded_block = usize::MAX;
+        self.tf_decoded_block = usize::MAX;
     }
 
     /// Skip forward so `current_doc_id() >= target`. Uses the skip
@@ -1197,6 +1466,24 @@ impl TermCursor {
         self.skip_to_cross_block(target);
     }
 
+    /// Skip whole blocks from the current one on, while each block's max
+    /// plus `others_ub` stays at or under `threshold` and the block ends
+    /// before `end_doc`. The caller has already found the current block
+    /// under that bar. Only block metadata is read on the way; the one
+    /// block the cursor lands on is decoded. A block reaching `end_doc` is
+    /// never skipped, because the bar may not hold past it.
+    pub(super) fn skip_blocks_under(&mut self, others_ub: f32, threshold: f32, end_doc: u32) {
+        debug_assert!(!self.is_exhausted());
+        let mut b = self.current_block;
+        while b + 1 < self.blocks.len()
+            && self.blocks[b + 1].block_max_bm25 + others_ub <= threshold
+            && self.blocks[b + 1].last_doc_id < end_doc
+        {
+            b += 1;
+        }
+        self.skip_to_cross_block(self.blocks[b].last_doc_id.saturating_add(1));
+    }
+
     /// Cross-block path of `skip_to`: target is past the current
     /// decoded block. Advances `current_block` via the skip table,
     /// decodes the new block (only when crossing), and scans pos.
@@ -1204,6 +1491,7 @@ impl TermCursor {
     /// to inline at every call site.
     #[cold]
     pub(super) fn skip_to_cross_block(&mut self, target: u32) {
+        let from_block = self.current_block;
         while self.current_block < self.blocks.len()
             && self.blocks[self.current_block].last_doc_id < target
         {
@@ -1214,6 +1502,47 @@ impl TermCursor {
         }
         if self.is_exhausted() {
             return;
+        }
+        let left_lazy = self.lazy_bit != u32::MAX && self.current_block != from_block;
+        if left_lazy || self.current_block > from_block + 1 {
+            // A probe that leaves a lazy block after one doc, or jumps past
+            // whole blocks, is sparse: serve the next bitset block lazily.
+            self.dense_streak = 0;
+            self.eager_blocks = 0;
+        } else if self.dense_streak >= 2 && self.current_block != from_block {
+            // Eager, moving block to block: every so often try one lazy
+            // probe again; if the block expands anyway the streak returns.
+            self.eager_blocks += 1;
+            if self.eager_blocks >= EAGER_RETRY_BLOCKS {
+                self.eager_blocks = 0;
+                self.dense_streak = 1;
+            }
+        }
+        if !self.predecoded
+            && self.dense_streak < 2
+            && self.current_header().encoding == ENCODING_BITSET
+        {
+            // A skip into a bitset block is a probe: publish the one doc
+            // the caller asked for instead of expanding all 128. A rare
+            // anchor's WAND touches a stopword block twice (the pivot, then
+            // the doc after it), so two lazy probes are allowed; a third
+            // skip into the same block is a caller walking it by skips (a
+            // stopword AND), which the expansion serves better.
+            let again = self.lazy_bit != u32::MAX && self.current_block == from_block;
+            let steps = match again {
+                true => self.lazy_steps + 1,
+                false => 0,
+            };
+            if steps < 2 {
+                let (hdr, range) = self.current_block_bytes();
+                let raw = &self.bytes[range];
+                if let Some((doc, rank)) = bitset_next_doc(raw, &hdr, target) {
+                    self.publish_lazy(doc, rank);
+                    self.lazy_steps = steps;
+                    return;
+                }
+            }
+            self.dense_streak = self.dense_streak.saturating_add(1);
         }
         self.decode_current_block();
         while self.pos < self.block_n && self.block_doc_ids[self.pos] < target {
@@ -1257,16 +1586,24 @@ impl TermCursor {
             let (bit, word, bitset_end) =
                 Self::bitset_word(raw, &hdr, doc).expect("contains(doc) confirmed presence");
             let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
-            if self.tf_decoded_block != self.current_block {
-                decode_block_tfs(raw, &hdr, &mut self.block_tfs);
-                self.tf_decoded_block = self.current_block;
-            }
-            self.block_tfs[rank as usize]
+            Self::bitset_tf_for_probe(
+                self.lazy_bit != u32::MAX,
+                self.current_block,
+                &mut self.tf_decoded_block,
+                &mut self.block_tfs,
+                raw,
+                &hdr,
+                rank as usize,
+            )
         } else {
-            // PACKED: `contains` decoded this block's doc ids and tfs. Locate doc.
+            // PACKED: `contains` or a bare `seek_block` put the block cursor
+            // here; decode once if needed and locate the doc.
+            if self.decoded_block != self.current_block {
+                self.decode_current_block();
+            }
             let pos = self.block_doc_ids[..self.block_n]
                 .binary_search(&doc)
-                .expect("contains(doc) confirmed presence");
+                .expect("doc confirmed present");
             self.block_tfs[pos]
         }
     }
@@ -1304,7 +1641,11 @@ mod tests {
 
     use super::*;
     use crate::superfile::fts::{
-        bm25, builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
+        bm25,
+        builder::FtsBuilder,
+        posting::{ENCODING_PACKED, ENCODING_PATCHED},
+        reader::FtsReader,
+        tokenize::AsciiLowerTokenizer,
     };
 
     /// The per-block BM25 upper bound stored in the skip table must be a
@@ -1375,6 +1716,255 @@ mod tests {
         }
         let json = r#"[{"name":"pos","tokenizer":"ascii_lower","positions":true},{"name":"flat","tokenizer":"ascii_lower"}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// A same-block tf probe on a lazily held cursor must not disturb the
+    /// published doc: `current_tf()` still answers for `current_doc_id()`.
+    /// The corpus varies tf within a block, so a buffer overwritten by a
+    /// whole-block unpack would show a different doc's tf.
+    #[tokio::test]
+    async fn same_block_tf_probes_leave_the_lazy_doc_intact() {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("flat".into(), false).expect("register");
+        for doc_id in 0..6000u32 {
+            let mut text = String::new();
+            for _ in 0..(1 + doc_id % 5) {
+                text.push_str("common ");
+            }
+            b.add_doc(0, doc_id, text.trim_end()).expect("add");
+        }
+        let json = r#"[{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let cursors = view
+            .build_term_cursors(0, &["common"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let tf_of = |doc: u32| 1 + doc % 5;
+        for probe in ["tf_at_contained", "bitset_probe_tf"] {
+            let mut c = cursors[0].clone();
+            c.skip_to(4_100);
+            assert_eq!(c.block_n, 1, "lazy hold");
+            assert_eq!((c.current_doc_id(), c.current_tf()), (4_100, tf_of(4_100)));
+            let got = match probe {
+                "tf_at_contained" => {
+                    assert!(c.contains(4_105));
+                    c.tf_at_contained(4_105)
+                }
+                _ => c.bitset_probe_tf(4_105).expect("present"),
+            };
+            assert_eq!(got, tf_of(4_105), "{probe}");
+            assert_eq!(
+                (c.current_doc_id(), c.current_tf()),
+                (4_100, tf_of(4_100)),
+                "{probe}: the lazy doc must be intact after the probe"
+            );
+            // And the walk on from the lazy doc stays exact.
+            for d in 4_100..4_400 {
+                assert_eq!(
+                    (c.current_doc_id(), c.current_tf()),
+                    (d, tf_of(d)),
+                    "{probe} walk {d}"
+                );
+                c.next();
+            }
+        }
+    }
+
+    /// The tf probe on a packed block steps the cursor to the doc. Every
+    /// doc across several blocks must answer exactly as the walk does for
+    /// ascending probes, and the cursor must stay on a valid in-block
+    /// position throughout.
+    #[tokio::test]
+    async fn packed_block_tf_probes_match_the_walk() {
+        use crate::superfile::fts::posting::{ENCODING_BITSET, block_encoding};
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("flat".into(), false).expect("register");
+        let tf_of = |doc: u32| doc.is_multiple_of(37).then(|| 1 + doc % 5);
+        for doc_id in 0..60_000u32 {
+            let text = match tf_of(doc_id) {
+                Some(tf) => vec!["sparse"; tf as usize].join(" "),
+                None => "filler".to_string(),
+            };
+            b.add_doc(0, doc_id, &text).expect("add");
+        }
+        let json = r#"[{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let cursors = view
+            .build_term_cursors(0, &["sparse"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let mut c = cursors[0].clone();
+        assert!(c.blocks.len() >= 4, "several blocks");
+        for blk in c.blocks.iter() {
+            assert_ne!(
+                block_encoding(&c.bytes[blk.block_byte_offset..blk.block_byte_end]),
+                ENCODING_BITSET,
+                "the gap-37 list must pack, or the packed path is not under test"
+            );
+        }
+        for doc in 0..12_000u32 {
+            assert_eq!(c.bitset_probe_tf(doc), tf_of(doc), "probe {doc}");
+            assert!(c.pos < c.block_n, "probe {doc} left pos out of the block");
+            let _ = c.current_doc_id();
+        }
+        // Past the last block: absent, and the cursor reports exhaustion.
+        assert_eq!(c.bitset_probe_tf(100_000), None);
+        assert!(c.is_exhausted());
+    }
+
+    /// A lazily published block must expand on demand for the callers
+    /// that need the whole block: `materialize_at` (positions read the
+    /// block's tf array by pair index), `contains` and `tf_at_contained`
+    /// on the same block, and the doc-at-a-time walk that follows.
+    #[tokio::test]
+    async fn lazy_block_expands_for_materialize_contains_and_walk() {
+        let view = two_column_reader();
+        let cursors = view
+            .build_term_cursors(1, &["common"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let mut reference = cursors[0].clone();
+        let mut walked: Vec<(u32, u32)> = Vec::new();
+        while !reference.is_exhausted() {
+            walked.push((reference.current_doc_id(), reference.current_tf()));
+            reference.next();
+        }
+        let tf_of = |doc: u32| walked.iter().find(|(d, _)| *d == doc).expect("present").1;
+
+        // materialize_at after a lazy skip: whole block, position on the doc.
+        let mut c = cursors[0].clone();
+        c.skip_to(3_001);
+        assert_eq!(c.block_n, 1, "a skip into a bitset block is lazy");
+        c.materialize_at(3_001);
+        assert!(c.block_n > 1, "materialize_at expands the block");
+        assert_eq!(c.current_doc_id(), 3_001);
+        assert_eq!(c.current_tf(), tf_of(3_001));
+        // Walking on from there matches the reference.
+        let start = walked
+            .iter()
+            .position(|(d, _)| *d == 3_001)
+            .expect("in range");
+        for &(d, tf) in &walked[start..start + 200] {
+            assert_eq!((c.current_doc_id(), c.current_tf()), (d, tf));
+            c.next();
+        }
+
+        // contains / tf_at_contained on a lazily entered block.
+        let mut c = cursors[0].clone();
+        c.skip_to(4_100);
+        assert!(c.contains(4_105));
+        assert_eq!(c.tf_at_contained(4_105), tf_of(4_105));
+        assert!(!c.contains(4_105 + 7_000));
+    }
+
+    /// The lazy probes must stay exact when a caller alternates between
+    /// dense stretches (several skips into every block, which switch the
+    /// cursor to eager expansion) and sparse jumps (which bring lazy
+    /// probing back), including the periodic retry while eager.
+    #[tokio::test]
+    async fn dense_and_sparse_skip_patterns_match_the_decoded_walk() {
+        let view = two_column_reader();
+        for count_only in [false, true] {
+            let cursors = view
+                .build_term_cursors(1, &["common"], None, false, None, None)
+                .await
+                .expect("cursors");
+            let mut reference = cursors[0].clone();
+            let mut walked: Vec<(u32, u32)> = Vec::new();
+            while !reference.is_exhausted() {
+                walked.push((reference.current_doc_id(), reference.current_tf()));
+                reference.next();
+            }
+            let expect_at = |target: u32| walked.iter().find(|(d, _)| *d >= target).copied();
+            let mut c = cursors[0].clone();
+            c.count_only = count_only;
+            let mut target = 0u32;
+            let mut strides: Vec<u32> = Vec::new();
+            strides.extend(std::iter::repeat_n(1, 300)); // dense: every doc, several per block
+            strides.extend(std::iter::repeat_n(41, 40)); // one probe per block
+            strides.extend(std::iter::repeat_n(2, 200)); // dense again
+            strides.extend([700, 700, 700, 3, 3, 3, 900]); // jumps past whole blocks, then dense
+            for (k, stride) in strides.into_iter().enumerate() {
+                target += stride;
+                c.skip_to(target);
+                match expect_at(target) {
+                    None => assert!(c.is_exhausted(), "step {k} target {target}"),
+                    Some((d, tf)) => {
+                        assert_eq!(c.current_doc_id(), d, "step {k} target {target}");
+                        if !count_only {
+                            assert_eq!(c.current_tf(), tf, "step {k} target {target}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every doc of `two_column_reader` carries `common`, so its blocks
+    /// are bitset-encoded and a skip publishes one doc lazily. Whatever
+    /// mix of skips and steps a kernel takes, the cursor must report the
+    /// same (doc, tf) sequence as a plain walk of the fully decoded
+    /// blocks — including the step that expands a lazy block mid-walk.
+    #[tokio::test]
+    async fn lazy_bitset_skips_match_the_decoded_walk() {
+        let view = two_column_reader();
+        for count_only in [false, true] {
+            let cursors = view
+                .build_term_cursors(1, &["common"], None, false, None, None)
+                .await
+                .expect("cursors");
+            let mut reference = cursors[0].clone();
+            let mut walked: Vec<(u32, u32)> = Vec::new();
+            while !reference.is_exhausted() {
+                walked.push((reference.current_doc_id(), reference.current_tf()));
+                reference.next();
+            }
+            assert_eq!(walked.len(), 6000);
+            let expect_at = |target: u32| walked.iter().find(|(d, _)| *d >= target).copied();
+
+            let mut c = cursors[0].clone();
+            c.count_only = count_only;
+            // Probe pattern: strides that land in a new block each time,
+            // then inside the same block, then a long jump.
+            let mut target = 0u32;
+            for stride in [131u32, 7, 1, 1, 1, 3, 2, 900, 1, 5000] {
+                target += stride;
+                c.skip_to(target);
+                match expect_at(target) {
+                    None => assert!(c.is_exhausted(), "target {target}"),
+                    Some((d, tf)) => {
+                        assert_eq!(c.current_doc_id(), d, "target {target}");
+                        if !count_only {
+                            assert_eq!(c.current_tf(), tf, "target {target}");
+                        }
+                    }
+                }
+            }
+            // Walk pattern after a skip: the steps expand the lazy block
+            // and continue from the right position, then cross blocks.
+            let mut c = cursors[0].clone();
+            c.count_only = count_only;
+            c.skip_to(2_600);
+            let start = walked
+                .iter()
+                .position(|(d, _)| *d >= 2_600)
+                .expect("in range");
+            for (k, &(d, tf)) in walked[start..start + 300].iter().enumerate() {
+                assert_eq!(c.current_doc_id(), d, "step {k}");
+                if !count_only {
+                    assert_eq!(c.current_tf(), tf, "step {k}");
+                }
+                c.next();
+            }
+            // A skip that stays inside the block the walk is in.
+            let target = walked[start + 300].0 + 2;
+            c.skip_to(target);
+            let (d, tf) = expect_at(target).expect("in range");
+            assert_eq!(c.current_doc_id(), d);
+            if !count_only {
+                assert_eq!(c.current_tf(), tf);
+            }
+        }
     }
 
     #[tokio::test]
@@ -1633,5 +2223,406 @@ mod tests {
             checked, TERM_DOCS,
             "every posting for the term must be visited"
         );
+    }
+
+    // ── Seeks across every block encoding ─────────────────────────────
+
+    /// Tokens per term in the planted seek corpora: `t0` is the long
+    /// multi-encoding list, `t1` the short-form list (`df <= BLOCK_LEN`),
+    /// `t2` the inline df=1 term.
+    const SEEK_TERMS: [&str; 3] = ["t0", "t1", "t2"];
+    /// Widest gap the planted "outlier" lanes take, so a block holding one
+    /// packs the other lanes narrow and lists the outlier as an exception.
+    const OUTLIER_GAP: u32 = 1 << 18;
+    /// Term frequency of the planted tf outlier lane.
+    const OUTLIER_TF: u32 = 700;
+    /// Proptest cases for the seek property; each builds a reader.
+    const SEEK_CASES: u32 = 24;
+
+    /// One term's planted postings: ascending `(doc, tf)`.
+    type Planted = Vec<(u32, u32)>;
+
+    /// Build a positionless reader over `terms[i]` holding `planted[i]`,
+    /// with `n_docs` rows (rows no term mentions carry a filler token so
+    /// every row is a document). Doc ids are the row indices.
+    fn planted_reader(planted: &[Planted], n_docs: u32) -> FtsReader {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        let mut at = vec![0usize; planted.len()];
+        let mut text = String::new();
+        for doc in 0..n_docs {
+            text.clear();
+            for (t, list) in planted.iter().enumerate() {
+                if let Some(&(d, tf)) = list.get(at[t])
+                    && d == doc
+                {
+                    for _ in 0..tf {
+                        text.push_str(SEEK_TERMS[t]);
+                        text.push(' ');
+                    }
+                    at[t] += 1;
+                }
+            }
+            if text.is_empty() {
+                text.push_str("filler");
+            }
+            b.add_doc(0, doc, text.trim_end()).expect("add doc");
+        }
+        for (t, list) in planted.iter().enumerate() {
+            assert_eq!(at[t], list.len(), "term {t}: every planted doc emitted");
+        }
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// The encodings a cursor's blocks take, in block order.
+    fn block_encodings(c: &TermCursor) -> Vec<u8> {
+        c.blocks
+            .iter()
+            .map(|b| block_encoding(&c.bytes[b.block_byte_offset..b.block_byte_end]))
+            .collect()
+    }
+
+    /// Seek targets that hit every block boundary of `c`: each block's
+    /// first doc, last doc and last+1, one interior doc, plus a target
+    /// past the list. Ascending, deduplicated.
+    fn boundary_targets(c: &TermCursor, walked: &[(u32, u32)], interior_pick: u32) -> Vec<u32> {
+        let mut targets: Vec<u32> = Vec::new();
+        let mut start = 0usize;
+        for b in c.blocks.iter() {
+            let end = walked.partition_point(|(d, _)| *d <= b.last_doc_id);
+            let block = &walked[start..end];
+            if let (Some(first), Some(last)) = (block.first(), block.last()) {
+                targets.push(first.0);
+                targets.push(last.0);
+                targets.push(last.0.saturating_add(1));
+                let pick = block[(interior_pick as usize) % block.len()].0;
+                targets.push(pick);
+            }
+            start = end;
+        }
+        targets.push(walked.last().map_or(0, |(d, _)| d.saturating_add(1)));
+        targets.push(u32::MAX);
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+
+    /// Every posting of `c` in order, from a fresh clone.
+    fn walk_all(c: &TermCursor) -> Vec<(u32, u32)> {
+        let mut r = c.clone();
+        let mut out = Vec::new();
+        while !r.is_exhausted() {
+            out.push((r.current_doc_id(), r.current_tf()));
+            r.next();
+        }
+        out
+    }
+
+    /// The seek contract, checked against the decoded walk: after
+    /// `skip_to(t)` the cursor sits on the first posting with doc ≥ `t`
+    /// (or is exhausted when none), reports that posting's tf, and a few
+    /// `next()` steps continue the walk from there. `contains` and
+    /// `bitset_probe_tf` on separate clones agree with the same walk.
+    fn assert_seeks_match_walk(c: &TermCursor, walked: &[(u32, u32)], targets: &[u32]) {
+        let expect_at = |t: u32| -> Option<usize> { walked.iter().position(|(d, _)| *d >= t) };
+        let mut seeker = c.clone();
+        let mut prober = c.clone();
+        let mut tf_prober = c.clone();
+        for &t in targets {
+            seeker.skip_to(t);
+            match expect_at(t) {
+                None => assert!(seeker.is_exhausted(), "target {t}: past the list"),
+                Some(i) => {
+                    let (d, tf) = walked[i];
+                    assert_eq!(seeker.current_doc_id(), d, "target {t}: landed doc");
+                    assert_eq!(seeker.current_tf(), tf, "target {t}: tf at landed doc");
+                    // A short walk from the landed doc stays in step.
+                    let mut stepper = seeker.clone();
+                    for &(wd, wtf) in walked[i..].iter().take(5) {
+                        assert_eq!(stepper.current_doc_id(), wd, "target {t}: walk doc");
+                        assert_eq!(stepper.current_tf(), wtf, "target {t}: walk tf");
+                        stepper.next();
+                    }
+                    if i + 5 >= walked.len() {
+                        assert!(
+                            stepper.is_exhausted(),
+                            "target {t}: walk ends with the list"
+                        );
+                    }
+                }
+            }
+            if t == u32::MAX {
+                continue;
+            }
+            let present = walked.iter().find(|(d, _)| *d == t).map(|(_, tf)| *tf);
+            assert_eq!(
+                prober.contains(t),
+                present.is_some(),
+                "target {t}: contains"
+            );
+            assert_eq!(
+                tf_prober.bitset_probe_tf(t),
+                present,
+                "target {t}: probe tf"
+            );
+        }
+    }
+
+    /// A long list whose blocks take every encoding: a dense stretch
+    /// (bitset), a stretch with one outlier gap and one outlier tf per
+    /// block (patched), a uniform-gap stretch (packed), and a partial last
+    /// block. Guards the corpus premise (all three encodings present, last
+    /// block partial) and then checks every boundary seek. Catches a seek
+    /// that lands one doc off at a block edge, a stale tf after a
+    /// cross-encoding jump, or a partial block read past its count.
+    #[tokio::test]
+    async fn seeks_land_on_the_first_doc_at_every_block_edge_of_every_encoding() {
+        let mut list: Planted = Vec::new();
+        // Dense: 300 consecutive docs from 10.
+        for d in 10..310u32 {
+            list.push((d, 1 + d % 3));
+        }
+        // Patched: 4 blocks of 128 docs two apart, each with one gap and
+        // one tf outlier.
+        let mut d = 312u32;
+        for blk in 0..4u32 {
+            for lane in 0..128u32 {
+                let tf = if lane == 40 + blk {
+                    OUTLIER_TF
+                } else {
+                    1 + lane % 4
+                };
+                list.push((d, tf));
+                d += if lane == 90 { OUTLIER_GAP } else { 2 };
+            }
+        }
+        // Packed: 3 blocks at a uniform gap of 37.
+        for _ in 0..(3 * 128) {
+            list.push((d, 2));
+            d += 37;
+        }
+        // Partial last block: 50 docs.
+        for _ in 0..50 {
+            list.push((d, 3));
+            d += 5;
+        }
+        let n_docs = d + 1;
+        let view = planted_reader(&[list.clone()], n_docs);
+        let cursors = view
+            .build_term_cursors(0, &SEEK_TERMS[..1], None, false, None, None)
+            .await
+            .expect("cursors");
+        let c = &cursors[0];
+        let encodings = block_encodings(c);
+        assert!(
+            encodings.contains(&ENCODING_BITSET),
+            "premise: a bitset block"
+        );
+        assert!(
+            encodings.contains(&ENCODING_PATCHED),
+            "premise: a patched block"
+        );
+        assert!(
+            encodings.contains(&ENCODING_PACKED),
+            "premise: a packed block"
+        );
+        let walked = walk_all(c);
+        assert_eq!(walked, list, "the decoded walk is the planted list");
+        assert_ne!(
+            list.len() % BLOCK_LEN,
+            0,
+            "premise: the last block is partial"
+        );
+        for pick in [0u32, 1, 63, 64, 127] {
+            let targets = boundary_targets(c, &walked, pick);
+            assert_seeks_match_walk(c, &walked, &targets);
+        }
+    }
+
+    /// Random posting lists over the same three encodings plus the short
+    /// and inline forms, with random boundary and interior seeks, all
+    /// against the decoded walk. The long term's segments are drawn per
+    /// case (dense runs, outlier stretches, uniform gaps, a partial tail),
+    /// the short term has at most `BLOCK_LEN` docs, the inline term one.
+    #[test]
+    fn prop_seeks_match_the_decoded_walk_on_random_lists() {
+        use proptest::{
+            prelude::*,
+            test_runner::{Config, TestRunner},
+        };
+
+        /// One planted segment of the long list.
+        #[derive(Clone, Debug)]
+        enum Segment {
+            /// `n` consecutive docs.
+            Dense(u16),
+            /// `n` docs two apart with an outlier gap and tf at `lane`.
+            Outlier(u16, u8),
+            /// `n` docs `gap` apart.
+            Uniform(u16, u8),
+        }
+        let segment = prop_oneof![
+            (1u16..=300).prop_map(Segment::Dense),
+            ((64u16..=256), any::<u8>()).prop_map(|(n, l)| Segment::Outlier(n, l)),
+            ((1u16..=300), (1u8..=60)).prop_map(|(n, g)| Segment::Uniform(n, g)),
+        ];
+        let strategy = (
+            prop::collection::vec(segment, 1..=5),
+            prop::collection::vec(any::<u16>(), 0..=BLOCK_LEN),
+            any::<u16>(),
+            prop::collection::vec(any::<u32>(), 1..=12),
+            any::<u64>(),
+        );
+        let mut runner = TestRunner::new(Config {
+            cases: SEEK_CASES,
+            ..Config::default()
+        });
+        runner
+            .run(
+                &strategy,
+                |(segments, short_seed, inline_seed, picks, tf_seed)| {
+                    let mut long: Planted = Vec::new();
+                    let mut d = 3u32;
+                    let mut rng = tf_seed | 1;
+                    let next_tf = |rng: &mut u64| -> u32 {
+                        *rng ^= *rng << 13;
+                        *rng ^= *rng >> 7;
+                        *rng ^= *rng << 17;
+                        1 + (*rng % 5) as u32
+                    };
+                    for s in &segments {
+                        match *s {
+                            Segment::Dense(n) => {
+                                for _ in 0..n {
+                                    long.push((d, next_tf(&mut rng)));
+                                    d += 1;
+                                }
+                            }
+                            Segment::Outlier(n, lane) => {
+                                for i in 0..n {
+                                    let tf = if i % 128 == u16::from(lane) % 128 {
+                                        OUTLIER_TF
+                                    } else {
+                                        next_tf(&mut rng)
+                                    };
+                                    long.push((d, tf));
+                                    d += if i % 128 == 100 { OUTLIER_GAP } else { 2 };
+                                }
+                            }
+                            Segment::Uniform(n, gap) => {
+                                for _ in 0..n {
+                                    long.push((d, next_tf(&mut rng)));
+                                    d += u32::from(gap);
+                                }
+                            }
+                        }
+                        d += 1;
+                    }
+                    let n_docs = d + 2;
+                    // Short term: distinct docs below `n_docs`, at most one block.
+                    let mut short: Vec<u32> =
+                        short_seed.iter().map(|&s| u32::from(s) % n_docs).collect();
+                    short.sort_unstable();
+                    short.dedup();
+                    let short: Planted =
+                        short.into_iter().map(|d| (d, next_tf(&mut rng))).collect();
+                    let inline: Planted = vec![(u32::from(inline_seed) % n_docs, 2)];
+                    let view =
+                        planted_reader(&[long.clone(), short.clone(), inline.clone()], n_docs);
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("runtime");
+                    for (t, planted) in [&long, &short, &inline].into_iter().enumerate() {
+                        if planted.is_empty() {
+                            continue;
+                        }
+                        let cursors = rt
+                            .block_on(view.build_term_cursors(
+                                0,
+                                &SEEK_TERMS[t..=t],
+                                None,
+                                false,
+                                None,
+                                None,
+                            ))
+                            .expect("cursors");
+                        let c = &cursors[0];
+                        let walked = walk_all(c);
+                        prop_assert_eq!(&walked, planted, "term {}: decoded walk", t);
+                        for &pick in &picks {
+                            let mut targets = boundary_targets(c, &walked, pick);
+                            // A few random interior targets too, kept ascending.
+                            targets.push(pick % n_docs);
+                            targets.sort_unstable();
+                            targets.dedup();
+                            assert_seeks_match_walk(c, &walked, &targets);
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .expect("seek property holds");
+    }
+
+    /// The lazy-probe retry: a cursor walking a dense bitset term block by
+    /// block by skips expands each block eagerly, and every
+    /// `EAGER_RETRY_BLOCKS` block crossings it tries one lazy probe again.
+    /// Whatever the mode, the reported postings must match the decoded
+    /// walk; and the retry must actually happen, or a cursor that once
+    /// went eager would expand every stopword block for the rest of a
+    /// sparse query.
+    #[tokio::test]
+    async fn eager_mode_retries_a_lazy_probe_every_few_blocks() {
+        let view = two_column_reader();
+        let cursors = view
+            .build_term_cursors(1, &["common"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let walked = walk_all(&cursors[0]);
+        let expect_at = |t: u32| walked.iter().find(|(d, _)| *d >= t).copied();
+        let mut c = cursors[0].clone();
+        assert!(c.is_bitset_dense(), "premise: a bitset-encoded term");
+        // The first block is decoded at construction, so the streak is
+        // built in later blocks: a third skip into the same bitset block
+        // expands it, and two such expansions in a row make the cursor
+        // eager.
+        for t in [130u32, 131, 132, 260, 261, 262] {
+            c.skip_to(t);
+            let (d, tf) = expect_at(t).expect("in range");
+            assert_eq!(c.current_doc_id(), d, "target {t}");
+            assert_eq!(c.current_tf(), tf, "target {t}");
+        }
+        assert!(c.dense_streak >= 2, "premise: the streak is eager");
+        assert_eq!(c.lazy_bit, u32::MAX, "an eager cursor holds no lazy doc");
+        // Now exactly one skip per block (every doc carries the term, so
+        // a block is `BLOCK_LEN` docs): the retry fires within the budget.
+        let mut crossings_until_retry = 0u32;
+        let mut t = c.current_doc_id() + BLOCK_LEN as u32;
+        loop {
+            c.skip_to(t);
+            crossings_until_retry += 1;
+            let (d, tf) = expect_at(t).expect("in range");
+            assert_eq!(c.current_doc_id(), d, "target {t}");
+            assert_eq!(c.current_tf(), tf, "target {t}");
+            if c.lazy_bit != u32::MAX {
+                break;
+            }
+            assert!(
+                crossings_until_retry <= u32::from(EAGER_RETRY_BLOCKS) + 1,
+                "no lazy retry within {EAGER_RETRY_BLOCKS} block crossings"
+            );
+            t += BLOCK_LEN as u32;
+        }
+        // And the walk continues correctly out of the lazily held block.
+        let start = walked
+            .iter()
+            .position(|(d, _)| *d == c.current_doc_id())
+            .expect("landed doc is a posting");
+        for &(wd, wtf) in walked[start..].iter().take(300) {
+            assert_eq!(c.current_doc_id(), wd);
+            assert_eq!(c.current_tf(), wtf);
+            c.next();
+        }
     }
 }

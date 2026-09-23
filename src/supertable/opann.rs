@@ -27,8 +27,8 @@
 //! re-spliced with [`encode_encoded_rows`], never decoded to full fp32 corpora.
 
 use std::{
-    cmp::Ordering,
-    collections::HashMap,
+    cmp::{Ordering, Reverse},
+    collections::{BinaryHeap, HashMap},
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicU32, Ordering as AtomicOrdering},
@@ -44,7 +44,10 @@ use crate::{
             relative_score_window,
         },
         kmeans::{kmeans, kmeans_pp},
-        quant::BitQuantizer,
+        quant::{
+            BitQuantizer, LutQuery, build_transposed_code_cache, for_each_code_block_scores,
+            lut_scan_supported,
+        },
         reader::CellFineCalibrationView,
         reservoir::Reservoir,
         rotation::RandomRotation,
@@ -908,6 +911,13 @@ const RERANK_LAW_EST_BINS: usize = 4096;
 const WIDTH_LAW_SAMPLE_SEED: u64 = 0x51ED_CA1B;
 /// Rows decoded per chunk while scoring a spilled cell.
 const WIDTH_LAW_SCORE_CHUNK: usize = 1024;
+/// Per-query survivor cap for the 1-bit-gated width sweep's pass-1 shortlist.
+/// Pass 1 keeps the top-CAP rows by 1-bit estimate per query; pass 2 exact-
+/// rescores only those. The cap must comfortably exceed each query's exact
+/// top-`WIDTH_LAW_MAX_K` survivor budget (the measured `rerank_for_k`, which
+/// grows ~sqrt(N)); set generously here and validated by law-parity against
+/// the exhaustive sweep. Bounds pass-1 memory at `Q * CAP` candidates.
+const WIDTH_LAW_SHORTLIST_CAP: usize = 8192;
 
 /// Frozen query sample: dequantized fp32 vectors + their stable ids
 /// (self-hit exclusion while scoring).
@@ -959,6 +969,13 @@ pub(crate) struct WidthLawCalibration {
     /// propagated: each merge is an atomic append+truncate, so a panicked
     /// pack worker leaves the held data usable.
     tops: Mutex<Vec<Vec<(f32, u32, i128, f32)>>>,
+    /// 1-bit-gated width sweep, pass-1 shortlist: per query, the top
+    /// `WIDTH_LAW_SHORTLIST_CAP` `(estimate, cell, stable id)` candidates by
+    /// 1-bit estimate. Pass 2 ([`Self::score_survivors`]) exact-rescores only
+    /// these into `tops`, so the exhaustive O(N * Q) fp32 sweep collapses to a
+    /// cheap O(N * Q) estimate pass plus an O(shortlist * Q) exact pass. Empty
+    /// unless the gated path is armed; the exact path leaves it untouched.
+    est_tops: Mutex<Vec<BinaryHeap<Reverse<EstCand>>>>,
     /// `(query index, stable id, cell) -> fine-centroid rank` of that
     /// candidate's fine cluster within THAT cell, recorded by
     /// [`Self::observe_shard_views`] after each shard is packed (fine
@@ -999,6 +1016,12 @@ pub(crate) struct WidthLawCalibration {
 /// [`finish`]: WidthLawCalibration::finish
 struct RerankLawObservation {
     quant: BitQuantizer,
+    /// One FastScan LUT per query (folded from `q_rot`), so the 1-bit-gated
+    /// width sweep's pass-1 shortlist scores 64 rows per SIMD permute instead
+    /// of one scalar estimate per (row, query). Empty when the FastScan path is
+    /// unsupported on this target, or a query's LUT overflows i16 — the pass-1
+    /// scalar fallback covers both.
+    luts: Vec<LutQuery>,
     /// Flat `n_queries x dim` rotated queries.
     q_rot: Vec<f32>,
     /// Per query `Σ q_rot[d]` — the estimator's per-query identity term.
@@ -1345,6 +1368,7 @@ impl WidthLawCalibration {
             dequant_scratch: vec![0f32; dim],
             frozen: None,
             tops: Mutex::new(Vec::new()),
+            est_tops: Mutex::new(Vec::new()),
             fine_ranks: Mutex::new(HashMap::new()),
             max_fine: AtomicU32::new(0),
             pool_cells: RERANK_LAW_POOL_CELLS,
@@ -1383,6 +1407,8 @@ impl WidthLawCalibration {
         let ids = self.slot_ids.clone();
         let n_queries = ids.len();
         *self.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![Vec::new(); n_queries];
+        *self.est_tops.lock().unwrap_or_else(PoisonError::into_inner) =
+            (0..n_queries).map(|_| BinaryHeap::new()).collect();
         if n_queries > 0 && grid.n_cent > 0 {
             let rotation = RandomRotation::new(self.dim, rot_seed);
             let mut q_rot = vec![0f32; n_queries * self.dim];
@@ -1403,8 +1429,19 @@ impl WidthLawCalibration {
                 pool.sort_unstable();
                 pools.push(pool);
             }
+            // Fold each rotated query into a FastScan LUT once (pass-1 shortlist
+            // scores 64 rows/permute against these). Empty when unsupported on
+            // this target; the scalar pass-1 fallback covers that.
+            let luts: Vec<LutQuery> = if lut_scan_supported() {
+                (0..n_queries)
+                    .map(|qi| LutQuery::new(&q_rot[qi * self.dim..(qi + 1) * self.dim]))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             self.rerank = Some(RerankLawObservation {
                 quant: BitQuantizer::new(self.dim),
+                luts,
                 q_rot,
                 q_total,
                 q_l1,
@@ -1451,9 +1488,12 @@ impl WidthLawCalibration {
         Ok(())
     }
 
-    /// [`Self::score_cell`] for already-materialized rows: the compaction
-    /// recalibration pass reads live rows back from stored superfiles
-    /// (no spill exists), then scores them through the same core.
+    /// [`Self::score_cell`] for already-materialized rows: an exhaustive fp32
+    /// score of every row through the same core. The recalibration sweep now
+    /// gates with the cheap 1-bit estimate (`shortlist_rows` + `score_survivors`)
+    /// instead; this exhaustive path is retained as the reference oracle the
+    /// gate's law-parity test scores against.
+    #[cfg(test)]
     pub(crate) fn score_rows(
         &self,
         cell: u32,
@@ -1485,6 +1525,303 @@ impl WidthLawCalibration {
         }
         self.merge_partial(partial, hist_local);
         Ok(())
+    }
+
+    /// Pass 1 of the 1-bit-gated width sweep: score every row's 1-bit estimate
+    /// against ALL frozen queries (cheap XOR+popcount, no fp32 rescore) and
+    /// keep, per query, the top-[`WIDTH_LAW_SHORTLIST_CAP`] `(estimate, cell,
+    /// stable id)` survivors. Also feeds the rerank-law histogram over pooled
+    /// queries, exactly as [`Self::score_slice`] does, so the rerank budget is
+    /// measured on the full estimate distribution (not just survivors). The
+    /// exact top-k the width law needs is produced by [`Self::score_survivors`]
+    /// (pass 2) rescoring only the survivors. Requires the rerank machinery
+    /// (rotated queries + quantizer); with it absent the caller must use the
+    /// exhaustive [`Self::score_rows`] path instead.
+    ///
+    /// A row whose 1-bit code is missing or yields a non-finite estimate is
+    /// admitted to every query's shortlist with an `INFINITY` key
+    /// (conservative — pass 2 places it by exact distance): such unrankable
+    /// rows sort ahead of every finite estimate and so survive eviction as
+    /// long as a query's unrankable count stays within
+    /// `WIDTH_LAW_SHORTLIST_CAP`. Only if a single query accumulates more than
+    /// CAP unrankable candidates (pervasive code corruption) can the cap-bounded
+    /// heap evict some by their `(cell, id)` tie-break — the one case the gate
+    /// can drop a row the exhaustive path would have scored; the wide CAP keeps
+    /// this far outside normal corpora.
+    pub(crate) fn shortlist_rows(&self, cell: u32, rows: &[MaterializedIvfRow]) {
+        let Some(frozen) = self.frozen.as_ref() else {
+            return;
+        };
+        let n_queries = frozen.ids.len();
+        let Some(rl) = self.rerank.as_ref() else {
+            return;
+        };
+        if n_queries == 0 {
+            return;
+        }
+        let members = self.pool_members(cell);
+        let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
+        let mut local: Vec<BinaryHeap<Reverse<EstCand>>> =
+            (0..n_queries).map(|_| BinaryHeap::new()).collect();
+        let code_bytes = rl.quant.code_bytes();
+        let cnt = rows.len();
+        // FastScan LUT path: fold each query once (done at freeze), transpose
+        // this cell's codes once, then score 64 rows per SIMD permute per query
+        // — vastly cheaper than one scalar estimate per (row, query). Requires
+        // the LUTs built (target-supported) and every row carrying a code.
+        //
+        // The choice is per cell, so a query's global shortlist can mix
+        // FastScan (LUT-quantized) estimates from all-coded cells with scalar
+        // estimates from cells that fell back (a missing code). Both approximate
+        // the same dot; the divergence is bounded by LUT quantization and only
+        // affects which candidates survive eviction near the (wide) cap — never
+        // the pass-2 exact rescore, and so never the laws while survivors cover
+        // the deepest law k.
+        let use_fast =
+            !rl.luts.is_empty() && rows.iter().all(|r| r.rabitq_code.len() == code_bytes);
+        if use_fast {
+            let mut codes = Vec::with_capacity(cnt * code_bytes);
+            for r in rows {
+                codes.extend_from_slice(&r.rabitq_code);
+            }
+            let cache = build_transposed_code_cache(&codes, cnt, code_bytes);
+            for (qi, local_q) in local.iter_mut().enumerate() {
+                let self_id = frozen.ids[qi];
+                let is_member = members.binary_search(&qi).is_ok();
+                if rl.luts[qi].fits_i16() {
+                    let out = &mut *local_q;
+                    let mut bins = is_member.then(|| vec![0u64; RERANK_LAW_EST_BINS]);
+                    for_each_code_block_scores(&cache, code_bytes, &rl.luts[qi], |base, scores| {
+                        let n = (cnt - base).min(scores.len());
+                        for (lane, &fs_est) in scores.iter().enumerate().take(n) {
+                            let row = &rows[base + lane];
+                            if row.stable_id == self_id {
+                                continue;
+                            }
+                            // Shortlist selection ranks by the cheap FastScan
+                            // estimate (higher = nearer; INFINITY = unrankable,
+                            // admitted conservatively).
+                            let short_est = if fs_est.is_finite() {
+                                fs_est
+                            } else {
+                                f32::INFINITY
+                            };
+                            push_bounded(
+                                out,
+                                EstCand {
+                                    est: short_est,
+                                    cell,
+                                    id: row.stable_id,
+                                },
+                                WIDTH_LAW_SHORTLIST_CAP,
+                            );
+                            // The rerank histogram bins the SCALAR estimate — the
+                            // same estimator the pass-2 candidate carries and the
+                            // exhaustive path uses — so finish()'s survivor-rank
+                            // lookup is consistent (FastScan's i8-quantized bins
+                            // would diverge). Members-only (bins is Some).
+                            if let Some(b) = bins.as_mut() {
+                                let s = rl.quant.estimate_dot_rotated_with_total(
+                                    &rl.q_rot[qi * self.dim..(qi + 1) * self.dim],
+                                    &row.rabitq_code,
+                                    rl.q_total[qi],
+                                );
+                                if s.is_finite() {
+                                    let bin = rl.bin(qi, s);
+                                    b[bin] = b[bin].saturating_add(1);
+                                }
+                            }
+                        }
+                    });
+                    if let Some(b) = bins {
+                        hist_local.insert(qi, b);
+                    }
+                } else {
+                    // Rare: this query's folded LUT overflows i16 — scalar for it.
+                    let q_rot = &rl.q_rot[qi * self.dim..(qi + 1) * self.dim];
+                    let mut bins = is_member.then(|| vec![0u64; RERANK_LAW_EST_BINS]);
+                    for row in rows {
+                        if row.stable_id == self_id {
+                            continue;
+                        }
+                        let raw = rl.quant.estimate_dot_rotated_with_total(
+                            q_rot,
+                            &row.rabitq_code,
+                            rl.q_total[qi],
+                        );
+                        let est = if raw.is_finite() {
+                            if let Some(b) = bins.as_mut() {
+                                let bin = rl.bin(qi, raw);
+                                b[bin] = b[bin].saturating_add(1);
+                            }
+                            raw
+                        } else {
+                            f32::INFINITY
+                        };
+                        push_bounded(
+                            local_q,
+                            EstCand {
+                                est,
+                                cell,
+                                id: row.stable_id,
+                            },
+                            WIDTH_LAW_SHORTLIST_CAP,
+                        );
+                    }
+                    if let Some(b) = bins {
+                        hist_local.insert(qi, b);
+                    }
+                }
+            }
+        } else {
+            // Scalar fallback (LUTs unbuilt on this target, or a row lacks a
+            // code): row-major, one estimate per (row, query).
+            for row in rows.iter() {
+                let has_code = row.rabitq_code.len() == code_bytes;
+                for (qi, local_q) in local.iter_mut().enumerate() {
+                    if row.stable_id == frozen.ids[qi] {
+                        continue;
+                    }
+                    let est = if !has_code {
+                        f32::INFINITY
+                    } else {
+                        let raw = rl.quant.estimate_dot_rotated_with_total(
+                            &rl.q_rot[qi * self.dim..(qi + 1) * self.dim],
+                            &row.rabitq_code,
+                            rl.q_total[qi],
+                        );
+                        if raw.is_finite() {
+                            if members.binary_search(&qi).is_ok() {
+                                let bins = hist_local
+                                    .entry(qi)
+                                    .or_insert_with(|| vec![0u64; RERANK_LAW_EST_BINS]);
+                                let bin = rl.bin(qi, raw);
+                                bins[bin] = bins[bin].saturating_add(1);
+                            }
+                            raw
+                        } else {
+                            f32::INFINITY
+                        }
+                    };
+                    push_bounded(
+                        local_q,
+                        EstCand {
+                            est,
+                            cell,
+                            id: row.stable_id,
+                        },
+                        WIDTH_LAW_SHORTLIST_CAP,
+                    );
+                }
+            }
+        }
+        // Drain the per-cell bounded heaps into the global per-query shortlists
+        // (also bounded) — O(cap log cap) per query, no sorts.
+        {
+            let mut tops = self.est_tops.lock().unwrap_or_else(PoisonError::into_inner);
+            for (qi, heap) in local.into_iter().enumerate() {
+                for Reverse(cand) in heap {
+                    push_bounded(&mut tops[qi], cand, WIDTH_LAW_SHORTLIST_CAP);
+                }
+            }
+        }
+        if !hist_local.is_empty() {
+            let mut hist = rl.hist.lock().unwrap_or_else(PoisonError::into_inner);
+            for (qi, delta) in hist_local {
+                let slot = &mut hist[qi];
+                if slot.is_empty() {
+                    *slot = delta;
+                } else {
+                    for (a, b) in slot.iter_mut().zip(delta) {
+                        *a = a.saturating_add(b);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pass-1 survivor set, reorganized by cell: `cell -> stable id -> the
+    /// queries that shortlisted it`. Consumed once between the two passes;
+    /// pass 2 loads each cell and exact-rescores only the rows named here.
+    pub(crate) fn survivors_by_cell(&self) -> HashMap<u32, HashMap<i128, Vec<usize>>> {
+        let est_tops = self.est_tops.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut out: HashMap<u32, HashMap<i128, Vec<usize>>> = HashMap::new();
+        for (qi, heap) in est_tops.iter().enumerate() {
+            for Reverse(cand) in heap.iter() {
+                out.entry(cand.cell)
+                    .or_default()
+                    .entry(cand.id)
+                    .or_default()
+                    .push(qi);
+            }
+        }
+        out
+    }
+
+    /// Pass 2 of the 1-bit-gated width sweep: exact-rescore only the pass-1
+    /// survivors of one cell into `tops`, so `finish` derives every law from
+    /// exhaustive-quality exact distances over a candidate set the cheap
+    /// estimate pass pre-narrowed. `survivors` is the entry for this cell from
+    /// [`Self::survivors_by_cell`]. Scores each surviving row exactly against
+    /// only the queries that shortlisted it; the shared [`merge_candidates`]
+    /// then dedups boundary replicas by stable id to their best exact copy,
+    /// identical to the exhaustive path's merge.
+    pub(crate) fn score_survivors(
+        &self,
+        cell: u32,
+        rows: &[MaterializedIvfRow],
+        survivors: &HashMap<i128, Vec<usize>>,
+    ) {
+        let Some(frozen) = self.frozen.as_ref() else {
+            return;
+        };
+        let n_queries = frozen.ids.len();
+        if n_queries == 0 || survivors.is_empty() {
+            return;
+        }
+        let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
+        let mut scratch = vec![0f32; self.dim];
+        // Each candidate carries its own 1-bit estimate so `finish` can read
+        // its survivor rank — but ONLY for queries whose distractor pool
+        // contains this cell (the exhaustive `score_slice` leaves all others
+        // NEG_INFINITY, unrankable-conservative); the est field must match
+        // that exactly or the rerank law diverges from the exhaustive sweep.
+        let members = self.pool_members(cell);
+        let rl = self.rerank.as_ref();
+        for row in rows {
+            let Some(query_indices) = survivors.get(&row.stable_id) else {
+                continue;
+            };
+            let has_code = rl.is_some_and(|r| row.rabitq_code.len() == r.quant.code_bytes());
+            dequantize_row_into(&row.encoded, &mut scratch);
+            if self.metric == Metric::Cosine {
+                normalize(&mut scratch);
+            }
+            for &qi in query_indices {
+                // Self-hit already excluded from the shortlist, but guard again
+                // so a stale id can never occupy a query's own slot.
+                if row.stable_id == frozen.ids[qi] {
+                    continue;
+                }
+                let est = match (has_code, rl) {
+                    (true, Some(rl)) if members.binary_search(&qi).is_ok() => {
+                        let q_rot = &rl.q_rot[qi * self.dim..(qi + 1) * self.dim];
+                        let e = rl.quant.estimate_dot_rotated_with_total(
+                            q_rot,
+                            &row.rabitq_code,
+                            rl.q_total[qi],
+                        );
+                        if e.is_finite() { e } else { f32::NEG_INFINITY }
+                    }
+                    _ => f32::NEG_INFINITY,
+                };
+                let q = &frozen.queries[qi * self.dim..(qi + 1) * self.dim];
+                partial[qi].push((distance(self.metric, q, &scratch), cell, row.stable_id, est));
+            }
+        }
+        // The gated path derives the rerank histogram in pass 1, so pass 2
+        // merges only the exact top-k candidates (empty histogram delta).
+        self.merge_partial(partial, HashMap::new());
     }
 
     /// One-lock merge of a cell's scored partials into the per-query
@@ -1945,6 +2282,55 @@ fn truncate_ascending(cand: &mut Vec<(f32, u32, i128, f32)>, cap: usize) {
     }
 }
 
+/// One pass-1 shortlist candidate, ordered by 1-bit estimate (higher = nearer).
+/// Total order (`total_cmp` then cell then id) so the bounded shortlist heap is
+/// deterministic across runs. `INFINITY` (unrankable/conservative admit) sorts
+/// to the top and is therefore always retained.
+#[derive(Clone, Copy)]
+pub(crate) struct EstCand {
+    est: f32,
+    cell: u32,
+    id: i128,
+}
+
+impl PartialEq for EstCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for EstCand {}
+impl PartialOrd for EstCand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for EstCand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.est
+            .total_cmp(&other.est)
+            .then_with(|| self.cell.cmp(&other.cell))
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+/// Bounded top-`cap`-by-estimate shortlist, held as a min-heap (`Reverse`) so
+/// the smallest kept estimate is at the top and evicted first. O(log cap) per
+/// candidate, no sorting — replaces the sort-truncate that profiled as 98% of
+/// the gate's cost.
+fn push_bounded(heap: &mut BinaryHeap<Reverse<EstCand>>, cand: EstCand, cap: usize) {
+    if cap == 0 {
+        return;
+    }
+    if heap.len() < cap {
+        heap.push(Reverse(cand));
+    } else if let Some(Reverse(min)) = heap.peek()
+        && cand > *min
+    {
+        heap.pop();
+        heap.push(Reverse(cand));
+    }
+}
+
 /// Two-centroid (`k = 2`) test-only wrapper over [`plan_sq8_split_kway`],
 /// returning the two-centroid / `u8`-assignment shape the split unit tests
 /// were written against. The production split path calls
@@ -2264,6 +2650,191 @@ mod tests {
         assert_eq!(&laws.fine_for_k[2..], &[0, 0], "unsupported points stay 0");
     }
 
+    /// The 1-bit-gated width sweep (pass 1 `shortlist_rows` + pass 2
+    /// `score_survivors`) must produce laws byte-identical to the exhaustive
+    /// `score_rows` sweep whenever the shortlist cap exceeds the row count —
+    /// then every row is admitted, so pass 2 exact-rescores exactly the set the
+    /// exhaustive path scored. Runs every metric: the estimate orientation and
+    /// the exact rescore both differ by metric, so parity must hold for each.
+    #[test]
+    fn one_bit_gate_matches_exhaustive_when_cap_covers_all_rows() {
+        const DIM: usize = 8;
+        const N_CELLS: usize = 4;
+        const ROWS_PER_CELL: usize = 30; // 120 rows << WIDTH_LAW_SHORTLIST_CAP
+        const { assert!(N_CELLS * ROWS_PER_CELL < WIDTH_LAW_SHORTLIST_CAP) };
+
+        // A grid whose centroids point along rotating axis pairs, so
+        // `rank_cells` gives every query a non-trivial cell order.
+        let mut cents = vec![0f32; N_CELLS * DIM];
+        for c in 0..N_CELLS {
+            cents[c * DIM + c] = 1.0;
+            cents[c * DIM + (c + 1) % DIM] = 0.5;
+        }
+        let grid = ClusterCentroids::from_fp32(
+            N_CELLS as u32,
+            DIM as u32,
+            &cents,
+            vec![ROWS_PER_CELL as u32; N_CELLS],
+        );
+
+        let scale: Arc<[f32]> = Arc::from(vec![1.0f32; DIM]);
+        let offset: Arc<[f32]> = Arc::from(vec![0.0f32; DIM]);
+        let make_row = |stable_id: i128, cell: u32, seed: u32| {
+            let codes: Vec<u8> = (0..DIM)
+                .map(|d| ((seed.wrapping_mul(131).wrapping_add(d as u32 * 17)) % 200 + 20) as u8)
+                .collect();
+            MaterializedIvfRow {
+                local_doc_id: stable_id as u32,
+                stable_id,
+                cluster: cell,
+                // code_bytes = DIM/8 = 1; a varied byte gives varied estimates.
+                rabitq_code: vec![(seed % 251) as u8],
+                encoded: EncodedCellRow {
+                    stable_id,
+                    rerank_codec: RerankCodec::Sq8FixedResidual,
+                    scale: Arc::clone(&scale),
+                    offset: Arc::clone(&offset),
+                    codes,
+                    residuals: vec![0u8; DIM],
+                    norm_sq: Some(1.0),
+                },
+            }
+        };
+
+        // Scored rows, grouped by cell; distinct ids from the query ids below.
+        let per_cell: Vec<(u32, Vec<MaterializedIvfRow>)> = (0..N_CELLS)
+            .map(|c| {
+                let rows = (0..ROWS_PER_CELL)
+                    .map(|i| {
+                        let id = (c * 1000 + i + 1) as i128;
+                        make_row(id, c as u32, (c * 1000 + i + 1) as u32)
+                    })
+                    .collect();
+                (c as u32, rows)
+            })
+            .collect();
+        // A handful of query rows (offered → frozen queries), ids well clear of
+        // the scored ids so no self-hit masks a candidate.
+        let query_rows: Vec<MaterializedIvfRow> = (0..6)
+            .map(|q| {
+                make_row(
+                    (900_000 + q) as i128,
+                    (q % N_CELLS) as u32,
+                    (7 + q * 1000) as u32,
+                )
+            })
+            .collect();
+
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let build = || {
+                let mut cal = WidthLawCalibration::new(DIM, metric, shipped_target_recall());
+                for qr in &query_rows {
+                    cal.offer(qr);
+                }
+                cal.freeze(&grid, 0x1234_5678, RERANK_LAW_POOL_CELLS);
+                cal
+            };
+
+            // Exhaustive path.
+            let cal_a = build();
+            for (cell, rows) in &per_cell {
+                cal_a
+                    .score_rows(*cell, rows)
+                    .expect("exhaustive score_rows");
+            }
+            let laws_a = cal_a.finish(&grid).expect("exhaustive laws");
+
+            // Gated two-pass path.
+            let cal_b = build();
+            for (cell, rows) in &per_cell {
+                cal_b.shortlist_rows(*cell, rows);
+            }
+            let survivors = cal_b.survivors_by_cell();
+            for (cell, rows) in &per_cell {
+                if let Some(s) = survivors.get(cell) {
+                    cal_b.score_survivors(*cell, rows, s);
+                }
+            }
+            let laws_b = cal_b.finish(&grid).expect("gated laws");
+
+            assert_eq!(
+                laws_a.width_for_k, laws_b.width_for_k,
+                "width law diverged under the gate ({metric:?})"
+            );
+            assert_eq!(
+                laws_a.rerank_for_k, laws_b.rerank_for_k,
+                "rerank law diverged under the gate ({metric:?})"
+            );
+            assert_eq!(
+                laws_a.fine_for_k, laws_b.fine_for_k,
+                "fine law diverged under the gate ({metric:?})"
+            );
+        }
+    }
+
+    /// The bounded-heap shortlist keeps exactly the top-`cap` candidates by
+    /// estimate, evicting the smallest — the eviction the parity test can't
+    /// reach (it runs with the cap above the row count so nothing is dropped).
+    /// A cap smaller than the input forces eviction; the survivors must be the
+    /// true top-`cap` an exact sort would keep, and `INFINITY` admits (missing
+    /// codes) must outrank every finite estimate.
+    #[test]
+    fn push_bounded_keeps_top_cap_and_retains_infinity() {
+        const CAP: usize = 5;
+        // Estimates in shuffled order, plus two INFINITY (unrankable) admits.
+        let ests = [
+            0.10f32,
+            0.90,
+            f32::INFINITY,
+            0.30,
+            0.70,
+            0.50,
+            0.20,
+            f32::INFINITY,
+            0.80,
+            0.40,
+        ];
+        let mut heap: BinaryHeap<Reverse<EstCand>> = BinaryHeap::new();
+        for (i, &est) in ests.iter().enumerate() {
+            push_bounded(
+                &mut heap,
+                EstCand {
+                    est,
+                    cell: 0,
+                    id: i as i128,
+                },
+                CAP,
+            );
+        }
+        assert_eq!(heap.len(), CAP, "heap must be bounded to the cap");
+
+        // Reference: the true top-CAP by the same total order.
+        let mut all: Vec<EstCand> = ests
+            .iter()
+            .enumerate()
+            .map(|(i, &est)| EstCand {
+                est,
+                cell: 0,
+                id: i as i128,
+            })
+            .collect();
+        all.sort_by(|a, b| b.cmp(a)); // descending
+        let expected: Vec<i128> = all[..CAP].iter().map(|c| c.id).collect();
+
+        let mut got: Vec<EstCand> = heap.into_iter().map(|Reverse(c)| c).collect();
+        got.sort_by(|a, b| b.cmp(a));
+        let got_ids: Vec<i128> = got.iter().map(|c| c.id).collect();
+        assert_eq!(got_ids, expected, "survivors must be the exact top-cap");
+
+        // Both INFINITY admits (ids 2 and 7) survived.
+        assert!(
+            got_ids.contains(&2) && got_ids.contains(&7),
+            "INFINITY admits must always be retained: {got_ids:?}"
+        );
+        // The largest finite estimate kept alongside them is 0.90 (id 1).
+        assert!(got_ids.contains(&1), "top finite estimate must survive");
+    }
+
     /// A stamped width beyond the calibration pool clears the rerank
     /// point (previous values were certified for narrower geometry and
     /// under-provision the wider one); widths within the pool keep it.
@@ -2307,6 +2878,7 @@ mod tests {
         // 0.5 (53 rows at-or-better). q_l1 = 1.0 makes bin() exact.
         let rl = RerankLawObservation {
             quant: BitQuantizer::new(DIM),
+            luts: Vec::new(),
             q_rot: vec![0.0; DIM],
             q_total: vec![0.0],
             q_l1: vec![1.0],

@@ -10,6 +10,7 @@ use std::{
     fmt::{self, Debug},
     path::PathBuf,
     sync::atomic::AtomicU64,
+    time::Duration,
 };
 
 use crate::supertable::manifest::SuperfileUri;
@@ -117,6 +118,26 @@ pub struct DiskCacheConfig {
     /// default threshold). Has no effect when
     /// `mmap_cold_threshold_secs == 0`.
     pub mmap_sweep_interval_secs: u64,
+    /// How long a background fill keeps yielding to foreground
+    /// queries that hold the same superfile's lazy reader before
+    /// it downloads anyway. Default 10 s.
+    ///
+    /// The fill yields so it does not compete for I/O with the
+    /// query that triggered it. Without a bound, a superfile under
+    /// continuous query load never goes idle, so the fill never
+    /// runs and the reader stays in its lazy state permanently —
+    /// holding the whole term dictionary and the doc-lengths tail
+    /// on the heap, per superfile, for the life of the process.
+    /// That state is also the slower one to query: reads are
+    /// per-block range fetches into fresh buffers rather than
+    /// slices of the mmap'd cache file.
+    ///
+    /// Promoting mid-query is safe — the fill writes a temp file
+    /// and swaps the cache entry, and an in-flight query keeps
+    /// reading through the `Arc` it already holds.
+    ///
+    /// [`Duration::MAX`] restores unbounded yielding.
+    pub promotion_defer_timeout: Duration,
     /// Pluggable eviction policy. Default: [`LruPolicy`].
     pub eviction: Box<dyn CacheEvictionPolicy>,
     /// Whether the cache's `SuperfileReader::open` calls
@@ -142,6 +163,11 @@ const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 const DEFAULT_MMAP_COLD_THRESHOLD_SECS: u64 = 300;
 /// Default background mmap-sweep period (seconds, ≈ threshold / 4).
 const DEFAULT_MMAP_SWEEP_INTERVAL_SECS: u64 = 75;
+/// Default window a background fill yields to same-superfile foreground
+/// queries before promoting anyway. Long enough that a short burst of
+/// queries is served without a competing download; short enough that a
+/// sustained workload still reaches the mmap-backed state quickly.
+pub(crate) const DEFAULT_PROMOTION_DEFER_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Default for DiskCacheConfig {
     fn default() -> Self {
@@ -154,6 +180,7 @@ impl Default for DiskCacheConfig {
             prefetch_concurrency: DEFAULT_PREFETCH_CONCURRENCY,
             mmap_cold_threshold_secs: DEFAULT_MMAP_COLD_THRESHOLD_SECS,
             mmap_sweep_interval_secs: DEFAULT_MMAP_SWEEP_INTERVAL_SECS,
+            promotion_defer_timeout: DEFAULT_PROMOTION_DEFER_TIMEOUT,
             eviction: Box::new(LruPolicy::new()),
             verify_crc_on_open: true,
         }

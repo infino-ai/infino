@@ -224,6 +224,16 @@ impl Table for RemoteTable {
             .ok_or_else(|| InfinoError::Backend("count response missing `count`".to_string()))
     }
 
+    /// The hosted API has no tokenize operation yet. Refused rather than
+    /// approximated: a caller asking how the index reads a text and getting
+    /// some other rule's answer would have no way to tell.
+    fn tokenize(&self, column: &str, _text: &str) -> Result<Vec<String>, InfinoError> {
+        Err(InfinoError::Backend(format!(
+            "tokenize({column:?}) is not available on a hosted table: the wire carries no \
+             tokenize operation"
+        )))
+    }
+
     fn vector_search(
         &self,
         column: &str,

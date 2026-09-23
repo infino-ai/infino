@@ -804,6 +804,83 @@ pub fn decode_block_tfs(bytes: &[u8], hdr: &BlockHeader, dest_tfs: &mut [u32]) {
 /// # Panics
 ///
 /// As [`decode_block`], minus the `dest_tfs` checks.
+/// The first set bit of a bitset block at or after `from`, as `(doc, rank)`
+/// where `rank` is the number of set bits before it — the doc's index in
+/// the block's tf array. `None` when no doc of the block is `>= from`.
+///
+/// A probe that skips into a bitset block needs one doc, not the 128 the
+/// full expansion writes; this scans the block's words from the target's
+/// word with a masked `trailing_zeros`, at most a handful of u64s.
+pub fn bitset_next_doc(bytes: &[u8], hdr: &BlockHeader, from: u32) -> Option<(u32, usize)> {
+    debug_assert_eq!(hdr.encoding, ENCODING_BITSET);
+    hdr.check_widths();
+    let tfs_size = hdr.tfs_size();
+    assert!(
+        bytes.len() >= hdr.payload() + tfs_size,
+        "bitset_next_doc: bytes shorter than header+tfs"
+    );
+    let words = &bytes[hdr.payload()..bytes.len() - tfs_size];
+    let bit = from.saturating_sub(hdr.base) as usize;
+    let first_word = bit / 64;
+    let mut rank = 0usize;
+    for (wi, chunk) in words.chunks_exact(8).enumerate() {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        if wi < first_word {
+            rank += word.count_ones() as usize;
+            continue;
+        }
+        let masked = match wi == first_word {
+            true => word & (u64::MAX << (bit % 64)),
+            false => word,
+        };
+        if masked != 0 {
+            let tz = masked.trailing_zeros();
+            rank += (word & !(u64::MAX << tz)).count_ones() as usize;
+            return Some((hdr.base + (wi as u32) * 64 + tz, rank));
+        }
+        rank += word.count_ones() as usize;
+    }
+    None
+}
+
+/// One tf out of a bitset block without unpacking the other 127: the tf of
+/// the doc with set-bit index `rank`. Bitset blocks carry plain packed tfs
+/// (never patched). `BitPacker4x` interleaves four 32-bit lanes: value `i`
+/// lives in lane `i % 4` at bit `(i / 4) * width` of that lane's stream,
+/// whose 32-bit words sit at every fourth word of the payload.
+///
+/// For a *walk* over a block the full unpack into the tf array wins (one
+/// unpack serves every doc); this is for a *probe* that touches one doc.
+pub fn bitset_tf_at(bytes: &[u8], hdr: &BlockHeader, rank: usize) -> u32 {
+    debug_assert_eq!(hdr.encoding, ENCODING_BITSET);
+    debug_assert!(rank < BLOCK_LEN);
+    hdr.check_widths();
+    let width = usize::from(hdr.tf_bits);
+    if width == 0 {
+        return 0;
+    }
+    let tfs_size = hdr.tfs_size();
+    assert!(
+        bytes.len() >= hdr.payload() + tfs_size,
+        "bitset_tf_at: bytes shorter than header+tfs"
+    );
+    let packed = &bytes[bytes.len() - tfs_size..];
+    let lane = rank % 4;
+    let bit = (rank / 4) * width;
+    let word = |w: usize| -> u64 {
+        let at = (w * 4 + lane) * 4;
+        u64::from(u32::from_le_bytes(
+            packed[at..at + 4].try_into().expect("4 bytes"),
+        ))
+    };
+    let shift = bit % 32;
+    let mut v = word(bit / 32) >> shift;
+    if shift + width > 32 {
+        v |= word(bit / 32 + 1) << (32 - shift);
+    }
+    (v & ((1u64 << width) - 1)) as u32
+}
+
 pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut [u32]) -> usize {
     hdr.check_widths();
     assert!(
@@ -1054,6 +1131,94 @@ mod tests {
             assert_eq!(hdr.base, 64, "{layout:?} origin");
             assert_eq!(hdr.delta_bits, 0);
         }
+    }
+
+    #[test]
+    fn bitset_probe_helpers_agree_with_the_full_expansion() {
+        // A dense block with a gap pattern: every target between the base
+        // and past the last doc must resolve to the same (doc, rank) the
+        // expanded arrays give, and the lane read must equal the unpacked tf
+        // for every width the packer produces.
+        let doc_ids: Vec<u32> = (0..128u32).map(|i| 1000 + i * 3 + (i % 5)).collect();
+        let doc_ids: Vec<u32> = {
+            let mut v = doc_ids;
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        for width in 0..=20u32 {
+            let cap = (1u64 << width) as u32;
+            let tfs: Vec<u32> = (0..doc_ids.len() as u32)
+                .map(|i| match width {
+                    0 => 1,
+                    _ => 1 + (i.wrapping_mul(2_654_435_761).wrapping_add(i * 7) % (cap - 1).max(1)),
+                })
+                .collect();
+            for layout in LAYOUTS {
+                let enc = encode_one(&block(&doc_ids, &tfs), layout, Some(900), true);
+                let hdr = BlockHeader::parse(&enc.bytes, layout, Some(900));
+                if hdr.encoding != ENCODING_BITSET {
+                    continue;
+                }
+                let mut ids = vec![0u32; BLOCK_LEN];
+                let mut got_tfs = vec![0u32; BLOCK_LEN];
+                let n = decode_block(&enc.bytes, &hdr, &mut ids, &mut got_tfs);
+                for target in (hdr.base - 5)..=(doc_ids[n - 1] + 3) {
+                    let want = ids[..n].iter().position(|&d| d >= target);
+                    let got = bitset_next_doc(&enc.bytes, &hdr, target);
+                    match want {
+                        None => assert!(got.is_none(), "{layout:?} target {target}"),
+                        Some(r) => {
+                            let (doc, rank) = got.expect("a doc >= target");
+                            assert_eq!((doc, rank), (ids[r], r), "{layout:?} target {target}");
+                            assert_eq!(bitset_tf_at(&enc.bytes, &hdr, rank), got_tfs[r]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "bit width > 32")]
+    fn bitset_probe_refuses_a_header_width_past_32() {
+        // A bitset block whose header claims tf width 33: the probe must
+        // fail the width check, not underflow the tf-size arithmetic.
+        let doc_ids: Vec<u32> = (256..384).collect();
+        let tfs = vec![1u32; 128];
+        let mut enc = encode_one(
+            &block(&doc_ids, &tfs),
+            BlockLayout::Compact,
+            Some(200),
+            false,
+        );
+        assert_eq!(block_encoding(&enc.bytes), ENCODING_BITSET);
+        let mut word = u32::from_le_bytes(enc.bytes[..4].try_into().expect("4 bytes"));
+        let mask = ((1u32 << HDR_WIDTH_BITS) - 1) << HDR_TF_BITS_SHIFT;
+        word = (word & !mask) | (33 << HDR_TF_BITS_SHIFT);
+        enc.bytes[..4].copy_from_slice(&word.to_le_bytes());
+        let hdr = BlockHeader::parse(&enc.bytes, BlockLayout::Compact, Some(200));
+        assert_eq!(hdr.tf_bits, 33);
+        let _ = bitset_next_doc(&enc.bytes, &hdr, 256);
+    }
+
+    #[test]
+    #[should_panic(expected = "bit width > 32")]
+    fn decoders_refuse_a_header_width_past_32() {
+        // The width check moved from every header parse to the decoders
+        // that consume the widths; a corrupt compact header still cannot
+        // reach an unpacker.
+        let doc_ids: Vec<u32> = (0..128u32).map(|i| 10 + i * 7).collect();
+        let tfs = vec![1u32; 128];
+        let mut enc = encode_one(&block(&doc_ids, &tfs), BlockLayout::Compact, None, false);
+        let mut word = u32::from_le_bytes(enc.bytes[..4].try_into().expect("4 bytes"));
+        let mask = ((1u32 << HDR_WIDTH_BITS) - 1) << HDR_DELTA_BITS_SHIFT;
+        word = (word & !mask) | (33 << HDR_DELTA_BITS_SHIFT);
+        enc.bytes[..4].copy_from_slice(&word.to_le_bytes());
+        let hdr = BlockHeader::parse(&enc.bytes, BlockLayout::Compact, None);
+        assert_eq!(hdr.delta_bits, 33, "the parse itself no longer rejects it");
+        let mut ids = vec![0u32; BLOCK_LEN];
+        decode_block_doc_ids(&enc.bytes, &hdr, &mut ids);
     }
 
     #[test]
@@ -1575,5 +1740,186 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- Patched exceptions at their limits -----------------------------
+
+    /// Gap and tf the outlier lanes take in the exception-limit blocks.
+    const LIMIT_OUTLIER_GAP: u32 = 1 << 20;
+    const LIMIT_OUTLIER_TF: u32 = 900;
+    /// The doc the exception-limit blocks follow: one below their first
+    /// doc, so lane 0's delta is 1 like every non-outlier lane.
+    const LIMIT_PREV_LAST_DOC: u32 = 1000;
+    /// A word-aligned base for the bitset-edge block.
+    const WORD_ALIGNED_BASE: u32 = 1024;
+
+    /// A block of 128 lanes one apart and tf 1, except the listed
+    /// outlier lanes (a wide gap, a large tf, or both on one lane).
+    fn outlier_block(delta_lanes: &[usize], tf_lanes: &[usize]) -> Block {
+        let mut doc_ids = Vec::with_capacity(BLOCK_LEN);
+        let mut d = 1000u32;
+        for lane in 0..BLOCK_LEN {
+            d += if delta_lanes.contains(&lane) {
+                LIMIT_OUTLIER_GAP
+            } else {
+                1
+            };
+            doc_ids.push(d);
+        }
+        let tfs: Vec<u32> = (0..BLOCK_LEN)
+            .map(|lane| {
+                if tf_lanes.contains(&lane) {
+                    LIMIT_OUTLIER_TF
+                } else {
+                    1
+                }
+            })
+            .collect();
+        block(&doc_ids, &tfs)
+    }
+
+    /// Exceptions in both streams at once, on shared and distinct lanes,
+    /// round-trip and are counted separately in the header. A decoder
+    /// that patched one stream's exceptions into the other, or read the
+    /// tf exceptions from where the delta exceptions end without
+    /// skipping them, would corrupt the lanes after the first exception.
+    #[test]
+    fn delta_and_tf_exceptions_coexist_in_one_block() {
+        let b = outlier_block(&[10, 50, 100], &[5, 50, 120]);
+        let enc = roundtrip_with(&b, BlockLayout::Compact, Some(LIMIT_PREV_LAST_DOC));
+        assert_eq!(block_encoding(&enc.bytes), ENCODING_PATCHED);
+        let hdr = BlockHeader::parse(&enc.bytes, BlockLayout::Compact, Some(LIMIT_PREV_LAST_DOC));
+        assert_eq!((hdr.n_delta_exc(), hdr.n_tf_exc()), (3, 3));
+        let (delta_exc, tf_exc) = patched_exception_ranges(&enc.bytes, &hdr);
+        assert!(!delta_exc.is_empty() && !tf_exc.is_empty());
+        // The wide layout never patches; the same block stays plain there.
+        let wide = roundtrip_with(&b, BlockLayout::Wide, Some(LIMIT_PREV_LAST_DOC));
+        assert_eq!(block_encoding(&wide.bytes), ENCODING_PACKED);
+    }
+
+    /// The exception count is a five-bit header field, so a stream may
+    /// carry at most `PATCHED_MAX_EXCEPTIONS` outliers: a block with
+    /// exactly that many patches, one more falls back to plain packing
+    /// at the outliers' width. Both decode to the planted lanes; an encoder
+    /// that admitted a 32nd exception would overflow the header field.
+    #[test]
+    fn patched_exceptions_stop_at_the_header_field_limit() {
+        let at_limit: Vec<usize> = (0..PATCHED_MAX_EXCEPTIONS).map(|i| 2 + 4 * i).collect();
+        let enc = roundtrip_with(
+            &outlier_block(&at_limit, &[]),
+            BlockLayout::Compact,
+            Some(LIMIT_PREV_LAST_DOC),
+        );
+        assert_eq!(block_encoding(&enc.bytes), ENCODING_PATCHED);
+        let hdr = BlockHeader::parse(&enc.bytes, BlockLayout::Compact, Some(LIMIT_PREV_LAST_DOC));
+        assert_eq!(hdr.n_delta_exc(), PATCHED_MAX_EXCEPTIONS);
+
+        let past: Vec<usize> = (0..=PATCHED_MAX_EXCEPTIONS).map(|i| 2 + 4 * i).collect();
+        let enc = roundtrip_with(
+            &outlier_block(&past, &[]),
+            BlockLayout::Compact,
+            Some(LIMIT_PREV_LAST_DOC),
+        );
+        assert_eq!(block_encoding(&enc.bytes), ENCODING_PACKED);
+
+        // The same limit on the tf stream.
+        let enc = roundtrip_with(
+            &outlier_block(&[], &at_limit),
+            BlockLayout::Compact,
+            Some(LIMIT_PREV_LAST_DOC),
+        );
+        assert_eq!(block_encoding(&enc.bytes), ENCODING_PATCHED);
+        let hdr = BlockHeader::parse(&enc.bytes, BlockLayout::Compact, Some(LIMIT_PREV_LAST_DOC));
+        assert_eq!(hdr.n_tf_exc(), PATCHED_MAX_EXCEPTIONS);
+        let enc = roundtrip_with(
+            &outlier_block(&[], &past),
+            BlockLayout::Compact,
+            Some(LIMIT_PREV_LAST_DOC),
+        );
+        assert_eq!(block_encoding(&enc.bytes), ENCODING_PACKED);
+    }
+
+    // --- Bitset probes at word edges ------------------------------------
+
+    /// The bitset probes at the docs that sit on 64-bit word edges: the
+    /// first and last bit of a word, and the two bits either side of a
+    /// word boundary. `bitset_next_doc` must not lose the last bit of a
+    /// word to the mask of the next, and the rank (the tf index) must
+    /// count every set bit of the earlier words. Absent docs on the
+    /// other side of each edge must resolve to the next present one.
+    #[test]
+    fn bitset_probes_resolve_docs_on_word_edges() {
+        // Present: the whole 128-doc range except four absent docs chosen
+        // next to the edges, so every edge has a present and an absent
+        // neighbour.
+        let absent = [
+            WORD_ALIGNED_BASE + 1,
+            WORD_ALIGNED_BASE + 62,
+            WORD_ALIGNED_BASE + 65,
+            WORD_ALIGNED_BASE + 126,
+        ];
+        let doc_ids: Vec<u32> = (WORD_ALIGNED_BASE..WORD_ALIGNED_BASE + BLOCK_LEN as u32)
+            .filter(|d| !absent.contains(d))
+            .collect();
+        let tfs: Vec<u32> = (0..doc_ids.len() as u32).map(|i| 1 + i % 7).collect();
+        let enc = encode_one(
+            &block(&doc_ids, &tfs),
+            BlockLayout::Compact,
+            Some(WORD_ALIGNED_BASE - 24),
+            true,
+        );
+        let hdr = BlockHeader::parse(
+            &enc.bytes,
+            BlockLayout::Compact,
+            Some(WORD_ALIGNED_BASE - 24),
+        );
+        assert_eq!(
+            hdr.encoding, ENCODING_BITSET,
+            "premise: a dense block is a bitset"
+        );
+        assert_eq!(
+            hdr.base, WORD_ALIGNED_BASE,
+            "premise: the origin is the first doc's word"
+        );
+        let rank_of = |doc: u32| doc_ids.iter().position(|&d| d == doc).expect("present");
+        for edge in [
+            WORD_ALIGNED_BASE,
+            WORD_ALIGNED_BASE + 63,
+            WORD_ALIGNED_BASE + 64,
+            WORD_ALIGNED_BASE + 127,
+        ] {
+            let rank = rank_of(edge);
+            assert_eq!(
+                bitset_next_doc(&enc.bytes, &hdr, edge),
+                Some((edge, rank)),
+                "edge doc {edge}"
+            );
+            assert_eq!(
+                bitset_tf_at(&enc.bytes, &hdr, rank),
+                tfs[rank],
+                "tf at edge doc {edge}"
+            );
+        }
+        // An absent doc just before an edge resolves to the edge doc.
+        for (from, next) in [
+            (WORD_ALIGNED_BASE + 62, WORD_ALIGNED_BASE + 63),
+            (WORD_ALIGNED_BASE + 126, WORD_ALIGNED_BASE + 127),
+        ] {
+            assert_eq!(
+                bitset_next_doc(&enc.bytes, &hdr, from),
+                Some((next, rank_of(next))),
+                "absent doc {from} resolves to {next}"
+            );
+        }
+        // An absent doc just after an edge resolves to the one after it.
+        assert_eq!(
+            bitset_next_doc(&enc.bytes, &hdr, WORD_ALIGNED_BASE + 65),
+            Some((WORD_ALIGNED_BASE + 66, rank_of(WORD_ALIGNED_BASE + 66)))
+        );
+        // Past the last bit: nothing.
+        assert_eq!(
+            bitset_next_doc(&enc.bytes, &hdr, WORD_ALIGNED_BASE + 128),
+            None
+        );
     }
 }

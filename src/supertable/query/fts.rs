@@ -134,9 +134,11 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        manifest::{ManifestSnapshot, SuperfileEntry},
+        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri},
         query::{
-            SuperfileHit, dispatch,
+            SuperfileHit,
+            candidate::CandidateScope,
+            dispatch,
             exec::common::{resolve_hits_named, take_rows_byte_source},
             prune::{PruneLeaf, select_superfiles},
         },
@@ -438,6 +440,25 @@ impl SupertableReader {
         k: usize,
         opts: Bm25SearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.bm25_search_scoped_async(column, query, k, opts, None)
+            .await
+    }
+
+    /// [`Self::bm25_search_async`] confined to a [`CandidateScope`] — what a
+    /// SQL `WHERE` pushed into the `bm25_search` / `hybrid_search` table
+    /// functions admits. Only the scope's superfiles are searched, and
+    /// under a bounded scope each superfile's kernel admits only its
+    /// candidate rows into the top-k heap, so the k hits are the k best
+    /// *among rows satisfying the predicate*, not the predicate applied to
+    /// a global top-k. `None` is the unscoped search.
+    pub(crate) async fn bm25_search_scoped_async(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        opts: Bm25SearchOptions,
+        scope: Option<&CandidateScope>,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -547,7 +568,19 @@ impl SupertableReader {
             terms: prune_terms,
             mode: prune_mode,
         };
-        let kept = select_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf)).await?;
+        let mut kept = select_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf)).await?;
+        // A pushed-down `WHERE` narrows the search to the superfiles its
+        // scope admits — the statistics survivors that still hold a
+        // candidate row. The global-idf gather below still probes every
+        // superfile the terms may live in, so idf stays table-wide and a
+        // scoped query ranks on the same scale as an unscoped one.
+        if let Some(scope) = scope {
+            let admitted: HashSet<Uuid> = scope
+                .admitted_superfiles()
+                .map(|e| e.superfile_id)
+                .collect();
+            kept.retain(|e| admitted.contains(&e.superfile_id));
+        }
         if kept.is_empty() {
             return Ok(Vec::new());
         }
@@ -602,17 +635,29 @@ impl SupertableReader {
         // clause stay on the un-ranged call.
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
         // Phrase-bearing queries stay per-superfile: the ranged
-        // kernel is the pure term-union fast path.
-        let fanout = match has_phrases {
+        // kernel is the pure term-union fast path. So does a search
+        // with a per-row scope — the ranged union kernel carries no
+        // admission gate, only the clause kernels do. A scope whose
+        // candidate sets admit every row of every kept superfile gates
+        // nothing, so it is dropped here and the fast path stays open.
+        let per_row_scope: Option<Arc<HashMap<SuperfileUri, Arc<RoaringBitmap>>>> = scope
+            .filter(|s| s.bounds_rows(&kept))
+            .and_then(|s| s.allow.clone())
+            .map(Arc::new);
+        let fanout = match has_phrases || per_row_scope.is_some() {
             true => FanOut::PerSuperfile,
             false => fanout_for(musts.len(), shoulds.len(), !negatives.is_empty()),
         };
         let work_units = build_work_units(&kept_refs, fanout, pool_threads);
-        let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, Uuid))> = work_units
+        let units: Vec<(
+            Arc<SuperfileEntry>,
+            (Option<(u32, u32)>, Uuid, SuperfileUri),
+        )> = work_units
             .into_iter()
             .map(|u| {
                 let suid = u.entry.superfile_id;
-                (u.entry, (u.range, suid))
+                let uri = u.entry.uri;
+                (u.entry, (u.range, suid, uri))
             })
             .collect();
 
@@ -658,214 +703,227 @@ impl SupertableReader {
         // tombstone-filters each unit's hits. The per-unit `params` is
         // the optional doc-id sub-range (`None` searches the whole
         // superfile) plus the superfile id for the tombstone-aware merge.
-        let kernel = move |r: Arc<SuperfileReader>, (range, suid): (Option<(u32, u32)>, Uuid)| {
-            let column_arc = Arc::clone(&column_arc);
-            let must_arc = Arc::clone(&must_arc);
-            let should_arc = Arc::clone(&should_arc);
-            let neg_arc = Arc::clone(&neg_arc);
-            let must_ph_arc = Arc::clone(&must_ph_arc);
-            let should_ph_arc = Arc::clone(&should_ph_arc);
-            let neg_ph_arc = Arc::clone(&neg_ph_arc);
-            let shared = Arc::clone(&shared);
-            let cursor_sets = Arc::clone(&cursor_sets);
-            let reader_pool = Arc::clone(&reader_pool);
-            let tombstones = tombstones.clone();
-            let global_idf = global_idf.clone();
-            let prefetch_memos = prefetch_memos.clone();
-            let op_stats = op_stats.clone();
-            async move {
-                // This superfile's open-wave fetches (global stats): the
-                // cursor builds below serve the scored terms from the memo
-                // instead of re-reading what the df wave already fetched.
-                let memo: Option<Arc<FetchedTermMemo>> =
-                    prefetch_memos.as_ref().and_then(|m| m.get(&suid)).cloned();
-                // Share the global kth-best floor with every superfile —
-                // single-term queries included — so each prunes its scored
-                // scan against the running top-k instead of returning a full
-                // local top-k for the merge to re-sort. Without this the
-                // fan-out churns ~(superfiles × k) candidates through the
-                // merge heap at large k, which dominates high-k latency.
-                // Ties stay correct: the floor prunes only scores strictly
-                // below the published kth-best (kernels compare via
-                // `floor.next_down()`), so the merged top-k — score ties
-                // included — matches an uncoordinated run; only the amount
-                // of skipped work depends on segment completion order.
-                let floor = shared.floor();
-                // The atom walks may also read the floor LIVE mid-walk and
-                // publish their own local kth into it — but a kernel heap
-                // is pre-tombstone-filter, so only a superfile with no
-                // tombstoned rows may participate: its local kth is a
-                // floor the merge (which sees only surviving scores) can
-                // never contradict. The sidecars were warmed by the
-                // dispatcher, so this lookup is an in-memory hit; on a
-                // miss/error the unit just keeps the snapshot floor.
-                let live_floor = match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
-                    Some(Ok(bitmap)) if !bitmap.is_empty() => None,
-                    Some(Err(_)) => None,
-                    _ => Some(shared.live_floor()),
-                };
-                let hits = match range {
-                    // Ranged units exist only for pure multi-should
-                    // queries (`fanout_for` never slices when a must
-                    // or negated clause exists).
-                    Some((start, end)) => {
-                        let cell = {
-                            let mut sets =
-                                cursor_sets.lock().expect("cursor-set map lock poisoned");
-                            Arc::clone(sets.entry(suid).or_default())
-                        };
-                        // The global idf is one map for the whole query, so
-                        // every slice of a superfile wants cursors built
-                        // with the same override — sharing the cursor set
-                        // across slices stays correct under global stats.
-                        let set = cell
-                            .get_or_try_init(|| async {
-                                let should_refs: Vec<&str> =
-                                    should_arc.iter().map(|s| s.as_str()).collect();
-                                let set = r
-                                    .bm25_or_cursor_set(
-                                        &column_arc,
-                                        &should_refs,
-                                        global_idf.as_deref(),
-                                        memo.as_deref(),
-                                    )
-                                    .await
-                                    .map_err(fts_read_error)?;
-                                // Flushed inside the OnceCell init so slices
-                                // sharing this superfile's cursor set count
-                                // its posting bytes exactly once.
-                                if let Some(stats) = &op_stats {
-                                    stats.add_fts_postings_bytes(set.postings_bytes());
-                                    stats.add_planned_read_ranges(set.planned_ranges());
-                                }
-                                Ok(Arc::new(set))
-                            })
-                            .await?;
-                        // Heavy kernels go to the reader pool; trivial ones
-                        // run inline where the oneshot round-trip would cost
-                        // more than the scan — see the gate's doc comment.
-                        if should_arc.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
-                            let kernel_reader = Arc::clone(&r);
-                            let kernel_set = Arc::clone(set);
-                            let kernel_stats = op_stats.clone();
-                            run_on_pool(
-                                Some(&reader_pool),
-                                "ranged fts kernel: reader pool dropped result",
-                                move || {
-                                    op_stats::timed_kernel(&kernel_stats, || {
-                                        kernel_reader.bm25_search_or_range_prebuilt(
-                                            &kernel_set,
-                                            k,
-                                            start,
-                                            end,
-                                            floor,
-                                            bm25_params,
+        let kernel =
+            move |r: Arc<SuperfileReader>,
+                  (range, suid, uri): (Option<(u32, u32)>, Uuid, SuperfileUri)| {
+                let column_arc = Arc::clone(&column_arc);
+                let must_arc = Arc::clone(&must_arc);
+                let should_arc = Arc::clone(&should_arc);
+                let neg_arc = Arc::clone(&neg_arc);
+                let must_ph_arc = Arc::clone(&must_ph_arc);
+                let should_ph_arc = Arc::clone(&should_ph_arc);
+                let neg_ph_arc = Arc::clone(&neg_ph_arc);
+                let shared = Arc::clone(&shared);
+                let cursor_sets = Arc::clone(&cursor_sets);
+                let reader_pool = Arc::clone(&reader_pool);
+                let tombstones = tombstones.clone();
+                let global_idf = global_idf.clone();
+                let prefetch_memos = prefetch_memos.clone();
+                let op_stats = op_stats.clone();
+                // This superfile's admitted rows under a bounded scope. `kept`
+                // holds only superfiles the scope admits, so the lookup
+                // succeeds; an absent entry would mean no row and is treated
+                // as exactly that rather than as "every row".
+                let allow: Option<Arc<RoaringBitmap>> = per_row_scope.as_ref().map(|rows| {
+                    rows.get(&uri)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(RoaringBitmap::new()))
+                });
+                async move {
+                    // This superfile's open-wave fetches (global stats): the
+                    // cursor builds below serve the scored terms from the memo
+                    // instead of re-reading what the df wave already fetched.
+                    let memo: Option<Arc<FetchedTermMemo>> =
+                        prefetch_memos.as_ref().and_then(|m| m.get(&suid)).cloned();
+                    // Share the global kth-best floor with every superfile —
+                    // single-term queries included — so each prunes its scored
+                    // scan against the running top-k instead of returning a full
+                    // local top-k for the merge to re-sort. Without this the
+                    // fan-out churns ~(superfiles × k) candidates through the
+                    // merge heap at large k, which dominates high-k latency.
+                    // Ties stay correct: the floor prunes only scores strictly
+                    // below the published kth-best (kernels compare via
+                    // `floor.next_down()`), so the merged top-k — score ties
+                    // included — matches an uncoordinated run; only the amount
+                    // of skipped work depends on segment completion order.
+                    let floor = shared.floor();
+                    // The atom walks may also read the floor LIVE mid-walk and
+                    // publish their own local kth into it — but a kernel heap
+                    // is pre-tombstone-filter, so only a superfile with no
+                    // tombstoned rows may participate: its local kth is a
+                    // floor the merge (which sees only surviving scores) can
+                    // never contradict. The sidecars were warmed by the
+                    // dispatcher, so this lookup is an in-memory hit; on a
+                    // miss/error the unit just keeps the snapshot floor.
+                    let live_floor = match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+                        Some(Ok(bitmap)) if !bitmap.is_empty() => None,
+                        Some(Err(_)) => None,
+                        _ => Some(shared.live_floor()),
+                    };
+                    let hits = match range {
+                        // Ranged units exist only for pure multi-should
+                        // queries (`fanout_for` never slices when a must
+                        // or negated clause exists).
+                        Some((start, end)) => {
+                            let cell = {
+                                let mut sets =
+                                    cursor_sets.lock().expect("cursor-set map lock poisoned");
+                                Arc::clone(sets.entry(suid).or_default())
+                            };
+                            // The global idf is one map for the whole query, so
+                            // every slice of a superfile wants cursors built
+                            // with the same override — sharing the cursor set
+                            // across slices stays correct under global stats.
+                            let set = cell
+                                .get_or_try_init(|| async {
+                                    let should_refs: Vec<&str> =
+                                        should_arc.iter().map(|s| s.as_str()).collect();
+                                    let set = r
+                                        .bm25_or_cursor_set(
+                                            &column_arc,
+                                            &should_refs,
+                                            global_idf.as_deref(),
+                                            memo.as_deref(),
                                         )
-                                    })
-                                },
-                            )
-                            .await
-                            .map_err(|e| QueryError::Execute(e.to_string()))?
-                            .map_err(fts_read_error)?
-                        } else {
-                            op_stats::timed_kernel(&op_stats, || {
-                                r.bm25_search_or_range_prebuilt(
-                                    set,
-                                    k,
-                                    start,
-                                    end,
-                                    floor,
-                                    bm25_params,
-                                )
-                            })
-                            .map_err(fts_read_error)?
-                        }
-                    }
-                    None => {
-                        let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
-                        let should_refs: Vec<&str> =
-                            should_arc.iter().map(|s| s.as_str()).collect();
-                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                        let prep = r
-                            .prepare_clauses(
-                                &column_arc,
-                                ClauseLists {
-                                    musts: &must_refs,
-                                    shoulds: &should_refs,
-                                    negatives: &neg_refs,
-                                    must_phrases: &must_ph_arc,
-                                    should_phrases: &should_ph_arc,
-                                    negative_phrases: &neg_ph_arc,
-                                    global_idf: global_idf.as_deref(),
-                                    prefetched: memo.as_deref(),
-                                    live_floor,
-                                },
-                                k,
-                                floor,
-                                bm25_params,
-                            )
-                            .await
-                            .map_err(fts_read_error)?;
-                        if let Some(stats) = &op_stats {
-                            stats.add_fts_postings_bytes(prep.postings_bytes());
-                            stats.add_planned_read_ranges(prep.planned_ranges());
-                            // Single-term / phrase shapes finish inside
-                            // `prepare_clauses`; their walk's on-CPU time
-                            // rides the `Done` (0 for cursor shapes, whose
-                            // kernels are bracketed below).
-                            stats.add_kernel_cpu_ns(prep.inline_kernel_cpu_ns());
-                        }
-                        match prep {
-                            // Already-final shapes: the walk (and its
-                            // kernel time) happened inside
-                            // `prepare_clauses`; `run_prepared` would be
-                            // a no-op move and the bracket two wasted
-                            // schedstat reads.
-                            PreparedClauses::Done { hits, .. } => hits,
-                            // Gate on posting mass, not term count: this
-                            // scan isn't sliced, so a rare-term query
-                            // with many terms can be cheaper than a
-                            // common-term pair.
-                            prep if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS => {
+                                        .await
+                                        .map_err(fts_read_error)?;
+                                    // Flushed inside the OnceCell init so slices
+                                    // sharing this superfile's cursor set count
+                                    // its posting bytes exactly once.
+                                    if let Some(stats) = &op_stats {
+                                        stats.add_fts_postings_bytes(set.postings_bytes());
+                                        stats.add_planned_read_ranges(set.planned_ranges());
+                                    }
+                                    Ok(Arc::new(set))
+                                })
+                                .await?;
+                            // Heavy kernels go to the reader pool; trivial ones
+                            // run inline where the oneshot round-trip would cost
+                            // more than the scan — see the gate's doc comment.
+                            if should_arc.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
                                 let kernel_reader = Arc::clone(&r);
+                                let kernel_set = Arc::clone(set);
                                 let kernel_stats = op_stats.clone();
                                 run_on_pool(
                                     Some(&reader_pool),
-                                    "un-ranged fts kernel: reader pool dropped result",
+                                    "ranged fts kernel: reader pool dropped result",
                                     move || {
                                         op_stats::timed_kernel(&kernel_stats, || {
-                                            kernel_reader.run_prepared(prep, bm25_params)
+                                            kernel_reader.bm25_search_or_range_prebuilt(
+                                                &kernel_set,
+                                                k,
+                                                start,
+                                                end,
+                                                floor,
+                                                bm25_params,
+                                            )
                                         })
                                     },
                                 )
                                 .await
                                 .map_err(|e| QueryError::Execute(e.to_string()))?
                                 .map_err(fts_read_error)?
+                            } else {
+                                op_stats::timed_kernel(&op_stats, || {
+                                    r.bm25_search_or_range_prebuilt(
+                                        set,
+                                        k,
+                                        start,
+                                        end,
+                                        floor,
+                                        bm25_params,
+                                    )
+                                })
+                                .map_err(fts_read_error)?
                             }
-                            prep => op_stats::timed_kernel(&op_stats, || {
-                                r.run_prepared(prep, bm25_params)
-                            })
-                            .map_err(fts_read_error)?,
                         }
+                        None => {
+                            let must_refs: Vec<&str> =
+                                must_arc.iter().map(|s| s.as_str()).collect();
+                            let should_refs: Vec<&str> =
+                                should_arc.iter().map(|s| s.as_str()).collect();
+                            let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                            let prep = r
+                                .prepare_clauses(
+                                    &column_arc,
+                                    ClauseLists {
+                                        musts: &must_refs,
+                                        shoulds: &should_refs,
+                                        negatives: &neg_refs,
+                                        must_phrases: &must_ph_arc,
+                                        should_phrases: &should_ph_arc,
+                                        negative_phrases: &neg_ph_arc,
+                                        global_idf: global_idf.as_deref(),
+                                        prefetched: memo.as_deref(),
+                                        live_floor,
+                                        allow,
+                                    },
+                                    k,
+                                    floor,
+                                    bm25_params,
+                                )
+                                .await
+                                .map_err(fts_read_error)?;
+                            if let Some(stats) = &op_stats {
+                                stats.add_fts_postings_bytes(prep.postings_bytes());
+                                stats.add_planned_read_ranges(prep.planned_ranges());
+                                // Single-term / phrase shapes finish inside
+                                // `prepare_clauses`; their walk's on-CPU time
+                                // rides the `Done` (0 for cursor shapes, whose
+                                // kernels are bracketed below).
+                                stats.add_kernel_cpu_ns(prep.inline_kernel_cpu_ns());
+                            }
+                            match prep {
+                                // Already-final shapes: the walk (and its
+                                // kernel time) happened inside
+                                // `prepare_clauses`; `run_prepared` would be
+                                // a no-op move and the bracket two wasted
+                                // schedstat reads.
+                                PreparedClauses::Done { hits, .. } => hits,
+                                // Gate on posting mass, not term count: this
+                                // scan isn't sliced, so a rare-term query
+                                // with many terms can be cheaper than a
+                                // common-term pair.
+                                prep if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS => {
+                                    let kernel_reader = Arc::clone(&r);
+                                    let kernel_stats = op_stats.clone();
+                                    run_on_pool(
+                                        Some(&reader_pool),
+                                        "un-ranged fts kernel: reader pool dropped result",
+                                        move || {
+                                            op_stats::timed_kernel(&kernel_stats, || {
+                                                kernel_reader.run_prepared(prep, bm25_params)
+                                            })
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|e| QueryError::Execute(e.to_string()))?
+                                    .map_err(fts_read_error)?
+                                }
+                                prep => op_stats::timed_kernel(&op_stats, || {
+                                    r.run_prepared(prep, bm25_params)
+                                })
+                                .map_err(fts_read_error)?,
+                            }
+                        }
+                    };
+                    // Raise the global floor with this unit's surviving
+                    // scores. Sidecars were prefetched by the dispatcher,
+                    // so the bitmap lookup is an in-memory hit; on a cache
+                    // miss/error we simply don't merge (a lower floor is
+                    // always safe).
+                    match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+                        Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
+                            hits.iter()
+                                .filter(|(d, _)| !bitmap.contains(*d))
+                                .map(|(_, s)| *s),
+                        ),
+                        Some(Err(_)) => {}
+                        _ => shared.merge(hits.iter().map(|(_, s)| *s)),
                     }
-                };
-                // Raise the global floor with this unit's surviving
-                // scores. Sidecars were prefetched by the dispatcher,
-                // so the bitmap lookup is an in-memory hit; on a cache
-                // miss/error we simply don't merge (a lower floor is
-                // always safe).
-                match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
-                    Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
-                        hits.iter()
-                            .filter(|(d, _)| !bitmap.contains(*d))
-                            .map(|(_, s)| *s),
-                    ),
-                    Some(Err(_)) => {}
-                    _ => shared.merge(hits.iter().map(|(_, s)| *s)),
+                    Ok(hits)
                 }
-                Ok(hits)
-            }
-        };
+            };
         let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
         let hits = select_top_k_stable(self, per_unit, k).await?;
         Ok(hits)
@@ -1113,6 +1171,10 @@ impl SupertableReader {
 
         let column_arc = Arc::new(column_owned);
         let prefix_arc = Arc::new(prefix_owned);
+        // No scope here: prefix search takes no pushed-down `WHERE` (the
+        // `bm25_search_prefix` table function fills its k by over-fetching
+        // under the exact predicate instead), so its units stay the plain
+        // `(range, superfile id)` pair.
         let reader_pool = Arc::clone(&manifest.options.reader_pool);
 
         // Share one FST expansion + cursor build per superfile across its
@@ -2244,6 +2306,32 @@ impl Supertable {
             .count(column, query, mode)
             .map_err(InfinoError::from)
             .map_err(|e| e.with_context("count", None))
+    }
+
+    /// `text` as the full-text index on `column` tokenizes it: the terms the
+    /// column's text was indexed under and a query over it is parsed into —
+    /// the column's analyzer with its stopword and stemmer filters — in
+    /// order, repeats kept. Two texts that share a token here are texts a
+    /// token match on `column` finds together, so a caller judging one text
+    /// against another — a question against the rows a query returned —
+    /// asks this instead of comparing spellings; its own copy of the rule
+    /// drifts from the index the moment a column is declared with another
+    /// analyzer. `column` must carry a full-text index: without one there is
+    /// no analyzer to tokenize with, and the error names the columns that
+    /// have one.
+    pub fn tokenize(&self, column: &str, text: &str) -> Result<Vec<String>, InfinoError> {
+        let reader = self.reader()?;
+        let options = reader.options();
+        let Some(tokenizer) = options.try_fts_tokenizer_for(column) else {
+            return Err(
+                InfinoError::from(QueryError::InvalidQuery(no_fts_index_message(
+                    column,
+                    &options.fts_columns,
+                )))
+                .with_context("tokenize", None),
+            );
+        };
+        Ok(tokenizer.tokenize(text).collect())
     }
 }
 

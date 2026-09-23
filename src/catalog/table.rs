@@ -56,6 +56,7 @@ pub(crate) trait Table: Send + Sync {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError>;
+    fn tokenize(&self, column: &str, text: &str) -> Result<Vec<String>, InfinoError>;
     fn vector_search(
         &self,
         column: &str,
@@ -137,6 +138,9 @@ impl Table for SupertableHandle {
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         SupertableHandle::count(self, column, query, mode)
     }
+    fn tokenize(&self, column: &str, text: &str) -> Result<Vec<String>, InfinoError> {
+        SupertableHandle::tokenize(self, column, text)
+    }
     fn vector_search(
         &self,
         column: &str,
@@ -185,8 +189,8 @@ impl Table for SupertableHandle {
 
 /// A single-table handle: `append` / `update` / `delete`, the search surface
 /// (`bm25_search` / `vector_search` / `hybrid_search` / `token_match` /
-/// `exact_match`), `count`, `schema`, `optimize`, and `gc`. Cheap to clone
-/// (one `Arc`); clones share the same table.
+/// `exact_match`), `count`, `tokenize`, `schema`, `optimize`, and `gc`.
+/// Cheap to clone (one `Arc`); clones share the same table.
 #[derive(Clone)]
 pub struct Supertable {
     pub(crate) inner: Arc<dyn Table>,
@@ -301,6 +305,50 @@ impl Supertable {
     /// Count rows matching a token query over one FTS column.
     pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         self.inner.count(column, query, mode)
+    }
+
+    /// `text` as the full-text index on `column` tokenizes it: the terms the
+    /// column's text is indexed under and a query over it is parsed into,
+    /// through the column's analyzer and its stopword and stemmer filters, in
+    /// order, repeats kept.
+    ///
+    /// Two texts that share a token here are texts a token match on `column`
+    /// finds together. A caller that judges one text against another — a
+    /// question against the rows a query returned, a literal against a line —
+    /// asks the index how it reads them rather than comparing spellings: a
+    /// slash, an underscore or a case difference is not a token, and its own
+    /// copy of the rule drifts from the index the moment a column is declared
+    /// with another analyzer. `column` must carry a full-text index; the
+    /// error for one that does not names the columns that do.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, FtsField, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![
+    /// #     Field::new("body", DataType::LargeUtf8, false),
+    /// #     Field::new("code", DataType::LargeUtf8, false),
+    /// # ]));
+    /// # let posts = db.create_table(
+    /// #     "posts",
+    /// #     schema,
+    /// #     IndexSpec::new()
+    /// #         .fts("body")
+    /// #         .fts(FtsField::new("code").analyzer("ascii_lower")),
+    /// # )?;
+    /// // The standard analyzer keeps a word whatever its script; the ASCII
+    /// // analyzer splits on every other byte and drops the accented word.
+    /// assert_eq!(posts.tokenize("body", "Hello, World! Café")?, ["hello", "world", "café"]);
+    /// assert_eq!(
+    ///     posts.tokenize("code", "left/failed write_pointer Café")?,
+    ///     ["left", "failed", "write", "pointer"]
+    /// );
+    /// assert!(posts.tokenize("nope", "anything").is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn tokenize(&self, column: &str, text: &str) -> Result<Vec<String>, InfinoError> {
+        self.inner.tokenize(column, text)
     }
 
     /// Vector (IVF kNN) search over one vector column.

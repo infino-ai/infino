@@ -41,6 +41,11 @@ PY_SRC = ROOT / "infino-python" / "src"
 # invisible to users (it shipped once — `createDatabase`), so check both, in the
 # wrapper's camelCase spelling.
 NODE_JS_WRAPPER = ROOT / "infino-node" / "infino" / "index.ts"
+# Likewise for Python: the pyo3 source under src/ is what runs, but the
+# hand-written stub is what typed callers see. A method present in the source
+# and missing from the stub works at runtime and fails mypy (it shipped once —
+# `append_named`), so check both.
+PY_STUB = ROOT / "infino-python" / "python" / "infino" / "_infino.pyi"
 
 # Trait-derive / plumbing methods that aren't part of the operation surface.
 NOISE = {"clone", "fmt", "eq", "from", "default", "serialize", "deserialize",
@@ -116,6 +121,13 @@ def snake_to_camel(name: str) -> str:
     return head + "".join(w[:1].upper() + w[1:] for w in rest)
 
 
+def py_stub_has(fn_name: str, text: str) -> bool:
+    """The hand-written stub declares `def fn_name(`. The pyo3 source proves the
+    method exists at runtime; the stub is what typed callers see, and it has
+    drifted from the source before."""
+    return re.search(rf"\bdef {re.escape(fn_name)}\s*\(", text) is not None
+
+
 def js_wrapper_has(camel: str, text: str) -> bool:
     """The wrapper defines/exposes `camel(...)`. Excludes `.camel(` — that is a
     `this.inner.camel(...)` call into the addon, not the wrapper's own method."""
@@ -169,6 +181,7 @@ def check() -> int:
             errors.append(f"STALE api-parity.txt entry (not in public-api.txt): {method}  -> remove it.")
 
     node_js = NODE_JS_WRAPPER.read_text()
+    py_stub = PY_STUB.read_text()
     for method, recorded in sorted(covered.items()):
         if method not in engine:
             continue
@@ -182,6 +195,11 @@ def check() -> int:
             )
         if not binding_has(PY_SRC, name):
             errors.append(f"COVERED but no Python wrapper `fn {name}`: {method}")
+        if not py_stub_has(name, py_stub):
+            errors.append(
+                f"COVERED but not declared in the Python type stub "
+                f"(infino-python/python/infino/_infino.pyi `def {name}`): {method}"
+            )
         if normalize_sig(recorded) != engine[method]:
             errors.append(
                 f"SIGNATURE CHANGED: {method}\n"

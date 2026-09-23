@@ -1242,6 +1242,9 @@ impl SupertableOptions {
                 prefetch_concurrency: cfg.storage.prefetch_concurrency.max(1),
                 mmap_cold_threshold_secs: cfg.storage.mmap_cold_threshold_secs,
                 mmap_sweep_interval_secs: cfg.storage.mmap_sweep_interval_secs,
+                promotion_defer_timeout: Duration::from_secs(
+                    cfg.storage.promotion_defer_timeout_secs,
+                ),
                 eviction: Box::new(LruPolicy::new()),
                 verify_crc_on_open: cfg.supertable.verify_crc_on_open,
             };

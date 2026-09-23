@@ -27,6 +27,7 @@ use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, 
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
     Bm25SearchOptions,
+    storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::FtsConfig,
         fts::reader::{Bm25Stats, BoolMode},
@@ -40,6 +41,7 @@ use infino::{
     },
     test_helpers::default_vector_config,
 };
+use tempfile::TempDir;
 
 /// `default_vector_config` is dim=16, cosine, n_cent=4.
 const DIM: usize = 16;
@@ -338,6 +340,112 @@ fn vector_filter_restricts_hits_to_the_predicate_match_set() {
         got.len(),
         allowed.len(),
         "k covers the whole match set — every predicate row returns"
+    );
+}
+
+/// UNDRAINED table, rare predicate whose matches sit far from the query's
+/// nearest cells, `k` covering the whole match set: the selectivity-widened
+/// probe must return every match.
+#[test]
+fn filtered_knn_finds_sparse_matches_outside_the_probed_cells() {
+    const ROWS: usize = 256;
+    const WIDE_DIM: usize = 256;
+    const NEEDLE_ROWS: std::ops::Range<usize> = 200..210;
+
+    let writer_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(RAYON_POOL_THREADS)
+            .build()
+            .expect("writer pool"),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("emb", fixed_list_f32(WIDE_DIM), false),
+    ]));
+    let st = Supertable::create(
+        SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig::new("title")],
+            vec![{
+                let mut vc = default_vector_config("emb", VECTOR_ROT_SEED);
+                vc.dim = WIDE_DIM;
+                vc
+            }],
+        )
+        .expect("valid options")
+        .with_writer_pool(writer_pool),
+    )
+    .expect("create");
+
+    let titles: Vec<String> = (0..ROWS)
+        .map(|i| {
+            if NEEDLE_ROWS.contains(&i) {
+                format!("doc {i} needle")
+            } else {
+                format!("doc {i}")
+            }
+        })
+        .collect();
+    let title_arr = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
+    // Row `i` = one-hot at dim `i`, plus a tiny distinct lean toward dim 0 on
+    // the needle rows so their exact distances are distinct and ordered.
+    let mut flat = vec![0.0f32; ROWS * WIDE_DIM];
+    for i in 0..ROWS {
+        flat[i * WIDE_DIM + i] = 1.0;
+        if NEEDLE_ROWS.contains(&i) {
+            flat[i * WIDE_DIM] = 0.01 * (i - NEEDLE_ROWS.start + 1) as f32;
+        }
+    }
+    let fsl = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        WIDE_DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(title_arr), Arc::new(fsl)]).expect("batch");
+    let mut w = st.writer().expect("writer");
+    w.append(&batch).expect("append");
+    w.commit().expect("commit");
+    drop(w);
+
+    let reader = st.reader().expect("reader");
+    let allowed = stable_ids(
+        &reader
+            .token_match("title", "needle", BoolMode::Or)
+            .expect("token_match"),
+    );
+    assert_eq!(allowed.len(), NEEDLE_ROWS.len(), "fixture: 10 needle rows");
+
+    let query: Vec<f32> = (0..WIDE_DIM)
+        .map(|d| if d == 0 { 1.0 } else { 0.0 })
+        .collect();
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &query,
+            NEEDLE_ROWS.len(),
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "title",
+                query: "needle",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search");
+    assert_eq!(
+        stable_ids(&hits),
+        allowed,
+        "every sparse match returns, wherever its cell sits"
+    );
+    // Exact ranking: the lean toward dim 0 grows with the row index, so
+    // cosine distance (1 - dot) strictly DECREASES with it — hits arrive
+    // best-first, i.e. highest needle row first.
+    let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
+    assert!(
+        scores.windows(2).all(|w| w[0] <= w[1]),
+        "hits are ranked ascending by exact distance: {scores:?}"
     );
 }
 
@@ -667,5 +775,143 @@ fn hybrid_search_doc_top_in_both_retrievers_ranks_first() {
         top,
         (vector[0].superfile, vector[0].local_doc_id),
         "fused #1 must also be the vector #1 (top in both ⇒ first)"
+    );
+}
+
+/// Partially-drained table: the drained superfiles hold many rows matching
+/// the filter token, the undrained tail holds ten sparse matches near the
+/// query. The tail's probe width must be sized from the tail's own counts —
+/// counting the drained matches overstates selectivity and collapses the
+/// probe back to the fixed floor.
+#[test]
+fn filtered_knn_sizes_the_tail_probe_from_tail_counts_only() {
+    const DRAINED_ROWS: usize = 512;
+    const TAIL_ROWS: usize = 256;
+    const WIDE_DIM: usize = 256;
+    const NEEDLE_ROWS: std::ops::Range<usize> = 200..210;
+
+    let writer_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(RAYON_POOL_THREADS)
+            .build()
+            .expect("writer pool"),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("emb", fixed_list_f32(WIDE_DIM), false),
+    ]));
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(
+        SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig::new("title")],
+            vec![{
+                let mut vc = default_vector_config("emb", VECTOR_ROT_SEED);
+                vc.dim = WIDE_DIM;
+                vc
+            }],
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(writer_pool),
+    )
+    .expect("create");
+
+    let batch_of = |titles: Vec<String>, flat: Vec<f32>| {
+        let title_arr =
+            LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            WIDE_DIM as i32,
+            Arc::new(Float32Array::from(flat)) as ArrayRef,
+            None,
+        )
+        .expect("FSL");
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(title_arr), Arc::new(fsl)])
+            .expect("batch")
+    };
+
+    // Drained half: every row matches "needle", every vector is zero at
+    // dim 0 (one-hot at dims 1..) — far from the query.
+    let drained_titles: Vec<String> = (0..DRAINED_ROWS)
+        .map(|i| format!("old {i} needle"))
+        .collect();
+    let mut drained_flat = vec![0.0f32; DRAINED_ROWS * WIDE_DIM];
+    for (i, row) in drained_flat.chunks_mut(WIDE_DIM).enumerate() {
+        row[1 + (i % (WIDE_DIM - 1))] = 1.0;
+    }
+    let mut w = st.writer().expect("writer");
+    w.append(&batch_of(drained_titles, drained_flat))
+        .expect("append drained");
+    w.commit().expect("commit drained");
+    drop(w);
+    st.drain_vectors_to_cells_sync().expect("drain");
+
+    // Undrained tail: only the needle rows match, one-hot spread with a
+    // growing dim-0 lean so they are the table's true top-k for the query.
+    let tail_titles: Vec<String> = (0..TAIL_ROWS)
+        .map(|i| {
+            if NEEDLE_ROWS.contains(&i) {
+                format!("doc {i} needle tailneedle")
+            } else {
+                format!("doc {i}")
+            }
+        })
+        .collect();
+    let mut tail_flat = vec![0.0f32; TAIL_ROWS * WIDE_DIM];
+    for i in 0..TAIL_ROWS {
+        tail_flat[i * WIDE_DIM + i] = 1.0;
+        if NEEDLE_ROWS.contains(&i) {
+            // Strong, distinct dim-0 mass: the needles' cells must outrank
+            // the orthogonal crowd under any centroid estimator — this test
+            // pins probe WIDTH accounting, not cell-ranking quality.
+            tail_flat[i * WIDE_DIM] = 0.1 * (i - NEEDLE_ROWS.start + 1) as f32;
+        }
+    }
+    let mut w = st.writer().expect("writer");
+    w.append(&batch_of(tail_titles, tail_flat))
+        .expect("append tail");
+    w.commit().expect("commit tail");
+    drop(w);
+
+    let reader = st.reader().expect("reader");
+    let all_matches = stable_ids(
+        &reader
+            .token_match("title", "needle", BoolMode::Or)
+            .expect("token_match"),
+    );
+    assert_eq!(
+        all_matches.len(),
+        DRAINED_ROWS + NEEDLE_ROWS.len(),
+        "fixture: drained matches dominate the allow map"
+    );
+    let tail_needles = stable_ids(
+        &reader
+            .token_match("title", "tailneedle", BoolMode::Or)
+            .expect("token_match tail"),
+    );
+
+    let query: Vec<f32> = (0..WIDE_DIM)
+        .map(|d| if d == 0 { 1.0 } else { 0.0 })
+        .collect();
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &query,
+            NEEDLE_ROWS.len(),
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "title",
+                query: "needle",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search");
+    assert_eq!(
+        stable_ids(&hits),
+        tail_needles,
+        "the tail's sparse matches win top-k; drained matches must not shrink the tail probe"
     );
 }

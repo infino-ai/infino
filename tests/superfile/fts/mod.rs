@@ -2,7 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 pub mod analysis_chain;
+pub mod boundaries;
 pub mod brute_force_oracle;
+pub mod corpus_truth;
 pub mod edge_and_unranked;
 pub mod fuzz_oracle;
 mod legacy_v5_fixture;

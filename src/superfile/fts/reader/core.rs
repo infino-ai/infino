@@ -22,6 +22,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -96,6 +97,14 @@ pub(crate) struct ClauseLists<'a> {
     /// kth into it as their heaps fill. `None` on single-superfile
     /// entry points, where there is no fan-out to share with.
     pub live_floor: Option<&'a LiveFloor>,
+    /// The rows this search may rank at all, as this superfile's
+    /// `local_doc_id`s — a SQL `WHERE` pushed into the search and
+    /// resolved against the index. Every kernel admits a doc into its
+    /// heap only if the set holds it, so the top-k fills from allowed
+    /// rows instead of being a post-filtered global top-k that
+    /// underflows. `None` ranks every matching row. Owned (`Arc`), not
+    /// borrowed: the prepared clauses carry it into a `'static` kernel.
+    pub allow: Option<Arc<RoaringBitmap>>,
 }
 
 impl ClauseLists<'_> {
@@ -367,9 +376,11 @@ pub(super) const OR_COUNT_BITSET_DENSITY_DIVISOR: u64 = 16;
 pub(super) const AND_MEMBERSHIP_ALWAYS_DIVISOR: u64 = 64;
 
 /// Upper sparsity bound for the density-gated middle routing tier — see
-/// [`AND_MEMBERSHIP_ALWAYS_DIVISOR`]. A rarest term denser than `1/16` of the
-/// corpus never routes to the membership walk.
-pub(super) const AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR: u64 = 16;
+/// [`AND_MEMBERSHIP_ALWAYS_DIVISOR`]. A rarest term denser than this fraction of
+/// the corpus never routes to the membership walk: past it the driver list is
+/// long enough that iterating it costs more than the block decode the walk
+/// avoids, screen or no screen.
+pub(super) const AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR: u64 = 8;
 
 /// Density guard for the middle routing tier: the *other* terms must be
 /// collectively at least this many times denser than the driver (their combined
@@ -380,10 +391,14 @@ pub(super) const AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR: u64 = 16;
 /// block decode is already cheap and its block-max skip prunes the driver, so it
 /// wins — routing such a query to the walk regressed it. Sparsity alone can't
 /// tell the two apart (same rarest term, different companions), so this ratio is
-/// the discriminator. Calibrated on the ranked-AND intersection set: middle-tier
-/// wins sit at ≥ ~38× and the one regression at ~4.5×, so `8` separates them
-/// with margin on both sides. (The very-sparse tier skips this check.)
-pub(super) const AND_MEMBERSHIP_OTHERS_DENSITY_MULT: u64 = 8;
+/// the discriminator. It was first calibrated on the ranked-AND intersection set
+/// against a walk that probed every driver doc: wins sat at ≥ ~38× and the one
+/// regression at ~4.5×, so `8` separated them with margin. The walk now screens
+/// each driver doc on its own score and probes only the survivors, which roughly
+/// halved its cost on the shapes it already served, so the break-even against
+/// the flat-merge moved down with it and the guard follows. (The very-sparse
+/// tier skips this check.)
+pub(super) const AND_MEMBERSHIP_OTHERS_DENSITY_MULT: u64 = 4;
 
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
@@ -640,12 +655,35 @@ impl FtsReader {
             ),
         )?;
 
-        let mut overlay = PrefetchedSource::new(source);
-        overlay.install(0, header);
-        overlay.install(header_size as u64, fst_region);
+        let mut overlay = PrefetchedSource::new(Arc::clone(&source));
+        overlay.install(0, header.clone());
+        overlay.install(header_size as u64, fst_region.clone());
         overlay.install(doc_lengths_table_offset as u64, doc_lengths_tail);
 
-        Self::open_with_source(Source::Lazy(Arc::new(overlay)), columns_json, opts)
+        let mut reader =
+            Self::open_with_source(Source::Lazy(Arc::new(overlay)), columns_json, opts)?;
+
+        // The doc-lengths tail was prefetched for one purpose: building the
+        // BM25 norm tables just above. Scoring reads those tables — one
+        // quantized byte per doc — and never the stored array again, so the
+        // raw region (`doc_length_bytes` per doc, per column, plus the
+        // directory) is derived data from here on. Rebuild the overlay
+        // without it rather than pin it for the reader's life; on a table
+        // whose superfiles stay lazy that is the difference between holding
+        // the region per superfile and not holding it at all.
+        //
+        // Rebuilding, rather than evicting in place, keeps the overlay's
+        // lookup vector immutable after open — the read path stays lock-free.
+        // The two surviving buffers are refcounted; this re-registers them
+        // rather than copying. The compaction merge path still reads the
+        // region through `read_doc_lengths`, which falls through to the
+        // underlying source on an overlay miss.
+        let mut without_doc_lengths = PrefetchedSource::new(source);
+        without_doc_lengths.install(0, header);
+        without_doc_lengths.install(header_size as u64, fst_region);
+        reader.source = Source::Lazy(Arc::new(without_doc_lengths));
+
+        Ok(reader)
     }
 
     /// Open over an arbitrary byte source. The eager path wraps a
@@ -1049,6 +1087,20 @@ impl FtsReader {
     pub fn column_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
         let id = self.resolve_column_id(column).ok()?;
         Some(self.columns[id as usize].length_stats)
+    }
+
+    test_visible! {
+    /// A column's stored per-document lengths, one per local doc id: the
+    /// array the norm table is quantized from, as the build wrote it
+    /// (saturated at the format's stored maximum). A benchmark oracle
+    /// compares it against its own tokenization of the rows it believes a
+    /// superfile holds, which pins the row-to-superfile mapping exactly
+    /// rather than assuming it from ingest order. Errors if `column` is not
+    /// a registered FTS column.
+    fn column_doc_lengths(&self, column: &str) -> Result<Vec<u32>, FtsError> {
+        let id = self.resolve_column_id(column)?;
+        self.read_doc_lengths(id)
+    }
     }
 
     /// Tokenizer configured for `column`, for tokenizing query text so
@@ -2078,11 +2130,16 @@ mod tests {
             );
         }
     }
-    use std::collections::HashSet;
+    use std::{
+        collections::HashSet,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use async_trait::async_trait;
 
     use super::{super::test_util::*, *};
     use crate::superfile::{
-        BytesLazyByteSource,
+        BytesLazyByteSource, LazyByteSourceError,
         fts::{
             bm25,
             builder::{BlobEra, FtsBuilder},
@@ -3238,6 +3295,67 @@ mod tests {
         scores.insert(9, 5.0);
         let out = top_k(scores, 10);
         assert_eq!(out, vec![(9, 5.0), (5, 2.0)]);
+    }
+
+    /// The doc-lengths tail is prefetched to build the norm tables and then
+    /// released: a post-open read of that region falls through to the source,
+    /// while the dictionary stays overlaid and scoring is unaffected.
+    #[tokio::test]
+    async fn open_lazy_releases_the_doc_lengths_tail_but_keeps_the_dictionary() {
+        #[derive(Debug)]
+        struct CountingSource {
+            inner: BytesLazyByteSource,
+            range_calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl LazyByteSource for CountingSource {
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+                self.range_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.range(start, len).await
+            }
+            fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
+                self.range_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.try_get_range_sync(start, len)
+            }
+        }
+
+        let (blob, json) = build_blob();
+        let counting = Arc::new(CountingSource {
+            inner: BytesLazyByteSource::new(blob),
+            range_calls: AtomicUsize::new(0),
+        });
+        let src: Arc<dyn LazyByteSource> = counting.clone();
+        let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+
+        // Scoring uses the quantized norm table, so a search must not go
+        // back to the source for the released region.
+        let after_open = counting.range_calls.load(Ordering::SeqCst);
+        let hits = r
+            .search("body", &["rust"], 10, BoolMode::Or)
+            .await
+            .expect("search over lazy reader");
+        assert!(
+            !hits.is_empty(),
+            "the released region must not break scoring"
+        );
+        let dict_reads = counting.range_calls.load(Ordering::SeqCst) - after_open;
+
+        // The stored array is gone from the overlay, so the merge path's
+        // read of it now reaches the source.
+        let before = counting.range_calls.load(Ordering::SeqCst);
+        let lengths = r.read_doc_lengths(0).expect("doc lengths still readable");
+        assert_eq!(lengths.len(), r.n_docs() as usize);
+        assert!(
+            counting.range_calls.load(Ordering::SeqCst) > before,
+            "the doc-lengths region must no longer be held by the overlay"
+        );
+        let _ = dict_reads;
     }
 
     #[tokio::test]

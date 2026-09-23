@@ -15,6 +15,7 @@ use std::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -387,6 +388,9 @@ impl DiskCacheStore {
             .unwrap_or_else(|| entry.size_bytes.load(Ordering::Acquire));
         let needs_reserve = matches!(entry.accounting, EntryAccounting::SourceOwned);
         let skip_vec = vector_blob_range(&entry.reader);
+        // The window opens now, when the entry becomes lazy — not when the
+        // fill task is scheduled — so a queued task cannot extend it.
+        let defer = PromotionDefer::start(self.config.promotion_defer_timeout);
         let store = Arc::downgrade(self);
         let reader = Arc::downgrade(&entry.reader);
         let uri_owned = *uri;
@@ -421,6 +425,7 @@ impl DiskCacheStore {
                     needs_reserve.then_some(size),
                     fetch_storage,
                     skip_vec,
+                    defer,
                 )
                 .await;
             }
@@ -860,9 +865,54 @@ fn background_store_abandoned(store: &Arc<DiskCacheStore>) -> bool {
     Arc::strong_count(store) == 1
 }
 
+/// How long a background fill keeps yielding to foreground queries holding
+/// the same superfile's lazy reader.
+///
+/// Yielding keeps the fill from competing for I/O with the query that
+/// triggered it. Left unbounded, a superfile under continuous load never
+/// goes idle, so the fill never runs and the reader stays lazy for the life
+/// of the process — holding its term dictionary and doc-lengths tail on the
+/// heap, and serving reads as per-block range fetches instead of slices of
+/// an mmap. Once the window closes the fill proceeds alongside the running
+/// query: it writes a temp file and swaps the cache entry, so an in-flight
+/// query keeps reading through the `Arc` it already holds.
+#[derive(Clone, Copy, Debug)]
+enum PromotionDefer {
+    /// Yield for as long as the reader stays busy.
+    Forever,
+    /// Yield until this instant, then fill regardless.
+    Until(Instant),
+}
+
+impl PromotionDefer {
+    /// Open a window of `timeout` starting now. A `timeout` that overflows
+    /// the clock (notably [`Duration::MAX`]) yields indefinitely.
+    fn start(timeout: Duration) -> Self {
+        match Instant::now().checked_add(timeout) {
+            Some(deadline) => Self::Until(deadline),
+            None => Self::Forever,
+        }
+    }
+
+    /// Whether the window is still open.
+    fn open(self) -> bool {
+        match self {
+            Self::Forever => true,
+            Self::Until(deadline) => Instant::now() < deadline,
+        }
+    }
+
+    /// Whether the fill should still yield to `reader` being held by a
+    /// caller other than the cache entry.
+    fn yields_to(self, reader: &Weak<SuperfileReader>) -> bool {
+        self.open() && reader_blocks_background_fill(reader)
+    }
+}
+
 async fn wait_for_lazy_foreground_release(
     store: &Weak<DiskCacheStore>,
     reader: &Weak<SuperfileReader>,
+    defer: PromotionDefer,
 ) -> Option<Arc<DiskCacheStore>> {
     loop {
         if store.strong_count() == 0 || reader.strong_count() == 0 {
@@ -872,6 +922,11 @@ async fn wait_for_lazy_foreground_release(
             && strong.n_promotion_waiters.load(Ordering::Acquire) > 0
         {
             return Some(strong);
+        }
+        if !defer.open() {
+            // Window closed: fill alongside the running query rather than
+            // leave this superfile lazy for the life of the process.
+            return store.upgrade();
         }
         if reader.strong_count() <= 1 {
             // `strong_count == 1` also occurs briefly while a caller is
@@ -892,9 +947,10 @@ async fn wait_for_lazy_foreground_release(
 async fn wait_for_reader_quiescence(
     store: &Arc<DiskCacheStore>,
     reader: &Weak<SuperfileReader>,
+    defer: PromotionDefer,
 ) -> bool {
     loop {
-        while reader_blocks_background_fill(reader) {
+        while defer.yields_to(reader) {
             if background_store_abandoned(store) {
                 return false;
             }
@@ -907,7 +963,7 @@ async fn wait_for_reader_quiescence(
         if reader.strong_count() == 0 {
             return false;
         }
-        if !reader_blocks_background_fill(reader) {
+        if !defer.yields_to(reader) {
             return !background_store_abandoned(store);
         }
     }
@@ -953,6 +1009,7 @@ async fn cold_fetch_to_disk_cancelable(
     size: u64,
     filled: &mut Vec<bool>,
     skip_vec: Option<(u64, u64)>,
+    defer: PromotionDefer,
 ) -> Result<BackgroundFillOutcome, DiskCacheError> {
     let n_streams = store.config.cold_fetch_streams.max(1);
     let chunk_size = store.config.cold_fetch_chunk_bytes.max(1);
@@ -1003,7 +1060,7 @@ async fn cold_fetch_to_disk_cancelable(
             if reader.strong_count() == 0 {
                 return Ok(BackgroundFillOutcome::Abandoned);
             }
-            if reader_blocks_background_fill(reader) {
+            if defer.yields_to(reader) {
                 return Ok(BackgroundFillOutcome::Paused);
             }
             let chunk_idx = next_chunk;
@@ -1037,7 +1094,7 @@ async fn cold_fetch_to_disk_cancelable(
         if reader.strong_count() == 0 {
             return Ok(BackgroundFillOutcome::Abandoned);
         }
-        if reader_blocks_background_fill(reader) {
+        if defer.yields_to(reader) {
             return Ok(BackgroundFillOutcome::Paused);
         }
         tokio::select! {
@@ -1048,7 +1105,7 @@ async fn cold_fetch_to_disk_cancelable(
                 if reader.strong_count() == 0 {
                     return Ok(BackgroundFillOutcome::Abandoned);
                 }
-                if reader_blocks_background_fill(reader) {
+                if defer.yields_to(reader) {
                     return Ok(BackgroundFillOutcome::Paused);
                 }
             }
@@ -1070,7 +1127,7 @@ async fn cold_fetch_to_disk_cancelable(
     if reader.strong_count() == 0 {
         return Ok(BackgroundFillOutcome::Abandoned);
     }
-    if reader_blocks_background_fill(reader) {
+    if defer.yields_to(reader) {
         return Ok(BackgroundFillOutcome::Paused);
     }
     spawn_blocking(carry_span(move || file.sync_all()))
@@ -1128,8 +1185,9 @@ async fn lazy_background_fill(
     mut own_reservation: Option<u64>,
     fetch_storage: Arc<dyn StorageProvider>,
     skip_vec: Option<(u64, u64)>,
+    defer: PromotionDefer,
 ) -> Result<(), DiskCacheError> {
-    let Some(store) = wait_for_lazy_foreground_release(&store, &reader).await else {
+    let Some(store) = wait_for_lazy_foreground_release(&store, &reader, defer).await else {
         return Ok(());
     };
     let tmp = store.fill_tmp_path(&uri);
@@ -1154,8 +1212,9 @@ async fn lazy_background_fill(
     // the unfinished chunks rather than a re-download of the whole object.
     let mut filled: Vec<bool> = Vec::new();
     loop {
-        if !wait_for_reader_quiescence(&store, &reader).await {
+        if !wait_for_reader_quiescence(&store, &reader, defer).await {
             rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation);
+
             return Ok(());
         }
         match cold_fetch_to_disk_cancelable(
@@ -1167,6 +1226,7 @@ async fn lazy_background_fill(
             size,
             &mut filled,
             skip_vec,
+            defer,
         )
         .await?
         {
@@ -1403,7 +1463,10 @@ impl LazyByteSource for HoleFallbackSource {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::Ordering};
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
 
     use bytes::Bytes;
     use tempfile::TempDir;
@@ -1789,6 +1852,86 @@ mod tests {
         assert!(r2.parquet_bytes().is_some());
     }
 
+    /// A held foreground reader must not defer the background fill forever.
+    /// Once the promotion window closes the fill runs alongside the query,
+    /// so the superfile stops serving reads from a heap-resident lazy reader
+    /// for the life of the process.
+    ///
+    /// Polls promotion directly: `wait_until_mmap_promoted` registers a
+    /// promotion waiter, which is itself an override of the deferral, so a
+    /// test using it could not tell whether the window did the work.
+    #[tokio::test]
+    async fn lazy_fill_promotes_while_a_foreground_reader_is_still_held() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.promotion_defer_timeout = Duration::ZERO;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        // Never dropped for the length of the assertion: this stands in for a
+        // superfile under continuous query load.
+        let held = store.reader(&uri).await.expect("lazy cold");
+        assert_eq!(held.n_docs(), 1);
+
+        assert!(
+            poll_until_mmap_promoted(&store, &uri, PROMOTE_TIMEOUT).await,
+            "closed promotion window must let the fill run under load"
+        );
+        assert_eq!(
+            store.stats().n_cold_fetches,
+            1,
+            "promotion re-reads the object once, not per query"
+        );
+        drop(held);
+    }
+
+    /// With the window left open the fill still yields: a held reader keeps
+    /// the superfile lazy, and promotion happens once the reader releases.
+    #[tokio::test]
+    async fn unbounded_promotion_defer_keeps_yielding_to_a_held_reader() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        let held = store.reader(&uri).await.expect("lazy cold");
+        assert!(
+            !poll_until_mmap_promoted(&store, &uri, DEFER_OBSERVATION).await,
+            "an open window must keep deferring to the held reader"
+        );
+
+        drop(held);
+        assert!(
+            poll_until_mmap_promoted(&store, &uri, PROMOTE_TIMEOUT).await,
+            "releasing the reader must let the deferred fill finish"
+        );
+    }
+
+    /// The window is a deadline, and `Duration::MAX` is the "never stop
+    /// yielding" sentinel rather than an overflow panic.
+    #[test]
+    fn promotion_defer_window_opens_and_closes() {
+        assert!(
+            !PromotionDefer::start(Duration::ZERO).open(),
+            "a zero window is closed on arrival"
+        );
+        assert!(
+            PromotionDefer::start(Duration::from_secs(3600)).open(),
+            "a long window is open"
+        );
+        assert!(
+            matches!(
+                PromotionDefer::start(Duration::MAX),
+                PromotionDefer::Forever
+            ),
+            "Duration::MAX overflows the clock and means unbounded yielding"
+        );
+        assert!(PromotionDefer::Forever.open());
+    }
+
     #[test]
     fn uncovered_ranges_are_the_open_ranges_the_blob_does_not_hold_whole() {
         let blob = vec![(100u64, vec![0u8; 50]), (1_000, vec![0u8; 10])];
@@ -2123,6 +2266,9 @@ mod tests {
                 PREEMPT_TEST_BYTES as u64,
                 &mut filled,
                 None,
+                // This test is about the yield itself, so keep the window
+                // open for its whole duration.
+                PromotionDefer::Forever,
             )
             .await;
             (outcome, filled)

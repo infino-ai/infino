@@ -54,14 +54,14 @@ use infino::{
     CompactionSettings, OptimizeOptions,
     supertable::{
         Supertable,
-        manifest::{ClusterCentroids, SuperfileEntry},
+        manifest::{ClusterCentroids, ManifestSnapshot, SuperfileEntry},
         writer::maintenance_pool_width,
     },
 };
 
 use crate::{
     cold_store::{self, ColdStoreMeasurement, STEADY_COLD_SAMPLES},
-    corpus::dim,
+    corpus::{self, dim},
     cost, cpu,
     executors::p50,
     ingest::supertable::{self, Modality, modality_label},
@@ -214,6 +214,16 @@ fn run_child_shape(key: &str) {
             std::process::exit(2);
         }
     };
+    // The child is re-executed with its parent's `corpus=` tokens (see
+    // `build_shape_isolated`) and resolves the corpus the same way; the
+    // FTS shape takes the FTS cells' realistic default.
+    if let Err(err) = corpus::install_source_from_args(std::env::args().skip(1)) {
+        eprintln!("[supertable] child process: {err}");
+        std::process::exit(2);
+    }
+    if modality == Modality::Fts {
+        corpus::default_text_flavor_for_fts();
+    }
 
     eprintln!(
         "[supertable] child process: ingesting {} shape ({} docs)...",
@@ -262,6 +272,14 @@ fn build_shape_isolated(key: &str) -> Option<ShapeMetrics> {
     // Forward a CLI-set dataset prefix; the child only inherits the env.
     if let Some(prefix) = crate::dataset::dataset_prefix() {
         cmd.env(crate::dataset::PREFIX_ENV, prefix);
+    }
+    // The corpus selector is process-wide state installed from the
+    // arguments; a child that did not receive it would silently ingest
+    // the default corpus under the parent's label.
+    for arg in std::env::args().skip(1) {
+        if arg.starts_with("corpus=") || arg.starts_with("corpus-dir=") {
+            cmd.arg(arg);
+        }
     }
     let output = cmd
         .stdout(Stdio::piped())
@@ -391,24 +409,28 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     ]
 }
 
-/// Visit committed superfiles through the flat eager view, or through manifest
-/// parts when the manifest is lazy and the flat view is empty.
-fn visit_manifest_superfiles(table: &Supertable, mut visit: impl FnMut(&SuperfileEntry)) {
-    let reader = table.reader().expect("reader");
-    let manifest = reader.manifest();
+/// Every committed superfile of `manifest`, from the flat eager view or,
+/// when the manifest is lazy and that view is empty, by loading its parts.
+/// The one place that knows the manifest exposes its entries two ways.
+pub(crate) fn collect_manifest_superfiles(manifest: &ManifestSnapshot) -> Vec<Arc<SuperfileEntry>> {
     let flat_superfiles = manifest.get_all_superfiles();
     if !flat_superfiles.is_empty() {
-        for entry in flat_superfiles {
-            visit(entry);
-        }
-        return;
+        return flat_superfiles.to_vec();
     }
+    let mut entries = Vec::new();
     for part_entry in manifest.get_all_list_entries() {
         let part = tiers::block_on(manifest.get_part_by_id(part_entry.part_id))
             .expect("load manifest part for bench metadata");
-        for entry in part.superfiles.iter() {
-            visit(entry);
-        }
+        entries.extend(part.superfiles.iter().cloned());
+    }
+    entries
+}
+
+/// Visit committed superfiles; see [`collect_manifest_superfiles`].
+fn visit_manifest_superfiles(table: &Supertable, mut visit: impl FnMut(&SuperfileEntry)) {
+    let reader = table.reader().expect("reader");
+    for entry in collect_manifest_superfiles(reader.manifest()) {
+        visit(&entry);
     }
 }
 
@@ -1753,6 +1775,9 @@ pub mod fts {
             eprintln!("[supertable_fts] skipped: {reason}");
             return;
         }
+        // Before any corpus is generated: BM25 is measured on text-shaped
+        // distributions unless the command line says `corpus=synthetic`.
+        corpus::default_text_flavor_for_fts();
 
         let n_docs = supertable::n_docs();
         let mut report = Report::load("supertable_fts");

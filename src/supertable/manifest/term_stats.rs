@@ -25,7 +25,7 @@
 //!
 //! [`Manifest::term_stats`]: super::list::Manifest::term_stats
 
-use std::{collections::BTreeMap, str::from_utf8, sync::Arc};
+use std::{collections::BTreeMap, future::Future, str::from_utf8, sync::Arc};
 
 use bytes::Bytes;
 use fst::Map;
@@ -38,7 +38,7 @@ use crate::{
         SuperfileReader,
         fts::dict::{DictBuilder, make_key},
     },
-    supertable::manifest::{RoutingRef, part::ContentHash},
+    supertable::manifest::{RoutingRef, SuperfileEntry, part::ContentHash},
 };
 
 /// Object-store directory prefix for term-stats artifacts, sibling to
@@ -145,13 +145,27 @@ fn encode(covered: &[Uuid], entries: &BTreeMap<Vec<u8>, u64>) -> Vec<u8> {
 /// performs (one dictionary parse + coalesced header fetches per batch)
 /// — no posting bodies are read, which is what makes this a *light*
 /// stats-only pass rather than a compaction.
-pub(crate) async fn build(
-    readers: &[(Uuid, Arc<SuperfileReader>)],
-) -> Result<Vec<u8>, TermStatsError> {
+/// `open` is called once per entry and its reader is dropped before the next
+/// one opens, so the pass costs one superfile's open-time state rather than
+/// the whole table's. That matters because a lazy reader pins its term
+/// dictionary for its lifetime — megabytes each — so holding every reader at
+/// once made this scale with table size instead of with the work: on a
+/// 30,000-superfile table it reached roughly 100 GB and could not run at all.
+/// Entries are still visited in order and one at a time, so throughput is
+/// unchanged; only the lifetime is.
+pub(crate) async fn build<F, Fut>(
+    entries: &[Arc<SuperfileEntry>],
+    mut open: F,
+) -> Result<Vec<u8>, TermStatsError>
+where
+    F: FnMut(&Arc<SuperfileEntry>) -> Fut,
+    Fut: Future<Output = Result<Arc<SuperfileReader>, TermStatsError>>,
+{
     let mut merged: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
-    let mut covered: Vec<Uuid> = Vec::with_capacity(readers.len());
-    for (id, reader) in readers {
-        covered.push(*id);
+    let mut covered: Vec<Uuid> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        covered.push(entry.superfile_id);
+        let reader = open(entry).await?;
         let Some(fts) = reader.fts() else { continue };
         let columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
         for column in &columns {
@@ -217,7 +231,162 @@ pub(crate) async fn load(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Weak;
+
+    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use uuid::Uuid as TestUuid;
+
     use super::*;
+    use crate::{
+        superfile::{
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+            reader::SuperfileReader,
+        },
+        supertable::{
+            manifest::{SuperfileUri, VectorLayout},
+            reader_cache::disk::test_support::tiny_superfile_bytes,
+        },
+        test_helpers::{decimal128_id_field, decimal128_ids},
+    };
+
+    fn entry() -> Arc<SuperfileEntry> {
+        Arc::new(SuperfileEntry {
+            stem: None,
+            birth_version: 0,
+            superfile_id: TestUuid::new_v4(),
+            uri: SuperfileUri::new_v4(),
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: Default::default(),
+            fts_summary: Default::default(),
+            vector_summary: Default::default(),
+            partition_key: vec![],
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        })
+    }
+
+    /// The pass must cost one superfile's open-time state, not the table's.
+    /// A reader pins its term dictionary for its lifetime, so holding every
+    /// reader at once scaled this with table size; opening them all was what
+    /// made the artifact unbuildable on a large table.
+    ///
+    /// Asserts the lifetime directly: by the time the opener is called for
+    /// the next entry, the previous reader must already be unreachable.
+    #[tokio::test]
+    async fn build_holds_one_reader_at_a_time() {
+        let entries: Vec<Arc<SuperfileEntry>> = (0..5).map(|_| entry()).collect();
+        let mut previous: Option<Weak<SuperfileReader>> = None;
+        let mut opened = 0usize;
+
+        let bytes = build(&entries, |_entry| {
+            if let Some(prior) = previous.as_ref() {
+                assert!(
+                    prior.upgrade().is_none(),
+                    "the previous reader must be dropped before the next opens"
+                );
+            }
+            let reader = Arc::new(
+                SuperfileReader::open(tiny_superfile_bytes()).expect("open tiny superfile"),
+            );
+            previous = Some(Arc::downgrade(&reader));
+            opened += 1;
+            async move { Ok(reader) }
+        })
+        .await
+        .expect("build");
+
+        assert_eq!(opened, entries.len(), "every entry must be visited");
+        let sidecar = TermStatsSidecar::decode(Bytes::from(bytes)).expect("decode");
+        assert_eq!(
+            sidecar.covered().len(),
+            entries.len(),
+            "the artifact must record every superfile it covers"
+        );
+    }
+
+    /// Build a superfile carrying an FTS index, so the df walk actually runs.
+    /// `tiny_superfile_bytes` has no FTS blob and is skipped by the build.
+    fn indexed_superfile_bytes() -> Bytes {
+        let schema = Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(
+            Arc::clone(&schema),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let ids = decimal128_ids(vec![1u64, 2]);
+        let titles = LargeStringArray::from(vec!["rust async runtime", "rust embedded system"]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(b.finish().expect("finish"))
+    }
+
+    /// Dropping each reader before the next opens must not lose a
+    /// contribution: `df` is the sum over superfiles, so building over N
+    /// copies of the same superfile must report N times the single-superfile
+    /// figure, and must cover all N.
+    #[tokio::test]
+    async fn build_sums_df_across_superfiles() {
+        let open_indexed = |_e: &Arc<SuperfileEntry>| async {
+            SuperfileReader::open(indexed_superfile_bytes())
+                .map(Arc::new)
+                .map_err(|e| TermStatsError::Build(e.to_string()))
+        };
+
+        let one = vec![entry()];
+        let side_one = TermStatsSidecar::decode(Bytes::from(
+            build(&one, open_indexed).await.expect("build one"),
+        ))
+        .expect("decode one");
+        let df_one = side_one.df("title", "rust");
+        assert!(
+            df_one > 0,
+            "the fixture must contribute a df for the walked term"
+        );
+
+        let n = 4;
+        let many: Vec<Arc<SuperfileEntry>> = (0..n).map(|_| entry()).collect();
+        let side_many = TermStatsSidecar::decode(Bytes::from(
+            build(&many, open_indexed).await.expect("build many"),
+        ))
+        .expect("decode many");
+
+        assert_eq!(
+            side_many.df("title", "rust"),
+            df_one * n as u64,
+            "df must be the sum over superfiles, so every reader's contribution counts"
+        );
+        assert_eq!(
+            side_many.covered().len(),
+            n,
+            "every superfile must be recorded as covered"
+        );
+        assert_eq!(side_many.df("title", "absent"), 0);
+    }
+
+    /// An opener failure must surface rather than yield a sidecar that
+    /// silently claims coverage it never read.
+    #[tokio::test]
+    async fn build_propagates_an_open_failure() {
+        let entries = vec![entry()];
+        let result = build(&entries, |_entry| async {
+            Err(TermStatsError::Build("open refused".into()))
+        })
+        .await;
+        assert!(
+            matches!(result, Err(TermStatsError::Build(m)) if m.contains("open refused")),
+            "the opener's error must propagate"
+        );
+    }
 
     #[test]
     fn round_trips_covered_ids_and_dfs() {

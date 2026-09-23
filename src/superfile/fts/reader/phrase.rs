@@ -27,6 +27,12 @@ use crate::superfile::{
 /// pair's run offset.
 pub(super) struct PhraseMember {
     pub(super) cursor: TermCursor,
+    /// A second cursor over the same postings for the block-at-a-time
+    /// alignment: it filters a whole block of the rarest member's docs
+    /// ([`TermCursor::retain_contained`]) and so runs ahead of `cursor`,
+    /// which only ever moves to the docs that survive, for their tf and
+    /// positions.
+    pub(super) probe: TermCursor,
     /// The term's complete position runs (empty for an inline df=1
     /// member, whose single position is `inline_position`).
     pub(super) positions: Bytes,
@@ -72,13 +78,22 @@ const NO_BLOCK_CACHED: usize = usize::MAX;
 impl PhraseMember {
     /// The member's positions at its cursor's current doc, decoded
     /// into `pos_scratch`. The cursor must be positioned on a doc
-    /// (not exhausted).
+    /// (not exhausted) **with its whole block decoded**: `pos` is read as
+    /// the pair index within the block and `block_tfs[..block_n]` as the
+    /// block's tf run. A cursor that reached the doc by a skip into a
+    /// bitset block holds only that one doc (`block_n == 1`, `pos == 0`)
+    /// and would read the wrong run; `materialize_at` expands it first,
+    /// which is why every caller goes through it.
     pub(super) fn decode_current_positions(&mut self) -> Result<(), FtsError> {
         self.pos_scratch.clear();
         if let Some(p) = self.inline_position {
             self.pos_scratch.push(p);
             return Ok(());
         }
+        debug_assert_eq!(
+            self.cursor.decoded_block, self.cursor.current_block,
+            "positions need the whole block decoded; call materialize_at first"
+        );
         let block = self.cursor.current_block;
         let pair = self.cursor.pos;
         let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
@@ -242,6 +257,15 @@ pub(super) struct PhraseCursor {
     /// phrase-start positions as they are filtered member by member —
     /// avoids a per-doc allocation on the hot verify path.
     pub(super) verify_scratch: Vec<u32>,
+    /// Docs of the rarest member's current block that every other member
+    /// contains, awaiting the ranked bound and adjacency verification;
+    /// `cand_next` is the first not yet served. Filled a block at a time
+    /// by [`Self::seek_match`].
+    cands: Vec<u32>,
+    cand_next: usize,
+    /// Where the next block refill starts: one past the last block
+    /// batched. `None` once the rarest member's last block is batched.
+    refill_from: Option<u32>,
 }
 
 impl PhraseCursor {
@@ -274,6 +298,7 @@ impl PhraseCursor {
                 min_scaled_bound = min_scaled_bound.min(cursor.term_max_bm25 / cursor.idf_weight);
                 idf_sum += cursor.idf_weight;
                 PhraseMember {
+                    probe: cursor.clone(),
                     cursor,
                     positions,
                     term_meta,
@@ -301,6 +326,9 @@ impl PhraseCursor {
             current_doc: 0,
             current_tf: 0,
             verify_scratch: Vec::new(),
+            cands: Vec::new(),
+            cand_next: 0,
+            refill_from: Some(0),
         };
         cursor.seek_match_unranked(0)?;
         Ok(cursor)
@@ -341,7 +369,7 @@ impl PhraseCursor {
         if self.is_exhausted() || self.current_doc >= target {
             return Ok(());
         }
-        self.seek_match(target, bar, dl_norm_k1)
+        self.seek_match(target, bar, Some(dl_norm_k1))
     }
 
     /// Approximate seek (the cheap half of a two-phase phrase): advance to the
@@ -395,113 +423,116 @@ impl PhraseCursor {
         }
     }
 
-    /// Unranked (match/count) doc alignment to the next *verified* phrase match
-    /// ≥ `from`: the approximate member-intersection ([`Self::approx_seek`])
-    /// followed by adjacency verification, retrying at the next candidate until
-    /// one verifies or the members exhaust. The count-path twin of the ranked
-    /// [`Self::seek_match`], which must keep decoding tfs for its score bar.
-    pub(super) fn seek_match_unranked(&mut self, mut from: u32) -> Result<(), FtsError> {
-        loop {
-            self.approx_seek(from);
-            if self.current_doc == u32::MAX {
-                return Ok(());
-            }
-            let aligned = self.current_doc;
-            // Verify adjacency; the probed members are decoded here, lazily.
-            let tf = self.verify_at_aligned(aligned)?;
-            if tf > 0 {
-                self.current_tf = tf;
-                return Ok(());
-            }
-            match aligned.checked_add(1) {
-                Some(next) => from = next,
-                None => {
-                    self.current_doc = u32::MAX;
-                    self.current_tf = 0;
-                    return Ok(());
-                }
-            }
-        }
+    /// Unranked (match/count) alignment to the next *verified* phrase match
+    /// ≥ `from`: the block-batched walk of [`Self::seek_match`] with no bar,
+    /// so no tf is compared and no doc is pre-screened.
+    pub(super) fn seek_match_unranked(&mut self, from: u32) -> Result<(), FtsError> {
+        self.seek_match(from, f32::NEG_INFINITY, None)
     }
 
-    /// Leapfrog the members to their next common doc ≥ `from`, verify
-    /// adjacency there, and repeat until a match or exhaustion. When
-    /// `bar` is finite, aligned docs are pre-screened without touching
-    /// positions: the phrase tf can't exceed any member's tf, so the
-    /// BM25 score at the members' minimum tf bounds the phrase's
-    /// contribution, and a doc strictly below `bar` is skipped before
-    /// the run decode. (`<`, not `<=`: a doc exactly at the bar can
-    /// still displace the incumbent kth-best on the ascending-doc-id
-    /// tie-break, so it must be verified.)
+    /// Advance to the first verified phrase match at doc ≥ `from`, a block
+    /// of the rarest member at a time. The rarest member's current block
+    /// is the candidate list; every other member filters it in one pass
+    /// ([`TermCursor::retain_contained`]: bit-tests on a bitset block, one
+    /// decode and a merge on a packed block) and only the survivors are
+    /// aligned doc by doc for their tf and positions. The candidates left
+    /// over after a match are kept for the next call. When `bar` is
+    /// finite, a block whose phrase bound is under the bar is skipped
+    /// before it is filtered, and a survivor is pre-screened without
+    /// touching positions: the phrase tf can't exceed any member's tf, so
+    /// the BM25 score at the members' minimum tf bounds its contribution,
+    /// and a doc strictly below `bar` is passed over. (`<`, not `<=`: a doc
+    /// exactly at the bar can still displace the incumbent kth-best on the
+    /// ascending-doc-id tie-break, so it must be verified.)
     pub(super) fn seek_match(
         &mut self,
-        mut from: u32,
+        from: u32,
         bar: f32,
-        dl_norm_k1: &NormTable,
+        dl_norm_k1: Option<&NormTable>,
     ) -> Result<(), FtsError> {
-        'docs: loop {
-            // Align every member to the same doc ≥ `from`, probing
-            // rarest-first so a common member is skip-confirmed last
-            // rather than re-skipped on every rare-member advance.
-            let mut aligned = from;
-            let mut oi = 0usize;
-            while oi < self.align_order.len() {
-                let mi = self.align_order[oi];
-                let c = &mut self.members[mi].cursor;
-                c.skip_to(aligned);
-                if c.is_exhausted() {
-                    self.current_doc = u32::MAX;
-                    self.current_tf = 0;
+        debug_assert!(
+            bar == f32::NEG_INFINITY || dl_norm_k1.is_some(),
+            "a finite bar needs the norms"
+        );
+        let bar_norm = dl_norm_k1.filter(|_| bar > f32::NEG_INFINITY);
+        while self.cand_next < self.cands.len() && self.cands[self.cand_next] < from {
+            self.cand_next += 1;
+        }
+        let driver = self.align_order[0];
+        loop {
+            while self.cand_next < self.cands.len() {
+                let s = self.cands[self.cand_next];
+                self.cand_next += 1;
+                // Every member holds `s`: move each walk cursor's block to it
+                // without a decode (the verification materializes the block
+                // it lands in, and a skip would publish a dense block lazily
+                // only to expand it right after).
+                for &mi in &self.align_order {
+                    self.members[mi].cursor.seek_block(s);
+                }
+                if let Some(norm) = bar_norm {
+                    let min_tf = self
+                        .members
+                        .iter_mut()
+                        .map(|m| m.cursor.tf_at_contained(s))
+                        .min()
+                        .expect("members >= 2");
+                    let ub = bm25::score_with_dl_norm_k1(self.idf_weight, min_tf, norm.get(s));
+                    if ub < bar {
+                        continue;
+                    }
+                }
+                let tf = self.verify_at_aligned(s)?;
+                if tf > 0 {
+                    self.current_doc = s;
+                    self.current_tf = tf;
                     return Ok(());
                 }
-                let here = c.current_doc_id();
-                if here > aligned {
-                    // Restart alignment at the higher doc.
-                    aligned = here;
-                    oi = 0;
-                    continue;
-                }
-                oi += 1;
             }
 
-            if bar > f32::NEG_INFINITY {
-                let min_tf = self
-                    .members
-                    .iter()
-                    .map(|m| m.cursor.current_tf())
-                    .min()
-                    .expect("members >= 2");
-                let ub =
-                    bm25::score_with_dl_norm_k1(self.idf_weight, min_tf, dl_norm_k1.get(aligned));
-                if ub < bar {
-                    from = match aligned.checked_add(1) {
-                        Some(next) => next,
-                        None => {
-                            self.current_doc = u32::MAX;
-                            self.current_tf = 0;
-                            return Ok(());
-                        }
-                    };
-                    continue 'docs;
-                }
-            }
-
-            // Verify adjacency at the aligned doc.
-            let tf = self.verify_at_aligned(aligned)?;
-            if tf > 0 {
-                self.current_doc = aligned;
-                self.current_tf = tf;
+            // Refill from the rarest member's next block at or after `from`.
+            let Some(refill) = self.refill_from else {
+                self.current_doc = u32::MAX;
+                self.current_tf = 0;
+                return Ok(());
+            };
+            let start = refill.max(from);
+            let d = &mut self.members[driver].cursor;
+            d.skip_to(start);
+            if d.is_exhausted() {
+                self.refill_from = None;
+                self.current_doc = u32::MAX;
+                self.current_tf = 0;
                 return Ok(());
             }
-            from = match aligned.checked_add(1) {
-                Some(next) => next,
-                None => {
-                    self.current_doc = u32::MAX;
-                    self.current_tf = 0;
-                    return Ok(());
+            // A skip into a dense block may hold just the one doc it landed
+            // on; the batch needs the whole block.
+            if d.decoded_block != d.current_block {
+                d.decode_current_block();
+                d.materialize_at(start);
+            }
+            let first = d.current_doc_id();
+            let block_last = d.current_block_last_doc_id();
+            self.refill_from = block_last.checked_add(1);
+            // Block-level bound: no doc of this block can score above the
+            // smallest member block max over its range scaled to the
+            // phrase idf. Under the bar, the block is skipped whole before
+            // any of its docs is aligned or its positions read.
+            if bar_norm.is_some() && self.block_max_in_range(first, block_last) < bar {
+                continue;
+            }
+            let d = &self.members[driver].cursor;
+            self.cands.clear();
+            self.cands
+                .extend_from_slice(&d.block_doc_ids[d.pos..d.block_n]);
+            self.cand_next = 0;
+            for oi in 1..self.align_order.len() {
+                if self.cands.is_empty() {
+                    break;
                 }
-            };
-            continue 'docs;
+                let mi = self.align_order[oi];
+                self.members[mi].probe.retain_contained(&mut self.cands);
+            }
         }
     }
 
@@ -530,8 +561,11 @@ impl PhraseCursor {
         //
         // `materialize_at` decodes each member's block only now: on the
         // unranked path a common member reached `aligned` by a `contains`
-        // bit-test and its block is not yet decoded; on the ranked path it
-        // was already decoded by `skip_to`, so this is a no-op there.
+        // bit-test and its block is not yet decoded; on the ranked path a
+        // `skip_to` into a bitset block holds just the one doc it landed on,
+        // and `decode_current_positions` needs the whole block (its pair
+        // index and tf run). Only a plain walk leaves the block decoded,
+        // so these calls are not optional.
         let anchor = self.align_order[0];
         let anchor_off = self.position_offsets[anchor];
         self.members[anchor].cursor.materialize_at(aligned);
@@ -719,10 +753,13 @@ impl AnyCursor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
+        builder::FtsBuilder,
         reader::{FtsReader, core::ClauseLists},
-        tokenize::Phrase,
+        tokenize::{AsciiLowerTokenizer, Phrase},
     };
 
     fn phrase(terms: &[&str]) -> Vec<Phrase<String>> {
@@ -862,6 +899,205 @@ mod tests {
         let mut ids: Vec<u32> = rare_hits.iter().map(|(d, _)| *d).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![0, 1, 2], "short-form member's packed group");
+    }
+
+    /// Ranked phrase walks prune whole blocks of the rarest member whose
+    /// block-level phrase bound is under the bar. Plant "the movement" in
+    /// every 13th doc, twice per doc in every fifth run of eight blocks
+    /// and once elsewhere, so a small k fills the heap from the doubled
+    /// runs and the rarest member's blocks inside the single-occurrence
+    /// runs fall under the bar; near-misses
+    /// ("movement the") keep the members aligning on docs that fail to
+    /// verify. Every k must match the unpruned walk's top-k.
+    #[tokio::test]
+    async fn ranked_phrase_block_pruning_agrees_with_the_unpruned_walk() {
+        use std::sync::Arc;
+
+        use crate::superfile::fts::{
+            builder::FtsBuilder, posting::BLOCK_LEN, tokenize::AsciiLowerTokenizer,
+        };
+        const N_DOCS: u32 = BLOCK_LEN as u32 * 40;
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        for d in 0..N_DOCS {
+            let hot = (d / (8 * BLOCK_LEN as u32)).is_multiple_of(5);
+            let text = match (d % 13, hot) {
+                (0, true) => "the movement of the movement",
+                (0, false) => "the movement of the people",
+                (5, _) => "movement the people of",
+                _ => "the people of the town",
+            };
+            b.add_doc(0, d, text).expect("add doc");
+        }
+        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let phrases = phrase(&["the", "movement"]);
+        let clauses = || ClauseLists {
+            should_phrases: &phrases,
+            ..ClauseLists::default()
+        };
+        // With k above the match count the heap never fills, so the bar
+        // stays at negative infinity and nothing is pruned: the oracle.
+        let mut all = r
+            .search_excluding("title", clauses(), N_DOCS as usize + 1, f32::NEG_INFINITY)
+            .await
+            .expect("unpruned");
+        assert_eq!(
+            all.len(),
+            (N_DOCS as usize).div_ceil(13),
+            "every 13th doc matches"
+        );
+        all.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        for k in [1usize, 3, 10, 50, 100, 200] {
+            let pruned = r
+                .search_excluding("title", clauses(), k, f32::NEG_INFINITY)
+                .await
+                .expect("pruned");
+            assert_eq!(pruned.len(), k, "k={k}");
+            for (i, ((dp, sp), (da, sa))) in pruned.iter().zip(all.iter()).enumerate() {
+                assert_eq!(
+                    dp, da,
+                    "doc mismatch k={k} rank {i}: pruned={dp} oracle={da}"
+                );
+                assert!(
+                    (sp - sa).abs() < 1e-4,
+                    "score mismatch k={k} rank {i}: {sp} vs {sa}"
+                );
+            }
+        }
+    }
+
+    /// The block-batched ranked walk and the doc-at-a-time unranked walk
+    /// must visit the same verified matches with the same tfs, from any
+    /// mix of consecutive advances and skips. The rarest member's blocks
+    /// each span dozens of the other members' blocks (a bitset one and a
+    /// packed one), so a batch is filtered across many member blocks and
+    /// its survivors are verified in blocks the probe has long left. With
+    /// a finite bar the ranked walk must still yield every match at or
+    /// above it.
+    #[tokio::test]
+    async fn batched_ranked_phrase_walk_matches_the_unranked_walk() {
+        use std::sync::Arc;
+
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+        use crate::superfile::fts::{
+            bm25, builder::FtsBuilder, posting::BLOCK_LEN, tokenize::AsciiLowerTokenizer,
+        };
+        const N_DOCS: u32 = BLOCK_LEN as u32 * 60;
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        for d in 0..N_DOCS {
+            let text = match (d % 53, d % 2, d % 3) {
+                (0, 0, _) if d.is_multiple_of(5) => "the mid rare the mid rare",
+                (0, 0, _) => "the mid rare",
+                (0, _, _) => "rare the mid",
+                (_, _, 0) => "the mid",
+                _ => "the x",
+            };
+            b.add_doc(0, d, text).expect("add doc");
+        }
+        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let phrases = phrase(&["the", "mid", "rare"]);
+        let build = || async {
+            let (mut atoms, _) = r
+                .build_atom_cursors(0, &[], &phrases, None, None)
+                .await
+                .expect("atoms");
+            match atoms.remove(0).expect("phrase present") {
+                AnyCursor::Phrase(c) => c,
+                AnyCursor::Term(_) => unreachable!("a phrase atom"),
+            }
+        };
+        let dl_norm = &r.columns[0].dl_norm_k1;
+
+        // Every match, by both walks, consecutively.
+        let mut unranked = build().await;
+        let mut expected = Vec::new();
+        while !unranked.is_exhausted() {
+            expected.push((unranked.current_doc_id(), unranked.current_tf));
+            unranked
+                .skip_to(unranked.current_doc_id() + 1)
+                .expect("skip");
+        }
+        assert_eq!(
+            expected.len(),
+            (N_DOCS as usize).div_ceil(106),
+            "every 106th doc matches"
+        );
+        let mut ranked = build().await;
+        let mut got = Vec::new();
+        while !ranked.is_exhausted() {
+            got.push((ranked.current_doc_id(), ranked.current_tf));
+            ranked
+                .skip_to_pruned(ranked.current_doc_id() + 1, f32::NEG_INFINITY, dl_norm)
+                .expect("skip");
+        }
+        assert_eq!(got, expected, "consecutive ranked walk");
+
+        // Random skips: both walks land on the same next match.
+        let mut rng = StdRng::seed_from_u64(7);
+        for trial in 0..20 {
+            let mut a = build().await;
+            let mut bb = build().await;
+            let mut target = 0u32;
+            while !a.is_exhausted() {
+                assert_eq!(
+                    (a.current_doc_id(), a.current_tf),
+                    (bb.current_doc_id(), bb.current_tf),
+                    "trial {trial} target {target}"
+                );
+                target = a.current_doc_id() + 1 + rng.random_range(0..700u32);
+                a.skip_to(target).expect("skip");
+                bb.skip_to_pruned(target, f32::NEG_INFINITY, dl_norm)
+                    .expect("skip");
+            }
+            assert!(
+                bb.is_exhausted(),
+                "trial {trial}: ranked walk must exhaust too"
+            );
+        }
+
+        // With a bar, the ranked walk yields exactly the matches whose
+        // score is not below it (the tf-2 docs), in order.
+        let bar_doc = expected
+            .iter()
+            .find(|(_, tf)| *tf == 2)
+            .map(|(d, _)| *d)
+            .expect("a tf-2 match");
+        let mut pruned = build().await;
+        let bar = bm25::score_with_dl_norm_k1(pruned.idf_weight, 2, dl_norm.get(bar_doc));
+        let above: Vec<(u32, u32)> = expected
+            .iter()
+            .copied()
+            .filter(|(d, tf)| {
+                bm25::score_with_dl_norm_k1(pruned.idf_weight, *tf, dl_norm.get(*d)) >= bar
+            })
+            .collect();
+        assert!(
+            above.len() >= 5 && above.len() < expected.len(),
+            "the bar splits the matches"
+        );
+        let mut got = Vec::new();
+        pruned.skip_to_pruned(0, bar, dl_norm).expect("seek");
+        // The constructor's initial seek is unranked; re-seek from 0 with the bar.
+        if !pruned.is_exhausted() {
+            let first = pruned.current_doc_id();
+            if bm25::score_with_dl_norm_k1(pruned.idf_weight, pruned.current_tf, dl_norm.get(first))
+                >= bar
+            {
+                got.push((first, pruned.current_tf));
+            }
+        }
+        while !pruned.is_exhausted() {
+            let next = pruned.current_doc_id() + 1;
+            pruned.skip_to_pruned(next, bar, dl_norm).expect("skip");
+            if !pruned.is_exhausted() {
+                got.push((pruned.current_doc_id(), pruned.current_tf));
+            }
+        }
+        assert_eq!(got, above, "ranked walk under a bar");
     }
 
     /// A block whose position runs are very long (600 occurrences per doc,
@@ -1072,5 +1308,117 @@ mod tests {
             .await
             .expect_err("must be a typed error");
         assert!(matches!(err, FtsError::PositionsUnavailable { .. }));
+    }
+
+    // ── Cursor-level phrase seeks ─────────────────────────────────────
+
+    /// Rows in the seek corpus: the common member spans a dozen blocks.
+    const SEEK_DOCS: u32 = 1500;
+    /// Rows holding the rare member. The first holds the words reversed;
+    /// the other two hold the phrase, hundreds of docs (several of the
+    /// common member's blocks) apart.
+    const RARE_REVERSED: u32 = 5;
+    const RARE_MATCH_FIRST: u32 = 700;
+    const RARE_MATCH_SECOND: u32 = 1400;
+
+    /// The one phrase cursor `terms` builds on `r`'s first column.
+    async fn phrase_cursor(r: &FtsReader, terms: &[&str]) -> PhraseCursor {
+        let (atoms, _) = r
+            .build_atom_cursors(0, &[], &phrase(terms), None, None)
+            .await
+            .expect("build atoms");
+        match atoms.into_iter().next().flatten() {
+            Some(AnyCursor::Phrase(pc)) => pc,
+            _ => panic!("expected one phrase atom"),
+        }
+    }
+
+    fn open_positional(docs: impl Iterator<Item = String>) -> FtsReader {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("title".into(), true).expect("register");
+        for (i, text) in docs.enumerate() {
+            b.add_doc(0, i as u32, &text).expect("add doc");
+        }
+        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// A phrase whose rare member drives the alignment and whose common
+    /// member must be seeked several blocks forward per candidate: the
+    /// cursor lands on each verified match and skips the reversed
+    /// co-occurrence. A member positioned by its own block scan rather
+    /// than a seek to the driver's doc would verify positions against
+    /// the wrong block and either miss the match or report a false one.
+    #[tokio::test]
+    async fn seek_match_positions_a_far_member_by_block_seek() {
+        let r = open_positional((0..SEEK_DOCS).map(|d| match d {
+            RARE_REVERSED => "y x".to_string(),
+            RARE_MATCH_FIRST | RARE_MATCH_SECOND => "x y".to_string(),
+            _ => "x".to_string(),
+        }));
+        let norms = &r.columns[0].dl_norm_k1;
+        let mut pc = phrase_cursor(&r, &["x", "y"]).await;
+        assert!(
+            pc.members[0].cursor.block_count() > 8,
+            "premise: the common member spans many blocks"
+        );
+        assert_eq!(pc.align_order[0], 1, "premise: the rare member drives");
+        assert_eq!(
+            pc.current_doc_id(),
+            RARE_MATCH_FIRST,
+            "construction seeks past the reversed doc"
+        );
+        assert_eq!(pc.current_tf, 1);
+        pc.seek_match(RARE_MATCH_FIRST + 1, f32::NEG_INFINITY, Some(norms))
+            .expect("seek");
+        assert_eq!(pc.current_doc_id(), RARE_MATCH_SECOND);
+        assert_eq!(pc.current_tf, 1);
+        pc.skip_to(RARE_MATCH_SECOND + 1).expect("skip");
+        assert!(pc.is_exhausted(), "no third match");
+    }
+
+    /// A repeated-word phrase counts every occurrence start, overlapping
+    /// ones included: `"a a"` has two starts in `a a a`, one in `a a`,
+    /// none in `a b a`. Counting non-overlapping runs would report one
+    /// for the first doc and misrank it.
+    #[tokio::test]
+    async fn seek_match_counts_overlapping_starts_of_a_repeated_word() {
+        let r = open_positional(
+            ["a a a", "a b a", "a a", "b b", "a a a a"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        let norms = &r.columns[0].dl_norm_k1;
+        let mut pc = phrase_cursor(&r, &["a", "a"]).await;
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        while !pc.is_exhausted() {
+            seen.push((pc.current_doc_id(), pc.current_tf));
+            let next = pc.current_doc_id() + 1;
+            pc.seek_match(next, f32::NEG_INFINITY, Some(norms))
+                .expect("seek");
+        }
+        assert_eq!(seen, vec![(0, 2), (2, 1), (4, 3)]);
+    }
+
+    /// A three-member phrase matches only where all three are adjacent in
+    /// order: a doc missing the last member is never a candidate, a doc
+    /// holding all three out of order is aligned but fails verification.
+    #[tokio::test]
+    async fn three_member_phrase_rejects_a_missing_or_misplaced_member() {
+        let r = open_positional(
+            ["p q r", "p q s", "p r q", "q r p q r", "p q"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        let norms = &r.columns[0].dl_norm_k1;
+        let mut pc = phrase_cursor(&r, &["p", "q", "r"]).await;
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        while !pc.is_exhausted() {
+            seen.push((pc.current_doc_id(), pc.current_tf));
+            let next = pc.current_doc_id() + 1;
+            pc.seek_match(next, f32::NEG_INFINITY, Some(norms))
+                .expect("seek");
+        }
+        assert_eq!(seen, vec![(0, 1), (3, 1)]);
     }
 }

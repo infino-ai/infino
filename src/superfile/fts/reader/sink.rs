@@ -144,6 +144,18 @@ pub(super) trait AndSink {
     /// unranked count over a large intersection cheaper than ranking it.
     fn needs_score(&self) -> bool;
 
+    /// Whether a leader doc's own score, tested against [`bar`](AndSink::bar),
+    /// is worth computing to reject the doc before the walk touches any other
+    /// term. True for a sink whose bar is the score a hit must actually beat.
+    ///
+    /// False for a sink that deliberately reports a bar *below* that, which no
+    /// leader-side screen can make up for: the gap between the two is exactly
+    /// the room the screen would have needed to reject anything, so it pays a
+    /// norm lookup and a divide per leader doc and rejects almost nothing.
+    fn screenable(&self) -> bool {
+        true
+    }
+
     /// Record one doc in the intersection. `score` is meaningful only
     /// when [`needs_score`](AndSink::needs_score) returns `true`;
     /// otherwise it is `0.0` and ignored.
@@ -228,6 +240,14 @@ impl AndSink for MustShouldSink<'_> {
         true
     }
 
+    /// The bar above is the k-th best lowered by every should term's maximum,
+    /// so that a doc carrying all the musts and no should is still reachable.
+    /// A must-only leader score tested against it is short by that same
+    /// discount, which is why the screen cannot pay here.
+    fn screenable(&self) -> bool {
+        false
+    }
+
     fn emit(&mut self, doc: u32, must_score: f32) {
         let norm = self.dl_norm_k1.get(doc);
         let mut score = must_score;
@@ -301,17 +321,61 @@ pub(super) fn and_heap_push(
     }
     if heap.len() < k {
         heap.push(TopKEntry(score, doc_id));
-    } else if let Some(&worst) = heap.peek()
+    } else if let Some(mut worst) = heap.peek_mut()
         && (score > worst.0 || (score == worst.0 && doc_id < worst.1))
     {
-        heap.pop();
-        heap.push(TopKEntry(score, doc_id));
+        *worst = TopKEntry(score, doc_id);
+    }
+}
+
+/// Replace the heap's worst entry in place — one sift, where a `pop`
+/// followed by a `push` costs a full sift-down and two sift-ups. The
+/// caller has already decided `entry` belongs in the top-k and the heap
+/// is non-empty (it holds `k`); unlike pop-then-push this does not insert
+/// into an empty heap, so that precondition is asserted.
+#[inline]
+pub(super) fn replace_worst(heap: &mut BinaryHeap<TopKEntry>, entry: TopKEntry) {
+    debug_assert!(!heap.is_empty(), "replace_worst on an empty heap");
+    if let Some(mut worst) = heap.peek_mut() {
+        *worst = entry;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn and_heap_push_keeps_the_smaller_doc_on_a_tied_score() {
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::new();
+        and_heap_push(&mut heap, 2, None, 1.0, 5);
+        and_heap_push(&mut heap, 2, None, 1.0, 9);
+        // Same score, smaller doc: evicts doc 9.
+        and_heap_push(&mut heap, 2, None, 1.0, 7);
+        assert_eq!(drain_top_k_desc(heap.clone()), vec![(5, 1.0), (7, 1.0)]);
+        // Same score, larger doc: no change.
+        and_heap_push(&mut heap, 2, None, 1.0, 12);
+        assert_eq!(drain_top_k_desc(heap.clone()), vec![(5, 1.0), (7, 1.0)]);
+        // Better score: evicts the worst (doc 7, the larger of the tie).
+        and_heap_push(&mut heap, 2, None, 2.0, 30);
+        assert_eq!(drain_top_k_desc(heap.clone()), vec![(30, 2.0), (5, 1.0)]);
+        // Worse score than the worst: no change.
+        and_heap_push(&mut heap, 2, None, 0.5, 1);
+        assert_eq!(drain_top_k_desc(heap), vec![(30, 2.0), (5, 1.0)]);
+    }
+
+    #[test]
+    fn replace_worst_is_pop_then_push() {
+        let mut a: BinaryHeap<TopKEntry> = [(1.0, 4), (2.0, 1), (3.0, 7)]
+            .into_iter()
+            .map(|(s, d)| TopKEntry(s, d))
+            .collect();
+        let mut b = a.clone();
+        replace_worst(&mut a, TopKEntry(2.5, 9));
+        b.pop();
+        b.push(TopKEntry(2.5, 9));
+        assert_eq!(drain_top_k_desc(a), drain_top_k_desc(b));
+    }
 
     #[test]
     fn drain_top_k_desc_orders_descending_with_tiebreak() {

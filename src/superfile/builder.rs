@@ -85,41 +85,44 @@ use roaring::RoaringBitmap;
 use tempfile::{NamedTempFile, tempfile};
 
 pub use crate::superfile::vector::builder::VectorConfig;
-use crate::superfile::{
-    BuildError, FtsError, ReadError, SuperfileReader,
-    format::{
-        self,
-        footer::{
-            EncodedBody, ParquetBodyEncoder, ParquetLayout, encode_parquet_body,
-            splice_index_streams_to,
+use crate::{
+    superfile::{
+        BuildError, FtsError, ReadError, SuperfileReader,
+        format::{
+            self,
+            footer::{
+                EncodedBody, ParquetBodyEncoder, ParquetLayout, encode_parquet_body,
+                splice_index_streams_to,
+            },
+            kv,
         },
-        kv,
-    },
-    fts::{
-        analysis::{Base, Stemmer, Stopwords, chain_name, chain_tokenizer},
-        bm25,
-        builder::FtsBuilder,
-        reader::{ColumnLengthStats, ColumnMeta},
-        tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
-    },
-    ids,
-    stats::SuperfileStats,
-    vector::{
-        builder::{
-            MultiCellSubsectionSource, VectorBuilder, build_merged_subsection_from_materialized,
-            finish_multi_cell_blob_to,
+        fts::{
+            analysis::{Base, Stemmer, Stopwords, chain_name, chain_tokenizer},
+            bm25,
+            builder::FtsBuilder,
+            reader::{ColumnLengthStats, ColumnMeta},
+            tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
         },
-        cell_posting::{CellPostingBuilder, MaterializedIvfRow},
-        distance::Metric,
-        ivf_merge::{
-            MergedIvfSubsection, Sq8IvfMergeInput, effective_fine_n_cent,
-            merge_sq8_ivf_subsections, merge_sq8_ivf_subsections_from_parsed,
-            stable_ids_in_merged_local_order,
+        ids,
+        stats::SuperfileStats,
+        vector::{
+            builder::{
+                MultiCellSubsectionSource, VectorBuilder,
+                build_merged_subsection_from_materialized, finish_multi_cell_blob_to,
+            },
+            cell_posting::{CellPostingBuilder, MaterializedIvfRow},
+            distance::Metric,
+            ivf_merge::{
+                MergedIvfSubsection, Sq8IvfMergeInput, effective_fine_n_cent,
+                merge_sq8_ivf_subsections, merge_sq8_ivf_subsections_from_parsed,
+                stable_ids_in_merged_local_order,
+            },
+            layout::VectorLayout,
+            reader::{ColumnReader, VectorReader},
+            rerank_codec::RerankCodec,
         },
-        layout::VectorLayout,
-        reader::{ColumnReader, VectorReader},
-        rerank_codec::RerankCodec,
     },
+    utils::trace::detail_span,
 };
 
 /// Per-column FTS configuration. The `column` must exist in
@@ -1442,8 +1445,17 @@ impl SuperfileBuilder {
 
             let mut cell_ids: Vec<u32> = by_cell.keys().copied().collect();
             cell_ids.sort_unstable();
+            // [optmerge] per-phase split: cells taking the cheap byte-splice
+            // (I/O + memcpy) vs the full decode/re-cluster/re-encode rebuild, and
+            // the wall in each. Gated, off by default.
+            let __merge_timers = crate::config::global().diagnostics.optimize_phase_timers;
+            let mut __splice_cells = 0usize;
+            let mut __rebuild_cells = 0usize;
+            let mut __splice_ns: u128 = 0;
+            let mut __rebuild_ns: u128 = 0;
             for cell_id in cell_ids {
                 let sources = by_cell.remove(&cell_id).expect("cell present");
+                let __mt = std::time::Instant::now();
                 let same_shape = sources
                     .windows(2)
                     .all(|pair| pair[0].2.n_cent == pair[1].2.n_cent);
@@ -1486,6 +1498,8 @@ impl SuperfileBuilder {
                     }
                     all_stable_ids.extend_from_slice(&cell_ids_col);
                     packed_cells.push((cell_id, merged));
+                    __splice_ns += __mt.elapsed().as_nanos();
+                    __splice_cells += 1;
                     continue;
                 }
                 // Reached when the sources disagree on fine `n_cent` (a small
@@ -1521,6 +1535,17 @@ impl SuperfileBuilder {
                 }
                 all_stable_ids.extend_from_slice(&stable_ids);
                 packed_cells.push((cell_id, merged));
+                __rebuild_ns += __mt.elapsed().as_nanos();
+                __rebuild_cells += 1;
+            }
+            if __merge_timers {
+                eprintln!(
+                    "[optmerge] cells splice {} ({:.1}s)  rebuild {} ({:.1}s)",
+                    __splice_cells,
+                    __splice_ns as f64 / 1e9,
+                    __rebuild_cells,
+                    __rebuild_ns as f64 / 1e9,
+                );
             }
         }
 
@@ -1802,6 +1827,10 @@ impl SuperfileBuilder {
     /// Streams the assembled superfile to `output` (compaction feeds a temp
     /// file it then mmaps) so the corpus-sized merge result is never held as an
     /// anon `Vec`.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(inputs = readers.len()))
+    )]
     pub(crate) fn build_from_readers_fts_merge_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
         fts_corpus: &HashMap<String, ColumnLengthStats>,
@@ -1839,6 +1868,7 @@ impl SuperfileBuilder {
         let mut ids_ok = true;
         let id_column = superfile_builder.opts.id_column.clone();
 
+        let copy_span = detail_span!("merge_copy_rows").entered();
         for (idx, (reader, deleted)) in readers.iter().enumerate() {
             superfile_builder.opts.check_mergeability(
                 reader.id_column(),
@@ -1882,7 +1912,10 @@ impl SuperfileBuilder {
             drop(record_batch);
             superfile_builder.next_local_doc_id += n_rows;
         }
+        drop(copy_span);
 
+        let finish_span =
+            detail_span!("merge_finish", rows = superfile_builder.next_local_doc_id).entered();
         // Every input fully tombstoned → no rows: match `finish_to`'s
         // empty-superfile contract (write nothing, return the merged stats).
         if superfile_builder.next_local_doc_id == 0 {
@@ -1891,6 +1924,7 @@ impl SuperfileBuilder {
         let body = body_encoder.finish()?;
         let ids_bytes: &[u8] = if ids_ok { &id_sidecar_bytes } else { &[] };
         superfile_builder.finish_to_with_body(body, ids_bytes, output)?;
+        drop(finish_span);
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
 
@@ -2022,6 +2056,7 @@ impl SuperfileBuilder {
     ///
     /// The caller must have advanced `next_local_doc_id` to the number of rows
     /// written into `body`.
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn finish_to_with_body<W: Write>(
         mut self,
         body: EncodedBody,

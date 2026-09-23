@@ -80,6 +80,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use arrow_schema::Schema;
+use datafusion::logical_expr::Expr;
 use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use roaring::RoaringBitmap;
 use tokio::{join, sync::OnceCell};
@@ -87,9 +88,10 @@ use uuid::Uuid;
 
 use super::{
     SuperfileHit,
-    candidate::CandidatePlan,
+    candidate::{CandidatePlan, CandidateScope},
     dispatch,
     exec::common::{SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source},
+    provider::prune_leaves_for_filters,
     prune::{PruneLeaf, select_superfiles},
 };
 pub use crate::superfile::reader::VectorSearchOptions;
@@ -114,7 +116,10 @@ use crate::{
             flat::Sq4FlatIndex,
             hnsw::{self, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
-            reader::{ProbeTally, ScanCandidate, ScanOutcome},
+            reader::{
+                EMPTY_FILTER_SELECTIVITY_MULT, ProbeTally, ScanCandidate, ScanOutcome,
+                selectivity_mult_from_counts,
+            },
         },
     },
     supertable::{
@@ -4998,7 +5003,13 @@ impl SupertableReader {
         Ok(())
     }
 
-    async fn vector_fanout_over_superfiles(
+    /// kNN fan-out over exactly `superfiles`, optionally admitting only the
+    /// rows in `allow` (per superfile; a superfile absent from the map has
+    /// no admitted row). The user-table kernel behind both the plain
+    /// search and the filtered one; `hybrid_search`'s vector leg calls it
+    /// directly so a pushed-down `WHERE` scopes both of its retrievers to
+    /// the same superfiles and rows.
+    pub(crate) async fn vector_fanout_over_superfiles(
         &self,
         superfiles: Vec<Arc<SuperfileEntry>>,
         column: &str,
@@ -5271,13 +5282,34 @@ impl SupertableReader {
                     base
                 }
             } else if filtered {
-                // Filtered UNDRAINED-tail fan: the default user-table
-                // search with a small fixed floor
-                // ([`FILTERED_USER_CELL_NPROBE`]) — the nearest MATCHING
-                // rows sit deeper than the fine-first single cell reaches.
+                // Filtered UNDRAINED-tail fan: cell routing follows the QUERY,
+                // but a sparse predicate's matches sit wherever they sit — so
+                // widen the [`FILTERED_USER_CELL_NPROBE`] floor by the filter's
+                // inverse selectivity (same capped math as the superfile tier's
+                // `selectivity_mult_from_counts`). Dense filters keep the floor.
+                // Count over THIS fan's superfiles only: the allow map still
+                // carries drained superfiles' entries, and mixing their
+                // matches into `allowed` overstates selectivity for the tail.
+                let allowed: u64 = allow
+                    .as_ref()
+                    .map(|m| {
+                        superfiles
+                            .iter()
+                            .filter_map(|e| m.get(&e.uri))
+                            .map(|bm| bm.len())
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                let population: u64 = superfiles.iter().map(|e| e.n_docs).sum();
+                let mult = selectivity_mult_from_counts(allowed, population);
+                if mult == EMPTY_FILTER_SELECTIVITY_MULT {
+                    // No tail row matches the filter: nothing to probe.
+                    return Ok(Vec::new());
+                }
+                let width = FILTERED_USER_CELL_NPROBE.saturating_mul(mult);
                 CellRoutingParams {
-                    nprobe_min: FILTERED_USER_CELL_NPROBE,
-                    nprobe_max: FILTERED_USER_CELL_NPROBE,
+                    nprobe_min: width,
+                    nprobe_max: width,
                     ..CellRoutingParams::default()
                 }
             } else {
@@ -6494,6 +6526,44 @@ impl SupertableReader {
         }
         self.route_filtered_vector_hits_async(superfiles, allow, column, query, k, options)
             .await
+    }
+
+    /// Resolve what a SQL `WHERE` pushed into a search table function
+    /// admits — the superfiles that may hold a match and, under a bounded
+    /// `plan`, the candidate rows in each. See [`CandidateScope`].
+    ///
+    /// Superfile survival is the intersection of two gates on the pinned
+    /// manifest, both pure statistics reads: the prune leaves the SQL scan
+    /// itself lowers `filters` to (scalar min/max, value sets, `LIKE`
+    /// blooms and ranges, null counts — so a `path = 'x'` on a column with
+    /// no full-text index still skips every superfile whose `path` range
+    /// excludes `x`), and the plan's term-bloom survival. The candidate
+    /// rows are the plan's per-superfile evaluation, tombstones removed;
+    /// an [`Unbounded`](CandidatePlan::Unbounded) plan bounds no row and
+    /// leaves `allow` as `None`.
+    pub(crate) async fn candidate_scope(
+        &self,
+        filters: &[Expr],
+        plan: &CandidatePlan,
+    ) -> Result<CandidateScope, QueryError> {
+        let manifest = self.manifest();
+        let leaves =
+            prune_leaves_for_filters(&manifest.options, &self.options().scalar_schema(), filters);
+        let mut superfiles = select_superfiles(manifest, &leaves).await?;
+        if let Some(surviving) = plan.surviving_superfile_ids(manifest).await? {
+            superfiles.retain(|e| surviving.contains(&e.superfile_id.as_u128()));
+        }
+        if superfiles.is_empty() {
+            return Ok(CandidateScope::empty());
+        }
+        let allow = match plan {
+            CandidatePlan::Unbounded => None,
+            bounded => Some(
+                self.candidate_bitmaps_from_plan(&superfiles, bounded)
+                    .await?,
+            ),
+        };
+        Ok(CandidateScope { superfiles, allow })
     }
 
     /// Convert user-table allow bitmaps (local doc ids) to stable `_id`s.

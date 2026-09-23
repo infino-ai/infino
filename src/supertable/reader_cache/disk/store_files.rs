@@ -239,6 +239,7 @@ impl DiskCacheStore {
                 mtime_us: file_mtime_us(&meta),
             },
         );
+        tracing::info!(target: "infino::cache", uri = %uri.0, filled, "cache build: adopted .blocks on scan");
         Some(filled)
     }
 
@@ -271,6 +272,13 @@ impl DiskCacheStore {
 
         let size = meta.len();
         if size == 0 || expected_size.is_some_and(|want| want != size) {
+            tracing::warn!(
+                target: "infino::cache",
+                uri = %uri.0,
+                on_disk_bytes = size,
+                manifest_bytes = expected_size,
+                "cache file size zero or does not match manifest offsets; discarding + re-fetching"
+            );
             self.discard_cache_file(uri);
             return Ok(None);
         }
@@ -297,11 +305,12 @@ impl DiskCacheStore {
 
                 Ok(Some(entry))
             }
-            Err(_) => {
+            Err(e) => {
                 // A dropped reservation frees itself; scan-counted bytes are given back by hand.
                 if counted {
                     self.current_bytes.fetch_sub(size, Ordering::Release);
                 }
+                tracing::error!(target: "infino::cache", uri = %uri.0, err = %e, "evict: cache file failed to open, discarding + re-fetching");
                 let _ = fs::remove_file(&path);
                 self.drop_block_file(uri);
                 Ok(None)
@@ -318,6 +327,7 @@ impl DiskCacheStore {
                 .fetch_sub(file.size_bytes, Ordering::Release);
         }
 
+        tracing::info!(target: "infino::cache", uri = %uri.0, "evict: discard whole .sf.parquet (unusable/size-mismatch)");
         let _ = fs::remove_file(self.cache_path(uri));
         self.drop_block_file(uri);
     }
@@ -327,6 +337,7 @@ impl DiskCacheStore {
             self.current_bytes
                 .fetch_sub(file.size_bytes, Ordering::Release);
         }
+        tracing::info!(target: "infino::cache", uri = %uri.0, "evict: dropped .blocks + .blocks.idx (unusable/scan)");
         let _ = fs::remove_file(self.blocks_path(uri));
         let _ = fs::remove_file(self.blocks_idx_path(uri));
     }
@@ -370,6 +381,7 @@ impl DiskCacheStore {
         }
 
         self.coordinators.remove(uri);
+        tracing::info!(target: "infino::cache", uri = %uri.0, present, "evict: erased local copy (object-store GC drop)");
         let _ = fs::remove_file(self.cache_path(uri));
         self.drop_block_file(uri);
         if present {

@@ -24,6 +24,8 @@ mod work;
 
 pub use core::*;
 
+#[cfg(any(test, feature = "test-helpers"))]
+pub use count::TermLayout;
 pub(crate) use expand::{LONG_S_ASCII, TermPattern, has_fold_partner};
 pub use metadata::{ColumnLengthStats, ColumnMeta, OpenOptions};
 pub use options::{Bm25SearchOptions, Bm25Stats, BoolMode};

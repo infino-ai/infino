@@ -584,4 +584,35 @@ mod tests {
             );
         }
     }
+
+    /// Averages whose thousandths sit on either side of a rounding
+    /// boundary land on the neighbouring fixed-point values, and the
+    /// stored value re-encodes to itself. The writer bakes bounds at the
+    /// stored value and the reader decodes with it; a rounding that
+    /// differed between the two sides by one step would make every bound
+    /// off by that step, unsoundly on the side that rounds down.
+    #[test]
+    fn stored_average_rounds_consistently_across_a_thousandth_boundary() {
+        assert_eq!(avgdl_x1000(293.3994), 293_399);
+        assert_eq!(avgdl_x1000(293.4), 293_400);
+        assert_eq!(avgdl_x1000(293.4006), 293_401);
+        // Sweep the neighbourhood at f32 granularity: every value is
+        // stored within half a step and the stored value is a fixed
+        // point of the encoding.
+        let mut x = 293.395f32;
+        while x < 293.405 {
+            let stored = stored_avgdl(x);
+            assert!(
+                (stored - x).abs() <= 0.5 / format::fts::AVGDL_FIXED_POINT_SCALE + x * f32::EPSILON,
+                "{x}: stored {stored} is more than half a step away"
+            );
+            assert_eq!(
+                avgdl_x1000(stored),
+                avgdl_x1000(x),
+                "{x}: re-encodes to the same step"
+            );
+            assert_eq!(stored_avgdl(stored), stored, "{x}: idempotent");
+            x = f32::from_bits(x.to_bits() + 1);
+        }
+    }
 }
