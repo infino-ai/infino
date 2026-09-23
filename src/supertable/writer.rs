@@ -3487,7 +3487,7 @@ async fn persist_superfile_publish_batch_async(
 /// all hardware threads. Sized once, at first use.
 static MAINT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
 
-fn maint_pool() -> Result<&'static ThreadPool, BuildError> {
+pub(super) fn maint_pool() -> Result<&'static ThreadPool, BuildError> {
     if let Some(pool) = MAINT_POOL.get() {
         return Ok(pool);
     }
