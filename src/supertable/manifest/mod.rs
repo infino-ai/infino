@@ -50,7 +50,7 @@ use arrow_array::*;
 use arrow_schema::{DataType, TimeUnit};
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::future;
+use futures::{future, stream, stream::StreamExt};
 /// Re-export the per-column skip aggregates so callers can refer to them as
 /// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
@@ -93,7 +93,7 @@ use crate::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
                 PartitionStrategy,
             },
-            part::{ContentHash, ManifestPart, PartId},
+            part::{ContentHash, ManifestPart, OpenBlobBudget, PartId},
             partition::{assign_partition, encode_partition_key},
         },
         query::{hierarchical_iter, prune::PruneLeaf},
@@ -902,7 +902,7 @@ impl ManifestSnapshot {
                         async move { loader.load(pid).await }
                     })
                     .collect::<Vec<_>>();
-                let loaded = future::join_all(load_futs).await;
+                let loaded = load_parts_bounded(load_futs).await;
                 for (pid, result) in missing_part_ids.iter().zip(loaded) {
                     let part = result?;
                     let cell = OnceCell::new();
@@ -942,7 +942,7 @@ impl ManifestSnapshot {
                         async move { loader.load(pid).await }
                     })
                     .collect::<Vec<_>>();
-                let loaded = future::join_all(load_futs).await;
+                let loaded = load_parts_bounded(load_futs).await;
                 for (pid, result) in part_ids.iter().zip(loaded) {
                     let part = result?;
                     all_superfiles.extend(part.superfiles.iter().cloned());
@@ -2158,16 +2158,38 @@ impl ManifestSnapshot {
                 opts.manifest_disk_cache.clone(),
             ))
         });
-        // Inherit only the cached parts the new list still
-        // references — entries for rewritten/removed parts are
-        // dropped rather than carried forward, so the in-memory
-        // parts cache can't grow without bound across commits.
-        // Surviving parts keep their warm cache entry (no refetch);
-        // the freshly-written parts are seeded below.
+        // Inherit only the cached parts the new list still references —
+        // entries for rewritten/removed parts are dropped rather than
+        // carried forward. That alone bounds nothing on an append-only
+        // table: nothing is ever removed, so every part stays live and the
+        // decoded set grows with the table. Each decoded part holds its
+        // entries' inline open blobs, so a long ingest accumulates them for
+        // the life of the writer.
+        //
+        // Carry forward only the tail the writer is about to touch. An
+        // append rewrites the newest part (and, across a split, the one
+        // before it), so the newest few cover the hot path with no refetch;
+        // everything older is left out of the map entirely and reloads on
+        // demand through `get_part_by_id`, which creates the cell and fills
+        // it from the loader. Those reads hit the manifest disk cache, so
+        // they are local, not an object-store round trip.
+        //
+        // Without a loader — an in-process table with no storage attached —
+        // nothing can reload, so everything live stays resident.
         let live_part_ids: HashSet<_> = new_list.parts.iter().map(|e| e.part_id).collect();
+        let carry_forward: HashSet<PartId> = match loader.is_some() {
+            true => new_list
+                .parts
+                .iter()
+                .rev()
+                .take(RESIDENT_PARTS_CARRIED_FORWARD)
+                .map(|e| e.part_id)
+                .collect(),
+            false => live_part_ids.clone(),
+        };
         let parts = DashMap::new();
         for kv in self.parts.iter() {
-            if live_part_ids.contains(kv.key()) {
+            if live_part_ids.contains(kv.key()) && carry_forward.contains(kv.key()) {
                 parts.insert(*kv.key(), kv.value().clone());
             }
         }
@@ -2279,6 +2301,52 @@ fn rebuild_part_and_entry(
 /// An optional [`ManifestDiskCache`] short-circuits the storage GET
 /// when the part's compressed bytes are already on local disk. Because
 /// parts are content-addressed, a cache hit can never be stale.
+/// Decoded manifest parts a commit carries into the next snapshot.
+///
+/// An append rewrites the newest part, and a split also touches the one
+/// before it, so a small tail covers what the writer actually reads without
+/// a refetch. Older parts are dropped from the resident map and reload on
+/// demand; the alternative — keeping every live part — grows with the table
+/// on an append-only ingest, because nothing is ever removed from the live
+/// set and each decoded part holds its entries' inline open blobs.
+const RESIDENT_PARTS_CARRIED_FORWARD: usize = 4;
+
+/// Manifest parts fetched + decoded concurrently during one snapshot load.
+///
+/// Each in-flight part holds its raw bytes, the Avro value tree decoded from
+/// them and the entries built out of that — a few times the part's own size —
+/// so loading every part at once makes the peak scale with the part count. A
+/// table of small superfiles has tens of thousands of parts, which is how an
+/// open reached tens of GB before it had answered anything. Bounded, the peak
+/// is a function of this number instead, and the fetches still overlap enough
+/// to keep the object store busy.
+const MANIFEST_PART_LOAD_CONCURRENCY: usize = 32;
+
+/// Await `futs` with at most [`MANIFEST_PART_LOAD_CONCURRENCY`] in flight,
+/// returning the results in the order the futures were given.
+///
+/// Order matters: both callers zip the results back against their part-id
+/// list, so completion order would mis-attribute parts.
+async fn load_parts_bounded<F>(futs: Vec<F>) -> Vec<F::Output>
+where
+    F: Future,
+{
+    stream::iter(futs)
+        .buffered(MANIFEST_PART_LOAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+}
+
+/// Default ceiling on inline open-blob bytes a manifest snapshot keeps
+/// resident, shared across the whole load.
+///
+/// Sized so a compacted table keeps every blob it has today: a compacted
+/// superfile inlines only its 64 KiB parquet tail (its FTS ranges exceed the
+/// writer's inline cap), so this covers several thousand of them. A table of
+/// small, uncompacted superfiles inlines both FTS ranges per entry and would
+/// otherwise grow without limit — 19,980 such entries reached 86 GB.
+const DEFAULT_OPEN_BLOB_BUDGET_BYTES: u64 = 512 * (1 << 20);
+
 pub struct ManifestPartLoader {
     storage: Arc<dyn StorageProvider>,
     /// Maps `PartId → (expected content_hash, uri, routing sibling)`.
@@ -2294,6 +2362,10 @@ pub struct ManifestPartLoader {
     /// the list stamps one. Writer handles keep this off — part rebuilds
     /// re-encode the full form and need resident fp32.
     prefer_routing: bool,
+    /// Ceiling on the inline open blobs this snapshot's parts keep
+    /// resident, shared across every part of the load. See
+    /// [`OpenBlobBudget`].
+    open_blob_budget: Arc<OpenBlobBudget>,
 }
 
 impl ManifestPartLoader {
@@ -2331,6 +2403,7 @@ impl ManifestPartLoader {
             parts_index: idx,
             manifest_disk_cache,
             prefer_routing,
+            open_blob_budget: Arc::new(OpenBlobBudget::new(DEFAULT_OPEN_BLOB_BUDGET_BYTES)),
         }
     }
 
@@ -2388,7 +2461,9 @@ impl ManifestPartLoader {
         {
             record("cache_hit", true);
             record("bytes", bytes.len() as u64);
-            let parsed = decode_part_off_thread(Bytes::from(bytes)).await?;
+            let parsed =
+                decode_part_off_thread(Bytes::from(bytes), Arc::clone(&self.open_blob_budget))
+                    .await?;
             return Ok(Arc::new(parsed));
         }
         record("cache_hit", false);
@@ -2403,7 +2478,12 @@ impl ManifestPartLoader {
         // blake3 over a multi-hundred-MiB part is CPU the polling task
         // must not absorb (it serializes the nominally-concurrent part
         // fan exactly like the inline decode used to).
-        let parsed = verify_and_decode_part_off_thread(bytes.clone(), *expected_hash).await?;
+        let parsed = verify_and_decode_part_off_thread(
+            bytes.clone(),
+            *expected_hash,
+            Arc::clone(&self.open_blob_budget),
+        )
+        .await?;
         // Populate the cache for next time (best-effort; the hash was
         // verified above, satisfying `put`'s contract).
         if let Some(cache) = &self.manifest_disk_cache {
@@ -2472,8 +2552,15 @@ impl UserCentroidCache {
     feature = "detailed-tracing",
     tracing::instrument(name = "manifest.part_decode", skip_all, fields(bytes = bytes.len() as u64))
 )]
-async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLoadError> {
-    match spawn_blocking(carry_span(move || part::decode(&bytes))).await {
+async fn decode_part_off_thread(
+    bytes: Bytes,
+    budget: Arc<OpenBlobBudget>,
+) -> Result<ManifestPart, ManifestLoadError> {
+    match spawn_blocking(carry_span(move || {
+        part::decode_with_blob_budget(&bytes, &budget)
+    }))
+    .await
+    {
         Ok(result) => Ok(result?),
         Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
             format!("part decode task failed: {join_error}"),
@@ -2495,6 +2582,7 @@ async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLo
 async fn verify_and_decode_part_off_thread(
     bytes: Bytes,
     expected_hash: ContentHash,
+    budget: Arc<OpenBlobBudget>,
 ) -> Result<ManifestPart, ManifestLoadError> {
     let verify_then_decode = move || {
         let actual_hash = ContentHash::of(&bytes);
@@ -2504,7 +2592,7 @@ async fn verify_and_decode_part_off_thread(
                 actual: actual_hash.to_hex(),
             });
         }
-        part::decode(&bytes).map_err(ManifestLoadError::from)
+        part::decode_with_blob_budget(&bytes, &budget).map_err(ManifestLoadError::from)
     };
     match spawn_blocking(carry_span(verify_then_decode)).await {
         Ok(result) => result,
@@ -4794,7 +4882,7 @@ mod tests {
         use async_trait::async_trait;
         use bytes::Bytes;
         use dashmap::DashMap;
-        use tokio::spawn;
+        use tokio::{spawn, task::yield_now};
         use uuid::Uuid;
 
         use super::super::*;
@@ -5030,6 +5118,143 @@ mod tests {
                     fingerprint: 222,
                     version: 2,
                 })
+            );
+        }
+
+        /// A snapshot load fans out over every part, and each one in flight
+        /// holds its bytes, its decoded Avro tree and the entries built from
+        /// them. Unbounded, the peak scales with the part count — tens of
+        /// thousands on a table of small superfiles. Pin both halves of the
+        /// contract: the cap is respected, and results still come back in the
+        /// order the callers zip against.
+        /// A commit inherits the decoded parts its new list still references.
+        /// On an append-only table nothing is ever removed, so every part
+        /// stays live and the decoded set grows with the table — each one
+        /// holding its entries' inline open blobs. Carry forward only the
+        /// tail the writer is about to touch; older parts must drop out of
+        /// the resident map and still be readable on demand.
+        #[tokio::test]
+        async fn commit_carries_forward_only_a_bounded_tail_of_decoded_parts() {
+            let n_parts = RESIDENT_PARTS_CARRIED_FORWARD * 3;
+            let parts: Vec<ManifestPart> = (0..n_parts).map(|i| make_test_part(i as u8)).collect();
+            let (objects, entries) = encode_and_index(&parts);
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let list = fresh_list(entries);
+
+            // Storage-backed options: without a loader nothing could reload,
+            // and the commit is then required to keep every part resident.
+            let opts = Arc::new(
+                SupertableOptions::new(
+                    Arc::new(Schema::new(vec![Field::new(
+                        "title",
+                        DataType::LargeUtf8,
+                        false,
+                    )])),
+                    vec![],
+                    vec![],
+                )
+                .expect("opts")
+                .with_storage(Arc::clone(&storage) as Arc<dyn StorageProvider>),
+            );
+
+            // Every part starts decoded and resident, the state a long
+            // ingest reaches.
+            let parts_map = DashMap::new();
+            for part in &parts {
+                parts_map.insert(
+                    part.part_id,
+                    Arc::new(OnceCell::new_with(Some(Arc::new(part.clone())))),
+                );
+            }
+            let dropped = parts[0].part_id;
+            let before = ManifestSnapshot {
+                superfile_list: SuperfileList {
+                    manifest_id: 0,
+                    options: Arc::clone(&opts),
+                    superfiles: vec![],
+                    vector_index_storage_prefix: None,
+                    next_manifest_id_floor: 0,
+                },
+                list: Some(list.clone()),
+                parts: parts_map,
+                loader: Some(Arc::new(ManifestPartLoader::new(
+                    Arc::clone(&storage) as Arc<dyn StorageProvider>,
+                    &list,
+                ))),
+                stamped_partition_strategy: None,
+                stamped_global_vector_index: None,
+                stamped_drained_ranges: None,
+            };
+            assert_eq!(before.parts.len(), n_parts, "all parts start resident");
+
+            // `fresh_list` partitions by hash: the entry must carry a bucket
+            // hint, and must NOT carry a key — commit assigns that.
+            let added = super::make_superfile_entry_hinted(1, vec![], 0);
+            let (after, _encoded) = before
+                .update(from_ref(&added), &[])
+                .await
+                .expect("append commit");
+
+            // The freshly written part is seeded on top of the carried tail.
+            assert!(
+                after.parts.len() <= RESIDENT_PARTS_CARRIED_FORWARD + 1,
+                "a commit must not carry every decoded part forward; kept {} of {n_parts}",
+                after.parts.len()
+            );
+            assert!(
+                after.parts.len() > 1,
+                "the tail the writer is about to touch must stay resident"
+            );
+
+            // Dropping residency must not lose the part: it reloads.
+            assert!(
+                !after.parts.contains_key(&dropped),
+                "the oldest part must have been dropped from the resident map"
+            );
+            let reloaded = after
+                .get_part_by_id(dropped)
+                .await
+                .expect("a dropped part reloads on demand");
+            assert_eq!(reloaded.part_id, dropped);
+        }
+
+        #[tokio::test]
+        async fn part_load_is_bounded_and_order_preserving() {
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let n = MANIFEST_PART_LOAD_CONCURRENCY * 3 + 7;
+
+            let futs: Vec<_> = (0..n)
+                .map(|i| {
+                    let in_flight = Arc::clone(&in_flight);
+                    let peak = Arc::clone(&peak);
+                    async move {
+                        let now = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                        peak.fetch_max(now, Ordering::AcqRel);
+                        // Yield so every admitted future is genuinely
+                        // concurrent; without it each could finish before the
+                        // next is polled and the peak would read 1.
+                        yield_now().await;
+                        in_flight.fetch_sub(1, Ordering::AcqRel);
+                        i
+                    }
+                })
+                .collect();
+
+            let out = load_parts_bounded(futs).await;
+            assert_eq!(
+                out,
+                (0..n).collect::<Vec<_>>(),
+                "results must stay in submission order — callers zip them against part ids"
+            );
+            let observed = peak.load(Ordering::Acquire);
+            assert!(
+                observed <= MANIFEST_PART_LOAD_CONCURRENCY,
+                "at most {MANIFEST_PART_LOAD_CONCURRENCY} parts may decode at once, saw {observed}"
+            );
+            assert!(
+                observed > 1,
+                "the load must still overlap fetches, saw {observed} in flight"
             );
         }
 
@@ -8691,9 +8916,10 @@ mod tests {
         };
         let bytes = part::encode(&part);
 
-        let decoded = decode_part_off_thread(Bytes::from(bytes))
-            .await
-            .expect("valid part decodes off-thread");
+        let decoded =
+            decode_part_off_thread(Bytes::from(bytes), Arc::new(OpenBlobBudget::unlimited()))
+                .await
+                .expect("valid part decodes off-thread");
         assert_eq!(decoded.part_id, part.part_id, "part_id round-trips");
         assert_eq!(decoded.superfiles.len(), 1);
         assert_eq!(decoded.superfiles[0].superfile_id, id);
@@ -8701,9 +8927,12 @@ mod tests {
         assert_eq!(decoded.superfiles[0].id_max, 7);
 
         // Garbage bytes surface a typed error, not a panic.
-        let err = decode_part_off_thread(Bytes::from_static(b"not-a-valid-part-blob"))
-            .await
-            .expect_err("garbage bytes must fail to decode");
+        let err = decode_part_off_thread(
+            Bytes::from_static(b"not-a-valid-part-blob"),
+            Arc::new(OpenBlobBudget::unlimited()),
+        )
+        .await
+        .expect_err("garbage bytes must fail to decode");
         assert!(
             matches!(err, ManifestLoadError::Parse(_)),
             "expected a parse error, got {err:?}"

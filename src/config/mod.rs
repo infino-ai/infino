@@ -51,6 +51,8 @@ use serde::{
     ser::Serializer,
 };
 
+use crate::supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT;
+
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
 
@@ -910,6 +912,11 @@ impl Default for VectorSettings {
 pub struct DiagnosticsSettings {
     /// Accumulate per-phase timers during the vector drain build.
     pub drain_build_timers: bool,
+    /// Emit top-level optimize() phase timers ([optphase]: drain / split / merge
+    /// / recalibrate / settle / compact_total / router_cache) plus the merge
+    /// splice-vs-rebuild split ([optmerge]). Off by default; a measuring stick
+    /// for compaction scaling work.
+    pub optimize_phase_timers: bool,
     /// Emit the FTS builder's finish-phase profile.
     pub fts_profile: bool,
     /// Capture the object-store I/O timeline.
@@ -956,6 +963,7 @@ impl GcSettings {
 pub struct OptimizeOptions {
     pub(crate) compaction: CompactionSettings,
     pub(crate) gc: GcSettings,
+    pub(crate) recalibrate: RecalibratePolicy,
 }
 
 impl OptimizeOptions {
@@ -964,6 +972,7 @@ impl OptimizeOptions {
         Self {
             compaction: settings,
             gc: GcSettings::default(),
+            recalibrate: RecalibratePolicy::default(),
         }
     }
 
@@ -972,6 +981,32 @@ impl OptimizeOptions {
         self.gc = gc;
         self
     }
+
+    /// Override how `optimize()` handles probe-law recalibration (default
+    /// [`RecalibratePolicy::Auto`] when unset — backward compatible).
+    pub fn with_recalibrate(mut self, recalibrate: RecalibratePolicy) -> Self {
+        self.recalibrate = recalibrate;
+        self
+    }
+}
+
+/// How `optimize()` treats the probe-law recalibration — the O(N) query-serving
+/// calibration, separable from the storage-necessary drain/split/merge which
+/// always run. Storage work is unaffected by this; only recalibration is gated.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecalibratePolicy {
+    /// Engine decides: recalibrate when the live superfile set changed since the
+    /// pre-pass snapshot, or the rerank law lags its pool.
+    #[default]
+    Auto,
+    /// Always recalibrate this optimize, regardless of the Auto condition — for a
+    /// final optimize before serving, when the laws must reflect the full corpus.
+    Force,
+    /// Skip recalibration this optimize; the storage-necessary drain/split/merge
+    /// still run. For a repeated-optimize ingest loop where no query is served
+    /// until a later, deliberately recalibrated optimize.
+    Skip,
 }
 
 /// What a reindex repairs.
@@ -1133,6 +1168,15 @@ pub struct StorageSettings {
     /// `mmap_cold_threshold_secs` and not accessed since the
     /// previous sweep. Default: 75 s.
     pub mmap_sweep_interval_secs: u64,
+    /// How long a background superfile fill yields to foreground
+    /// queries holding the same superfile's lazy reader before it
+    /// downloads anyway. Default: 10 s. `0` promotes immediately;
+    /// a superfile under continuous query load would otherwise never
+    /// go idle, so the fill would never run and the reader would stay
+    /// in its heap-resident lazy state for the life of the process.
+    /// See
+    /// [`crate::supertable::reader_cache::DiskCacheConfig::promotion_defer_timeout`].
+    pub promotion_defer_timeout_secs: u64,
 }
 
 impl Default for StorageSettings {
@@ -1152,6 +1196,7 @@ impl Default for StorageSettings {
             prefetch_concurrency: DEFAULT_PREFETCH_CONCURRENCY,
             mmap_cold_threshold_secs: DEFAULT_MMAP_COLD_THRESHOLD_SECS,
             mmap_sweep_interval_secs: DEFAULT_MMAP_SWEEP_INTERVAL_SECS,
+            promotion_defer_timeout_secs: DEFAULT_PROMOTION_DEFER_TIMEOUT_SECS,
         }
     }
 }
@@ -1171,6 +1216,14 @@ pub(crate) const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 const DEFAULT_MMAP_COLD_THRESHOLD_SECS: u64 = 300;
 /// Default background mmap-sweep period (seconds).
 const DEFAULT_MMAP_SWEEP_INTERVAL_SECS: u64 = 75;
+/// Default window a background fill yields to same-superfile foreground
+/// queries before promoting anyway (seconds).
+///
+/// Derived from the runtime-side default rather than restated, so the YAML
+/// default and [`DiskCacheConfig`]'s can never drift apart.
+///
+/// [`DiskCacheConfig`]: crate::supertable::reader_cache::DiskCacheConfig
+const DEFAULT_PROMOTION_DEFER_TIMEOUT_SECS: u64 = DEFAULT_PROMOTION_DEFER_TIMEOUT.as_secs();
 
 fn default_id_column() -> String {
     "_id".to_string()

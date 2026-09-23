@@ -126,6 +126,40 @@ pub(crate) fn detached(span: Span) -> Span {
     span
 }
 
+/// Create an `info` span, or nothing at all without `detailed-tracing`.
+///
+/// The inline counterpart to `#[cfg_attr(feature = "detailed-tracing",
+/// tracing::instrument(...))]`, for work that is a region inside a
+/// function rather than a whole function. Feature off, this expands to
+/// [`Span::none()`], and the field expressions are not compiled at all
+/// — so a field naming a variable that only exists for the span will
+/// fail the `detailed-tracing` build while the default build stays
+/// green. That is what `make check`'s `cargo check --features
+/// metering,detailed-tracing` line is there to catch.
+///
+/// Entering a `Span::none()` is a genuine no-op: it never touches the
+/// dispatcher's span stack, so spans created inside the guard's scope
+/// keep the ambient parent rather than being orphaned. That makes the
+/// guard safe to hold across arbitrary nested work in either build.
+///
+/// Fields are `name = value` pairs only. `tracing`'s own sigils (`?x`,
+/// `%x`) and dotted field names are not expressible here: for the
+/// sigils use `tracing::field::debug(&x)` / `display(&x)`, and for a
+/// dotted name reach for `info_span!` under a `cfg_attr`.
+macro_rules! detail_span {
+    ($name:literal $(, $field:ident = $value:expr)* $(,)?) => {{
+        #[cfg(feature = "detailed-tracing")]
+        {
+            ::tracing::info_span!($name $(, $field = $value)*)
+        }
+        #[cfg(not(feature = "detailed-tracing"))]
+        {
+            ::tracing::Span::none()
+        }
+    }};
+}
+pub(crate) use detail_span;
+
 /// Record `value` into `field` on the currently-entered span.
 ///
 /// For the outcome of an operation — a cache hit, a byte count, which of

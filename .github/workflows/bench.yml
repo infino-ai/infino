@@ -52,14 +52,34 @@ jobs:
         # One modality per leg, each on its own VM. `suffix` keeps per-leg
         # resources and comment markers unique (all legs share one run_id).
         include:
-          - { bench: superfile,         docs: "1000000", suffix: sf }
-          # The FTS leg runs the generated realistic text corpus — the one
-          # the quality oracle is calibrated on. The synthetic corpus draws
-          # every battery token from one Zipf, so its "common-word" phrases
-          # pair near-universal terms whose per-superfile idf is degenerate
-          # (~0 and hypersensitive to shard df); grading FTS perf and
-          # quality there rewards scoring artifacts of that degeneracy
-          # instead of behavior on text-shaped term distributions.
+          # Every superfile cell, every phase: for the FTS cell that is
+          # build + warm + cold + quality on the realistic text corpus, so
+          # the single-file BM25 oracle gates every bench run alongside the
+          # supertable one below.
+          #
+          # The corpus is stated rather than left to the FTS cells' default
+          # because both A/B arms read this one argument string: the PR arm
+          # runs this branch's default and the baseline arm runs main's, so
+          # a leg that says nothing compares two different corpora the
+          # moment the default moves — which it just did, and every FTS row
+          # read as a several-hundred-percent regression. Naming it here
+          # puts both arms on the same corpus whatever either side defaults
+          # to. The other generated flavour is `synthetic`.
+          #
+          # The ceiling is raised with it: this leg runs the FTS, vector
+          # and SQL superfile cells across two arms, and the realistic
+          # corpus is ~6x the synthetic bytes at equal docs, the same
+          # reason the two supertable FTS legs below sit at 75.
+          - { bench: superfile,         docs: "1000000", suffix: sf, corpus: realistic, timeout_minutes: "90" }
+          # The FTS legs run the generated realistic text corpus — the one
+          # the quality oracle is calibrated on, and the FTS cells' default
+          # (stated here so the leg reads the same whatever the default).
+          # The synthetic corpus draws every battery token from one Zipf,
+          # so its "common-word" phrases pair near-universal terms whose
+          # per-superfile idf is degenerate (~0 and hypersensitive to shard
+          # df); grading FTS perf and quality there rewards scoring
+          # artifacts of that degeneracy instead of behavior on text-shaped
+          # term distributions.
           # The FTS cell runs as two legs split by read phase. The realistic
           # corpus is ~6x the synthetic bytes at equal docs and cold
           # measurement pays per byte, so one combined leg overran the

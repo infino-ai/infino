@@ -363,6 +363,29 @@ the two rankings with reciprocal-rank fusion, so a row surfaced by both
 retrievers ranks above one surfaced by a single retriever. It is a
 SQL-level fusion, not a separate engine kernel.
 
+A `WHERE` over a search table function means *the top k among rows
+satisfying the predicate* — never the predicate applied to a global
+top-k, which for a selective predicate returns a fraction of k or
+nothing. The functions report their filters as inexact, so the
+planner both hands them the predicate and re-checks it above them,
+and each function narrows its search in three tiers. The manifest
+statistics prune superfiles first, with the same leaves a plain scan
+uses (scalar min/max, value sets, term blooms, null counts), so
+`WHERE path = 'x'` on a column with no full-text index still opens
+only the superfiles whose `path` range can hold `x`. Where the
+predicate is on an FTS-indexed column, the candidate plan resolves it
+per superfile to the rows that can match, and the kernel admits only
+those rows into its top-k heap — `hybrid_search` hands one such scope
+to both of its retrievers, so they rank within the same rows before
+fusion. Whatever the index could not bound (a scalar column, a
+negation, a token superset that the exact predicate trims), the
+function makes up by applying the exact predicate to its own resolved
+rows and widening the search — doubling k each round — until k rows
+survive or the table is exhausted; the cost is proportional to the
+predicate's selectivity, never to a fixed over-fetch. Prefix search
+takes only that last tier: its term set is known per superfile, not
+per query.
+
 ## Concurrency
 
 - **Reader/writer isolation.** Reads and writes do not block each

@@ -67,7 +67,7 @@
             "description": "Missing or invalid API key."
           },
           "403": {
-            "description": "The account already stores one of its limits — rows, or vectors (one per row of a table with a vector column) — so no more can be added. The response body names which limit was reached. Delete rows to free space; reads and deletes are never refused for this reason. Not transient: retrying without freeing space fails identically."
+            "description": "The account already stores one of its limits — rows, or vectors (one per row of a table with a vector column) — so no more can be added. Which ceiling applies depends on the account: one with no payment method on file is held to the smaller free-plan ceiling, and adding a payment method raises it. The response body names which limit was reached, the numbers, and whether a payment method would raise it. Delete rows to free space; reads and deletes are never refused for this reason. Not transient: retrying without freeing space fails identically."
           },
           "404": {
             "description": "The target table does not exist. Append never creates a table — create it first with create_table."
@@ -306,18 +306,8 @@
               }
             }
           },
-          "402": {
-            "description": "The account has not completed onboarding.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
           "403": {
-            "description": "The API key may not address this database, or the account is not entitled to storage bindings (BYOB is an enterprise feature).",
+            "description": "The API key may not address this database; the account already owns as many databases as its plan allows (a free-plan limit — adding a payment method lifts it); or the account is not entitled to storage bindings (BYOB is an enterprise feature).",
             "content": {
               "application/json": {
                 "schema": {
@@ -924,7 +914,7 @@
             "description": "Missing or invalid API key."
           },
           "403": {
-            "description": "The account already stores one of its limits — rows, or vectors (one per row of a table with a vector column) — so no more can be added. The response body names which limit was reached. Delete rows to free space; reads and deletes are never refused for this reason. Not transient: retrying without freeing space fails identically."
+            "description": "The account already stores one of its limits — rows, or vectors (one per row of a table with a vector column) — so no more can be added. Which ceiling applies depends on the account: one with no payment method on file is held to the smaller free-plan ceiling, and adding a payment method raises it. The response body names which limit was reached, the numbers, and whether a payment method would raise it. Delete rows to free space; reads and deletes are never refused for this reason. Not transient: retrying without freeing space fails identically."
           },
           "409": {
             "description": "Another write to the same table was in flight, so this one was not applied. A table takes one write at a time. Transient — reissue the identical request after the `Retry-After` interval, or batch more rows per request to need fewer of them."
@@ -1009,12 +999,28 @@
           "mode"
         ],
         "properties": {
+          "b": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Overrides the column's declared BM25 length normalization for this\nsearch only. Must be given together with `k1`."
+          },
           "field_name": {
             "type": "string"
           },
           "k": {
             "type": "integer",
             "minimum": 0
+          },
+          "k1": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Overrides the column's declared BM25 term-frequency saturation for\nthis search only. Absent ⇒ score with whatever the column declared.\nMust be given together with `b`."
           },
           "mode": {
             "$ref": "#/components/schemas/Mode"
@@ -1038,7 +1044,7 @@
               },
               {
                 "$ref": "#/components/schemas/Stats",
-                "description": "BM25 corpus statistics for idf scoring. Absent ⇒ the engine default\n(per-superfile); the engine SDK's remote transport always sends it."
+                "description": "BM25 corpus statistics for idf scoring. Absent ⇒ the deployed\nengine's own default, whatever that is; the engine SDK's remote\ntransport always sends it explicitly."
               }
             ]
           },
@@ -1383,7 +1389,7 @@
       },
       "FtsColumn": {
         "type": "object",
-        "description": "One FTS index declaration under `indexes.fts` — a column plus its\nper-column options (`{\"column\": \"body\", \"analyzer\": \"standard\", \"stored\":\nfalse}`). Every option is optional and, when omitted, takes the engine\ndefault — the same defaults a bare-string entry gets (see [`FtsIndex`]).\nThe object shape mirrors what the engine's hosted transport sends for a\nnon-default `FtsField`, so an option chosen through the SDK reaches the\nservice rather than being refused at the door.",
+        "description": "One FTS index declaration under `indexes.fts` — a column plus its\nper-column options, e.g. `{\"column\": \"body\", \"analyzer\": \"standard\"}`.\nThe fields below are the full set; every one is optional and, when\nomitted, takes the engine default — the same defaults a bare-string entry gets (see [`FtsIndex`]).\nThe object shape mirrors what the engine's hosted transport sends for a\nnon-default `FtsField`, so an option chosen through the SDK reaches the\nservice rather than being refused at the door.",
         "required": [
           "column"
         ],
@@ -1393,10 +1399,26 @@
               "string",
               "null"
             ],
-            "description": "Analyzer name (`\"ascii_lower\"` or `\"standard\"`). Omitted means the\nengine default, `ascii_lower`."
+            "description": "Analyzer name (`\"standard\"` or `\"ascii_lower\"`). Omitted means the\nengine default, `standard` — the Unicode-aware UAX #29 tokenizer.\n`ascii_lower` splits on ASCII alphanumerics and drops every\nnon-ASCII token. Recorded with the table; it cannot be changed\nafterwards, so pass it explicitly to pin a column either way."
+          },
+          "b": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "BM25 length normalization for this column. Omitted means the engine\ndefault. Must be given together with `k1`."
           },
           "column": {
             "type": "string"
+          },
+          "k1": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "BM25 term-frequency saturation for this column. Omitted means the\nengine default. Must be given together with `b`: the two interact\nthrough the length norm, so half a pair scores with a combination\nthe caller never chose."
           },
           "stored": {
             "type": [
@@ -1416,10 +1438,10 @@
           },
           {
             "$ref": "#/components/schemas/FtsColumn",
-            "description": "`{\"column\": \"body\", \"analyzer\": \"standard\", \"stored\": false}`."
+            "description": "An object naming the column and any options it sets explicitly,\ne.g. `{\"column\": \"body\", \"analyzer\": \"standard\", \"k1\": 1.6,\n\"b\": 0.4}` — see [`FtsColumn`] for the full set."
           }
         ],
-        "description": "One entry in `indexes.fts`. Either a bare column name — which uses the\nengine defaults (`ascii_lower` analyzer, stored text) — or a `{column,\nanalyzer, stored}` object that sets options explicitly. The bare-string\nform keeps clients that send `\"fts\": [\"body\"]` working unchanged. Options\napply per column, not per table."
+        "description": "One entry in `indexes.fts`. Either a bare column name — which uses the\nengine defaults — or an options object that sets them explicitly. The bare-string\nform keeps clients that send `\"fts\": [\"body\"]` working unchanged. Options\napply per column, not per table."
       },
       "HybridSearchRequest": {
         "type": "object",
@@ -1484,7 +1506,7 @@
             "items": {
               "$ref": "#/components/schemas/FtsIndex"
             },
-            "description": "FTS index declarations — a bare column name (engine defaults) or a\n`{column, analyzer, stored}` object per column."
+            "description": "FTS index declarations — a bare column name (engine defaults) or an\noptions object per column (see [`FtsColumn`])."
           },
           "vector": {
             "type": [
@@ -1626,7 +1648,7 @@
       },
       "Stats": {
         "type": "string",
-        "description": "Which BM25 corpus statistics to score term rarity (idf) with. Accepted\ncase-insensitively on the wire (`\"per_superfile\"`, `\"global\"`); serialized\ncanonically. Absent on a request ⇒ the engine default (per-superfile).",
+        "description": "Which BM25 corpus statistics to score term rarity (idf) with. Accepted\ncase-insensitively on the wire (`\"per_superfile\"`, `\"global\"`); serialized\ncanonically. Absent on a request ⇒ whatever the deployed engine defaults\nto, deliberately: an omitted field means \"let the engine choose\", so a\nraw REST caller and an SDK caller who both leave it out score alike, and\nthe engine can improve its default without this contract going stale. Send\nthe field explicitly to pin one mode across engine versions.",
         "enum": [
           "per_superfile",
           "global"

@@ -27,7 +27,7 @@ use infino::{
         Supertable, SupertableOptions,
         mutations::MutationError,
         options::Consistency,
-        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore},
     },
     test_helpers::{build_title_batch, default_supertable_options, default_vector_config},
 };
@@ -110,8 +110,9 @@ fn make_disk_cache(
         prefetch_concurrency: PREFETCH_CONCURRENCY,
         mmap_cold_threshold_secs: MMAP_TIMER_DISABLED_SECS,
         mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
-        eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        // Everything below here at its default: these tests pin the
+        // cold-fetch and sweep knobs and care about nothing else.
+        ..DiskCacheConfig::default()
     };
     let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
     DiskCacheStore::new(storage, cfg, pinned).expect("cache")

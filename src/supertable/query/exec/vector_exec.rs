@@ -34,7 +34,7 @@
 //! score` ascending lists nearest neighbours first. See
 //! [`SuperfileHit::score`].
 
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow::compute::cast;
 use arrow_array::{Array, ArrayRef, Float32Array, ListArray};
@@ -63,7 +63,8 @@ use crate::{
         query::{
             candidate::CandidatePlan,
             exec::common::{
-                SCORE_COLUMN, arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits,
+                PushedPredicate, SCORE_COLUMN, arg_to_string, arg_to_usize,
+                candidate_plan_for_filters, fill_top_k, output_schema_with_score, resolve_hits,
                 search_query_df_error,
             },
             vector::{free_column_slot, hits_id_score_batch, user_placement_for_scalar_resolve},
@@ -143,8 +144,10 @@ impl TableFunctionImpl for VectorSearchFunc {
 }
 
 /// One parsed `vector_search(...)` invocation as a `TableProvider`.
-/// `scan` lowers to [`VectorSearchExec`]; no scalar `WHERE` filters
-/// or `LIMIT` are pushed in (the TVF's `k` is the top-k bound).
+/// `scan` lowers to [`VectorSearchExec`]; the TVF's `k` is the top-k
+/// bound, `WHERE` filters scope the kNN and fill that `k` (see
+/// [`supports_filters_pushdown`](Self::supports_filters_pushdown)),
+/// and `LIMIT` is not pushed in.
 struct VectorSearchTable {
     reader: Arc<SupertableReader>,
     column: String,
@@ -207,11 +210,17 @@ impl TableProvider for VectorSearchTable {
     /// The FTS candidate plan is a token-match *superset* of exact SQL
     /// equality. For columns whose tokenization is 1:1 with the literal
     /// (keyword / categorical values) the pushdown is exact and the
-    /// `FilterExec` drops nothing. For free-text columns where the literal
-    /// is a sub-token of larger text, the `FilterExec` may trim below `k`
-    /// (mild underflow) — still far better than the pre-pushdown behavior,
-    /// which filtered the *global* top-k. The exact, no-`FilterExec` path is
-    /// the Rust `Supertable::vector_search_filtered` API.
+    /// `FilterExec` drops nothing. Where it is not — a literal that is a
+    /// sub-token of larger text, or a predicate no index bounds at all —
+    /// the exec applies the exact predicate to its own rows and widens the
+    /// kNN until `k` survive (`fill_top_k`). That fill is best-effort, not
+    /// a guarantee: it widens `k`, while the probe count comes from
+    /// `VectorSearchOptions::resolve` and does not move with it, so the
+    /// candidates stay those of the probed cells. A predicate satisfied
+    /// only by rows in cells the query never probes can still come out
+    /// short, and the fill is bounded in any case (see `fill_top_k`). The
+    /// exact, no-`FilterExec` path is the Rust
+    /// `Supertable::vector_search_filtered` API.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -395,50 +404,76 @@ impl ExecutionPlan for VectorSearchExec {
             // Lower the pushed-down `WHERE` filters to an FTS candidate
             // plan. A bounded plan is pushed into the kNN (the kernel ranks
             // distance only among matching rows); `Unbounded` (no
-            // FTS-resolvable predicate, or none pushed) runs the plain kNN
-            // and lets the `FilterExec` above apply the predicate.
-            let manifest = reader.manifest();
-            let fts_cols: HashSet<&str> = manifest
-                .options
-                .fts_columns
-                .iter()
-                .map(|c| c.column.as_str())
-                .collect();
-            let plan = CandidatePlan::from_filters(&filters, &fts_cols, &|col| {
-                manifest.options.try_fts_tokenizer_for(col)
-            });
-            let hits = match plan {
-                CandidatePlan::Unbounded => {
-                    reader
-                        .vector_search_async(&column, &query, k, options)
-                        .await
+            // FTS-resolvable predicate, or none pushed) runs the plain kNN.
+            // Either way the exact predicate is then applied to the
+            // resolved rows and the search widened until `k` survive
+            // (`fill_top_k`), so a superset bound or a scalar predicate
+            // never leaves the function short of `k`.
+            let plan = candidate_plan_for_filters(reader.manifest(), &filters);
+            let search = |want: usize| {
+                let reader = &reader;
+                let column = &column;
+                let query = &query;
+                let plan = &plan;
+                async move {
+                    let hits = match plan {
+                        CandidatePlan::Unbounded => {
+                            reader
+                                .vector_search_async(column, query, want, options)
+                                .await?
+                        }
+                        bounded => {
+                            reader
+                                .vector_hits_filtered_by_plan(column, query, want, options, bounded)
+                                .await?
+                        }
+                    };
+                    Ok(hits)
                 }
-                bounded => {
-                    reader
-                        .vector_hits_filtered_by_plan(&column, &query, k, options, &bounded)
-                        .await
-                }
-            }
-            .map_err(search_query_df_error)?;
+            };
             // Same stamp guard as the hybrid exec path: unstamped hits fall
-            // through to placement rather than failing the query.
-            if let Some(indices) = id_score_projection
-                && hits.iter().all(|hit| hit.stable_id.is_some())
+            // through to placement rather than failing the query. The
+            // free-column fast path decodes nothing, so it can only serve
+            // a query with no predicate to check.
+            if filters.is_empty()
+                && let Some(indices) = id_score_projection
             {
-                return hits_id_score_batch(&reader, &hits)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?
-                    .project(&indices)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()));
+                let hits = search(k).await.map_err(search_query_df_error)?;
+                if hits.iter().all(|hit| hit.stable_id.is_some()) {
+                    return hits_id_score_batch(&reader, &hits)
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?
+                        .project(&indices)
+                        .map_err(|e| DataFusionError::Execution(e.to_string()));
+                }
+                let hits = user_placement_for_scalar_resolve(&reader, &hits)
+                    .await
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                return resolve_hits(
+                    &reader,
+                    &hits,
+                    &scalar_schema,
+                    &output_schema,
+                    projection.as_deref(),
+                )
+                .await;
             }
-            let hits = user_placement_for_scalar_resolve(&reader, &hits)
-                .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            resolve_hits(
+            let predicate = PushedPredicate::compile(&filters, &output_schema);
+            let placed = |want: usize| {
+                let search = &search;
+                let reader = &reader;
+                async move {
+                    let hits = search(want).await?;
+                    user_placement_for_scalar_resolve(reader, &hits).await
+                }
+            };
+            fill_top_k(
                 &reader,
-                &hits,
+                k,
+                predicate.as_ref(),
                 &scalar_schema,
                 &output_schema,
                 projection.as_deref(),
+                placed,
             )
             .await
         };
@@ -554,6 +589,8 @@ fn scalar_to_f32(sv: &ScalarValue) -> DfResult<f32> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use arrow_array::{
         Array, Decimal128Array, FixedSizeListArray, Int32Array, LargeStringArray, RecordBatch,
         StringArray,
@@ -954,6 +991,39 @@ mod tests {
             .expect("query_sql");
         let total: usize = rows.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, k, "unbounded predicate falls back to plain kNN");
+    }
+
+    /// A predicate the index cannot bound at all (`<>` lowers to
+    /// `Unbounded`) still fills `k`: the function applies it to its own
+    /// rows and widens the kNN until `k` survive — where a post-filtered
+    /// global top-k returned nothing.
+    #[test]
+    fn vector_search_tvf_where_unbounded_predicate_fills_k() {
+        let dim = 16;
+        let k = 3;
+        // Docs 0..=2 are "common" (nearest), docs 3..=7 are "rare".
+        let st = supertable_for_pushdown(dim, 8, 3);
+        let q = csv_one_hot(dim, 0);
+        let rows = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT title, score FROM vector_search('emb', '{q}', {k}) WHERE title <> 'common'"
+            ))
+            .expect("query_sql");
+        let total: usize = rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, k, "k rows survive after over-fetching");
+        assert_eq!(
+            count_title(&rows, "rare"),
+            k,
+            "every row satisfies the predicate"
+        );
+        for b in &rows {
+            let s = col_f32(b, "score");
+            for i in 1..s.len() {
+                assert!(s.value(i - 1) <= s.value(i), "still nearest-first");
+            }
+        }
     }
 
     /// Titles across `batches`, in hit order.

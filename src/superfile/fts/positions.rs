@@ -18,7 +18,10 @@
 use std::ops::Range;
 
 use crate::superfile::{
-    bits::{ExceptionPlan, PackScratch, for_each_lane, payload_bytes, plan_exceptions, put_bits},
+    bits::{
+        ExceptionPlan, PackScratch, for_each_lane, get_bits, payload_bytes, plan_exceptions,
+        put_bits,
+    },
     varint::{push_varint, read_varint, varint_len},
 };
 
@@ -220,6 +223,29 @@ impl StreamIndex {
     }
 
     /// Lanes `from..from + n`, exceptions patched in, appended to `out`.
+    /// One lane of the stream, exception applied.
+    #[inline]
+    fn lane(&self, bytes: &[u8], i: usize) -> Option<u32> {
+        let low = u32::try_from(get_bits(&bytes[self.payload.clone()], i, self.width)?).ok()?;
+        if self.exceptions.is_empty() {
+            return Some(low);
+        }
+        let hi = match self
+            .exceptions
+            .binary_search_by_key(&(i as u32), |&(lane, _)| lane)
+        {
+            Ok(k) => self.exception_hi(self.exceptions[k].1),
+            Err(_) => 0,
+        };
+        Some(low | hi)
+    }
+
+    /// An exception's high bits placed above the stream's packed width.
+    #[inline]
+    fn exception_hi(&self, hi: u32) -> u32 {
+        hi.checked_shl(u32::from(self.width)).unwrap_or(0)
+    }
+
     fn read_lanes(&self, bytes: &[u8], from: usize, n: usize, out: &mut Vec<u32>) -> Option<()> {
         let payload = &bytes[self.payload.clone()];
         let base = out.len();
@@ -236,7 +262,7 @@ impl StreamIndex {
             if lane >= from + n {
                 break;
             }
-            out[base + lane - from] |= hi.checked_shl(u32::from(self.width)).unwrap_or(0);
+            out[base + lane - from] |= self.exception_hi(hi);
         }
         Some(())
     }
@@ -268,6 +294,8 @@ enum GroupKind {
 /// per-run path, where decoding all 128 runs would cost more than they
 /// do.
 const BULK_AFTER_RUNS: u32 = 2;
+/// Runs up to this many positions bypass the generic lane reader.
+const SMALL_TF: usize = 4;
 const BULK_MAX_STRIDE: usize = 4;
 
 /// A position group located for **per-run** access: one pair's run is
@@ -367,6 +395,20 @@ impl GroupIndex {
                     .extend_from_slice(self.values.get(start..start + tf as usize)?);
             }
             GroupKind::Packed => {
+                if tf as usize <= SMALL_TF {
+                    // Most runs on a real corpus are one to three positions:
+                    // read the lanes straight out of the two payloads and
+                    // write the prefix sums, skipping the generic lane
+                    // reader and its scratch. An exception is looked up per
+                    // lane only when the stream has any.
+                    let mut p = self.first.lane(bytes, pair)?;
+                    out.push(p);
+                    for k in 0..tf as usize - 1 {
+                        p = p.checked_add(self.gap.lane(bytes, start + k)?)?;
+                        out.push(p);
+                    }
+                    return Some(());
+                }
                 self.first.read_lanes(bytes, pair, 1, &mut self.run)?;
                 self.gap
                     .read_lanes(bytes, start, tf as usize - 1, &mut self.run)?;
@@ -559,6 +601,55 @@ mod tests {
                 .run_positions(&out, pair, tfs[pair], &mut Vec::new())
                 .expect("run");
             assert_eq!(scattered.kind, GroupKind::Packed, "pair {pair}");
+        }
+    }
+
+    #[test]
+    fn short_runs_read_directly_agree_with_the_lane_reader() {
+        // Runs of one to four positions take the direct path; the same
+        // runs with exceptions in the first stream, in the gap stream, and
+        // in both must read the same as the generic reader, including a
+        // run that is itself the exception.
+        let tfs: Vec<u32> = (0..64u32).map(|d| 1 + d % 4).collect();
+        let mut vals = Vec::new();
+        for (d, &tf) in tfs.iter().enumerate() {
+            vals.push(12 * d as u32 + 5);
+            vals.extend((1..tf).map(|g| 2 + (g + d as u32) % 7));
+        }
+        let base = positions_of(&tfs, &vals);
+        let first_of = |pair: usize| tfs[..pair].iter().map(|&t| t as usize).sum::<usize>();
+        let mut variants: Vec<(&str, Vec<u32>)> = vec![("no exceptions", vals.clone())];
+        let mut v = vals.clone();
+        v[first_of(9)] = 1 << 26; // tf-2 pair, first value is an exception
+        variants.push(("first stream", v));
+        let mut v = vals.clone();
+        v[first_of(14) + 2] = 1 << 22; // tf-3 pair, a gap is an exception
+        variants.push(("gap stream", v));
+        let mut v = vals.clone();
+        v[first_of(21)] = 1 << 27;
+        v[first_of(21) + 1] = 1 << 21; // tf-2 pair, both lanes exceptional
+        v[first_of(0)] = 1 << 25; // the first pair of the block too
+        variants.push(("both streams", v));
+        for (label, vals) in variants {
+            let want = if label == "no exceptions" {
+                base.clone()
+            } else {
+                positions_of(&tfs, &vals)
+            };
+            let mut out = Vec::new();
+            group(&mut out, &tfs, &vals, false);
+            assert_eq!(out[0], GROUP_PACKED, "{label}");
+            let mut index = GroupIndex::default();
+            index.locate(&out, &mut 0, &tfs).expect("parses");
+            let mut wi = 0usize;
+            for (pair, &tf) in tfs.iter().enumerate() {
+                let mut got = Vec::new();
+                index
+                    .run_positions(&out, pair, tf, &mut got)
+                    .expect("run decodes");
+                assert_eq!(got, want[wi..wi + tf as usize], "{label} pair {pair}");
+                wi += tf as usize;
+            }
         }
     }
 

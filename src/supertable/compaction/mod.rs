@@ -21,13 +21,10 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures::{
-    future::join_all,
-    stream::{self, StreamExt},
-};
+use futures::stream::{self, StreamExt};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
-use tokio::time;
+use tokio::{sync::Semaphore, task::JoinSet, time};
 #[cfg(not(feature = "detailed-tracing"))]
 use tracing::Span;
 #[cfg(feature = "detailed-tracing")]
@@ -36,7 +33,7 @@ use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::CompactionSettings,
+    config::{CompactionSettings, RecalibratePolicy},
     runtime_bridge::bridge_on_runtime,
     superfile::{
         builder::SuperfileBuilder,
@@ -93,6 +90,7 @@ impl Supertable {
 }
 
 const MIB: u64 = 1024 * 1024;
+const MAX_CONCURRENT_INPUT_OPENS: usize = 64;
 
 /// Stats for one superfile. The caller fills these in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,10 +361,33 @@ impl Supertable {
     /// selects compaction jobs, then for each job seals every input
     /// superfile's tombstone sidecar so no concurrent deletes can land
     /// during the merge window.
+    /// Compaction with the historical `Auto` recalibration behavior. Used by
+    /// tests; production goes through [`compact_with`] from the optimize entry
+    /// point so the caller's [`RecalibratePolicy`] is honored.
+    #[cfg(test)]
     pub(crate) fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
-        bridge_on_runtime(self.compact_async(cfg), &self.inner().query_runtime())
+        self.compact_with(cfg, RecalibratePolicy::Auto)
     }
 
+    /// Like [`compact`], but with an explicit recalibration policy. `compact`
+    /// keeps the historical `Auto` behavior for its many call sites; the
+    /// optimize entry point threads the caller's `OptimizeOptions.recalibrate`
+    /// through here so a repeated-optimize ingest loop can skip the O(N)
+    /// recalibration.
+    pub(crate) fn compact_with(
+        &self,
+        cfg: &CompactionSettings,
+        recalibrate: RecalibratePolicy,
+    ) -> Result<(), CompactionError> {
+        bridge_on_runtime(
+            self.compact_async_with(cfg, recalibrate),
+            &self.inner().query_runtime(),
+        )
+    }
+
+    /// Async compaction with the historical `Auto` recalibration behavior.
+    /// Used by tests; production goes through [`compact_async_with`].
+    #[cfg(test)]
     #[cfg_attr(
         feature = "detailed-tracing",
         tracing::instrument(name = "compact", skip_all, fields(role = self.role().as_str()))
@@ -375,24 +396,56 @@ impl Supertable {
         &self,
         cfg: &CompactionSettings,
     ) -> Result<(), CompactionError> {
-        Self::compact_one_table(self, cfg).await?;
+        self.compact_async_with(cfg, RecalibratePolicy::Auto).await
+    }
+
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "compact", skip_all, fields(role = self.role().as_str()))
+    )]
+    pub(crate) async fn compact_async_with(
+        &self,
+        cfg: &CompactionSettings,
+        recalibrate: RecalibratePolicy,
+    ) -> Result<(), CompactionError> {
+        let phase_timers = crate::config::global().diagnostics.optimize_phase_timers;
+        Self::compact_one_table(self, cfg, recalibrate).await?;
         if matches!(
             self.inner().manifest.load().get_partition_strategy(),
             PartitionStrategy::VectorCell { .. }
         ) {
-            refresh_slow_vector_state(self.inner())
-                .await
-                .map_err(|error| CompactionError::Refresh(error.to_string()))?;
+            let __st = Instant::now();
+            refresh_slow_vector_state(
+                self.inner(),
+                !matches!(recalibrate, RecalibratePolicy::Skip),
+            )
+            .await
+            .map_err(|error| CompactionError::Refresh(error.to_string()))?;
+            if phase_timers {
+                info!(secs = __st.elapsed().as_secs_f64(), "[optphase]   settle");
+            }
         } else if let Some(hidden) = self.inner().vector_index_table.as_ref() {
-            Self::compact_one_table(hidden, &hidden_vector_index_compaction_settings()).await?;
+            Self::compact_one_table(
+                hidden,
+                &hidden_vector_index_compaction_settings(),
+                recalibrate,
+            )
+            .await?;
             // The hidden pass settled vector membership (merges + finalize +
             // any cell splits); its `update`s cleared the slow-CAS ref, so
             // republish the entry blob and restamp. Hidden tables have no
             // manifest parts, so publication is required for reopen and a
             // failure must be visible to the caller.
-            refresh_slow_vector_state(hidden.inner())
-                .await
-                .map_err(|error| CompactionError::Refresh(error.to_string()))?;
+            let __st = Instant::now();
+            refresh_slow_vector_state(
+                hidden.inner(),
+                !matches!(recalibrate, RecalibratePolicy::Skip),
+            )
+            .await
+            .map_err(|error| CompactionError::Refresh(error.to_string()))?;
+            if phase_timers {
+                info!(secs = __st.elapsed().as_secs_f64(), "[optphase]   settle");
+            }
         }
         Ok(())
     }
@@ -404,6 +457,7 @@ impl Supertable {
     pub(crate) async fn compact_one_table(
         table: &Supertable,
         cfg: &CompactionSettings,
+        recalibrate: RecalibratePolicy,
     ) -> Result<(), CompactionError> {
         let inner = table.inner();
 
@@ -460,10 +514,16 @@ impl Supertable {
         } else {
             HashSet::new()
         };
+        // Optimize phase timers ([optphase]); gated, off by default.
+        let phase_timers = crate::config::global().diagnostics.optimize_phase_timers;
+        let mut __pt = Instant::now();
         if hidden_ivf {
             split_overflow_cells(Arc::clone(inner))
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
+        }
+        if phase_timers {
+            info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   split");
         }
 
         let manifest = inner.manifest.load_full();
@@ -547,12 +607,18 @@ impl Supertable {
                 jobs = jobs.len(),
                 "compaction jobs planned"
             );
+            if phase_timers {
+                __pt = Instant::now();
+            }
             for job in jobs {
                 table.run_compaction_job(job, stale_seal_timeout).await?;
                 table
                     .refresh()
                     .await
                     .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+            }
+            if phase_timers {
+                info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   merge");
             }
         }
 
@@ -575,10 +641,29 @@ impl Supertable {
             }
             _ => false,
         };
-        if hidden_ivf && (snapshot_ids() != pre_pass_ids || rerank_lags()) {
+        // Recalibration is the O(N) query-serving calibration — gate it by the
+        // caller's policy (default Auto). Skip runs no recalibration; Force always
+        // runs it; Auto keeps the changed-or-lagging condition. Storage work above
+        // already ran regardless of the policy.
+        let run_recalibrate = hidden_ivf
+            && match recalibrate {
+                RecalibratePolicy::Skip => false,
+                RecalibratePolicy::Force => true,
+                RecalibratePolicy::Auto => snapshot_ids() != pre_pass_ids || rerank_lags(),
+            };
+        if run_recalibrate {
+            if phase_timers {
+                __pt = Instant::now();
+            }
             recalibrate_probe_laws(inner)
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
+            if phase_timers {
+                info!(
+                    secs = __pt.elapsed().as_secs_f64(),
+                    "[optphase]   recalibrate"
+                );
+            }
         }
 
         let clamped_components = transcode_clamped_components() - transcode_clamp_baseline;
@@ -642,21 +727,39 @@ impl Supertable {
             .try_reserve(estimated_bytes)
             .map_err(|e| BuildError::MemoryBudgetExceeded(e.to_string()))?;
 
-        let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
-        for entry in superfiles {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_INPUT_OPENS));
+        let mut superfile_readers_tasks = JoinSet::new();
+        for (idx, entry) in superfiles.iter().enumerate() {
             #[cfg(feature = "detailed-tracing")]
             let span = info_span!("compaction_input", superfile_id = %entry.superfile_id);
             #[cfg(not(feature = "detailed-tracing"))]
             let span = Span::none();
-            let open_fut = async {
-                let r = open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
-                    .await;
-                (entry.superfile_id, r)
+            let store = store.clone();
+            let disk_cache = disk_cache.clone();
+            let storage = storage.clone();
+            let entry = entry.clone();
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("should not be closed");
+            let open_fut = async move {
+                let _permit = permit;
+                let r = open_compaction_input(
+                    &store,
+                    disk_cache.as_ref(),
+                    storage.as_ref(),
+                    entry.as_ref(),
+                )
+                .await;
+                (idx, entry.superfile_id, r)
             }
             .instrument(span);
-            superfile_readers_fut.push(open_fut);
+
+            superfile_readers_tasks.spawn(open_fut);
         }
-        let readers = join_all(superfile_readers_fut).await;
+        let mut readers = superfile_readers_tasks.join_all().await;
+        readers.sort_unstable_by_key(|(idx, ..)| *idx);
 
         let now = Instant::now();
         if let Some(tombstone_cache) = &tombstone_cache {
@@ -671,7 +774,7 @@ impl Supertable {
         let superseded_map = manifest.get_superseded_cells();
         let mut readers_with_tombstones = Vec::with_capacity(readers.len());
         let mut superseded_per_reader = Vec::with_capacity(readers.len());
-        for (superfile_id, reader) in readers {
+        for (_idx, superfile_id, reader) in readers {
             let bitmap = tombstone_cache
                 .as_ref()
                 .map(|t| t.bitmap_for(superfile_id, now))
@@ -1086,7 +1189,9 @@ async fn seal_with_bounded_retry(
 mod tests {
     use std::{collections::HashSet, mem, str, sync::Arc};
 
-    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+    use arrow_array::{
+        ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
@@ -1097,7 +1202,7 @@ mod tests {
         Bm25Stats, BoolMode, VectorSearchOptions,
         config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         memory::ConnectionMemoryBudget,
-        superfile::{builder::FtsConfig, fts::reader::Bm25SearchOptions},
+        superfile::{builder::FtsConfig, fts::reader::Bm25SearchOptions, reader::SuperfileReader},
         supertable::{
             Supertable, SupertableOptions,
             error::CompactionError,
@@ -1900,6 +2005,79 @@ mod tests {
                 .unwrap_or_else(|_| panic!("token_match for '{term}'"));
             assert_eq!(hits.len(), 2, "term '{term}' should match exactly 2 docs");
         }
+    }
+
+    /// Stable ids of every row in `reader`, in row order.
+    fn read_ids(reader: &SuperfileReader) -> Vec<i128> {
+        let batch = reader.get_record_batch(None).expect("record batch");
+        batch
+            .column(
+                batch
+                    .schema()
+                    .index_of(reader.id_column())
+                    .expect("id column"),
+            )
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal ids")
+            .values()
+            .to_vec()
+    }
+
+    /// Inputs are opened concurrently, but the merged rows must still follow
+    /// the input order. Otherwise a merged file with a contiguous id span
+    /// maps local rows to the wrong `_id` via `id_min + local`. The first
+    /// inputs are the largest so they tend to finish opening last.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_superfiles_keeps_input_row_order() {
+        const N_INPUTS: usize = 8;
+        const ROWS_PER_STEP: usize = 500;
+
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        for i in 0..N_INPUTS {
+            let titles: Vec<String> = (0..(N_INPUTS - i) * ROWS_PER_STEP)
+                .map(|r| format!("doc {r}"))
+                .collect();
+            let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+            commit_titles(&st, &titles);
+        }
+
+        let superfiles: Vec<Arc<SuperfileEntry>> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .to_vec();
+        assert_eq!(superfiles.len(), N_INPUTS);
+
+        let merged = st
+            .merge_superfiles(&superfiles)
+            .await
+            .expect("merge_superfiles should succeed");
+        let merged_reader = merged
+            .open_reader()
+            .expect("merged superfile should have bytes")
+            .expect("open reader on merged superfile");
+
+        // Ids are not always contiguous within one commit, so read each
+        // input's ids from its own rows.
+        let storage = st
+            .inner()
+            .manifest
+            .load_full()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed table");
+        let mut expected = Vec::new();
+        for entry in &superfiles {
+            let (bytes, _) = storage.get(&entry.storage_path()).await.expect("get input");
+            let reader = SuperfileReader::open(bytes).expect("open input");
+            expected.extend(read_ids(&reader));
+        }
+        let ids = read_ids(&merged_reader);
+        assert_eq!(ids, expected, "merged rows must follow input order");
     }
 
     /// Ranked BM25 search must survive the k-way compaction merge. Two docs

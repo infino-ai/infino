@@ -171,7 +171,9 @@ pub use catalog::Supertable;
 pub use catalog::{
     ColdFetchMode, ConnectOptions, Connection, FtsField, IndexSpec, connect, connect_with,
 };
-pub use config::{CompactionSettings, GcSettings, OptimizeOptions, ReindexMode, ReindexOptions};
+pub use config::{
+    CompactionSettings, GcSettings, OptimizeOptions, RecalibratePolicy, ReindexMode, ReindexOptions,
+};
 /// The single public error type for the curated API.
 pub use error::InfinoError;
 // `VectorSearchOptions` (probe width / rerank budget) is deliberately

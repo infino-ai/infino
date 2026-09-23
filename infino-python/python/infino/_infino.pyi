@@ -116,6 +116,9 @@ class IndexSpec:
 
 class Table:
     def append(self, data: RowData) -> None: ...
+    # `append`, naming the source the rows came from; the name becomes part of
+    # the superfile's object key. Not available on a hosted table.
+    def append_named(self, data: RowData, source_name: str) -> None: ...
     # `k1` / `b` override the columns' declared parameters for this search
     # only; pass both or neither. Results stay exact — only pruning power is
     # traded — and nothing is rebuilt.
@@ -215,4 +218,5 @@ class OptimizeOptions:
         min_fill_percent: int | None = ...,
         target_superfile_size_mb: int | None = ...,
         stale_seal_timeout_ms: int | None = ...,
+        recalibrate: Literal["auto", "force", "skip"] | None = ...,
     ) -> None: ...

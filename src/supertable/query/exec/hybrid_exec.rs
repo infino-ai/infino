@@ -42,6 +42,15 @@
 //! score DESC` lists the best blended matches first. Identity is
 //! `(superfile, local_doc_id)`, so a document surfaced by *both*
 //! retrievers is boosted above one surfaced by a single retriever.
+//!
+//! ## `WHERE` on the function
+//!
+//! A `WHERE` over the function's output means *the top k among rows
+//! satisfying the predicate*. Filters are reported `Inexact`, lowered
+//! once to a [`CandidateScope`] and handed to **both** retrievers, so the
+//! BM25 leg and the vector leg rank within the same superfiles and rows
+//! before fusion; what the index could not bound is made up by
+//! [`fill_top_k`] applying the exact predicate and fetching more.
 
 use std::{cmp::Ordering, collections::HashMap, fmt, sync::Arc};
 
@@ -52,7 +61,7 @@ use datafusion::{
     catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider},
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::SessionContext},
-    logical_expr::{Expr, TableType},
+    logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -79,10 +88,12 @@ use crate::{
         manifest::SuperfileUri,
         query::{
             SuperfileHit,
+            candidate::CandidateScope,
             exec::{
                 common::{
-                    arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits,
-                    resolve_hits_named, search_query_df_error,
+                    PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
+                    fill_top_k, output_schema_with_score, resolve_hits_named,
+                    search_query_df_error,
                 },
                 vector_exec::arg_to_query_vector,
             },
@@ -145,20 +156,73 @@ impl SupertableReader {
         options: VectorSearchOptions,
         k: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.hybrid_search_scoped_async(text_col, q_text, mode, vec_col, q_vec, options, k, None)
+            .await
+    }
+
+    /// [`Self::hybrid_search_async`] confined to a [`CandidateScope`] —
+    /// what a SQL `WHERE` pushed into the `hybrid_search` table function
+    /// admits. One scope feeds both retrievers: the BM25 leg searches only
+    /// the scope's superfiles and admits only its candidate rows, and the
+    /// vector leg fans out over the same superfiles with the same rows as
+    /// its allow-set, so the fused top-k is the best `k` among rows that
+    /// can satisfy the predicate. The vector leg stays on the user table
+    /// as the unscoped one does: fusion joins the two legs on
+    /// `(superfile, local_doc_id)`, and a hidden-index hit carries a
+    /// different identity. `None` is the unscoped search.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn hybrid_search_scoped_async(
+        &self,
+        text_col: &str,
+        q_text: &str,
+        mode: BoolMode,
+        vec_col: &str,
+        q_vec: &[f32],
+        options: VectorSearchOptions,
+        k: usize,
+        scope: Option<&CandidateScope>,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
         // Hybrid's vector arm enters without the sync wrappers — apply the
         // cosine query calibration (#512) at this seam so hybrid scores
         // match the public vector path.
         let q_vec = calibrated_query(self, vec_col, q_vec);
+        let vector_leg = async {
+            match scope {
+                None => {
+                    self.vector_search_user_table_async(vec_col, &q_vec, k, options)
+                        .await
+                }
+                Some(scope) => {
+                    // Only superfiles that still hold a candidate row; the
+                    // kernel treats a superfile absent from the allow map as
+                    // having no admitted row, so none is handed to it.
+                    let superfiles: Vec<_> = scope.admitted_superfiles().cloned().collect();
+                    if superfiles.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    self.vector_fanout_over_superfiles(
+                        superfiles,
+                        vec_col,
+                        &q_vec,
+                        k,
+                        options,
+                        scope.allow.clone(),
+                    )
+                    .await
+                }
+            }
+        };
         // Both retrievers run concurrently on the query runtime; each
         // inherits its own manifest skip and returns hits best-first.
         let (bm25_res, vector_res) = future::join(
-            self.bm25_search_async(
+            self.bm25_search_scoped_async(
                 text_col,
                 q_text,
                 k,
                 Bm25SearchOptions::new().with_mode(mode),
+                scope,
             ),
-            self.vector_search_user_table_async(vec_col, &q_vec, k, options),
+            vector_leg,
         )
         .await;
         let (bm25_hits, vector_hits) = (bm25_res?, vector_res?);
@@ -349,7 +413,7 @@ impl TableProvider for HybridSearchTable {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let exec = HybridSearchExec::try_new(
@@ -364,8 +428,21 @@ impl TableProvider for HybridSearchTable {
             Arc::clone(&self.scalar_schema),
             Arc::clone(&self.output_schema),
             projection.cloned(),
+            filters.to_vec(),
         )?;
         Ok(Arc::new(exec))
+    }
+
+    /// Report every `WHERE` filter as `Inexact`: DataFusion hands the
+    /// predicates to [`scan`](Self::scan), where they scope both
+    /// retrievers to the rows that can satisfy them, **and** keeps a
+    /// `FilterExec` above the scan that re-applies the exact predicate.
+    /// Correctness never depends on the pushdown.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 }
 
@@ -382,6 +459,10 @@ struct HybridSearchExec {
     q_vec: Vec<f32>,
     options: VectorSearchOptions,
     k: usize,
+    /// `WHERE` predicates DataFusion pushed into this scan (reported
+    /// `Inexact`); scope both retrievers and fill the fused `k` in
+    /// `execute`.
+    filters: Vec<Expr>,
     /// Scalar schema, used as the resolve projection.
     scalar_schema: SchemaRef,
     /// Full (pre-projection) output schema: scalar columns + score.
@@ -407,6 +488,7 @@ impl HybridSearchExec {
         scalar_schema: SchemaRef,
         output_schema: SchemaRef,
         projection: Option<Vec<usize>>,
+        filters: Vec<Expr>,
     ) -> DfResult<Self> {
         let projected_schema = match &projection {
             Some(indices) => Arc::new(
@@ -431,6 +513,7 @@ impl HybridSearchExec {
             q_vec,
             options,
             k,
+            filters,
             scalar_schema,
             output_schema,
             projection,
@@ -501,31 +584,58 @@ impl ExecutionPlan for HybridSearchExec {
         let q_vec = self.q_vec.clone();
         let options = self.options;
         let k = self.k;
+        let filters = self.filters.clone();
         let scalar_schema = Arc::clone(&self.scalar_schema);
         let output_schema = Arc::clone(&self.output_schema);
         let projection = self.projection.clone();
         let projected_schema = Arc::clone(&self.projected_schema);
 
         let fut = async move {
+            // What the pushed-down `WHERE` admits, resolved once and handed
+            // to both retrievers.
+            let scope = match filters.is_empty() {
+                true => None,
+                false => {
+                    let plan = candidate_plan_for_filters(reader.manifest(), &filters);
+                    Some(
+                        reader
+                            .candidate_scope(&filters, &plan)
+                            .await
+                            .map_err(search_query_df_error)?,
+                    )
+                }
+            };
+            let predicate = PushedPredicate::compile(&filters, &output_schema);
             // Run both retrievers concurrently and fuse with RRF via the
-            // shared kernel, then resolve the fused set once.
-            let fused = reader
-                .hybrid_search_async(&text_col, &q_text, mode, &vec_col, &q_vec, options, k)
-                .await
-                .map_err(search_query_df_error)?;
-            // Cell-packed user hits can be boundary stubs whose IVF local
-            // does not address a Parquet row; remap those to their owning
-            // placement by stable id before the scalar decode — the same
-            // step the vector TVF takes.
-            let fused = user_placement_for_scalar_resolve(&reader, &fused)
-                .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            resolve_hits(
+            // shared kernel; the fused set is resolved once per round.
+            let search = |want: usize| {
+                let reader = &reader;
+                let text_col = &text_col;
+                let q_text = &q_text;
+                let vec_col = &vec_col;
+                let q_vec = &q_vec;
+                let scope = scope.as_ref();
+                async move {
+                    let fused = reader
+                        .hybrid_search_scoped_async(
+                            text_col, q_text, mode, vec_col, q_vec, options, want, scope,
+                        )
+                        .await?;
+                    // Cell-packed user hits can be boundary stubs whose IVF
+                    // local does not address a Parquet row; remap those to
+                    // their owning placement by stable id before the scalar
+                    // decode — the same step the vector TVF takes.
+                    user_placement_for_scalar_resolve(reader, &fused).await
+                }
+            };
+            fill_top_k(
                 &reader,
-                &fused,
+                k,
+                predicate.as_ref(),
                 &scalar_schema,
                 &output_schema,
                 projection.as_deref(),
+                search,
             )
             .await
         };
@@ -594,8 +704,8 @@ mod tests {
     use std::collections::HashSet;
 
     use arrow_array::{
-        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray,
-        RecordBatch, StringArray,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema};
     use rayon::ThreadPoolBuilder;
@@ -1295,6 +1405,191 @@ mod tests {
             w.commit().expect("commit seg2");
         }
         st
+    }
+
+    /// Rows across `batches` whose `category` equals `want`.
+    fn count_category(batches: &[RecordBatch], want: &str) -> usize {
+        batches
+            .iter()
+            .map(|b| {
+                let c = col_str(b, "category");
+                (0..c.len()).filter(|&i| c.value(i) == want).count()
+            })
+            .sum()
+    }
+
+    /// A `WHERE` on a column no index bounds: the function applies the
+    /// exact predicate to its fused rows and widens both retrievers until
+    /// `k` survive — where a post-filtered global top-k came up short.
+    #[test]
+    fn hybrid_search_where_on_unindexed_column_fills_k() {
+        let dim = 16;
+        let st = demo_cat_two_superfiles(dim);
+        let qv: String = (0..dim)
+            .map(|d| (dim - d).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let k = 3;
+        // Guard: the unfiltered fused top-3 holds fewer than 3 `cooking`
+        // rows (vector rank is doc order, `rust` matches docs 0,2,3,5,6;
+        // only doc 2 is both cooking and near the top of either list).
+        let unfiltered = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT category FROM hybrid_search('title', 'rust', 'emb', '{qv}', {k})"
+            ))
+            .expect("unfiltered query_sql");
+        assert!(
+            count_category(&unfiltered, "cooking") < k,
+            "guard: a post-filtered global top-{k} would underflow"
+        );
+        let filtered = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT category, score FROM hybrid_search('title', 'rust', 'emb', '{qv}', {k}) \
+                 WHERE category = 'cooking'"
+            ))
+            .expect("filtered query_sql");
+        let total: usize = filtered.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, k, "k rows, every one cooking");
+        assert_eq!(count_category(&filtered, "cooking"), k);
+        let s = scores(&filtered);
+        for w in s.windows(2) {
+            assert!(w[0] >= w[1], "fused scores stay descending: {s:?}");
+        }
+    }
+
+    /// Schema `[tag (FTS), title (FTS), emb]`: `tag` is the one-keyword
+    /// column the index bounds a `WHERE` on.
+    fn options_tag_title_emb(dim: usize) -> SupertableOptions {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tag", DataType::LargeUtf8, false),
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("emb", fixed_list_f32(dim), false),
+        ]));
+        SupertableOptions::new(
+            schema,
+            vec![FtsConfig::new("tag"), FtsConfig::new("title")],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
+            }],
+        )
+        .expect("valid options")
+        .with_writer_pool(pool)
+    }
+
+    /// Eight rows all titled `rust` (one BM25 score, ties broken by doc
+    /// id) with vector `[1, i, 0, …]` (distance to `[1, 0, …]` rises with
+    /// `i`), so both retrievers rank doc order; the first five are tagged
+    /// `a`, the last three `b`.
+    fn supertable_tag_ranked(dim: usize) -> Supertable {
+        let st = Supertable::create(options_tag_title_emb(dim)).expect("create");
+        let mut w = st.writer().expect("writer");
+        let n = 8;
+        let tags = LargeStringArray::from(
+            (0..n)
+                .map(|i| if i < 5 { "a" } else { "b" })
+                .collect::<Vec<_>>(),
+        );
+        let titles = LargeStringArray::from(vec!["rust"; n]);
+        let mut flat = Vec::<f32>::with_capacity(n * dim);
+        for i in 0..n {
+            for d in 0..dim {
+                flat.push(match d {
+                    0 => 1.0,
+                    1 => i as f32,
+                    _ => 0.0,
+                });
+            }
+        }
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)) as ArrayRef,
+            None,
+        )
+        .expect("FSL");
+        let batch = RecordBatch::try_new(
+            st.options().schema.clone(),
+            vec![Arc::new(tags), Arc::new(titles), Arc::new(fsl)],
+        )
+        .expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st
+    }
+
+    /// A `WHERE` on an FTS-indexed column: one scope bounds the rows for
+    /// both retrievers, so the fused top-k is exactly the `k` best rows
+    /// satisfying it — the three `b` rows, in fused order.
+    #[test]
+    fn hybrid_search_where_on_indexed_column_ranks_among_matching() {
+        let dim = 16;
+        let st = supertable_tag_ranked(dim);
+        let k = 3;
+        let qv = csv_one_hot(dim, 0);
+        let tags_of = |batches: &[RecordBatch]| -> Vec<String> {
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let t = col_str(b, "tag");
+                    (0..t.len())
+                        .map(|i| t.value(i).to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let unfiltered = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT tag FROM hybrid_search('title', 'rust', 'emb', '{qv}', {k})"
+            ))
+            .expect("unfiltered query_sql");
+        assert_eq!(
+            tags_of(&unfiltered),
+            vec!["a", "a", "a"],
+            "guard: the unfiltered top-{k} is all `a`"
+        );
+        let filtered = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT tag FROM hybrid_search('title', 'rust', 'emb', '{qv}', {k}) WHERE tag = 'b'"
+            ))
+            .expect("filtered query_sql");
+        assert_eq!(tags_of(&filtered), vec!["b", "b", "b"]);
+        // An aggregate over the filtered relation counts the matching rows,
+        // not the survivors of a global fused top-k — the same acceptance
+        // case `bm25_search` holds, on the fused function.
+        let count = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT COUNT(*) AS n FROM hybrid_search('title', 'rust', 'emb', '{qv}', {k}) \
+                 WHERE tag = 'b'"
+            ))
+            .expect("count query_sql");
+        let n = count[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count is int64")
+            .value(0);
+        assert_eq!(n, k as i64);
     }
 
     #[test]
