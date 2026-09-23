@@ -874,7 +874,22 @@ impl Supertable {
             // Another compactor already merged our inputs — nothing left to commit.
             let entries_to_remove = match resolve_entries_to_remove(&current, &job.inputs) {
                 Ok(entries) => entries,
-                Err(_missing) => return Ok(()),
+                Err(missing) => {
+                    let loaded = current.get_all_superfiles_loaded().await;
+                    let (loaded_view, loaded_has_missing) = match &loaded {
+                        Ok(v) => (v.len() as i64, v.iter().any(|e| e.superfile_id == missing)),
+                        Err(_) => (-1, false),
+                    };
+                    warn!(
+                        missing_input = %missing,
+                        job_inputs = job.inputs.len(),
+                        flat_view = current.get_all_superfiles().len(),
+                        loaded_view,
+                        loaded_has_missing,
+                        "compact commit no-op: input missing from flat manifest view"
+                    );
+                    return Ok(());
+                }
             };
 
             let mut pending_storage_replaces: Vec<(String, Bytes)> = Vec::new();
