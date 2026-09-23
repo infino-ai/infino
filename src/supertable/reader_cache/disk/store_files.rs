@@ -892,14 +892,18 @@ mod tests {
         let stale = SuperfileUri::new_v4();
         let fresh = SuperfileUri::new_v4();
         let skewed = SuperfileUri::new_v4();
+        let stale_fill = SuperfileUri::new_v4();
+        let fresh_fill = SuperfileUri::new_v4();
         let now = SystemTime::now();
-        for (uri, mtime) in [
-            (stale, now - TMP_RECLAIM_AGE * 2),
-            (fresh, now),
+        for (path, mtime) in [
+            (store.tmp_path(&stale), now - TMP_RECLAIM_AGE * 2),
+            (store.tmp_path(&fresh), now),
             // A future mtime (clock skew) must read as not-stale, never as reclaimable.
-            (skewed, now + TMP_RECLAIM_AGE),
+            (store.tmp_path(&skewed), now + TMP_RECLAIM_AGE),
+            // A background fill's tempfile has its own name and the same rule.
+            (store.fill_tmp_path(&stale_fill), now - TMP_RECLAIM_AGE * 2),
+            (store.fill_tmp_path(&fresh_fill), now),
         ] {
-            let path = store.tmp_path(&uri);
             fs::write(&path, bytes.as_ref()).expect("seed tmp");
             fs::File::options()
                 .write(true)
@@ -919,6 +923,14 @@ mod tests {
         assert!(
             opened.tmp_path(&skewed).exists(),
             "future mtime spared under clock skew"
+        );
+        assert!(
+            !opened.fill_tmp_path(&stale_fill).exists(),
+            "stale fill tmp reclaimed"
+        );
+        assert!(
+            opened.fill_tmp_path(&fresh_fill).exists(),
+            "fresh fill tmp left for its owner"
         );
         assert_eq!(
             opened.stats().current_bytes,

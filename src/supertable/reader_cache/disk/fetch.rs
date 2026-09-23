@@ -8,6 +8,7 @@
 use std::{
     fs,
     io::SeekFrom,
+    mem,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
@@ -93,35 +94,43 @@ impl DiskCacheStore {
         })
     }
 
-    /// Install a promoted entry, honoring the reinstate-only-if-present gate that keeps the budget
-    /// balanced under a racing eviction.
+    /// Put the whole-file entry a background fill produced into the cache.
     ///
-    /// `Fresh` admits through [`Self::admit_entry`]: the foreground cold-fetch owns the slot it just
-    /// reserved, and anything a lost race left there (a lazy admission of the same URI) has its
-    /// budget released.
-    /// `ReplaceIfPresent` is for a background finalizer that may have been evicted while it ran: it
-    /// replaces an occupied slot, but on a vacant slot it drops the just-renamed file and returns
-    /// `None` (eviction already released the reservation, so reinstating the entry would leak it).
+    /// The fill may only swap out the entry it started from (`owner` is that entry's reader). If
+    /// tier 2 admitted a whole file meanwhile, that one stays and our download was wasted. If the
+    /// entry was evicted mid-fill, the slot stays empty and the file goes too. Either way the fill
+    /// gives back only `own_reservation`, what it reserved for itself.
     pub(crate) fn install_promoted_entry(
         &self,
         uri: SuperfileUri,
         entry: Arc<CachedEntry>,
         final_path: &Path,
-        mode: InstallMode,
+        owner: &Weak<SuperfileReader>,
+        own_reservation: Option<u64>,
     ) -> Option<Arc<CachedEntry>> {
-        match mode {
-            InstallMode::Fresh => Some(self.admit_entry(uri, entry)),
-            InstallMode::ReplaceIfPresent => match self.cached.entry(uri) {
-                Entry::Occupied(mut occ) => {
-                    *occ.get_mut() = Arc::clone(&entry);
-                    Some(entry)
-                }
-                Entry::Vacant(_) => {
-                    let _ = fs::remove_file(final_path);
-                    None
-                }
-            },
+        // Decide under the shard lock, touch the file after it.
+        let evicted_mid_fill = match self.cached.entry(uri) {
+            Entry::Occupied(mut occupied) if is_mine(occupied.get(), owner) => {
+                let replaced = mem::replace(occupied.get_mut(), Arc::clone(&entry));
+                // Off the shard lock before the old entry can drop: a last reference takes an
+                // fsync of the block index with it.
+                drop(occupied);
+                drop(replaced);
+                return Some(entry);
+            }
+            Entry::Occupied(_) => false,
+            Entry::Vacant(_) => true,
+        };
+
+        // Someone else's whole file is the same bytes, and the file on disk now backs their entry.
+        // With no entry at all the file is charged to nobody, so it cannot stay.
+        if evicted_mid_fill {
+            let _ = fs::remove_file(final_path);
         }
+        if let Some(bytes) = own_reservation {
+            self.release_block_bytes(bytes);
+        }
+        None
     }
 
     /// Hybrid cold-fetch. Returns the foreground reader
@@ -141,14 +150,10 @@ impl DiskCacheStore {
         let head = fetch_storage.head(&storage_uri).await?;
 
         let size = head.size;
-        // Don't use the borrow-lifetimed Reservation guard
-        // because it would tie the future to `&self` and block
-        // the `tokio::spawn` of the background finalizer. We
-        // reserve manually here; the background task either
-        // commits (cache filled) or rolls back via fetch_sub.
-        self.reserve_manual(size).await?;
+        // Guarded: any `?` below hands the bytes back. Committed once the entry is admitted; from
+        // then on the entry's own accounting carries them.
+        let reservation = self.reserve(size).await?;
 
-        let reserved_bytes = size;
         let tmp = self.tmp_path(uri);
         let final_path = self.cache_path(uri);
 
@@ -264,12 +269,15 @@ impl DiskCacheStore {
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
         // Admit the entry so later readers hit tier 1 instead of re-entering the coordinator.
         let entry = self.admit_entry(*uri, entry);
+        reservation.commit();
 
         // 5. Spawn the background finalizer: wait for pwrites,
         //    fsync, rename, mmap, and atomically replace the
         //    cached entry with a mmap-backed reader. On error,
         //    release the manual reservation back to the pool.
         let store = Arc::clone(self);
+        // The finalizer may only replace the buffered entry it is promoting; this is how it tells.
+        let owner = Arc::downgrade(&foreground_reader);
         let uri_owned = *uri;
         let tmp_owned = tmp.clone();
         let final_owned = final_path.clone();
@@ -294,7 +302,7 @@ impl DiskCacheStore {
                     file_owned,
                     write_handles,
                     size,
-                    reserved_bytes,
+                    owner,
                 )
                 .await;
             }
@@ -410,7 +418,7 @@ impl DiskCacheStore {
                     uri_owned,
                     storage_uri_owned,
                     size,
-                    size,
+                    needs_reserve.then_some(size),
                     fetch_storage,
                     skip_vec,
                 )
@@ -676,7 +684,7 @@ impl DiskCacheStore {
         )?;
         let entry = self.build_mmap_entry(Arc::new(reader), mmap, size, None);
 
-        self.install_promoted_entry(*uri, Arc::clone(&entry), &final_path, InstallMode::Fresh);
+        let entry = self.admit_entry(*uri, entry);
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
 
         reservation.commit();
@@ -779,7 +787,7 @@ async fn finalize_to_mmap(
     file: Arc<tokio::sync::Mutex<tokio::fs::File>>,
     pwrite_handles: Vec<oneshot::Receiver<JoinHandle<Result<(), DiskCacheError>>>>,
     size: u64,
-    reserved_bytes: u64,
+    owner: Weak<SuperfileReader>,
 ) -> Result<(), DiskCacheError> {
     let res: Result<(), DiskCacheError> = async {
         // 1. Resolve every pwrite handle through its oneshot,
@@ -807,29 +815,23 @@ async fn finalize_to_mmap(
                 verify_crc: store.config.verify_crc_on_open,
             },
         )?;
-        // Replace the in-memory-backed entry with the mmap-backed one. `ReplaceIfPresent` drops
-        // the file instead of reinstating when a racing reservation evicted the slot mid-finalize
-        // (reinstating an evicted, already-released entry would leak its reservation).
+        // Swap in over the buffered entry, which already carries the whole-size charge. The
+        // finalizer reserved nothing of its own.
         let entry = store.build_mmap_entry(Arc::new(reader), mmap, size, None);
-        store.install_promoted_entry(uri, entry, &final_path, InstallMode::ReplaceIfPresent);
-        store.coordinators.remove(&uri);
+        store.install_promoted_entry(uri, entry, &final_path, &owner, None);
         Ok::<(), DiskCacheError>(())
     }
     .await;
     if res.is_err() {
-        // Rollback. Use the same atomic gate as eviction
-        // (`cached.remove(uri).is_some()`) so we don't double-
-        // decrement when a racing eviction already removed
-        // this entry + released its bytes.
-        if let Some((_, entry)) = store.cached.remove(&uri) {
-            store.release_entry_accounting(&entry);
+        // Drop only the entry this finalizer was promoting, and its partial download.
+        if let Some((_, mine)) = store
+            .cached
+            .remove_if(&uri, |_, entry| is_mine(entry, &owner))
+        {
+            store.release_entry_accounting(&mine);
         }
-        store.coordinators.remove(&uri);
+        let _ = fs::remove_file(&tmp_path);
     }
-    // `reserved_bytes` parameter is retained for future use
-    // (e.g., observability counters); the bytes accounting is
-    // entirely driven by `cached.remove` gating now.
-    let _ = reserved_bytes;
     res
 }
 
@@ -1077,11 +1079,32 @@ async fn cold_fetch_to_disk_cancelable(
     Ok(BackgroundFillOutcome::Complete)
 }
 
-fn rollback_lazy_background_fill(store: &Arc<DiskCacheStore>, uri: &SuperfileUri, tmp: &Path) {
-    if let Some((_, entry)) = store.cached.remove(uri) {
-        store.release_entry_accounting(&entry);
+/// Is `entry` the one this fill started from? Same reader, by pointer.
+fn is_mine(entry: &CachedEntry, owner: &Weak<SuperfileReader>) -> bool {
+    owner
+        .upgrade()
+        .is_some_and(|mine| Arc::ptr_eq(&entry.reader, &mine))
+}
+
+/// Undo a fill that did not finish: drop the entry it started from if it is still there, give
+/// back what the fill reserved for itself, delete the partial download. The coordinator is not
+/// the fill's, and removing it by key could strip a fetch in flight, so it is left alone.
+fn rollback_lazy_background_fill(
+    store: &Arc<DiskCacheStore>,
+    uri: &SuperfileUri,
+    tmp: &Path,
+    owner: &Weak<SuperfileReader>,
+    own_reservation: Option<u64>,
+) {
+    if let Some((_, mine)) = store
+        .cached
+        .remove_if(uri, |_, entry| is_mine(entry, owner))
+    {
+        store.release_entry_accounting(&mine);
     }
-    store.coordinators.remove(uri);
+    if let Some(bytes) = own_reservation {
+        store.release_block_bytes(bytes);
+    }
     let _ = fs::remove_file(tmp);
 }
 
@@ -1102,26 +1125,25 @@ async fn lazy_background_fill(
     uri: SuperfileUri,
     storage_uri: String,
     size: u64,
-    reserved_bytes: u64,
+    mut own_reservation: Option<u64>,
     fetch_storage: Arc<dyn StorageProvider>,
     skip_vec: Option<(u64, u64)>,
 ) -> Result<(), DiskCacheError> {
     let Some(store) = wait_for_lazy_foreground_release(&store, &reader).await else {
         return Ok(());
     };
-    let tmp = store.tmp_path(&uri);
+    let tmp = store.fill_tmp_path(&uri);
     let final_path = store.cache_path(&uri);
 
     if background_store_abandoned(&store) {
-        rollback_lazy_background_fill(&store, &uri, &tmp);
-        let _ = reserved_bytes;
+        rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation);
         return Ok(());
     }
 
     let _prefetch_permit = match Arc::clone(&store.prefetch_semaphore).acquire_owned().await {
         Ok(permit) => permit,
         Err(error) => {
-            rollback_lazy_background_fill(&store, &uri, &tmp);
+            rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation);
             return Err(DiskCacheError::SuperfileOpen(format!(
                 "prefetch semaphore closed: {error}"
             )));
@@ -1133,7 +1155,7 @@ async fn lazy_background_fill(
     let mut filled: Vec<bool> = Vec::new();
     loop {
         if !wait_for_reader_quiescence(&store, &reader).await {
-            rollback_lazy_background_fill(&store, &uri, &tmp);
+            rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation);
             return Ok(());
         }
         match cold_fetch_to_disk_cancelable(
@@ -1153,7 +1175,7 @@ async fn lazy_background_fill(
             // resumes from the first unwritten chunk.
             BackgroundFillOutcome::Paused => {}
             BackgroundFillOutcome::Abandoned => {
-                rollback_lazy_background_fill(&store, &uri, &tmp);
+                rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation);
                 return Ok(());
             }
         }
@@ -1241,23 +1263,22 @@ async fn lazy_background_fill(
         // Installed (still present) + no retained block source -> the promoted mmap serves every
         // range, so the sparse block sidecar is dead weight; drop it. Evicted mid-fill -> the
         // install dropped the file and we leave the sidecar to normal reclaim.
-        if store
-            .install_promoted_entry(uri, entry, &final_path, InstallMode::ReplaceIfPresent)
-            .is_some()
-            && !block_source_retained
-        {
+        let installed =
+            store.install_promoted_entry(uri, entry, &final_path, &reader, own_reservation);
+        // Either way the install settled this fill's reservation: it now backs the promoted entry,
+        // or it was released along with the redundant download.
+        own_reservation = None;
+        if installed.is_some() && !block_source_retained {
             store.drop_block_file(&uri);
         }
-        store.coordinators.remove(&uri);
         Ok(())
     }
     .await;
 
     if result.is_err() || background_store_abandoned(&store) {
-        rollback_lazy_background_fill(&store, &uri, &tmp);
-        let _ = fs::remove_file(&tmp);
+        // `own_reservation` is already `None` once the install ran, so this releases nothing twice.
+        rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation);
     }
-    let _ = reserved_bytes;
     result
 }
 
@@ -1401,9 +1422,8 @@ mod tests {
         },
     };
 
-    /// `rollback_lazy_background_fill` undoes an in-flight promotion: it drops
-    /// the cache entry, forgets the coordinator, and deletes the tmp scratch
-    /// file left by the partial download.
+    /// `rollback_lazy_background_fill` undoes an in-flight promotion: it drops the entry the fill
+    /// was promoting and deletes the tmp scratch file left by the partial download.
     #[tokio::test]
     async fn rollback_lazy_background_fill_evicts_entry_and_tmp() {
         let (_dir, store) = test_store();
@@ -1412,15 +1432,16 @@ mod tests {
         // Seed a cache entry the way a lazy fill would, plus a leftover tmp
         // scratch file for the partial download.
         store.install_block_entry_for_test(uri, dummy_block_source(&store, uri));
+        let owner = Arc::downgrade(&store.cached.get(&uri).expect("cached").reader);
         assert!(
             store.is_cached(&uri),
             "entry must be cached before rollback"
         );
-        let tmp = store.tmp_path(&uri);
+        let tmp = store.fill_tmp_path(&uri);
         std::fs::write(&tmp, b"partial-download-bytes").expect("seed tmp scratch file");
         assert!(tmp.exists(), "tmp scratch file must exist before rollback");
 
-        rollback_lazy_background_fill(&store, &uri, &tmp);
+        rollback_lazy_background_fill(&store, &uri, &tmp, &owner, None);
 
         assert!(
             !store.is_cached(&uri),
@@ -1430,6 +1451,46 @@ mod tests {
             !tmp.exists(),
             "tmp scratch file must be deleted after rollback"
         );
+        store.assert_budget_consistent();
+    }
+
+    /// Rollback undoes only the entry the fill was promoting. A whole file someone else admitted
+    /// in the meantime is not the fill's to remove, and its charge is not the fill's to release.
+    #[tokio::test]
+    async fn rollback_leaves_an_entry_the_fill_did_not_create() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        seed_cache_file(&store, &uri, &tiny_superfile_bytes());
+        let stranger = store
+            .fetch_from_disk_cache(&uri, None)
+            .await
+            .expect("disk probe")
+            .expect("whole file admitted");
+        let charged = store.stats().current_bytes;
+        let tmp = store.fill_tmp_path(&uri);
+        std::fs::write(&tmp, b"partial-download-bytes").expect("seed tmp scratch file");
+
+        // A fill spawned for some long-gone lazy entry gives up.
+        let not_mine: Weak<SuperfileReader> = Weak::new();
+        rollback_lazy_background_fill(&store, &uri, &tmp, &not_mine, None);
+
+        assert!(
+            Arc::ptr_eq(
+                &store.cached.get(&uri).expect("still cached").reader,
+                &stranger.reader
+            ),
+            "the stranger stays"
+        );
+        assert_eq!(
+            store.stats().current_bytes,
+            charged,
+            "its charge is untouched"
+        );
+        assert!(
+            !tmp.exists(),
+            "the fill's own scratch file is still cleaned up"
+        );
+        store.assert_budget_consistent();
     }
 
     // ----- warm insert path (insert_warm + cold-free path) -----
@@ -1466,38 +1527,146 @@ mod tests {
         let _ = format!("{err}");
     }
 
+    /// A hybrid fetch that fails after reserving must give the reservation back, or every failed
+    /// open shrinks the budget for good.
     #[tokio::test]
-    async fn install_promoted_entry_on_evicted_slot_drops_file_and_skips_insert() {
-        // The background-finalize gate: if the slot was evicted while the finalizer ran,
-        // ReplaceIfPresent must drop the just-renamed file and NOT reinsert. Reinserting an
-        // already-released entry would leak its reservation against the budget.
-        let (_dir, store) = test_store();
+    async fn hybrid_fetch_failure_leaves_the_ledger_balanced() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::HybridWithPrefetch;
+        });
         let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, Bytes::from_static(b"not a superfile")).await;
 
-        // Stage a real, openable cache file at the final path.
-        let final_path = store.cache_path(&uri);
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).expect("cache dir");
-        }
-        let bytes = tiny_superfile_bytes();
-        let size = bytes.len() as u64;
-        fs::write(&final_path, &bytes).expect("write cache file");
+        store
+            .reader(&uri)
+            .await
+            .expect_err("garbage does not open as a superfile");
 
-        let (mmap, mapped) = mmap_readonly_with_handle(&final_path).expect("mmap");
+        assert_eq!(
+            store.stats().current_bytes,
+            0,
+            "the failed fetch's reservation came back"
+        );
+        assert_eq!(store.stats().n_entries, 0);
+        store.assert_budget_consistent();
+    }
+
+    /// The entry a finishing fill would install: the whole file at `path`, mmapped and opened.
+    fn promoted_entry_at(store: &Arc<DiskCacheStore>, path: &Path, size: u64) -> Arc<CachedEntry> {
+        let (mmap, mapped) = mmap_readonly_with_handle(path).expect("mmap");
         let reader = Arc::new(
             SuperfileReader::open_with(mapped, OpenOptions { verify_crc: false }).expect("open"),
         );
-        let entry = store.build_mmap_entry(reader, mmap, size, None);
+        store.build_mmap_entry(reader, mmap, size, None)
+    }
 
-        // `cached` is empty (slot evicted): ReplaceIfPresent returns None, removes the file, and
-        // touches no budget.
+    #[tokio::test]
+    async fn install_promoted_entry_on_evicted_slot_drops_file_and_skips_insert() {
+        // The background-finalize gate: if the slot was evicted while the finalizer ran, the
+        // install must drop the just-renamed file and NOT reinsert. Reinserting an already-released
+        // entry would leak its reservation against the budget.
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let size = seed_cache_file(&store, &uri, &bytes);
+        let final_path = store.cache_path(&uri);
+        let entry = promoted_entry_at(&store, &final_path, size);
+
+        // `cached` is empty (slot evicted): the install returns None, removes the file, and, with
+        // no reservation of its own, touches no budget.
         let before = store.current_bytes.load(Ordering::Acquire);
-        let installed =
-            store.install_promoted_entry(uri, entry, &final_path, InstallMode::ReplaceIfPresent);
+        let installed = store.install_promoted_entry(uri, entry, &final_path, &Weak::new(), None);
         assert!(installed.is_none(), "vacant slot must not reinstate");
         assert!(!final_path.exists(), "file dropped on evicted slot");
         assert_eq!(store.current_bytes.load(Ordering::Acquire), before);
         assert_eq!(store.stats().n_entries, 0);
+        store.assert_budget_consistent();
+    }
+
+    /// A fill that reserved for itself (the Stream-then-Warm shape) and finds its slot evicted must
+    /// give that reservation back, or every evict-during-fill shrinks the budget for good.
+    #[tokio::test]
+    async fn fill_finishing_on_an_evicted_slot_releases_its_own_reservation() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let size = seed_cache_file(&store, &uri, &bytes);
+        let final_path = store.cache_path(&uri);
+        let entry = promoted_entry_at(&store, &final_path, size);
+
+        let before = store.current_bytes.load(Ordering::Acquire);
+        store
+            .reserve_manual(size)
+            .await
+            .expect("the fill's own reservation");
+        let installed =
+            store.install_promoted_entry(uri, entry, &final_path, &Weak::new(), Some(size));
+
+        assert!(installed.is_none(), "vacant slot must not reinstate");
+        assert_eq!(
+            store.current_bytes.load(Ordering::Acquire),
+            before,
+            "the fill's reservation came back"
+        );
+        store.assert_budget_consistent();
+    }
+
+    /// A fill that finishes after a whole file was admitted from disk by someone else must not
+    /// touch that entry, its charge, or its on-disk file: the download was redundant, so the fill
+    /// releases only what it reserved for itself. Stream-then-Warm shape, where the fill does own
+    /// a reservation.
+    #[tokio::test]
+    async fn fill_finishing_over_a_stranger_keeps_it_and_releases_only_its_own_reservation() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let size = bytes.len() as u64;
+        put_superfile(&store, &uri, bytes.clone()).await;
+
+        // The lazy entry a fill would be spawned for, and the fill's own reservation for it.
+        store
+            .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Stream)
+            .await
+            .expect("lazy open");
+        let owner = Arc::downgrade(&store.cached.get(&uri).expect("lazy entry").reader);
+        store
+            .reserve_manual(size)
+            .await
+            .expect("the fill's own reservation");
+
+        // Meanwhile the whole file lands on disk and tier 2 admits it over the lazy entry.
+        seed_cache_file(&store, &uri, &bytes);
+        let stranger = store
+            .fetch_from_disk_cache(&uri, None)
+            .await
+            .expect("disk probe")
+            .expect("whole file admitted");
+        let charged_before = store.stats().current_bytes;
+
+        // The fill finishes and must yield to the stranger.
+        let final_path = store.cache_path(&uri);
+        let promoted = promoted_entry_at(&store, &final_path, size);
+        let installed =
+            store.install_promoted_entry(uri, promoted, &final_path, &owner, Some(size));
+
+        assert!(installed.is_none(), "a redundant download is not installed");
+        assert!(
+            Arc::ptr_eq(
+                &store.cached.get(&uri).expect("still cached").reader,
+                &stranger.reader
+            ),
+            "the stranger stays"
+        );
+        assert!(
+            final_path.exists(),
+            "the stranger's on-disk file is not unlinked"
+        );
+        assert_eq!(
+            store.stats().current_bytes,
+            charged_before - size,
+            "only the fill's own reservation is released"
+        );
+        store.assert_budget_consistent();
     }
 
     #[tokio::test]

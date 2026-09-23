@@ -53,11 +53,9 @@ use crate::{
 /// configured. See the module-level docs for the precise
 /// policy.
 ///
-/// `storage_key` is the object key the superfile's bytes live at, the
-/// manifest entry's `storage_path()`, which carries a source stem when the
-/// superfile was ingested with one. It is passed alongside `uri` rather
-/// than re-derived from it because a named superfile's key is not a
-/// function of its uuid; `uri` still keys every cache tier.
+/// `storage_key` is the object key the bytes live at (the manifest entry's
+/// `storage_path()`); [`DiskCacheStore::open_for_query`] says why it travels
+/// beside `uri`.
 ///
 /// `offsets` is an optional pre-known layout hint
 /// pulled from the manifest's [`SubsectionOffsets`]. When `Some`

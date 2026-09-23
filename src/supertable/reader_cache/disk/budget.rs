@@ -243,15 +243,9 @@ impl DiskCacheStore {
         freed
     }
 
-    /// Same as [`Self::reserve`] but returns just the
-    /// reserved-bytes count instead of a borrow-lifetimed
-    /// guard. Caller is responsible for either committing
-    /// (no-op — the bytes stay reserved as part of a cached
-    /// entry) or rolling back via
-    /// `self.current_bytes.fetch_sub(bytes, Release)` on
-    /// failure. Used by the hybrid cold-fetch path where the
-    /// reservation outlives the borrow on `&self` via a
-    /// `tokio::spawn`-ed background finalizer.
+    /// Like [`Self::reserve`] but without the guard: the bytes stay reserved until the caller
+    /// releases them with [`Self::release_block_bytes`] or hands them to an admitted entry. For a
+    /// reservation that outlives a borrow of `self`: a lazy open's entry, a fill's own reservation.
     pub(crate) async fn reserve_manual(&self, bytes: u64) -> Result<(), DiskCacheError> {
         loop {
             let budget = self.disk_budget_bytes();
@@ -318,10 +312,16 @@ impl DiskCacheStore {
         match self.cached.entry(uri) {
             Entry::Occupied(mut occupied) => {
                 if !entry.has_whole_file() && occupied.get().has_whole_file() {
+                    let existing = Arc::clone(occupied.get());
+                    drop(occupied);
                     self.release_entry_accounting(&entry);
-                    return Arc::clone(occupied.get());
+                    return existing;
                 }
+
                 let replaced = mem::replace(occupied.get_mut(), Arc::clone(&entry));
+                // Off the shard lock before `replaced` can drop: a last reference takes an fsync
+                // of the block index or a munmap with it, and every URI in the shard would wait.
+                drop(occupied);
                 self.release_entry_accounting(&replaced);
                 entry
             }
@@ -434,6 +434,28 @@ impl DiskCacheStore {
     }
 
     // Test helpers. Compiled only for tests, never into the shipped library.
+
+    /// The budget ledger invariant, checked at quiescence: every byte charged is backed by a live
+    /// entry, a scanned-but-unopened cache file, or a scanned block file, and by nothing else. A
+    /// phantom charge (bytes with no backing) or an unbacked entry (backing with no charge) fails
+    /// this, which is how every admission and fill path is kept honest. Only meaningful with no
+    /// fetch or fill in flight, which is why it is a test hook.
+    #[cfg(test)]
+    pub(crate) fn assert_budget_consistent(&self) {
+        let entries: u64 = self
+            .cached
+            .iter()
+            .map(|e| e.value().size_bytes.load(Ordering::Acquire))
+            .sum();
+        let unindexed: u64 = self.unindexed.iter().map(|f| f.value().size_bytes).sum();
+        let block_files: u64 = self.block_files.iter().map(|f| f.value().size_bytes).sum();
+        assert_eq!(
+            self.current_bytes.load(Ordering::Acquire),
+            entries + unindexed + block_files,
+            "budget ledger drifted from what the cache holds \
+             (entries {entries}, unindexed {unindexed}, block files {block_files})"
+        );
+    }
 
     #[cfg(test)]
     pub(crate) fn install_block_entry_for_test(

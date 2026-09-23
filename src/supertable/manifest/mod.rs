@@ -113,6 +113,10 @@ pub(crate) const SUPERFILE_DATA_DIR: &str = "data";
 /// the file is atomically renamed to the bare name once complete.
 pub(crate) const CACHE_TMP_EXTENSION: &str = ".tmp";
 
+/// Infix before [`CACHE_TMP_EXTENSION`] on a background fill's tempfile, so a fill and a foreground
+/// fetch for the same superfile never write one file.
+pub(crate) const CACHE_FILL_TMP_INFIX: &str = ".fill";
+
 /// Characters a hyphenated uuid renders to (`8-4-4-4-12`). The fixed width
 /// is what makes the `<stem>-<uuid>` key grammar unambiguous whatever the
 /// stem contains: the uuid is always the last this many bytes of the body.
@@ -2783,6 +2787,16 @@ impl SuperfileUri {
         format!("{}{CACHE_TMP_EXTENSION}", self.cache_filename())
     }
 
+    /// Disk-cache tempfile while a background fill downloads the file. Distinct from
+    /// [`Self::cache_tmp_filename`]: a fill and a foreground fetch for the same superfile can run
+    /// at once, and two writers on one tempfile leave holes in whichever copy lands last.
+    pub fn cache_fill_tmp_filename(self) -> String {
+        format!(
+            "{}{CACHE_FILL_TMP_INFIX}{CACHE_TMP_EXTENSION}",
+            self.cache_filename()
+        )
+    }
+
     /// Inverse of [`Self::cache_filename`]: recover the URI from an on-disk
     /// cache file name. The disk cache uses this to rebuild its in-memory index
     /// from files a prior run left under `cache_root`, so a restart / second
@@ -2795,10 +2809,12 @@ impl SuperfileUri {
         Uuid::parse_str(body).ok().map(SuperfileUri)
     }
 
-    /// Inverse of [`Self::cache_tmp_filename`]: recover the URI from an in-flight tempfile's name.
-    /// A crash can leave one behind; the disk cache uses this to recognize and delete it.
+    /// Inverse of [`Self::cache_tmp_filename`] and [`Self::cache_fill_tmp_filename`]: recover the
+    /// URI from an in-flight tempfile's name. A crash can leave one behind; the disk cache uses this
+    /// to recognize and delete it.
     pub fn from_cache_tmp_filename(name: &str) -> Option<Self> {
-        Self::from_cache_filename(name.strip_suffix(CACHE_TMP_EXTENSION)?)
+        let body = name.strip_suffix(CACHE_TMP_EXTENSION)?;
+        Self::from_cache_filename(body.strip_suffix(CACHE_FILL_TMP_INFIX).unwrap_or(body))
     }
 
     /// Inverse of [`Self::storage_path`] and of

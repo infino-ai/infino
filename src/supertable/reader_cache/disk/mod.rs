@@ -140,12 +140,9 @@ pub enum DiskCacheError {
     /// match on it instead of a stringified message.
     #[error("superfile reader failed to open bytes")]
     SuperfileOpenRead(#[from] crate::superfile::ReadError),
-    /// Eviction couldn't free enough space because every
-    /// cached entry was pinned (or there were no cached
-    /// entries and the incoming superfile alone exceeds the
-    /// disk budget). The query layer can fall back to a
-    /// `RangeOnly` path on this error; the cache itself just
-    /// surfaces it as a typed error.
+    /// Eviction could not free enough space: every cached entry is pinned, or the incoming
+    /// superfile alone exceeds the budget. [`DiskCacheStore::open_for_query`] degrades to an
+    /// uncached range-only reader on this; whole-file reads surface it.
     #[error("disk cache budget exceeded with no eligible victims")]
     BudgetExceeded,
     /// An invalid or conflicting configuration was supplied.
@@ -263,15 +260,6 @@ enum EntryAccounting {
     SourceOwned,
 }
 
-/// How a promoted entry lands in `cached` (see [`DiskCacheStore::install_promoted_entry`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InstallMode {
-    /// Foreground cold-fetch: insert unconditionally, the slot is ours.
-    Fresh,
-    /// Background finalizer: replace only if still present, else drop the file (evicted mid-fill).
-    ReplaceIfPresent,
-}
-
 /// Coalescing cell — concurrent cold readers on the same URI
 /// share one `OnceCell` and observe the same fetch result.
 type Coordinator = Arc<OnceCell<Result<Arc<CachedEntry>, DiskCacheError>>>;
@@ -307,20 +295,17 @@ struct UnindexedFile {
     mtime_us: u64,
 }
 
-/// Pulls superfile bytes through a [`StorageProvider`] and
-/// caches them locally as mmap-backed `SuperfileReader`s.
-///
-/// Construction is sync; `reader()` is async (cold fetches
-/// go through the storage provider's async interface).
+/// Pulls superfile bytes through a [`StorageProvider`] and caches them locally as mmap-backed
+/// `SuperfileReader`s. Construction is sync; the reads ([`Self::open_for_query`] and its siblings)
+/// are async, since a miss fetches through the provider's async interface.
 pub struct DiskCacheStore {
     storage: Arc<dyn StorageProvider>,
     config: DiskCacheConfig,
     started_at: Instant,
     cached: DashMap<SuperfileUri, Arc<CachedEntry>>,
-    /// Per-URI cold-fetch coalescing. Inserted by the first
-    /// caller to touch a cold URI; subsequent callers find
-    /// the same `OnceCell` and `await` it via
-    /// `get_or_try_init`.
+    /// One in-flight lookup per URI (tiers 2 to 4). The first caller to miss creates the cell and
+    /// runs the walk; later callers await the same cell. The waiter that created it removes it
+    /// once the walk settles.
     coordinators: DashMap<SuperfileUri, Coordinator>,
     /// Files on disk that no read has opened yet. Filled by `scan_cache_root`, drained by reuse or eviction.
     unindexed: DashMap<SuperfileUri, UnindexedFile>,
@@ -610,6 +595,12 @@ impl DiskCacheStore {
     /// during cold fetch; renamed to `cache_path` on success).
     pub(crate) fn tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
         self.config.cache_root.join(uri.cache_tmp_filename())
+    }
+
+    /// Tempfile a background fill downloads into; renamed to `cache_path` on success. Not
+    /// [`Self::tmp_path`]: a foreground fetch for the same superfile may be writing that one.
+    pub(crate) fn fill_tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
+        self.config.cache_root.join(uri.cache_fill_tmp_filename())
     }
 
     // Test and bench helpers. Compiled only for tests and the `test-helpers` feature, never into
