@@ -1245,35 +1245,36 @@ pub(crate) async fn compose_centroid_router_section(
     Some(encode_centroid_router_section(&router, entries, dim))
 }
 
-/// Build the in-memory centroid router from OPENED readers' OWN resident fine
+/// Build the in-memory centroid router from superfiles' OWN resident fine
 /// centroids — no [`CentroidSection`] fetch. This is the recalibration-side
 /// build (the settle path uses [`build_centroid_router`] from the published
-/// section). It mirrors [`centroid_router_walk`] node for node: readers in the
-/// given order, each superfile's fine clusters in `flat` order, the fp32
+/// section). It mirrors [`centroid_router_walk`] node for node: superfiles in
+/// the given order, each superfile's fine clusters in `flat` order, the fp32
 /// centroids metric-prepared and indexed by [`HnswParams::default`] — so the
 /// router built here is byte-identical to the settle-published one for the same
 /// membership, the parity the carried-forward fanout stamp relies on.
 ///
+/// Takes the centroids as already-extracted `(si, flat, centroid)` tuples in
+/// node order rather than opening readers itself, so the caller can stream the
+/// superfiles — extract each one's fine centroids, drop the (whole-superfile)
+/// reader, then build from the small centroid projection alone — instead of
+/// holding a resident reader per superfile (which would pin the entire hidden
+/// index in memory). Pass the tuples in superfile × `resident_fine_cluster_vectors`
+/// order.
+///
 /// [`CentroidSection`]: crate::supertable::slow_vector_state::CentroidSection
-pub(crate) fn build_centroid_router_from_readers(
-    readers: &[Arc<SuperfileReader>],
-    column: &str,
+pub(crate) fn build_centroid_router_from_cluster_vectors(
+    cluster_vectors: Vec<(usize, u32, Vec<f32>)>,
     dim: usize,
     metric: Metric,
 ) -> Result<CentroidRouterGraph, QueryError> {
     use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
-    let mut vecs: Vec<Vec<f32>> = Vec::new();
-    let mut node_map: Vec<(usize, u32)> = Vec::new();
-    for (si, reader) in readers.iter().enumerate() {
-        let Some(vr) = reader.vec() else { continue };
-        let Some(cluster_vecs) = vr.resident_fine_cluster_vectors(column) else {
-            continue;
-        };
-        for (flat, mut vec) in cluster_vecs {
-            gfc_prepare_for_metric(metric, &mut vec);
-            vecs.push(vec);
-            node_map.push((si, flat));
-        }
+    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(cluster_vectors.len());
+    let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(cluster_vectors.len());
+    for (si, flat, mut vec) in cluster_vectors {
+        gfc_prepare_for_metric(metric, &mut vec);
+        vecs.push(vec);
+        node_map.push((si, flat));
     }
     let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
     let graph = Hnsw::build(&scorer, HnswParams::default());

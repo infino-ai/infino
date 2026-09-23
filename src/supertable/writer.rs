@@ -8516,28 +8516,9 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     })
     .await
     .map_err(|e| BuildError::Store(format!("recalibration freeze: {e}")))?;
-    // Open a resident reader per live superfile once, reused for the
-    // centroid-router build, the per-cell flat-cluster base lookup during
-    // scoring, and the depth observation below. `open_compaction_input`
-    // guarantees fully-resident bytes (the depth observation reads them
-    // synchronously).
-    let mut work_readers: Vec<Arc<SuperfileReader>> = Vec::with_capacity(work.len());
-    for (entry, _) in &work {
-        work_readers.push(
-            open_compaction_input(
-                &inner.options.store,
-                inner.options.disk_cache.as_ref(),
-                inner.options.storage.as_ref(),
-                entry,
-            )
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?,
-        );
-    }
-
     // Centroid-router fanout calibration rides the SAME scan: build the router
     // over the settled fine centroids (byte-identical to the settle-published
-    // one — same readers × flat node order, `HnswParams::default`) and select
+    // one — same superfile × flat node order, `HnswParams::default`) and select
     // each frozen query's top-fanout clusters, so the scan can tag prefix rows
     // with their cluster's selection rank. Gated exactly like the settle's
     // router publish — engaged only when the centroid-graph router is on and
@@ -8551,18 +8532,57 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         vcfg.global_fine_fanout,
         &inner.options.vector_columns,
     );
+    let router_eligible = router_column.as_deref() == Some(column.as_str())
+        && !(vcfg.ivf_router == crate::config::IvfRouter::Auto
+            && manifest.n_docs_total() < vcfg.centroid_graph_scale_floor_docs);
+    // Per-superfile flat-cluster base (`cell -> flat_base`) for the pass-2
+    // prefix tag, indexed by `si`. Populated by the streaming extraction below
+    // only when the router is built, so no superfile reader is held past its
+    // open.
+    let mut flat_base_by_si: Vec<HashMap<u32, u32>> = Vec::new();
     #[allow(clippy::type_complexity)]
     let fanout_calib: Option<(
         Arc<Vec<Vec<HashMap<u32, u32>>>>,
         usize,
         opann::FanoutCalibCtx,
-    )> = if router_column.as_deref() == Some(column.as_str())
-        && !(vcfg.ivf_router == crate::config::IvfRouter::Auto
-            && manifest.n_docs_total() < vcfg.centroid_graph_scale_floor_docs)
-    {
-        match crate::supertable::query::vector::build_centroid_router_from_readers(
-            &work_readers,
-            &column,
+    )> = if router_eligible {
+        // Stream the live superfiles once, extracting only the small state the
+        // scan needs past the open — each superfile's fine-cluster centroids
+        // (the router nodes) and its per-cell flat-cluster base — dropping each
+        // reader before opening the next. `open_compaction_input` cannot serve a
+        // hidden vector superfile from the mmap disk cache (its vector blob is
+        // left sparse), so it materializes the whole superfile in anonymous
+        // memory; holding one resident reader per live superfile at once would
+        // pin the entire hidden index in RAM.
+        let mut router_cluster_vecs: Vec<(usize, u32, Vec<f32>)> = Vec::new();
+        flat_base_by_si = Vec::with_capacity(work.len());
+        for (si, (entry, cells)) in work.iter().enumerate() {
+            let reader = open_compaction_input(
+                &inner.options.store,
+                inner.options.disk_cache.as_ref(),
+                inner.options.storage.as_ref(),
+                entry,
+            )
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+            let mut bases = HashMap::new();
+            if let Some(vr) = reader.vec() {
+                if let Some(cluster_vecs) = vr.resident_fine_cluster_vectors(column.as_str()) {
+                    for (flat, vec) in cluster_vecs {
+                        router_cluster_vecs.push((si, flat, vec));
+                    }
+                }
+                for &(cell, _) in cells.iter() {
+                    if let Some(base) = vr.flat_cluster_base_for_cell(cell) {
+                        bases.insert(cell, base);
+                    }
+                }
+            }
+            flat_base_by_si.push(bases);
+            drop(reader);
+        }
+        match crate::supertable::query::vector::build_centroid_router_from_cluster_vectors(
+            router_cluster_vecs,
             dim,
             metric,
         ) {
@@ -8659,9 +8679,11 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     let survivors = Arc::new(cal.survivors_by_cell());
     for (si, (entry, cells)) in work.iter().enumerate() {
         // Per-superfile flat-cluster base for the router prefix tag: a cell's
-        // global flat cluster is `flat_base + row.cluster`. `None` on a v1
-        // (single-cell) reader, whose cells simply carry no fanout tag.
-        let flat_reader = &work_readers[si];
+        // global flat cluster is `flat_base + row.cluster`. Absent for a v1
+        // (single-cell) superfile, whose cells carry no fanout tag; precomputed
+        // by the streaming extraction above so no superfile reader is held
+        // across the scan.
+        let flat_bases = flat_base_by_si.get(si);
         for chunk in cells.chunks(chunk_cells) {
             let mut loaded: Vec<(u32, Option<u32>, Vec<MaterializedIvfRow>)> =
                 Vec::with_capacity(chunk.len());
@@ -8679,9 +8701,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                     Some(&[cell]),
                 )
                 .await?;
-                let flat_base = flat_reader
-                    .vec()
-                    .and_then(|v| v.flat_cluster_base_for_cell(cell));
+                let flat_base = flat_bases.and_then(|m| m.get(&cell).copied());
                 loaded.push((cell, flat_base, rows));
             }
             if !loaded.is_empty() {
