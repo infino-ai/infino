@@ -414,6 +414,11 @@ impl Supertable {
             split_overflow_cells(Arc::clone(inner))
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
+            info!(
+                role = table.role().as_str(),
+                wall_ms = __pt.elapsed().as_millis() as u64,
+                "compaction: split phase done"
+            );
         }
         if phase_timers {
             info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   split");
@@ -907,6 +912,13 @@ impl Supertable {
             .await
             {
                 Ok(new_manifest) => {
+                    info!(
+                        inputs = job.inputs.len(),
+                        removed = entries_to_remove.len(),
+                        added = new_entries.len(),
+                        manifest_id = new_manifest.get_manifest_id(),
+                        "compaction job committed"
+                    );
                     inner.manifest.store(Arc::new(new_manifest));
                     // Warm the merged superfile into the in-memory reader
                     // cache, same as a normal writer commit does. Without
@@ -1015,7 +1027,7 @@ async fn unseal_all(wal_store: &WalStore, sealed: Vec<SealedInput>) {
 
 /// Look up `job_inputs` in `current`, in order. `Err` carries the first
 /// missing id (removed by another compactor).
-fn resolve_entries_to_remove(
+pub(crate) fn resolve_entries_to_remove(
     current: &ManifestSnapshot,
     job_inputs: &[Uuid],
 ) -> Result<Vec<Arc<SuperfileEntry>>, Uuid> {

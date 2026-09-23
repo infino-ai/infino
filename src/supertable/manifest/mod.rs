@@ -4083,9 +4083,12 @@ mod tests {
     use crate::{
         storage::LocalFsStorageProvider,
         superfile::{builder::FtsConfig, vector::distance::distance},
-        supertable::manifest::{
-            commit::{PartWriteResult, write_manifest_part},
-            list::{Manifest, PartitionStrategy},
+        supertable::{
+            compaction::resolve_entries_to_remove,
+            manifest::{
+                commit::{PartWriteResult, write_manifest_part},
+                list::{Manifest, PartitionStrategy},
+            },
         },
         test_helpers::default_tokenizer,
     };
@@ -6136,6 +6139,26 @@ mod tests {
             "hydration must not fetch any manifest part"
         );
         assert!(loaded.slow_vector_state_blob().is_some());
+    }
+
+    /// A load without a slow-state blob still hydrates the flat view fully
+    /// (no part loads skipped), so `resolve_entries_to_remove` — which reads
+    /// that flat view — finds every input. This rules out the load path as a
+    /// source of the silent compaction no-op.
+    #[tokio::test]
+    async fn resolve_entries_to_remove_finds_inputs_after_lazy_load() {
+        let opts = make_opts();
+        let (_dir, storage) = local_storage();
+        let persisted = persist_two_entry_table(&storage, None).await;
+        let ids: Vec<Uuid> = persisted.iter().map(|e| e.superfile_id).collect();
+
+        let snap = ManifestSnapshot::load(None, Arc::clone(&storage), Some(opts))
+            .await
+            .expect("load");
+
+        assert_eq!(snap.get_all_superfiles().len(), 2, "flat view is complete");
+        let resolved = resolve_entries_to_remove(&snap, &ids).expect("both inputs resolve");
+        assert_eq!(resolved.len(), 2);
     }
 
     /// Dim for the routing-hydration fixture summaries.

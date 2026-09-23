@@ -7633,6 +7633,22 @@ pub(in crate::supertable) async fn split_repack_bulk(
     let superseded_map = manifest.get_superseded_cells();
     let dim = clusters.dim;
     let initial_n_cent = clusters.n_cent;
+    {
+        let parents = candidates
+            .iter()
+            .filter_map(|&(cell, _)| parents_by_cell.get(&cell))
+            .flatten()
+            .map(|entry| entry.superfile_id)
+            .collect::<HashSet<Uuid>>()
+            .len();
+        info!(
+            cells = candidates.len(),
+            parents,
+            n_cent = initial_n_cent,
+            dim,
+            "repack: start"
+        );
+    }
     let budget_bytes = split_batch_memory_budget_bytes();
 
     /// Removes the pass's scratch on every return path — a failed repack
@@ -7718,7 +7734,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
             Err(_) => None,
         };
         if wave_reservation.is_none() {
-            debug!(
+            info!(
                 cell = wave_cells[0],
                 "repack: budget denied; single-cell wave proceeds unreserved"
             );
@@ -7726,6 +7742,12 @@ pub(in crate::supertable) async fn split_repack_bulk(
 
         let jobs = live_split_extraction_jobs(&wave_cells, parents_by_cell, superseded_map);
         let extracted = extract_split_cell_rows(inner, &column, now, jobs).await?;
+        info!(
+            wave_cells = wave_cells.len(),
+            rows = extracted.iter().map(|item| item.rows.len()).sum::<usize>(),
+            wall_ms = now.elapsed().as_millis() as u64,
+            "repack: wave extracted"
+        );
         let mut plan_inputs: Vec<ExtractedCellRows> = Vec::new();
         for item in extracted {
             if item.rows.len() < MIN_ROWS_TO_SPLIT_CELL {
@@ -7999,7 +8021,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
     apply_pending_store_inserts(inner, pending_store_inserts);
     schedule_background_storage_reclaim(Arc::clone(inner));
 
-    debug!(
+    info!(
         cells = committed_cells.len(),
         children = new_entries_by_cell.len(),
         shards = bucket_cells.len(),
@@ -8133,7 +8155,27 @@ pub(in crate::supertable) async fn split_overflow_cells(
     // reopening every superfile for another full recount (the singleton
     // path additionally re-scanned the whole manifest PER SPLIT for parent
     // discovery — this index is that scan's one-pass replacement).
+    let pass_started = std::time::Instant::now();
     let (mut cell_counts, mut parents_by_cell) = scan_cell_parents(&inner, &manifest, None).await?;
+    {
+        let total_docs: u64 = cell_counts.values().sum();
+        let max_cell = cell_counts.values().copied().max().unwrap_or(0);
+        let over_cap = cell_counts
+            .values()
+            .filter(|&&n| opann::split_overflow_needed(n))
+            .count();
+        info!(
+            n_cent,
+            dim,
+            superfiles = manifest.superfiles.len(),
+            cells = cell_counts.len(),
+            total_docs,
+            max_cell,
+            over_cap,
+            scan_ms = pass_started.elapsed().as_millis() as u64,
+            "cell split pass: scanned"
+        );
+    }
 
     // Defensive progress guard for cells whose split no-op'd this pass.
     // Selection uses physical counts, so without this set any unchanged
@@ -8181,10 +8223,30 @@ pub(in crate::supertable) async fn split_overflow_cells(
     // still-over-cap children. The repack is one pass, not a loop, so the
     // per-optimize split bound doesn't gate it; the loop's bound still
     // applies to everything after.
+    info!(
+        modality_d,
+        stored_verdicts = stored_checks.len(),
+        verdict_hits = unsplittable.len(),
+        pending_verdicts = pending_fingerprints.len(),
+        "cell split pass: verdicts"
+    );
     let eligible = split_candidates(&cell_counts, &unsplittable);
-    if !eligible.is_empty()
-        && eligible.len() as f64 >= f64::from(n_cent) * SPLIT_BULK_REPACK_MIN_CANDIDATE_FRACTION
-    {
+    let bulk_min = f64::from(n_cent) * SPLIT_BULK_REPACK_MIN_CANDIDATE_FRACTION;
+    let bulk_repack = !eligible.is_empty() && eligible.len() as f64 >= bulk_min;
+    info!(
+        eligible = eligible.len(),
+        n_cent,
+        bulk_min = bulk_min.ceil() as u64,
+        path = if bulk_repack {
+            "bulk-repack"
+        } else if eligible.is_empty() {
+            "none"
+        } else {
+            "batched"
+        },
+        "cell split pass: candidates"
+    );
+    if bulk_repack {
         let outcome = split_repack_bulk(
             &inner,
             &manifest,
@@ -8287,18 +8349,19 @@ pub(in crate::supertable) async fn split_overflow_cells(
     // Convergence summary for this optimize's split pass. `over_cap > 0` here
     // means some cells still exceed the cap (unsplittable rows, or the
     // MAX_SPLITS bound) and will misrank until a later optimize finishes them.
-    if splits_committed > 0 {
+    {
         let over_cap = cell_counts
             .values()
             .filter(|&&n| opann::split_overflow_needed(n))
             .count();
         let max_cell = cell_counts.values().copied().max().unwrap_or(0);
-        debug!(
+        info!(
             splits = splits_committed,
             cells = cell_counts.len(),
             over_cap,
             max_cell,
             unsplittable = unsplittable.len(),
+            wall_ms = pass_started.elapsed().as_millis() as u64,
             "cell split pass done"
         );
     }
@@ -8325,6 +8388,10 @@ pub(in crate::supertable) async fn split_overflow_cells(
         .clone()
         .filter(|_| !new_checks.is_empty())
     {
+        info!(
+            verdicts_recorded = new_checks.len(),
+            "cell split pass: committing verdicts"
+        );
         let list_metadata = CommitListMetadata {
             split_checks_additions: Some(new_checks),
             ..CommitListMetadata::empty()
@@ -8891,7 +8958,15 @@ pub(in crate::supertable) async fn refresh_slow_vector_state(
     inner: &SupertableInner,
     calibrate_fanout: bool,
 ) -> Result<(), BuildError> {
-    stamp_slow_vector_state(inner, calibrate_fanout, None).await
+    info!(calibrate_fanout, "slow vector state refresh: start");
+    let started = std::time::Instant::now();
+    let result = stamp_slow_vector_state(inner, calibrate_fanout, None).await;
+    info!(
+        ok = result.is_ok(),
+        wall_ms = started.elapsed().as_millis() as u64,
+        "slow vector state refresh: done"
+    );
+    result
 }
 
 /// Build + PUT the centroid-router section for the settled generation AND
