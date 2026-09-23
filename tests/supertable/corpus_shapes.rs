@@ -41,10 +41,14 @@
 //! accepts but nothing in the wild can be in — and it is what makes both
 //! droppable together when the superseded read paths go.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use infino::{
-    Bm25SearchOptions, Supertable, connect,
+    Bm25SearchOptions, Connection, Supertable, connect,
     superfile::format::fts::{
         BlobLayout, VERSION_CURRENT, VERSION_V1_LEGACY, VERSION_V2, VERSION_V3, VERSION_V4,
         VERSION_V5, VERSION_V6, VERSION_V7,
@@ -111,13 +115,8 @@ struct BlobHeader {
     columns_json: String,
 }
 
-/// Every superfile's FTS blob header under `root`, in path order.
-///
-/// Reads the raw bytes rather than going through the reader: the point is
-/// to assert what the *file* says, independently of how this engine's
-/// reader chooses to interpret it.
-fn blob_headers(root: &Path) -> Vec<BlobHeader> {
-    let mut found = Vec::new();
+/// Every superfile under `root`, in path order.
+pub(crate) fn superfile_paths(root: &Path) -> Vec<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     let mut files = Vec::new();
     while let Some(dir) = stack.pop() {
@@ -131,7 +130,17 @@ fn blob_headers(root: &Path) -> Vec<BlobHeader> {
         }
     }
     files.sort();
-    for path in files {
+    files
+}
+
+/// Every superfile's FTS blob header under `root`, in path order.
+///
+/// Reads the raw bytes rather than going through the reader: the point is
+/// to assert what the *file* says, independently of how this engine's
+/// reader chooses to interpret it.
+fn blob_headers(root: &Path) -> Vec<BlobHeader> {
+    let mut found = Vec::new();
+    for path in superfile_paths(root) {
         let bytes = fs::read(&path).expect("read superfile");
         let at = bytes
             .windows(FTS_MAGIC.len())
@@ -162,18 +171,28 @@ fn find_columns_json(bytes: &[u8]) -> Option<String> {
     String::from_utf8(bytes[start..start + end + 2].to_vec()).ok()
 }
 
-/// Copy a corpus table into a temp dir and open it.
+/// Copy a corpus table into a temp dir and connect to it.
 ///
 /// The checked-in bytes are a fixture: opening a table takes a lock and
 /// can write manifest state, so a test that opened them in place would
 /// mutate the thing it is asserting about.
-pub(crate) fn open_corpus(shape: &str) -> Option<(TempDir, Supertable, std::path::PathBuf)> {
+///
+/// Hands back the connection as well as the copy, because SQL hangs off
+/// the connection rather than the table handle — a test that compares
+/// stored columns needs it alive.
+pub(crate) fn connect_corpus(shape: &str) -> Option<(TempDir, Connection, PathBuf)> {
     let src = corpus_dir(shape)?;
     let tmp = TempDir::new().expect("tempdir");
     copy_tree(&src, tmp.path());
     let root = tmp.path().to_path_buf();
 
     let db = connect(root.to_str().expect("utf-8 path")).expect("connect to corpus");
+    Some((tmp, db, root))
+}
+
+/// Copy a corpus table into a temp dir and open its table handle.
+pub(crate) fn open_corpus(shape: &str) -> Option<(TempDir, Supertable, PathBuf)> {
+    let (tmp, db, root) = connect_corpus(shape)?;
     let table = db.open_table(TABLE).expect("open corpus table");
     Some((tmp, table, root))
 }

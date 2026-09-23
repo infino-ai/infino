@@ -47,6 +47,7 @@ mod manifest;
 mod query;
 mod reindex;
 mod reindex_crash;
+mod reindex_invariance;
 mod storage;
 mod update_crash_property;
 mod vector_cosine_normalize;
