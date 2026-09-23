@@ -920,8 +920,8 @@ mod tests {
                 "`shared` df is that superfile's doc count"
             );
             assert!(
-                p.bound.is_infinite(),
-                "this build writes the trivially valid bound"
+                p.bound.is_finite() && p.bound > 0.0,
+                "every posting carries a real ceiling"
             );
             assert_ne!(
                 p.location,
@@ -1187,5 +1187,95 @@ mod tests {
             by_prefix, s1,
             "a prefix routes through the slices to the same superfile"
         );
+    }
+    /// Every posting's bound is a true ceiling: for each term, the highest
+    /// score any document in that superfile actually receives under the
+    /// superfile's own statistics does not exceed the artifact's bound for
+    /// it. The oracle is the public search itself, run with per-superfile
+    /// statistics so its scores are in the scale the bounds were baked in;
+    /// hits map to superfiles through the entries' id ranges.
+    #[test]
+    fn bounds_are_upper_bounds_on_real_scores() {
+        use arrow_array::{Array, Decimal128Array, Float32Array, Int64Array};
+
+        use crate::{Bm25SearchOptions, superfile::fts::reader::Bm25Stats};
+
+        let (_dir, storage, st) = fresh_table();
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let reader = st.reader().expect("reader");
+        let ranges: Vec<(Uuid, i128, i128)> = reader
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| (e.superfile_id, e.id_min, e.id_max))
+            .collect();
+        let superfile_of = |id: i128| -> Uuid {
+            ranges
+                .iter()
+                .find(|(_, lo, hi)| *lo <= id && id <= *hi)
+                .map(|(sf, _, _)| *sf)
+                .expect("every hit falls in one superfile's id range")
+        };
+        for term in ["shared", "alpha", "beta", "s1d00", "s2d04"] {
+            let postings = rt.block_on(index.postings("title", term)).expect("lookup");
+            assert!(!postings.is_empty(), "{term} is indexed");
+            let bounds: HashMap<Uuid, f32> = postings
+                .iter()
+                .map(|p| (index.superfile_id(p.superfile).expect("ordinal"), p.bound))
+                .collect();
+            for (sf, b) in &bounds {
+                assert!(
+                    b.is_finite(),
+                    "{term} in {sf}: bound is a real ceiling, not the +inf placeholder"
+                );
+            }
+            let batches = reader
+                .bm25_search(
+                    "title",
+                    term,
+                    DOCS_PER_SEGMENT * SEGMENTS,
+                    Bm25SearchOptions::new().with_stats(Bm25Stats::PerSuperfile),
+                    Some(&["_id", "score"]),
+                )
+                .expect("search");
+            let mut observed_max: HashMap<Uuid, f32> = HashMap::new();
+            for b in &batches {
+                let scores = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("score");
+                let ids = b.column(0);
+                for i in 0..b.num_rows() {
+                    let id: i128 = if let Some(a) = ids.as_any().downcast_ref::<Decimal128Array>() {
+                        a.value(i)
+                    } else {
+                        ids.as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("_id")
+                            .value(i) as i128
+                    };
+                    let sf = superfile_of(id);
+                    let e = observed_max.entry(sf).or_insert(0.0);
+                    *e = e.max(scores.value(i));
+                }
+            }
+            assert!(!observed_max.is_empty());
+            for (sf, observed) in observed_max {
+                let bound = bounds
+                    .get(&sf)
+                    .copied()
+                    .unwrap_or_else(|| panic!("{term}: a superfile with hits has a posting"));
+                assert!(
+                    observed <= bound,
+                    "{term} in {sf}: observed max {observed} exceeds bound {bound}"
+                );
+            }
+        }
     }
 }

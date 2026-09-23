@@ -1451,6 +1451,20 @@ impl SuperfileReader {
         Ok(fts.term_df(column, token).await?)
     }
 
+    /// Upper bound on the BM25 score each of `tokens` can reach here, at
+    /// this superfile's own statistics (`None` for an absent token).
+    /// Delegates to [`FtsReader::term_max_bounds`].
+    pub(crate) async fn term_max_bounds(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<Vec<Option<f32>>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_max_bounds(column, tokens).await?)
+    }
+
     /// Dictionary entry of each of `tokens` in `column`, in input order
     /// (`None` for an absent token). Delegates to
     /// [`FtsReader::term_locations`].

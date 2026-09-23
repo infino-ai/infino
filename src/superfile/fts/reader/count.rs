@@ -315,6 +315,32 @@ impl FtsReader {
     /// ranges into a minimal set of parallel GETs). This matters on the
     /// global-statistics path, where a superfile is probed for every
     /// scored term of a query at once.
+    /// Upper bound on the BM25 score each of `tokens` can reach in this
+    /// superfile, in input order — `None` for an absent token. Scored at
+    /// this superfile's own idf and declared parameters, exactly as its
+    /// stored block maxima are: for a long term the maximum over its skip
+    /// entries, for a short or inline term the maximum over its postings.
+    /// A table-level index records these so a query can order superfiles
+    /// by ceiling before opening any; the query rescales for a global idf
+    /// or an override the same way the in-superfile bounds are.
+    pub(crate) async fn term_max_bounds(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<Vec<Option<f32>>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cursors = self
+            .build_term_cursors_opt(column_id, tokens, None, false, None, None)
+            .await?;
+        Ok(cursors
+            .into_iter()
+            .map(|c| c.map(|c| c.term_max_bm25))
+            .collect())
+    }
+
     /// Dictionary entry of each of `tokens` in `column`, in input order —
     /// `None` for an absent token. One dictionary fetch, no postings read.
     /// This is what a table-level term index records so a later query can

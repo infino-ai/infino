@@ -3024,8 +3024,8 @@ pub(crate) fn build_fts_summary(
 /// in-memory bytes: every FTS column's terms in key order, each with its
 /// `df` and where its postings sit. The reader's source is the bytes just
 /// built, so the awaited calls resolve without I/O; the bridge only lends
-/// them an executor from this synchronous prepare path. Bounds are written
-/// as `+∞`, a valid ceiling, until the tightening pass replaces them.
+/// them an executor from this synchronous prepare path. Every term carries
+/// its score ceiling in this superfile, at the superfile's own statistics.
 fn build_term_contribution(
     reader: &SuperfileReader,
     options: &SupertableOptions,
@@ -3052,18 +3052,24 @@ fn build_term_contribution(
             .map(|t| from_utf8(t).map_err(|_| BuildError::Store("non-utf8 term".into())))
             .collect::<Result<_, _>>()?;
         for chunk in terms.chunks(TERM_INDEX_BATCH_TERMS) {
-            let (dfs, locations) = bridge_sync_to_async(async {
+            let (dfs, locations, bounds) = bridge_sync_to_async(async {
                 let (dfs, _work) = reader.term_dfs(column, chunk).await?;
                 let locations = reader.term_locations(column, chunk).await?;
-                Ok::<_, ReadError>((dfs, locations))
+                let bounds = reader.term_max_bounds(column, chunk).await?;
+                Ok::<_, ReadError>((dfs, locations, bounds))
             })
             .map_err(|e| BuildError::Store(format!("term-index contribution: {e}")))?;
-            for ((term, df), location) in chunk.iter().zip(dfs).zip(locations) {
+            for (((term, df), location), bound) in chunk.iter().zip(dfs).zip(locations).zip(bounds)
+            {
                 let location = location
                     .map(term_index::Location::from_dict_value)
                     .unwrap_or(term_index::Location::None);
+                // A term the dictionary lists but no cursor could bound is
+                // given the ceiling that prunes nothing rather than one that
+                // could be wrong.
+                let bound = bound.unwrap_or(f32::INFINITY);
                 writer
-                    .push(&make_key(column, term), df, f32::INFINITY, location)
+                    .push(&make_key(column, term), df, bound, location)
                     .map_err(|e| BuildError::Store(e.to_string()))?;
             }
         }
@@ -9474,8 +9480,8 @@ pub(in crate::supertable) async fn stamp_term_stats(
 /// spilled before the next opens, so the pass costs one superfile's
 /// open-time state plus one slice, whatever the table's size.
 ///
-/// Bounds are written as `+∞`, a valid ceiling that prunes nothing; the
-/// tightening pass replaces them.
+/// Every posting carries the term's score ceiling in that superfile, at the
+/// superfile's own statistics; the query rescales it.
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
@@ -9589,11 +9595,22 @@ async fn collect_and_build_term_index(
                         .term_locations(column, chunk)
                         .await
                         .map_err(|e| TermIndexError::Build(format!("location batch: {e}")))?;
-                    for ((term, df), location) in chunk.iter().zip(dfs).zip(locations) {
+                    let bounds = reader
+                        .term_max_bounds(column, chunk)
+                        .await
+                        .map_err(|e| TermIndexError::Build(format!("bound batch: {e}")))?;
+                    for (((term, df), location), bound) in
+                        chunk.iter().zip(dfs).zip(locations).zip(bounds)
+                    {
                         let location = location
                             .map(term_index::Location::from_dict_value)
                             .unwrap_or(term_index::Location::None);
-                        writer.push(&make_key(column, term), df, f32::INFINITY, location)?;
+                        writer.push(
+                            &make_key(column, term),
+                            df,
+                            bound.unwrap_or(f32::INFINITY),
+                            location,
+                        )?;
                     }
                 }
             }
