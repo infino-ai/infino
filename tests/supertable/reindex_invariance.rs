@@ -12,9 +12,12 @@
 //! instead of a side effect.
 //!
 //! The id sidecar is the exception these tests found rather than assumed,
-//! and it is why [`REPAIRED_REGIONS`] is a list of two: a rewrite also
-//! re-encodes a pre-packed-layout sidecar into the packed one. The ids
-//! are unchanged; their encoding is not.
+//! and it is why [`REPAIRED_REGIONS`] is a list of two. The builder writes
+//! the packed sidecar unconditionally, so a rewrite does one of three
+//! things to it depending on how old the input is: adds one to a file that
+//! predates the sidecar entirely, re-encodes a raw `i128` array into the
+//! packed layout, or leaves an already-packed one alone. The ids
+//! themselves are unchanged in every case; only their encoding moves.
 //!
 //! ## Why the region check enumerates instead of listing
 //!
@@ -39,12 +42,18 @@
 //! byte-faithful or it is broken, so a tolerance there would hide the one
 //! defect the check exists to catch.
 
-use std::{collections::BTreeMap, fs, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    path::Path,
+    time::Duration,
+};
 
 use arrow_array::{Array, Decimal128Array, Float32Array, LargeStringArray};
+use datafusion::prelude::{Expr, col, lit};
 use infino::{Connection, ReindexOptions, Supertable, superfile::format::footer::read_kv_metadata};
 
-use super::corpus_shapes::{TABLE, connect_corpus, open_corpus, superfile_paths};
+use super::corpus_shapes::{TABLE, connect_corpus, corpus_dir, open_corpus, superfile_paths};
 
 /// The shape every test here runs on: a table carrying both an FTS index
 /// and a vector index, so "nothing but FTS moves" has something to move.
@@ -65,17 +74,26 @@ const IDS_REGION: &str = "ids";
 const IDS_LAYOUT_KEY: &str = "inf.ids.layout";
 /// The [`IDS_LAYOUT_KEY`] value for the packed sidecar.
 const IDS_LAYOUT_PACKED: &str = "packed";
+/// Footer key naming the vector blob's layout.
+const VEC_LAYOUT_KEY: &str = "inf.vec.layout";
+/// The [`VEC_LAYOUT_KEY`] value for cell-directory subsections — the
+/// layout a rewrite has the most work to carry across untouched.
+const VEC_LAYOUT_MULTI_CELL: &str = "multi_cell_ivf";
 
 /// The regions a rewrite is allowed to change. Everything else is cargo
 /// and is held to byte equality.
 ///
 /// The FTS blob is the point of the operation. The id sidecar is not, and
 /// is here because a rewrite re-encodes it whether or not anyone asked:
-/// the builder writes the packed frame-of-reference layout, so a file
-/// written before that layout existed carries a raw `i128` array in and a
-/// packed sidecar out. That is a second format migration riding along
-/// with the first — the ids themselves are unchanged, which
+/// the builder packs the sidecar unconditionally, so a file written before
+/// the packed layout existed comes out with one regardless. That is a
+/// second format migration riding along with the first — the ids
+/// themselves are unchanged, which
 /// [`a_rewrite_round_trips_the_stored_columns`] is what actually pins.
+///
+/// A region is added here only with its reason. The point of the list is
+/// that everything outside it is held to byte equality, so growing it is
+/// how the boundary moves — deliberately, and in writing.
 const REPAIRED_REGIONS: &[&str] = &[FTS_REGION, IDS_REGION];
 
 /// Neighbours retrieved by the probe; large enough that a dropped or
@@ -86,6 +104,11 @@ const EMBEDDING_DIM: usize = 16;
 /// Off-axis weight in the probe vector, mirroring the generators'
 /// `embedding(0)`.
 const PROBE_OFF_AXIS: f32 = 0.05;
+
+/// Rows the deletion test removes. Enough to span more than one superfile
+/// so the tombstone carry is exercised per file, few enough to keep the
+/// predicate readable.
+const DELETED_DOCS: usize = 25;
 
 /// One superfile's spliced regions, as `name -> bytes`.
 ///
@@ -283,35 +306,42 @@ fn rewrite(table: &Supertable) {
 /// A region this engine grows later is carried by default — it is not in
 /// [`REPAIRED_REGIONS`], so it must survive untouched, and whoever makes
 /// it legitimately change has to come here and say why.
-#[test]
-fn a_rewrite_changes_only_the_regions_it_repairs() {
-    let Some((_tmp, table, root)) = open_corpus(SHAPE) else {
+/// Run against every shape rather than one: the carried regions differ by
+/// shape — only the hybrid shape has a vector subsection to carry — and a
+/// claim about what a rewrite leaves alone is worth exactly as much as the
+/// number of writers it has been checked against.
+fn assert_only_repaired_regions_change(shape: &str) {
+    let Some((_tmp, table, root)) = open_corpus(shape) else {
         return;
     };
 
     let before = table_regions(&root);
     assert!(
         before.contains_key(FTS_REGION),
-        "the fixture declares no FTS region, so this proves nothing: {:?}",
+        "{shape}: the fixture declares no FTS region, so this proves nothing: {:?}",
         before.keys().collect::<Vec<_>>()
     );
     let carried: Vec<&String> = before
         .keys()
         .filter(|n| !REPAIRED_REGIONS.contains(&n.as_str()))
         .collect();
-    assert!(
-        !carried.is_empty(),
-        "the fixture declares only repaired regions, so there is nothing to carry: {:?}",
-        before.keys().collect::<Vec<_>>()
-    );
 
     rewrite(&table);
     let after = table_regions(&root);
 
+    // Only the carried regions have to be the same *set*. A repaired
+    // region is allowed to appear: the oldest shapes predate the stable-id
+    // sidecar entirely and resolve `_id` from the Parquet id pages, so a
+    // rewrite gives them a sidecar they never had. Holding the whole key
+    // set equal would call that a defect, and it is the opposite — the
+    // file gains an `_id` resolve that decodes no Parquet page.
+    let carried_after: Vec<&String> = after
+        .keys()
+        .filter(|n| !REPAIRED_REGIONS.contains(&n.as_str()))
+        .collect();
     assert_eq!(
-        before.keys().collect::<Vec<_>>(),
-        after.keys().collect::<Vec<_>>(),
-        "a rewrite added or dropped a whole region"
+        carried, carried_after,
+        "{shape}: a rewrite added or dropped a region it does not repair"
     );
     // Every carried region is reported, not just the first to fail: which
     // ones moved is the finding, and stopping at one hides the rest.
@@ -325,8 +355,8 @@ fn a_rewrite_changes_only_the_regions_it_repairs() {
         .collect();
     assert!(
         moved.is_empty(),
-        "a rewrite changed {} region(s) it does not repair — either the \
-         change is a defect, or the region belongs in REPAIRED_REGIONS \
+        "{shape}: a rewrite changed {} region(s) it does not repair — either \
+         the change is a defect, or the region belongs in REPAIRED_REGIONS \
          with the reason written down:\n{}",
         moved.len(),
         moved.join("\n")
@@ -334,8 +364,44 @@ fn a_rewrite_changes_only_the_regions_it_repairs() {
     assert_ne!(
         before.get(FTS_REGION),
         after.get(FTS_REGION),
-        "the FTS region came through unchanged, so the rewrite repaired nothing"
+        "{shape}: the FTS region came through unchanged, so the rewrite \
+         repaired nothing"
     );
+}
+
+// No `v1_positionless` case. A v1-era catalog record names no analyzer,
+// so the table cannot be opened at all, let alone reindexed — the refusal
+// is pinned by `corpus_shapes::v1_positionless`. v1 is outside the claim
+// this module makes rather than an exception to it.
+
+#[test]
+fn a_positions_region_rewrite_changes_only_what_it_repairs() {
+    assert_only_repaired_regions_change("v2_positions_region");
+}
+
+#[test]
+fn a_bitset_block_rewrite_changes_only_what_it_repairs() {
+    assert_only_repaired_regions_change("v4_bitset_blocks");
+}
+
+#[test]
+fn a_positionless_rewrite_changes_only_what_it_repairs() {
+    assert_only_repaired_regions_change("v5_positionless");
+}
+
+#[test]
+fn a_positional_rewrite_changes_only_what_it_repairs() {
+    assert_only_repaired_regions_change("v5_positional");
+}
+
+#[test]
+fn a_coarse_rewrite_changes_only_what_it_repairs() {
+    assert_only_repaired_regions_change("v6_positional");
+}
+
+#[test]
+fn a_hybrid_rewrite_changes_only_what_it_repairs() {
+    assert_only_repaired_regions_change(SHAPE);
 }
 
 /// Vector results survive a rewrite exactly — the same neighbours at the
@@ -450,4 +516,118 @@ fn total_ids_bytes(root: &Path) -> usize {
         .get(IDS_REGION)
         .map(|regions| regions.iter().map(Vec::len).sum())
         .unwrap_or_default()
+}
+
+/// The hybrid fixture's vector subsections really are the multi-cell
+/// layout, so the byte-identity result above is a claim about the layout
+/// that is hardest to carry — not only the single-cell one.
+///
+/// Asserted rather than assumed: "the vector region survives" is worth
+/// what the fixture behind it is worth, and a fixture that quietly
+/// regenerated as single-cell would weaken every vector claim in this
+/// module without failing any of them.
+#[test]
+fn the_hybrid_fixture_carries_multi_cell_vector_subsections() {
+    let Some(dir) = corpus_dir(SHAPE) else {
+        return;
+    };
+
+    let layouts: Vec<Option<String>> = superfile_paths(&dir)
+        .iter()
+        .map(|path| {
+            let bytes = fs::read(path).expect("read superfile");
+            read_kv_metadata(&bytes)
+                .expect("read superfile key-value metadata")
+                .get(VEC_LAYOUT_KEY)
+                .cloned()
+        })
+        .collect();
+
+    assert!(!layouts.is_empty(), "the hybrid fixture has no superfiles");
+    assert!(
+        layouts
+            .iter()
+            .all(|l| l.as_deref() == Some(VEC_LAYOUT_MULTI_CELL)),
+        "the hybrid fixture is not multi-cell throughout, so the vector \
+         byte-identity claim covers less than it appears to: {layouts:?}"
+    );
+}
+
+/// A rewrite does not resurrect a deleted row.
+///
+/// The interaction nothing else covers: deletions live in a per-superfile
+/// tombstone sidecar keyed by local doc id, and a rewrite mints a new
+/// superfile id. Getting that wrong brings dead rows back, which is worse
+/// than the recall loss the migration exists to repair and is invisible to
+/// any test that only asks whether the live rows are still there.
+///
+/// Pins today's behaviour, where the build applies the deletion bitmap and
+/// the dead rows are dropped from the output entirely. A change to carry
+/// the row set instead has to keep every assertion here passing — the
+/// deleted rows stay gone either way, which is the part that matters.
+#[test]
+fn a_rewrite_keeps_deleted_rows_deleted() {
+    let Some((_tmp, db, _root)) = connect_corpus(SHAPE) else {
+        return;
+    };
+    let table = db.open_table(TABLE).expect("open corpus table");
+
+    // A deterministic slice, taken by id order so the choice does not
+    // depend on which superfile happens to hold what.
+    let victims: Vec<(i128, String)> = rows_by_id(&db)
+        .into_iter()
+        .take(DELETED_DOCS)
+        .map(|(id, _body, title, _notes)| (id, title))
+        .collect();
+    assert_eq!(
+        victims.len(),
+        DELETED_DOCS,
+        "the fixture has fewer rows than this test deletes"
+    );
+
+    let predicate = victims
+        .iter()
+        .map(|(_, title)| col("title").eq(lit(title.clone())))
+        .reduce(Expr::or)
+        .expect("at least one row to delete");
+    let stats = table.delete(predicate).expect("delete rows");
+    assert_eq!(
+        stats.n_tombstoned(),
+        DELETED_DOCS,
+        "the delete did not tombstone the rows this test is about"
+    );
+
+    let deleted: HashSet<i128> = victims.iter().map(|(id, _)| *id).collect();
+    let live_before: Vec<i128> = rows_by_id(&db).into_iter().map(|(id, ..)| id).collect();
+    assert!(
+        live_before.iter().all(|id| !deleted.contains(id)),
+        "a deleted row was still readable before the rewrite"
+    );
+    let probe = probe_embedding();
+    let vector_before = vector_hits(&table, &probe);
+    assert!(
+        vector_before.iter().all(|(id, _)| !deleted.contains(id)),
+        "vector search returned a deleted row before the rewrite"
+    );
+
+    rewrite(&table);
+
+    let live_after: Vec<i128> = rows_by_id(&db).into_iter().map(|(id, ..)| id).collect();
+    assert!(
+        live_after.iter().all(|id| !deleted.contains(id)),
+        "a rewrite brought a deleted row back to life"
+    );
+    assert_eq!(
+        live_after, live_before,
+        "a rewrite changed which rows are live, or the order they read in"
+    );
+    let vector_after = vector_hits(&table, &probe);
+    assert!(
+        vector_after.iter().all(|(id, _)| !deleted.contains(id)),
+        "vector search returned a deleted row after the rewrite"
+    );
+    assert_eq!(
+        vector_after, vector_before,
+        "a rewrite moved the vector results of a table with deletions"
+    );
 }
