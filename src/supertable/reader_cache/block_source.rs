@@ -166,6 +166,12 @@ impl BlockCachedSource {
         Arc::ptr_eq(&self.entry_token, token)
     }
 
+    /// Whether this source reserves and releases the bytes of the blocks it fills itself, rather
+    /// than riding on a reservation its owning entry made.
+    pub(crate) fn owns_accounting(&self) -> bool {
+        self.owns_accounting
+    }
+
     /// Shared filled-bytes counter, installed as the cache entry's
     /// `size_bytes` so accounting and eviction see live growth.
     pub(crate) fn filled_bytes_handle(&self) -> Arc<AtomicU64> {

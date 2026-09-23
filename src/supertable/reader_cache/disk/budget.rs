@@ -317,6 +317,17 @@ impl DiskCacheStore {
         self.reserve_manual(bytes).await
     }
 
+    /// Reserve `bytes` only if the budget has room right now, never evicting. For a caller that
+    /// cannot wait, such as an install decided under a shard lock.
+    pub(crate) fn try_reserve_without_evicting(&self, bytes: u64) -> bool {
+        let budget = self.disk_budget_bytes();
+        self.current_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                cur.checked_add(bytes).filter(|&next| next <= budget)
+            })
+            .is_ok()
+    }
+
     /// Release previously reserved block-cache bytes.
     pub(crate) fn release_block_bytes(&self, bytes: u64) {
         self.current_bytes.fetch_sub(bytes, Ordering::Release);
@@ -492,11 +503,7 @@ impl DiskCacheStore {
     /// fetch or fill in flight, which is why it is a test hook.
     #[cfg(test)]
     pub(crate) fn assert_budget_consistent(&self) {
-        let entries: u64 = self
-            .cached
-            .iter()
-            .map(|e| e.value().size_bytes.load(Ordering::Acquire))
-            .sum();
+        let entries: u64 = self.cached.iter().map(|e| e.value().charged_bytes()).sum();
         let unindexed: u64 = self.unindexed.iter().map(|f| f.value().size_bytes).sum();
         let block_files: u64 = self.block_files.iter().map(|f| f.value().size_bytes).sum();
         assert_eq!(

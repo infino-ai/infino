@@ -901,25 +901,26 @@ mod tests {
         // sibling process's in-flight fetch: deleting it would fail that fetch's rename.
         let (_dir, store) = test_store();
         let bytes = tiny_superfile_bytes();
-        let stale = SuperfileUri::new_v4();
-        let fresh = SuperfileUri::new_v4();
-        let skewed = SuperfileUri::new_v4();
-        let stale_fill = SuperfileUri::new_v4();
-        let fresh_fill = SuperfileUri::new_v4();
         let now = SystemTime::now();
+        let stale = store.tmp_path(&SuperfileUri::new_v4());
+        let fresh = store.tmp_path(&SuperfileUri::new_v4());
+        let skewed = store.tmp_path(&SuperfileUri::new_v4());
+        // The unnumbered name older builds wrote is reclaimed by the same rule.
+        let legacy = store
+            .config
+            .cache_root
+            .join(format!("{}.tmp", SuperfileUri::new_v4().cache_filename()));
         for (path, mtime) in [
-            (store.tmp_path(&stale), now - TMP_RECLAIM_AGE * 2),
-            (store.tmp_path(&fresh), now),
+            (&stale, now - TMP_RECLAIM_AGE * 2),
+            (&fresh, now),
             // A future mtime (clock skew) must read as not-stale, never as reclaimable.
-            (store.tmp_path(&skewed), now + TMP_RECLAIM_AGE),
-            // A background fill's tempfile has its own name and the same rule.
-            (store.fill_tmp_path(&stale_fill), now - TMP_RECLAIM_AGE * 2),
-            (store.fill_tmp_path(&fresh_fill), now),
+            (&skewed, now + TMP_RECLAIM_AGE),
+            (&legacy, now - TMP_RECLAIM_AGE * 2),
         ] {
-            fs::write(&path, bytes.as_ref()).expect("seed tmp");
+            fs::write(path, bytes.as_ref()).expect("seed tmp");
             fs::File::options()
                 .write(true)
-                .open(&path)
+                .open(path)
                 .expect("open tmp")
                 .set_modified(mtime)
                 .expect("set mtime");
@@ -927,22 +928,12 @@ mod tests {
 
         let opened = reopen_store(&store, |_| {});
 
-        assert!(!opened.tmp_path(&stale).exists(), "stale tmp reclaimed");
+        assert!(!stale.exists(), "stale tmp reclaimed");
+        assert!(fresh.exists(), "fresh tmp left for its owner");
+        assert!(skewed.exists(), "future mtime spared under clock skew");
         assert!(
-            opened.tmp_path(&fresh).exists(),
-            "fresh tmp left for its owner"
-        );
-        assert!(
-            opened.tmp_path(&skewed).exists(),
-            "future mtime spared under clock skew"
-        );
-        assert!(
-            !opened.fill_tmp_path(&stale_fill).exists(),
-            "stale fill tmp reclaimed"
-        );
-        assert!(
-            opened.fill_tmp_path(&fresh_fill).exists(),
-            "fresh fill tmp left for its owner"
+            !legacy.exists(),
+            "a stale unnumbered tmp from an older build is reclaimed"
         );
         assert_eq!(
             opened.stats().current_bytes,
@@ -958,16 +949,14 @@ mod tests {
         let (_dir, store) = test_store();
         let uri = SuperfileUri::new_v4();
         let bytes = tiny_superfile_bytes();
-        fs::write(store.tmp_path(&uri), bytes.as_ref()).expect("sibling's in-flight tmp");
+        let sibling_tmp = store.tmp_path(&uri);
+        fs::write(&sibling_tmp, bytes.as_ref()).expect("sibling's in-flight tmp");
 
         let opened = reopen_store(&store, |_| {});
-        assert!(
-            opened.tmp_path(&uri).exists(),
-            "scan spared the in-flight tmp"
-        );
+        assert!(sibling_tmp.exists(), "scan spared the in-flight tmp");
 
         // The sibling finishes: fsync'd bytes, atomic rename to the final name.
-        fs::rename(opened.tmp_path(&uri), opened.cache_path(&uri)).expect("sibling renames");
+        fs::rename(&sibling_tmp, opened.cache_path(&uri)).expect("sibling renames");
 
         let _r = opened
             .reader(&uri)

@@ -267,6 +267,13 @@ impl DiskCacheStore {
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+        // A background fill may have installed the whole file since this caller's memory check.
+        // Take it rather than probe its file on disk: a fill that kept the vector blob on the block
+        // cache leaves an mmap file with a hole in it, which only its live entry can serve.
+        if let Some(entry) = self.whole_file_in_memory(uri) {
+            return Ok(entry);
+        }
+
         // Tier 2, disk cache: the whole file is already on local disk (a prior run, or a lazy reader
         // that has since been fully filled). Mmap it, zero object-store GETs.
         if let Some(entry) = self

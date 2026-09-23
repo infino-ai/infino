@@ -113,10 +113,6 @@ pub(crate) const SUPERFILE_DATA_DIR: &str = "data";
 /// the file is atomically renamed to the bare name once complete.
 pub(crate) const CACHE_TMP_EXTENSION: &str = ".tmp";
 
-/// Infix before [`CACHE_TMP_EXTENSION`] on a background fill's tempfile, so a fill and a foreground
-/// fetch for the same superfile never write one file.
-pub(crate) const CACHE_FILL_TMP_INFIX: &str = ".fill";
-
 /// Characters a hyphenated uuid renders to (`8-4-4-4-12`). The fixed width
 /// is what makes the `<stem>-<uuid>` key grammar unambiguous whatever the
 /// stem contains: the uuid is always the last this many bytes of the body.
@@ -2870,19 +2866,12 @@ impl SuperfileUri {
         format!("seg-{}.sf.parquet", self.0)
     }
 
-    /// Disk-cache tempfile while a cold fetch is in flight.
-    pub fn cache_tmp_filename(self) -> String {
-        format!("{}{CACHE_TMP_EXTENSION}", self.cache_filename())
-    }
-
-    /// Disk-cache tempfile while a background fill downloads the file. Distinct from
-    /// [`Self::cache_tmp_filename`]: a fill and a foreground fetch for the same superfile can run
-    /// at once, and two writers on one tempfile leave holes in whichever copy lands last.
-    pub fn cache_fill_tmp_filename(self) -> String {
-        format!(
-            "{}{CACHE_FILL_TMP_INFIX}{CACHE_TMP_EXTENSION}",
-            self.cache_filename()
-        )
+    /// Disk-cache tempfile number `seq` while a download of this superfile is in flight. Unique per
+    /// writer: a foreground fetch, a background fill and a hybrid finalizer can all be writing the
+    /// same superfile at once (after an evict and reopen), and two writers on one tempfile leave
+    /// holes in whichever copy lands last.
+    pub fn cache_tmp_filename(self, seq: u64) -> String {
+        format!("{}.{seq}{CACHE_TMP_EXTENSION}", self.cache_filename())
     }
 
     /// Inverse of [`Self::cache_filename`]: recover the URI from an on-disk
@@ -2897,12 +2886,21 @@ impl SuperfileUri {
         Uuid::parse_str(body).ok().map(SuperfileUri)
     }
 
-    /// Inverse of [`Self::cache_tmp_filename`] and [`Self::cache_fill_tmp_filename`]: recover the
-    /// URI from an in-flight tempfile's name. A crash can leave one behind; the disk cache uses this
-    /// to recognize and delete it.
+    /// Inverse of [`Self::cache_tmp_filename`]: recover the URI from an in-flight tempfile's name.
+    /// A crash can leave one behind; the disk cache uses this to recognize and delete it. Also
+    /// accepts the unnumbered `seg-<uuid>.sf.parquet.tmp` older builds wrote, so their leftovers
+    /// are reclaimed too.
     pub fn from_cache_tmp_filename(name: &str) -> Option<Self> {
         let body = name.strip_suffix(CACHE_TMP_EXTENSION)?;
-        Self::from_cache_filename(body.strip_suffix(CACHE_FILL_TMP_INFIX).unwrap_or(body))
+        let body = match body.rsplit_once('.') {
+            Some((cache_name, seq))
+                if !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                cache_name
+            }
+            _ => body,
+        };
+        Self::from_cache_filename(body)
     }
 
     /// Inverse of [`Self::storage_path`] and of
@@ -5508,7 +5506,22 @@ mod tests {
         let id = uri.0;
         assert_eq!(uri.storage_path(), format!("data/seg-{id}.sf.parquet"));
         assert_eq!(uri.cache_filename(), format!("seg-{id}.sf.parquet"));
-        assert_eq!(uri.cache_tmp_filename(), format!("seg-{id}.sf.parquet.tmp"));
+        assert_eq!(
+            uri.cache_tmp_filename(7),
+            format!("seg-{id}.sf.parquet.7.tmp")
+        );
+        // Numbered tempfiles, and the unnumbered ones older builds left behind, both map back.
+        for name in [
+            uri.cache_tmp_filename(7),
+            format!("seg-{id}.sf.parquet.tmp"),
+        ] {
+            assert_eq!(SuperfileUri::from_cache_tmp_filename(&name), Some(uri));
+        }
+        // A non-numeric suffix is not one of ours.
+        assert_eq!(
+            SuperfileUri::from_cache_tmp_filename(&format!("seg-{id}.sf.parquet.x.tmp")),
+            None
+        );
     }
 
     #[test]

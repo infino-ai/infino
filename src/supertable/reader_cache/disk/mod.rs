@@ -250,6 +250,22 @@ impl CachedEntry {
             _ => None,
         }
     }
+
+    /// Every byte this entry keeps charged: its own `size_bytes`, plus the blocks a retained vector
+    /// source charges for itself.
+    #[cfg(test)]
+    fn charged_bytes(&self) -> u64 {
+        let own = self.size_bytes.load(Ordering::Acquire);
+        match &self.residency {
+            Residency::Mapped {
+                vector_source: Some(source),
+                ..
+            } if source.owns_accounting() => {
+                own + source.filled_bytes_handle().load(Ordering::Acquire)
+            }
+            _ => own,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +365,8 @@ pub struct DiskCacheStore {
     pinned_fn: std::sync::Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
     /// Global cap on concurrent background full-superfile fills.
     prefetch_semaphore: Arc<Semaphore>,
+    /// Numbers each download's tempfile, see [`Self::tmp_path`].
+    tmp_seq: AtomicU64,
 }
 
 impl fmt::Debug for DiskCacheStore {
@@ -418,6 +436,7 @@ impl DiskCacheStore {
             n_promotion_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
             prefetch_semaphore,
+            tmp_seq: AtomicU64::new(0),
         });
 
         // Record what is already on disk so the budget is correct from the start. Files are opened
@@ -591,16 +610,12 @@ impl DiskCacheStore {
         ))
     }
 
-    /// Build a per-URI tempfile path (sparse destination
-    /// during cold fetch; renamed to `cache_path` on success).
+    /// A fresh tempfile for one download of `uri`, renamed to `cache_path` once it is complete
+    /// (and, for a background fill, installed). Every call names a new file: a foreground fetch, a
+    /// background fill and a hybrid finalizer may all be writing the same superfile at once.
     pub(crate) fn tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
-        self.config.cache_root.join(uri.cache_tmp_filename())
-    }
-
-    /// Tempfile a background fill downloads into; renamed to `cache_path` on success. Not
-    /// [`Self::tmp_path`]: a foreground fetch for the same superfile may be writing that one.
-    pub(crate) fn fill_tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
-        self.config.cache_root.join(uri.cache_fill_tmp_filename())
+        let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
+        self.config.cache_root.join(uri.cache_tmp_filename(seq))
     }
 
     // Test and bench helpers. Compiled only for tests and the `test-helpers` feature, never into
