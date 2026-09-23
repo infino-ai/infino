@@ -1463,10 +1463,10 @@ mod tests {
             }
         }
     }
-    /// Like [`fresh_table`] with a reader pool of `threads`, which is also the
-    /// width of the bound-ordered open window.
-    fn fresh_table_with_threads(
-        threads: usize,
+    /// Like [`fresh_table`] with a ceiling-ordered open window of `window`
+    /// superfiles (1 = strictly sequential, so skipping is observable).
+    fn fresh_table_with_open_window(
+        window: usize,
     ) -> (
         TempDir,
         Arc<dyn StorageProvider>,
@@ -1485,17 +1485,11 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        let reader_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .expect("pool"),
-        );
         let options =
             SupertableOptions::new(title_schema(), vec![FtsConfig::new("title")], Vec::new())
                 .expect("options")
                 .with_writer_pool(writer_pool)
-                .with_reader_pool(reader_pool)
+                .with_bound_ordered_open_window(window)
                 .with_storage(Arc::clone(&storage));
         (dir, storage, Supertable::create(options).expect("create"))
     }
@@ -1551,7 +1545,7 @@ mod tests {
             superfile::fts::reader::Bm25Stats,
         };
 
-        let (_dir, _storage, st) = fresh_table_with_threads(1);
+        let (_dir, _storage, st) = fresh_table_with_open_window(1);
         // Segment 0 carries `alpha` three times per title — a clearly higher
         // ceiling than the single occurrence in segments 1 and 2.
         for segment in 0..3 {

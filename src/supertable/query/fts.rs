@@ -1023,7 +1023,7 @@ impl SupertableReader {
             // in the top k — not even a tie the stable `_id` order could
             // admit — so it is never opened.
             true => {
-                let window = manifest.options.reader_pool.current_num_threads().max(1);
+                let window = manifest.options.bound_ordered_open_window.max(1);
                 dispatch::fanout_local_hits_ordered(
                     self,
                     units,
