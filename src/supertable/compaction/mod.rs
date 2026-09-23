@@ -171,6 +171,20 @@ pub(crate) trait SuperfileMerge: Send + Sync {
         inputs: MergeInputs<'_>,
         output: &mut dyn Write,
     ) -> Result<BuiltSuperfileStats, BuildError>;
+
+    /// Whether the build carries every input row, tombstoned ones
+    /// included, instead of dropping them.
+    ///
+    /// The two answers need opposite handling at commit time, which is why
+    /// the build has to say which it is. A build that drops dead rows
+    /// renumbers the survivors, so the inputs' bitmaps describe nothing in
+    /// the output and the output needs no sidecar. A build that carries
+    /// the row set leaves every local doc id where it was, so those
+    /// bitmaps still describe the output exactly — and failing to carry
+    /// them onto it would bring the deleted rows back.
+    fn preserves_tombstones(&self) -> bool {
+        false
+    }
 }
 
 /// The opened inputs a [`SuperfileMerge`] builds from.
@@ -991,6 +1005,29 @@ impl Supertable {
             None => (Vec::new(), Vec::new(), None, None, Uuid::nil()),
         };
 
+        // Carry the inputs' tombstones onto the output, for a build that
+        // kept their rows.
+        //
+        // **Before the manifest swap, deliberately.** After it there is a
+        // window in which the output is live and carries no tombstones,
+        // and a read landing in that window returns deleted rows — the
+        // failure this whole path exists to avoid. Writing first can only
+        // leave an orphan sidecar for a superfile that never commits,
+        // which GC reclaims and no reader ever resolves.
+        let carried_sidecars: Vec<Uuid> = if merge.preserves_tombstones() {
+            match carry_tombstones_to_output(&wal_store, &inputs, &new_entries, sealed.as_slice())
+                .await
+            {
+                Ok(ids) => ids,
+                Err(e) => {
+                    unseal_all(&wal_store, sealed).await;
+                    return Err(e);
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
         for attempt in 0..max_retries {
             let current = inner.manifest.load_full();
 
@@ -1009,6 +1046,7 @@ impl Supertable {
                 &new_entries,
                 &entries_to_remove,
                 NewEntryBirthVersions::Preserve,
+                &carried_sidecars,
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
             )
@@ -1016,6 +1054,15 @@ impl Supertable {
             {
                 Ok(new_manifest) => {
                     inner.manifest.store(Arc::new(new_manifest));
+                    // Advance the sidecar cache's freshness authority to the
+                    // manifest just published, as every other commit path
+                    // does. Until this runs the cache still holds the
+                    // predecessor's seq map, in which the superfile this
+                    // commit created does not appear — and an absent seq
+                    // means "no tombstones" to the cache, so a rewrite that
+                    // carried a sidecar would have it ignored and serve the
+                    // deleted rows it just took care to keep deleted.
+                    inner.reconcile_tombstone_seqs();
                     // Warm the merged superfile into the in-memory reader
                     // cache, same as a normal writer commit does. Without
                     // this every query against it misses and re-fetches +
@@ -1084,6 +1131,81 @@ impl Supertable {
             "commit retries exhausted".to_string(),
         ))
     }
+}
+
+/// Write the input's tombstone bitmap onto the superfile that replaces it.
+///
+/// Only sound because the bits mean the same thing on both sides: a
+/// tombstone names a *local* doc id, and a build that carried every row
+/// left those ids where they were, so the bitmap transfers unchanged. That
+/// is exactly what is checked below rather than assumed — if the output
+/// holds a different number of documents then rows moved, the bitmap would
+/// mark the wrong ones, and marking the wrong rows dead is worse than
+/// failing the job.
+///
+/// Restricted to one input and one output for the same reason. Several
+/// inputs concatenate, so their bitmaps would each need shifting by the
+/// rows ahead of them — arithmetic with nothing that needs it today, since
+/// every job that carries tombstones is a one-in-one-out migration.
+///
+/// An input with no tombstones writes no sidecar: absent *is* the empty
+/// state, and creating one would leave an object for GC to collect and
+/// every reader to fetch for nothing.
+async fn carry_tombstones_to_output(
+    wal_store: &WalStore,
+    inputs: &[Arc<SuperfileEntry>],
+    new_entries: &[Arc<SuperfileEntry>],
+    sealed: &[SealedInput],
+) -> Result<Vec<Uuid>, CompactionError> {
+    let ([input], [output]) = (inputs, new_entries) else {
+        // A build that carried the rows produced no output only if there
+        // were no rows; anything else is a shape this cannot reason about.
+        return match new_entries.is_empty() {
+            true => Ok(Vec::new()),
+            false => Err(CompactionError::Build(format!(
+                "a tombstone-preserving build must be one-in-one-out, got {} input(s) \
+                 and {} output(s)",
+                inputs.len(),
+                new_entries.len()
+            ))),
+        };
+    };
+
+    let Some(bitmap) = sealed
+        .iter()
+        .find(|s| s.superfile_id == input.superfile_id)
+        .map(|s| &s.bitmap)
+        .filter(|b| !b.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+
+    if output.n_docs != input.n_docs {
+        return Err(CompactionError::Build(format!(
+            "a tombstone-preserving build changed the document count of {} \
+             ({} in, {} out), so its local doc ids moved and its tombstones \
+             no longer describe it",
+            input.superfile_id, input.n_docs, output.n_docs
+        )));
+    }
+
+    let sidecar = TombstonesSidecar {
+        // The output is a live superfile a writer may immediately tombstone
+        // into, not a frozen merge input. Carrying the input's seal would
+        // lock it against the mutation path from birth.
+        seal: None,
+        bitmap: bitmap.clone(),
+    };
+    wal_store
+        .put_tombstones(output.superfile_id, None, &sidecar)
+        .await
+        .map_err(|e| {
+            CompactionError::Build(format!(
+                "carrying tombstones onto {}: {e}",
+                output.superfile_id
+            ))
+        })?;
+    Ok(vec![output.superfile_id])
 }
 
 /// One superfile this attempt sealed: enough to unseal it later with

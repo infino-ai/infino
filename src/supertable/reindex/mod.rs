@@ -35,7 +35,7 @@ use crate::{
     },
     supertable::{
         Supertable,
-        compaction::{CompactionJob, CompactionMerge, JobOutcome, SuperfileMerge},
+        compaction::{CompactionJob, JobOutcome, SuperfileMerge},
         error::{CompactionError, ReindexError},
         query::dispatch::open_compaction_input,
     },
@@ -502,13 +502,14 @@ impl Supertable {
             });
         }
 
-        // The build this run drives. `Rewrite` wants exactly what a
-        // compaction produces — postings carried, layout current — so it
-        // reuses that build rather than restating it. `Reanalyze` is the
-        // one this tool owns.
+        // The build this run drives. `Rewrite` wants what a compaction
+        // produces — postings carried, layout current — with its deletions
+        // turned off, because a migration reshapes nothing. `Reanalyze` is
+        // the one this tool owns. Both carry the row set.
+        let rewrite = build::RewriteMerge;
         let reanalyze = build::ReanalyzeMerge;
         let merge: &dyn SuperfileMerge = match opts.mode {
-            ReindexMode::Rewrite => &CompactionMerge,
+            ReindexMode::Rewrite => &rewrite,
             ReindexMode::Reanalyze => &reanalyze,
         };
         for (done, job) in plan_jobs(&all, opts.mode).into_iter().enumerate() {

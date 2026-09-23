@@ -51,7 +51,10 @@ use std::{
 
 use arrow_array::{Array, Decimal128Array, Float32Array, LargeStringArray};
 use datafusion::prelude::{Expr, col, lit};
-use infino::{Connection, ReindexOptions, Supertable, superfile::format::footer::read_kv_metadata};
+use infino::{
+    Connection, ReindexOptions, Supertable, superfile::format::footer::read_kv_metadata,
+    supertable::wal::tombstones_codec::decode_sidecar,
+};
 
 use super::corpus_shapes::{TABLE, connect_corpus, corpus_dir, open_corpus, superfile_paths};
 
@@ -79,6 +82,9 @@ const VEC_LAYOUT_KEY: &str = "inf.vec.layout";
 /// The [`VEC_LAYOUT_KEY`] value for cell-directory subsections — the
 /// layout a rewrite has the most work to carry across untouched.
 const VEC_LAYOUT_MULTI_CELL: &str = "multi_cell_ivf";
+/// Footer key holding a superfile's document count, tombstoned rows
+/// included.
+const N_DOCS_KEY: &str = "inf.n_docs";
 
 /// The regions a rewrite is allowed to change. Everything else is cargo
 /// and is held to byte equality.
@@ -629,5 +635,149 @@ fn a_rewrite_keeps_deleted_rows_deleted() {
     assert_eq!(
         vector_after, vector_before,
         "a rewrite moved the vector results of a table with deletions"
+    );
+}
+
+/// The rewrite carries the tombstones rather than dropping the rows.
+///
+/// [`a_rewrite_keeps_deleted_rows_deleted`] proves the *outcome*; this
+/// proves the *mechanism*, and the two fail in different places. A build
+/// that quietly went back to dropping dead rows would still keep them
+/// unreadable and pass that test — while renumbering every surviving row,
+/// which is what makes the vector subsection a byte copy instead of a
+/// remapping. So: the row count is unchanged, and a sidecar exists under
+/// the new superfile id carrying exactly the bits the old one had.
+#[test]
+fn a_rewrite_carries_the_tombstone_sidecar_to_the_new_superfile() {
+    let Some((_tmp, db, root)) = connect_corpus(SHAPE) else {
+        return;
+    };
+    let table = db.open_table(TABLE).expect("open corpus table");
+
+    let victims: Vec<String> = rows_by_id(&db)
+        .into_iter()
+        .take(DELETED_DOCS)
+        .map(|(_id, _body, title, _notes)| title)
+        .collect();
+    let predicate = victims
+        .iter()
+        .map(|title| col("title").eq(lit(title.clone())))
+        .reduce(Expr::or)
+        .expect("at least one row to delete");
+    table.delete(predicate).expect("delete rows");
+
+    let docs_before = total_docs(&root);
+    let sidecars_before = tombstone_bit_counts(&root);
+    let bits_before: u64 = sidecars_before.iter().sum();
+    assert_eq!(
+        bits_before, DELETED_DOCS as u64,
+        "the delete did not land the bits this test is about: {sidecars_before:?}"
+    );
+
+    rewrite(&table);
+
+    assert_eq!(
+        total_docs(&root),
+        docs_before,
+        "a rewrite dropped rows, so the surviving rows renumbered — the \
+         tombstones carried onto the output no longer name the same rows"
+    );
+    let sidecars_after = tombstone_bit_counts(&root);
+    assert_eq!(
+        sidecars_after.iter().sum::<u64>(),
+        bits_before,
+        "the rewrite did not carry the same number of tombstone bits: \
+         {sidecars_before:?} -> {sidecars_after:?}"
+    );
+}
+
+/// Documents every superfile under `root` holds, tombstoned included.
+fn total_docs(root: &Path) -> u64 {
+    superfile_paths(root)
+        .iter()
+        .map(|path| {
+            let bytes = fs::read(path).expect("read superfile");
+            read_kv_metadata(&bytes)
+                .expect("read superfile key-value metadata")
+                .get(N_DOCS_KEY)
+                .expect("every superfile records its document count")
+                .parse::<u64>()
+                .expect("document count is a number")
+        })
+        .sum()
+}
+
+/// Set bits in each tombstone sidecar under `root`, in path order.
+///
+/// Read off storage rather than through the cache: the point is what was
+/// durably written for the superfile that now exists, not what a reader
+/// happens to have resolved.
+fn tombstone_bit_counts(root: &Path) -> Vec<u64> {
+    let mut counts = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut paths = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read table dir") {
+            let path = entry.expect("dir entry").path();
+            match path.is_dir() {
+                true => stack.push(path),
+                false if path.extension().is_some_and(|e| e == "tombstones") => paths.push(path),
+                false => {}
+            }
+        }
+    }
+    paths.sort();
+    for path in paths {
+        let bytes = fs::read(&path).expect("read sidecar");
+        let sidecar = decode_sidecar(&bytes).expect("decode sidecar");
+        if !sidecar.bitmap.is_empty() {
+            counts.push(sidecar.bitmap.len());
+        }
+    }
+    counts
+}
+
+/// A migration still terminates on a table with deletions.
+///
+/// Carrying the row set changes what a rewrite produces, and what a
+/// rewrite produces is exactly what the planner selects on — so this is
+/// the property most at risk from the change and least visible when it
+/// breaks. A run that left its output as stale as its input would rewrite
+/// the same files on every pass, forever, reporting success each time.
+#[test]
+fn a_second_run_over_a_table_with_deletions_has_nothing_to_do() {
+    let Some((_tmp, db, _root)) = connect_corpus(SHAPE) else {
+        return;
+    };
+    let table = db.open_table(TABLE).expect("open corpus table");
+
+    let victims: Vec<String> = rows_by_id(&db)
+        .into_iter()
+        .take(DELETED_DOCS)
+        .map(|(_id, _body, title, _notes)| title)
+        .collect();
+    let predicate = victims
+        .iter()
+        .map(|title| col("title").eq(lit(title.clone())))
+        .reduce(Expr::or)
+        .expect("at least one row to delete");
+    table.delete(predicate).expect("delete rows");
+
+    rewrite(&table);
+
+    let after = table.index_staleness().expect("assess the rewritten table");
+    assert_eq!(
+        after.needing_rewrite, 0,
+        "a rewritten table still reports containers to rewrite, so the \
+         migration would repeat this work on every run: {after:?}"
+    );
+
+    let second = table
+        .reindex(&ReindexOptions::default())
+        .expect("a second run is allowed");
+    assert_eq!(
+        second.rewritten, 0,
+        "a second run rewrote superfiles the first had already brought \
+         current: {second:?}"
     );
 }
