@@ -67,10 +67,12 @@ pub(crate) const STORAGE_PREFIX: &str = "term-index/";
 /// Objects at or above this size go through the multipart upload path.
 const MULTIPART_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Slices kept decoded in memory per loaded index. Beyond this the map is
-/// cleared and slices come back from the manifest disk cache, which is the
-/// tier meant to hold them; this is only the hot set of one query burst.
-const MAX_RESIDENT_SLICES: usize = 16;
+/// Bytes of fetched slices kept resident per loaded index, least recently
+/// used first out. Sized so a query burst over a large table's whole
+/// vocabulary stays resident: at ~8 MiB a slice this holds ~64 slices, and a
+/// slice is re-read from the manifest disk cache (a local read, no hash)
+/// only after it has fallen out.
+const RESIDENT_SLICE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Errors from building, storing or reading the term index.
 #[derive(Debug, Error)]
@@ -196,9 +198,11 @@ async fn fetch_verified(
     uri: &str,
     hash: &ContentHash,
 ) -> Result<Bytes, TermIndexError> {
+    // The disk cache is keyed by content hash and verifies on insert, so a
+    // hit needs no second hash; re-hashing a multi-megabyte slice on every
+    // read was a per-query cost on the order of milliseconds.
     if let Some(cache) = disk_cache
         && let Some(cached) = cache.get(hash).await
-        && ContentHash::of(&cached) == *hash
     {
         return Ok(Bytes::from(cached));
     }
@@ -241,7 +245,44 @@ pub(crate) struct TermIndex {
     indexed: HashSet<Uuid>,
     storage: Arc<dyn StorageProvider>,
     disk_cache: Option<Arc<ManifestDiskCache>>,
-    slices: tokio::sync::Mutex<HashMap<ContentHash, Bytes>>,
+    slices: tokio::sync::Mutex<ResidentSlices>,
+}
+
+/// The resident slice set: insertion-ordered so eviction is least recently
+/// used, bounded by bytes.
+#[derive(Default)]
+struct ResidentSlices {
+    order: std::collections::VecDeque<ContentHash>,
+    bytes: HashMap<ContentHash, Bytes>,
+    total: usize,
+}
+
+impl ResidentSlices {
+    fn get(&mut self, hash: &ContentHash) -> Option<Bytes> {
+        let b = self.bytes.get(hash)?.clone();
+        // Move to the back: most recently used.
+        if let Some(i) = self.order.iter().position(|h| h == hash) {
+            self.order.remove(i);
+            self.order.push_back(*hash);
+        }
+        Some(b)
+    }
+
+    fn insert(&mut self, hash: ContentHash, b: Bytes) {
+        if self.bytes.contains_key(&hash) {
+            return;
+        }
+        while self.total + b.len() > RESIDENT_SLICE_BUDGET_BYTES && !self.order.is_empty() {
+            if let Some(old) = self.order.pop_front()
+                && let Some(gone) = self.bytes.remove(&old)
+            {
+                self.total -= gone.len();
+            }
+        }
+        self.total += b.len();
+        self.order.push_back(hash);
+        self.bytes.insert(hash, b);
+    }
 }
 
 #[cfg_attr(
@@ -263,7 +304,7 @@ impl TermIndex {
             indexed,
             storage,
             disk_cache,
-            slices: tokio::sync::Mutex::new(HashMap::new()),
+            slices: tokio::sync::Mutex::new(ResidentSlices::default()),
         }
     }
 
@@ -492,7 +533,7 @@ impl TermIndex {
 
     async fn slice_bytes(&self, hash: &ContentHash) -> Result<Bytes, TermIndexError> {
         if let Some(b) = self.slices.lock().await.get(hash) {
-            return Ok(b.clone());
+            return Ok(b);
         }
         let bytes = fetch_verified(
             self.storage.as_ref(),
@@ -501,11 +542,7 @@ impl TermIndex {
             hash,
         )
         .await?;
-        let mut resident = self.slices.lock().await;
-        if resident.len() >= MAX_RESIDENT_SLICES {
-            resident.clear();
-        }
-        resident.insert(*hash, bytes.clone());
+        self.slices.lock().await.insert(*hash, bytes.clone());
         Ok(bytes)
     }
 
@@ -1939,5 +1976,28 @@ mod tests {
                 "{q}: every old hit survives the append"
             );
         }
+    }
+    /// The resident slice set evicts least recently used by bytes, and a
+    /// read refreshes recency — so a query burst that cycles through more
+    /// slices than fit keeps the ones it keeps touching.
+    #[test]
+    fn resident_slices_evict_least_recently_used_by_bytes() {
+        let mut r = ResidentSlices::default();
+        // Two of these fit the budget; three do not.
+        let big = RESIDENT_SLICE_BUDGET_BYTES / 3 + 1;
+        let h = |n: u8| ContentHash([n; 32]);
+        r.insert(h(1), Bytes::from(vec![0u8; big]));
+        r.insert(h(2), Bytes::from(vec![0u8; big]));
+        assert!(r.get(&h(1)).is_some(), "touch 1: it is now most recent");
+        r.insert(h(3), Bytes::from(vec![0u8; big]));
+        assert!(
+            r.get(&h(2)).is_none(),
+            "2 was least recently used and went first"
+        );
+        assert!(r.get(&h(1)).is_some(), "1 was refreshed and survives");
+        assert!(r.get(&h(3)).is_some());
+        assert!(r.total <= RESIDENT_SLICE_BUDGET_BYTES);
+        r.insert(h(3), Bytes::from(vec![0u8; big]));
+        assert_eq!(r.total, 2 * big, "re-inserting a resident slice is a no-op");
     }
 }
