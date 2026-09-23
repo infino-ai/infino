@@ -53,8 +53,10 @@ use uuid::Uuid;
 
 use crate::{
     storage::{StorageError, StorageProvider},
-    superfile::fts::reader::BoolMode,
-    supertable::manifest::{RoutingRef, disk_cache::ManifestDiskCache, part::ContentHash},
+    superfile::fts::{bm25::idf as bm25_idf, reader::BoolMode},
+    supertable::manifest::{
+        RoutingRef, SuperfileEntry, disk_cache::ManifestDiskCache, part::ContentHash,
+    },
     utils::terms::make_key,
 };
 
@@ -319,6 +321,110 @@ impl TermIndex {
             });
         }
         Ok(out.unwrap_or_default())
+    }
+
+    /// Per-superfile score ceilings for a query: for each entry, the sum
+    /// over `terms` of the term's bound in that superfile, rescaled from
+    /// the superfile's own idf to the idf the query scores with, plus for
+    /// each phrase the cursor's own phrase ceiling — the members' idf sum
+    /// times the smallest member bound in idf-scaled form — so a phrase is
+    /// bounded by its rarest member. A superfile lacking a term contributes
+    /// nothing for it; one the root does not list gets `+∞`, so it is
+    /// opened first and unconditionally. `idf_used(term, local_idf)` is the
+    /// idf the query scores `term` with given the superfile's own.
+    pub(crate) async fn query_ceilings(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Vec<&str>],
+        entries: &[Arc<SuperfileEntry>],
+        idf_used: &(dyn Fn(&str, f32) -> f32 + Sync),
+    ) -> Result<HashMap<Uuid, f32>, TermIndexError> {
+        let scored_docs: HashMap<Uuid, u64> = entries
+            .iter()
+            .map(|e| {
+                let n = e
+                    .fts_summary
+                    .get(column)
+                    .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
+                    .unwrap_or(e.n_docs);
+                (e.superfile_id, n)
+            })
+            .collect();
+        // Per term: superfile → (bound rescaled to the query's idf, bound / local idf).
+        let mut per_term: HashMap<&str, HashMap<Uuid, (f32, f32)>> = HashMap::new();
+        let mut all_terms: Vec<&str> = terms.to_vec();
+        all_terms.extend(phrases.iter().flatten().copied());
+        all_terms.sort_unstable();
+        all_terms.dedup();
+        for term in all_terms {
+            let mut by_sf = HashMap::new();
+            for p in self.postings(column, term).await? {
+                let Some(id) = self.superfile_id(p.superfile) else {
+                    continue;
+                };
+                let Some(&n) = scored_docs.get(&id) else {
+                    continue;
+                };
+                let local_idf = bm25_idf(n, p.df.min(n));
+                let ratio = if local_idf > 0.0 {
+                    idf_used(term, local_idf) / local_idf
+                } else {
+                    1.0
+                };
+                let scaled = if local_idf > 0.0 {
+                    p.bound / local_idf
+                } else {
+                    p.bound
+                };
+                by_sf.insert(id, (p.bound * ratio, scaled));
+            }
+            per_term.insert(term, by_sf);
+        }
+        let mut out: HashMap<Uuid, f32> = HashMap::with_capacity(entries.len());
+        for e in entries {
+            let id = e.superfile_id;
+            if !self.is_indexed(&id) {
+                out.insert(id, f32::INFINITY);
+                continue;
+            }
+            let mut ceiling = 0.0f32;
+            for term in terms {
+                if let Some((rescaled, _)) = per_term.get(term).and_then(|m| m.get(&id)) {
+                    ceiling += rescaled;
+                }
+            }
+            for phrase in phrases {
+                let mut idf_sum = 0.0f32;
+                let mut min_scaled = f32::INFINITY;
+                let mut complete = true;
+                for member in phrase {
+                    match per_term.get(member).and_then(|m| m.get(&id)) {
+                        Some((rescaled, scaled)) => {
+                            // rescaled = bound × (idf_used / local_idf); recover idf_used
+                            // from the pair without a second idf call.
+                            let local_scaled = *scaled;
+                            let idf = if local_scaled > 0.0 {
+                                rescaled / local_scaled
+                            } else {
+                                0.0
+                            };
+                            idf_sum += idf;
+                            min_scaled = min_scaled.min(local_scaled);
+                        }
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if complete && min_scaled.is_finite() {
+                    ceiling += idf_sum * min_scaled;
+                }
+            }
+            out.insert(id, ceiling);
+        }
+        Ok(out)
     }
 
     /// The superfiles holding any term with `prefix` in `column`.
@@ -1277,5 +1383,145 @@ mod tests {
                 );
             }
         }
+    }
+    /// Like [`fresh_table`] with a reader pool of `threads`, which is also the
+    /// width of the bound-ordered open window.
+    fn fresh_table_with_threads(
+        threads: usize,
+    ) -> (
+        TempDir,
+        Arc<dyn StorageProvider>,
+        crate::supertable::Supertable,
+    ) {
+        use crate::{
+            superfile::builder::FtsConfig,
+            supertable::{Supertable, SupertableOptions},
+        };
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let writer_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let reader_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool"),
+        );
+        let options =
+            SupertableOptions::new(title_schema(), vec![FtsConfig::new("title")], Vec::new())
+                .expect("options")
+                .with_writer_pool(writer_pool)
+                .with_reader_pool(reader_pool)
+                .with_storage(Arc::clone(&storage));
+        (dir, storage, Supertable::create(options).expect("create"))
+    }
+
+    fn commit_titles(st: &crate::supertable::Supertable, titles: &[String]) {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        let arr: ArrayRef = Arc::new(LargeStringArray::from(
+            titles.iter().map(String::as_str).collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(title_schema(), vec![arr]).expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+
+    /// `(_id, score)` per hit, in result order.
+    fn hits_of(batches: &[arrow_array::RecordBatch]) -> Vec<(i128, f32)> {
+        use arrow_array::{Array, Decimal128Array, Float32Array, Int64Array};
+        let mut out = Vec::new();
+        for b in batches {
+            let scores = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("score");
+            let ids = b.column(0);
+            for i in 0..b.num_rows() {
+                let id: i128 = if let Some(a) = ids.as_any().downcast_ref::<Decimal128Array>() {
+                    a.value(i)
+                } else {
+                    ids.as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("_id")
+                        .value(i) as i128
+                };
+                out.push((id, scores.value(i)));
+            }
+        }
+        out
+    }
+
+    /// With superfiles opened in ceiling order and a strictly sequential
+    /// window, a top-k query opens only the superfiles that can still place
+    /// a document: the first open sets the floor, and a superfile whose
+    /// ceiling is below it is never opened. Results are identical to the
+    /// full walk (the same query with k large enough that nothing is
+    /// skipped), and opening every superfile is what a large k still does.
+    #[test]
+    fn bound_ordered_opening_skips_superfiles_that_cannot_compete() {
+        use crate::{
+            Bm25SearchOptions,
+            runtime_metrics::op_stats::{self, with_op_stats},
+            superfile::fts::reader::Bm25Stats,
+        };
+
+        let (_dir, _storage, st) = fresh_table_with_threads(1);
+        // Segment 0 carries `alpha` three times per title — a clearly higher
+        // ceiling than the single occurrence in segments 1 and 2.
+        for segment in 0..3 {
+            let word = if segment == 0 {
+                "alpha alpha alpha"
+            } else {
+                "alpha"
+            };
+            let titles: Vec<String> = (0..DOCS_PER_SEGMENT)
+                .map(|i| format!("{word} shared s{segment}d{i:02}"))
+                .collect();
+            commit_titles(&st, &titles);
+        }
+        let run = |k: usize| -> (Vec<(i128, f32)>, u64) {
+            with_op_stats(|| {
+                let reader = st.reader().expect("reader");
+                let batches = reader
+                    .bm25_search(
+                        "title",
+                        "alpha",
+                        k,
+                        Bm25SearchOptions::new().with_stats(Bm25Stats::PerSuperfile),
+                        Some(&["_id", "score"]),
+                    )
+                    .expect("search");
+                let opened = op_stats::current().expect("metered").superfiles_opened();
+                (hits_of(&batches), opened)
+            })
+            .0
+        };
+        let (all, opened_all) = run(3 * DOCS_PER_SEGMENT);
+        assert_eq!(
+            opened_all, 3,
+            "a k that needs every document opens every superfile"
+        );
+        assert_eq!(all.len(), 3 * DOCS_PER_SEGMENT);
+
+        let (top1, opened_1) = run(1);
+        assert_eq!(top1, all[..1].to_vec(), "identical to the full walk");
+        assert_eq!(
+            opened_1, 1,
+            "the highest-ceiling superfile alone decides the top 1"
+        );
+
+        let (top5, opened_5) = run(5);
+        assert_eq!(top5, all[..5].to_vec());
+        assert_eq!(
+            opened_5, 1,
+            "five hits all sit in the tf-3 superfile; the others' ceilings stay below the floor"
+        );
     }
 }

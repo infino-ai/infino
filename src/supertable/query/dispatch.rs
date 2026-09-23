@@ -42,7 +42,10 @@
 use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
 
 use arrow_array::Decimal128Array;
-use futures::future::try_join_all;
+use futures::{
+    future::try_join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 use roaring::RoaringBitmap;
 use tracing::{Instrument, trace};
 use uuid::Uuid;
@@ -489,6 +492,138 @@ async fn stable_ids_for_tagged_hits(
 /// stamping until after global top-k selection. Vector MultiCell hits use
 /// [`fanout`] instead because their local ids include cell-ordering and
 /// boundary stubs.
+/// Record one superfile open on the operation's stats, when metered.
+fn note_superfile_opened(op_stats: Option<&Arc<OpStatsCollector>>) {
+    if let Some(stats) = op_stats {
+        stats.add_superfiles_opened(1);
+    }
+}
+
+/// [`fanout_with`] for units the caller has ordered by how much they can
+/// still contribute: at most `window` units are in flight, units start in
+/// the given order, and `skip_before_open` is asked about each unit just
+/// before its superfile would be opened — so a unit that can no longer
+/// change the outcome (its score ceiling is below the running k-th score)
+/// is never opened at all. Results come back in completion order, which
+/// the callers here merge order-independently.
+///
+/// The window is the trade the plan names: strictly sequential opens
+/// maximise skips but serialise I/O; a window of the reader pool's width
+/// keeps the CPU busy while the first results raise the floor for the rest.
+pub(crate) async fn fanout_with_ordered<P, R, B, Fut, S>(
+    reader: &SupertableReader,
+    units: Vec<(Arc<SuperfileEntry>, P)>,
+    window: usize,
+    skip_before_open: S,
+    body: B,
+) -> Result<Vec<R>, QueryError>
+where
+    P: Send + 'static,
+    R: Send + 'static,
+    S: Fn(&P) -> bool,
+    B: Fn(Arc<SuperfileReader>, Arc<SuperfileEntry>, Option<Arc<SidecarCache>>, Instant, P) -> Fut
+        + Clone
+        + Send
+        + 'static,
+    Fut: Future<Output = Result<R, QueryError>> + Send + 'static,
+{
+    if units.is_empty() {
+        return Ok(Vec::new());
+    }
+    trace!(
+        units = units.len(),
+        window, "fanning query out across superfiles in ceiling order"
+    );
+    let manifest = reader.manifest();
+    let store = Arc::clone(&manifest.options.store);
+    let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
+    let storage = manifest.options.storage.as_ref().map(Arc::clone);
+    let vector_columns = Arc::new(manifest.options.vector_columns.clone());
+    let tombstone_cache = reader.tombstone_cache.clone();
+    let op_stats = reader.op_stats.clone();
+    let now = Instant::now();
+    if let Some(cache) = tombstone_cache.as_ref() {
+        let mut ids: Vec<Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        cache.prefetch(&ids, now).await;
+    }
+    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+    let mut out = Vec::with_capacity(units.len());
+    let mut pending = units.into_iter();
+    let window = window.max(1);
+    loop {
+        while in_flight.len() < window {
+            let Some((entry, params)) = pending.next() else {
+                break;
+            };
+            if skip_before_open(&params) {
+                continue;
+            }
+            let store = Arc::clone(&store);
+            let disk_cache = disk_cache.clone();
+            let storage = storage.clone();
+            let tombstone_cache = tombstone_cache.clone();
+            let body = body.clone();
+            let vector_columns = Arc::clone(&vector_columns);
+            let op_stats = op_stats.clone();
+            let handle = tokio::spawn(
+                async move {
+                    let r =
+                        open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry, true)
+                            .await?;
+                    verify_superfile_vector_codecs(&r, &vector_columns)?;
+                    note_superfile_opened(op_stats.as_ref());
+                    body(r, entry, tombstone_cache, now, params).await
+                }
+                .in_current_span(),
+            );
+            in_flight.push(async move {
+                handle
+                    .await
+                    .map_err(|e| QueryError::Store(format!("fan-out task join: {e}")))?
+            });
+        }
+        match in_flight.next().await {
+            Some(result) => out.push(result?),
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// [`fanout_local_hits`] in ceiling order — see [`fanout_with_ordered`].
+pub(crate) async fn fanout_local_hits_ordered<P, K, Fut, S>(
+    reader: &SupertableReader,
+    units: Vec<(Arc<SuperfileEntry>, P)>,
+    window: usize,
+    skip_before_open: S,
+    kernel: K,
+) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
+where
+    P: Send + 'static,
+    S: Fn(&P) -> bool,
+    K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
+{
+    fanout_with_ordered(
+        reader,
+        units,
+        window,
+        skip_before_open,
+        move |r, entry, tombstone_cache, now, params| {
+            let kernel = kernel.clone();
+            async move {
+                let hits = kernel(r, params).await?;
+                let mut tagged = tag_hits(&entry, hits);
+                apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
+                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+            }
+        },
+    )
+    .await
+}
+
 pub(crate) async fn fanout_local_hits<P, K, Fut>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
@@ -592,10 +727,12 @@ where
         )
         .await?;
         verify_superfile_vector_codecs(&r, &vector_columns)?;
+        note_superfile_opened(reader.op_stats.as_ref());
         let out = body(r, entry, tombstone_cache, now, params).await?;
         return Ok(vec![out]);
     }
 
+    let op_stats = reader.op_stats.clone();
     let handles = units.into_iter().map(|(entry, params)| {
         let store = Arc::clone(&store);
         let disk_cache = disk_cache.clone();
@@ -603,6 +740,7 @@ where
         let tombstone_cache = tombstone_cache.clone();
         let body = body.clone();
         let vector_columns = Arc::clone(&vector_columns);
+        let op_stats = op_stats.clone();
         let handle = tokio::spawn(
             async move {
                 let r = open_reader(
@@ -614,6 +752,7 @@ where
                 )
                 .await?;
                 verify_superfile_vector_codecs(&r, &vector_columns)?;
+                note_superfile_opened(op_stats.as_ref());
                 body(r, entry, tombstone_cache, now, params).await
             }
             .in_current_span(),
