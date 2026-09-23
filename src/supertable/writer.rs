@@ -10464,7 +10464,14 @@ pub(crate) async fn try_commit_attempt(
         }
     }
 
-    // 2c. The term index: this commit's superfiles publish their postings
+    // 3. Read the prior pointer's etag for the CAS. Every storage-backed
+    //    table has a pointer by now — `create` publishes one before any
+    //    writer runs — so an absent pointer is not an initial commit but a
+    //    table dropped and purged under this handle, and the read refuses
+    //    rather than republishing one from stale state.
+    let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&current_manifest)).await?;
+
+    // 3b. The term index: this commit's superfiles publish their postings
     //     in the SAME CAS as their entries — a delta segment appended to
     //     the root the current manifest references (which `update` carried
     //     forward), then the new root's reference on this successor. So a
@@ -10472,13 +10479,22 @@ pub(crate) async fn try_commit_attempt(
     //     writes and the CAS leaves only orphans for GC. On a lost CAS the
     //     retry rebuilds against the winner's root; the slices are
     //     content-addressed, so their re-PUTs are no-ops.
+    //
+    //     Runs after the pointer fence above so a purged table refuses the
+    //     commit before any artifact is written. A prior root that cannot
+    //     be loaded is not fatal to the commit — membership is the commit's
+    //     job, routing is derived — so the index restarts from this commit's
+    //     superfiles alone and is marked incomplete; a maintenance rebuild
+    //     makes it whole.
     if !term_contributions.is_empty() {
         let prior = match current_manifest.term_index_ref() {
-            Some(reference) => Some(
-                term_index::load_root(storage.as_ref(), reference)
-                    .await
-                    .map_err(|e| BuildError::Store(e.to_string()))?,
-            ),
+            Some(reference) => match term_index::load_root(storage.as_ref(), reference).await {
+                Ok(root) => Some(root),
+                Err(e) => {
+                    warn!(error = %e, uri = %reference.uri, "prior term-index root unreadable; restarting the index from this commit");
+                    None
+                }
+            },
             None => None,
         };
         // Complete when every live superfile is listed: a delta on top of a
@@ -10499,12 +10515,6 @@ pub(crate) async fn try_commit_attempt(
         .map_err(|e| BuildError::Store(e.to_string()))?;
         new_manifest = new_manifest.with_term_index_ref(reference, complete);
     }
-    // 3. Read the prior pointer's etag for the CAS. Every storage-backed
-    //    table has a pointer by now — `create` publishes one before any
-    //    writer runs — so an absent pointer is not an initial commit but a
-    //    table dropped and purged under this handle, and the read refuses
-    //    rather than republishing one from stale state.
-    let prev_etag = get_current_manifest_etag(&storage, current_manifest).await?;
 
     // 4. Parallel-issue (touched parts) + list PUTs, then
     //    conditional pointer PUT (the visibility barrier).
