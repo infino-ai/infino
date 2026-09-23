@@ -40,16 +40,36 @@ use std::{cmp::Ordering, collections::BTreeMap, io::Write, mem::take, ops::Range
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 
-use crate::superfile::{
-    format::{FST_SEPARATOR, fts::DictLayout, u32_le_at, u64_le_at},
-    fts::fst_value::{FstValue, PFOR_LENGTH_UNKNOWN},
+use crate::utils::{
+    bytes::{u32_le_at, u64_le_at},
     varint::{push_u64_varint, push_varint, read_u64_varint, read_varint},
 };
+
+pub(crate) mod value;
+pub(crate) use value::{FstValue, INLINE_TF_MAX, PFOR_LENGTH_UNKNOWN};
+
+/// Reserved separator byte inside dictionary keys (`<column>\x1F<term>`).
+/// User column names must not contain this byte. ASCII Unit Separator
+/// (U+001F) is below every printable ASCII char, so prefix iteration over a
+/// column's terms works via a plain range scan.
+pub const FST_SEPARATOR: u8 = 0x1F;
+
+/// How a term dictionary lays its terms out — by blob version for a
+/// superfile, by choice for any other caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DictLayout {
+    /// One FST keyed `column <SEP> term`, values packed as [`value`]
+    /// describes. Superfile blobs `V1`–`V6`.
+    Fst,
+    /// Front-coded term blocks behind a fixed-width first-key table (the
+    /// block layout in this module). Superfile blobs `V7`+.
+    Blocks,
+}
 
 /// Build a canonical FST key from `(column_name, term)`.
 ///
 /// Encoding: `<column_name_utf8> | 0x1F | <term_utf8>`. The separator
-/// byte (`FST_SEPARATOR`, ASCII Unit Separator) is below every printable
+/// byte ([`FST_SEPARATOR`], ASCII Unit Separator) is below every printable
 /// ASCII byte, so prefix iteration `column_name\x1F` cleanly captures
 /// every term in that column.
 ///
@@ -102,11 +122,13 @@ impl DictBuilder {
     }
 
     /// Number of distinct keys staged so far.
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         self.sorted_buffer.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.sorted_buffer.is_empty()
     }
 

@@ -35,12 +35,11 @@ use crate::{
         format,
         fts::{
             bm25,
-            dict::make_key,
-            fst_value::FstValue,
             posting::{BLOCK_LEN, BlockHeader, decode_block},
             short::{decode_short, short_df},
         },
     },
+    utils::terms::{FstValue, make_key},
 };
 
 /// One scored term's open-wave fetch result: the dictionary resolution

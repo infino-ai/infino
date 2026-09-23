@@ -34,11 +34,9 @@ use uuid::Uuid;
 
 use crate::{
     storage::{StorageError, StorageProvider},
-    superfile::{
-        SuperfileReader,
-        fts::dict::{DictBuilder, make_key},
-    },
+    superfile::SuperfileReader,
     supertable::manifest::{RoutingRef, SuperfileEntry, part::ContentHash},
+    utils::terms::{DictBuilder, make_key},
 };
 
 /// Object-store directory prefix for term-stats artifacts, sibling to

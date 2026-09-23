@@ -86,10 +86,12 @@ use std::ops::Range;
 use bitpacking::{BitPacker, BitPacker4x};
 use wide::u32x8;
 
-use crate::superfile::{
-    bits::{ExceptionPlan, PackScratch, plan_exceptions},
-    format::fts::BlockLayout,
-    varint::{CONTINUATION_BIT, push_varint, read_varint, varint_len},
+use crate::{
+    superfile::{
+        bits::{ExceptionPlan, PackScratch, plan_exceptions},
+        format::fts::BlockLayout,
+    },
+    utils::varint::{CONTINUATION_BIT, push_varint, read_varint, varint_len},
 };
 
 /// Number of `(doc_id, tf)` pairs per encoded block. Fixed at 128 to

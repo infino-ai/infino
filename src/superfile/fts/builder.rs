@@ -102,8 +102,6 @@ use crate::{
         fts::{
             analysis::ChainTokenizer,
             bm25,
-            dict::{StreamingTermDictBuilder, TermDictBuilder},
-            fst_value::{FstValue, INLINE_TF_MAX},
             positions::{encode_group, encode_run, skip_run},
             posting::{
                 BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, block_encoding, encode_block,
@@ -112,9 +110,15 @@ use crate::{
             short::{SHORT_MAX_DF, encode_short},
             tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
         },
+    },
+    utils::{
+        terms::{
+            FstValue, INLINE_TF_MAX, StreamingTermDictBuilder, TermDictBuilder,
+            validate_column_name,
+        },
+        trace::{detail_span, record},
         varint::read_varint,
     },
-    utils::trace::{detail_span, record},
 };
 
 /// Per-column term interner table.
@@ -225,7 +229,7 @@ impl FinishProfile {
 ///                  (e.g. the 16 GB target).
 ///   off 12 .. 16 : postings_length (u32) — this term's byte length; the
 ///                  authority on it, since the FST value's own length
-///                  slot is narrower (see `fst_value::PFOR_LENGTH_UNKNOWN`).
+///                  slot is narrower (see `utils::terms::PFOR_LENGTH_UNKNOWN`).
 ///   off 16 .. 20 : num_blocks (u32)
 ///
 /// `df`, `postings_length`, and `num_blocks` stay u32; only the absolute
@@ -1516,7 +1520,7 @@ impl FtsBuilder {
         tokenizer: Arc<dyn Tokenizer>,
         params: bm25::Bm25Params,
     ) -> Result<u32, BuildError> {
-        if name.as_bytes().contains(&FST_SEPARATOR) {
+        if !validate_column_name(&name) {
             return Err(BuildError::ReservedSeparatorInColumnName(name));
         }
         if name.starts_with(format::RESERVED_PREFIX) {

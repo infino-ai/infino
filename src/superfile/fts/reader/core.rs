@@ -35,29 +35,30 @@ use super::{
     sink::{LiveFloor, TopKEntry, drain_top_k_desc},
     work::{term_cursor_bytes, term_cursor_ranges},
 };
-use crate::superfile::{
-    ReadError,
-    error::FtsError,
-    format::{
-        self, FST_SEPARATOR,
-        checksum::crc32c,
-        fts::{
-            BlobLayout, DictLayout, HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, MAGIC_BYTES,
-            U32_BYTES, U64_BYTES, hdr, term_meta,
+use crate::{
+    superfile::{
+        ReadError,
+        error::FtsError,
+        format::{
+            self, FST_SEPARATOR,
+            checksum::crc32c,
+            fts::{
+                BlobLayout, DictLayout, HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, MAGIC_BYTES,
+                U32_BYTES, U64_BYTES, hdr, term_meta,
+            },
         },
+        fts::{
+            analysis::{Base, chain_tokenizer},
+            bm25,
+            builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
+            positions::{GroupIndex, decode_run},
+            posting::{BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
+            short::decode_short,
+            tokenize::{Phrase, Tokenizer},
+        },
+        lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
     },
-    fts::{
-        analysis::{Base, chain_tokenizer},
-        bm25,
-        builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
-        dict::{TermDict, make_key},
-        fst_value::FstValue,
-        positions::{GroupIndex, decode_run},
-        posting::{BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
-        short::decode_short,
-        tokenize::{Phrase, Tokenizer},
-    },
-    lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
+    utils::terms::{FstValue, TermDict, make_key},
 };
 
 /// Largest gap worth overfetching when adjacent term postings share a request.

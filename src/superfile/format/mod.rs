@@ -152,7 +152,7 @@ pub mod fts {
     /// the df=1 inline form already uses.
     ///
     /// The term dictionary is no longer an FST: it is sorted,
-    /// front-coded term blocks behind a first-key index (`fts::dict`),
+    /// front-coded term blocks behind a first-key index (`utils::terms`),
     /// whose entries carry the short/long form explicitly and the
     /// metadata offset as a delta — a third smaller than the FST for
     /// the same terms. Readers select the layout by this version;
@@ -335,16 +335,10 @@ pub mod fts {
         Compact,
     }
 
-    /// How the term dictionary lays its terms out — by blob version.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum DictLayout {
-        /// `V1`–`V6`: one FST keyed `column <SEP> term`, values packed as
-        /// `fts::fst_value` describes.
-        Fst,
-        /// `V7`+: front-coded term blocks behind a fixed-width first-key
-        /// table (see `fts::dict`).
-        Blocks,
-    }
+    /// How the term dictionary lays its terms out — by blob version. The
+    /// enum lives with the dictionary code it selects (`utils::terms`); it
+    /// is re-exported here because it is part of the blob layout table.
+    pub use crate::utils::terms::DictLayout;
 
     /// Everything a blob version decides about how its regions are laid
     /// out — the one table the writer (by the era it writes) and the
@@ -824,27 +818,11 @@ pub(crate) const ID_SIDECAR_ENTRY_BYTES: usize = size_of::<i128>();
 /// internal namespace separate even if we add more KV keys later.
 pub const RESERVED_PREFIX: &str = "inf.";
 
-/// Little-endian `u32` at `at`, `None` past the end of `bytes`.
-#[inline]
-pub(crate) fn u32_le_at(bytes: &[u8], at: usize) -> Option<u32> {
-    bytes
-        .get(at..at + 4)
-        .map(|s| u32::from_le_bytes(s.try_into().expect("4 bytes")))
-}
-
-/// Little-endian `u64` at `at`, `None` past the end of `bytes`.
-#[inline]
-pub(crate) fn u64_le_at(bytes: &[u8], at: usize) -> Option<u64> {
-    bytes
-        .get(at..at + 8)
-        .map(|s| u64::from_le_bytes(s.try_into().expect("8 bytes")))
-}
-
-/// Reserved separator byte inside FST keys (`<column>\x1F<term>`). User
-/// column names must not contain this byte. ASCII Unit Separator (U+001F)
-/// is below every printable ASCII char so prefix iteration over a column's
-/// terms works correctly via FST range scan.
-pub const FST_SEPARATOR: u8 = 0x1F;
+pub(crate) use crate::utils::bytes::{u32_le_at, u64_le_at};
+/// The key separator is owned by the term dictionary (`utils::terms`) and
+/// re-exported here because the format layer validates column names
+/// against it.
+pub use crate::utils::terms::FST_SEPARATOR;
 
 /// Parsed (major, minor, patch) representation of a semver string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

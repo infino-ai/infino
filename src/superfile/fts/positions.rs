@@ -17,12 +17,12 @@
 
 use std::ops::Range;
 
-use crate::superfile::{
-    bits::{
+use crate::{
+    superfile::bits::{
         ExceptionPlan, PackScratch, for_each_lane, get_bits, payload_bytes, plan_exceptions,
         put_bits,
     },
-    varint::{push_varint, read_varint, varint_len},
+    utils::varint::{push_varint, read_varint, varint_len},
 };
 
 /// Append one document's position run — first value absolute, then

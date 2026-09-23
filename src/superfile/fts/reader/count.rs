@@ -23,11 +23,9 @@ use crate::{
         ReadError,
         error::FtsError,
         format::fts::U32_BYTES,
-        fts::{
-            builder::TERM_META_SIZE, dict::make_key, fst_value::FstValue, short::short_df,
-            tokenize::Phrase,
-        },
+        fts::{builder::TERM_META_SIZE, short::short_df, tokenize::Phrase},
     },
+    utils::terms::{FstValue, make_key},
 };
 
 impl FtsReader {
