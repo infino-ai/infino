@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::{
     config::{CompactionSettings, RecalibratePolicy},
-    runtime_bridge::bridge_on_runtime,
+    runtime_bridge::{bridge_on_runtime, run_on_pool},
     superfile::{
         builder::SuperfileBuilder,
         vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
@@ -53,10 +53,12 @@ use crate::{
         },
         writer::{
             NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
-            finalize_compaction_commit, prepare_superfile_named, recalibrate_probe_laws,
-            refresh_slow_vector_state, split_overflow_cells, try_commit_attempt,
+            finalize_compaction_commit, maint_pool, prepare_superfile_named,
+            recalibrate_probe_laws, refresh_slow_vector_state, split_overflow_cells,
+            try_commit_attempt,
         },
     },
+    utils::trace::detail_span,
 };
 
 struct CompactionSlot<'a>(&'a AtomicBool);
@@ -668,67 +670,75 @@ impl Supertable {
         // what lets a compacted table score like an unfragmented one.
         let replaced: HashSet<Uuid> = superfiles.iter().map(|e| e.superfile_id).collect();
         let fts_corpus = manifest.fts_corpus_stats(&replaced);
-        let (merged_bytes, superfile_stats): (Bytes, _) = {
-            let first_vec = readers_with_tombstones
-                .first()
-                .and_then(|(reader, _)| reader.vec());
-            let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
-            let sq8_merge = first_vec.and_then(|v| {
-                v.vector_columns_config()
-                    .next()
-                    .map(|c| c.rerank_codec.is_ivf_mergeable())
-            });
-            // Every merge kind streams its output to a temp file and mmaps it
-            // back, so the corpus-sized merge output is never held as an anon
-            // Vec — the allocation that OOMs compaction on a memory-tight host.
-            // Mapped pages are file-backed and reclaimable; downstream publish
-            // takes `Bytes` unchanged (large superfiles already stream via
-            // put_multipart).
-            let mut output = NamedTempFile::new()
-                .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
-            let stats = {
-                let mut writer = BufWriter::new(output.as_file_mut());
-                let stats = if multi_cell && sq8_merge == Some(true) {
-                    SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
-                        &readers_with_tombstones,
-                        &superseded_per_reader,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else if sq8_merge == Some(true) {
-                    SuperfileBuilder::build_from_sq8_ivf_readers_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else if first_vec.is_none() {
-                    // FTS/scalar inputs (no vector index): carry each input's
-                    // already-built posting lists across instead of
-                    // re-tokenizing the whole corpus.
-                    SuperfileBuilder::build_from_readers_fts_merge_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else {
-                    // A vector index is present but not IVF-mergeable (e.g. an
-                    // fp32 rerank codec); the re-index path re-encodes both the
-                    // FTS and the vectors from the decoded rows.
-                    SuperfileBuilder::build_from_readers_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
+        // The build is long, synchronous CPU work, so it runs on the
+        // maintenance pool rather than the thread driving this future.
+        let (merged_bytes, superfile_stats) = run_on_pool(
+            Some(maint_pool()?),
+            "compaction merge",
+            move || -> Result<(Bytes, _), BuildError> {
+                let first_vec = readers_with_tombstones
+                    .first()
+                    .and_then(|(reader, _)| reader.vec());
+                let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
+                let sq8_merge = first_vec.and_then(|v| {
+                    v.vector_columns_config()
+                        .next()
+                        .map(|c| c.rerank_codec.is_ivf_mergeable())
+                });
+                // Every merge kind streams its output to a temp file and mmaps it
+                // back, so the corpus-sized merge output is never held as an anon
+                // Vec — the allocation that OOMs compaction on a memory-tight host.
+                // Mapped pages are file-backed and reclaimable; downstream publish
+                // takes `Bytes` unchanged (large superfiles already stream via
+                // put_multipart).
+                let mut output = NamedTempFile::new()
+                    .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
+                let stats = {
+                    let mut writer = BufWriter::new(output.as_file_mut());
+                    let stats = if multi_cell && sq8_merge == Some(true) {
+                        SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
+                            &readers_with_tombstones,
+                            &superseded_per_reader,
+                            &fts_corpus,
+                            &mut writer,
+                        )?
+                    } else if sq8_merge == Some(true) {
+                        SuperfileBuilder::build_from_sq8_ivf_readers_to(
+                            &readers_with_tombstones,
+                            &fts_corpus,
+                            &mut writer,
+                        )?
+                    } else if first_vec.is_none() {
+                        // FTS/scalar inputs (no vector index): carry each input's
+                        // already-built posting lists across instead of
+                        // re-tokenizing the whole corpus.
+                        SuperfileBuilder::build_from_readers_fts_merge_to(
+                            &readers_with_tombstones,
+                            &fts_corpus,
+                            &mut writer,
+                        )?
+                    } else {
+                        // A vector index is present but not IVF-mergeable (e.g. an
+                        // fp32 rerank codec); the re-index path re-encodes both the
+                        // FTS and the vectors from the decoded rows.
+                        SuperfileBuilder::build_from_readers_to(
+                            &readers_with_tombstones,
+                            &fts_corpus,
+                            &mut writer,
+                        )?
+                    };
+                    writer
+                        .flush()
+                        .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
+                    stats
                 };
-                writer
-                    .flush()
-                    .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
-                stats
-            };
-            let bytes = mmap_readonly_bytes(output.path())
-                .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
-            (bytes, stats)
-        };
+                let bytes = mmap_readonly_bytes(output.path())
+                    .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
+                Ok((bytes, stats))
+            },
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))??;
 
         let shard = ShardOutput::new_with_params(
             merged_bytes,
@@ -746,7 +756,10 @@ impl Supertable {
             .first()
             .and_then(|first| first.stem.as_deref())
             .filter(|stem| superfiles.iter().all(|e| e.stem.as_deref() == Some(*stem)));
-        let prepared_superfile = prepare_superfile_named(self.inner().as_ref(), shard, stem)?;
+        let prepared_superfile = {
+            let _span = detail_span!("prepare_merged_superfile").entered();
+            prepare_superfile_named(self.inner().as_ref(), shard, stem)?
+        };
 
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)
     }
