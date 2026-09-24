@@ -1206,6 +1206,45 @@ impl SupertableReader {
             return Ok((map, None));
         }
 
+        // A complete term index already holds every term's gross df in
+        // every live superfile — the same numbers a superfile's dictionary
+        // would give — so the corpus-wide df is a sum over its postings and
+        // nothing is opened: no dictionary, no sidecar. The walk builds its
+        // memos from the index's locations. (A partial index, after a commit
+        // on a table the index did not yet cover in full, takes the wave
+        // below like a table with no index.)
+        if manifest.term_index_complete()
+            && let Some(index) = manifest.term_index().await
+        {
+            let live: HashSet<Uuid> = manifest
+                .get_all_superfiles_loaded()
+                .await
+                .map_err(|e| QueryError::Store(e.to_string()))?
+                .iter()
+                .map(|e| e.superfile_id)
+                .collect();
+            let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(misses.len());
+            for t in &misses {
+                let postings = index.postings(column, t).await.map_err(|e| {
+                    QueryError::Store(format!("term index unreadable for global stats: {e}"))
+                })?;
+                let df: u64 = postings
+                    .iter()
+                    .filter(|p| {
+                        index
+                            .superfile_id(p.superfile)
+                            .is_some_and(|id| live.contains(&id))
+                    })
+                    .map(|p| p.df)
+                    .sum();
+                let idf = bm25::idf(global_n, df.min(global_n));
+                map.insert(t.clone(), idf);
+                fresh.push((t.as_str(), idf));
+            }
+            cache.insert(manifest_id, column, &fresh);
+            return Ok((map, None));
+        }
+
         // Maintenance-published corpus stats first: the sidecar sums gross
         // df over its covered superfiles, so the wave below shrinks to the
         // uncovered tail (recent commits) — and vanishes entirely on a
@@ -5059,5 +5098,83 @@ mod tests {
                 .expect("count after delete"),
             2
         );
+    }
+
+    /// Under global statistics on a table whose term index is complete,
+    /// each scored term's corpus-wide df is summed from the index and no
+    /// superfile is opened for it: the idf is exactly what summing every
+    /// superfile's own dictionary gives, at zero opens — where the wave
+    /// used to open every superfile the term may live in for its
+    /// dictionary, free only while the manifest inlined the dictionaries.
+    #[test]
+    fn global_idf_comes_from_a_complete_term_index_without_opening_a_superfile() {
+        use crate::{
+            runtime_metrics::op_stats::with_op_stats,
+            superfile::{SuperfileReader, fts::bm25},
+        };
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_one_superfile_per_commit().with_storage(storage))
+            .expect("create");
+        // Three commits, one superfile each; `alpha` in two, `beta` in one,
+        // `shared` in all, `absent` in none.
+        for titles in [
+            &["alpha shared one", "shared two"][..],
+            &["beta shared three", "alpha shared four", "shared five"][..],
+            &["shared six"][..],
+        ] {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_batch(0, titles)).expect("append");
+            w.commit().expect("commit");
+        }
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        assert!(manifest.term_index_complete(), "every commit contributed");
+        assert!(
+            reader.manifest().term_stats_blob().is_none(),
+            "no maintenance has run, so there is no sidecar to sum from"
+        );
+        let entries = manifest.get_all_superfiles().to_vec();
+        let terms = ["alpha", "beta", "shared", "absent"];
+
+        // The oracle: every superfile's own dictionary, summed.
+        let rt = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let mut expected_df = [0u64; 4];
+        for e in &entries {
+            let bytes = std::fs::read(dir.path().join(e.uri.storage_path())).expect("bytes");
+            let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+            let (dfs, _) = rt.block_on(sf.term_dfs("title", &terms)).expect("dfs");
+            for (i, d) in dfs.into_iter().enumerate() {
+                expected_df[i] += d;
+            }
+        }
+        assert_eq!(expected_df, [2, 1, 6, 0]);
+        let n = manifest.n_docs_total();
+
+        let owned: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
+        let ((idf, memos), opened) = with_op_stats(|| {
+            let (map, memos) = rt
+                .block_on(reader.global_idf_open_wave(manifest, "title", &owned, &entries, None))
+                .expect("wave");
+            let opened = crate::runtime_metrics::op_stats::current()
+                .expect("metered")
+                .superfiles_opened();
+            ((map, memos), opened)
+        })
+        .0;
+        assert_eq!(opened, 0, "the index answers; no superfile is opened");
+        assert!(memos.is_none(), "no open wave, so no open-wave memos");
+        for (i, t) in terms.iter().enumerate() {
+            assert_eq!(
+                idf[*t],
+                bm25::idf(n, expected_df[i]),
+                "idf of `{t}` from the index equals the dictionaries' sum"
+            );
+        }
     }
 }
