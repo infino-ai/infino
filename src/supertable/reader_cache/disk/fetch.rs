@@ -123,9 +123,7 @@ impl DiskCacheStore {
 
         // Decide under the shard lock, touch the files after it.
         let (installed, to_release) = match self.cached.entry(uri) {
-            Entry::Occupied(mut occupied)
-                if is_mine(occupied.get(), owner) || !occupied.get().has_whole_file() =>
-            {
+            Entry::Occupied(mut occupied) if fill_may_replace(occupied.get(), owner) => {
                 let current = occupied.get();
                 let inherited = match current.accounting {
                     EntryAccounting::Eager => current.size_bytes.load(Ordering::Acquire),
@@ -158,6 +156,14 @@ impl DiskCacheStore {
             self.release_block_bytes(to_release);
         }
         installed.then_some(entry)
+    }
+
+    /// Whether a finished fill could still install over what the slot holds now. The install
+    /// re-checks under the shard lock; this only spares the fill work it would throw away.
+    fn fill_can_install(&self, uri: &SuperfileUri, owner: &Weak<SuperfileReader>) -> bool {
+        self.cached
+            .get(uri)
+            .is_some_and(|entry| fill_may_replace(&entry, owner))
     }
 
     /// Rename an installed fill's tempfile to the cache name. Runs after the shard lock is
@@ -1193,6 +1199,11 @@ fn is_mine(entry: &CachedEntry, owner: &Weak<SuperfileReader>) -> bool {
         .is_some_and(|mine| Arc::ptr_eq(&entry.reader, &mine))
 }
 
+/// A finished fill may replace its own entry or a lazy one, never someone else's whole file.
+fn fill_may_replace(entry: &CachedEntry, owner: &Weak<SuperfileReader>) -> bool {
+    is_mine(entry, owner) || !entry.has_whole_file()
+}
+
 /// Undo a fill that did not finish: drop the entry it started from if it is still there, give
 /// back what the fill reserved for itself, delete the partial download. The coordinator is not
 /// the fill's, and removing it by key could strip a fetch in flight, so it is left alone.
@@ -1267,6 +1278,11 @@ async fn lazy_background_fill(
 
             return Ok(());
         }
+        // Evicted, or someone else's whole file is there: the download would be thrown away.
+        if !store.fill_can_install(&uri, &reader) {
+            rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation);
+            return Ok(());
+        }
         match cold_fetch_to_disk_cancelable(
             &store,
             &reader,
@@ -1293,6 +1309,13 @@ async fn lazy_background_fill(
 
     let result: Result<(), DiskCacheError> = async {
         if background_store_abandoned(&store) {
+            return Ok(());
+        }
+
+        // The slot changed during the download. Skip the promotion: its vector-header reads would
+        // go uncached to object storage, only for the install to yield.
+        if !store.fill_can_install(&uri, &reader) {
+            rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation.take());
             return Ok(());
         }
 
@@ -1324,7 +1347,7 @@ async fn lazy_background_fill(
                 (reader, Some(block_source))
             }
             (Some((vec_off, vec_len)), None) => {
-                // Evicted mid-fill: fresh block cache over storage for the hole.
+                // Only after an eviction raced the check above: a fresh block cache for the hole.
                 let remote: Arc<dyn LazyByteSource> =
                     Arc::new(StorageRangeSource::with_known_size(
                         Arc::clone(&fetch_storage),
@@ -1532,7 +1555,7 @@ mod tests {
     use tokio::{spawn, task::yield_now, time::timeout};
 
     use crate::{
-        storage::StorageProvider,
+        storage::{LocalFsStorageProvider, StorageProvider},
         superfile::reader::{OpenOptions, SuperfileReader},
         supertable::{
             manifest::{SubsectionOffsets, SuperfileUri},
@@ -1543,6 +1566,168 @@ mod tests {
             },
         },
     };
+
+    /// Poll cadence while a test waits for a background fill to finish.
+    const FILL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    /// A store over recording storage holding one vector superfile, with a Warm open whose fill is
+    /// parked at the only fill permit. Returns the held reader, the permit and the vector hole.
+    async fn store_with_a_parked_fill() -> (
+        TempDir,
+        Arc<DiskCacheStore>,
+        Arc<RecordingStorage>,
+        SuperfileUri,
+        Arc<SuperfileReader>,
+        tokio::sync::OwnedSemaphorePermit,
+        (u64, u64),
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let recording = RecordingStorage::over(local);
+        let storage: Arc<dyn StorageProvider> = Arc::clone(&recording) as Arc<dyn StorageProvider>;
+        let store = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+                mmap_cold_threshold_secs: 0,
+                // The fill runs alongside the held reader, and parks at its permit until released.
+                promotion_defer_timeout: Duration::ZERO,
+                prefetch_concurrency: 1,
+                ..Default::default()
+            },
+        )
+        .expect("store");
+        let uri = SuperfileUri::new_v4();
+        storage
+            .put_atomic(&uri.storage_path(), tiny_vector_superfile_bytes())
+            .await
+            .expect("put");
+        let permit = Arc::clone(&store.prefetch_semaphore)
+            .acquire_owned()
+            .await
+            .expect("fill permit");
+        let held = store
+            .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Warm)
+            .await
+            .expect("warm open starts the fill");
+        let hole = vector_blob_range(&held).expect("vector blob");
+        // Parked at the permit, the fill task holds the store alive.
+        timeout(PROMOTE_TIMEOUT, async {
+            while Arc::strong_count(&store) == 1 {
+                tokio::time::sleep(FILL_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("the fill starts and parks");
+        (dir, store, recording, uri, held, permit, hole)
+    }
+
+    /// Wait for the parked fill to run and exit. It holds the store alive while it runs.
+    async fn wait_for_the_fill_to_exit(store: &Arc<DiskCacheStore>) {
+        timeout(PROMOTE_TIMEOUT, async {
+            while Arc::strong_count(store) > 1 {
+                tokio::time::sleep(FILL_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("the fill exits");
+    }
+
+    fn overlaps(range: &std::ops::Range<u64>, (off, len): (u64, u64)) -> bool {
+        range.start < off + len && off < range.end
+    }
+
+    /// A fill whose entry was evicted before it started downloading gives up without a single GET.
+    #[tokio::test]
+    async fn fill_whose_entry_was_evicted_does_not_download() {
+        let (_dir, store, recording, uri, held, permit, _) = store_with_a_parked_fill().await;
+        store.evict_at_least(1).await.expect("evict the entry");
+
+        let from = recording.n_ranges();
+        drop(permit);
+        wait_for_the_fill_to_exit(&store).await;
+        drop(held);
+
+        assert!(
+            recording.ranges_since(from).is_empty(),
+            "no GET after the eviction"
+        );
+        assert!(!store.is_cached(&uri), "nothing is reinstated");
+        assert!(
+            !store.cache_path(&uri).exists(),
+            "no file under the cache name"
+        );
+        store.assert_budget_consistent();
+    }
+
+    /// A fill that finds someone else's whole file in its slot gives up without a single GET, and
+    /// leaves that file alone.
+    #[tokio::test]
+    async fn fill_over_a_whole_file_does_not_download() {
+        let (_dir, store, recording, uri, held, permit, _) = store_with_a_parked_fill().await;
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("a Load puts the whole file in the slot");
+
+        let from = recording.n_ranges();
+        drop(permit);
+        wait_for_the_fill_to_exit(&store).await;
+        drop(held);
+
+        assert!(
+            recording.ranges_since(from).is_empty(),
+            "no GET once the whole file is there"
+        );
+        assert!(store.is_mmap_promoted(&uri), "the Load's whole file stays");
+        assert!(store.cache_path(&uri).exists());
+        store.assert_budget_consistent();
+    }
+
+    /// A fill whose entry is evicted while it downloads skips the promotion. The download itself
+    /// never touches the vector blob, so a GET inside it would be a promotion read: each one goes
+    /// uncached to object storage through a block source no entry owns.
+    #[tokio::test]
+    async fn fill_whose_entry_was_evicted_mid_download_skips_the_promotion() {
+        let (_dir, store, recording, uri, held, permit, hole) = store_with_a_parked_fill().await;
+
+        let from = recording.n_ranges();
+        recording.pause_next_read();
+        drop(permit);
+        timeout(PROMOTE_TIMEOUT, async {
+            while !recording.is_paused() {
+                tokio::time::sleep(FILL_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("the download starts");
+        store
+            .evict_at_least(1)
+            .await
+            .expect("evict the entry mid-download");
+        recording.resume();
+        wait_for_the_fill_to_exit(&store).await;
+        drop(held);
+
+        let in_hole: Vec<_> = recording
+            .ranges_since(from)
+            .into_iter()
+            .filter(|r| overlaps(r, hole))
+            .collect();
+        assert!(
+            in_hole.is_empty(),
+            "promotion reads reached storage: {in_hole:?}"
+        );
+        assert!(!store.is_cached(&uri), "nothing is reinstated");
+        assert!(
+            !store.cache_path(&uri).exists(),
+            "no file under the cache name"
+        );
+        assert_eq!(leftover_tempfiles(&store), 0, "the download is deleted");
+        store.assert_budget_consistent();
+    }
 
     /// How much smaller than the file the surplus test's promoted charge is: any amount works, it
     /// only has to leave a surplus in the fill's full-size reservation.

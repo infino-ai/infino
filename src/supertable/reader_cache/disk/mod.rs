@@ -660,19 +660,25 @@ impl DiskCacheStore {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::{
-        sync::Arc,
+        ops::Range,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::{Duration, Instant},
     };
 
     use arrow_array::{LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
     use bytes::Bytes;
+    use object_store::MultipartUpload;
     use roaring::RoaringBitmap;
     use tempfile::TempDir;
-    use tokio::time::sleep;
+    use tokio::{sync::Notify, time::sleep};
 
     use crate::{
-        storage::{LocalFsStorageProvider, StorageProvider},
+        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
             BytesLazyByteSource, LazyByteSource,
             builder::{BuilderOptions, SuperfileBuilder},
@@ -687,6 +693,89 @@ pub(crate) mod test_support {
         },
         test_helpers::{decimal128_id_field, decimal128_ids, default_vector_config},
     };
+
+    /// Storage that records every ranged GET, so a test can check which bytes left object storage.
+    /// [`Self::pause_next_read`] parks the next ranged GET until [`Self::resume`], so a test can act
+    /// in the middle of a download.
+    #[derive(Debug)]
+    pub(crate) struct RecordingStorage {
+        inner: Arc<dyn StorageProvider>,
+        ranges: Mutex<Vec<Range<u64>>>,
+        pause_next: AtomicBool,
+        paused: AtomicBool,
+        resume: Notify,
+    }
+
+    impl RecordingStorage {
+        pub(crate) fn over(inner: Arc<dyn StorageProvider>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                ranges: Mutex::new(Vec::new()),
+                pause_next: AtomicBool::new(false),
+                paused: AtomicBool::new(false),
+                resume: Notify::new(),
+            })
+        }
+
+        pub(crate) fn n_ranges(&self) -> usize {
+            self.ranges.lock().expect("ranges").len()
+        }
+
+        pub(crate) fn ranges_since(&self, from: usize) -> Vec<Range<u64>> {
+            self.ranges.lock().expect("ranges")[from..].to_vec()
+        }
+
+        pub(crate) fn pause_next_read(&self) {
+            self.pause_next.store(true, Ordering::SeqCst);
+        }
+
+        pub(crate) fn is_paused(&self) -> bool {
+            self.paused.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn resume(&self) {
+            self.resume.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for RecordingStorage {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            self.inner.get(uri).await
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.ranges.lock().expect("ranges").push(range.clone());
+            if self.pause_next.swap(false, Ordering::SeqCst) {
+                self.paused.store(true, Ordering::SeqCst);
+                self.resume.notified().await;
+            }
+            self.inner.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+    }
 
     /// A block source over empty storage, for tests that only need a [`Residency::Paged`] entry to
     /// exist. Does not own budget accounting, so dropping it never touches `current_bytes`.
