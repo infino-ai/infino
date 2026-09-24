@@ -5,14 +5,25 @@
 //! table ([`NormTable`]), per-column metadata ([`ColumnMeta`]) and its
 //! JSON config ([`FtsColumnConfig`]), and the reader [`OpenOptions`].
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    fmt,
+    ops::Range,
+    sync::{Arc, OnceLock},
+};
 
 use serde::Deserialize;
 
-use crate::superfile::fts::{
-    analysis::{Base, Stemmer, Stopwords},
-    bm25,
-    tokenize::Tokenizer,
+use crate::superfile::{
+    ReadError,
+    error::FtsError,
+    format::checksum::crc32c,
+    fts::{
+        analysis::{Base, Stemmer, Stopwords},
+        bm25,
+        reader::core::read_doc_length,
+        tokenize::Tokenizer,
+    },
+    lazy_source::Source,
 };
 
 /// Per-doc BM25 length normalizer, quantized to one byte per doc.
@@ -274,65 +285,257 @@ fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]> {
 }
 
 /// Per-column metadata, indexed by column_id (declaration order).
+/// What scoring needs from a column's per-document length array: the
+/// norm table, the length statistics it was computed from, and the factor
+/// that keeps the stored bounds upper bounds. Built on first scored use —
+/// see [`ColumnMeta::norms`] — so a query that only matches, or that a
+/// table-level term index resolves without this superfile's dictionary,
+/// never reads the array.
 #[derive(Debug, Clone)]
+pub struct ColumnNorms {
+    pub dl_norm_k1: NormTable,
+    pub length_stats: ColumnLengthStats,
+    /// `1.0` for a file whose bounds were baked at the average it declares;
+    /// the older-file correction otherwise; composed with the override
+    /// factor when the column is scored at other parameters.
+    pub bound_scale: f32,
+}
+
+impl ColumnNorms {
+    /// Build from a column's length array, at `params` (the pair the stored
+    /// bounds were baked at) and the average the file declares.
+    pub(super) fn from_array(
+        array: &[u8],
+        n_docs: usize,
+        doc_length_bytes: usize,
+        params: bm25::Bm25Params,
+        baked_avgdl: f32,
+        declared: bool,
+    ) -> Self {
+        let (dl_norm_k1, length_stats) = NormTable::new(
+            (0..n_docs).map(|d| read_doc_length(array, d, doc_length_bytes)),
+            n_docs,
+            params,
+            |stats| match declared {
+                true => baked_avgdl,
+                false => bm25::stored_avgdl(stats.avgdl()),
+            },
+        );
+        // A current-version file is scored at the average it declares, so
+        // its bounds are exact as stored. An older file is scored at the
+        // average over the documents that carry tokens, computed from the
+        // array being walked, and its bounds owe two corrections: that
+        // average can only be higher than the row-count one it was baked
+        // at (no more documents carry tokens than there are rows), which
+        // lowers the norm and raises every score above the bound meant to
+        // cap it, so the bound is inflated by the supremum of that move;
+        // and the `(k1 + 1)` factor those files carry is divided out, which
+        // restores exactly the pruning they had.
+        let bound_scale = match declared {
+            true => 1.0,
+            false => {
+                let baked = dl_norm_k1.rescored(baked_avgdl, params);
+                baked.bound_scale(&dl_norm_k1, params, params) / (params.k1 + 1.0)
+            }
+        };
+        Self {
+            dl_norm_k1,
+            length_stats,
+            bound_scale,
+        }
+    }
+
+    /// The norms for a column that has none to read (a failed or empty
+    /// array): every score computes against an empty table.
+    fn empty() -> Self {
+        Self {
+            dl_norm_k1: NormTable::empty(),
+            length_stats: ColumnLengthStats::default(),
+            bound_scale: 1.0,
+        }
+    }
+
+    /// These norms re-derived at `params`, for a view that scores with
+    /// parameters other than `declared` — the ones the stored bounds were
+    /// baked at. The per-doc length buckets are shared, not copied; the
+    /// bound factor composes rather than replaces, since an older file's
+    /// bounds already owe the correction applied above and this move is
+    /// owed on top of it. The product of the two suprema cannot under-bound.
+    fn rescored(&self, declared: bm25::Bm25Params, params: bm25::Bm25Params) -> Self {
+        let dl_norm_k1 = self.dl_norm_k1.rescored(self.dl_norm_k1.avgdl(), params);
+        Self {
+            bound_scale: self.bound_scale
+                * self.dl_norm_k1.bound_scale(&dl_norm_k1, declared, params),
+            dl_norm_k1,
+            length_stats: self.length_stats,
+        }
+    }
+}
+
+/// One FTS column as the reader sees it: its configuration, where its
+/// length array sits, and the norms scoring needs — built lazily, see
+/// [`Self::norms`].
+#[derive(Clone)]
 pub struct ColumnMeta {
     pub name: String,
-    /// Byte range into [`FtsReader::blob`] holding this column's
-    /// `u32` doc-lengths array (4 bytes per doc, length × n_docs).
     pub doc_lengths_range: Range<usize>,
-    /// This column's exact token total and the number of documents
-    /// carrying tokens, summed at open. Table-wide statistics are these
-    /// summed across superfiles.
-    pub length_stats: ColumnLengthStats,
-    /// Per-doc BM25 length normalizer, byte-quantized — see
-    /// [`NormTable`]. Computed once per reader at `open` time from the
-    /// column's on-disk doc-lengths array. The hot scoring loop reads
-    /// `dl_norm_k1.get(d)` and multiplies-out to `idf · tf /
-    /// (tf + dl_norm_k1.get(d))`.
-    pub dl_norm_k1: NormTable,
-    /// The parameters this column is being *scored* with. Equal to the
-    /// pair recorded in the KV entry unless the query overrode it, in
-    /// which case `dl_norm_k1` has been re-decoded to match and
-    /// `bound_scale` carries the correction for the stored bounds.
+    /// The parameters this column is scored at: the declared pair, or an
+    /// override's (see `FtsReader::with_bm25_override`).
     pub params: bm25::Bm25Params,
-    /// Factor to apply to every bound read out of the skip table or the
-    /// coarse table before comparing it against a score.
-    ///
-    /// The stored bounds are exact scores under what the build baked
-    /// in: the column's declared parameter pair, and the average length
-    /// the doc-lengths directory declares. Every reason the scored value
-    /// departs from that — an older file's row-count average corrected
-    /// to the documents that carry tokens, a query-time parameter
-    /// override — is a [`NormTable::bound_scale`]
-    /// factor, and they compose by multiplication because each is a
-    /// supremum of a ratio (a product of suprema is never below the
-    /// supremum of the product, so composing loosens and cannot
-    /// under-bound).
-    pub bound_scale: f32,
-    /// Whether this column's index carries token positions (from
-    /// `inf.fts.columns`); phrase queries require it.
     pub positions: bool,
-    /// Tokenizer for this column, reconstructed at open time from the
-    /// `tokenizer` name in `inf.fts.columns` plus its `stopwords` /
-    /// `stemmer` fields. Query terms for this column must be tokenized
-    /// with it to match how the column was indexed.
     pub tokenizer: Arc<dyn Tokenizer>,
-    /// The column's base tokenizer, kept beside the assembled
-    /// [`ColumnMeta::tokenizer`] so a rebuild can reconstruct the same
-    /// chain from its components. `Tokenizer::name` reports the chain's
-    /// derived identity, which is not a name any lookup accepts back.
     pub(crate) base: Base,
-    /// The column's stopword set, kept for the same reason as
-    /// [`ColumnMeta::base`].
     pub stopwords: Stopwords,
-    /// The column's stemmer, kept for the same reason as
-    /// [`ColumnMeta::base`].
     pub stemmer: Stemmer,
-    /// Whether the column's raw text is kept in the Parquet body (from
-    /// `inf.fts.columns`). Index-only columns (`false`) are searchable
-    /// but absent from the stored schema, so they cannot be read back;
-    /// a rebuild carries their postings across instead of re-tokenizing.
     pub stored: bool,
+    /// Where the length array is read from when the norms are first needed.
+    pub(super) source: Source,
+    pub(super) n_docs: u32,
+    pub(super) doc_length_bytes: usize,
+    pub(super) baked_avgdl: f32,
+    /// Whether the file declares the average its bounds were baked at.
+    pub(super) declared: bool,
+    /// The pair the stored bounds were baked at.
+    pub(super) declared_params: bm25::Bm25Params,
+    /// Whether the length array's CRC is checked when it is read.
+    pub(super) verify_crc: bool,
+    /// Norms at the declared parameters, shared by every view of the reader.
+    pub(super) base_norms: Arc<OnceLock<ColumnNorms>>,
+    /// Norms at `params` when they differ from the declared pair, derived
+    /// from the base on first use; each override view has its own.
+    pub(super) view_norms: Arc<OnceLock<ColumnNorms>>,
+}
+
+impl fmt::Debug for ColumnMeta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ColumnMeta")
+            .field("name", &self.name)
+            .field("doc_lengths_range", &self.doc_lengths_range)
+            .field("params", &self.params)
+            .field("positions", &self.positions)
+            .field("stored", &self.stored)
+            .field("norms_loaded", &self.base_norms.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ColumnMeta {
+    /// The norms at the declared parameters, reading the length array now
+    /// if no scoring entry point has done so yet. The entry points prewarm
+    /// through `FtsReader::ensure_norms` on the async path; this synchronous
+    /// fallback exists so a kernel can never find the norms absent — on an
+    /// in-memory source it costs nothing, on a lazy one it is the read the
+    /// prewarm would have made. A read that fails here logs and scores
+    /// against an empty table rather than aborting mid-kernel.
+    fn base_norms(&self) -> &ColumnNorms {
+        self.base_norms.get_or_init(|| {
+            let n = self.n_docs as usize;
+            let array_len = n * self.doc_length_bytes;
+            let start = self.doc_lengths_range.start;
+            let fetched = self
+                .source
+                .get_range(start..start + array_len + 4)
+                .map_err(|e| e.to_string())
+                .and_then(|array| {
+                    self.check_array_crc(&array)
+                        .map(|()| array)
+                        .map_err(|e| e.to_string())
+                });
+            match fetched {
+                Ok(array) => self.norms_from_array(&array[..array_len]),
+                Err(error) => {
+                    tracing::error!(column = %self.name, %error, "doc-length array unreadable; scoring against empty norms");
+                    ColumnNorms::empty()
+                }
+            }
+        })
+    }
+
+    /// Check the CRC that trails the length array in `array_with_crc`, when
+    /// verification is on. The array is `n_docs × doc_length_bytes` long
+    /// and its CRC32C follows it.
+    pub(super) fn check_array_crc(&self, array_with_crc: &[u8]) -> Result<(), FtsError> {
+        if !self.verify_crc {
+            return Ok(());
+        }
+        let len = self.n_docs as usize * self.doc_length_bytes;
+        let Some(crc_bytes) = array_with_crc.get(len..len + 4) else {
+            return Err(FtsError::Read(ReadError::MalformedVersion(
+                "doc-lengths array shorter than its CRC".into(),
+            )));
+        };
+        let expected = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+        if expected != crc32c(&array_with_crc[..len]) {
+            return Err(FtsError::Read(ReadError::ChecksumMismatch {
+                section: "fts/doc_lengths_array",
+                column: format!(" (column '{}')", self.name),
+            }));
+        }
+        Ok(())
+    }
+
+    /// Build the declared-parameter norms from the column's length array.
+    pub(super) fn norms_from_array(&self, array: &[u8]) -> ColumnNorms {
+        ColumnNorms::from_array(
+            array,
+            self.n_docs as usize,
+            self.doc_length_bytes,
+            self.declared_params,
+            self.baked_avgdl,
+            self.declared,
+        )
+    }
+
+    /// The norms this column scores with: the declared ones, or the
+    /// override view's, derived from them on first use.
+    pub(super) fn norms(&self) -> &ColumnNorms {
+        if self.params == self.declared_params {
+            return self.base_norms();
+        }
+        self.view_norms.get_or_init(|| {
+            self.base_norms()
+                .rescored(self.declared_params, self.params)
+        })
+    }
+
+    /// Whether the declared-parameter norms have been built.
+    pub(super) fn norms_loaded(&self) -> bool {
+        self.base_norms.get().is_some()
+    }
+
+    /// This column with its bound factor replaced — for tests that probe the
+    /// decoder's scaling. Marks the file as not declaring its average so the
+    /// exact-`1.0` shortcut in [`Self::bound_scale`] does not bypass the
+    /// replaced value.
+    #[cfg(test)]
+    pub(super) fn with_bound_scale_for_test(mut self, bound_scale: f32) -> Self {
+        let mut norms = self.base_norms().clone();
+        norms.bound_scale = bound_scale;
+        self.base_norms = Arc::new(OnceLock::from(norms));
+        self.view_norms = Arc::new(OnceLock::new());
+        self.declared = false;
+        self
+    }
+
+    /// The BM25 length-normalization table; see [`Self::norms`].
+    pub fn dl_norm_k1(&self) -> &NormTable {
+        &self.norms().dl_norm_k1
+    }
+
+    /// The length statistics the norms were computed from.
+    pub fn length_stats(&self) -> ColumnLengthStats {
+        self.norms().length_stats
+    }
+
+    /// The factor that keeps this column's stored bounds upper bounds under
+    /// the parameters it is scored at. Exactly `1.0` for a current-version
+    /// file scored as declared, known without reading anything.
+    pub fn bound_scale(&self) -> f32 {
+        if self.declared && self.params == self.declared_params {
+            return 1.0;
+        }
+        self.norms().bound_scale
+    }
 }
 
 impl ColumnMeta {
@@ -348,13 +551,13 @@ impl ColumnMeta {
     /// its rare ones. Counting only documents that could match keeps
     /// each column's weighting independent of how often it is filled.
     pub fn scored_doc_count(&self) -> u64 {
-        self.length_stats.n_scored_docs
+        self.length_stats().n_scored_docs
     }
 
     /// The average document length this column is scored at — the one
     /// its norm table decodes with.
     pub fn avgdl(&self) -> f32 {
-        self.dl_norm_k1.avgdl()
+        self.dl_norm_k1().avgdl()
     }
 }
 
@@ -633,9 +836,9 @@ mod tests {
         let r = sparse_reader();
         let col = &r.columns[0];
         // Four tokens over the two documents that have any.
-        assert_eq!(col.length_stats.total_tokens, 4);
+        assert_eq!(col.length_stats().total_tokens, 4);
         assert_eq!(
-            col.length_stats.n_scored_docs,
+            col.length_stats().n_scored_docs,
             u64::from(SPARSE_FILLED_ROWS),
             "empty rows are not documents this column has"
         );
@@ -646,7 +849,7 @@ mod tests {
         // The doc-lengths array still has one slot per row: the array is
         // indexed by local doc id and cannot skip rows.
         assert_eq!(
-            col.dl_norm_k1.len(),
+            col.dl_norm_k1().len(),
             (SPARSE_FILLED_ROWS + SPARSE_EMPTY_ROWS) as usize
         );
     }
@@ -659,7 +862,7 @@ mod tests {
         let r = sparse_reader();
         let col = &r.columns[0];
         assert_eq!(col.avgdl(), 2.0);
-        assert_eq!(col.bound_scale, 1.0);
+        assert_eq!(col.bound_scale(), 1.0);
     }
 
     #[test]
@@ -682,24 +885,24 @@ mod tests {
             );
             let legacy_scale = 1.0 / (col.params.k1 + 1.0);
             assert!(
-                col.bound_scale > legacy_scale,
+                col.bound_scale() > legacy_scale,
                 "{era:?}: a corrected average owes an inflation factor beyond the scale change, got {}",
-                col.bound_scale
+                col.bound_scale()
             );
             // What that build recorded: the same token total over every row.
             let rows = (SPARSE_FILLED_ROWS + SPARSE_EMPTY_ROWS) as f32;
             let baked = col
-                .dl_norm_k1
-                .rescored(col.length_stats.total_tokens as f32 / rows, col.params);
+                .dl_norm_k1()
+                .rescored(col.length_stats().total_tokens as f32 / rows, col.params);
             for doc in 0..SPARSE_FILLED_ROWS {
                 for tf in 1..8u32 {
                     let at_baked =
                         bm25::score_with_dl_norm_k1(col.params.k1 + 1.0, tf, baked.get(doc));
-                    let at_scored = bm25::score_with_dl_norm_k1(1.0, tf, col.dl_norm_k1.get(doc));
+                    let at_scored = bm25::score_with_dl_norm_k1(1.0, tf, col.dl_norm_k1().get(doc));
                     assert!(
-                        at_baked * col.bound_scale >= at_scored - f32::EPSILON,
+                        at_baked * col.bound_scale() >= at_scored - f32::EPSILON,
                         "{era:?} doc {doc} tf {tf}: {at_baked} * {} < {at_scored}",
-                        col.bound_scale
+                        col.bound_scale()
                     );
                 }
             }
@@ -714,16 +917,16 @@ mod tests {
         // under-bounded every score.
         let r = sparse_reader();
         let col = &r.columns[0];
-        let wider = col.dl_norm_k1.rescored(col.avgdl() * 2.0, col.params);
-        let factor = col.dl_norm_k1.bound_scale(&wider, col.params, col.params);
+        let wider = col.dl_norm_k1().rescored(col.avgdl() * 2.0, col.params);
+        let factor = col.dl_norm_k1().bound_scale(&wider, col.params, col.params);
         assert!(
             factor > 1.0,
             "same parameters, larger average: expected an inflation factor, got {factor}"
         );
         // And it is still exactly 1.0 when nothing moves at all.
-        let same = col.dl_norm_k1.rescored(col.avgdl(), col.params);
+        let same = col.dl_norm_k1().rescored(col.avgdl(), col.params);
         assert_eq!(
-            col.dl_norm_k1.bound_scale(&same, col.params, col.params),
+            col.dl_norm_k1().bound_scale(&same, col.params, col.params),
             1.0
         );
     }
@@ -741,9 +944,9 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let col = &r.columns[0];
-        assert_eq!(col.length_stats.n_scored_docs, 0);
+        assert_eq!(col.length_stats().n_scored_docs, 0);
         assert_eq!(col.avgdl(), 0.0);
-        assert_eq!(col.dl_norm_k1.len(), 0);
+        assert_eq!(col.dl_norm_k1().len(), 0);
     }
 
     // ── Additional coverage ───────────────────────────────────────────
@@ -799,7 +1002,7 @@ mod tests {
         // Three non-empty docs ⇒ a positive average doc length and a
         // populated per-doc normalization table.
         assert!(cols[0].avgdl() > 0.0);
-        assert_eq!(cols[0].dl_norm_k1.len(), 3);
+        assert_eq!(cols[0].dl_norm_k1().len(), 3);
     }
 
     #[test]
@@ -823,7 +1026,7 @@ mod tests {
         let bytes = b.finish().expect("finish");
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
-        let nt = &r.columns[0].dl_norm_k1;
+        let nt = r.columns[0].dl_norm_k1();
 
         let per_doc = nt.bytes.len(); // 1 byte/doc
         let lut = std::mem::size_of_val(&*nt.lut); // 256 * 4 = 1 KiB

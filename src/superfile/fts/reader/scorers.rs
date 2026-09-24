@@ -431,7 +431,7 @@ impl FtsReader {
         k: usize,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let dl_norm_k1 = col_meta.dl_norm_k1();
 
         // `search_multi` passes `k = usize::MAX` to gather every
         // matching doc before weighting across columns; cap initial
@@ -707,7 +707,7 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let dl_norm_k1 = col_meta.dl_norm_k1();
 
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
@@ -913,7 +913,7 @@ impl FtsReader {
             "dispatch routes empty-side shapes to the AND/OR kernels"
         );
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let dl_norm_k1 = col_meta.dl_norm_k1();
         must_cursors.sort_by_key(|c| c.block_count());
 
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
@@ -948,7 +948,7 @@ impl FtsReader {
             return Vec::new();
         }
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let dl_norm_k1 = col_meta.dl_norm_k1();
         cursors.sort_by_key(|c| c.block_count());
         let mut sink = CollectSink { out: Vec::new() };
         self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
@@ -991,7 +991,7 @@ impl FtsReader {
             return count_and_intersect_membership(cursors);
         }
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let dl_norm_k1 = col_meta.dl_norm_k1();
         cursors.sort_by_key(|c| c.block_count());
         let mut sink = CountSink { n: 0 };
         self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
@@ -1351,7 +1351,7 @@ impl FtsReader {
         floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let dl_norm_k1 = col_meta.dl_norm_k1();
 
         // Sub-range seek: jump every cursor past any doc_id below
         // the lower bound. Cursors already past the bound stay where
@@ -1752,7 +1752,7 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let dl_norm_k1 = col_meta.dl_norm_k1();
 
         if doc_id_start > 0 {
             for c in &mut cursors {
@@ -1912,7 +1912,7 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let dl_norm_k1 = col_meta.dl_norm_k1();
 
         if doc_id_start > 0 {
             for c in &mut cursors {
@@ -2484,7 +2484,7 @@ impl FtsReader {
         k: usize,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let dl_norm_k1 = col_meta.dl_norm_k1();
 
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
@@ -3591,7 +3591,7 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let col = r.resolve_column_id("body").expect("col");
-        let norms = &r.columns[col as usize].dl_norm_k1;
+        let norms = &r.columns[col as usize].dl_norm_k1();
         let terms = ["book", "the", "of"];
         let build = async || {
             r.build_term_cursors(col, &terms, None, false, None, None)
@@ -3817,7 +3817,7 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let col = r.resolve_column_id("body").expect("col");
-        let dl_norm_k1 = &r.columns[col as usize].dl_norm_k1;
+        let dl_norm_k1 = &r.columns[col as usize].dl_norm_k1();
         for k in [1usize, 5, 20] {
             let mut cursors = r
                 .build_term_cursors(col, &["the", "rare"], None, false, None, None)
@@ -4185,7 +4185,7 @@ mod tests {
             .run(&strategy, |(seed, k1, b)| {
                 let (r, lead_tf, other_tf) = bound_reader(seed, k1, b);
                 let col = r.resolve_column_id("body").expect("col");
-                let norms = &r.columns[col as usize].dl_norm_k1;
+                let norms = &r.columns[col as usize].dl_norm_k1();
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .build()
                     .expect("runtime");
@@ -4244,7 +4244,7 @@ mod tests {
             .run(&strategy, |(seed, k1, b, k)| {
                 let (r, lead_tf, other_tf) = bound_reader(seed, k1, b);
                 let col = r.resolve_column_id("body").expect("col");
-                let norms = &r.columns[col as usize].dl_norm_k1;
+                let norms = &r.columns[col as usize].dl_norm_k1();
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .build()
                     .expect("runtime");

@@ -2821,33 +2821,40 @@ mod tests {
             .is_empty()
         );
     }
-    /// A committed superfile's open blob holds the parquet tail only: the
-    /// FTS open ranges are still recorded, so a cold open knows what to
-    /// fetch, but their bytes are no longer copied into the manifest.
+    /// A committed superfile's open blob carries the parquet tail plus the
+    /// two tiny FTS ranges a cold open reads — the header and the
+    /// doc-lengths directory — and never the dictionary or the length
+    /// arrays, which only a query that needs them reads.
     #[test]
-    fn open_blob_no_longer_inlines_the_dictionary() {
+    fn open_blob_inlines_the_fts_header_and_directory_but_not_the_dictionary() {
         let (_dir, _storage, st) = fresh_table();
         commit_segment(&st, 0);
         let reader = st.reader().expect("reader");
         for e in reader.manifest().get_all_superfiles() {
             let offsets = e.subsection_offsets.as_ref().expect("offsets recorded");
-            assert!(
-                !offsets.fts_open_ranges.is_empty(),
-                "the ranges are still recorded"
+            assert_eq!(
+                offsets.fts_open_ranges.len(),
+                2,
+                "the header and the directory: {:?}",
+                offsets.fts_open_ranges
             );
-            // An inlined range is its own blob entry starting at the range's
-            // offset. (On a fixture this small the parquet tail spans the
-            // whole file, so "covered by some entry" would not distinguish.)
-            for &(off, _) in &offsets.fts_open_ranges {
+            for &(off, len) in &offsets.fts_open_ranges {
                 assert!(
-                    !offsets.open_blob.iter().any(|(b_off, _)| *b_off == off),
-                    "an FTS open range must not be inlined into the manifest"
+                    len < 1024,
+                    "an FTS open range is a few hundred bytes, never a dictionary: {len}"
+                );
+                assert!(
+                    offsets
+                        .open_blob
+                        .iter()
+                        .any(|(b_off, b)| *b_off == off && b.len() as u64 == len),
+                    "each FTS open range is inlined"
                 );
             }
             assert_eq!(
                 offsets.open_blob.len(),
-                1,
-                "only the parquet tail is inlined"
+                1 + offsets.fts_open_ranges.len(),
+                "the parquet tail plus the FTS open ranges"
             );
         }
     }

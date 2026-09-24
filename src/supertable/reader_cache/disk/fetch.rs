@@ -576,9 +576,10 @@ impl DiskCacheStore {
             // overlay; the rest of the open batch — the parquet tail and
             // any open range the writer left out of the blob because
             // copying it into every manifest read would cost more than
-            // the round trip (a large superfile's term dictionary) — is
-            // fetched over the wire in one parallel wave. A complete blob
-            // means zero open-time GETs against the superfile object.
+            // the round trip (a large vector index, or the term dictionary
+            // an older writer recorded as an open range) — is fetched over
+            // the wire in one parallel wave. A complete blob means zero
+            // open-time GETs against the superfile object.
             for (off, bytes) in &offsets.open_blob {
                 overlay.install(*off, Bytes::copy_from_slice(bytes));
             }

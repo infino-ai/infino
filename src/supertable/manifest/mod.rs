@@ -2952,9 +2952,11 @@ pub struct SubsectionOffsets {
     /// batch so `VectorReader::open_lazy` can resolve header,
     /// directory, subheaders, and codec metadata from the overlay.
     pub vec_open_ranges: Vec<(u64, u64)>,
-    /// Absolute ranges that fully cover FTS open-time metadata:
-    /// header+dictionary and doc-length tables. Query-time postings
-    /// stay lazy.
+    /// Absolute ranges that cover what an FTS open reads: the header and
+    /// the doc-lengths directory for a current writer; older writers also
+    /// recorded the dictionary and the length arrays here, and the reader
+    /// still honours those. Postings, the dictionary and the length arrays
+    /// are otherwise read by the first query that needs them.
     pub fts_open_ranges: Vec<(u64, u64)>,
     /// the actual bytes covering the superfile's
     /// open-time batch (parquet footer tail + the

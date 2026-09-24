@@ -140,7 +140,7 @@ impl BoundDecoder {
         };
         Self {
             stored,
-            scale: idf_ratio * col.bound_scale,
+            scale: idf_ratio * col.bound_scale(),
         }
     }
 
@@ -213,8 +213,7 @@ mod tests {
         b.add_doc(0, 0, "a b").expect("doc");
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        let mut col = r.columns[0].clone();
-        col.bound_scale = 0.5;
+        let col = r.columns[0].clone().with_bound_scale_for_test(0.5);
 
         // idf 2.0 against a local 1.0 doubles; the column halves: net 1.0.
         let unit = BoundDecoder::new(StoredBound::V6, &col, 2.0, 1.0);

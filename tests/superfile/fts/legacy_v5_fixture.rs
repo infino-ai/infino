@@ -66,19 +66,19 @@ async fn a_blob_written_by_0_8_1_ranks_exactly_like_a_fresh_build() {
     for (old_col, fresh_col) in old.fts_columns_config().zip(fresh.fts_columns_config()) {
         assert_eq!(old_col.name, fresh_col.name);
         assert_eq!(old_col.scored_doc_count(), docs);
-        assert_eq!(old_col.length_stats.total_tokens, tokens);
+        assert_eq!(old_col.length_stats().total_tokens, tokens);
         assert_eq!(
             old_col.avgdl(),
             fresh_col.avgdl(),
             "{}: corrected average",
             old_col.name
         );
-        assert_eq!(fresh_col.bound_scale, 1.0);
+        assert_eq!(fresh_col.bound_scale(), 1.0);
         assert!(
-            old_col.bound_scale > 1.0 / (old_col.params.k1 + 1.0),
+            old_col.bound_scale() > 1.0 / (old_col.params.k1 + 1.0),
             "{}: a row-average file owes inflation beyond the scale change, got {}",
             old_col.name,
-            old_col.bound_scale
+            old_col.bound_scale()
         );
     }
 

@@ -226,7 +226,7 @@ impl FtsReader {
         floor_eff: f32,
         live_floor: Option<&LiveFloor>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1;
+        let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1();
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         // The strict-below admission cutoff, refreshed from the live
@@ -1139,7 +1139,7 @@ impl FtsReader {
                 {
                     return Ok((Vec::new(), MatchWork::default(), 0));
                 }
-                let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
+                let dl_norm_k1 = col_meta.dl_norm_k1().get(doc_id);
                 let score = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1);
                 if score <= floor_eff {
                     return Ok((Vec::new(), MatchWork::default(), 0));
@@ -1165,7 +1165,7 @@ impl FtsReader {
                         })?;
                 let idf_weight = global_idf
                     .unwrap_or_else(|| bm25::idf(col_meta.scored_doc_count(), decoded.n as u64));
-                let dl_norm_k1 = &col_meta.dl_norm_k1;
+                let dl_norm_k1 = col_meta.dl_norm_k1();
                 let mut heap: BinaryHeap<TopKEntry> =
                     BinaryHeap::with_capacity(k.min(decoded.n).max(1));
                 for j in 0..decoded.n {
@@ -1228,7 +1228,7 @@ impl FtsReader {
         // same idf and statistics the scores below use, so the skip tests
         // compare like with like. See `BoundDecoder`.
         let bounds = BoundDecoder::new(self.bounds, col_meta, idf_t, local_idf);
-        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let dl_norm_k1 = col_meta.dl_norm_k1();
 
         // Top-k min-heap; see `TopKEntry` for the reversed ordering
         // that makes `peek()` the current kth-best score.
@@ -1607,6 +1607,11 @@ impl FtsReader {
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<Vec<Option<TermCursor>>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
+        // Scoring needs the column's norms; a match-only build does not,
+        // and must not read the length array for them.
+        if !count_only {
+            self.ensure_norms(column_id).await?;
+        }
 
         // Resolve each term to an inline (df=1) value, a PFOR metadata
         // offset, or a miss — preserving query order and arity (a miss is a
@@ -1706,14 +1711,18 @@ impl FtsReader {
                         true => 1,
                         false => tf,
                     };
-                    let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
+                    // A match-only cursor never scores; a fixed idf keeps it
+                    // from consulting the column's statistics or norms.
+                    let (n_scored, dl_norm_k1, gidf) = match count_only {
+                        true => (0, 1.0, Some(0.0)),
+                        false => (
+                            col_meta.scored_doc_count(),
+                            col_meta.dl_norm_k1().get(doc_id),
+                            gidf,
+                        ),
+                    };
                     cursors.push(Some(TermCursor::new_inline(
-                        doc_id,
-                        tf,
-                        col_meta.scored_doc_count(),
-                        dl_norm_k1,
-                        gidf,
-                        weight,
+                        doc_id, tf, n_scored, dl_norm_k1, gidf, weight,
                     )));
                 }
                 Some(Resolved::Memo {
@@ -1727,9 +1736,14 @@ impl FtsReader {
                     gidf,
                 }) => {
                     let cursor = match short {
-                        true => {
-                            TermCursor::new_short(bytes, col_meta, gidf, weight, header_probed)?
-                        }
+                        true => TermCursor::new_short(
+                            bytes,
+                            col_meta,
+                            gidf,
+                            weight,
+                            header_probed,
+                            count_only,
+                        )?,
                         false => TermCursor::new(
                             bytes,
                             col_meta,
@@ -1753,15 +1767,18 @@ impl FtsReader {
                         true => 1,
                         false => tf,
                     };
-                    let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
-                    let cursor = TermCursor::new_inline(
-                        doc_id,
-                        tf,
-                        col_meta.scored_doc_count(),
-                        dl_norm_k1,
-                        gidf,
-                        weight,
-                    );
+                    // A match-only cursor never scores; a fixed idf keeps it
+                    // from consulting the column's statistics or norms.
+                    let (n_scored, dl_norm_k1, gidf) = match count_only {
+                        true => (0, 1.0, Some(0.0)),
+                        false => (
+                            col_meta.scored_doc_count(),
+                            col_meta.dl_norm_k1().get(doc_id),
+                            gidf,
+                        ),
+                    };
+                    let cursor =
+                        TermCursor::new_inline(doc_id, tf, n_scored, dl_norm_k1, gidf, weight);
                     cursors.push(Some(cursor));
                 }
                 Some(Resolved::Pfor {
@@ -1777,6 +1794,7 @@ impl FtsReader {
                             gidf,
                             weight,
                             header_probed,
+                            count_only,
                         )?,
                         false => TermCursor::new(
                             term_bytes,

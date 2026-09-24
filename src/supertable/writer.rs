@@ -2627,7 +2627,7 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
     // tells a routed query where a term's postings sit, so the dictionary is
     // not read on that path at all. A path that still needs it fetches it
     // once, lazily, through the disk cache.
-    let open_blob = build_open_blob(bytes, total_size, &vec_open_ranges, &[]);
+    let open_blob = build_open_blob(bytes, total_size, &vec_open_ranges, &fts_open_ranges);
 
     Some(SubsectionOffsets {
         total_size,
@@ -2659,16 +2659,13 @@ fn build_open_blob(
     // Must match `cold_fetch_lazy_with_hints`'s parquet tail
     // speculation length so the overlay covers `source.tail()`.
     const PARQUET_TAIL_SPEC: u64 = 64 * 1024;
-    // The blob is a second copy of the open ranges. For an FTS column
-    // those are the term dictionary and the per-doc lengths; on a
-    // superfile of a million or more documents the dictionary alone runs
-    // to tens of MiB and does not compress, and copying it into every
-    // manifest read costs more than the one round trip it saves the cold
-    // open. So each range is inlined only while it stays under this
-    // size; the reader fetches the ranges the blob lacks in its open
-    // wave. The parquet tail, a small superfile's whole dictionary and
-    // the doc lengths of all but the largest superfiles stay inline, so
-    // a table of many ordinary superfiles opens as it always did.
+    // The blob is a second copy of the open ranges. A vector column's can
+    // grow with the superfile, so each range is inlined only while it
+    // stays under this size and the reader fetches the ranges the blob
+    // lacks in its open wave. An FTS column's open ranges are its header
+    // and doc-lengths directory only — a few hundred bytes at most — so
+    // they always ride inline; its dictionary and length arrays are not
+    // open ranges at all and are read by the queries that need them.
     const OPEN_BLOB_INLINE_MAX_RANGE_BYTES: u64 = 4 * 1024 * 1024;
     let mut blob: Vec<(u64, Vec<u8>)> =
         Vec::with_capacity(1 + vec_open_ranges.len() + fts_open_ranges.len());
@@ -2872,6 +2869,13 @@ fn vector_open_ranges_multi_cell(blob: &[u8], off: u64, dim: usize) -> Option<Ve
     Some(merge_ranges(ranges))
 }
 
+/// The byte ranges an FTS reader reads to open: the fixed header and the
+/// doc-lengths directory (one small entry per column). Both are tiny, so
+/// the manifest carries them inline and a cold open costs no read against
+/// the superfile. The dictionary and the per-document length arrays are
+/// deliberately left out: a query the table-level term index resolves
+/// never reads the dictionary, a match-only query never reads the lengths,
+/// and either is fetched on first use by the query that needs it.
 fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
     let start = off as usize;
     let end = start.checked_add(len as usize)?;
@@ -2879,24 +2883,26 @@ fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>>
     if blob.len() < FTS_HEADER_SIZE {
         return None;
     }
-    let postings_offset =
-        read_u64_le(blob.get(hdr::POSTINGS_OFFSET_OFF..hdr::POSTINGS_OFFSET_OFF + U64_BYTES)?)
-            as usize;
+    let version = read_u32_le(blob.get(hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES)?);
+    let header_size = match version == crate::superfile::format::fts::VERSION_V1_LEGACY {
+        true => FTS_HEADER_SIZE,
+        false => crate::superfile::format::fts::HEADER_SIZE_V2,
+    };
+    let n_columns =
+        read_u32_le(blob.get(hdr::N_COLUMNS_OFF..hdr::N_COLUMNS_OFF + U32_BYTES)?) as usize;
     let doc_lengths_offset =
         read_u64_le(blob.get(hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES)?)
             as usize;
-    if postings_offset > blob.len()
-        || doc_lengths_offset > blob.len()
-        || postings_offset > doc_lengths_offset
-    {
+    // Entries plus the directory's CRC.
+    let dir_len = n_columns
+        .checked_mul(crate::superfile::fts::builder::DOC_LENGTHS_ENTRY_SIZE)?
+        .checked_add(4)?;
+    if header_size > blob.len() || doc_lengths_offset.checked_add(dir_len)? > blob.len() {
         return None;
     }
     Some(merge_ranges(vec![
-        (off, postings_offset as u64),
-        (
-            off + doc_lengths_offset as u64,
-            (blob.len() - doc_lengths_offset) as u64,
-        ),
+        (off, header_size as u64),
+        (off + doc_lengths_offset as u64, dir_len as u64),
     ]))
 }
 
