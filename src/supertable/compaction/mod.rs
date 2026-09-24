@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::{
     config::{CompactionSettings, RecalibratePolicy},
-    runtime_bridge::bridge_on_runtime,
+    runtime_bridge::{bridge_on_runtime, run_on_pool},
     superfile::{
         builder::SuperfileBuilder,
         fts::reader::ColumnLengthStats,
@@ -56,10 +56,12 @@ use crate::{
         },
         writer::{
             NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
-            finalize_compaction_commit, prepare_superfile_named, recalibrate_probe_laws,
-            refresh_slow_vector_state, split_overflow_cells, try_commit_attempt,
+            finalize_compaction_commit, maint_pool, prepare_superfile_named,
+            recalibrate_probe_laws, refresh_slow_vector_state, split_overflow_cells,
+            try_commit_attempt,
         },
     },
+    utils::trace::detail_span,
 };
 
 /// Held for as long as one process is reshaping superfiles, and released
@@ -706,7 +708,7 @@ impl Supertable {
         &self,
         superfiles: &[Arc<SuperfileEntry>],
     ) -> Result<PreparedSuperfile, BuildError> {
-        self.merge_superfiles_with(superfiles, &CompactionMerge)
+        self.merge_superfiles_with(superfiles, Arc::new(CompactionMerge))
             .await
     }
 
@@ -719,7 +721,7 @@ impl Supertable {
     pub(crate) async fn merge_superfiles_with(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
-        merge: &dyn SuperfileMerge,
+        merge: Arc<dyn SuperfileMerge>,
     ) -> Result<PreparedSuperfile, BuildError> {
         let manifest = { self.inner().manifest.load().clone() };
         let store = manifest.options.store.clone();
@@ -817,35 +819,47 @@ impl Supertable {
         // what lets a compacted table score like an unfragmented one.
         let replaced: HashSet<Uuid> = superfiles.iter().map(|e| e.superfile_id).collect();
         let fts_corpus = manifest.fts_corpus_stats(&replaced);
-        let (merged_bytes, superfile_stats): (Bytes, _) = {
-            // Every merge kind streams its output to a temp file and mmaps it
-            // back, so the corpus-sized merge output is never held as an anon
-            // Vec — the allocation that OOMs compaction on a memory-tight host.
-            // Mapped pages are file-backed and reclaimable; downstream publish
-            // takes `Bytes` unchanged (large superfiles already stream via
-            // put_multipart).
-            let mut output = NamedTempFile::new()
-                .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
-            let stats = {
-                let mut writer = BufWriter::new(output.as_file_mut());
-                let stats = merge.build(
-                    MergeInputs {
-                        readers: &readers_with_tombstones,
-                        entries: superfiles,
-                        superseded: &superseded_per_reader,
-                        fts_corpus: &fts_corpus,
-                    },
-                    &mut writer,
-                )?;
-                writer
-                    .flush()
-                    .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
-                stats
-            };
-            let bytes = mmap_readonly_bytes(output.path())
-                .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
-            (bytes, stats)
-        };
+        // The build is long, synchronous CPU work, so it runs on the
+        // maintenance pool rather than the thread driving this future.
+        // `run_on_pool` needs a `'static` closure, so everything it reads —
+        // the merge included — is owned before it crosses over.
+        let entries: Vec<Arc<SuperfileEntry>> = superfiles.to_vec();
+        let merge = Arc::clone(&merge);
+        let (merged_bytes, superfile_stats) = run_on_pool(
+            Some(maint_pool()?),
+            "compaction merge",
+            move || -> Result<(Bytes, _), BuildError> {
+                // Every merge kind streams its output to a temp file and mmaps it
+                // back, so the corpus-sized merge output is never held as an anon
+                // Vec — the allocation that OOMs compaction on a memory-tight host.
+                // Mapped pages are file-backed and reclaimable; downstream publish
+                // takes `Bytes` unchanged (large superfiles already stream via
+                // put_multipart).
+                let mut output = NamedTempFile::new()
+                    .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
+                let stats = {
+                    let mut writer = BufWriter::new(output.as_file_mut());
+                    let stats = merge.build(
+                        MergeInputs {
+                            readers: &readers_with_tombstones,
+                            entries: &entries,
+                            superseded: &superseded_per_reader,
+                            fts_corpus: &fts_corpus,
+                        },
+                        &mut writer,
+                    )?;
+                    writer
+                        .flush()
+                        .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
+                    stats
+                };
+                let bytes = mmap_readonly_bytes(output.path())
+                    .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
+                Ok((bytes, stats))
+            },
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))??;
 
         let shard = ShardOutput::new_with_params(
             merged_bytes,
@@ -863,7 +877,10 @@ impl Supertable {
             .first()
             .and_then(|first| first.stem.as_deref())
             .filter(|stem| superfiles.iter().all(|e| e.stem.as_deref() == Some(*stem)));
-        let prepared_superfile = prepare_superfile_named(self.inner().as_ref(), shard, stem)?;
+        let prepared_superfile = {
+            let _span = detail_span!("prepare_merged_superfile").entered();
+            prepare_superfile_named(self.inner().as_ref(), shard, stem)?
+        };
 
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)
     }
@@ -886,7 +903,7 @@ impl Supertable {
         job: CompactionJob,
         stale_seal_timeout: std::time::Duration,
     ) -> Result<JobOutcome, CompactionError> {
-        self.run_compaction_job_with(job, stale_seal_timeout, &CompactionMerge)
+        self.run_compaction_job_with(job, stale_seal_timeout, Arc::new(CompactionMerge))
             .await
     }
 
@@ -896,7 +913,7 @@ impl Supertable {
         &self,
         job: CompactionJob,
         stale_seal_timeout: std::time::Duration,
-        merge: &dyn SuperfileMerge,
+        merge: Arc<dyn SuperfileMerge>,
     ) -> Result<JobOutcome, CompactionError> {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
@@ -958,7 +975,10 @@ impl Supertable {
             });
         }
 
-        let merged_segment = match self.merge_superfiles_with(&inputs, merge).await {
+        let merged_segment = match self
+            .merge_superfiles_with(&inputs, Arc::clone(&merge))
+            .await
+        {
             Ok(seg) => Some(seg),
             // Every input was fully dead — all cells tombstoned, or all
             // superseded by an in-place cell split. There is nothing live to
@@ -1015,16 +1035,21 @@ impl Supertable {
 
         // Before the manifest swap: an orphan sidecar is recoverable, a
         // live output with no tombstones is not.
-        let carried_sidecar =
-            match carry_tombstones_to_output(merge, &wal_store, &inputs, &new_entries, &sealed)
-                .await
-            {
-                Ok(id) => id,
-                Err(e) => {
-                    unseal_all(&wal_store, sealed).await;
-                    return Err(e);
-                }
-            };
+        let carried_sidecar = match carry_tombstones_to_output(
+            merge.as_ref(),
+            &wal_store,
+            &inputs,
+            &new_entries,
+            &sealed,
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                unseal_all(&wal_store, sealed).await;
+                return Err(e);
+            }
+        };
 
         for attempt in 0..max_retries {
             let current = inner.manifest.load_full();

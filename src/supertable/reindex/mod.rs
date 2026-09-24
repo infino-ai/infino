@@ -17,7 +17,7 @@
 //! the files it must reach are exactly the large, already-compacted ones
 //! compaction skips — so the selection rule is different, and lives here.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use futures::future::join_all;
 use tracing::warn;
@@ -444,14 +444,14 @@ impl Supertable {
 
         // `Rewrite` is compaction's build with deletions off; `Reanalyze`
         // is this tool's own. Both carry the row set.
-        let merge: &dyn SuperfileMerge = match opts.mode {
-            ReindexMode::Rewrite => &build::RewriteMerge,
-            ReindexMode::Reanalyze => &build::ReanalyzeMerge,
+        let merge: Arc<dyn SuperfileMerge> = match opts.mode {
+            ReindexMode::Rewrite => Arc::new(build::RewriteMerge),
+            ReindexMode::Reanalyze => Arc::new(build::ReanalyzeMerge),
         };
         for (done, job) in plan_jobs(&all, opts.mode).into_iter().enumerate() {
             let superfile_id = job.inputs[0];
             let outcome = match self
-                .run_compaction_job_with(job, stale_seal_timeout, merge)
+                .run_compaction_job_with(job, stale_seal_timeout, Arc::clone(&merge))
                 .await
             {
                 Ok(outcome) => outcome,
