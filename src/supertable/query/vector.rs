@@ -4766,17 +4766,23 @@ impl SupertableReader {
             let pool = Arc::clone(&scan_pool);
             let budget = Arc::clone(&scan_budget);
             scan_futs.push(async move {
-                let flats = if coalesce {
-                    vr.coalesce_flats_to_cell_spans(&flats)
+                // Coalesce widens each cell's selected clusters to their
+                // contiguous `[min..max]` id span so the gap clusters between
+                // them ride one larger read. That span is an I/O plan only:
+                // the fetch covers it, but scoring and rerank stay on the
+                // originally selected clusters, passed through as `score_only`.
+                let (fetch, score_only) = if coalesce {
+                    (vr.coalesce_flats_to_cell_spans(&flats), Some(flats))
                 } else {
-                    flats
+                    (flats, None)
                 };
                 let scan = vr
                     .search_clusters_scan_async(
                         column,
                         query,
                         k,
-                        &flats,
+                        &fetch,
+                        score_only.as_deref(),
                         rerank_mult,
                         rerank_mult,
                         None,
