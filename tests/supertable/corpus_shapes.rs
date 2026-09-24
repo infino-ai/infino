@@ -546,15 +546,11 @@ shape_tests! {
 }
 
 /// The same writer as [`v6_positional`], plus a vector column — the shape
-/// that shows what a migration cannot do rather than what it can.
+/// every hybrid table in the wild is in.
 ///
-/// Its FTS index is stale exactly like its text-only sibling's, so a
-/// container rewrite is available. Re-analysis is not: it would have to
-/// decode every vector back to `f32` and re-encode it, and only an `Fp32`
-/// rerank codec survives that round trip. Nothing here selects a codec —
-/// `IndexSpec::vector` takes a column, a dimension and a metric, and the
-/// codec behind it is internal. So this table is un-re-analyzable by
-/// construction, which is the case every hybrid table in the wild is in.
+/// Both repairs are available to it: a rewrite moves the container, and
+/// re-analysis rebuilds the terms while carrying the vector subsection
+/// across untouched rather than decoding it.
 mod v6_hybrid {
     use super::*;
 

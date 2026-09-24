@@ -13,7 +13,7 @@
 use std::{sync::Arc, time::Duration};
 
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
-use infino::{ReindexError, ReindexOptions, Supertable, superfile::format::fts::VERSION_CURRENT};
+use infino::{ReindexOptions, Supertable, superfile::format::fts::VERSION_CURRENT};
 
 use crate::corpus_shapes::{
     N_DOCS, assert_scores_equivalent, blob_versions, corpus_dir, hits, hits_k, open_corpus,
@@ -244,61 +244,26 @@ fn a_mixed_table_reads_cleanly_across_versions_and_revisions() {
     assert_mixed_table_reads_cleanly("v2_positions_region", 2);
 }
 
-/// A table with a vector index can have its container migrated and its
-/// terms repaired **never** — and the assessment says so before anything
-/// is attempted.
+/// A table with a vector index can have its terms repaired too.
 ///
-/// Re-analysis rebuilds an index from stored text, which means decoding
-/// every vector back to `f32` and re-encoding it. Only the `Fp32` rerank
-/// codec survives that round trip; a quantized or multi-cell index can be
-/// spliced across a merge but not reconstructed. `IndexSpec::vector` takes
-/// a column, a dimension and a metric — the codec is internal and is
-/// `Sq16` for cosine, `Sq16Adaptive` otherwise. **No public API reaches
-/// `Fp32`**, so this is not an edge case: it is every hybrid table.
-///
-/// What that costs is worth stating plainly. The silent recall loss this
-/// migration exists to repair cannot be repaired on these tables. They can
-/// be brought to the current container and no further. The test exists so
-/// that stays a deliberate, visible limitation instead of a surprise at
-/// the point someone tries.
+/// Re-analysis used to be refused here: rebuilding terms went through the
+/// append path, which decodes every vector back to `f32`, and only the
+/// `Fp32` rerank codec survives that round trip — a codec no public API
+/// reaches. Carrying the vector subsection instead of rebuilding it
+/// removes the decode, and with it the limitation.
 #[test]
-fn a_vector_bearing_table_can_be_rewritten_but_never_reanalyzed() {
+fn a_vector_bearing_table_can_be_rewritten_and_reanalyzed() {
     let Some((_tmp, table, root)) = open_corpus("v6_hybrid") else {
         return;
     };
 
-    // The assessment names the problem up front — the whole point of
-    // reporting it rather than discovering it through a failure.
     let before = table.index_staleness().expect("assess a hybrid table");
     assert!(before.superfiles > 0, "the fixture has no superfiles");
     assert_eq!(
-        before.reanalysis_blocked, before.awaiting_reanalysis,
-        "every stale superfile here carries a vector index that cannot be \
-         rebuilt, so every one of them blocks re-analysis"
-    );
-    assert!(
-        before.reanalysis_blocked > 0,
-        "a table with a vector index reported nothing blocking re-analysis: \
-         {before:?}"
+        before.awaiting_reanalysis, before.superfiles,
+        "every corpus file predates the analysis revision"
     );
 
-    // And re-analysis refuses, before committing anything rather than
-    // halfway through a table.
-    let refused = table
-        .reindex(&ReindexOptions::reanalyzing())
-        .expect_err("re-analysis must refuse a table whose vectors cannot be rebuilt");
-    assert!(
-        matches!(refused, ReindexError::ReanalyzeUnsupported { .. }),
-        "expected the up-front refusal, got {refused:?}"
-    );
-    assert_eq!(
-        blob_versions(&root).len(),
-        before.superfiles,
-        "the refusal wrote something"
-    );
-
-    // The cheap repair is still available, and it carries the vectors
-    // across rather than rebuilding them.
     let probe: Vec<f32> = infino_probe_embedding();
     let hits_before = vector_hits(&table, &probe);
     assert!(
@@ -307,11 +272,11 @@ fn a_vector_bearing_table_can_be_rewritten_but_never_reanalyzed() {
     );
 
     let report = table
-        .reindex(&ReindexOptions::default())
-        .expect("a container rewrite is available to a hybrid table");
+        .reindex(&ReindexOptions::reanalyzing())
+        .expect("re-analysis is available to a hybrid table");
     assert_eq!(
-        report.rewritten, before.needing_rewrite,
-        "the rewrite did not migrate every stale container"
+        report.rewritten, before.superfiles,
+        "re-analysis did not repair every stale superfile"
     );
 
     table.gc(Duration::ZERO).expect("collect superseded bytes");
@@ -322,20 +287,20 @@ fn a_vector_bearing_table_can_be_rewritten_but_never_reanalyzed() {
     assert_eq!(
         vector_hits(&table, &probe),
         hits_before,
-        "the rewrite moved the vector results it was supposed to splice across"
+        "re-analysis moved the vector results it carries across untouched"
     );
 
-    // Still blocked, still honest about it: the container axis is clear
-    // and the analysis axis cannot be.
-    let after = table.index_staleness().expect("assess the rewritten table");
+    // Both axes clear: the container is current and the terms were rebuilt
+    // from stored text, which is what a rewrite alone could never do.
+    let after = table.index_staleness().expect("assess the repaired table");
     assert_eq!(after.needing_rewrite, 0, "containers are still behind");
     assert_eq!(
-        after.reanalysis_blocked, before.reanalysis_blocked,
-        "a container rewrite changed what re-analysis can do, which it cannot"
+        after.awaiting_reanalysis, 0,
+        "terms are still from an older analysis: {after:?}"
     );
     assert!(
-        !after.is_current(),
-        "a table that can never be fully repaired must not report itself finished"
+        after.is_current(),
+        "a fully repaired table must report itself finished: {after:?}"
     );
 }
 
@@ -388,10 +353,6 @@ fn assert_staleness_predicts_the_run(shape: &str) {
     assert_eq!(
         before.awaiting_reanalysis, before.superfiles,
         "{shape}: every corpus file predates the analysis revision"
-    );
-    assert_eq!(
-        before.reanalysis_blocked, 0,
-        "{shape}: these tables carry no vector index, so nothing blocks re-analysis"
     );
     assert!(
         before.bytes_to_rewrite > 0,

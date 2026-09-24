@@ -31,7 +31,6 @@ use crate::{
     superfile::{
         fts::reader::{FtsStaleness, StaleColumn},
         reader::SuperfileReader,
-        vector::rerank_codec::RerankCodec,
     },
     supertable::{
         Supertable,
@@ -71,16 +70,6 @@ pub(crate) struct StaleSuperfile {
     /// Live bytes, for the job's size estimate.
     pub(crate) live_bytes: u64,
     pub(crate) fts: FtsStaleness,
-    /// Whether this superfile's terms can be rebuilt from its text.
-    ///
-    /// Re-analysis decodes each row and re-encodes the whole file, vectors
-    /// included — and only an `fp32` rerank codec can be decoded back to
-    /// the vectors an append needs. A quantized or multi-cell index can be
-    /// spliced across a merge but not reconstructed, so re-analyzing one
-    /// would fail partway with a decode error. Detected when the file is
-    /// assessed so the refusal comes before any rewrite commits, not after
-    /// half the table has moved.
-    pub(crate) reanalyzable: bool,
 }
 
 impl StaleSuperfile {
@@ -96,23 +85,11 @@ impl StaleSuperfile {
         reader: &SuperfileReader,
     ) -> Self {
         let fts = reader.fts().map(|f| f.staleness()).unwrap_or_default();
-        // No vector index: nothing to re-encode, so a rebuild is fine.
-        // With one, every column has to survive a decode to `f32`.
-        let reanalyzable = match reader.vec() {
-            None => true,
-            Some(vec) => {
-                !vec.is_multi_cell()
-                    && vec
-                        .vector_columns_config()
-                        .all(|c| c.rerank_codec == RerankCodec::Fp32)
-            }
-        };
         Self {
             superfile_id,
             partition_key,
             live_bytes,
             fts,
-            reanalyzable,
         }
     }
 
@@ -157,16 +134,6 @@ pub struct StalenessReport {
     /// instead, because re-analyzing it would rewrite the corpus and
     /// change nothing.
     pub awaiting_reanalysis: usize,
-    /// Superfiles [`crate::ReindexMode::Reanalyze`] would refuse, because
-    /// their vectors cannot be reconstructed.
-    ///
-    /// A quantized or multi-cell vector index can be spliced across a
-    /// merge but not rebuilt from what the file holds. The run refuses
-    /// before it commits anything rather than failing halfway — and
-    /// non-zero here is how a caller learns that *before* starting, which
-    /// is the difference between choosing a mode and discovering the
-    /// choice was unavailable.
-    pub reanalysis_blocked: usize,
     /// Live bytes in the superfiles a [`crate::ReindexMode::Rewrite`]
     /// would read and write again.
     ///
@@ -231,21 +198,6 @@ pub struct ReindexReport {
     /// source, which is outside the engine — so this is reported rather
     /// than swallowed.
     pub unrepairable_columns: Vec<String>,
-}
-
-/// The first superfile that would make a re-analysis fail partway, if any.
-///
-/// Only asks the question for [`ReindexMode::Reanalyze`], and only about
-/// files that would actually be re-analyzed: a file whose terms are
-/// already current is never rebuilt, so its vector codec is irrelevant.
-fn first_blocking_reanalysis(stale: &[StaleSuperfile], mode: ReindexMode) -> Option<Uuid> {
-    if mode != ReindexMode::Reanalyze {
-        return None;
-    }
-    stale
-        .iter()
-        .find(|s| s.fts.needs_reanalysis() && !s.reanalyzable)
-        .map(|s| s.superfile_id)
 }
 
 /// One rewrite job per stale superfile.
@@ -425,9 +377,6 @@ impl Supertable {
             }
             if file.fts.needs_reanalysis() {
                 report.awaiting_reanalysis += 1;
-                if !file.reanalyzable {
-                    report.reanalysis_blocked += 1;
-                }
             }
             for column in file.unrepairable_columns() {
                 if !report.unrepairable_columns.contains(&column.name) {
@@ -491,15 +440,6 @@ impl Supertable {
                 report.unrepairable_columns.len(),
                 report.unrepairable_columns.join(", "),
             );
-        }
-
-        // Refuse before anything commits. A reindex that discovered this
-        // halfway would leave the table split between rebuilt and original
-        // files, with no way to finish and nothing saying why.
-        if let Some(blocked) = first_blocking_reanalysis(&all, opts.mode) {
-            return Err(ReindexError::ReanalyzeUnsupported {
-                superfile_id: blocked,
-            });
         }
 
         // `Rewrite` is compaction's build with deletions off; `Reanalyze`
@@ -576,7 +516,6 @@ mod tests {
             partition_key: vec![7],
             live_bytes: 1_024,
             fts,
-            reanalyzable: true,
         }
     }
 
@@ -668,50 +607,6 @@ mod tests {
             ReindexMode::Rewrite,
         );
         assert_eq!(forward, reversed);
-    }
-
-    fn unrebuildable(id: u128) -> StaleSuperfile {
-        StaleSuperfile {
-            reanalyzable: false,
-            ..entry(id, behind_analysis())
-        }
-    }
-
-    /// A table whose vectors cannot be rebuilt is refused before any
-    /// rewrite commits, not discovered halfway through one.
-    #[test]
-    fn reanalysis_is_refused_up_front_when_a_file_cannot_be_rebuilt() {
-        let stale = [unrebuildable(1)];
-        assert_eq!(
-            first_blocking_reanalysis(&stale, ReindexMode::Reanalyze),
-            Some(Uuid::from_u128(1)),
-        );
-    }
-
-    /// The same table rewrites its layout fine — only re-analysis is
-    /// blocked, so the cheap repair stays available.
-    #[test]
-    fn a_layout_rewrite_is_not_blocked_by_an_unrebuildable_vector_index() {
-        let stale = [unrebuildable(1)];
-        assert_eq!(
-            first_blocking_reanalysis(&stale, ReindexMode::Rewrite),
-            None
-        );
-    }
-
-    /// A file that needs no re-analysis is never rebuilt, so its codec
-    /// cannot block one.
-    #[test]
-    fn an_already_current_file_never_blocks_reanalysis() {
-        let stale = [StaleSuperfile {
-            reanalyzable: false,
-            ..entry(1, behind_container())
-        }];
-        assert_eq!(
-            first_blocking_reanalysis(&stale, ReindexMode::Reanalyze),
-            None,
-            "its terms are current, so re-analysis would not touch it"
-        );
     }
 
     /// Nothing stale, nothing to do — the state a completed migration

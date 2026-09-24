@@ -212,8 +212,6 @@ impl core::panic::unwind_safe::UnwindSafe for infino::RecalibratePolicy
 pub infino::ReindexError::AlreadyRunning
 pub infino::ReindexError::Assess(alloc::string::String)
 pub infino::ReindexError::NoStorage
-pub infino::ReindexError::ReanalyzeUnsupported
-pub infino::ReindexError::ReanalyzeUnsupported::superfile_id: uuid::Uuid
 pub infino::ReindexError::Rewrite
 pub infino::ReindexError::Rewrite::cause: alloc::string::String
 pub infino::ReindexError::Rewrite::superfile_id: uuid::Uuid
@@ -584,7 +582,6 @@ impl core::panic::unwind_safe::UnwindSafe for infino::ReindexReport
 pub infino::StalenessReport::awaiting_reanalysis: usize
 pub infino::StalenessReport::bytes_to_rewrite: u64
 pub infino::StalenessReport::needing_rewrite: usize
-pub infino::StalenessReport::reanalysis_blocked: usize
 pub infino::StalenessReport::superfiles: usize
 pub infino::StalenessReport::unrepairable_columns: alloc::vec::Vec<alloc::string::String>
 impl infino::StalenessReport
