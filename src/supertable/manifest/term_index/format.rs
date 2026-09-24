@@ -710,6 +710,51 @@ mod tests {
             Root::decode(&bytes[..bytes.len() - 3]).is_err(),
             "truncated"
         );
+        // The previous layout carried no smallest doc ids: a root written
+        // by it names its version, and is refused on that alone.
+        let mut previous = bytes.clone();
+        previous[MAGIC_LEN..MAGIC_LEN + U32_LEN].copy_from_slice(&1u32.to_le_bytes());
+        assert!(
+            matches!(Root::decode(&previous), Err(TermIndexError::Malformed(m)) if m.contains("unsupported version 1"))
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(
+            matches!(Root::decode(&trailing), Err(TermIndexError::Malformed(m)) if m.contains("trailing")),
+            "bytes past the last segment are malformed, not ignored"
+        );
+    }
+
+    /// A prefix with no upper bound (all `0xFF`) runs to the end of each
+    /// segment: every slice from the first that can hold it onward.
+    #[test]
+    fn a_prefix_with_no_upper_bound_scans_to_the_end_of_each_segment() {
+        let hi = |a: &[u8], b: &[u8], n: u8| SliceRef {
+            first_key: a.to_vec(),
+            last_key: b.to_vec(),
+            content_hash: ContentHash([n; 32]),
+            len: 1,
+        };
+        let root = Root {
+            superfiles: vec![],
+            id_mins: vec![],
+            segments: vec![Segment {
+                slices: vec![
+                    slice_ref("a", "m", 1),
+                    hi(&[0xFF, 0x01], &[0xFF, 0x05], 2),
+                    hi(&[0xFF, 0x06], &[0xFF, 0xFF], 3),
+                ],
+            }],
+        };
+        let hashes: Vec<u8> = root
+            .slices_for_prefix(&[0xFF])
+            .map(|s| s.content_hash.0[0])
+            .collect();
+        assert_eq!(
+            hashes,
+            vec![2, 3],
+            "from the first slice that can hold it to the end"
+        );
     }
 
     #[test]

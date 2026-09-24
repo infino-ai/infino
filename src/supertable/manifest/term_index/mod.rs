@@ -72,6 +72,15 @@ pub(crate) const STORAGE_PREFIX: &str = "term-index/";
 /// it has fallen out.
 const RESIDENT_SLICE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
+/// A stored bound is exact, but a ceiling reaches the query through a
+/// handful of roundings — the idf ratio, its product with the bound, a
+/// phrase's idf recovery — that the score itself does not go through, so
+/// the two can differ by a few ulps in either direction. A ceiling an ulp
+/// below a real score would skip the superfile holding it; widening by
+/// this factor keeps every ceiling an upper bound and prunes no less in
+/// practice.
+const CEILING_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
+
 /// Decoded posting runs kept per loaded index, keyed by `column \x1F term`.
 /// A ranked query asks for the same term's postings several times — to
 /// choose parts, to select superfiles, for ceilings, for locations — and
@@ -531,7 +540,7 @@ impl TermIndex {
                     };
                 }
             }
-            out.insert(id, ceiling);
+            out.insert(id, ceiling * CEILING_SLACK);
         }
         Ok(out)
     }
@@ -670,6 +679,7 @@ mod tests {
     use super::*;
     use crate::{
         storage::LocalFsStorageProvider,
+        supertable::query::prune::select_superfiles,
         utils::terms::{FstValue, make_key},
     };
 
@@ -940,10 +950,15 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        SupertableOptions::new(title_schema(), vec![FtsConfig::new("title")], Vec::new())
-            .expect("options")
-            .with_writer_pool(pool)
-            .with_storage(Arc::clone(storage))
+        // Positions on, so phrase queries have something to verify against.
+        SupertableOptions::new(
+            title_schema(),
+            vec![FtsConfig::new("title").positions(true)],
+            Vec::new(),
+        )
+        .expect("options")
+        .with_writer_pool(pool)
+        .with_storage(Arc::clone(storage))
     }
 
     /// An empty FTS table on local-filesystem storage, its options adjusted
@@ -1276,6 +1291,13 @@ mod tests {
         let (live_before, root_before) = live_and_covered(&st, &storage, &rt);
         assert!(live_before.len() >= SEGMENTS);
         let segments_before = root_before.segments.len();
+        // `s0d00` names one title in segment 0 — a superfile compaction
+        // removes; `alpha` spans every segment.
+        let before: Vec<Vec<String>> = ["alpha", "s0d00"]
+            .iter()
+            .map(|q| ranked_titles(&st, q))
+            .collect();
+        assert_eq!(before[1].len(), 1);
 
         st.compact(&CompactionSettings {
             min_fill_percent: 1,
@@ -1334,6 +1356,66 @@ mod tests {
             shared.len() > live_after.len(),
             "the removed inputs' postings remain until the next fold"
         );
+
+        // Through the query path, a posting is followed only if its
+        // superfile is live: the removed inputs' stale postings route
+        // nowhere, the merged superfile's fresh ones route to it, and
+        // every row comes back.
+        let after: Vec<Vec<String>> = ["alpha", "s0d00"]
+            .iter()
+            .map(|q| ranked_titles(&st, q))
+            .collect();
+        assert_eq!(after, before, "the same rows rank after compaction");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let routed = rt
+            .block_on(select_superfiles(
+                manifest,
+                &[PruneLeaf::TermPresence {
+                    column: "title".into(),
+                    terms: vec!["s0d00".into()],
+                    mode: BoolMode::Or,
+                }],
+            ))
+            .expect("select");
+        assert_eq!(
+            routed.len(),
+            1,
+            "a removed input's token routes to one superfile"
+        );
+        assert!(
+            live_after.contains(&routed[0].superfile_id),
+            "and that superfile is the live, merged one"
+        );
+    }
+
+    /// Titles ranked for `query`, in result order, over the whole table.
+    fn ranked_titles(st: &crate::supertable::Supertable, query: &str) -> Vec<String> {
+        use arrow_array::{Array, LargeStringArray};
+
+        use crate::Bm25SearchOptions;
+        let reader = st.reader().expect("reader");
+        let batches = reader
+            .bm25_search(
+                "title",
+                query,
+                DOCS_PER_SEGMENT * SEGMENTS,
+                Bm25SearchOptions::new(),
+                Some(&["title"]),
+            )
+            .expect("search");
+        let mut out = Vec::new();
+        for b in &batches {
+            let titles = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title");
+            for i in 0..b.num_rows() {
+                out.push(titles.value(i).to_owned());
+            }
+        }
+        out
     }
     /// A row update replaces its rows with a fresh superfile through the
     /// update pipeline rather than the append path. Its postings publish
@@ -1458,6 +1540,650 @@ mod tests {
         assert!(
             !committed.term_index_complete(),
             "an unindexed live superfile makes the index incomplete"
+        );
+    }
+
+    /// Every ceiling the index computes is an upper bound on the score any
+    /// document actually receives — for single terms, multi-term unions
+    /// and phrases, under per-superfile statistics and under table-wide
+    /// statistics, where the stored bound is rescaled from the superfile's
+    /// own idf to the query's.
+    #[test]
+    fn query_ceilings_bound_real_scores_for_terms_and_phrases_under_both_stats() {
+        use crate::{Bm25SearchOptions, superfile::fts::reader::Bm25Stats};
+
+        let (_dir, storage, st) = fresh_table();
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let reader = st.reader().expect("reader");
+        let entries = reader.manifest().get_all_superfiles().to_vec();
+        let ranges: Vec<(Uuid, i128, i128)> = entries
+            .iter()
+            .map(|e| (e.superfile_id, e.id_min, e.id_max))
+            .collect();
+        let superfile_of = |id: i128| -> Uuid {
+            ranges
+                .iter()
+                .find(|(_, lo, hi)| *lo <= id && id <= *hi)
+                .map(|(sf, _, _)| *sf)
+                .expect("every hit falls in one superfile's id range")
+        };
+        // Table-wide idf per term, as the query scores with under
+        // `Bm25Stats::Global`: N is the scored-document total, df the sum
+        // over every live superfile's posting.
+        let scored_total: u64 = entries
+            .iter()
+            .map(|e| {
+                e.fts_summary
+                    .get("title")
+                    .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
+                    .unwrap_or(e.n_docs)
+            })
+            .sum();
+        let global_idf: HashMap<&str, f32> = ["alpha", "beta", "shared", "s1d02"]
+            .into_iter()
+            .map(|term| {
+                let df: u64 = rt
+                    .block_on(index.postings("title", term))
+                    .expect("postings")
+                    .iter()
+                    .map(|p| p.df)
+                    .sum();
+                (term, bm25_idf(scored_total, df))
+            })
+            .collect();
+        // (query, plain terms, phrases)
+        let queries: [(&str, &[&str], &[&[&str]]); 5] = [
+            ("alpha", &["alpha"], &[]),
+            ("alpha shared", &["alpha", "shared"], &[]),
+            ("\"alpha shared\"", &[], &[&["alpha", "shared"]]),
+            (
+                "shared \"alpha shared\"",
+                &["shared"],
+                &[&["alpha", "shared"]],
+            ),
+            ("beta \"shared s1d02\"", &["beta"], &[&["shared", "s1d02"]]),
+        ];
+        for stats in [Bm25Stats::PerSuperfile, Bm25Stats::Global] {
+            for (query, terms, phrases) in &queries {
+                let phrases: Vec<Vec<&str>> = phrases.iter().map(|p| p.to_vec()).collect();
+                let idf_used = |term: &str, local: f32| match stats {
+                    Bm25Stats::PerSuperfile => local,
+                    Bm25Stats::Global => global_idf[term],
+                };
+                let ceilings = rt
+                    .block_on(index.query_ceilings("title", terms, &phrases, &entries, &idf_used))
+                    .expect("ceilings");
+                let batches = reader
+                    .bm25_search(
+                        "title",
+                        query,
+                        DOCS_PER_SEGMENT * SEGMENTS,
+                        Bm25SearchOptions::new().with_stats(stats),
+                        Some(&["_id", "score"]),
+                    )
+                    .expect("search");
+                let hits = hits_of(&batches);
+                assert!(!hits.is_empty(), "{query}: the fixture has hits");
+                for (id, score) in hits {
+                    let sf = superfile_of(id);
+                    let ceiling = ceilings[&sf];
+                    assert!(
+                        score <= ceiling,
+                        "{query} under {stats:?} in {sf}: score {score} exceeds ceiling {ceiling}"
+                    );
+                    assert!(
+                        ceiling.is_finite(),
+                        "{query}: a real ceiling, not the placeholder"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A phrase whose members all carry the placeholder bound is unbounded
+    /// in that superfile, not absent: its ceiling is `+∞`, so the superfile
+    /// is opened unconditionally rather than skipped.
+    #[test]
+    fn a_phrase_of_unbounded_members_has_an_unbounded_ceiling() {
+        use crate::supertable::manifest::{SuperfileUri, VectorLayout};
+
+        let dir = TempDir::new().expect("tempdir");
+        // The `contribution` helper records the `+inf` placeholder bound.
+        let c = contribution(&dir, 1, &[("title", "alpha", 5), ("title", "shared", 9)]);
+        let built = build(&[c], &BuildPolicy::default()).expect("build");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let reference = rt
+            .block_on(write_built(storage.as_ref(), built))
+            .expect("write");
+        let index = rt
+            .block_on(TermIndex::load(Arc::clone(&storage), None, &reference))
+            .expect("load");
+        let entry = Arc::new(SuperfileEntry {
+            stem: None,
+            birth_version: 0,
+            superfile_id: Uuid::from_u128(1),
+            uri: SuperfileUri::new_v4(),
+            n_docs: 10,
+            id_min: 0,
+            id_max: 9,
+            scalar_stats: Default::default(),
+            fts_summary: Default::default(),
+            vector_summary: Default::default(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        });
+        let entries = vec![entry];
+        let local = |_: &str, idf: f32| idf;
+        let ceilings = rt
+            .block_on(index.query_ceilings(
+                "title",
+                &[],
+                &[vec!["alpha", "shared"]],
+                &entries,
+                &local,
+            ))
+            .expect("ceilings");
+        assert_eq!(ceilings[&Uuid::from_u128(1)], f32::INFINITY);
+        let ceilings = rt
+            .block_on(index.query_ceilings("title", &["alpha"], &[], &entries, &local))
+            .expect("ceilings");
+        assert_eq!(ceilings[&Uuid::from_u128(1)], f32::INFINITY);
+    }
+
+    /// A superfile whose ceiling exactly equals the running k-th score is
+    /// still opened: it may hold a document that ties, and the stable
+    /// `_id` order decides ties, so skipping it would return the wrong
+    /// document. Only a ceiling strictly below the floor is skipped.
+    #[test]
+    fn a_superfile_whose_ceiling_ties_the_floor_is_still_opened() {
+        use crate::{
+            Bm25SearchOptions,
+            runtime_metrics::op_stats::{self, with_op_stats},
+        };
+
+        let (_dir, _storage, st) = fresh_table_with_open_window(1);
+        // Every title is three tokens, so length normalization is identical
+        // everywhere and `alpha shared x` scores the same in both superfiles
+        // under table-wide statistics. The second superfile's tf-2 title
+        // gives it the higher ceiling, so it opens first; the first
+        // superfile's ceiling then equals the k-th score exactly.
+        commit_titles(&st, &["alpha shared x".to_owned()]);
+        commit_titles(
+            &st,
+            &["alpha alpha x".to_owned(), "alpha shared x".to_owned()],
+        );
+        let run = |k: usize| -> (Vec<(i128, f32)>, u64) {
+            with_op_stats(|| {
+                let reader = st.reader().expect("reader");
+                let batches = reader
+                    .bm25_search(
+                        "title",
+                        "alpha",
+                        k,
+                        Bm25SearchOptions::new(),
+                        Some(&["_id", "score"]),
+                    )
+                    .expect("search");
+                let opened = op_stats::current().expect("metered").superfiles_opened();
+                (hits_of(&batches), opened)
+            })
+            .0
+        };
+        let (all, _) = run(3);
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all[1].1, all[2].1,
+            "the two `alpha shared x` titles tie on score"
+        );
+        assert!(all[1].0 < all[2].0, "ties resolve to the lower id");
+        let (top2, opened) = run(2);
+        assert_eq!(opened, 2, "the tying superfile is opened");
+        assert_eq!(
+            top2,
+            all[..2].to_vec(),
+            "and its lower-id document wins the tie"
+        );
+    }
+
+    /// Ceiling-ordered opening changes only which superfiles are opened,
+    /// never the answer: a multi-term query with a phrase returns the same
+    /// `(id, score)` list at every window width, and the same as the
+    /// unordered path (which a scoring override selects).
+    #[test]
+    fn ceiling_ordered_results_match_at_every_window_and_the_unordered_path() {
+        use crate::{Bm25SearchOptions, superfile::fts::bm25::Bm25Params};
+
+        let query = "alpha beta \"alpha shared\"";
+        let k = 7;
+        let mut results: Vec<Vec<(i128, f32)>> = Vec::new();
+        for window in [1usize, 2, 64] {
+            let (_dir, _storage, st) = fresh_table_with_open_window(window);
+            for segment in 0..SEGMENTS {
+                commit_segment(&st, segment);
+            }
+            let reader = st.reader().expect("reader");
+            let ordered = reader
+                .bm25_search(
+                    "title",
+                    query,
+                    k,
+                    Bm25SearchOptions::new(),
+                    Some(&["_id", "score"]),
+                )
+                .expect("search");
+            let defaults = Bm25Params::default();
+            let unordered = reader
+                .bm25_search(
+                    "title",
+                    query,
+                    k,
+                    Bm25SearchOptions::new().with_bm25(defaults.k1, defaults.b),
+                    Some(&["_id", "score"]),
+                )
+                .expect("search");
+            let ordered = hits_of(&ordered);
+            assert_eq!(ordered.len(), k);
+            assert_eq!(
+                ordered,
+                hits_of(&unordered),
+                "window {window}: the ordered and unordered paths agree"
+            );
+            results.push(ordered);
+        }
+        // Ids are minted per table, so across tables the scores are what
+        // must agree; within a table the `(id, score)` lists already did.
+        let scores: Vec<Vec<f32>> = results
+            .iter()
+            .map(|r| r.iter().map(|(_, s)| *s).collect())
+            .collect();
+        assert!(
+            scores.iter().all(|s| *s == scores[0]),
+            "every window returns the same ranking: {results:?}"
+        );
+    }
+
+    /// A memo that covers only some of a query's terms serves those and
+    /// leaves the rest to the dictionary: the hits are identical to a run
+    /// with no memo and to a run whose memo covers every term.
+    #[test]
+    fn a_partial_memo_falls_back_to_the_dictionary_for_the_terms_it_lacks() {
+        use crate::superfile::{SuperfileReader, fts::reader::ClauseLists};
+
+        let (dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let entries = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .to_vec();
+        assert_eq!(entries.len(), 1);
+        let bytes = std::fs::read(dir.path().join(entries[0].uri.storage_path())).expect("bytes");
+        let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+        let memo_for = |terms: &[&str]| {
+            let by_sf = rt
+                .block_on(index.locations("title", terms, &entries))
+                .expect("locations");
+            let pairs: Vec<(&str, u64, FstValue)> = by_sf[&entries[0].superfile_id]
+                .iter()
+                .filter_map(|(t, df, l)| l.to_dict_value().map(|v| (t.as_str(), *df, v)))
+                .collect();
+            assert_eq!(pairs.len(), terms.len(), "every asked term has a location");
+            rt.block_on(sf.term_memo_from_dict_values(&pairs))
+                .expect("memo")
+        };
+        let run = |memo: Option<&crate::superfile::fts::reader::FetchedTermMemo>| {
+            let prep = rt
+                .block_on(sf.prepare_clauses(
+                    "title",
+                    ClauseLists {
+                        musts: &["alpha", "shared"],
+                        shoulds: &[],
+                        negatives: &[],
+                        must_phrases: &[],
+                        should_phrases: &[],
+                        negative_phrases: &[],
+                        global_idf: None,
+                        prefetched: memo,
+                        live_floor: None,
+                        allow: None,
+                    },
+                    DOCS_PER_SEGMENT,
+                    f32::NEG_INFINITY,
+                    None,
+                ))
+                .expect("prepare");
+            let mut hits = sf.run_prepared(prep, None).expect("run");
+            hits.sort_by_key(|hit| hit.0);
+            hits
+        };
+        let plain = run(None);
+        assert!(!plain.is_empty());
+        let partial = memo_for(&["shared"]);
+        assert_eq!(
+            run(Some(&partial)),
+            plain,
+            "a memo missing `alpha` still finds it"
+        );
+        let full = memo_for(&["alpha", "shared"]);
+        assert_eq!(run(Some(&full)), plain, "a memo covering both terms agrees");
+    }
+
+    /// A lazily loaded handle reloads the index when its own commit
+    /// publishes a new root: rows committed after the first query are
+    /// found through the index, which lists the new superfile.
+    #[test]
+    fn a_lazy_handle_reloads_the_index_after_its_own_commit() {
+        use crate::Bm25SearchOptions;
+
+        let (_dir, _storage, st) = table_with(|o| {
+            o.with_eager_load_threshold(0)
+                .with_target_superfiles_per_part(1)
+        });
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        let search = |term: &str| -> usize {
+            let reader = st.reader().expect("reader");
+            let batches = reader
+                .bm25_search(
+                    "title",
+                    term,
+                    10,
+                    Bm25SearchOptions::new(),
+                    Some(&["_id", "score"]),
+                )
+                .expect("search");
+            hits_of(&batches).len()
+        };
+        assert!(search("alpha") > 0, "the first query loads the index");
+        let first_root = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned()
+            .expect("reference");
+        commit_titles(&st, &["zeta shared extra".to_owned()]);
+        assert_eq!(search("zeta"), 1, "the new row is found after the commit");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let reference = manifest.term_index_ref().cloned().expect("reference");
+        assert_ne!(reference, first_root, "the commit published a new root");
+        let index = reader
+            .block_on(manifest.term_index())
+            .expect("the index loads");
+        assert_eq!(
+            index.root_uri(),
+            reference.uri,
+            "the loaded index is the new root's"
+        );
+        let newest = manifest
+            .get_all_superfiles()
+            .iter()
+            .max_by_key(|e| e.id_min)
+            .expect("entries")
+            .superfile_id;
+        assert!(index.is_indexed(&newest), "the new superfile is listed");
+    }
+
+    /// A slice fetched once is served from the manifest disk cache
+    /// afterwards: with the object gone from storage, a fresh index over
+    /// the same cache still answers, and one without the cache does not.
+    #[test]
+    fn slices_are_served_from_the_manifest_disk_cache_once_fetched() {
+        use std::fs;
+
+        use crate::supertable::manifest::disk_cache::ManifestDiskCache;
+
+        let (dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        let cache_dir = TempDir::new().expect("cache dir");
+        let cache = ManifestDiskCache::new(cache_dir.path().to_path_buf(), 1 << 30).expect("cache");
+        let warm = TermIndex::new(
+            root.clone(),
+            String::new(),
+            Arc::clone(&storage),
+            Some(Arc::clone(&cache)),
+        );
+        let first = rt
+            .block_on(warm.postings("title", "shared"))
+            .expect("fetch through storage");
+        assert!(!first.is_empty());
+        for slice in root.segments.iter().flat_map(|s| s.slices.iter()) {
+            fs::remove_file(dir.path().join(slice_uri(&slice.content_hash))).expect("remove slice");
+        }
+        let cached = TermIndex::new(
+            root.clone(),
+            String::new(),
+            Arc::clone(&storage),
+            Some(cache),
+        );
+        let again = rt
+            .block_on(cached.postings("title", "shared"))
+            .expect("served from the disk cache");
+        assert_eq!(*again, *first);
+        let uncached = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        assert!(
+            matches!(
+                rt.block_on(uncached.postings("title", "shared")),
+                Err(TermIndexError::Storage(_))
+            ),
+            "without the cache the missing object is a storage error"
+        );
+    }
+
+    /// A commit against a table whose pointer is gone refuses before it
+    /// writes any term-index object: the pointer fence runs first, so a
+    /// purged table gains no orphans.
+    #[test]
+    fn a_purged_table_refuses_the_commit_before_writing_index_objects() {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+
+        use crate::supertable::manifest::commit::POINTER_PATH;
+
+        let (dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        let objects = |dir: &TempDir| -> usize {
+            std::fs::read_dir(dir.path().join(STORAGE_PREFIX))
+                .expect("term-index dir")
+                .count()
+        };
+        let before = objects(&dir);
+        assert!(before >= 2, "a root and at least one slice");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(storage.delete(POINTER_PATH))
+            .expect("delete pointer");
+        let arr: ArrayRef = Arc::new(LargeStringArray::from(vec!["gamma shared late"]));
+        let batch = RecordBatch::try_new(title_schema(), vec![arr]).expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        assert!(w.commit().is_err(), "the commit refuses");
+        assert_eq!(objects(&dir), before, "no term-index object was written");
+    }
+
+    /// A prior root that cannot be read does not fail the commit: the
+    /// index restarts from this commit's superfiles and is marked
+    /// incomplete, and the next maintenance rebuild makes it whole again.
+    #[test]
+    fn an_unreadable_prior_root_restarts_the_index_incomplete() {
+        let (dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (live_before, _) = live_and_covered(&st, &storage, &rt);
+        let reference = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned()
+            .expect("reference");
+        std::fs::remove_file(dir.path().join(&reference.uri)).expect("remove root");
+
+        commit_segment(&st, 1);
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        assert!(
+            !manifest.term_index_complete(),
+            "the restarted index does not list the earlier superfile"
+        );
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        let covered: std::collections::HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        assert!(
+            covered.is_disjoint(&live_before),
+            "the earlier superfile is not listed"
+        );
+        assert_eq!(
+            covered.len(),
+            live.len() - live_before.len(),
+            "this commit's superfiles are"
+        );
+
+        stats_only_optimize(&st);
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        assert!(
+            manifest.term_index_complete(),
+            "a maintenance rebuild makes it whole"
+        );
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        let covered: std::collections::HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        assert_eq!(covered, live);
+    }
+
+    /// GC with an unreadable root sweeps nothing: the live set cannot be
+    /// derived, so the sweep errors rather than deleting slices it can no
+    /// longer prove referenced.
+    #[test]
+    fn gc_refuses_to_sweep_when_the_root_is_unreadable() {
+        use std::{fs, time::Duration};
+
+        let (dir, storage, st, _) = optimized_fragmented_table();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        let reference = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned()
+            .expect("reference");
+        let orphan = dir
+            .path()
+            .join(slice_uri(&ContentHash::of(b"nothing references me")));
+        fs::write(&orphan, b"stray slice bytes").expect("plant orphan");
+        fs::remove_file(dir.path().join(&reference.uri)).expect("remove root");
+
+        assert!(st.gc(Duration::ZERO).is_err(), "the sweep refuses");
+        assert!(orphan.exists(), "nothing was deleted, the orphan included");
+        for slice in root.segments.iter().flat_map(|s| s.slices.iter()) {
+            assert!(dir.path().join(slice_uri(&slice.content_hash)).exists());
+        }
+    }
+
+    /// A commit's delta publishes a new root and leaves the previous one
+    /// unreferenced. GC keeps it while it is younger than the safety gap,
+    /// then sweeps it; the slices the new root still names survive both.
+    #[test]
+    fn gc_sweeps_a_superseded_root_and_keeps_the_slices_the_new_root_names() {
+        use std::time::Duration;
+
+        let (dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        let first = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned()
+            .expect("first root");
+        commit_segment(&st, 1);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        let second = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned()
+            .expect("second root");
+        assert_ne!(first, second);
+        let first_path = dir.path().join(&first.uri);
+        assert!(first_path.exists());
+
+        st.gc(Duration::from_secs(3600)).expect("gc within the gap");
+        assert!(first_path.exists(), "younger than the safety gap: kept");
+
+        st.gc(Duration::ZERO).expect("gc");
+        assert!(!first_path.exists(), "the superseded root is swept");
+        assert!(dir.path().join(&second.uri).exists());
+        for slice in root.segments.iter().flat_map(|s| s.slices.iter()) {
+            assert!(
+                dir.path().join(slice_uri(&slice.content_hash)).exists(),
+                "a slice the current root names survives"
+            );
+        }
+    }
+
+    /// Optimize on an empty table publishes no index, and a repeat over an
+    /// unchanged membership publishes nothing new — the same reference is
+    /// found and no successor manifest is written.
+    #[test]
+    fn optimize_on_an_empty_table_publishes_no_index_and_a_repeat_is_a_no_op() {
+        let (_dir, _storage, st) = fresh_table();
+        stats_only_optimize(&st);
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_ref()
+                .is_none(),
+            "nothing to index"
+        );
+        commit_segment(&st, 0);
+        stats_only_optimize(&st);
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let reference = manifest.term_index_ref().cloned().expect("reference");
+        let id = manifest.get_manifest_id();
+        stats_only_optimize(&st);
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        assert_eq!(manifest.term_index_ref(), Some(&reference));
+        assert_eq!(
+            manifest.get_manifest_id(),
+            id,
+            "no successor for an unchanged index"
+        );
+    }
+
+    /// A slice with bytes past its declared sections is refused loudly,
+    /// never read as a shorter but valid slice.
+    #[test]
+    fn a_slice_with_trailing_bytes_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        let c = contribution(&dir, 1, &[("title", "alpha", 5)]);
+        let built = build(&[c], &BuildPolicy::default()).expect("build");
+        let mut bytes = built.slices[0].1.clone();
+        assert!(Slice::open(&bytes).is_ok());
+        bytes.push(0);
+        assert!(
+            matches!(Slice::open(&bytes), Err(TermIndexError::Malformed(m)) if m.contains("trailing")),
+            "trailing bytes are malformed"
         );
     }
 
