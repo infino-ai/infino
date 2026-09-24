@@ -166,8 +166,8 @@ impl BlockCachedSource {
         Arc::ptr_eq(&self.entry_token, token)
     }
 
-    /// Whether this source reserves and releases the bytes of the blocks it fills itself, rather
-    /// than riding on a reservation its owning entry made.
+    /// Whether this source charges the budget for the blocks it fills, rather than riding on its
+    /// owning entry's reservation.
     pub(crate) fn owns_accounting(&self) -> bool {
         self.owns_accounting
     }

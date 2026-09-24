@@ -2866,10 +2866,9 @@ impl SuperfileUri {
         format!("seg-{}.sf.parquet", self.0)
     }
 
-    /// Disk-cache tempfile number `seq` while a download of this superfile is in flight. Unique per
-    /// writer: a foreground fetch, a background fill and a hybrid finalizer can all be writing the
-    /// same superfile at once (after an evict and reopen), and two writers on one tempfile leave
-    /// holes in whichever copy lands last.
+    /// Disk-cache tempfile name for download number `seq` of this superfile. Each download gets its
+    /// own: several can run at once (a foreground fetch, a background fill, a hybrid finalizer),
+    /// and two writers on one tempfile corrupt it.
     pub fn cache_tmp_filename(self, seq: u64) -> String {
         format!("{}.{seq}{CACHE_TMP_EXTENSION}", self.cache_filename())
     }
@@ -2879,17 +2878,16 @@ impl SuperfileUri {
     /// from files a prior run left under `cache_root`, so a restart / second
     /// handle reuses the NVMe bytes instead of cold-fetching from object
     /// storage. Returns `None` for anything that isn't exactly
-    /// `seg-<uuid>.sf.parquet` — notably the `.tmp` in-flight files, whose
-    /// longer `.sf.parquet.tmp` suffix must be ignored (incomplete writes).
+    /// `seg-<uuid>.sf.parquet`, including in-flight tempfiles (see
+    /// [`Self::from_cache_tmp_filename`]).
     pub fn from_cache_filename(name: &str) -> Option<Self> {
         let body = name.strip_prefix("seg-")?.strip_suffix(".sf.parquet")?;
         Uuid::parse_str(body).ok().map(SuperfileUri)
     }
 
-    /// Inverse of [`Self::cache_tmp_filename`]: recover the URI from an in-flight tempfile's name.
-    /// A crash can leave one behind; the disk cache uses this to recognize and delete it. Also
-    /// accepts the unnumbered `seg-<uuid>.sf.parquet.tmp` older builds wrote, so their leftovers
-    /// are reclaimed too.
+    /// Inverse of [`Self::cache_tmp_filename`], so the disk cache can find and delete tempfiles a
+    /// crash left behind. Also accepts the unnumbered `seg-<uuid>.sf.parquet.tmp` older builds
+    /// wrote.
     pub fn from_cache_tmp_filename(name: &str) -> Option<Self> {
         let body = name.strip_suffix(CACHE_TMP_EXTENSION)?;
         let body = match body.rsplit_once('.') {

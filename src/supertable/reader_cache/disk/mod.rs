@@ -118,9 +118,8 @@ fn file_mtime_us(meta: &fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
-/// Pause this URI's background full-object fill while a caller besides the
-/// cache entry holds its lazy reader (`strong_count > 1`). Unrelated URIs
-/// are unaffected — that is the per-URI quiescence contract.
+/// Pause this URI's background fill while a caller besides the cache entry holds its lazy reader
+/// (`strong_count > 1`). Other URIs are unaffected.
 fn reader_blocks_background_fill(reader: &Weak<SuperfileReader>) -> bool {
     reader.strong_count() > 1
 }
@@ -168,35 +167,31 @@ pub(crate) struct CachedEntry {
     last_access_us: AtomicU64,
 }
 
-/// What a caller needs locally, chosen per read. Decides which cached entries count as a hit
-/// (a whole-file [`CachedEntry::has_whole_file`] serves any intent; a lazy [`Residency::Paged`]
-/// entry serves `Stream`/`Warm` but not `Load`) and which fetch shape a real miss uses; nothing
-/// else branches on it.
+/// What a read needs locally. It decides two things: whether a cached entry is a hit (a whole
+/// file serves every intent, a lazy [`Residency::Paged`] entry serves `Stream` and `Warm` but not
+/// `Load`), and how a miss is fetched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadIntent {
-    /// Serve byte ranges on demand from the block cache and never download the whole file to
-    /// promote it. A whole file already on local disk is still used (the disk tier), since that
-    /// costs no GETs. Vector search.
+    /// Read ranges on demand through the block cache and never download the whole file. A whole
+    /// file already on local disk is still used, since it costs no GETs. Vector search.
     Stream,
-    /// Serve now, and download the rest in the background toward a local mmap. FTS and SQL
-    /// queries, and user-table compaction, which opens its inputs this way.
+    /// Serve now from ranges, and download the whole file in the background toward a local mmap.
+    /// FTS and SQL queries, and other non-vector reads.
     Warm,
-    /// Download the whole file and mmap it before serving; a lazy hit is never enough. Hidden
-    /// vector-index maintenance, which rewrites its input.
+    /// Download the whole file and mmap it before serving; a lazy entry is never enough. Every
+    /// compaction input, user table or hidden index, since the merge reads all of it.
     Load,
 }
 
-/// Where a cached entry's bytes currently live. Lines up with the four tiers
-/// [`DiskCacheStore::open_for_query`] checks in order: whole file in memory, whole file on disk, a
-/// lazy reader already open, then the object store.
+/// Where a cached entry's bytes live. `Mapped` and `Buffered` hold the whole file; `Paged` holds
+/// only the ranges read so far.
 enum Residency {
     /// Whole superfile in an anonymous heap buffer, and the only copy. A background task writes it
     /// to disk and promotes it to [`Residency::Mapped`].
     Buffered,
-    /// Superfile mmapped from the local cache file. Usually the whole object; `vector_source` is
-    /// `Some` when the vector blob was deliberately left out of the file (vector search reads only
-    /// a few clusters, so downloading the whole blob is wasteful) and is served from the block
-    /// cache instead. Parquet and FTS always come from the mmap.
+    /// Superfile mmapped from the local cache file. `vector_source` is `Some` when the vector blob
+    /// was left out of the file (vector search reads only a few clusters of it) and is served from
+    /// the block cache instead. Parquet and FTS always come from the mmap.
     Mapped {
         mmap: Arc<Mmap>,
         vector_source: Option<Arc<BlockCachedSource>>,
@@ -223,9 +218,8 @@ impl CachedEntry {
         matches!(self.residency, Residency::Mapped { .. })
     }
 
-    /// Whether this entry holds the complete file locally, ready to read with no object-store GETs:
-    /// [`Residency::Mapped`] (mmapped from disk) or [`Residency::Buffered`] (in a RAM buffer). A
-    /// [`Residency::Paged`] entry does not, it only has the ranges touched so far.
+    /// Whether the whole file is local, [`Residency::Mapped`] or [`Residency::Buffered`], so reads
+    /// need no GETs.
     fn has_whole_file(&self) -> bool {
         matches!(
             self.residency,
@@ -276,8 +270,7 @@ enum EntryAccounting {
     SourceOwned,
 }
 
-/// Coalescing cell — concurrent cold readers on the same URI
-/// share one `OnceCell` and observe the same fetch result.
+/// One in-flight walk for a URI: concurrent readers share the `OnceCell` and its result.
 type Coordinator = Arc<OnceCell<Result<Arc<CachedEntry>, DiskCacheError>>>;
 
 /// Snapshot of the disk cache's load. Surfaced via
@@ -319,9 +312,8 @@ pub struct DiskCacheStore {
     config: DiskCacheConfig,
     started_at: Instant,
     cached: DashMap<SuperfileUri, Arc<CachedEntry>>,
-    /// One in-flight lookup per URI (tiers 2 to 4). The first caller to miss creates the cell and
-    /// runs the walk; later callers await the same cell. The waiter that created it removes it
-    /// once the walk settles.
+    /// One in-flight walk per URI (tiers 2 to 4). The first caller to miss creates the cell and
+    /// runs the walk; later callers await it. Removed once the walk settles.
     coordinators: DashMap<SuperfileUri, Coordinator>,
     /// Files on disk that no read has opened yet. Filled by `scan_cache_root`, drained by reuse or eviction.
     unindexed: DashMap<SuperfileUri, UnindexedFile>,
@@ -610,9 +602,8 @@ impl DiskCacheStore {
         ))
     }
 
-    /// A fresh tempfile for one download of `uri`, renamed to `cache_path` once it is complete
-    /// (and, for a background fill, installed). Every call names a new file: a foreground fetch, a
-    /// background fill and a hybrid finalizer may all be writing the same superfile at once.
+    /// A fresh tempfile for one download of `uri`, renamed to `cache_path` once complete. Every
+    /// call names a new file, since several downloads of one superfile can run at once.
     pub(crate) fn tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
         let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
         self.config.cache_root.join(uri.cache_tmp_filename(seq))
@@ -628,25 +619,15 @@ impl DiskCacheStore {
         self.cached.contains_key(uri)
     }
 
-    /// Whether `uri` is cached with a finished mmap promotion
-    /// (`CachedEntry::mmap == Some`). False while
-    /// `LazyForegroundWithBackgroundFill` still holds the lazy
-    /// in-memory reader or the background download is in flight.
+    /// Whether `uri` is cached as a [`Residency::Mapped`] entry. False while it is still lazy or
+    /// its background fill is in flight.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn is_mmap_promoted(&self, uri: &SuperfileUri) -> bool {
         self.cached.get(uri).map(|e| e.is_mapped()).unwrap_or(false)
     }
 
-    /// Observability accessor: invoke the currently-installed
-    /// `pinned_fn` and return its result. Lets tests assert which
-    /// URIs are protected from eviction at the moment of the call.
-    ///
-    /// Cheap: clones the `Arc<dyn Fn>` out of the mutex,
-    /// drops the lock, then invokes the closure. The closure
-    /// itself is whatever the caller installed, most
-    /// commonly the `Weak<SupertableInner>`-based snapshot
-    /// installed by [`crate::supertable::Supertable::create`]
-    /// / [`crate::supertable::Supertable::open`].
+    /// The URIs the installed `pinned_fn` protects from eviction right now. The closure is called
+    /// outside the mutex.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn current_pinned_uris(&self) -> HashSet<SuperfileUri> {
         let f = {

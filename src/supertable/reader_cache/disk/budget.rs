@@ -12,6 +12,10 @@ use std::{
 use dashmap::mapref::entry::Entry;
 use memmap2::{Mmap, UncheckedAdvice};
 
+#[cfg(test)]
+use crate::supertable::reader_cache::{
+    block_source::BlockCachedSource, disk::test_support::tiny_superfile_bytes,
+};
 use crate::supertable::{
     manifest::SuperfileUri,
     reader_cache::{config::EvictionCandidate, disk::*},
@@ -290,9 +294,9 @@ impl DiskCacheStore {
         freed
     }
 
-    /// Like [`Self::reserve`] but without the guard: the bytes stay reserved until the caller
-    /// releases them with [`Self::release_block_bytes`] or hands them to an admitted entry. For a
-    /// reservation that outlives a borrow of `self`: a lazy open's entry, a fill's own reservation.
+    /// Reserve `bytes`, evicting as needed, with no guard: the bytes stay reserved until the caller
+    /// releases them ([`Self::release_block_bytes`]) or hands them to an admitted entry. For a
+    /// reservation that outlives a borrow of `self`, such as a background fill's.
     pub(crate) async fn reserve_manual(&self, bytes: u64) -> Result<(), DiskCacheError> {
         loop {
             let budget = self.disk_budget_bytes();
@@ -317,8 +321,8 @@ impl DiskCacheStore {
         self.reserve_manual(bytes).await
     }
 
-    /// Reserve `bytes` only if the budget has room right now, never evicting. For a caller that
-    /// cannot wait, such as an install decided under a shard lock.
+    /// Reserve `bytes` only if the budget has room now, never evicting. For a caller that cannot
+    /// wait, such as an install under a shard lock.
     pub(crate) fn try_reserve_without_evicting(&self, bytes: u64) -> bool {
         let budget = self.disk_budget_bytes();
         self.current_bytes
@@ -349,19 +353,14 @@ impl DiskCacheStore {
         }
     }
 
-    /// Put `entry` in the cache under `uri`. The one place an entry is admitted, so two rules hold
-    /// wherever admissions race on a URI (a compaction read landing while a query is opening the
-    /// same file, two disk reuses, a lazy open and a whole-file fetch):
+    /// Put `entry` in the cache under `uri`. Every admission goes through here, so when admissions
+    /// race on a URI (a compaction read and a query open, two disk reuses) two rules hold:
     ///
-    /// 1. A lazy entry never replaces a whole-file one. If a [`Residency::Paged`] entry arrives
-    ///    while the slot already holds a `Mapped` or `Buffered` copy, the incoming entry is dropped
-    ///    (its budget released) and the existing copy is returned, so the caller serves the better
-    ///    copy instead of shadowing it.
-    /// 2. Whatever an admission does replace has its budget released, so a lost race never leaves
-    ///    phantom bytes charged.
+    /// 1. A lazy entry never replaces a whole file. It is dropped, its budget released, and the
+    ///    whole file is returned instead.
+    /// 2. Whatever is replaced has its budget released, so a lost race leaves no bytes charged.
     ///
-    /// Returns the entry now current for `uri`: the incoming one, or the whole-file copy it yielded
-    /// to. Callers must serve what comes back, not what they passed in.
+    /// Returns the entry now in the slot. Callers serve that, not what they passed in.
     pub(crate) fn admit_entry(
         &self,
         uri: SuperfileUri,
@@ -377,8 +376,8 @@ impl DiskCacheStore {
                 }
 
                 let replaced = mem::replace(occupied.get_mut(), Arc::clone(&entry));
-                // Off the shard lock before `replaced` can drop: a last reference takes an fsync
-                // of the block index or a munmap with it, and every URI in the shard would wait.
+                // Leave the shard lock before `replaced` drops: its last reference may fsync a
+                // block index or munmap, and every URI in the shard would wait on that.
                 drop(occupied);
                 self.release_entry_accounting(&replaced);
                 entry
@@ -390,36 +389,15 @@ impl DiskCacheStore {
         }
     }
 
-    /// Reserve `bytes` of disk budget via CAS-loop on
-    /// `current_bytes`. On budget pressure runs eviction;
-    /// retries until either reserved or `BudgetExceeded`.
+    /// Reserve `bytes`, evicting as needed, or fail with `BudgetExceeded`. The guard releases the
+    /// bytes on drop unless committed.
     pub(crate) async fn reserve(&self, bytes: u64) -> Result<Reservation<'_>, DiskCacheError> {
-        loop {
-            let budget = self.disk_budget_bytes();
-            let cur = self.current_bytes.load(Ordering::Acquire);
-            if cur + bytes <= budget {
-                if self
-                    .current_bytes
-                    .compare_exchange_weak(cur, cur + bytes, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    return Ok(Reservation {
-                        store: self,
-                        bytes,
-                        committed: false,
-                    });
-                }
-                // Lost the race; another reservation slipped
-                // in. Re-read and retry — most of the time
-                // there's still room.
-                continue;
-            }
-            // Over budget — try eviction. If eviction frees
-            // enough, the next loop iteration's CAS will
-            // succeed.
-            let needed = (cur + bytes).saturating_sub(budget);
-            self.evict_at_least(needed).await?;
-        }
+        self.reserve_manual(bytes).await?;
+        Ok(Reservation {
+            store: self,
+            bytes,
+            committed: false,
+        })
     }
 
     /// Drive the eviction policy until either `bytes_needed`
@@ -476,11 +454,9 @@ impl DiskCacheStore {
             // reservations evicting the same victim could
             // double-decrement current_bytes.
             if let Some((_, entry)) = self.cached.remove(&uri) {
-                // A coordinator normally lives only while a fetch is in flight. If one is still
-                // here, it holds a strong reference that would keep the evicted entry, and the
-                // budget it owns, alive behind the cache's back.
                 tracing::info!(target: "infino::cache", uri = %uri.0, "evict: live cached entry (budget pressure)");
 
+                // A leftover coordinator would keep the evicted entry, and its budget, alive.
                 self.coordinators.remove(&uri);
 
                 let path = self.cache_path(&uri);
@@ -496,11 +472,8 @@ impl DiskCacheStore {
 
     // Test helpers. Compiled only for tests, never into the shipped library.
 
-    /// The budget ledger invariant, checked at quiescence: every byte charged is backed by a live
-    /// entry, a scanned-but-unopened cache file, or a scanned block file, and by nothing else. A
-    /// phantom charge (bytes with no backing) or an unbacked entry (backing with no charge) fails
-    /// this, which is how every admission and fill path is kept honest. Only meaningful with no
-    /// fetch or fill in flight, which is why it is a test hook.
+    /// The budget ledger at rest: every charged byte is backed by a live entry, a scanned cache
+    /// file or a scanned block file, and nothing else. Holds only with no fetch or fill in flight.
     #[cfg(test)]
     pub(crate) fn assert_budget_consistent(&self) {
         let entries: u64 = self.cached.iter().map(|e| e.value().charged_bytes()).sum();
@@ -518,12 +491,9 @@ impl DiskCacheStore {
     pub(crate) fn install_block_entry_for_test(
         &self,
         uri: SuperfileUri,
-        block_source: Arc<crate::supertable::reader_cache::block_source::BlockCachedSource>,
+        block_source: Arc<BlockCachedSource>,
     ) {
-        let reader = SuperfileReader::open(
-            crate::supertable::reader_cache::disk::test_support::tiny_superfile_bytes(),
-        )
-        .expect("tiny superfile opens");
+        let reader = SuperfileReader::open(tiny_superfile_bytes()).expect("tiny superfile opens");
         let size_bytes = block_source.filled_bytes_handle();
         self.cached.insert(
             uri,

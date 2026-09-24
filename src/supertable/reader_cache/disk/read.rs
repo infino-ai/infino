@@ -25,24 +25,23 @@ use crate::{
     },
 };
 
-/// How many shared walks a caller joins before walking alone. Two: the one that did not serve it
-/// (it failed, or handed a `Load` a lazy entry), and one coalesced retry.
+/// Shared walks a caller joins before walking alone: the first, plus one retry when the first
+/// failed or handed a `Load` a lazy entry.
 const COALESCED_FETCH_ATTEMPTS: usize = 2;
 
 impl DiskCacheStore {
-    /// The reader every query (FTS, SQL, vector) opens a superfile through. See
-    /// [`Self::reader_tiered`] for the memory/disk/source lookup and [`ReadIntent`] for `intent`.
+    /// The reader every query (FTS, SQL, vector) opens a superfile through. The lookup is
+    /// [`Self::reader_tiered`]; `intent` is explained on [`ReadIntent`].
     ///
-    /// `storage_key` is the object key the bytes live at (the manifest entry's `storage_path()`).
-    /// It travels beside `uri` because a source-named superfile's key is not a function of its
-    /// uuid, while every cache slot and filename stays keyed by `uri`. `offsets` is the manifest's
-    /// footer and blob layout; with it a cold open fetches its open ranges in one round trip.
+    /// `storage_key` is the object key (the manifest entry's `storage_path()`). It is passed beside
+    /// `uri` because a source-named superfile's key is not derived from its uuid, while the cache
+    /// stays keyed by `uri`. With `offsets` (the manifest's footer and blob layout) a cold open
+    /// fetches what it needs in one round trip.
     ///
-    /// If the file cannot be admitted at all ([`DiskCacheError::BudgetExceeded`], typically a single
-    /// superfile larger than the whole budget), this degrades to [`Self::open_range_only`], an
-    /// uncached streaming reader, so the query still runs. [`ReadIntent::Load`] is rejected here: a
-    /// whole-file read can never accept that degrade, so it goes through
-    /// [`Self::reader_synchronous_with_storage`] instead.
+    /// If the file cannot be admitted ([`DiskCacheError::BudgetExceeded`], usually one superfile
+    /// larger than the whole budget), the query streams it uncached through
+    /// [`Self::open_range_only`] instead of failing. [`ReadIntent::Load`] is rejected: a whole-file
+    /// read cannot degrade like that, so it uses [`Self::reader_synchronous_with_storage`].
     pub async fn open_for_query(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -70,19 +69,10 @@ impl DiskCacheStore {
         }
     }
 
-    /// Open a streaming reader straight against object storage, bypassing the cache entirely: no
-    /// budget reservation, no background fill, no entry inserted into `cached`. The query still
-    /// succeeds by issuing range GETs for only the bytes it touches.
-    ///
-    /// This is the [`DiskCacheError::BudgetExceeded`] fallback that [`Self::open_for_query`] takes,
-    /// and it deliberately does not go through [`Self::reader_tiered`]: by the time it runs, the
-    /// tiers have all been walked and tier 4 refused to admit the file (typically a single superfile
-    /// larger than the whole cache budget). Re-walking them would re-check a file just proved to be
-    /// neither local nor admittable. Nor can it be a tier of its own: the tiers find or admit a
-    /// [`CachedEntry`], and this path has nothing to cache and so nothing to evict. It is the escape
-    /// hatch for when caching is impossible, not a fifth place to look.
-    ///
-    /// Takes the object key alone: nothing here is keyed by uri, since no cache entry is created.
+    /// A streaming reader straight over object storage: no budget, no fill, no cache entry, so it
+    /// needs only the object key. [`Self::open_for_query`] falls back to it on
+    /// [`DiskCacheError::BudgetExceeded`], after the tiers have shown the file is neither local nor
+    /// admittable, so it does not walk them again.
     async fn open_range_only(
         self: &Arc<Self>,
         storage_key: &str,
@@ -104,20 +94,17 @@ impl DiskCacheStore {
             )),
         };
 
-        // Range-only is also a lazy reader over object storage. A full CRC
-        // scan here would turn a fallback path meant to issue targeted
-        // ranges into a whole-superfile read.
+        // No CRC check: it reads the whole file, and this path reads only the ranges touched.
         let reader =
             SuperfileReader::open_lazy_with(range_src, OpenOptions { verify_crc: false }).await?;
 
         Ok(Arc::new(reader))
     }
 
-    /// The reader compaction opens its input through. Blocks until the whole file is local and
-    /// mmapped, then serves; a lazy cache hit is not enough for a rewrite, so it re-fetches a full
-    /// copy. A miss is fetched through `fetch_storage` rather than the cache's own `self.storage`:
-    /// the hidden vector-index's superfiles live behind a prefixed storage provider the shared
-    /// (user-keyed) cache cannot resolve on its own.
+    /// The reader compaction opens its inputs through, as a [`ReadIntent::Load`]: it returns once
+    /// the whole file is local and mmapped. A miss fetches through `fetch_storage`, not
+    /// `self.storage`, because hidden vector-index files live behind a prefixed provider the shared
+    /// cache cannot resolve.
     pub async fn reader_synchronous_with_storage(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -134,18 +121,9 @@ impl DiskCacheStore {
         .await
     }
 
-    /// The reader lookup, read top to bottom as four tiers, cheapest first: whole file in memory,
-    /// whole file on local disk, a lazy reader already open, then the object store. Each tier says
-    /// exactly what it is trying to find. `intent` is the only policy: it decides which local copies
-    /// count (a lazy reader is a hit for a query but not for [`ReadIntent::Load`], which rewrites the
-    /// whole file) and which fetch shape a miss uses. Nothing else branches on the caller.
-    /// `storage_key` is the object key the bytes live at; only tier 4 and the background fill use
-    /// it, every local tier is keyed by `uri`.
-    ///
-    /// # Tier cascade
-    ///
-    /// A read falls through the tiers until one holds the file. The first hit serves and returns; a
-    /// higher tier is always cheaper, so we never pay a lower tier's cost when a higher one hits.
+    /// The lookup: four tiers, cheapest first, and the first hit serves. `intent` is the only
+    /// policy (see [`ReadIntent`]). `storage_key` is used only to fetch from the object store; the
+    /// local tiers are keyed by `uri`.
     ///
     /// ```text
     ///                 reader_tiered(uri, intent)
@@ -170,7 +148,7 @@ impl DiskCacheStore {
     ///   │                          ▼                                                         │
     ///   │ Tier 4  fetch_from_source          ────────►  admit + serve         cold GETs      │
     ///   │ source  (nothing was local)                                                        │
-    ///   └──────────────────────────────────────────────────────────────────────────────────-─┘
+    ///   └────────────────────────────────────────────────────────────────────────────────────┘
     /// ```
     async fn reader_tiered(
         self: &Arc<Self>,
@@ -185,15 +163,14 @@ impl DiskCacheStore {
             return Ok(self.serve(uri, storage_key, &entry, intent, storage));
         }
 
-        // A Load (a compaction read) rewrites the whole file, so a lazy handle is no use to it: drop
-        // it here so it can neither shadow the disk check below nor be served as the tier-3 hit.
+        // A Load needs the whole file, so a lazy entry is no use to it. Drop it and free its budget
+        // before fetching a whole copy.
         if intent == ReadIntent::Load {
             self.drop_lazy_entry(uri);
         }
 
-        // Tiers 2 to 4, walked once per URI at a time: local disk, then an open lazy reader, then
-        // the object store. Concurrent callers share one walk, so a file N readers miss on at once
-        // costs one stat, one mmap, or one download, not N.
+        // Tiers 2 to 4, one walk per URI: concurrent callers share it, so N misses cost one stat,
+        // one mmap or one download.
         let entry = self
             .fetch_local_or_source_coalesced(uri, storage_key, intent, offsets, storage)
             .await?;
@@ -201,34 +178,30 @@ impl DiskCacheStore {
         Ok(self.serve(uri, storage_key, &entry, intent, storage))
     }
 
-    /// Tier 1: a cached entry that holds the whole file locally (mmapped or buffered), so it serves
-    /// any read with no object-store GETs. A lazy ([`Residency::Paged`]) entry does not qualify and
-    /// falls through to the disk check.
+    /// Tier 1: a cached entry holding the whole file (mmapped or buffered). It serves any read
+    /// with no GETs. A lazy entry does not count.
     fn whole_file_in_memory(&self, uri: &SuperfileUri) -> Option<Arc<CachedEntry>> {
         let entry = self.cached.get(uri)?;
 
         entry.has_whole_file().then(|| Arc::clone(&entry))
     }
 
-    /// Tier 3: a cached lazy ([`Residency::Paged`]) entry, already streaming this file from the
-    /// source over a shared block cache. Reached only after tier 2 confirms no full copy is on disk.
+    /// Tier 3: a cached lazy ([`Residency::Paged`]) entry. A query shares its block cache instead
+    /// of opening a second stream.
     fn open_lazy_reader(&self, uri: &SuperfileUri) -> Option<Arc<CachedEntry>> {
-        // Explicitly Paged, not "whatever tier 1 did not take": a future residency kind must not
-        // be served here by accident.
+        // Match Paged by name, so a new residency kind is never served here by accident.
         self.cached
             .get(uri)
             .filter(|e| matches!(e.residency, Residency::Paged { .. }))
             .map(|e| Arc::clone(&e))
     }
 
-    /// Remove a cached lazy entry and give its budget back. Used when [`ReadIntent::Load`] finds a
-    /// lazy entry it cannot use and must re-fetch a full copy. A whole file that landed since the
-    /// memory check is a hit to keep, so the remove is gated on the entry still being lazy.
+    /// Remove a lazy entry and release its budget, for a [`ReadIntent::Load`]. A whole file that
+    /// landed since the memory check is kept.
     ///
-    /// Leaves any coordinator alone: a cell present here belongs to a fetch still in flight, and
-    /// removing it by key would strand that fetch and push later callers into a duplicate download.
-    /// If the Load ends up joining that fetch, [`Self::fetch_local_or_source_coalesced`] makes sure
-    /// it still gets a whole file.
+    /// Leaves any coordinator alone: it belongs to a fetch in flight, and removing it would send
+    /// later callers into a second download. A Load that joins that fetch still ends with a whole
+    /// file (see [`Self::fetch_local_or_source_coalesced`]).
     fn drop_lazy_entry(&self, uri: &SuperfileUri) {
         if let Some((_, removed)) = self
             .cached
@@ -238,8 +211,8 @@ impl DiskCacheStore {
         }
     }
 
-    /// Hand the caller a reader: bump the LRU timestamp, and for [`ReadIntent::Warm`] keep the
-    /// background fill going toward a full mmap. Every tier hands its hit through here.
+    /// Every hit is served through here: bump the entry's LRU time and, for [`ReadIntent::Warm`],
+    /// start its background fill if it has not started yet.
     fn serve(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -256,9 +229,8 @@ impl DiskCacheStore {
         Arc::clone(&entry.reader)
     }
 
-    /// Tiers 2 to 4 for one caller: the whole file on local disk, else an open lazy reader (never
-    /// for a `Load`, which cannot use one), else fetch from the object store. Uncoalesced; see
-    /// [`Self::fetch_local_or_source_coalesced`] for the per-URI single flight around it.
+    /// Tiers 2 to 4 for one caller, uncoalesced. [`Self::fetch_local_or_source_coalesced`] wraps
+    /// it in the per-URI single flight.
     async fn fetch_local_or_source(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -267,15 +239,15 @@ impl DiskCacheStore {
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
-        // A background fill may have installed the whole file since this caller's memory check.
-        // Take it rather than probe its file on disk: a fill that kept the vector blob on the block
-        // cache leaves an mmap file with a hole in it, which only its live entry can serve.
+        // A fill may have installed the whole file since the memory check. Use its entry, not the
+        // file on disk: a fill that left the vector blob on the block cache wrote a file with a
+        // hole, and only the live entry can serve it.
         if let Some(entry) = self.whole_file_in_memory(uri) {
             return Ok(entry);
         }
 
-        // Tier 2, disk cache: the whole file is already on local disk (a prior run, or a lazy reader
-        // that has since been fully filled). Mmap it, zero object-store GETs.
+        // Tier 2, disk: the whole file is on local disk (a prior run, or a finished fill). Mmap
+        // it, no GETs.
         if let Some(entry) = self
             .fetch_from_disk_cache(uri, offsets.map(|o| o.total_size))
             .await?
@@ -283,39 +255,30 @@ impl DiskCacheStore {
             return Ok(entry);
         }
 
-        // Tier 3, open lazy reader: a Paged handle is already streaming this file. No full copy is
-        // local, but a query can ride the existing block cache instead of opening a second stream.
+        // Tier 3, lazy reader: a query rides its block cache. Not for a Load, which needs the
+        // whole file.
         if intent != ReadIntent::Load
             && let Some(entry) = self.open_lazy_reader(uri)
         {
             return Ok(entry);
         }
 
-        // Tier 4, source: nothing local. Fetch it from the object store.
+        // Tier 4, object store: nothing is local.
         self.fetch_from_source(uri, storage_key, intent, offsets, storage)
             .await
     }
 
-    /// Tiers 2 to 4, but only one walk per URI at a time even when many readers miss at once. The
-    /// first caller runs [`Self::fetch_local_or_source`]; everyone else waits on the shared
-    /// `OnceCell` and gets that one result, so N concurrent misses cost one stat, one mmap, or one
-    /// download, not N. Keeping the disk probe inside the single flight is also what stops a whole
-    /// file from being admitted a second time while a background fill is latched on the same URI.
+    /// Tiers 2 to 4 as one walk per URI. The first caller runs [`Self::fetch_local_or_source`] and
+    /// concurrent callers await the same `OnceCell`, so N misses cost one stat, mmap or download.
+    /// Probing disk inside the walk also keeps a whole file from being admitted twice.
     ///
-    /// The entry returned satisfies `intent`. The cell is not keyed by intent, so a `Load` can join
-    /// a query's lazy walk; when that happens it walks again, coalesced like any other attempt,
-    /// rather than serve the partial file. Joining and waiting is the cheaper side of that trade:
-    /// stripping the query's cell would push later callers into duplicate downloads.
+    /// The returned entry satisfies `intent`. The cell is not keyed by intent, so a `Load` can join
+    /// a query's walk and get a lazy entry; it then walks again rather than serve a partial file.
+    /// A failure is not cached either: each waiter walks again once, still coalesced, and after a
+    /// second failure walks alone, so one bad fetch cannot poison later readers.
     ///
-    /// If the fetch fails, the failure is not cached. Every waiter drops the cell, but only if it
-    /// is still the cell it joined (a newer one may already be running a fresh attempt), then
-    /// re-enters this path once so the retry is coalesced too: the first waiter back creates the
-    /// new cell and the rest join it. A second failure falls through to one uncoalesced attempt,
-    /// so a failing URI still cannot poison later readers.
-    ///
-    /// The cell lives only for the walk. Once the entry is admitted, later callers find it in the
-    /// map, so this is where the cell is dropped for every outcome. Leaving it behind would keep a
-    /// strong reference that outlives eviction and quietly serves an evicted entry.
+    /// The cell lives only for the walk and is dropped here on every outcome. Left behind, it would
+    /// keep an evicted entry alive and keep serving it.
     async fn fetch_local_or_source_coalesced(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -337,19 +300,18 @@ impl DiskCacheStore {
                 })
                 .await;
 
-            // Drop the cell only if it is still ours. Removing by key could strip a newer cell
-            // another waiter already re-established, and start yet another duplicate download.
+            // Remove only our own cell. A newer one belongs to a retry already in flight.
             self.coordinators
                 .remove_if(uri, |_, live| Arc::ptr_eq(live, &cell));
 
             match result {
-                // Joined a query's lazy walk. A Load needs the whole file, so walk again: the lazy
-                // entry is no hit for a Load at tier 2 or 3, and tier 4 fetches it whole.
+                // Joined a query's lazy walk. A Load needs the whole file, so walk again.
                 Ok(entry) if intent == ReadIntent::Load && !entry.has_whole_file() => continue,
                 Ok(entry) => return Ok(Arc::clone(entry)),
                 Err(_) => continue,
             }
         }
+
         self.fetch_local_or_source(uri, storage_key, intent, offsets, storage)
             .await
     }
@@ -357,12 +319,9 @@ impl DiskCacheStore {
     // Test and bench helpers. Compiled only for tests and the `test-helpers` feature, never into
     // the shipped library.
 
-    /// Test and bench shorthand: a [`ReadIntent::Warm`] walk of [`Self::reader_tiered`] with no
-    /// manifest offsets and the cache's own storage. Unlike [`Self::open_for_query`] it does not
-    /// degrade to a range-only reader on [`DiskCacheError::BudgetExceeded`], so tests can assert on
-    /// that error surfacing. Takes only the uri, so it is for a superfile with the unnamed key shape
-    /// (tests and benches that mint their own); a query path holds the manifest entry and passes
-    /// `entry.storage_path()`, the key a source-named superfile actually lives at.
+    /// Test and bench shorthand: a [`ReadIntent::Warm`] read through the cache's own storage, at
+    /// the key derived from `uri`. Unlike [`Self::open_for_query`] it returns
+    /// [`DiskCacheError::BudgetExceeded`] instead of degrading, so tests can assert on it.
     #[cfg(any(test, feature = "test-helpers"))]
     pub async fn reader(
         self: &Arc<Self>,
@@ -466,9 +425,7 @@ mod tests {
     /// enough to stay cheap.
     const CONCURRENT_MISSES: usize = 8;
 
-    // The tiers must never re-fetch data that is already local, for any read intent, and a lazy
-    // entry must not shadow a full file that has landed on disk. Measured via the source-fetch
-    // counter (`n_cold_fetches`) and the disk-reuse counter (`n_disk_reuses`).
+    /// `(source fetches, disk reuses)` caused by one read of `uri` with `intent`.
     async fn read_delta(
         store: &Arc<DiskCacheStore>,
         intent: ReadIntent,
@@ -491,6 +448,7 @@ mod tests {
         )
     }
 
+    /// No tier re-fetches data that is already local, for any intent.
     #[tokio::test]
     async fn tiers_never_refetch_local_data() {
         for intent in [ReadIntent::Stream, ReadIntent::Warm, ReadIntent::Load] {
@@ -502,8 +460,8 @@ mod tests {
             let (cold, _) = read_delta(&store, intent, &uri).await;
             assert_eq!(cold, 0, "{intent:?}: memory hit must not fetch from source");
 
-            // MEM-LAZY: a lazy entry cached, then the full file lands on disk from a sibling. The
-            // read must use the disk file, not keep fetching from source (the shadow bug).
+            // MEM-LAZY: a lazy entry cached, then a sibling writes the full file to disk. The read
+            // must use the disk file, not keep fetching from source.
             let (_dl, store_l) = test_store();
             let uri_l = SuperfileUri::new_v4();
             put_superfile(&store_l, &uri_l, tiny_superfile_bytes()).await;
@@ -527,9 +485,7 @@ mod tests {
                 cold_l, 0,
                 "{intent:?}: a lazy entry must not shadow the on-disk file"
             );
-            // This holds for Stream too. "Stream never promotes" means it never downloads the
-            // whole file to get there; a whole file already sitting on local disk is free, and
-            // mmapping it beats keeping the lazy reader's range GETs alive.
+            // Stream too: it never downloads the whole file, but one already on disk is free.
             assert!(
                 store_l.is_mmap_promoted(&uri_l),
                 "{intent:?}: the read must promote to the on-disk file"
@@ -707,7 +663,7 @@ mod tests {
             .await
             .expect("range open");
         assert_eq!(r.n_docs(), 1);
-        // Bypasses the cache entirely — nothing admitted.
+        // Bypasses the cache: nothing admitted.
         assert_eq!(store.stats().n_entries, 0);
         assert_eq!(store.stats().current_bytes, 0);
     }
@@ -992,9 +948,8 @@ mod tests {
             .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Stream)
             .await
             .expect("lazy open");
-        // Fill one block through the entry's block source so SourceOwned bytes are charged. (A
-        // lazy reader has no eager parquet bytes to read wholesale.) Clone the source out first:
-        // holding the map guard across the await could deadlock against a fill's eviction.
+        // Fill one block so the entry has SourceOwned bytes charged. Clone the source out first:
+        // holding the map guard across the await could deadlock against an eviction.
         let source = Arc::clone(
             store
                 .cached
@@ -1013,9 +968,7 @@ mod tests {
         assert_eq!(store.stats().n_entries, 1);
         drop(reader);
 
-        // Ask eviction to free a single byte. The policy is all-or-nothing (it returns no victims
-        // if the eligible entries cannot cover the request), so a tiny request is what selects our
-        // one entry.
+        // Ask eviction for one byte. It is all-or-nothing, so a tiny request picks our one entry.
         store
             .evict_at_least(1)
             .await

@@ -56,12 +56,9 @@ use crate::{
 };
 
 impl DiskCacheStore {
-    /// mmap a cache file and open it as a [`SuperfileReader`], building the
-    /// `CachedEntry`. Shared by the warm-insert path and the open-time index
-    /// rebuild ([`Self::restore_from_cache_root`]); the caller owns budget
-    /// accounting and the `cached`-map insert. The reader's bytes and
-    /// `CachedEntry.mmap` share one `Arc<Mmap>` so a later `MADV_DONTNEED`
-    /// sweep touches the same mapping.
+    /// Mmap a cache file and open it as a [`Residency::Mapped`] entry. The caller owns the budget
+    /// and the map insert. The reader and the entry share one `Arc<Mmap>`, so the idle-page sweep's
+    /// `madvise` reaches the mapping the reader uses.
     pub(crate) fn open_cached_entry(
         &self,
         path: &Path,
@@ -73,11 +70,9 @@ impl DiskCacheStore {
         Ok(self.build_mmap_entry(Arc::new(reader), mmap, size, None))
     }
 
-    /// Build a promoted [`Residency::Mapped`] entry: the single place the mmap shape is written,
-    /// always `Eager`. `charge` is the bytes the store holds for it: the file size, or less when
+    /// Build a [`Residency::Mapped`] entry, always `Eager`. `charge` is the file size, or less when
     /// the vector blob stays on a block source that charges its own blocks. `vector_source` is
-    /// `Some` only when the vector blob was left out of the mmap and still comes from the block
-    /// cache.
+    /// `Some` only when the vector blob was left out of the mmap.
     pub(crate) fn build_mmap_entry(
         &self,
         reader: Arc<SuperfileReader>,
@@ -97,18 +92,16 @@ impl DiskCacheStore {
         })
     }
 
-    /// Put the whole-file entry a background fill produced into the cache, from the fill's own
-    /// tempfile. `entry` is already mmapped from `tmp_path`.
+    /// Install the whole file a background fill (or the hybrid finalizer) produced. `entry` is
+    /// already mmapped from `tmp_path`.
     ///
-    /// The fill wins over the entry it started from (`owner` is that entry's reader) and over any
-    /// other lazy entry: a finished local copy beats range reads. Only someone else's whole file
-    /// beats it. The promoted entry's charge comes from the entry it replaces (when that one was
-    /// charged in full), then from `own_reservation`, then from spare budget; if none of that
-    /// covers it, the fill yields rather than leave bytes uncharged.
+    /// It replaces the entry it started from (`owner` is that entry's reader) or any other lazy
+    /// entry, never someone else's whole file (see [`fill_may_replace`]). Its charge is covered by
+    /// what the replaced entry held (if charged in full), then `own_reservation`, then spare
+    /// budget; if that is not enough, the fill yields rather than leave bytes uncharged.
     ///
-    /// Installed, the tempfile is renamed to `final_path`. The mmap follows the file, so readers
-    /// never notice, and until this point nothing incomplete sat under the cache name. Otherwise
-    /// the tempfile is deleted and only the fill's own reservation is given back.
+    /// Installed, the tempfile is renamed to `final_path`; the mmap follows the file. Otherwise the
+    /// tempfile is deleted and only `own_reservation` is released.
     pub(crate) fn install_promoted_entry(
         &self,
         uri: SuperfileUri,
@@ -127,15 +120,15 @@ impl DiskCacheStore {
                 let current = occupied.get();
                 let inherited = match current.accounting {
                     EntryAccounting::Eager => current.size_bytes.load(Ordering::Acquire),
-                    // Per-block charges stay with its block source until that source drops.
+                    // Its block source keeps charging its blocks until it drops.
                     EntryAccounting::SourceOwned => 0,
                 };
                 let held = own + inherited;
                 let covered = held >= charge || self.try_reserve_without_evicting(charge - held);
                 if covered {
                     let replaced = mem::replace(occupied.get_mut(), Arc::clone(&entry));
-                    // Off the shard lock before the old entry can drop: a last reference takes an
-                    // fsync of the block index with it.
+                    // Leave the shard lock before the old entry drops: its last reference may
+                    // fsync a block index.
                     drop(occupied);
                     drop(replaced);
                     (true, held.saturating_sub(charge))
@@ -166,19 +159,18 @@ impl DiskCacheStore {
             .is_some_and(|entry| fill_may_replace(&entry, owner))
     }
 
-    /// Rename an installed fill's tempfile to the cache name. Runs after the shard lock is
-    /// released, so the entry may already be gone: an eviction in between deleted a cache file
-    /// that did not exist yet, and the rename would then leave a file no entry owns and no budget
-    /// charges. The slot is re-checked after the rename to catch that. If the rename itself fails,
-    /// the tempfile is unlinked; the entry keeps serving from its mmap, which outlives the name.
+    /// Rename an installed fill's tempfile to the cache name, after the shard lock is released.
+    /// An eviction in between leaves the slot empty, and the renamed file would then belong to no
+    /// entry and no budget, so it is deleted. If the rename fails, the tempfile is deleted; the
+    /// entry keeps serving from its mmap.
     fn move_into_cache(&self, uri: SuperfileUri, tmp_path: &Path, final_path: &Path) {
         if let Err(error) = fs::rename(tmp_path, final_path) {
             tracing::warn!(target: "infino::cache", uri = %uri.0, %error, "fill: rename into the cache failed");
             let _ = fs::remove_file(tmp_path);
             return;
         }
-        // Only an empty slot proves the file is an orphan: anyone else now in the slot may be
-        // serving this very file, since tier 2 adopts whatever sits under the cache name.
+        // Delete only when the slot is empty: any entry in it may be serving this file, since
+        // tier 2 adopts whatever sits under the cache name.
         if !self.cached.contains_key(&uri) {
             let _ = fs::remove_file(final_path);
         }
@@ -363,10 +355,9 @@ impl DiskCacheStore {
         Ok(entry)
     }
 
-    /// Tier 4: the file is not local anywhere, so fetch it from the object store. The one place a
-    /// fetch shape is chosen. [`ReadIntent::Load`] always downloads the whole file and mmaps it;
-    /// `Warm` and `Stream` follow the configured cold-fetch mode, differing only in whether a lazy
-    /// open keeps warming toward a full mmap in the background.
+    /// Tier 4: fetch from the object store, the one place a fetch shape is chosen. A
+    /// [`ReadIntent::Load`] downloads the whole file and mmaps it. `Warm` and `Stream` follow the
+    /// configured cold-fetch mode; only `Warm` lets a lazy open start a background fill.
     pub(crate) async fn fetch_from_source(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -404,9 +395,8 @@ impl DiskCacheStore {
         }
     }
 
-    /// Start parquet/FTS background fill once per URI when an FTS/SQL open
-    /// asks for it. Vector opens never call this — they keep block-cache
-    /// retention only. Fill skips the vector blob range.
+    /// Start the background fill for a lazy entry, at most once. Only `Warm` reads call this. The
+    /// vector blob, if any, is left out of the download and keeps coming from the block cache.
     pub(crate) fn maybe_spawn_background_fill(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -427,10 +417,9 @@ impl DiskCacheStore {
         {
             return;
         }
-        // A source-owned (vector-opened) entry accounts its live filled bytes,
-        // so `size_bytes` is NOT the object size. Take the full size from the
-        // block source, and reserve it here — the vector open never did, so the
-        // promotion's mmap needs budget reserved before it downloads.
+        // A Stream-opened (SourceOwned) entry charges only its filled blocks, so `size_bytes` is
+        // not the file size and nothing is reserved for the download yet. Take the size from the
+        // block source and reserve below.
         let size = entry
             .block_source()
             .map(|bs| bs.size())
@@ -439,16 +428,15 @@ impl DiskCacheStore {
         let needs_reserve = matches!(entry.accounting, EntryAccounting::SourceOwned);
         let skip_vec = vector_blob_range(&entry.reader);
 
-        // The fill leaves the vector blob out of the file and keeps this entry's block source for
-        // it, which already charges its own blocks. So reserve only what the file will hold; holding
-        // the hole too for the whole download would only push other entries out.
+        // The vector blob stays on this entry's block source, which charges its own blocks, so
+        // reserve only what the file will hold.
         let reservation = match skip_vec {
             Some((_, vec_len)) if needs_reserve => size.saturating_sub(vec_len),
             _ => size,
         };
 
-        // The window opens now, when the entry becomes lazy — not when the
-        // fill task is scheduled — so a queued task cannot extend it.
+        // The defer window opens now, not when the task is scheduled, so a queued task cannot
+        // extend it.
         let defer = PromotionDefer::start(self.config.promotion_defer_timeout);
         let store = Arc::downgrade(self);
         let reader = Arc::downgrade(&entry.reader);
@@ -680,11 +668,9 @@ impl DiskCacheStore {
             (lazy_reader, size)
         };
 
-        // Vector opens keep their blob sparse and never mmap-promote, so they
-        // account their live filled bytes (source-owned) instead of reserving
-        // the whole superfile up front. Otherwise a fanout touching many
-        // superfiles over-reserves and evicts live peers. FTS/SQL opens promote
-        // to a full mmap, so they keep the eager full-size reservation.
+        // A Stream open charges only the blocks it fills (SourceOwned), so a fanout over many
+        // superfiles does not reserve them all in full and evict live peers. A Warm open will
+        // download the whole file, so it reserves the full size now.
         if allow_background_fill {
             self.reserve_manual(size).await?;
         }
@@ -700,8 +686,7 @@ impl DiskCacheStore {
         };
         let entry = Arc::new(CachedEntry {
             reader: Arc::clone(&lazy_reader),
-            // Fill is modality-gated via [`Self::maybe_spawn_background_fill`] after the open
-            // returns, so it starts false here and vector opens never flip it.
+            // Unlatched: a later Warm read starts the fill, see `maybe_spawn_background_fill`.
             residency: Residency::Paged {
                 block_source: block_source_arc,
                 fill_spawned: AtomicBool::new(false),
@@ -711,13 +696,12 @@ impl DiskCacheStore {
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
-        // Admission may hand back an existing whole-file copy instead of this lazy entry; serve
-        // whatever it returns.
+        // Admission may return an existing whole file instead; serve what it returns.
         Ok(self.admit_entry(*uri, entry))
     }
 
-    /// Run the cold-fetch coordinator for `uri`. Reserves
-    /// budget, fetches, mmap's, registers in `cached`.
+    /// Download the whole file to local disk and admit it as a mapped entry. What a `Load` miss
+    /// uses.
     pub(crate) async fn cold_fetch(
         &self,
         uri: &SuperfileUri,
@@ -1204,9 +1188,9 @@ fn fill_may_replace(entry: &CachedEntry, owner: &Weak<SuperfileReader>) -> bool 
     is_mine(entry, owner) || !entry.has_whole_file()
 }
 
-/// Undo a fill that did not finish: drop the entry it started from if it is still there, give
-/// back what the fill reserved for itself, delete the partial download. The coordinator is not
-/// the fill's, and removing it by key could strip a fetch in flight, so it is left alone.
+/// Undo a fill that did not finish: drop the entry it started from if still there, release the
+/// fill's own reservation, delete the partial download. Leaves the coordinator alone: it belongs
+/// to whatever fetch is in flight, not to the fill.
 fn rollback_lazy_background_fill(
     store: &Arc<DiskCacheStore>,
     uri: &SuperfileUri,
@@ -1232,11 +1216,9 @@ pub(crate) fn skip_background_fill() -> bool {
     global_config().diagnostics.disable_background_fill
 }
 
-/// Promote one released lazy reader to an mmap-backed cache entry.
-///
-/// When `skip_vec` is set, the fill file leaves the vector blob sparse and
-/// promotion opens a hybrid reader: mmap for parquet/FTS, the preserved
-/// block-cache source for vector ranges.
+/// Download the whole file for a lazy entry and install it as a mapped one. With `skip_vec`, the
+/// vector blob is left out of the file and read through the block cache instead (see
+/// [`HoleFallbackSource`]).
 async fn lazy_background_fill(
     store: Weak<DiskCacheStore>,
     reader: Weak<SuperfileReader>,
@@ -1322,64 +1304,44 @@ async fn lazy_background_fill(
         // Mmap the tempfile itself; the install renames it into the cache only if it wins the slot.
         let (mmap_arc, bytes) = mmap_readonly_with_handle(&tmp)?;
 
-        // Reuse the live block-cache source when excluding the vector blob so
-        // touched vector ranges from the cold query stay local after promote.
-        let prior_block = store
-            .cached
-            .get(&uri)
-            .and_then(|entry| entry.block_source().cloned());
-        let (promoted_reader, vector_source) = match (skip_vec, prior_block) {
-            (Some((vec_off, vec_len)), Some(block_source)) => {
-                let local: Arc<dyn LazyByteSource> =
-                    Arc::new(BytesLazyByteSource::new(bytes.clone()));
+        let (promoted_reader, vector_source) = match skip_vec {
+            Some((hole_start, hole_len)) => {
+                // Keep the live block cache, so the vector ranges the cold query read stay local.
+                // None only if an eviction raced the check above: start a fresh one for the hole.
+                let block_source = store
+                    .cached
+                    .get(&uri)
+                    .and_then(|entry| entry.block_source().cloned())
+                    .unwrap_or_else(|| {
+                        let remote: Arc<dyn LazyByteSource> =
+                            Arc::new(StorageRangeSource::with_known_size(
+                                Arc::clone(&fetch_storage),
+                                storage_uri.clone(),
+                                size,
+                            ));
+                        // Serves only the vector hole; FTS bytes come from the mmap.
+                        BlockCachedSource::new_pre_reserved(
+                            remote,
+                            Arc::downgrade(&store),
+                            uri,
+                            store.blocks_path(&uri),
+                            None,
+                        )
+                    });
                 let source: Arc<dyn LazyByteSource> = Arc::new(HoleFallbackSource {
-                    local,
-                    hole_start: vec_off,
-                    hole_len: vec_len,
+                    local: Arc::new(BytesLazyByteSource::new(bytes.clone())),
+                    hole_start,
+                    hole_len,
                     fallback: Arc::clone(&block_source),
                 });
                 let mut reader =
                     SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
                         .await?;
-                // Sync parquet decodes (take / id scans) run off the mmap;
-                // the sparse vector region stays behind the hole source.
+                // Sync parquet decodes (take, id scans) run off the mmap.
                 reader.install_resident_parquet(bytes)?;
                 (reader, Some(block_source))
             }
-            (Some((vec_off, vec_len)), None) => {
-                // Only after an eviction raced the check above: a fresh block cache for the hole.
-                let remote: Arc<dyn LazyByteSource> =
-                    Arc::new(StorageRangeSource::with_known_size(
-                        Arc::clone(&fetch_storage),
-                        storage_uri.clone(),
-                        size,
-                    ));
-                let block_source = BlockCachedSource::new_pre_reserved(
-                    remote,
-                    Arc::downgrade(&store),
-                    uri,
-                    store.blocks_path(&uri),
-                    // Serves only the promoted reader's vector hole; FTS
-                    // bytes come from the mmap.
-                    None,
-                );
-                let local: Arc<dyn LazyByteSource> =
-                    Arc::new(BytesLazyByteSource::new(bytes.clone()));
-                let source: Arc<dyn LazyByteSource> = Arc::new(HoleFallbackSource {
-                    local,
-                    hole_start: vec_off,
-                    hole_len: vec_len,
-                    fallback: Arc::clone(&block_source),
-                });
-                let mut reader =
-                    SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
-                        .await?;
-                // Sync parquet decodes (take / id scans) run off the mmap;
-                // the sparse vector region stays behind the hole source.
-                reader.install_resident_parquet(bytes)?;
-                (reader, Some(block_source))
-            }
-            (None, _) => {
+            None => {
                 let reader = SuperfileReader::open_with(
                     bytes,
                     OpenOptions {
@@ -1401,13 +1363,12 @@ async fn lazy_background_fill(
         };
         let entry =
             store.build_mmap_entry(Arc::new(promoted_reader), mmap_arc, charge, vector_source);
-        // Installed + no retained block source -> the promoted mmap serves every range, so the
-        // sparse block sidecar is dead weight; drop it. Not installed -> the install deleted the
-        // tempfile and we leave the sidecar to its current owner.
+        // Installed with no vector hole, the mmap serves every range and the block file is dead
+        // weight. Not installed, the block file stays with whoever holds the slot.
         let installed =
             store.install_promoted_entry(uri, entry, &tmp, &final_path, &reader, own_reservation);
-        // Either way the install settled this fill's reservation: it now backs the promoted entry,
-        // or it was released along with the redundant download.
+        // The install settled the fill's reservation either way: it backs the new entry, or it
+        // was released.
         own_reservation = None;
         if installed.is_some() && !block_source_retained {
             store.drop_block_file(&uri);
@@ -1686,9 +1647,8 @@ mod tests {
         store.assert_budget_consistent();
     }
 
-    /// A fill whose entry is evicted while it downloads skips the promotion. The download itself
-    /// never touches the vector blob, so a GET inside it would be a promotion read: each one goes
-    /// uncached to object storage through a block source no entry owns.
+    /// A fill whose entry is evicted while it downloads skips the promotion. The download never
+    /// reads the vector blob, so any GET inside it would come from the promotion.
     #[tokio::test]
     async fn fill_whose_entry_was_evicted_mid_download_skips_the_promotion() {
         let (_dir, store, recording, uri, held, permit, hole) = store_with_a_parked_fill().await;
@@ -1733,8 +1693,8 @@ mod tests {
     /// only has to leave a surplus in the fill's full-size reservation.
     const SURPLUS_TEST_BYTES: u64 = 100;
 
-    /// `rollback_lazy_background_fill` undoes an in-flight promotion: it drops the entry the fill
-    /// was promoting and deletes the tmp scratch file left by the partial download.
+    /// `rollback_lazy_background_fill` drops the entry the fill was promoting and deletes its
+    /// partial tempfile.
     #[tokio::test]
     async fn rollback_lazy_background_fill_evicts_entry_and_tmp() {
         let (_dir, store) = test_store();

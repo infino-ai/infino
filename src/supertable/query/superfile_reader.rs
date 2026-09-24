@@ -65,10 +65,7 @@ use crate::{
 /// and the subsection fetches second (2 RTTs). `None` falls back
 /// to the 2-RTT path — same shape, slower.
 ///
-/// `intent` is the read policy: `ReadIntent::Warm` for FTS/SQL
-/// (serve now, warm a full local mmap in the background),
-/// `ReadIntent::Stream` for vector search (block cache only,
-/// never promote).
+/// `intent` is the read policy; see [`ReadIntent`].
 pub async fn superfile_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
@@ -87,9 +84,8 @@ pub async fn superfile_reader(
         Err(other) => return Err(other),
     }
 
-    // 2. Disk cache fallback (when attached). The cache itself degrades to
-    //    an uncached streaming reader when it cannot admit the superfile
-    //    (larger than the whole budget), so a budget miss never fails here.
+    // 2. Disk cache, when attached. It streams uncached when it cannot admit
+    //    the file, so a budget miss never fails here.
     if let Some(cache) = disk_cache {
         return cache
             .open_for_query(uri, storage_key, offsets, storage, intent)
