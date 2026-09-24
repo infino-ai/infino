@@ -95,14 +95,17 @@ impl DiskCacheStore {
         n_advised
     }
 
-    /// Drop idle lazy (`Residency::Paged`) entries from the cache.
+    /// Drop idle entries that hold no mmap: lazy (`Residency::Paged`) ones,
+    /// and `Buffered` ones a hybrid fetch has not finalized yet.
     ///
-    /// A lazy reader's cost is anonymous heap — the open-time ranges its
-    /// source holds — and `madvise` cannot touch that, so the mmap sweep
-    /// above sees nothing to do for these entries and their memory
+    /// Their cost is anonymous heap, which `madvise` cannot touch, so the
+    /// mmap sweep above sees nothing to do for them and their memory
     /// accumulates with every superfile a process has ever opened.
     /// Dropping the entry releases it: the cache holds the last `Arc`,
-    /// and the next reader for that URI re-opens.
+    /// and the next reader for that URI re-opens. Its budget is released
+    /// with it, since a Warm lazy or buffered entry is charged its full
+    /// size at open. A background fill still running for it sees the
+    /// reader gone and stops at its next chunk.
     ///
     /// Only entries the cache alone holds are dropped. A reader a query
     /// is still using has a live `Arc`, so removing it from the map would
@@ -125,8 +128,12 @@ impl DiskCacheStore {
             // Re-check under the shard guard: a query may have taken a
             // reference since the snapshot, in which case dropping the
             // entry would free nothing and cost that query a re-open.
-            self.cached
-                .remove_if(&uri, |_, entry| reclaimable_lazy_entry(entry));
+            if let Some((_, removed)) = self
+                .cached
+                .remove_if(&uri, |_, entry| reclaimable_lazy_entry(entry))
+            {
+                self.release_entry_accounting(&removed);
+            }
         }
     }
 
@@ -590,6 +597,51 @@ mod tests {
         // And it is re-openable afterwards.
         let again = store.reader(&uri).await.expect("re-open after release");
         assert_eq!(again.n_docs(), 1);
+    }
+
+    /// The sweep gives back the budget of every entry it drops. A Warm lazy entry is charged its
+    /// full size up front, so dropping it without releasing that charge leaves phantom bytes, and
+    /// eviction then deletes real files to make room for them.
+    #[tokio::test]
+    async fn idle_sweep_releases_the_budget_of_what_it_drops() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.mmap_cold_threshold_secs = 0;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let warm = SuperfileUri::new_v4();
+        let stream = SuperfileUri::new_v4();
+        for uri in [&warm, &stream] {
+            put_superfile(&store, uri, tiny_superfile_bytes()).await;
+        }
+        store.reader(&warm).await.expect("warm lazy open");
+        store
+            .open_for_query(
+                &stream,
+                &stream.storage_path(),
+                None,
+                None,
+                ReadIntent::Stream,
+            )
+            .await
+            .expect("stream lazy open");
+        assert!(
+            store.stats().current_bytes > 0,
+            "the warm open charged its full size"
+        );
+
+        store.sweep_once();
+
+        assert!(
+            !store.is_cached(&warm) && !store.is_cached(&stream),
+            "both idle lazy entries are dropped"
+        );
+        store.assert_budget_consistent();
+        assert_eq!(
+            store.stats().current_bytes,
+            0,
+            "nothing is charged once both entries are gone"
+        );
     }
 
     #[tokio::test]
