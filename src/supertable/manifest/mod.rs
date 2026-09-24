@@ -2887,7 +2887,7 @@ pub struct SuperfileEntry {
     /// stamp this field; the cold open path falls back to the
     /// 2-RTT shape (parquet tail
     /// then vec/fts in parallel) — see
-    /// `DiskCacheStore::reader_with_hints`.
+    /// `DiskCacheStore::open_for_query`.
     pub subsection_offsets: Option<SubsectionOffsets>,
     pub(crate) vector_layout: VectorLayout,
     /// The `manifest_id` of the commit that introduced this superfile — its
@@ -3008,9 +3008,11 @@ impl SuperfileUri {
         format!("seg-{}.sf.parquet", self.0)
     }
 
-    /// Disk-cache tempfile while a cold fetch is in flight.
-    pub fn cache_tmp_filename(self) -> String {
-        format!("{}{CACHE_TMP_EXTENSION}", self.cache_filename())
+    /// Disk-cache tempfile name for download number `seq` of this superfile. Each download gets its
+    /// own: several can run at once (a foreground fetch, a background fill, a hybrid finalizer),
+    /// and two writers on one tempfile corrupt it.
+    pub fn cache_tmp_filename(self, seq: u64) -> String {
+        format!("{}.{seq}{CACHE_TMP_EXTENSION}", self.cache_filename())
     }
 
     /// Inverse of [`Self::cache_filename`]: recover the URI from an on-disk
@@ -3018,17 +3020,27 @@ impl SuperfileUri {
     /// from files a prior run left under `cache_root`, so a restart / second
     /// handle reuses the NVMe bytes instead of cold-fetching from object
     /// storage. Returns `None` for anything that isn't exactly
-    /// `seg-<uuid>.sf.parquet` — notably the `.tmp` in-flight files, whose
-    /// longer `.sf.parquet.tmp` suffix must be ignored (incomplete writes).
+    /// `seg-<uuid>.sf.parquet`, including in-flight tempfiles (see
+    /// [`Self::from_cache_tmp_filename`]).
     pub fn from_cache_filename(name: &str) -> Option<Self> {
         let body = name.strip_prefix("seg-")?.strip_suffix(".sf.parquet")?;
         Uuid::parse_str(body).ok().map(SuperfileUri)
     }
 
-    /// Inverse of [`Self::cache_tmp_filename`]: recover the URI from an in-flight tempfile's name.
-    /// A crash can leave one behind; the disk cache uses this to recognize and delete it.
+    /// Inverse of [`Self::cache_tmp_filename`], so the disk cache can find and delete tempfiles a
+    /// crash left behind. Also accepts the unnumbered `seg-<uuid>.sf.parquet.tmp` older builds
+    /// wrote.
     pub fn from_cache_tmp_filename(name: &str) -> Option<Self> {
-        Self::from_cache_filename(name.strip_suffix(CACHE_TMP_EXTENSION)?)
+        let body = name.strip_suffix(CACHE_TMP_EXTENSION)?;
+        let body = match body.rsplit_once('.') {
+            Some((cache_name, seq))
+                if !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                cache_name
+            }
+            _ => body,
+        };
+        Self::from_cache_filename(body)
     }
 
     /// Inverse of [`Self::storage_path`] and of
@@ -5636,7 +5648,22 @@ mod tests {
         let id = uri.0;
         assert_eq!(uri.storage_path(), format!("data/seg-{id}.sf.parquet"));
         assert_eq!(uri.cache_filename(), format!("seg-{id}.sf.parquet"));
-        assert_eq!(uri.cache_tmp_filename(), format!("seg-{id}.sf.parquet.tmp"));
+        assert_eq!(
+            uri.cache_tmp_filename(7),
+            format!("seg-{id}.sf.parquet.7.tmp")
+        );
+        // Numbered tempfiles, and the unnumbered ones older builds left behind, both map back.
+        for name in [
+            uri.cache_tmp_filename(7),
+            format!("seg-{id}.sf.parquet.tmp"),
+        ] {
+            assert_eq!(SuperfileUri::from_cache_tmp_filename(&name), Some(uri));
+        }
+        // A non-numeric suffix is not one of ours.
+        assert_eq!(
+            SuperfileUri::from_cache_tmp_filename(&format!("seg-{id}.sf.parquet.x.tmp")),
+            None
+        );
     }
 
     #[test]

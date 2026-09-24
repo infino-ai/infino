@@ -35,6 +35,9 @@ use std::{
     },
 };
 
+// Re-exported for the drain caller (`writer.rs`), which owns the coarse
+// router across the batch loop and so must name these types.
+pub(crate) use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw};
 use crate::{
     config,
     superfile::vector::{
@@ -43,13 +46,13 @@ use crate::{
             Metric, distance, nearest_k_centroids_bytes, nearest_k_centroids_transposed, normalize,
             relative_score_window,
         },
+        hnsw::HnswParams,
         kmeans::{kmeans, kmeans_pp},
         quant::{
             BitQuantizer, LutQuery, build_transposed_code_cache, for_each_code_block_scores,
             lut_scan_supported,
         },
         reader::CellFineCalibrationView,
-        reservoir::Reservoir,
         rotation::RandomRotation,
         spill::SpilledCellRows,
     },
@@ -284,6 +287,142 @@ pub(crate) fn boundary_assignment_fp32(
         exact
     };
     boundary_from_ranked(clusters, metric, &ranked)
+}
+
+/// Grid sizes at or below this cell count take the exact/shortlist assign
+/// path, not the graph. Below ~64 cells the centroid HNSW's build and walk
+/// overhead outweighs the exact scan it replaces (the exact scan already
+/// covers the whole grid in one blocked-SIMD pass), and the shortlist window
+/// floor already means small grids scan exactly. The graph pays off only as
+/// the grid grows (the kernel bench crosses over well above this).
+pub(crate) const GRAPH_ASSIGN_MIN_N_CENT: usize = 64;
+
+/// Search beam width for the coarse centroid router as a function of grid size:
+/// `ef = max(16, round(sqrt(n_cent) / 4))`. Monotonic in `n_cent`; `sqrt` tracks
+/// the graph's diameter growth (a fixed ef under-serves a large grid and
+/// over-serves a small one). Cosine yields 16@256, 16@1024, 16@4096, 32@16384.
+///
+/// Graph-routed assign is cosine-gated at the drain caller (non-cosine metrics
+/// take the exact path — their centroid HNSW is hub-dominated and collapses the
+/// grid), so this is the cosine beam. The `_metric` parameter is retained for
+/// when a metric-robust coarse router re-enables non-cosine.
+///
+/// The floor is 16, not the graph's nominal minimum: at small grids a bare
+/// `sqrt(n)/4` beam (4-8) leaves ~0.994 primary parity vs the exact path, which
+/// does not hurt recall but shifts post-drain cell membership enough to perturb
+/// the cold-read block layout; a floor of 16 lifts small-grid parity back to the
+/// exact path's footprint, and the graph is cheap at those sizes anyway.
+pub(crate) fn coarse_router_ef(n_cent: usize, _metric: Metric) -> usize {
+    (((n_cent as f64).sqrt() / 4.0).round() as usize).max(16)
+}
+
+/// Graph-routed variant of [`boundary_assignment_fp32`]. Instead of the
+/// 1-bit admit shortlist + windowed exact rescore, route the row through a
+/// centroid HNSW built ONCE over the coarse cell centroids (caller-owned,
+/// live-built — not rebuilt per row) to surface the `top_k` nearest cells,
+/// then re-score exactly those cells with [`ClusterCentroids::score_one`]
+/// — the identical score orientation [`boundary_assignment_fp32`] feeds —
+/// and run the shared [`boundary_from_ranked`] closure unchanged. `ef` is
+/// the graph's search beam width (see [`coarse_router_ef`]).
+///
+/// The graph is built only over POPULATED cells (count-0 cells are skipped,
+/// matching the production shortlist path), so graph node ids are dense and
+/// do NOT equal cell ids. `node_to_cell` (from [`build_coarse_router`]) maps
+/// each returned node back to its cell id before scoring; scoring and
+/// [`boundary_from_ranked`] then run entirely in cell-id space.
+///
+/// Re-scoring the returned cells with `score_one` (rather than trusting the
+/// graph's own returned scores) keeps the number fed to `boundary_from_ranked`
+/// bit-identical to the current path, so any placement difference measures
+/// the graph's candidate recall, never a score-space mismatch. The cost is
+/// `top_k` extra exact centroid scores per row — negligible beside the walk.
+pub(crate) fn boundary_assignment_graph(
+    graph: &Hnsw,
+    scorer: &Fp32Scorer,
+    node_to_cell: &[u32],
+    clusters: &ClusterCentroids,
+    metric: Metric,
+    row_fp: &[f32],
+    ef: usize,
+) -> BoundaryAssignment {
+    let top_k = REPLICA_CLOSURE_MAX_REPLICAS + 1;
+    // The scorer ranks in the metric's prepared space (unit-normalized for
+    // cosine, as build does via the same normalize); prepare the query the
+    // same way before the walk. `score_one` below still sees the raw
+    // `row_fp`, exactly as `boundary_assignment_fp32` does.
+    let mut query = row_fp.to_vec();
+    if metric == Metric::Cosine {
+        normalize(&mut query);
+    }
+    let mut exact: Vec<(u32, f32)> = graph
+        .search(scorer, &query, top_k, ef)
+        .into_iter()
+        .map(|(node, _)| {
+            let cell = node_to_cell[node as usize];
+            (cell, clusters.score_one(metric, cell as usize, row_fp))
+        })
+        .collect();
+    exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    exact.truncate(top_k);
+    boundary_from_ranked(clusters, metric, &exact)
+}
+
+/// Build the coarse centroid router used by the graph-routed drain assign:
+/// one HNSW over the fp32 centroids of the POPULATED cells plus the matching
+/// fp32 scorer, built ONCE per drain by the caller. Count-0 cells are skipped
+/// so the graph never surfaces an unpopulated cell the production shortlist
+/// path (`admit_shortlist` / `estimate_admit_scores_into`, both of which skip
+/// count-0) would not — a split that empties a cell would otherwise let the
+/// graph route a row into it and diverge from the exact path. Because empty
+/// cells are dropped, node id != cell id; the returned `node_to_cell` maps
+/// dense node ids back to cell ids. For cosine the centroids are
+/// unit-normalized into the graph's prepared space (queries are normalized in
+/// [`boundary_assignment_graph`]); other metrics build over the raw
+/// centroids. The returned scorer must outlive every search on the graph.
+pub(crate) fn build_coarse_router(
+    clusters: &ClusterCentroids,
+    metric: Metric,
+) -> (Fp32Scorer, Hnsw, Vec<u32>) {
+    let dim = clusters.dim as usize;
+    let n_cent = clusters.n_cent as usize;
+    let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(n_cent);
+    let mut node_to_cell: Vec<u32> = Vec::with_capacity(n_cent);
+    for c in 0..n_cent {
+        if clusters.counts[c] == 0 {
+            continue;
+        }
+        let mut v = clusters.centroid(c).to_vec();
+        if metric == Metric::Cosine {
+            normalize(&mut v);
+        }
+        centroids.push(v);
+        node_to_cell.push(c as u32);
+    }
+    let scorer = Fp32Scorer::from_vectors(&centroids, dim, metric);
+    // Serial (deterministic) build: the coarse router decides drain-assign cell
+    // membership, and the parallel build's concurrent insert reordering shifts
+    // membership for a thin tail of boundary rows run to run, perturbing the
+    // post-drain cold-read block layout. A serial build over these few thousand
+    // centroids is negligible and makes placement reproducible.
+    let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+    (scorer, graph, node_to_cell)
+}
+
+/// Graph-routed drain assign for an encoded row: decode the Sq8+ε row once,
+/// then route through the caller-owned centroid HNSW. Same result type and
+/// placement semantics as [`boundary_assignment_encoded`], differing only in
+/// how the candidate cells are surfaced (graph walk vs. 1-bit shortlist).
+pub(crate) fn boundary_assignment_graph_encoded(
+    graph: &Hnsw,
+    scorer: &Fp32Scorer,
+    node_to_cell: &[u32],
+    clusters: &ClusterCentroids,
+    metric: Metric,
+    row: &EncodedCellRow,
+    ef: usize,
+) -> BoundaryAssignment {
+    let row_fp = dequantize_row(row, clusters.dim as usize);
+    boundary_assignment_graph(graph, scorer, node_to_cell, clusters, metric, &row_fp, ef)
 }
 
 /// Shared closure tail: primary = best-ranked cell; replicas = ranked
@@ -906,7 +1045,7 @@ pub(crate) fn fanout_knee_from_recalls(
 /// the prefix INCLUDING its own bin — rank error is bounded by one bin's
 /// occupancy and always over-counts (a wider law, never a narrower one).
 const RERANK_LAW_EST_BINS: usize = 4096;
-/// Fixed seed for the calibration reservoir, so a re-drained identical
+/// Fixed seed for the calibration query min-hash, so a re-drained identical
 /// corpus stamps an identical law.
 const WIDTH_LAW_SAMPLE_SEED: u64 = 0x51ED_CA1B;
 /// Rows decoded per chunk while scoring a spilled cell.
@@ -918,6 +1057,55 @@ const WIDTH_LAW_SCORE_CHUNK: usize = 1024;
 /// grows ~sqrt(N)); set generously here and validated by law-parity against
 /// the exhaustive sweep. Bounds pass-1 memory at `Q * CAP` candidates.
 const WIDTH_LAW_SHORTLIST_CAP: usize = 8192;
+
+/// Deterministic content hash of a decoded query vector — FNV-1a over the
+/// float bits, salted by [`WIDTH_LAW_SAMPLE_SEED`]. Depends only on the
+/// vector's contents, so it is invariant to the order rows are offered.
+fn width_law_query_hash(vec: &[f32]) -> u64 {
+    let mut h = WIDTH_LAW_SAMPLE_SEED ^ 0x1405_7B7E_F767_814F;
+    for &v in vec {
+        h = (h ^ v.to_bits() as u64).wrapping_mul(0x0100_0000_01B3);
+    }
+    h ^ (h >> 29)
+}
+
+/// One calibration-query candidate, kept by content min-hash so the sampled
+/// query set is a deterministic function of the offered rows' CONTENT — not
+/// of the order they were offered. The drain streams rows to the calibrator
+/// in an order that varies run to run (materialization/enumeration is not
+/// order-stable), which shifts a position-based reservoir sample and
+/// destabilizes the stamped law even though the corpus is identical.
+/// [`WidthLawCalibration`] keeps the [`WIDTH_LAW_QUERY_SAMPLE`] smallest-hash
+/// candidates in a bounded max-heap (each `pop` evicts the largest hash).
+/// Ties break on the vector bytes so distinct vectors that collide stay
+/// deterministic; the stable id is NOT a tie-break — it is a per-run
+/// snowflake, and two content-identical rows are interchangeable as queries.
+struct QueryCand {
+    hash: u64,
+    vec: Vec<f32>,
+    id: i128,
+}
+impl PartialEq for QueryCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for QueryCand {}
+impl PartialOrd for QueryCand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for QueryCand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.hash.cmp(&other.hash).then_with(|| {
+            self.vec
+                .iter()
+                .map(|v| v.to_bits())
+                .cmp(other.vec.iter().map(|v| v.to_bits()))
+        })
+    }
+}
 
 /// Frozen query sample: dequantized fp32 vectors + their stable ids
 /// (self-hit exclusion while scoring).
@@ -955,10 +1143,10 @@ struct WidthLawQueries {
 pub(crate) struct WidthLawCalibration {
     dim: usize,
     metric: Metric,
-    reservoir: Reservoir,
-    /// Stable id of each reservoir slot, kept in lockstep through
-    /// [`Reservoir::update_traced`].
-    slot_ids: Vec<i128>,
+    /// Bounded content min-hash of offered rows: the [`WIDTH_LAW_QUERY_SAMPLE`]
+    /// smallest-hash candidates (see [`QueryCand`]). Order-independent, so the
+    /// sampled query set — and the stamped law — is reproducible run to run.
+    query_cands: std::collections::BinaryHeap<QueryCand>,
     dequant_scratch: Vec<f32>,
     frozen: Option<WidthLawQueries>,
     /// Per-query `(score, cell, stable id)` candidates, truncated to the
@@ -1363,8 +1551,7 @@ impl WidthLawCalibration {
         Self {
             dim,
             metric,
-            reservoir: Reservoir::new(WIDTH_LAW_QUERY_SAMPLE, dim, WIDTH_LAW_SAMPLE_SEED),
-            slot_ids: Vec::with_capacity(WIDTH_LAW_QUERY_SAMPLE),
+            query_cands: std::collections::BinaryHeap::with_capacity(WIDTH_LAW_QUERY_SAMPLE + 1),
             dequant_scratch: vec![0f32; dim],
             frozen: None,
             tops: Mutex::new(Vec::new()),
@@ -1381,12 +1568,22 @@ impl WidthLawCalibration {
     pub(crate) fn offer(&mut self, row: &MaterializedIvfRow) {
         debug_assert!(self.frozen.is_none(), "offer after freeze");
         dequantize_row_into(&row.encoded, &mut self.dequant_scratch);
-        if let Some(slot) = self.reservoir.update_traced(&self.dequant_scratch) {
-            if slot == self.slot_ids.len() {
-                self.slot_ids.push(row.stable_id);
-            } else {
-                self.slot_ids[slot] = row.stable_id;
-            }
+        let hash = width_law_query_hash(&self.dequant_scratch);
+        // Keep the WIDTH_LAW_QUERY_SAMPLE smallest-hash candidates. Skip the
+        // clone when the heap is full and this row's hash can't beat the
+        // current largest (its top); otherwise push and evict the max.
+        if self.query_cands.len() >= WIDTH_LAW_QUERY_SAMPLE
+            && self.query_cands.peek().map(|t| t.hash).unwrap_or(u64::MAX) < hash
+        {
+            return;
+        }
+        self.query_cands.push(QueryCand {
+            hash,
+            vec: self.dequant_scratch.clone(),
+            id: row.stable_id,
+        });
+        if self.query_cands.len() > WIDTH_LAW_QUERY_SAMPLE {
+            self.query_cands.pop();
         }
     }
 
@@ -1403,8 +1600,17 @@ impl WidthLawCalibration {
         self.pool_cells = pool_cells
             .max(RERANK_LAW_POOL_CELLS)
             .min((grid.n_cent as usize).max(1));
-        let queries = self.reservoir.sample().to_vec();
-        let ids = self.slot_ids.clone();
+        // Drain the min-hash candidates in ascending (hash, bytes) order — an
+        // order-independent query set the sampler produces identically for any
+        // offer order over the same rows.
+        let mut cands: Vec<QueryCand> = std::mem::take(&mut self.query_cands).into_vec();
+        cands.sort_unstable();
+        let mut queries: Vec<f32> = Vec::with_capacity(cands.len() * self.dim);
+        let mut ids: Vec<i128> = Vec::with_capacity(cands.len());
+        for c in &cands {
+            queries.extend_from_slice(&c.vec);
+            ids.push(c.id);
+        }
         let n_queries = ids.len();
         *self.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![Vec::new(); n_queries];
         *self.est_tops.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -3564,5 +3770,505 @@ mod tests {
             populated >= 2,
             "at least 2 sub-cells populated, got {populated}"
         );
+    }
+
+    /// Deterministic xorshift64* → f32 in `[-1, 1)`. No `rand` dependency, no
+    /// wall-clock: fixed seed in, fixed grid out, so the bench is reproducible.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn unit_f32(&mut self) -> f32 {
+            // 24-bit mantissa → [0,1), then map to [-1,1).
+            let u = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32;
+            u * 2.0 - 1.0
+        }
+    }
+
+    fn unit_normalize(v: &mut [f32]) {
+        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if n > 0.0 {
+            for x in v.iter_mut() {
+                *x /= n;
+            }
+        }
+    }
+
+    /// Standalone isolation micro-bench for the graph-routed drain assignment.
+    /// Synthetic well-separated unit centroids + clustered query rows; no
+    /// ingest, no storage. Compares [`boundary_assignment_fp32`] (current) to
+    /// [`boundary_assignment_graph`] on placement parity and per-row speed
+    /// across grid sizes, sweeping `ef` to find the smallest that reaches 0.99
+    /// primary parity. Run with:
+    ///   cargo test --release -p infino graph_routed_assignment_microbench -- --nocapture --ignored
+    #[test]
+    #[ignore = "micro-bench: run explicitly with --release --nocapture --ignored"]
+    fn graph_routed_assignment_microbench() {
+        use std::{hint::black_box, time::Instant};
+
+        const DIM: usize = 768;
+        const QUERY_ROWS: usize = 5000;
+        const METRIC: Metric = Metric::Cosine;
+        let grids = [256usize, 1024, 4096, 16384];
+        let efs = [8usize, 16, 32];
+
+        eprintln!(
+            "\n=== graph-routed drain assignment micro-bench (dim={DIM}, rows={QUERY_ROWS}, metric={METRIC:?}) ===\n"
+        );
+        eprintln!(
+            "{:>7} | {:>11} | {:>11} | {:>8} | {:>8} | {:>10} | {:>10} | {:>9}",
+            "n_cent",
+            "current-ns",
+            "graph-ns",
+            "speedup",
+            "formula-ef",
+            "prim-parity",
+            "repl-parity",
+            "build-ms"
+        );
+        eprintln!("{}", "-".repeat(92));
+
+        for &n_cent in &grids {
+            // --- Synthetic well-separated unit centroids (random high-dim
+            // Gaussian-ish vectors are near-orthogonal at dim=768). ---
+            let mut rng = Rng(0x1234_5678_9abc_def0 ^ (n_cent as u64).wrapping_mul(0x9E37_79B9));
+            let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(n_cent);
+            for _ in 0..n_cent {
+                let mut v = vec![0f32; DIM];
+                for x in v.iter_mut() {
+                    *x = rng.unit_f32();
+                }
+                unit_normalize(&mut v);
+                centroids.push(v);
+            }
+            let flat: Vec<f32> = centroids.iter().flatten().copied().collect();
+            let counts = vec![1u32; n_cent];
+            let clusters =
+                ClusterCentroids::from_fp32(n_cent as u32, DIM as u32, &flat, counts.clone());
+            let admit_ctx = RabitqAdmitContext::new(DIM, 0xA5A5_5A5A_1234_9876);
+            let window = assignment_shortlist_window(n_cent);
+
+            // --- Clustered query rows: pick a centroid, add per-component
+            // noise, normalize. Noise magnitude is kept well below the unit
+            // signal (per-component in [-EPS, EPS]; at dim=768 the noise vector
+            // norm is ~EPS*16, so EPS=0.02 => noise norm ~0.3, a clean 3:1
+            // signal:noise). This is the "well-separated clusters" regime: each
+            // row has an unambiguous nearest cell, with a thin tail of genuine
+            // boundary rows that exercise the replica closure. ---
+            const EPS: f32 = 0.02;
+            let mut queries: Vec<Vec<f32>> = Vec::with_capacity(QUERY_ROWS);
+            for _ in 0..QUERY_ROWS {
+                let t = (rng.next_u64() as usize) % n_cent;
+                let mut q = centroids[t].clone();
+                for x in q.iter_mut() {
+                    *x += EPS * rng.unit_f32();
+                }
+                unit_normalize(&mut q);
+                queries.push(q);
+            }
+
+            // --- Build the coarse centroid router ONCE (the same builder the
+            // drain uses, so the node_to_cell mapping and cosine normalization
+            // are exercised here too), timed separately from per-row assign. ---
+            let t0 = Instant::now();
+            let (scorer, graph, node_to_cell) = build_coarse_router(&clusters, METRIC);
+            let build_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+            // --- Reference assignments via the current path (ef-independent),
+            // computed once. ---
+            let fp32_assign: Vec<BoundaryAssignment> = queries
+                .iter()
+                .map(|q| boundary_assignment_fp32(&clusters, METRIC, q, &admit_ctx, window))
+                .collect();
+
+            // Comparable key: primary + sorted replica cell ids.
+            let key = |a: &BoundaryAssignment| -> (u32, Vec<u32>) {
+                let mut reps: Vec<u32> = a
+                    .replicas
+                    .iter()
+                    .filter_map(|r| r.map(|(c, _)| c))
+                    .collect();
+                reps.sort_unstable();
+                (a.primary, reps)
+            };
+            let fp32_keys: Vec<(u32, Vec<u32>)> = fp32_assign.iter().map(key).collect();
+
+            // --- Sweep ef for parity, plus the production formula's own ef so
+            // the shipped `coarse_router_ef(n_cent)` is measured directly. ---
+            let formula_ef = coarse_router_ef(n_cent, METRIC);
+            let mut sweep: Vec<usize> = efs.to_vec();
+            if !sweep.contains(&formula_ef) {
+                sweep.push(formula_ef);
+            }
+            sweep.sort_unstable();
+            let mut min_ef_099: Option<usize> = None;
+            let mut parity_at: Vec<(usize, f64, f64)> = Vec::new();
+            for &ef in &sweep {
+                let mut prim_ok = 0usize;
+                let mut repl_ok = 0usize;
+                for (q, fk) in queries.iter().zip(fp32_keys.iter()) {
+                    let g = boundary_assignment_graph(
+                        &graph,
+                        &scorer,
+                        &node_to_cell,
+                        &clusters,
+                        METRIC,
+                        q,
+                        ef,
+                    );
+                    let gk = key(&g);
+                    if gk.0 == fk.0 {
+                        prim_ok += 1;
+                    }
+                    if gk == *fk {
+                        repl_ok += 1;
+                    }
+                }
+                let pp = prim_ok as f64 / QUERY_ROWS as f64;
+                let rp = repl_ok as f64 / QUERY_ROWS as f64;
+                parity_at.push((ef, pp, rp));
+                if pp >= 0.99 && min_ef_099.is_none() {
+                    min_ef_099 = Some(ef);
+                }
+            }
+            // Report at the production formula's ef (not the swept minimum): it
+            // is what the drain actually uses, and it must clear 0.99 primary.
+            let chosen_ef = formula_ef;
+            let (_, chosen_pp, chosen_rp) = *parity_at
+                .iter()
+                .find(|(e, _, _)| *e == chosen_ef)
+                .expect("formula ef was measured in the sweep");
+
+            // --- Speed: mean per-row ns, current vs graph at chosen ef. ---
+            let t_cur = Instant::now();
+            for q in &queries {
+                black_box(boundary_assignment_fp32(
+                    &clusters, METRIC, q, &admit_ctx, window,
+                ));
+            }
+            let cur_ns = t_cur.elapsed().as_nanos() as f64 / QUERY_ROWS as f64;
+
+            let t_g = Instant::now();
+            for q in &queries {
+                black_box(boundary_assignment_graph(
+                    &graph,
+                    &scorer,
+                    &node_to_cell,
+                    &clusters,
+                    METRIC,
+                    q,
+                    chosen_ef,
+                ));
+            }
+            let g_ns = t_g.elapsed().as_nanos() as f64 / QUERY_ROWS as f64;
+
+            eprintln!(
+                "{:>7} | {:>11.0} | {:>11.0} | {:>7.2}x | {:>8} | {:>10.4} | {:>10.4} | {:>9.1}",
+                n_cent,
+                cur_ns,
+                g_ns,
+                cur_ns / g_ns,
+                chosen_ef,
+                chosen_pp,
+                chosen_rp,
+                build_ms
+            );
+            for (ef, pp, rp) in &parity_at {
+                eprintln!("          ef={ef:>2}: primary={pp:.4} replica={rp:.4}");
+            }
+
+            // The SHIPPED formula ef must clear 0.99 primary parity at this
+            // grid — this is the acceptance bar for `coarse_router_ef`.
+            assert!(
+                chosen_pp >= 0.99,
+                "n_cent={n_cent}: formula ef={chosen_ef} gave primary parity {chosen_pp:.4} < 0.99"
+            );
+            // Sanity: 0.99 was reachable somewhere in the sweep.
+            assert!(
+                min_ef_099.is_some(),
+                "n_cent={n_cent}: graph never reached 0.99 primary parity across ef {sweep:?}"
+            );
+        }
+        eprintln!("\n=== end micro-bench ===\n");
+    }
+
+    /// Comparable placement key: primary cell + its sorted replica cell ids.
+    fn assignment_key(a: &BoundaryAssignment) -> (u32, Vec<u32>) {
+        let mut reps: Vec<u32> = a
+            .replicas
+            .iter()
+            .filter_map(|r| r.map(|(c, _)| c))
+            .collect();
+        reps.sort_unstable();
+        (a.primary, reps)
+    }
+
+    /// Ground-truth boundary assignment: an EXACT full scan over every
+    /// POPULATED cell (skipping count-0, as the production shortlist does),
+    /// fed through the same [`boundary_from_ranked`] closure. This is the true
+    /// placement the graph approximates — comparing the graph to THIS (rather
+    /// than to the 1-bit shortlist, which carries its own estimator error)
+    /// isolates the graph's candidate recall, the only thing under test.
+    fn exact_reference(
+        clusters: &ClusterCentroids,
+        metric: Metric,
+        counts: &[u32],
+        q: &[f32],
+    ) -> BoundaryAssignment {
+        let top_k = REPLICA_CLOSURE_MAX_REPLICAS + 1;
+        let mut ranked: Vec<(u32, f32)> = (0..clusters.n_cent as usize)
+            .filter(|&c| counts[c] > 0)
+            .map(|c| (c as u32, clusters.score_one(metric, c, q)))
+            .collect();
+        ranked.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(top_k);
+        boundary_from_ranked(clusters, metric, &ranked)
+    }
+
+    /// Build a well-separated synthetic grid (`n_cent` unit centroids at
+    /// `dim`) with the given per-cell counts, plus `n_rows` clustered query
+    /// rows (each a populated centroid + small noise). Returns
+    /// `(clusters, counts, queries)`. Deterministic (fixed seed).
+    fn synthetic_grid(
+        n_cent: usize,
+        dim: usize,
+        counts: Vec<u32>,
+        n_rows: usize,
+        metric: Metric,
+        seed: u64,
+    ) -> (ClusterCentroids, Vec<u32>, Vec<Vec<f32>>) {
+        let mut rng = Rng(seed);
+        let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(n_cent);
+        for _ in 0..n_cent {
+            let mut v = vec![0f32; dim];
+            for x in v.iter_mut() {
+                *x = rng.unit_f32();
+            }
+            unit_normalize(&mut v);
+            centroids.push(v);
+        }
+        let flat: Vec<f32> = centroids.iter().flatten().copied().collect();
+        let clusters =
+            ClusterCentroids::from_fp32(n_cent as u32, dim as u32, &flat, counts.clone());
+        // Query rows only from POPULATED centroids (empty cells hold no rows).
+        let populated: Vec<usize> = (0..n_cent).filter(|&c| counts[c] > 0).collect();
+        assert!(!populated.is_empty(), "grid must have a populated cell");
+        // Per-component noise moves rows off their centroid so the
+        // closure/rescore code runs, with a thin tail of genuine boundary rows.
+        const EPS: f32 = 0.02;
+        let mut queries: Vec<Vec<f32>> = Vec::with_capacity(n_rows);
+        for _ in 0..n_rows {
+            let t = populated[(rng.next_u64() as usize) % populated.len()];
+            let mut q = centroids[t].clone();
+            for x in q.iter_mut() {
+                *x += EPS * rng.unit_f32();
+            }
+            if metric == Metric::Cosine {
+                unit_normalize(&mut q);
+            }
+            queries.push(q);
+        }
+        (clusters, counts, queries)
+    }
+
+    /// Graph-routed placement must match the exact scan for EVERY metric.
+    /// Cosine, L2Sq and NegDot all re-score candidates with the SAME
+    /// `score_one` and run the SAME `boundary_from_ranked`, so once the graph
+    /// surfaces the true candidate set the placement is identical — this test
+    /// locks that score-orientation wiring per metric (the bug it guards is a
+    /// metric fed to the graph in one space and re-scored in another). It runs
+    /// the graph at a wide, near-exhaustive `ef` so graph candidate recall is
+    /// ~1.0 and any residual would be a wiring error, not a beam-width miss;
+    /// the shipped `coarse_router_ef` beam is validated separately by the
+    /// micro-bench and `coarse_router_ef_hits_parity_knees`. The reference is
+    /// the exact full scan over populated cells.
+    #[test]
+    fn graph_assign_matches_exact_across_metrics() {
+        const DIM: usize = 768;
+        const N_CENT: usize = 128;
+        const N_ROWS: usize = 400;
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let counts = vec![1u32; N_CENT];
+            let (clusters, counts, queries) = synthetic_grid(
+                N_CENT,
+                DIM,
+                counts,
+                N_ROWS,
+                metric,
+                0xC0FFEE ^ metric as u64,
+            );
+            const { assert!(N_CENT >= GRAPH_ASSIGN_MIN_N_CENT) };
+            let (scorer, graph, node_to_cell) = build_coarse_router(&clusters, metric);
+            // Near-exhaustive beam: isolate wiring from beam-width recall.
+            let ef = N_CENT;
+            let mut primary_ok = 0usize;
+            let mut full_ok = 0usize;
+            for q in &queries {
+                let exact = exact_reference(&clusters, metric, &counts, q);
+                let g = boundary_assignment_graph(
+                    &graph,
+                    &scorer,
+                    &node_to_cell,
+                    &clusters,
+                    metric,
+                    q,
+                    ef,
+                );
+                if exact.primary == g.primary {
+                    primary_ok += 1;
+                }
+                if assignment_key(&exact) == assignment_key(&g) {
+                    full_ok += 1;
+                }
+            }
+            // Primary and full placement track the exact scan at or above the
+            // acceptance bar. The graph is an approximate index, so the residual
+            // (a handful of genuine near-tie rows) is graph candidate recall —
+            // the same >=0.99 bar `coarse_router_ef` is calibrated to.
+            let primary_parity = primary_ok as f64 / N_ROWS as f64;
+            let full_parity = full_ok as f64 / N_ROWS as f64;
+            assert!(
+                primary_parity >= 0.99,
+                "metric={metric:?}: primary parity {primary_parity:.4} < 0.99 \
+                 ({}/{N_ROWS} differ from the exact scan)",
+                N_ROWS - primary_ok
+            );
+            assert!(
+                full_parity >= 0.99,
+                "metric={metric:?}: full placement parity {full_parity:.4} < 0.99 \
+                 ({}/{N_ROWS} differ)",
+                N_ROWS - full_ok
+            );
+        }
+    }
+
+    /// Count-0 cells present: the graph is built only over populated cells, so
+    /// it can never route a primary or replica into an empty cell — matching
+    /// the exact shortlist path, which also skips count-0. Regression for the
+    /// parity break a split (which empties a parent cell) would otherwise
+    /// introduce. Every empty cell keeps a stored centroid (deliberately
+    /// placed near a query cluster so a naive all-cells graph WOULD pick it).
+    #[test]
+    fn graph_assign_skips_count_zero_cells() {
+        const DIM: usize = 768;
+        const N_CENT: usize = 128;
+        const N_ROWS: usize = 400;
+        let metric = Metric::Cosine;
+        // Half the cells empty, interleaved, so empty and populated centroids
+        // are thoroughly mixed in id space.
+        let counts: Vec<u32> = (0..N_CENT)
+            .map(|c| if c % 2 == 0 { 1 } else { 0 })
+            .collect();
+        let empty: std::collections::HashSet<u32> = counts
+            .iter()
+            .enumerate()
+            .filter_map(|(c, &n)| (n == 0).then_some(c as u32))
+            .collect();
+        assert!(!empty.is_empty(), "test must have count-0 cells");
+        let (clusters, counts, queries) =
+            synthetic_grid(N_CENT, DIM, counts, N_ROWS, metric, 0xBADF00D);
+        let (scorer, graph, node_to_cell) = build_coarse_router(&clusters, metric);
+        // The router graph must hold exactly the populated cells.
+        assert_eq!(
+            node_to_cell.len(),
+            N_CENT - empty.len(),
+            "router must drop every count-0 cell"
+        );
+        for &cell in &node_to_cell {
+            assert!(
+                !empty.contains(&cell),
+                "router node maps to an empty cell {cell}"
+            );
+        }
+        // Beam = N_CENT (exhaustive over the populated nodes): this test asserts
+        // the count-0 SKIP invariant (ef-independent — the graph holds no empty
+        // node), so its secondary parity floor should be deterministic, not
+        // subject to HNSW-build nondeterminism at a narrow production beam.
+        // Walk recall at the production ef is covered by
+        // `graph_assign_matches_exact_across_metrics`.
+        let ef = N_CENT;
+        let mut primary_ok = 0usize;
+        let mut full_ok = 0usize;
+        for q in &queries {
+            let exact = exact_reference(&clusters, metric, &counts, q);
+            let g =
+                boundary_assignment_graph(&graph, &scorer, &node_to_cell, &clusters, metric, q, ef);
+            // The load-bearing invariant: the graph NEVER places into an empty
+            // cell (this is exactly what a naive all-cells graph would break).
+            assert!(
+                !empty.contains(&g.primary),
+                "graph primary is an empty cell"
+            );
+            for r in g.replicas.iter().flatten() {
+                assert!(!empty.contains(&r.0), "graph replica is an empty cell");
+            }
+            if exact.primary == g.primary {
+                primary_ok += 1;
+            }
+            if assignment_key(&exact) == assignment_key(&g) {
+                full_ok += 1;
+            }
+        }
+        // With empty cells dropped from the graph, placement still tracks the
+        // exact scan over populated cells at or above the parity bar.
+        let primary_parity = primary_ok as f64 / N_ROWS as f64;
+        let full_parity = full_ok as f64 / N_ROWS as f64;
+        assert!(
+            primary_parity >= 0.99,
+            "primary parity {primary_parity:.4} < 0.99 with count-0 cells present \
+             ({}/{N_ROWS} differ from the exact scan)",
+            N_ROWS - primary_ok
+        );
+        assert!(
+            full_parity >= 0.99,
+            "full placement parity {full_parity:.4} < 0.99 with count-0 cells present \
+             ({}/{N_ROWS} differ)",
+            N_ROWS - full_ok
+        );
+    }
+
+    /// `coarse_router_ef` is monotonic and clears the bench parity knees per
+    /// metric: cosine 8@256, 8@1024, 16@4096, 32@16384; L2Sq and NegDot get
+    /// the 2x beam — 8@256, 16@1024, 32@4096, 64@16384. Locks the shipped
+    /// formula so a refactor can't silently drop the beam below a validated
+    /// point.
+    #[test]
+    fn coarse_router_ef_hits_parity_knees() {
+        // Cosine beam, floor 16: max(16, round(sqrt(n)/4)).
+        assert_eq!(coarse_router_ef(256, Metric::Cosine), 16);
+        assert_eq!(coarse_router_ef(1024, Metric::Cosine), 16);
+        assert_eq!(coarse_router_ef(4096, Metric::Cosine), 16);
+        assert_eq!(coarse_router_ef(16384, Metric::Cosine), 32);
+        // Metric-independent now (graph-assign is cosine-gated; the parameter is
+        // retained but ignored): every metric gets the cosine beam.
+        for metric in [Metric::L2Sq, Metric::NegDot] {
+            for n in [256usize, 1024, 4096, 16384] {
+                assert_eq!(
+                    coarse_router_ef(n, metric),
+                    coarse_router_ef(n, Metric::Cosine),
+                    "metric={metric:?} n={n}"
+                );
+            }
+        }
+        // Monotonic non-decreasing across the full range, with the floor of 16,
+        // for every metric.
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let mut prev = 0usize;
+            for n in [1usize, 64, 256, 1024, 4096, 16384, 65536, 262144] {
+                let ef = coarse_router_ef(n, metric);
+                assert!(
+                    ef >= prev,
+                    "ef must be monotonic: ef({n},{metric:?})={ef} < {prev}"
+                );
+                assert!(ef >= 16, "ef floor is 16: ef({n},{metric:?})={ef}");
+                prev = ef;
+            }
+        }
     }
 }

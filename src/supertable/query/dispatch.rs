@@ -64,7 +64,7 @@ use crate::{
             superfile_reader::superfile_reader,
             vector::row_id_from_manifest_entry,
         },
-        reader_cache::{DiskCacheStore, SuperfileReaderCache},
+        reader_cache::{DiskCacheStore, ReadIntent, SuperfileReaderCache},
         tombstones::SidecarCache,
     },
 };
@@ -82,7 +82,7 @@ pub(crate) async fn open_reader(
     disk_cache: Option<&Arc<DiskCacheStore>>,
     storage: Option<&Arc<dyn StorageProvider>>,
     entry: &SuperfileEntry,
-    allow_background_fill: bool,
+    intent: ReadIntent,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
     superfile_reader(
         store,
@@ -91,7 +91,7 @@ pub(crate) async fn open_reader(
         &entry.uri,
         &entry.storage_path(),
         entry.subsection_offsets.as_ref(),
-        allow_background_fill,
+        intent,
     )
     .await
     .map_err(|e| QueryError::build(e.to_string(), &e))
@@ -208,7 +208,7 @@ pub(crate) async fn open_compaction_input(
         return Ok(Arc::new(reader));
     }
     // Compaction is not a query modality; allow fill so inputs can promote.
-    open_reader(store, disk_cache, storage, entry, true).await
+    open_reader(store, disk_cache, storage, entry, ReadIntent::Warm).await
 }
 
 /// Tag a kernel's results with their source and stamp stable ids immediately
@@ -507,7 +507,7 @@ struct FanoutContext {
     tombstone_cache: Option<Arc<SidecarCache>>,
     op_stats: Option<Arc<OpStatsCollector>>,
     now: Instant,
-    allow_background_fill: bool,
+    intent: ReadIntent,
 }
 
 impl FanoutContext {
@@ -515,7 +515,7 @@ impl FanoutContext {
         reader: &SupertableReader,
         units: &[(Arc<SuperfileEntry>, P)],
         prefetch_tombstones: bool,
-        allow_background_fill: bool,
+        intent: ReadIntent,
     ) -> Self {
         let manifest = reader.manifest();
         let tombstone_cache = reader.tombstone_cache.clone();
@@ -540,7 +540,7 @@ impl FanoutContext {
             tombstone_cache,
             op_stats: reader.op_stats.clone(),
             now,
-            allow_background_fill,
+            intent,
         }
     }
 
@@ -566,7 +566,7 @@ impl FanoutContext {
             self.disk_cache.as_ref(),
             self.storage.as_ref(),
             &entry,
-            self.allow_background_fill,
+            self.intent,
         )
         .await?;
         verify_superfile_vector_codecs(&r, &self.vector_columns)?;
@@ -633,7 +633,7 @@ pub(crate) async fn fanout_with<P, R, B, Fut>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
     prefetch_tombstones: bool,
-    allow_background_fill: bool,
+    intent: ReadIntent,
     body: B,
 ) -> Result<Vec<R>, QueryError>
 where
@@ -649,7 +649,7 @@ where
         return Ok(Vec::new());
     }
     trace!(units = units.len(), "fanning query out across superfiles");
-    let ctx = FanoutContext::new(reader, &units, prefetch_tombstones, allow_background_fill).await;
+    let ctx = FanoutContext::new(reader, &units, prefetch_tombstones, intent).await;
 
     // Single unit (the common case for a compacted, single-superfile
     // table): run the body inline on the current task. `tokio::spawn`
@@ -704,7 +704,7 @@ where
         units = units.len(),
         window, "fanning query out across superfiles in ceiling order"
     );
-    let ctx = FanoutContext::new(reader, &units, true, true).await;
+    let ctx = FanoutContext::new(reader, &units, true, ReadIntent::Warm).await;
     // One unit: inline, as in [`fanout_with`]; nothing to overlap against.
     if units.len() == 1 {
         let (entry, params) = units.into_iter().next().expect("len == 1");
@@ -755,7 +755,7 @@ where
         reader,
         units,
         true,
-        true, // FTS/local-hit path — background fill allowed
+        ReadIntent::Warm, // FTS/local-hit path: warm toward a full mmap
         local_hits_body(kernel),
     )
     .await

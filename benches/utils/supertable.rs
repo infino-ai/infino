@@ -3779,8 +3779,8 @@ pub mod vector {
                         .expect("routing-state warm vector search"),
                 );
             },
-            // Vector consumers open with allow_background_fill =
-            // false (block cache only) — no fills to settle.
+            // Vector consumers open with ReadIntent::Stream
+            // (block cache only), so there are no fills to settle.
             &|| {},
             &|| {
                 measure_cold_store(

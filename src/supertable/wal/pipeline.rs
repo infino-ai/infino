@@ -76,6 +76,7 @@ use crate::{
         manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::superfile_reader::superfile_reader,
+        reader_cache::ReadIntent,
         utils::vector_split::split_vectors,
         wal::{
             persistence::{Etag, WalStore, WalStoreError},
@@ -1429,7 +1430,7 @@ fn lookup_ids_in_superfile(
         &entry.uri,
         &entry.storage_path(),
         entry.subsection_offsets.as_ref(),
-        true,
+        ReadIntent::Warm,
     )) {
         Ok(r) => r,
         Err(e) => {
