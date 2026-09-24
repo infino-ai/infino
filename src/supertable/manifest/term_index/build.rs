@@ -37,7 +37,7 @@ use crate::{
     supertable::manifest::part::ContentHash,
     utils::{
         terms::{DictLayout, FstValue, TermDictBuilder},
-        varint::{push_varint, read_varint},
+        varint::{CONTINUATION_BIT, push_varint, read_u64_varint, read_varint},
     },
 };
 
@@ -209,37 +209,43 @@ struct Record {
     posting: Posting,
 }
 
+/// Largest byte length one encoded `u64` can occupy (10 × 7 bits).
+const MAX_U64_VARINT_BYTES: usize = 10;
+
 /// Read one LEB128 varint from a stream; `None` at a clean end of file
-/// *before* the first byte.
+/// *before* the first byte. The bytes are decoded by the crate's one
+/// varint reader, so a value the slice reader would refuse is refused
+/// here too.
 fn read_varint_stream(rd: &mut impl Read) -> io::Result<Option<u64>> {
-    let mut value = 0u64;
-    let mut shift = 0u32;
-    let mut first = true;
+    let mut buf = [0u8; MAX_U64_VARINT_BYTES];
+    let mut n = 0usize;
     loop {
         let mut b = [0u8; 1];
-        match rd.read(&mut b)? {
-            0 if first => return Ok(None),
-            0 => {
-                return Err(io::Error::new(
+        if rd.read(&mut b)? == 0 {
+            return match n {
+                0 => Ok(None),
+                _ => Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "varint cut short",
-                ));
-            }
-            _ => {}
+                )),
+            };
         }
-        first = false;
-        value |= u64::from(b[0] & 0x7F) << shift;
-        if b[0] & 0x80 == 0 {
-            return Ok(Some(value));
-        }
-        shift += 7;
-        if shift > u64::BITS {
+        if n == buf.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "varint too long",
             ));
         }
+        buf[n] = b[0];
+        n += 1;
+        if b[0] & CONTINUATION_BIT == 0 {
+            break;
+        }
     }
+    let mut at = 0usize;
+    read_u64_varint(&buf[..n], &mut at)
+        .map(Some)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "varint overflows u64"))
 }
 
 impl ContributionReader {

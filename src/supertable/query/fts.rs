@@ -641,8 +641,20 @@ impl SupertableReader {
         // changes the parameters the stored ceilings were baked at; until the
         // rescale from the manifest's length stats exists, such a query keeps
         // the unordered path — correct, just unpruned.
-        let ceilings: Option<HashMap<Uuid, f32>> = match (manifest.term_index().await, bm25_params)
-        {
+        let term_index = manifest.term_index().await;
+        // Every scored term, phrase members included, once: what the index
+        // is asked for locations.
+        let mut all_terms: Vec<&str> = musts
+            .iter()
+            .chain(shoulds.iter())
+            .map(String::as_str)
+            .collect();
+        for p in must_phrases.iter().chain(should_phrases.iter()) {
+            all_terms.extend(p.iter().map(String::as_str));
+        }
+        all_terms.sort_unstable();
+        all_terms.dedup();
+        let ceilings: Option<HashMap<Uuid, f32>> = match (&term_index, bm25_params) {
             (Some(index), None) => {
                 let terms: Vec<&str> = musts
                     .iter()
@@ -676,25 +688,11 @@ impl SupertableReader {
         // indexed superfile, so a cursor set can be built from those
         // locations and the superfile's dictionary never read.
         let index_locations: Arc<HashMap<Uuid, Arc<Vec<(String, u64, term_index::Location)>>>> =
-            match manifest.term_index().await {
-                Some(index) => {
-                    let mut all: Vec<&str> = musts
-                        .iter()
-                        .chain(shoulds.iter())
-                        .map(String::as_str)
-                        .collect();
-                    for p in must_phrases.iter().chain(should_phrases.iter()) {
-                        all.extend(p.iter().map(String::as_str));
-                    }
-                    all.sort_unstable();
-                    all.dedup();
-                    match index.locations(column, &all, &kept).await {
-                        Ok(map) => {
-                            Arc::new(map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect())
-                        }
-                        Err(_) => Arc::new(HashMap::new()),
-                    }
-                }
+            match &term_index {
+                Some(index) => match index.locations(column, &all_terms, &kept).await {
+                    Ok(map) => Arc::new(map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()),
+                    Err(_) => Arc::new(HashMap::new()),
+                },
                 None => Arc::new(HashMap::new()),
             };
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();

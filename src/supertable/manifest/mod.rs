@@ -36,58 +36,6 @@ pub mod partition;
 pub(crate) mod term_index;
 use term_index::TermIndex;
 
-/// Parts that hold at least one superfile the term index routes the
-/// query's term and prefix leaves to — intersected across leaves, as the
-/// summary-based part prune is. `None` when no leaf is routable or when a
-/// routed superfile has no recorded smallest id, so the caller keeps its
-/// summary-based choice.
-async fn parts_holding_routed_superfiles(
-    index: &TermIndex,
-    list: &Manifest,
-    leaves: &[PruneLeaf],
-) -> Option<HashSet<PartId>> {
-    let mut kept: Option<HashSet<PartId>> = None;
-    for leaf in leaves {
-        let routed = match leaf {
-            PruneLeaf::TermPresence {
-                column,
-                terms,
-                mode,
-            } => {
-                if terms.is_empty() {
-                    continue;
-                }
-                let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-                index.route(column, &refs, *mode).await.ok()?
-            }
-            PruneLeaf::Prefix { column, prefix } => {
-                let prefix = std::str::from_utf8(prefix).ok()?;
-                index.route_prefix(column, prefix).await.ok()?
-            }
-            _ => continue,
-        };
-        let mut id_mins: Vec<i128> = Vec::with_capacity(routed.len());
-        for id in &routed {
-            id_mins.push(index.id_min_of(id)?);
-        }
-        id_mins.sort_unstable();
-        let parts: HashSet<PartId> = list
-            .parts
-            .iter()
-            .filter(|p| {
-                let (lo, hi) = p.id_range;
-                let i = id_mins.partition_point(|m| *m < lo);
-                id_mins.get(i).is_some_and(|m| *m <= hi)
-            })
-            .map(|p| p.part_id)
-            .collect();
-        kept = Some(match kept {
-            None => parts,
-            Some(existing) => existing.intersection(&parts).copied().collect(),
-        });
-    }
-    kept
-}
 pub mod term_range;
 pub mod term_stats;
 
@@ -330,6 +278,44 @@ impl SuperfileList {
             })
             .collect()
     }
+}
+
+/// Parts that hold at least one superfile the term index routes the
+/// query's term and prefix leaves to — intersected across leaves, as the
+/// summary-based part prune is. A leaf the index cannot answer imposes no
+/// constraint; `None` when no leaf was answered or a routed superfile has
+/// no recorded smallest id, so the caller keeps its summary-based choice.
+async fn parts_holding_routed_superfiles(
+    index: &TermIndex,
+    list: &Manifest,
+    leaves: &[PruneLeaf],
+) -> Option<HashSet<PartId>> {
+    let mut kept: Option<HashSet<PartId>> = None;
+    for leaf in leaves {
+        let Some(routed) = index.route_leaf(leaf).await else {
+            continue;
+        };
+        let mut id_mins: Vec<i128> = routed
+            .iter()
+            .map(|id| index.id_min_of(id))
+            .collect::<Option<_>>()?;
+        id_mins.sort_unstable();
+        let parts: HashSet<PartId> = list
+            .parts
+            .iter()
+            .filter(|p| {
+                let (lo, hi) = p.id_range;
+                let i = id_mins.partition_point(|m| *m < lo);
+                id_mins.get(i).is_some_and(|m| *m <= hi)
+            })
+            .map(|p| p.part_id)
+            .collect();
+        kept = Some(match kept {
+            None => parts,
+            Some(existing) => existing.intersection(&parts).copied().collect(),
+        });
+    }
+    kept
 }
 
 /// The hierarchical manifest. Outer wrapper around the
@@ -1235,16 +1221,16 @@ impl ManifestSnapshot {
         }
     }
 
-    /// All superfile entries, loaded through the hierarchical part loader in
-    /// manifest (time) order. Vector search fans over every entry — cell
-    /// routing (nearest global centroids) is the selection mechanism, not a
-    /// part-level prune.
-    /// The manifest's term-index root reference, plus whether it lists every
-    /// live superfile.
+    /// Whether the term index lists every live superfile — the condition
+    /// under which part selection may trust it.
     pub(crate) fn term_index_complete(&self) -> bool {
         self.list.as_ref().is_some_and(|l| l.term_index_complete)
     }
 
+    /// All superfile entries, loaded through the hierarchical part loader in
+    /// manifest (time) order. Vector search fans over every entry — cell
+    /// routing (nearest global centroids) is the selection mechanism, not a
+    /// part-level prune.
     pub(crate) async fn get_all_superfiles_loaded(
         &self,
     ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
@@ -1383,28 +1369,40 @@ impl ManifestSnapshot {
         self.list.as_ref().and_then(|l| l.term_stats.as_ref())
     }
 
-    /// Successor manifest (bumped id) with the term-stats sidecar
-    /// reference stamped — the maintenance publish, mirroring
-    /// [`Self::with_slow_vector_state`].
-    pub(crate) fn with_term_stats(&self, reference: RoutingRef) -> Self {
+    /// This snapshot with `edit` applied to a copy of its list — a
+    /// successor on the next manifest id when `bump_id` (a maintenance
+    /// publish), otherwise an overlay on the same id for a commit to
+    /// publish. Everything else is shared with `self`.
+    fn with_list_edited(&self, bump_id: bool, edit: impl FnOnce(&mut Manifest)) -> Self {
         let next_id = self.get_next_manifest_id();
-        let new_list = self.list.as_ref().map(|list| {
+        let list = self.list.as_ref().map(|list| {
             let mut list = list.clone();
-            list.manifest_id = next_id;
-            list.term_stats = Some(reference.clone());
+            if bump_id {
+                list.manifest_id = next_id;
+            }
+            edit(&mut list);
             list
         });
         let mut superfile_list = self.superfile_list.clone();
-        superfile_list.manifest_id = next_id;
+        if bump_id {
+            superfile_list.manifest_id = next_id;
+        }
         Self {
             superfile_list,
-            list: new_list,
+            list,
             parts: self.parts.clone(),
             loader: self.loader.clone(),
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
         }
+    }
+
+    /// Successor manifest (bumped id) with the term-stats sidecar
+    /// reference stamped — the maintenance publish, mirroring
+    /// [`Self::with_slow_vector_state`].
+    pub(crate) fn with_term_stats(&self, reference: RoutingRef) -> Self {
+        self.with_list_edited(true, |list| list.term_stats = Some(reference))
     }
 
     /// The manifest's term-index root reference, when one has been built.
@@ -1423,48 +1421,23 @@ impl ManifestSnapshot {
     /// This manifest with the term-index root reference replaced, id
     /// unchanged — for a membership commit that publishes its delta in the
     /// same CAS as the entries it covers, mirroring
-    /// [`Self::with_slow_vector_state_ref`].
+    /// [`Self::with_slow_vector_state_ref`]. `complete` records whether the
+    /// index lists every live superfile.
     pub(crate) fn with_term_index_ref(&self, reference: RoutingRef, complete: bool) -> Self {
-        let new_list = self.list.as_ref().map(|list| {
-            let mut list = list.clone();
+        self.with_list_edited(false, |list| {
             list.term_index = Some(reference);
             list.term_index_complete = complete;
-            list
-        });
-        Self {
-            superfile_list: self.superfile_list.clone(),
-            list: new_list,
-            parts: self.parts.clone(),
-            loader: self.loader.clone(),
-            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
-            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
-            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
-        }
+        })
     }
 
     /// Successor manifest (bumped id) with the term-index root reference
     /// stamped — the maintenance publish, mirroring [`Self::with_term_stats`].
+    /// A maintenance build covers the whole membership.
     pub(crate) fn with_term_index(&self, reference: RoutingRef) -> Self {
-        let next_id = self.get_next_manifest_id();
-        let new_list = self.list.as_ref().map(|list| {
-            let mut list = list.clone();
-            list.manifest_id = next_id;
-            list.term_index = Some(reference.clone());
-            // A maintenance build covers the whole membership.
+        self.with_list_edited(true, |list| {
+            list.term_index = Some(reference);
             list.term_index_complete = true;
-            list
-        });
-        let mut superfile_list = self.superfile_list.clone();
-        superfile_list.manifest_id = next_id;
-        Self {
-            superfile_list,
-            list: new_list,
-            parts: self.parts.clone(),
-            loader: self.loader.clone(),
-            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
-            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
-            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
-        }
+        })
     }
 
     pub(crate) fn slow_vector_state_centroids_blob(&self) -> Option<&RoutingRef> {
@@ -1575,8 +1548,7 @@ impl ManifestSnapshot {
         hash: part::ContentHash,
         centroids: RoutingRef,
     ) -> Self {
-        let new_list = self.list.as_ref().map(|list| {
-            let mut list = list.clone();
+        self.with_list_edited(false, |list| {
             list.slow_vector_state_uri = Some(uri);
             list.slow_vector_state_content_hash = Some(hash);
             list.slow_vector_state_centroids = Some(centroids);
@@ -1585,17 +1557,7 @@ impl ManifestSnapshot {
             // separately via `with_slow_vector_state_graphs` — routed through
             // `CommitListMetadata` so it lands in the SAME membership commit as
             // `drained_ranges`, not a later settle.
-            list
-        });
-        Self {
-            superfile_list: self.superfile_list.clone(),
-            list: new_list,
-            parts: self.parts.clone(),
-            loader: self.loader.clone(),
-            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
-            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
-            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
-        }
+        })
     }
 
     /// Stamp ONLY the `hnsw` graph ref on an already-built successor, leaving
@@ -1605,20 +1567,7 @@ impl ManifestSnapshot {
     /// bump `manifest_id` (an overlay, like the other `CommitListMetadata`
     /// stamps); the successor id is set by the surrounding commit.
     pub(crate) fn with_slow_vector_state_graphs(&self, graphs: Option<RoutingRef>) -> Self {
-        let new_list = self.list.as_ref().map(|list| {
-            let mut list = list.clone();
-            list.slow_vector_state_graphs = graphs;
-            list
-        });
-        Self {
-            superfile_list: self.superfile_list.clone(),
-            list: new_list,
-            parts: self.parts.clone(),
-            loader: self.loader.clone(),
-            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
-            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
-            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
-        }
+        self.with_list_edited(false, |list| list.slow_vector_state_graphs = graphs)
     }
 
     /// Stamp (or replace) the partition strategy on this manifest snapshot.

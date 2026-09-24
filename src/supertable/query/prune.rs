@@ -26,10 +26,9 @@
 //! different shape from these static boolean tests. It keeps its own
 //! path.
 
-use std::{collections::HashSet, str::from_utf8, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::scalar::ScalarValue;
-use uuid::Uuid;
 
 use crate::{
     superfile::fts::reader::BoolMode,
@@ -172,23 +171,20 @@ fn scalar_value_set_keep_parts(
     })
 }
 
-/// Select the superfiles a predicate could match, newest-first in
-/// manifest order, applying the two prune tiers (part aggregates →
-/// per-superfile summaries). Returns the surviving superfile entries; the
-/// caller drives execution over them (search fan-out or DataFusion
-/// scan).
-///
-/// An empty `leaves` slice keeps every superfile (the no-`WHERE` scan).
-/// Per-superfile keep mask: the index's exact answer where the superfile is
-/// indexed, the manifest-summary answer (`fallback`) where it is not or
-/// where routing was unavailable.
-fn with_routing(
+/// Per-superfile keep mask for a term or prefix leaf: the index's exact
+/// answer where the superfile is indexed, the manifest-summary answer
+/// (`fallback`) where it is not, or everywhere when there is no index or
+/// it could not answer the leaf.
+async fn with_routing(
     superfiles: &[Arc<SuperfileEntry>],
     index: Option<&TermIndex>,
-    routed: Option<&HashSet<Uuid>>,
+    leaf: &PruneLeaf,
     fallback: Vec<bool>,
 ) -> Vec<bool> {
-    let (Some(index), Some(routed)) = (index, routed) else {
+    let Some(index) = index else {
+        return fallback;
+    };
+    let Some(routed) = index.route_leaf(leaf).await else {
         return fallback;
     };
     superfiles
@@ -203,6 +199,13 @@ fn with_routing(
         .collect()
 }
 
+/// Select the superfiles a predicate could match, newest-first in
+/// manifest order, applying the two prune tiers (part aggregates →
+/// per-superfile summaries). Returns the surviving superfile entries; the
+/// caller drives execution over them (search fan-out or DataFusion
+/// scan).
+///
+/// An empty `leaves` slice keeps every superfile (the no-`WHERE` scan).
 pub(crate) async fn select_superfiles(
     manifest: &ManifestSnapshot,
     leaves: &[PruneLeaf],
@@ -248,34 +251,16 @@ pub(crate) async fn select_superfiles(
             } => {
                 let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
                 let summaries = fts_bloom_skip(&superfiles, column, &refs, *mode);
-                let routed = match (&term_index, refs.is_empty()) {
-                    (Some(index), false) => index.route(column, &refs, *mode).await.ok(),
-                    _ => None,
-                };
                 and_into(
                     &mut mask,
-                    &with_routing(
-                        &superfiles,
-                        term_index.as_deref(),
-                        routed.as_ref(),
-                        summaries,
-                    ),
+                    &with_routing(&superfiles, term_index.as_deref(), leaf, summaries).await,
                 );
             }
             PruneLeaf::Prefix { column, prefix } => {
                 let summaries = fts_prefix_skip(&superfiles, column, prefix);
-                let routed = match (&term_index, from_utf8(prefix)) {
-                    (Some(index), Ok(prefix)) => index.route_prefix(column, prefix).await.ok(),
-                    _ => None,
-                };
                 and_into(
                     &mut mask,
-                    &with_routing(
-                        &superfiles,
-                        term_index.as_deref(),
-                        routed.as_ref(),
-                        summaries,
-                    ),
+                    &with_routing(&superfiles, term_index.as_deref(), leaf, summaries).await,
                 );
             }
             PruneLeaf::ScalarValueSet { column, values } => {

@@ -951,15 +951,15 @@ impl SupertableOptions {
     /// [`DiskCacheStore`] yourself with whatever `pinned_fn` /
     /// budget / eviction policy fits the deployment; pass the
     /// resulting `Arc<DiskCacheStore>` here.
+    pub fn with_disk_cache(mut self, cache: Arc<DiskCacheStore>) -> Self {
+        self.disk_cache = Some(cache);
+        self
+    }
+
     /// Set how many superfiles a ceiling-ordered ranked query opens at once
     /// (see [`Self::bound_ordered_open_window`]).
     pub fn with_bound_ordered_open_window(mut self, window: usize) -> Self {
         self.bound_ordered_open_window = window.max(1);
-        self
-    }
-
-    pub fn with_disk_cache(mut self, cache: Arc<DiskCacheStore>) -> Self {
-        self.disk_cache = Some(cache);
         self
     }
 

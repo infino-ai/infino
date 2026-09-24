@@ -9397,7 +9397,69 @@ async fn build_hnsw_graph_ref(
     .await
 }
 
-/// Build and publish the global term-stats sidecar over the CURRENT
+/// Publish one maintenance artifact under the commit-race protocol every
+/// stamp shares: load the current manifest, let `successor` build the
+/// artifact against its membership and return the manifest to publish
+/// (`None` when nothing needs publishing), then CAS it in. A lost race
+/// derives the next attempt past any crash-orphaned list and retries
+/// with backoff; `what` names the artifact in the terminal error.
+async fn stamp_with_retries<F, Fut>(
+    inner: &SupertableInner,
+    storage: &Arc<dyn StorageProvider>,
+    what: &str,
+    successor: F,
+) -> Result<(), BuildError>
+where
+    F: Fn(Arc<ManifestSnapshot>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<ManifestSnapshot>, BuildError>>,
+{
+    let max_retries = inner.options.max_commit_retries.max(1);
+    let mut next_id_floor: u64 = 0;
+    for attempt in 0..max_retries {
+        let old = inner.manifest.load_full();
+        // A prior attempt found its id occupied by a crash-orphaned
+        // manifest list — derive this attempt's successor past it.
+        let old = if next_id_floor > 0 {
+            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
+        } else {
+            old
+        };
+        // Rebuilt per attempt: a competing commit may have changed the
+        // membership, and the artifact must describe exactly the set the
+        // successor manifest publishes.
+        let Some(new_manifest) = successor(Arc::clone(&old)).await? else {
+            return Ok(());
+        };
+        let attempted_id = new_manifest.get_manifest_id();
+        let prev_etag = get_current_manifest_etag(storage, old)
+            .await
+            .inspect_err(|e| inner.note_commit_error(e))
+            .map_err(BuildError::from)?;
+        match new_manifest
+            .write(storage.as_ref(), prev_etag.as_deref(), &[])
+            .await
+        {
+            Ok(()) => {
+                inner.manifest.store(Arc::new(new_manifest));
+                return Ok(());
+            }
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                next_id_floor = next_id_floor.max(
+                    refresh_and_orphaned_id_floor(inner, storage, attempted_id)
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?,
+                );
+                sleep(backoff_delay(attempt)).await;
+            }
+            Err(e) => return Err(BuildError::Store(e.to_string())),
+        }
+    }
+    Err(BuildError::Store(format!(
+        "{what} publish lost every commit race"
+    )))
+}
+
+/// Build and publish the term-stats sidecar over the CURRENT
 /// membership, stamping its reference on a successor manifest (see
 /// `manifest::term_stats` for artifact semantics and the carry rule).
 /// Maintenance-only: optimize calls it after compaction settles, so the
@@ -9413,103 +9475,76 @@ pub(in crate::supertable) async fn stamp_term_stats(
     if inner.options.fts_columns.is_empty() {
         return Ok(());
     }
-    let max_retries = inner.options.max_commit_retries.max(1);
-    let mut next_id_floor: u64 = 0;
-    for attempt in 0..max_retries {
-        let old = inner.manifest.load_full();
-        let old = if next_id_floor > 0 {
-            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
-        } else {
-            old
-        };
-        let entries = old.get_all_superfiles();
-        // One superfile is its own global statistics: a query gathers df
-        // from that superfile's dictionary — the same numbers, one probe
-        // — so publishing an artifact would only duplicate the dictionary
-        // on disk. Nothing to drop either: a commit that removed the other
-        // superfiles already dropped the reference (the carry rule), and
-        // the next multi-superfile maintenance pass republishes.
-        if entries.len() <= 1 {
-            return Ok(());
-        }
-        // Rebuilt per attempt: a competing commit may have changed the
-        // membership, and the artifact must describe exactly the set the
-        // successor manifest publishes.
-        let store = Arc::clone(&old.options.store);
-        let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
-        let opt_storage = old.options.storage.as_ref().map(Arc::clone);
-        // Readers are opened by `build`, one at a time, and dropped before
-        // the next: each pins its superfile's term dictionary for its
-        // lifetime, so materializing them all here made the pass scale with
-        // table size rather than with the work it does.
-        //
-        // No background fills: this pass reads dictionaries and df headers
-        // only, and a fill here copies EVERY superfile — including
-        // compaction's fresh multi-GiB outputs — into the disk cache. On real
-        // object storage those fills outlive the optimize call and their
-        // reads bleed into whatever runs next (they surfaced as phantom
-        // user-data GETs in cold measurements that began while a fill was
-        // still draining).
-        let bytes = term_stats::build(entries, |entry| {
-            let store = Arc::clone(&store);
-            let disk_cache = disk_cache.clone();
-            let opt_storage = opt_storage.clone();
-            let entry = Arc::clone(entry);
-            async move {
-                open_reader(
-                    &store,
-                    disk_cache.as_ref(),
-                    opt_storage.as_ref(),
-                    &entry,
-                    false,
-                )
+    stamp_with_retries(inner, &storage, "term-stats", |old| {
+        let storage = Arc::clone(&storage);
+        async move {
+            // Every live superfile, parts included: a lazily loaded
+            // manifest's flat view holds only what has been loaded.
+            let entries = old
+                .get_all_superfiles_loaded()
                 .await
-                .map_err(|e| term_stats::TermStatsError::Build(e.to_string()))
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            // One superfile is its own global statistics: a query gathers
+            // df from that superfile's dictionary — the same numbers, one
+            // probe — so publishing an artifact would only duplicate the
+            // dictionary on disk. Nothing to drop either: a commit that
+            // removed the other superfiles already dropped the reference
+            // (the carry rule), and the next multi-superfile maintenance
+            // pass republishes.
+            if entries.len() <= 1 {
+                return Ok(None);
             }
-        })
-        .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
-        let reference = term_stats::write(storage.as_ref(), bytes)
+            let store = Arc::clone(&old.options.store);
+            let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
+            let opt_storage = old.options.storage.as_ref().map(Arc::clone);
+            // Readers are opened by `build`, one at a time, and dropped
+            // before the next: each pins its superfile's term dictionary
+            // for its lifetime, so materializing them all here made the
+            // pass scale with table size rather than with the work it does.
+            //
+            // No background fills: this pass reads dictionaries and df
+            // headers only, and a fill here copies EVERY superfile —
+            // including compaction's fresh multi-GiB outputs — into the
+            // disk cache. On real object storage those fills outlive the
+            // optimize call and their reads bleed into whatever runs next
+            // (they surfaced as phantom user-data GETs in cold measurements
+            // that began while a fill was still draining).
+            let bytes = term_stats::build(&entries, |entry| {
+                let store = Arc::clone(&store);
+                let disk_cache = disk_cache.clone();
+                let opt_storage = opt_storage.clone();
+                let entry = Arc::clone(entry);
+                async move {
+                    open_reader(
+                        &store,
+                        disk_cache.as_ref(),
+                        opt_storage.as_ref(),
+                        &entry,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| term_stats::TermStatsError::Build(e.to_string()))
+                }
+            })
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
-        if old.term_stats_blob() == Some(&reference) {
-            return Ok(());
-        }
-        let new_manifest = old.with_term_stats(reference);
-        let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
-            .await
-            .inspect_err(|e| inner.note_commit_error(e))
-            .map_err(BuildError::from)?;
-        match new_manifest
-            .write(storage.as_ref(), prev_etag.as_deref(), &[])
-            .await
-        {
-            Ok(()) => {
-                inner.manifest.store(Arc::new(new_manifest));
-                return Ok(());
+            let reference = term_stats::write(storage.as_ref(), bytes)
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            if old.term_stats_blob() == Some(&reference) {
+                return Ok(None);
             }
-            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                next_id_floor = next_id_floor.max(
-                    refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?,
-                );
-                sleep(backoff_delay(attempt)).await;
-            }
-            Err(e) => return Err(BuildError::Store(e.to_string())),
+            Ok(Some(old.with_term_stats(reference)))
         }
-    }
-    Err(BuildError::Store(
-        "term-stats publish lost every commit race".into(),
-    ))
+    })
+    .await
 }
 
 /// Build and publish the table-level term index over the CURRENT
 /// membership, stamping its root reference on a successor manifest (see
-/// `manifest::term_index`). Maintenance-only for now: optimize calls it
-/// after compaction so the base segment describes the post-merge superfile
-/// set. Readers are opened one at a time and each superfile's terms are
+/// `manifest::term_index`). Maintenance-only: optimize calls it after
+/// compaction so the base segment describes the post-merge superfile set.
+/// Readers are opened one at a time and each superfile's terms are
 /// spilled before the next opens, so the pass costs one superfile's
 /// open-time state plus one slice, whatever the table's size.
 ///
@@ -9524,64 +9559,37 @@ pub(in crate::supertable) async fn stamp_term_index(
     if inner.options.fts_columns.is_empty() {
         return Ok(());
     }
-    let max_retries = inner.options.max_commit_retries.max(1);
-    let mut next_id_floor: u64 = 0;
-    for attempt in 0..max_retries {
-        let old = inner.manifest.load_full();
-        let old = if next_id_floor > 0 {
-            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
-        } else {
-            old
-        };
-        let entries = old.get_all_superfiles();
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let store = Arc::clone(&old.options.store);
-        let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
-        let opt_storage = old.options.storage.as_ref().map(Arc::clone);
-        let built = collect_and_build_term_index(
-            &store,
-            disk_cache.as_ref(),
-            opt_storage.as_ref(),
-            entries,
-        )
-        .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
-        let reference = term_index::write_built(storage.as_ref(), built)
+    stamp_with_retries(inner, &storage, "term-index", |old| {
+        let storage = Arc::clone(&storage);
+        async move {
+            let entries = old
+                .get_all_superfiles_loaded()
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            let store = Arc::clone(&old.options.store);
+            let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
+            let opt_storage = old.options.storage.as_ref().map(Arc::clone);
+            let built = collect_and_build_term_index(
+                &store,
+                disk_cache.as_ref(),
+                opt_storage.as_ref(),
+                &entries,
+            )
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
-        if old.term_index_ref() == Some(&reference) {
-            return Ok(());
-        }
-        let new_manifest = old.with_term_index(reference);
-        let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
-            .await
-            .inspect_err(|e| inner.note_commit_error(e))
-            .map_err(BuildError::from)?;
-        match new_manifest
-            .write(storage.as_ref(), prev_etag.as_deref(), &[])
-            .await
-        {
-            Ok(()) => {
-                inner.manifest.store(Arc::new(new_manifest));
-                return Ok(());
+            let reference = term_index::write_built(storage.as_ref(), built)
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            if old.term_index_ref() == Some(&reference) {
+                return Ok(None);
             }
-            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                next_id_floor = next_id_floor.max(
-                    refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?,
-                );
-                sleep(backoff_delay(attempt)).await;
-            }
-            Err(e) => return Err(BuildError::Store(e.to_string())),
+            Ok(Some(old.with_term_index(reference)))
         }
-    }
-    Err(BuildError::Store(
-        "term-index publish lost every commit race".into(),
-    ))
+    })
+    .await
 }
 
 /// Walk every superfile's dictionary once, spilling a contribution per
@@ -10763,6 +10771,40 @@ pub(in crate::supertable) async fn put_bytes_multipart_or_atomic(
         put_superfile_multipart(storage, path, bytes).await
     } else {
         storage.put_atomic(path, bytes).await.map(|_| ())
+    }
+}
+
+/// Objects at or above this size go through the multipart upload path.
+/// Azure and S3 cap a single PUT at ~5 GiB, and the artifacts written by
+/// content hash — slow-vector state, term statistics, term-index slices
+/// and roots — can grow past that at scale; the figure matches the
+/// superfile default.
+pub(in crate::supertable) const CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES: u64 =
+    100 * 1024 * 1024;
+
+/// Persist `bytes` under the name `uri_for` derives from their content
+/// hash and return the reference a manifest records. Idempotent: an
+/// object that already exists under its hash name is the same bytes, so
+/// the store's `PreconditionFailed` is success.
+pub(in crate::supertable) async fn put_content_addressed(
+    storage: &dyn StorageProvider,
+    uri_for: impl FnOnce(&part_mod::ContentHash) -> String,
+    bytes: Vec<u8>,
+) -> Result<RoutingRef, StorageError> {
+    let content_hash = part_mod::ContentHash::of(&bytes);
+    let uri = uri_for(&content_hash);
+    match put_bytes_multipart_or_atomic(
+        storage,
+        &uri,
+        Bytes::from(bytes),
+        CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES,
+    )
+    .await
+    {
+        Ok(()) | Err(StorageError::PreconditionFailed { .. }) => {
+            Ok(RoutingRef { uri, content_hash })
+        }
+        Err(e) => Err(e),
     }
 }
 

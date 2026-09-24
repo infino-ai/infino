@@ -288,7 +288,6 @@ impl OpStatsCollector {
         self.vector_rows_reranked.fetch_add(rows, Ordering::Relaxed);
     }
 
-    /// Flush a kernel's planned byte-source range count.
     /// Count superfiles a fan-out opened for this operation.
     pub(crate) fn add_superfiles_opened(&self, n: u64) {
         self.superfiles_opened.fetch_add(n, Ordering::Relaxed);
@@ -300,6 +299,7 @@ impl OpStatsCollector {
         self.superfiles_opened.load(Ordering::Relaxed)
     }
 
+    /// Flush a kernel's planned byte-source range count.
     pub(crate) fn add_planned_read_ranges(&self, ranges: u64) {
         self.planned_read_ranges
             .fetch_add(ranges, Ordering::Relaxed);

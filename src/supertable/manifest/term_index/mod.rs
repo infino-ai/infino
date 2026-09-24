@@ -54,8 +54,9 @@ use uuid::Uuid;
 use crate::{
     storage::{StorageError, StorageProvider},
     superfile::fts::{bm25::idf as bm25_idf, reader::BoolMode},
-    supertable::manifest::{
-        RoutingRef, SuperfileEntry, disk_cache::ManifestDiskCache, part::ContentHash,
+    supertable::{
+        manifest::{RoutingRef, SuperfileEntry, disk_cache::ManifestDiskCache, part::ContentHash},
+        query::prune::PruneLeaf,
     },
     utils::terms::make_key,
 };
@@ -64,14 +65,11 @@ use crate::{
 /// superfile data, manifest-parts and term-stats prefixes.
 pub(crate) const STORAGE_PREFIX: &str = "term-index/";
 
-/// Objects at or above this size go through the multipart upload path.
-const MULTIPART_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
-
 /// Bytes of fetched slices kept resident per loaded index, least recently
 /// used first out. Sized so a query burst over a large table's whole
 /// vocabulary stays resident: at ~8 MiB a slice this holds ~64 slices, and a
-/// slice is re-read from the manifest disk cache (a local read, no hash)
-/// only after it has fallen out.
+/// slice is re-read from the manifest disk cache (a local read) only after
+/// it has fallen out.
 const RESIDENT_SLICE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Decoded posting runs kept per loaded index, keyed by `column \x1F term`.
@@ -122,22 +120,12 @@ async fn put_content_addressed(
     kind: &str,
     bytes: Vec<u8>,
 ) -> Result<RoutingRef, TermIndexError> {
-    let content_hash = ContentHash::of(&bytes);
-    let uri = object_uri(kind, &content_hash);
-    match crate::supertable::writer::put_bytes_multipart_or_atomic(
+    Ok(crate::supertable::writer::put_content_addressed(
         storage,
-        &uri,
-        Bytes::from(bytes),
-        MULTIPART_THRESHOLD_BYTES,
+        |hash| object_uri(kind, hash),
+        bytes,
     )
-    .await
-    {
-        // An object that already exists under its hash name is the same
-        // bytes.
-        Ok(()) | Err(StorageError::PreconditionFailed { .. }) => {}
-        Err(e) => return Err(e.into()),
-    }
-    Ok(RoutingRef { uri, content_hash })
+    .await?)
 }
 
 /// Persist one slice; idempotent by content hash.
@@ -158,16 +146,25 @@ pub(crate) async fn write_root(
     put_content_addressed(storage, "root", root.encode()).await
 }
 
+/// Persist every slice of a build; idempotent by content hash.
+async fn write_slices(
+    storage: &dyn StorageProvider,
+    slices: Vec<(ContentHash, Vec<u8>)>,
+) -> Result<(), TermIndexError> {
+    for (hash, bytes) in slices {
+        let reference = write_slice(storage, bytes).await?;
+        debug_assert_eq!(reference.content_hash, hash);
+    }
+    Ok(())
+}
+
 /// Persist a finished build — slices first, then the root — and return
 /// the root's reference for the manifest.
 pub(crate) async fn write_built(
     storage: &dyn StorageProvider,
     built: Built,
 ) -> Result<RoutingRef, TermIndexError> {
-    for (hash, bytes) in built.slices {
-        let reference = write_slice(storage, bytes).await?;
-        debug_assert_eq!(reference.content_hash, hash);
-    }
+    write_slices(storage, built.slices).await?;
     write_root(storage, &built.root).await
 }
 
@@ -186,10 +183,7 @@ pub(crate) async fn append_delta(
 ) -> Result<RoutingRef, TermIndexError> {
     let mut root = prior.unwrap_or_default();
     let built = build_segment(contributions, policy, root.superfiles.len() as u32)?;
-    for (hash, bytes) in built.slices {
-        let reference = write_slice(storage, bytes).await?;
-        debug_assert_eq!(reference.content_hash, hash);
-    }
+    write_slices(storage, built.slices).await?;
     root.superfiles.extend(built.superfiles);
     root.id_mins.extend(built.id_mins);
     root.segments.push(built.segment);
@@ -197,25 +191,31 @@ pub(crate) async fn append_delta(
 }
 
 /// Fetch a content-addressed object, through the manifest disk cache when
-/// one is attached: a hit is served from local disk; a miss is fetched,
-/// hash-verified, and written back best-effort. The hash check is the
-/// only integrity check either tier gets.
+/// one is attached: a hit is served from local disk, already verified by
+/// the cache; a miss is fetched, hash-verified, and written back
+/// best-effort. The hash check is the only integrity check either tier
+/// gets.
 async fn fetch_verified(
     storage: &dyn StorageProvider,
     disk_cache: Option<&ManifestDiskCache>,
     uri: &str,
     hash: &ContentHash,
 ) -> Result<Bytes, TermIndexError> {
-    // The disk cache is keyed by content hash and verifies on insert, so a
-    // hit needs no second hash; re-hashing a multi-megabyte slice on every
-    // read was a per-query cost on the order of milliseconds.
     if let Some(cache) = disk_cache
         && let Some(cached) = cache.get(hash).await
     {
         return Ok(Bytes::from(cached));
     }
     let (bytes, _meta) = storage.get(uri).await?;
-    if ContentHash::of(bytes.as_ref()) != *hash {
+    // Hashing a slice of several megabytes on the async worker would
+    // stall every other unit that worker polls, so it runs off-thread.
+    let expected = *hash;
+    let to_check = bytes.clone();
+    let matches =
+        tokio::task::spawn_blocking(move || ContentHash::of(to_check.as_ref()) == expected)
+            .await
+            .map_err(|e| TermIndexError::Storage(format!("hash task: {e}")))?;
+    if !matches {
         return Err(TermIndexError::HashMismatch);
     }
     if let Some(cache) = disk_cache {
@@ -248,79 +248,68 @@ pub(crate) struct TermIndex {
     /// The root's storage URI — the identity a manifest pins, and what a
     /// cache compares to decide whether a loaded index is still current.
     root_uri: String,
-    /// Every superfile the root lists. A live superfile absent from it was
-    /// committed before the index existed and is routed the old way.
-    indexed: HashSet<Uuid>,
+    /// Every superfile the root lists, with its smallest doc id. A live
+    /// superfile absent from it was committed before the index existed
+    /// and is routed the old way.
+    indexed: HashMap<Uuid, i128>,
     storage: Arc<dyn StorageProvider>,
     disk_cache: Option<Arc<ManifestDiskCache>>,
-    slices: tokio::sync::Mutex<ResidentSlices>,
+    /// Fetched slices by content hash; see [`RESIDENT_SLICE_BUDGET_BYTES`].
+    slices: tokio::sync::Mutex<Resident<ContentHash, Bytes>>,
     /// Decoded runs by key; see [`RESIDENT_RUNS`]. A std mutex: nothing
     /// awaits while it is held.
-    runs: std::sync::Mutex<ResidentRuns>,
+    runs: std::sync::Mutex<Resident<Vec<u8>, Arc<Vec<Posting>>>>,
 }
 
-/// Decoded posting runs, least recently inserted first out. An absent
-/// term is remembered too (an empty run), since asking again costs the
-/// same slice open.
-#[derive(Default)]
-struct ResidentRuns {
-    order: std::collections::VecDeque<Vec<u8>>,
-    runs: HashMap<Vec<u8>, Arc<Vec<Posting>>>,
-}
-
-impl ResidentRuns {
-    fn get(&self, key: &[u8]) -> Option<Arc<Vec<Posting>>> {
-        self.runs.get(key).cloned()
-    }
-
-    fn insert(&mut self, key: Vec<u8>, run: Arc<Vec<Posting>>) {
-        if self.runs.contains_key(&key) {
-            return;
-        }
-        while self.runs.len() >= RESIDENT_RUNS
-            && let Some(old) = self.order.pop_front()
-        {
-            self.runs.remove(&old);
-        }
-        self.order.push_back(key.clone());
-        self.runs.insert(key, run);
-    }
-}
-
-/// The resident slice set: insertion-ordered so eviction is least recently
-/// used, bounded by bytes.
-#[derive(Default)]
-struct ResidentSlices {
-    order: std::collections::VecDeque<ContentHash>,
-    bytes: HashMap<ContentHash, Bytes>,
+/// A bounded resident set, least recently used first out: `weigh` gives
+/// each value's cost against `budget`, and a read refreshes recency, so a
+/// burst that cycles through more than fits keeps what it keeps touching.
+struct Resident<K, V> {
+    map: HashMap<K, (V, u64)>,
+    by_use: std::collections::BTreeMap<u64, K>,
+    tick: u64,
     total: usize,
+    budget: usize,
+    weigh: fn(&V) -> usize,
 }
 
-impl ResidentSlices {
-    fn get(&mut self, hash: &ContentHash) -> Option<Bytes> {
-        let b = self.bytes.get(hash)?.clone();
-        // Move to the back: most recently used.
-        if let Some(i) = self.order.iter().position(|h| h == hash) {
-            self.order.remove(i);
-            self.order.push_back(*hash);
+impl<K: Eq + std::hash::Hash + Clone, V: Clone> Resident<K, V> {
+    fn new(budget: usize, weigh: fn(&V) -> usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            by_use: std::collections::BTreeMap::new(),
+            tick: 0,
+            total: 0,
+            budget,
+            weigh,
         }
-        Some(b)
     }
 
-    fn insert(&mut self, hash: ContentHash, b: Bytes) {
-        if self.bytes.contains_key(&hash) {
+    fn get(&mut self, key: &K) -> Option<V> {
+        let (value, used) = self.map.get_mut(key)?;
+        self.tick += 1;
+        self.by_use.remove(used);
+        *used = self.tick;
+        self.by_use.insert(self.tick, key.clone());
+        Some(value.clone())
+    }
+
+    /// Insert unless resident, evicting least recently used until it fits.
+    fn insert(&mut self, key: K, value: V) {
+        if self.map.contains_key(&key) {
             return;
         }
-        while self.total + b.len() > RESIDENT_SLICE_BUDGET_BYTES && !self.order.is_empty() {
-            if let Some(old) = self.order.pop_front()
-                && let Some(gone) = self.bytes.remove(&old)
-            {
-                self.total -= gone.len();
-            }
+        let weight = (self.weigh)(&value);
+        while self.total + weight > self.budget
+            && let Some((_, old)) = self.by_use.pop_first()
+            && let Some((gone, _)) = self.map.remove(&old)
+        {
+            self.total -= (self.weigh)(&gone);
         }
-        self.total += b.len();
-        self.order.push_back(hash);
-        self.bytes.insert(hash, b);
+        self.total += weight;
+        self.tick += 1;
+        self.by_use.insert(self.tick, key.clone());
+        self.map.insert(key, (value, self.tick));
     }
 }
 
@@ -336,15 +325,20 @@ impl TermIndex {
         storage: Arc<dyn StorageProvider>,
         disk_cache: Option<Arc<ManifestDiskCache>>,
     ) -> Self {
-        let indexed = root.superfiles.iter().copied().collect();
+        let indexed = root
+            .superfiles
+            .iter()
+            .copied()
+            .zip(root.id_mins.iter().copied())
+            .collect();
         Self {
             root,
             root_uri,
             indexed,
             storage,
             disk_cache,
-            slices: tokio::sync::Mutex::new(ResidentSlices::default()),
-            runs: std::sync::Mutex::new(ResidentRuns::default()),
+            slices: tokio::sync::Mutex::new(Resident::new(RESIDENT_SLICE_BUDGET_BYTES, Bytes::len)),
+            runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
         }
     }
 
@@ -374,14 +368,35 @@ impl TermIndex {
     /// Whether the root lists `superfile` — i.e. whether its postings are
     /// in this index at all.
     pub(crate) fn is_indexed(&self, superfile: &Uuid) -> bool {
-        self.indexed.contains(superfile)
+        self.indexed.contains_key(superfile)
     }
 
     /// The smallest doc id of a listed superfile — the key that finds its
     /// manifest part from the part's recorded id range.
     pub(crate) fn id_min_of(&self, superfile: &Uuid) -> Option<i128> {
-        let ordinal = self.root.superfiles.iter().position(|id| id == superfile)?;
-        self.root.id_mins.get(ordinal).copied()
+        self.indexed.get(superfile).copied()
+    }
+
+    /// The superfiles a term or prefix leaf routes to, or `None` when the
+    /// leaf is not one the index answers — a scalar leaf, an empty term
+    /// list, a non-UTF-8 prefix — or the lookup failed; the caller then
+    /// keeps its summary-based answer.
+    pub(crate) async fn route_leaf(&self, leaf: &PruneLeaf) -> Option<HashSet<Uuid>> {
+        match leaf {
+            PruneLeaf::TermPresence {
+                column,
+                terms,
+                mode,
+            } if !terms.is_empty() => {
+                let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+                self.route(column, &refs, *mode).await.ok()
+            }
+            PruneLeaf::Prefix { column, prefix } => {
+                let prefix = std::str::from_utf8(prefix).ok()?;
+                self.route_prefix(column, prefix).await.ok()
+            }
+            _ => None,
+        }
     }
 
     /// The superfiles that can match `terms` in `column` under `mode`:
@@ -507,8 +522,13 @@ impl TermIndex {
                         }
                     }
                 }
-                if complete && min_scaled.is_finite() {
-                    ceiling += idf_sum * min_scaled;
+                // Every member carries the placeholder that bounds nothing:
+                // the phrase is unbounded here, not absent.
+                if complete {
+                    ceiling += match min_scaled.is_finite() {
+                        true => idf_sum * min_scaled,
+                        false => f32::INFINITY,
+                    };
                 }
             }
             out.insert(id, ceiling);
@@ -1136,14 +1156,7 @@ mod tests {
         assert!(reference.uri.starts_with(STORAGE_PREFIX));
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let root = rt
-            .block_on(load_root(storage.as_ref(), &reference))
-            .expect("root loads and verifies");
-        let live: std::collections::HashSet<Uuid> = manifest
-            .get_all_superfiles()
-            .iter()
-            .map(|e| e.superfile_id)
-            .collect();
+        let (live, root) = live_and_covered(&st, &storage, &rt);
         let covered: std::collections::HashSet<Uuid> = root.superfiles.iter().copied().collect();
         assert_eq!(
             covered, live,
@@ -2147,28 +2160,70 @@ mod tests {
             );
         }
     }
-    /// The resident slice set evicts least recently used by bytes, and a
-    /// read refreshes recency — so a query burst that cycles through more
-    /// slices than fit keeps the ones it keeps touching.
+    /// The resident set evicts least recently used against its budget —
+    /// bytes for slices, a count for runs — and a read refreshes recency,
+    /// so a burst that cycles through more than fits keeps what it keeps
+    /// touching. Re-inserting a resident key is a no-op.
     #[test]
-    fn resident_slices_evict_least_recently_used_by_bytes() {
-        let mut r = ResidentSlices::default();
-        // Two of these fit the budget; three do not.
-        let big = RESIDENT_SLICE_BUDGET_BYTES / 3 + 1;
+    fn resident_sets_evict_least_recently_used_within_budget() {
         let h = |n: u8| ContentHash([n; 32]);
-        r.insert(h(1), Bytes::from(vec![0u8; big]));
-        r.insert(h(2), Bytes::from(vec![0u8; big]));
-        assert!(r.get(&h(1)).is_some(), "touch 1: it is now most recent");
-        r.insert(h(3), Bytes::from(vec![0u8; big]));
+        // Two of these fit the byte budget; three do not.
+        let big = RESIDENT_SLICE_BUDGET_BYTES / 3 + 1;
+        let mut slices: Resident<ContentHash, Bytes> =
+            Resident::new(RESIDENT_SLICE_BUDGET_BYTES, Bytes::len);
+        slices.insert(h(1), Bytes::from(vec![0u8; big]));
+        slices.insert(h(2), Bytes::from(vec![0u8; big]));
         assert!(
-            r.get(&h(2)).is_none(),
+            slices.get(&h(1)).is_some(),
+            "touch 1: it is now most recent"
+        );
+        slices.insert(h(3), Bytes::from(vec![0u8; big]));
+        assert!(
+            slices.get(&h(2)).is_none(),
             "2 was least recently used and went first"
         );
-        assert!(r.get(&h(1)).is_some(), "1 was refreshed and survives");
-        assert!(r.get(&h(3)).is_some());
-        assert!(r.total <= RESIDENT_SLICE_BUDGET_BYTES);
-        r.insert(h(3), Bytes::from(vec![0u8; big]));
-        assert_eq!(r.total, 2 * big, "re-inserting a resident slice is a no-op");
+        assert!(slices.get(&h(1)).is_some(), "1 was refreshed and survives");
+        assert!(slices.get(&h(3)).is_some());
+        assert!(slices.total <= RESIDENT_SLICE_BUDGET_BYTES);
+        slices.insert(h(3), Bytes::from(vec![0u8; big]));
+        assert_eq!(
+            slices.total,
+            2 * big,
+            "re-inserting a resident slice is a no-op"
+        );
+
+        // Counted: the map never exceeds the bound, the oldest untouched
+        // key goes first, and a fresh key is always admitted.
+        let bound = 4;
+        let mut runs: Resident<Vec<u8>, Arc<Vec<Posting>>> = Resident::new(bound, |_| 1);
+        for n in 0..bound {
+            runs.insert(vec![n as u8], Arc::new(Vec::new()));
+        }
+        assert!(runs.get(&vec![0u8]).is_some(), "touch 0");
+        runs.insert(vec![bound as u8], Arc::new(Vec::new()));
+        assert_eq!(runs.map.len(), bound, "the bound holds");
+        assert!(
+            runs.get(&vec![1u8]).is_none(),
+            "1 was the least recently used"
+        );
+        assert!(runs.get(&vec![0u8]).is_some(), "0 was refreshed");
+        assert!(
+            runs.get(&vec![bound as u8]).is_some(),
+            "the newest key is resident"
+        );
+        runs.insert(
+            vec![0u8],
+            Arc::new(vec![Posting {
+                superfile: 0,
+                df: 1,
+                bound: 1.0,
+                location: Location::None,
+            }]),
+        );
+        assert!(
+            runs.get(&vec![0u8]).expect("resident").is_empty(),
+            "re-inserting a resident key keeps the first value"
+        );
     }
     /// A term's decoded run is served from the resident set on later asks:
     /// the same allocation comes back, so the several consultations a

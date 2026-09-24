@@ -3489,25 +3489,28 @@ mod tests {
     fn term_index_ref_round_trips_and_requires_both_halves() {
         let mut list = empty_list();
         list.term_index = Some(RoutingRef {
-            uri: "term-stats/stats-abc.bin".into(),
+            uri: "term-index/root-abc.bin".into(),
             content_hash: ContentHash([7u8; 32]),
         });
+        list.term_index_complete = true;
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.term_index, list.term_index);
-        // A manifest without the field decodes to None (older writers).
+        assert!(
+            decoded.term_index_complete,
+            "the completeness flag rides along"
+        );
+        // A manifest without the fields decodes to no reference and an
+        // incomplete index (older writers), and writes neither on the wire.
         let empty_bytes = encode(&empty_list()).expect("encode empty");
         let s = from_utf8(&empty_bytes).expect("utf8");
         assert!(
             !s.contains("term_index"),
-            "absent ref must not appear on the wire (older manifests stay byte-identical)"
+            "absent ref and false flag must not appear on the wire (older manifests stay byte-identical)"
         );
-        assert!(
-            decode(&empty_bytes)
-                .expect("decode empty")
-                .term_index
-                .is_none()
-        );
+        let empty = decode(&empty_bytes).expect("decode empty");
+        assert!(empty.term_index.is_none());
+        assert!(!empty.term_index_complete);
         // One half without the other is treated as no ref, like the
         // centroid/graph refs.
         let with_ref = from_utf8(&bytes).expect("utf8");

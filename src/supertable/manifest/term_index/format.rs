@@ -54,7 +54,7 @@ use uuid::Uuid;
 
 use super::TermIndexError;
 use crate::{
-    supertable::manifest::part::ContentHash,
+    supertable::manifest::{part::ContentHash, term_range::prefix_upper_bound},
     utils::{
         bytes::{u32_le_at, u64_le_at},
         terms::{DictLayout, FstValue, TermDict},
@@ -382,19 +382,6 @@ impl Root {
                 })
         })
     }
-}
-
-/// Smallest byte string greater than every string with `prefix`, or
-/// `None` when no such string exists (`prefix` is empty or all `0xFF`).
-pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut upper = prefix.to_vec();
-    while let Some(last) = upper.pop() {
-        if last < u8::MAX {
-            upper.push(last + 1);
-            return Some(upper);
-        }
-    }
-    None
 }
 
 /// Append one posting to a run.
@@ -795,14 +782,6 @@ mod tests {
             .map(|s| s.content_hash.0[0])
             .collect();
         assert!(hits.is_empty());
-    }
-
-    #[test]
-    fn prefix_upper_bound_handles_carry_and_all_ff() {
-        assert_eq!(prefix_upper_bound(b"ab"), Some(b"ac".to_vec()));
-        assert_eq!(prefix_upper_bound(&[b'a', 0xFF]), Some(b"b".to_vec()));
-        assert_eq!(prefix_upper_bound(&[0xFF, 0xFF]), None);
-        assert_eq!(prefix_upper_bound(b""), None);
     }
 
     fn build_slice(entries: &[(&str, &str, Vec<Posting>)]) -> Vec<u8> {
