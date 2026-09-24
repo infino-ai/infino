@@ -767,7 +767,6 @@ mod tests {
         let c = contribution(&dir, 3, &[("body", "alpha", 1)]);
         let policy = BuildPolicy {
             slice_target_bytes: usize::MAX,
-            range_max_superfiles: 2,
         };
         let built = build(&[a, b, c], &policy).expect("build");
         assert_eq!(
@@ -791,8 +790,8 @@ mod tests {
             vec![3, 7, 1]
         );
         assert!(
-            alpha.iter().all(|p| p.location == Location::None),
-            "three superfiles exceeds the range threshold of two: locations dropped"
+            alpha.iter().all(|p| p.location != Location::None),
+            "a term in every superfile keeps its location in each"
         );
 
         let beta = slice
@@ -845,7 +844,6 @@ mod tests {
         let a = contribution(&dir, 1, &refs);
         let policy = BuildPolicy {
             slice_target_bytes: 600,
-            range_max_superfiles: 64,
         };
         let built = build(&[a], &policy).expect("build");
         let slices = &built.root.segments[0].slices;
@@ -887,7 +885,6 @@ mod tests {
         let b = contribution(&dir, 8, &[("body", "ab005", 9), ("body", "zz", 1)]);
         let policy = BuildPolicy {
             slice_target_bytes: 800,
-            range_max_superfiles: 64,
         };
         let built = build(&[a, b], &policy).expect("build");
         let n_slices = built.root.segments[0].slices.len();
@@ -2286,6 +2283,74 @@ mod tests {
         );
     }
 
+    /// On a table wider than sixty-four superfiles whose index one
+    /// maintenance rebuild covers in a single segment, a term in every
+    /// superfile still resolves from the index's locations: each
+    /// superfile's memo covers every query term, so the ranked walk never
+    /// reads a dictionary.
+    #[test]
+    fn a_wide_folded_index_resolves_every_superfile_from_locations() {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+
+        use crate::{
+            superfile::SuperfileReader,
+            supertable::query::fts::{index_locations_for, memo_from_locations},
+        };
+
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(8)
+                .build()
+                .expect("pool"),
+        );
+        let (dir, _storage, st) =
+            table_with(|o| o.with_writer_pool(pool).with_superfile_buffer_split_mb(0));
+        // Nine commits of eight superfiles each: 72, past the width at
+        // which locations were once dropped.
+        for c in 0..9 {
+            let titles: Vec<String> = (0..400)
+                .map(|i| format!("shared common{} c{c}d{i:03}", i % 3))
+                .collect();
+            let arr: ArrayRef = Arc::new(LargeStringArray::from(
+                titles.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            let batch = RecordBatch::try_new(title_schema(), vec![arr]).expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.refresh_term_stats_sync().expect("maintenance rebuild");
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entries = manifest.get_all_superfiles().to_vec();
+        assert!(entries.len() > 64, "wide table: {}", entries.len());
+        let index = rt.block_on(manifest.term_index()).expect("index");
+        assert_eq!(index.root().segments.len(), 1, "one folded segment");
+        let run = rt
+            .block_on(index.postings("title", "shared"))
+            .expect("postings");
+        assert_eq!(run.len(), entries.len());
+        assert!(
+            run.iter().all(|p| p.location != Location::None),
+            "a term in every superfile keeps every location"
+        );
+        let terms = ["shared", "common1", "absent"];
+        let locations = rt.block_on(index_locations_for(manifest, "title", &terms, &entries));
+        for e in &entries {
+            let bytes =
+                std::fs::read(dir.path().join(e.uri.storage_path())).expect("superfile bytes");
+            let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+            let memo = rt
+                .block_on(memo_from_locations(&sf, &locations, e.superfile_id))
+                .expect("a memo for an indexed superfile");
+            assert!(
+                memo.covers(&terms),
+                "every query term is resolved, present or absent, without the dictionary"
+            );
+        }
+    }
+
     /// A candidate plan — what a SQL `WHERE` on a text column and a filtered
     /// vector search resolve — reads no dictionary for the terms the index
     /// located: same rows as the dictionary path, one planned read fewer
@@ -2358,6 +2423,58 @@ mod tests {
         assert!(total_rows > 0, "the fixture matches the plan");
     }
 
+    /// A term in every one of many superfiles keeps a location in each:
+    /// there is no width past which locations are dropped. Without them a
+    /// query on such a term reads every opened superfile's whole dictionary
+    /// — megabytes each — for postings that are kilobytes.
+    #[test]
+    fn locations_are_kept_however_many_superfiles_hold_the_term() {
+        let dir = TempDir::new().expect("tempdir");
+        let n = 130;
+        let contributions: Vec<Contribution> = (1..=n)
+            .map(|i| {
+                let mut w =
+                    ContributionWriter::create(dir.path(), Uuid::from_u128(i as u128), i as i128)
+                        .expect("create");
+                w.push(
+                    &make_key("body", "common"),
+                    7,
+                    1.5,
+                    Location::Pfor {
+                        offset: 100 * i as u64,
+                        len: 64,
+                    },
+                )
+                .expect("push");
+                w.finish().expect("finish")
+            })
+            .collect();
+        let built = build(&contributions, &BuildPolicy::default()).expect("build");
+        let run: Vec<Posting> = built
+            .slices
+            .iter()
+            .filter_map(|(_, bytes)| {
+                Slice::open(bytes)
+                    .expect("open")
+                    .postings(&make_key("body", "common"))
+                    .expect("ok")
+            })
+            .flatten()
+            .collect();
+        assert_eq!(run.len(), n);
+        for (i, p) in run.iter().enumerate() {
+            assert_eq!(
+                p.location,
+                Location::Pfor {
+                    offset: 100 * (i as u64 + 1),
+                    len: 64
+                },
+                "superfile {} keeps its location",
+                i + 1
+            );
+        }
+    }
+
     /// Routing is exact: `Or` is the union of the terms' posting sets and
     /// `And` their intersection, term by term, on random corpora.
     #[test]
@@ -2380,7 +2497,7 @@ mod tests {
                     w.finish().expect("finish")
                 })
                 .collect();
-            let policy = BuildPolicy { slice_target_bytes: 512, range_max_superfiles: 3 };
+            let policy = BuildPolicy { slice_target_bytes: 512 };
             let built = build(&contributions, &policy).expect("build");
             let store_dir = TempDir::new().expect("store dir");
             let storage: Arc<dyn StorageProvider> =

@@ -47,12 +47,6 @@ use crate::{
 /// measured value.
 pub(crate) const SLICE_TARGET_BYTES: usize = 8 * 1024 * 1024;
 
-/// Postings for a term in more superfiles than this carry no location: a
-/// query on such a term opens most of the table regardless, so skipping
-/// its dictionaries buys little, and the location is the widest field.
-/// **Pending measurement.**
-pub(crate) const RANGE_MAX_SUPERFILES: usize = 64;
-
 /// Bytes a front-coded dictionary entry costs beyond the key's unshared
 /// tail, used only to decide when a slice is full. Rough on purpose.
 const DICT_ENTRY_OVERHEAD_ESTIMATE: usize = 4;
@@ -64,15 +58,12 @@ const DICT_KEY_SHARE_ESTIMATE_DIVISOR: usize = 3;
 pub(crate) struct BuildPolicy {
     /// See [`SLICE_TARGET_BYTES`].
     pub(crate) slice_target_bytes: usize,
-    /// See [`RANGE_MAX_SUPERFILES`].
-    pub(crate) range_max_superfiles: usize,
 }
 
 impl Default for BuildPolicy {
     fn default() -> Self {
         Self {
             slice_target_bytes: SLICE_TARGET_BYTES,
-            range_max_superfiles: RANGE_MAX_SUPERFILES,
         }
     }
 }
@@ -484,13 +475,12 @@ pub(crate) fn build_segment(
                 &mut heap,
             )?;
         }
-        // Field policy: a term in more superfiles than the threshold
-        // carries no locations.
-        if run.len() > policy.range_max_superfiles {
-            for p in &mut run {
-                p.location = Location::None;
-            }
-        }
+        // Every posting keeps its location, however many superfiles the
+        // term is in. A common term opens most of the table, and each open
+        // that lacks a location reads the superfile's whole dictionary —
+        // megabytes per superfile, per query, where the postings it wants
+        // are kilobytes — so the location is worth most exactly where it
+        // was once dropped.
         let encoded = encode_run(&run);
         if current.n_terms > 0
             && current.estimated_bytes() + encoded.len() > policy.slice_target_bytes
