@@ -911,31 +911,50 @@ mod tests {
         )]))
     }
 
-    /// An empty FTS table on local-filesystem storage.
-    fn fresh_table() -> (
-        TempDir,
-        Arc<dyn StorageProvider>,
-        crate::supertable::Supertable,
-    ) {
-        use crate::{
-            superfile::builder::FtsConfig,
-            supertable::{Supertable, SupertableOptions},
-        };
-        let dir = TempDir::new().expect("tempdir");
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+    /// Options for an FTS table on `storage`, with a small writer pool.
+    fn fresh_options(storage: &Arc<dyn StorageProvider>) -> crate::supertable::SupertableOptions {
+        use crate::{superfile::builder::FtsConfig, supertable::SupertableOptions};
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(2)
                 .build()
                 .expect("pool"),
         );
-        let options =
-            SupertableOptions::new(title_schema(), vec![FtsConfig::new("title")], Vec::new())
-                .expect("options")
-                .with_writer_pool(pool)
-                .with_storage(Arc::clone(&storage));
-        (dir, storage, Supertable::create(options).expect("create"))
+        SupertableOptions::new(title_schema(), vec![FtsConfig::new("title")], Vec::new())
+            .expect("options")
+            .with_writer_pool(pool)
+            .with_storage(Arc::clone(storage))
+    }
+
+    /// An empty FTS table on local-filesystem storage, its options adjusted
+    /// by `customize`.
+    fn table_with(
+        customize: impl FnOnce(
+            crate::supertable::SupertableOptions,
+        ) -> crate::supertable::SupertableOptions,
+    ) -> (
+        TempDir,
+        Arc<dyn StorageProvider>,
+        crate::supertable::Supertable,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let options = customize(fresh_options(&storage));
+        (
+            dir,
+            storage,
+            crate::supertable::Supertable::create(options).expect("create"),
+        )
+    }
+
+    /// An empty FTS table on local-filesystem storage.
+    fn fresh_table() -> (
+        TempDir,
+        Arc<dyn StorageProvider>,
+        crate::supertable::Supertable,
+    ) {
+        table_with(|o| o)
     }
 
     /// Commit one segment: every title holds `shared`; segment `s` holds
@@ -1303,6 +1322,132 @@ mod tests {
             "the removed inputs' postings remain until the next fold"
         );
     }
+    /// A row update replaces its rows with a fresh superfile through the
+    /// update pipeline rather than the append path. Its postings publish
+    /// with its entry all the same, so on a lazily loaded table — where
+    /// part selection trusts a complete index — the replacement rows are
+    /// found through it.
+    #[test]
+    fn updates_publish_the_replacement_superfile_into_the_index() {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        use datafusion::prelude::{col, lit};
+
+        use crate::{Bm25SearchOptions, superfile::fts::reader::Bm25Stats, supertable::Supertable};
+
+        let (_dir, storage, st) = table_with(|o| {
+            o.with_eager_load_threshold(0)
+                .with_target_superfiles_per_part(1)
+        });
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        let replacement: ArrayRef = Arc::new(LargeStringArray::from(vec!["zeta shared s0d00"]));
+        let batch = RecordBatch::try_new(title_schema(), vec![replacement]).expect("batch");
+        let stats = st
+            .update(col("title").eq(lit("alpha shared s0d00")), &batch)
+            .expect("update");
+        assert_eq!(stats.matched(), 1);
+
+        let consumer =
+            Supertable::open(fresh_options(&storage).with_eager_load_threshold(0)).expect("open");
+        let reader = consumer.reader().expect("reader");
+        let manifest = reader.manifest();
+        assert!(
+            manifest.term_index_complete(),
+            "a replacement with postings keeps the index complete"
+        );
+        let index = reader
+            .block_on(manifest.term_index())
+            .expect("the index loads");
+        let unindexed: Vec<Uuid> = reader
+            .block_on(manifest.get_all_superfiles_loaded())
+            .expect("entries")
+            .iter()
+            .map(|e| e.superfile_id)
+            .filter(|id| !index.is_indexed(id))
+            .collect();
+        assert!(
+            unindexed.is_empty(),
+            "every live superfile is indexed: {unindexed:?}"
+        );
+        let batches = reader
+            .bm25_search(
+                "title",
+                "zeta",
+                10,
+                Bm25SearchOptions::new().with_stats(Bm25Stats::PerSuperfile),
+                Some(&["_id", "score"]),
+            )
+            .expect("search");
+        assert_eq!(
+            hits_of(&batches).len(),
+            1,
+            "the replacement row is found through the index"
+        );
+    }
+
+    /// A commit that publishes a superfile without postings — one whose
+    /// path built no contribution — leaves the index unable to route to
+    /// it, so the index must stop claiming to list every live superfile.
+    #[test]
+    fn a_superfile_published_without_postings_marks_the_index_incomplete() {
+        use crate::supertable::{
+            manifest::{SuperfileUri, VectorLayout},
+            writer::{CommitListMetadata, persist_commit_async},
+        };
+
+        let (_dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        let entry = Arc::new(SuperfileEntry {
+            stem: None,
+            birth_version: 0,
+            superfile_id: Uuid::new_v4(),
+            uri: SuperfileUri::new_v4(),
+            n_docs: 1,
+            id_min: 1_000_000,
+            id_max: 1_000_000,
+            scalar_stats: Default::default(),
+            fts_summary: Default::default(),
+            vector_summary: Default::default(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        });
+        let committed = st
+            .block_on_query(persist_commit_async(
+                st.inner(),
+                Arc::clone(&storage),
+                vec![entry],
+                &[],
+                Vec::new(),
+                Vec::new(),
+                CommitListMetadata::empty(),
+                Vec::new(),
+            ))
+            .expect("commit");
+        assert!(
+            committed.term_index_ref().is_some(),
+            "the prior root is carried forward"
+        );
+        assert!(
+            !committed.term_index_complete(),
+            "an unindexed live superfile makes the index incomplete"
+        );
+    }
+
     /// Routing is exact: `Or` is the union of the terms' posting sets and
     /// `And` their intersection, term by term, on random corpora.
     #[test]
@@ -1520,26 +1665,7 @@ mod tests {
         Arc<dyn StorageProvider>,
         crate::supertable::Supertable,
     ) {
-        use crate::{
-            superfile::builder::FtsConfig,
-            supertable::{Supertable, SupertableOptions},
-        };
-        let dir = TempDir::new().expect("tempdir");
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
-        let writer_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(2)
-                .build()
-                .expect("pool"),
-        );
-        let options =
-            SupertableOptions::new(title_schema(), vec![FtsConfig::new("title")], Vec::new())
-                .expect("options")
-                .with_writer_pool(writer_pool)
-                .with_bound_ordered_open_window(window)
-                .with_storage(Arc::clone(&storage));
-        (dir, storage, Supertable::create(options).expect("create"))
+        table_with(|o| o.with_bound_ordered_open_window(window))
     }
 
     fn commit_titles(st: &crate::supertable::Supertable, titles: &[String]) {
@@ -1688,17 +1814,19 @@ mod tests {
                 .expect("memo");
             let names: Vec<&str> = pairs.iter().map(|(t, _, _)| *t).collect();
             let (dfs, _) = rt.block_on(sf.term_dfs("title", &names)).expect("dfs");
-            let values = rt
-                .block_on(sf.term_locations("title", &names))
-                .expect("values");
-            for ((name, df), value) in names.iter().zip(dfs).zip(values) {
+            let facts = rt
+                .block_on(sf.term_index_facts("title", &names))
+                .expect("facts");
+            for ((name, df), fact) in names.iter().zip(dfs).zip(facts) {
+                let fact = fact.expect("dictionary has it");
+                assert_eq!(fact.df, df, "{name}: the cursor's df is the header's df");
                 assert_eq!(
                     memo.df(name),
                     df,
                     "{name}: df from the index equals the dictionary's"
                 );
                 let slot = memo.lookup(name).expect("in memo").expect("present");
-                match (slot, value.expect("dictionary has it")) {
+                match (slot, fact.entry) {
                     (
                         FetchedTermSlot::Inline { doc_id, tf },
                         FstValue::Inline { doc_id: d, tf: t },

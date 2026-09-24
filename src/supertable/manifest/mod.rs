@@ -1159,6 +1159,17 @@ impl ManifestSnapshot {
         &self.superfile_list.superfiles
     }
 
+    /// Whether the table has no superfiles at all. Counted from the
+    /// list's parts when there is a list: a lazily loaded manifest's flat
+    /// view holds only what has been loaded, so its emptiness proves
+    /// nothing.
+    pub(crate) fn holds_no_superfiles(&self) -> bool {
+        match &self.list {
+            Some(list) => list.parts.iter().all(|p| p.n_superfiles == 0),
+            None => self.superfile_list.superfiles.is_empty(),
+        }
+    }
+
     pub(crate) async fn get_pruned_superfiles(
         &self,
         leaves: &[PruneLeaf],

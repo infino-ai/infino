@@ -3046,64 +3046,70 @@ pub(crate) fn build_fts_summary(
 /// built, so the awaited calls resolve without I/O; the bridge only lends
 /// them an executor from this synchronous prepare path. Every term carries
 /// its score ceiling in this superfile, at the superfile's own statistics.
-fn build_term_contribution(
+pub(in crate::supertable) fn build_term_contribution(
     reader: &SuperfileReader,
     options: &SupertableOptions,
     superfile_id: Uuid,
     id_min: i128,
 ) -> Result<Option<TermContribution>, BuildError> {
-    let Some(fts) = reader.fts() else {
-        return Ok(None);
-    };
-    // No storage, no term index to publish into: the spill would only be
-    // removed again after the commit.
-    if options.storage.is_none() {
+    // No storage, or no text columns: no term index to publish into.
+    if options.storage.is_none() || options.fts_columns.is_empty() {
         return Ok(None);
     }
-    let spill = env::temp_dir().join(format!("infino-term-index-{superfile_id}"));
-    let mut writer = term_index::ContributionWriter::create(&spill, superfile_id, id_min)
+    let mut writer = term_index::ContributionWriter::create_in_scratch(superfile_id, id_min)
         .map_err(|e| BuildError::Store(e.to_string()))?;
-    let mut columns: Vec<&str> = options
-        .fts_columns
-        .iter()
-        .map(|c| c.column.as_str())
-        .collect();
-    columns.sort_unstable();
-    for column in columns {
-        let term_bytes = fts
-            .iter_column_terms(column)
-            .map_err(|e| BuildError::Store(format!("term walk: {e}")))?;
-        let terms: Vec<&str> = term_bytes
-            .iter()
-            .map(|t| from_utf8(t).map_err(|_| BuildError::Store("non-utf8 term".into())))
-            .collect::<Result<_, _>>()?;
-        for chunk in terms.chunks(TERM_INDEX_BATCH_TERMS) {
-            let (dfs, locations, bounds) = bridge_sync_to_async(async {
-                let (dfs, _work) = reader.term_dfs(column, chunk).await?;
-                let locations = reader.term_locations(column, chunk).await?;
-                let bounds = reader.term_max_bounds(column, chunk).await?;
-                Ok::<_, ReadError>((dfs, locations, bounds))
-            })
-            .map_err(|e| BuildError::Store(format!("term-index contribution: {e}")))?;
-            for (((term, df), location), bound) in chunk.iter().zip(dfs).zip(locations).zip(bounds)
-            {
-                let location = location
-                    .map(term_index::Location::from_dict_value)
-                    .unwrap_or(term_index::Location::None);
-                // A term the dictionary lists but no cursor could bound is
-                // given the ceiling that prunes nothing rather than one that
-                // could be wrong.
-                let bound = bound.unwrap_or(f32::INFINITY);
-                writer
-                    .push(&make_key(column, term), df, bound, location)
-                    .map_err(|e| BuildError::Store(e.to_string()))?;
-            }
-        }
-    }
+    bridge_sync_to_async(write_superfile_terms(reader, &mut writer))
+        .map_err(|e| BuildError::Store(e.to_string()))?;
     writer
         .finish()
         .map(Some)
         .map_err(|e| BuildError::Store(e.to_string()))
+}
+
+/// Walk every text column of `reader`'s dictionary and append each term's
+/// index facts to `writer`. Columns are visited in name order and a
+/// dictionary yields its terms sorted, so the contribution is in the
+/// ascending key order the merge requires. A superfile with no text index
+/// contributes no terms but is still listed by the index.
+async fn write_superfile_terms(
+    reader: &SuperfileReader,
+    writer: &mut term_index::ContributionWriter,
+) -> Result<(), TermIndexError> {
+    let Some(fts) = reader.fts() else {
+        return Ok(());
+    };
+    let mut columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
+    columns.sort();
+    for column in &columns {
+        let term_bytes = fts
+            .iter_column_terms(column)
+            .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
+        let terms: Vec<&str> = term_bytes
+            .iter()
+            .map(|t| from_utf8(t).map_err(|_| TermIndexError::Build("non-utf8 term".into())))
+            .collect::<Result<_, _>>()?;
+        for chunk in terms.chunks(TERM_INDEX_BATCH_TERMS) {
+            let facts = reader
+                .term_index_facts(column, chunk)
+                .await
+                .map_err(|e| TermIndexError::Build(format!("term facts: {e}")))?;
+            for (term, fact) in chunk.iter().zip(facts) {
+                // A term the dictionary lists but no cursor could describe
+                // keeps its presence and is given the ceiling that prunes
+                // nothing rather than one that could be wrong.
+                let (df, bound, location) = match fact {
+                    Some(f) => (
+                        f.df,
+                        f.bound,
+                        term_index::Location::from_dict_value(f.entry),
+                    ),
+                    None => (0, f32::INFINITY, term_index::Location::None),
+                };
+                writer.push(&make_key(column, term), df, bound, location)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn build_column_vector_summary(
@@ -9534,18 +9540,14 @@ pub(in crate::supertable) async fn stamp_term_index(
         let store = Arc::clone(&old.options.store);
         let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
         let opt_storage = old.options.storage.as_ref().map(Arc::clone);
-        let spill = env::temp_dir().join(format!("infino-term-index-{}", Uuid::new_v4()));
         let built = collect_and_build_term_index(
             &store,
             disk_cache.as_ref(),
             opt_storage.as_ref(),
             entries,
-            &spill,
         )
-        .await;
-        // Spill files are scratch; remove them whatever the outcome.
-        let _ = fs::remove_dir_all(&spill);
-        let built = built.map_err(|e| BuildError::Store(e.to_string()))?;
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
         let reference = term_index::write_built(storage.as_ref(), built)
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -9583,73 +9585,35 @@ pub(in crate::supertable) async fn stamp_term_index(
 }
 
 /// Walk every superfile's dictionary once, spilling a contribution per
-/// superfile under `spill`, then merge them into slices. Columns are
-/// visited in name order and a dictionary yields its terms sorted, so each
-/// contribution is in ascending key order as the merge requires.
+/// superfile into one scratch directory, then merge them into slices. The
+/// scratch directory goes with the contributions when this returns.
 async fn collect_and_build_term_index(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
     opt_storage: Option<&Arc<dyn StorageProvider>>,
     entries: &[Arc<SuperfileEntry>],
-    spill: &Path,
 ) -> Result<term_index::Built, TermIndexError> {
+    let scratch = tempfile::Builder::new()
+        .prefix("infino-term-index-")
+        .tempdir()?;
     let mut contributions = Vec::with_capacity(entries.len());
     for entry in entries {
         let reader = open_reader(store, disk_cache, opt_storage, entry, false)
             .await
             .map_err(|e| TermIndexError::Build(e.to_string()))?;
-        let mut writer =
-            term_index::ContributionWriter::create(spill, entry.superfile_id, entry.id_min)?;
-        if let Some(fts) = reader.fts() {
-            let mut columns: Vec<String> =
-                fts.fts_columns_config().map(|c| c.name.clone()).collect();
-            columns.sort();
-            for column in &columns {
-                let term_bytes = fts
-                    .iter_column_terms(column)
-                    .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
-                let terms: Vec<&str> = term_bytes
-                    .iter()
-                    .map(|t| {
-                        from_utf8(t).map_err(|_| TermIndexError::Build("non-utf8 term".into()))
-                    })
-                    .collect::<Result<_, _>>()?;
-                for chunk in terms.chunks(TERM_INDEX_BATCH_TERMS) {
-                    let (dfs, _work) = reader
-                        .term_dfs(column, chunk)
-                        .await
-                        .map_err(|e| TermIndexError::Build(format!("df batch: {e}")))?;
-                    let locations = reader
-                        .term_locations(column, chunk)
-                        .await
-                        .map_err(|e| TermIndexError::Build(format!("location batch: {e}")))?;
-                    let bounds = reader
-                        .term_max_bounds(column, chunk)
-                        .await
-                        .map_err(|e| TermIndexError::Build(format!("bound batch: {e}")))?;
-                    for (((term, df), location), bound) in
-                        chunk.iter().zip(dfs).zip(locations).zip(bounds)
-                    {
-                        let location = location
-                            .map(term_index::Location::from_dict_value)
-                            .unwrap_or(term_index::Location::None);
-                        writer.push(
-                            &make_key(column, term),
-                            df,
-                            bound.unwrap_or(f32::INFINITY),
-                            location,
-                        )?;
-                    }
-                }
-            }
-        }
+        let mut writer = term_index::ContributionWriter::create(
+            scratch.path(),
+            entry.superfile_id,
+            entry.id_min,
+        )?;
+        write_superfile_terms(&reader, &mut writer).await?;
         contributions.push(writer.finish()?);
         drop(reader);
     }
     term_index::build(&contributions, &term_index::BuildPolicy::default())
 }
 
-/// Terms per batched df / location read during the term-index build.
+/// Terms per batched dictionary read during the term-index build.
 const TERM_INDEX_BATCH_TERMS: usize = 4096;
 
 /// Publish/refresh the slow-CAS serving state (Commit B, "settle").
@@ -10104,14 +10068,10 @@ pub(in crate::supertable) async fn persist_commit_async(
     // would serialize the `tokio::join!` in `commit` (the user + hidden publishes
     // are meant to overlap) and risk a nested-block_on panic. The sync→async
     // bridge lives only in the `persist_commit` wrapper below.
-    let result = drive.await;
-    // Spill files are scratch for this commit; remove them whatever the
-    // outcome. A failed commit's postings are rebuilt from the superfile by
-    // the next maintenance pass.
-    for contribution in &term_contributions {
-        let _ = fs::remove_file(&contribution.path);
-    }
-    result
+    // The contributions' spill files go with them when this returns,
+    // whatever the outcome. A failed commit's postings are rebuilt from the
+    // superfile by the next maintenance pass.
+    drive.await
 }
 
 pub(in crate::supertable) fn persist_commit(
@@ -10122,6 +10082,7 @@ pub(in crate::supertable) fn persist_commit(
     pending_storage_writes: Vec<(String, Bytes)>,
     pending_storage_replaces: Vec<(String, Bytes)>,
     list_metadata: CommitListMetadata,
+    term_contributions: Vec<TermContribution>,
 ) -> Result<(), SupertableCommitError> {
     let drive = persist_commit_async(
         inner,
@@ -10131,7 +10092,7 @@ pub(in crate::supertable) fn persist_commit(
         pending_storage_writes,
         pending_storage_replaces,
         list_metadata,
-        Vec::new(),
+        term_contributions,
     );
     let new_manifest = bridge_on_runtime(drive, &inner.query_runtime())?;
     inner.manifest.store(Arc::new(new_manifest));
@@ -10486,6 +10447,16 @@ pub(crate) async fn try_commit_attempt(
     //     job, routing is derived — so the index restarts from this commit's
     //     superfiles alone and is marked incomplete; a maintenance rebuild
     //     makes it whole.
+    //
+    //     The index is complete only while it lists every live superfile.
+    //     A commit that publishes a superfile without postings (a path that
+    //     built no contribution) leaves it incomplete, so part selection
+    //     keeps its summary-based choice instead of trusting an index that
+    //     would never route to that superfile.
+    let contributed: HashSet<Uuid> = term_contributions.iter().map(|c| c.superfile_id).collect();
+    let every_new_covered = new_entries
+        .iter()
+        .all(|e| contributed.contains(&e.superfile_id));
     if !term_contributions.is_empty() {
         let prior = match current_manifest.term_index_ref() {
             Some(reference) => match term_index::load_root(storage.as_ref(), reference).await {
@@ -10497,14 +10468,14 @@ pub(crate) async fn try_commit_attempt(
             },
             None => None,
         };
-        // Complete when every live superfile is listed: a delta on top of a
-        // complete index stays complete; the first index on a table that
-        // already held superfiles covers only this commit's, and stays
-        // incomplete until a maintenance rebuild.
-        let complete = match prior.is_some() {
-            true => current_manifest.term_index_complete(),
-            false => current_manifest.get_all_superfiles().is_empty(),
-        };
+        // A delta on top of a complete index stays complete; the first
+        // index on a table that already held superfiles covers only this
+        // commit's, and stays incomplete until a maintenance rebuild.
+        let complete = every_new_covered
+            && match prior.is_some() {
+                true => current_manifest.term_index_complete(),
+                false => current_manifest.holds_no_superfiles(),
+            };
         let reference = term_index::append_delta(
             storage.as_ref(),
             prior,
@@ -10514,6 +10485,11 @@ pub(crate) async fn try_commit_attempt(
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
         new_manifest = new_manifest.with_term_index_ref(reference, complete);
+    } else if !every_new_covered
+        && current_manifest.term_index_complete()
+        && let Some(reference) = current_manifest.term_index_ref()
+    {
+        new_manifest = new_manifest.with_term_index_ref(reference.clone(), false);
     }
 
     // 4. Parallel-issue (touched parts) + list PUTs, then

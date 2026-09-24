@@ -23,6 +23,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::{
@@ -85,6 +86,10 @@ impl Default for BuildPolicy {
 pub(crate) struct ContributionWriter {
     out: BufWriter<File>,
     path: PathBuf,
+    /// A scratch directory this writer owns, removed when the finished
+    /// contribution is dropped. `None` when the caller supplied the
+    /// directory.
+    scratch: Option<TempDir>,
     superfile_id: Uuid,
     id_min: i128,
     prev_key: Vec<u8>,
@@ -106,12 +111,28 @@ impl ContributionWriter {
         Ok(Self {
             out,
             path,
+            scratch: None,
             superfile_id,
             id_min,
             prev_key: Vec::new(),
             n_terms: 0,
             record: Vec::new(),
         })
+    }
+
+    /// Like [`Self::create`], spilling into a scratch directory of its own
+    /// under the system temporary directory; the directory lives as long as
+    /// the finished contribution does.
+    pub(crate) fn create_in_scratch(
+        superfile_id: Uuid,
+        id_min: i128,
+    ) -> Result<Self, TermIndexError> {
+        let scratch = tempfile::Builder::new()
+            .prefix("infino-term-index-")
+            .tempdir()?;
+        let mut writer = Self::create(scratch.path(), superfile_id, id_min)?;
+        writer.scratch = Some(scratch);
+        Ok(writer)
     }
 
     /// Append one term. Keys must arrive in strictly ascending order.
@@ -157,6 +178,7 @@ impl ContributionWriter {
             superfile_id: self.superfile_id,
             id_min: self.id_min,
             path: self.path,
+            _scratch: self.scratch,
         })
     }
 }
@@ -170,6 +192,9 @@ pub(crate) struct Contribution {
     pub(crate) id_min: i128,
     /// The spill file.
     pub(crate) path: PathBuf,
+    /// The scratch directory holding it, when this contribution owns one;
+    /// dropping the contribution removes both.
+    _scratch: Option<TempDir>,
 }
 
 /// Sequential reader over one spilled contribution.

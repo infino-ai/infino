@@ -63,7 +63,7 @@ use crate::{
             bm25::Bm25Params,
             reader::{
                 self as fts_reader, BoolMode, ClauseLists, FetchedTermMemo, FtsReader, MatchWork,
-                OrCursorSet, PreparedClauses, TermPattern,
+                OrCursorSet, PreparedClauses, TermIndexFact, TermPattern,
             },
             tokenize::{Phrase, Tokenizer},
         },
@@ -1464,32 +1464,18 @@ impl SuperfileReader {
         Ok(fts.memo_from_dict_values(terms).await?)
     }
 
-    /// Upper bound on the BM25 score each of `tokens` can reach here, at
-    /// this superfile's own statistics (`None` for an absent token).
-    /// Delegates to [`FtsReader::term_max_bounds`].
-    pub(crate) async fn term_max_bounds(
+    /// What a table-level term index records about each of `tokens` in
+    /// `column`, in input order (`None` for an absent token). Delegates to
+    /// [`FtsReader::term_index_facts`].
+    pub(crate) async fn term_index_facts(
         &self,
         column: &str,
         tokens: &[&str],
-    ) -> Result<Vec<Option<f32>>, ReadError> {
+    ) -> Result<Vec<Option<TermIndexFact>>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.term_max_bounds(column, tokens).await?)
-    }
-
-    /// Dictionary entry of each of `tokens` in `column`, in input order
-    /// (`None` for an absent token). Delegates to
-    /// [`FtsReader::term_locations`].
-    pub(crate) async fn term_locations(
-        &self,
-        column: &str,
-        tokens: &[&str],
-    ) -> Result<Vec<Option<FstValue>>, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.term_locations(column, tokens).await?)
+        Ok(fts.term_index_facts(column, tokens).await?)
     }
 
     /// Document frequency of each of `tokens` in `column`, in input order

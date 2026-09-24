@@ -24,6 +24,7 @@ mod work;
 
 pub use core::*;
 
+pub(crate) use count::TermIndexFact;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use count::TermLayout;
 pub(crate) use expand::{LONG_S_ASCII, TermPattern, has_fold_partner};

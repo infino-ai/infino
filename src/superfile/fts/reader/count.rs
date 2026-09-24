@@ -28,6 +28,19 @@ use crate::{
     utils::terms::{FstValue, make_key},
 };
 
+/// One term's entry in a table-level term index, as read from one
+/// superfile: see [`FtsReader::term_index_facts`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TermIndexFact {
+    /// Documents in this superfile containing the term.
+    pub(crate) df: u64,
+    /// Upper bound on the term's BM25 score here, at this superfile's own
+    /// statistics.
+    pub(crate) bound: f32,
+    /// The term's dictionary entry: where its postings sit.
+    pub(crate) entry: FstValue,
+}
+
 impl FtsReader {
     /// Unranked doc-at-a-time walk over heterogeneous atoms, calling
     /// `on_doc` for every matching doc in ascending order. `And` walks
@@ -301,6 +314,51 @@ impl FtsReader {
         Ok((n, work))
     }
 
+    /// What a table-level term index records about each of `tokens` in
+    /// `column`, in input order — `None` for an absent token: its `df`, the
+    /// upper bound on the BM25 score it can reach in this superfile, and
+    /// its dictionary entry. One dictionary resolution and one cursor build
+    /// serve all three: a built cursor already carries the term's `df` and
+    /// its maximum block score, so nothing is read twice.
+    ///
+    /// The bound is scored at this superfile's own idf and declared
+    /// parameters, exactly as its stored block maxima are: for a long term
+    /// the maximum over its skip entries, for a short or inline term the
+    /// maximum over its postings. A query rescales it for a global idf the
+    /// same way the in-superfile bounds are.
+    pub(crate) async fn term_index_facts(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<Vec<Option<TermIndexFact>>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fst_bytes = self.dict_bytes_async().await?;
+        let dict = self.open_dict(&fst_bytes)?;
+        let col_meta = &self.columns[column_id as usize];
+        let entries: Vec<Option<FstValue>> = tokens
+            .iter()
+            .map(|token| dict.lookup(&make_key(&col_meta.name, token)))
+            .collect();
+        let cursors = self
+            .build_term_cursors_opt(column_id, tokens, None, false, None, None)
+            .await?;
+        Ok(entries
+            .into_iter()
+            .zip(cursors)
+            .map(|(entry, cursor)| {
+                let cursor = cursor?;
+                Some(TermIndexFact {
+                    df: cursor.df,
+                    bound: cursor.term_max_bm25,
+                    entry: entry?,
+                })
+            })
+            .collect())
+    }
+
     /// Document frequency for each of `tokens` in `column` — the number
     /// of docs containing each — in input order, read cheaply from the
     /// index **without** decoding posting lists.
@@ -315,54 +373,6 @@ impl FtsReader {
     /// ranges into a minimal set of parallel GETs). This matters on the
     /// global-statistics path, where a superfile is probed for every
     /// scored term of a query at once.
-    /// Upper bound on the BM25 score each of `tokens` can reach in this
-    /// superfile, in input order — `None` for an absent token. Scored at
-    /// this superfile's own idf and declared parameters, exactly as its
-    /// stored block maxima are: for a long term the maximum over its skip
-    /// entries, for a short or inline term the maximum over its postings.
-    /// A table-level index records these so a query can order superfiles
-    /// by ceiling before opening any; the query rescales for a global idf
-    /// or an override the same way the in-superfile bounds are.
-    pub(crate) async fn term_max_bounds(
-        &self,
-        column: &str,
-        tokens: &[&str],
-    ) -> Result<Vec<Option<f32>>, FtsError> {
-        let column_id = self.resolve_column_id(column)?;
-        if tokens.is_empty() {
-            return Ok(Vec::new());
-        }
-        let cursors = self
-            .build_term_cursors_opt(column_id, tokens, None, false, None, None)
-            .await?;
-        Ok(cursors
-            .into_iter()
-            .map(|c| c.map(|c| c.term_max_bm25))
-            .collect())
-    }
-
-    /// Dictionary entry of each of `tokens` in `column`, in input order —
-    /// `None` for an absent token. One dictionary fetch, no postings read.
-    /// This is what a table-level term index records so a later query can
-    /// reach a term's postings without opening this dictionary.
-    pub(crate) async fn term_locations(
-        &self,
-        column: &str,
-        tokens: &[&str],
-    ) -> Result<Vec<Option<FstValue>>, FtsError> {
-        let column_id = self.resolve_column_id(column)?;
-        if tokens.is_empty() {
-            return Ok(Vec::new());
-        }
-        let fst_bytes = self.dict_bytes_async().await?;
-        let dict = self.open_dict(&fst_bytes)?;
-        let col_meta = &self.columns[column_id as usize];
-        Ok(tokens
-            .iter()
-            .map(|token| dict.lookup(&make_key(&col_meta.name, token)))
-            .collect())
-    }
-
     pub async fn term_dfs(
         &self,
         column: &str,
