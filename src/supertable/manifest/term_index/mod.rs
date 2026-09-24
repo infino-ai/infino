@@ -2286,6 +2286,78 @@ mod tests {
         );
     }
 
+    /// A candidate plan — what a SQL `WHERE` on a text column and a filtered
+    /// vector search resolve — reads no dictionary for the terms the index
+    /// located: same rows as the dictionary path, one planned read fewer
+    /// per superfile, and nothing changes for a column the memos lack.
+    #[test]
+    fn candidate_plans_resolve_from_the_index_locations() {
+        use crate::{
+            superfile::SuperfileReader,
+            supertable::query::{
+                candidate::{CandidatePlan, TermMemos},
+                fts::{memos_from_plan_locations, plan_locations_for},
+            },
+        };
+
+        let (dir, _storage, st) = fresh_table();
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let entries = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .to_vec();
+        let plan = CandidatePlan::And(vec![
+            CandidatePlan::TermsAll {
+                column: "title".into(),
+                tokens: vec!["alpha".into(), "shared".into()],
+            },
+            CandidatePlan::TermsAny {
+                column: "title".into(),
+                terms: vec!["s0d00".into(), "s1d02".into(), "absent".into()],
+            },
+        ]);
+        let requests = plan.term_requests();
+        assert_eq!(
+            requests["title"],
+            vec!["absent", "alpha", "s0d00", "s1d02", "shared"],
+            "every exact-match term, once, per column"
+        );
+        // The real helpers: locations per column from the table's index,
+        // then one memo per column per superfile — with the terms the index
+        // shows absent from a superfile recorded as resolved misses.
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let locations = rt.block_on(plan_locations_for(manifest, &plan, &entries));
+        assert_eq!(locations.len(), 1, "one column");
+        let mut total_rows = 0u64;
+        for e in &entries {
+            let bytes =
+                std::fs::read(dir.path().join(e.uri.storage_path())).expect("superfile bytes");
+            let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+            let memos = rt.block_on(memos_from_plan_locations(&sf, &locations, e.superfile_id));
+            assert!(
+                memos.contains_key("title"),
+                "an indexed superfile gets a memo"
+            );
+            let (plain, plain_work) = rt
+                .block_on(plan.evaluate(&sf, None, &TermMemos::new()))
+                .expect("dictionary path");
+            let (memoed, memo_work) = rt
+                .block_on(plan.evaluate(&sf, None, &memos))
+                .expect("memo path");
+            assert_eq!(memoed, plain, "same rows either way");
+            // Two exact-match nodes, each spared its dictionary read.
+            assert_eq!(memo_work.planned_ranges + 2, plain_work.planned_ranges);
+            total_rows += plain.map_or(0, |b| b.len());
+        }
+        assert!(total_rows > 0, "the fixture matches the plan");
+    }
+
     /// Routing is exact: `Or` is the union of the terms' posting sets and
     /// `And` their intersection, term by term, on random corpora.
     #[test]

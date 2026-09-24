@@ -91,7 +91,7 @@ use super::{
     candidate::{CandidatePlan, CandidateScope},
     dispatch,
     exec::common::{SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source},
-    fts::memo_from_locations,
+    fts::{memo_from_locations, memos_from_plan_locations},
     provider::prune_leaves_for_filters,
     prune::{PruneLeaf, select_superfiles},
 };
@@ -7106,13 +7106,18 @@ impl SupertableReader {
         // A `LIKE` leaf's dictionary walk is CPU work: it runs on the reader
         // pool, not on the tokio worker driving this fan-out.
         let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
-        self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
+        // The index's locations for the plan's terms let each superfile
+        // resolve them from its postings alone.
+        let locations = Arc::new(self.plan_locations(plan, superfiles).await);
+        self.fanout_candidate_bitmaps(superfiles, move |r, entry| {
             let plan = Arc::clone(&plan_arc);
             let op_stats = op_stats.clone();
             let reader_pool = Arc::clone(&reader_pool);
+            let locations = Arc::clone(&locations);
             async move {
+                let memos = memos_from_plan_locations(&r, &locations, entry.superfile_id).await;
                 let (bitmap, work) = plan
-                    .evaluate(r.as_ref(), Some(&reader_pool))
+                    .evaluate(r.as_ref(), Some(&reader_pool), &memos)
                     .await
                     .map_err(|e| QueryError::Parquet(e.to_string()))?;
                 // The SQL predicate's posting walks, summed across the

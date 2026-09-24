@@ -102,6 +102,14 @@ impl FetchedTermMemo {
         terms.iter().all(|t| self.contains(t))
     }
 
+    /// Record `term` as resolved absent from this superfile, unless the
+    /// memo already holds it: a caller that knows the term has no postings
+    /// here (a table-level term index lists none) spares the cursor build
+    /// a dictionary read that would only confirm the absence.
+    pub(crate) fn note_absent(&mut self, term: &str) {
+        self.map.entry(Box::from(term)).or_insert(None);
+    }
+
     /// This superfile's df contribution per term (0 for a miss or an
     /// un-fetched term, 1 for an inline slot).
     pub(crate) fn df(&self, term: &str) -> u64 {

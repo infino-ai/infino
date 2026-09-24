@@ -114,6 +114,7 @@ use crate::{
             candidate::{CandidatePlan, like_prune_leaves},
             df_object_store::SuperfileObjectStore,
             exec::metered_exec::MeteredExec,
+            fts::{memos_from_plan_locations, plan_locations_for},
             prune::{PruneLeaf, select_superfiles},
             skip::{ScalarOp, ScalarPredicate},
             superfile_reader::superfile_reader,
@@ -850,6 +851,13 @@ impl TableProvider for SupertableProvider {
         // A `LIKE` leaf is bound to each superfile's dictionary once, up
         // front, so the estimate and the evaluation below share one walk.
         let needs_expansion = candidate_plan.has_like();
+        // The term index's locations for the predicate's terms: each
+        // superfile then resolves them from its postings, not its dictionary.
+        let survivor_entries: Vec<Arc<SuperfileEntry>> =
+            survivors.iter().map(|e| Arc::clone(e)).collect();
+        let plan_locations =
+            plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await;
+        let plan_locations = &plan_locations;
         let prepared_files =
             try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry))).await?;
 
@@ -954,8 +962,14 @@ impl TableProvider for SupertableProvider {
                         let candidates = if est > gate || est >= density_cap {
                             None
                         } else {
+                            let memos = memos_from_plan_locations(
+                                prepared.reader.as_ref(),
+                                plan_locations,
+                                entry.superfile_id,
+                            )
+                            .await;
                             let (bitmap, eval_work) = plan
-                                .evaluate(prepared.reader.as_ref(), Some(reader_pool))
+                                .evaluate(prepared.reader.as_ref(), Some(reader_pool), &memos)
                                 .await
                                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
                             predicate_work.merge(eval_work);

@@ -137,7 +137,7 @@ use crate::{
         manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri, term_index},
         query::{
             SuperfileHit,
-            candidate::CandidateScope,
+            candidate::{CandidatePlan, CandidateScope, TermMemos},
             dispatch,
             exec::common::{resolve_hits_named, take_rows_byte_source},
             prune::{PruneLeaf, select_superfiles},
@@ -397,30 +397,103 @@ impl SharedTopK {
 }
 
 /// Where each kept superfile's postings for a query's terms sit, per the
-/// term index: superfile → `(term, df, location)`. Empty when the table has
-/// no index, or it could not answer, in which case every cursor build
-/// reads its superfile's dictionary as before.
-pub(crate) type IndexLocations = Arc<HashMap<Uuid, Arc<Vec<(String, u64, term_index::Location)>>>>;
+/// term index: superfile → `(term, df, location)` for the terms it holds.
+/// `terms` are the ones asked about, so a term missing from an indexed
+/// superfile's entry is known absent there. `by_superfile` is empty when
+/// the table has no index, or it could not answer, in which case every
+/// cursor build reads its superfile's dictionary as before.
+pub(crate) struct LocatedTerms {
+    terms: Vec<String>,
+    by_superfile: HashMap<Uuid, Arc<Vec<(String, u64, term_index::Location)>>>,
+}
+
+/// Shared handle to one query's [`LocatedTerms`].
+pub(crate) type IndexLocations = Arc<LocatedTerms>;
+
+/// The term index's locations for every exact-match term a candidate plan
+/// resolves, per column, over the superfiles `kept`; see
+/// [`IndexLocations`]. Empty when the table has no index.
+pub(crate) type PlanLocations = HashMap<String, IndexLocations>;
+
+/// The term index's postings locations for `terms` in every superfile of
+/// `kept` that `manifest`'s index lists; see [`IndexLocations`].
+pub(crate) async fn index_locations_for(
+    manifest: &ManifestSnapshot,
+    column: &str,
+    terms: &[&str],
+    kept: &[Arc<SuperfileEntry>],
+) -> IndexLocations {
+    let owned: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
+    let by_superfile = match manifest.term_index().await {
+        Some(index) => match index.locations(column, terms, kept).await {
+            Ok(map) => map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
+            Err(_) => HashMap::new(),
+        },
+        None => HashMap::new(),
+    };
+    Arc::new(LocatedTerms {
+        terms: owned,
+        by_superfile,
+    })
+}
+
+/// [`index_locations_for`] for every exact-match term of `plan`, per
+/// column; see [`PlanLocations`].
+pub(crate) async fn plan_locations_for(
+    manifest: &ManifestSnapshot,
+    plan: &CandidatePlan,
+    kept: &[Arc<SuperfileEntry>],
+) -> PlanLocations {
+    let mut out = PlanLocations::new();
+    for (column, terms) in plan.term_requests() {
+        let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let located = index_locations_for(manifest, &column, &refs, kept).await;
+        out.insert(column, located);
+    }
+    out
+}
+
+/// Build a plan's per-column memos for `superfile` from [`PlanLocations`]:
+/// one memo per column the index located terms in.
+pub(crate) async fn memos_from_plan_locations(
+    r: &SuperfileReader,
+    locations: &PlanLocations,
+    superfile: Uuid,
+) -> TermMemos {
+    let mut memos = TermMemos::new();
+    for (column, locations) in locations {
+        if let Some(memo) = memo_from_locations(r, locations, superfile).await {
+            memos.insert(column.clone(), memo);
+        }
+    }
+    memos
+}
 
 /// A prefetched-term memo for `superfile` built from the index's
-/// locations: the postings ranges are fetched, the dictionary is not.
-/// `None` when the index holds no locations for this superfile or the
-/// fetch failed — the cursor build then reads the dictionary; the cost is
-/// a read, never the answer.
+/// locations: the postings ranges are fetched, the dictionary is not, and
+/// a term the index lists no posting for in this superfile is recorded as
+/// a resolved miss, so its absence costs no dictionary read either. A term
+/// whose location the index chose not to carry stays out of the memo and
+/// resolves through the dictionary. `None` when the index does not list
+/// this superfile or the fetch failed — the cursor build then reads the
+/// dictionary; the cost is a read, never the answer.
 pub(crate) async fn memo_from_locations(
     r: &SuperfileReader,
     locations: &IndexLocations,
     superfile: Uuid,
 ) -> Option<Arc<FetchedTermMemo>> {
-    let locations = locations.get(&superfile)?;
-    let pairs: Vec<(&str, u64, FstValue)> = locations
+    let located = locations.by_superfile.get(&superfile)?;
+    let pairs: Vec<(&str, u64, FstValue)> = located
         .iter()
         .filter_map(|(t, df, loc)| loc.to_dict_value().map(|v| (t.as_str(), *df, v)))
         .collect();
-    r.term_memo_from_dict_values(&pairs)
-        .await
-        .ok()
-        .map(Arc::new)
+    let mut memo = r.term_memo_from_dict_values(&pairs).await.ok()?;
+    for term in &locations.terms {
+        if !located.iter().any(|(t, _, _)| t == term) {
+            memo.note_absent(term);
+        }
+    }
+    Some(Arc::new(memo))
 }
 
 /// Whether a superfile whose best possible score is `ceiling` can still
@@ -438,22 +511,23 @@ pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
 }
 
 impl SupertableReader {
-    /// The term index's postings locations for `terms` in every superfile
-    /// of `kept` that it lists; see [`IndexLocations`].
+    /// [`plan_locations_for`] on this reader's manifest.
+    pub(crate) async fn plan_locations(
+        &self,
+        plan: &CandidatePlan,
+        kept: &[Arc<SuperfileEntry>],
+    ) -> PlanLocations {
+        plan_locations_for(self.manifest(), plan, kept).await
+    }
+
+    /// [`index_locations_for`] on this reader's manifest.
     pub(crate) async fn index_locations(
         &self,
         column: &str,
         terms: &[&str],
         kept: &[Arc<SuperfileEntry>],
     ) -> IndexLocations {
-        let manifest = self.manifest();
-        let Some(index) = manifest.term_index().await else {
-            return Arc::new(HashMap::new());
-        };
-        match index.locations(column, terms, kept).await {
-            Ok(map) => Arc::new(map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()),
-            Err(_) => Arc::new(HashMap::new()),
-        }
+        index_locations_for(self.manifest(), column, terms, kept).await
     }
 
     /// Single-column BM25 search across the pinned manifest's
