@@ -115,12 +115,43 @@ impl SuperfileMerge for ReanalyzeMerge {
         inputs: MergeInputs<'_>,
         output: &mut dyn Write,
     ) -> Result<SuperfileStats, BuildError> {
-        reanalyze_to(inputs.readers, inputs.fts_corpus, output)
+        match carry_body(&inputs) {
+            Some((reader, entry)) => {
+                reanalyze_carrying_body_to(reader, entry, inputs.fts_corpus, output)
+            }
+            None => reanalyze_to(inputs.readers, inputs.fts_corpus, output),
+        }
     }
 
     fn preserves_tombstones(&self) -> bool {
         true
     }
+}
+
+/// Re-analyze `source`'s terms, and copy every other byte across.
+///
+/// Rows are unchanged by a re-analysis — only terms are — so the body and
+/// the vector subsection carry, and the vectors are never decoded. That is
+/// what the append path cannot do for a quantized codec.
+fn reanalyze_carrying_body_to(
+    source: &Arc<SuperfileReader>,
+    entry: &Arc<SuperfileEntry>,
+    fts_corpus: &HashMap<String, ColumnLengthStats>,
+    output: &mut dyn Write,
+) -> Result<SuperfileStats, BuildError> {
+    let readers = [(Arc::clone(source), None)];
+    let first = &readers[0];
+    let builder_opts = merge_builder_opts(&readers, first, fts_corpus).reanalyze_stored_columns();
+    let mut builder = SuperfileBuilder::new(builder_opts)?;
+    builder.reanalyze_fts_from_reader(source)?;
+    builder.set_carried_doc_count(entry.n_docs);
+    builder.finish_carrying_body_to(source, output)?;
+    Ok(SuperfileStats {
+        n_docs: entry.n_docs,
+        id_min: entry.id_min,
+        id_max: entry.id_max,
+        scalar_stats: entry.scalar_stats.clone(),
+    })
 }
 
 /// Rebuild `readers` into one superfile, re-analyzing every stored column.

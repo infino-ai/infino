@@ -2264,6 +2264,25 @@ impl SuperfileBuilder {
         splice_body_and_blobs_to(body, fts_file, vec_file, ids_bytes, &kvs, output)
     }
 
+    /// Rebuild the FTS index from `source`'s stored text, touching nothing
+    /// else.
+    ///
+    /// The FTS half of [`Self::add_batch_from_reader_scoped`] without the
+    /// body encode or the vector re-encode, for a build that carries both.
+    /// A column whose text was never stored has nothing to re-analyze, so
+    /// its postings are carried and it keeps the revision it came in at.
+    pub(crate) fn reanalyze_fts_from_reader(
+        &mut self,
+        source: &SuperfileReader,
+    ) -> Result<(), BuildError> {
+        self.carry_fts_from_reader_scoped(source, None, CarryScope::UnstoredOnly)?;
+        let batch = source
+            .get_record_batch(None)
+            .map_err(|_| BuildError::BatchReadError)?;
+        let n_rows = u32::try_from(batch.num_rows()).map_err(|_| BuildError::BatchReadError)?;
+        self.index_fts_batch(&batch, n_rows)
+    }
+
     /// Record that `n_docs` rows were carried in without this builder
     /// encoding them, so the finish sees the row count the body holds.
     pub(crate) fn set_carried_doc_count(&mut self, n_docs: u64) {
