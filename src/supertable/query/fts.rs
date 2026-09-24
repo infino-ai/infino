@@ -423,6 +423,20 @@ pub(crate) async fn memo_from_locations(
         .map(Arc::new)
 }
 
+/// Whether a superfile whose best possible score is `ceiling` can still
+/// place a document once the running k-th score is `floor`. Only a ceiling
+/// strictly below the floor cannot: a ceiling equal to it may hold a
+/// document that ties the k-th, and the stable `_id` order may admit that
+/// tie, so an equal ceiling is opened. This comparison handles an exact tie
+/// on its own; a ceiling that rounding put an ulp below a real score is
+/// protected by the widening the term index applies to every ceiling
+/// (`CEILING_SLACK`), not by this test.
+pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
+    // Written as "not strictly less" rather than `>=` so an incomparable
+    // ceiling (a NaN from a degenerate rescale) is opened, never skipped.
+    ceiling.partial_cmp(&floor) != Some(std::cmp::Ordering::Less)
+}
+
 impl SupertableReader {
     /// The term index's postings locations for `terms` in every superfile
     /// of `kept` that it lists; see [`IndexLocations`].
@@ -1051,7 +1065,7 @@ impl SupertableReader {
                     units,
                     window,
                     move |(_, _, _, ceiling): &(Option<(u32, u32)>, Uuid, SuperfileUri, f32)| {
-                        *ceiling < floor_handle.floor()
+                        !ceiling_can_compete(*ceiling, floor_handle.floor())
                     },
                     kernel,
                 )
@@ -2526,6 +2540,21 @@ mod tests {
         future::Future,
         sync::Arc,
     };
+
+    /// The skip decision at its boundary: a ceiling equal to the floor is
+    /// opened, one an ulp below it is skipped, and nothing is skipped before
+    /// a floor exists. Pinned here because the end-to-end tie test cannot
+    /// construct an exactly-equal ceiling — the term index widens every
+    /// ceiling it hands out.
+    #[test]
+    fn a_ceiling_equal_to_the_floor_still_competes() {
+        let floor = 0.20840901f32;
+        assert!(super::ceiling_can_compete(floor, floor));
+        assert!(!super::ceiling_can_compete(floor.next_down(), floor));
+        assert!(super::ceiling_can_compete(floor.next_up(), floor));
+        assert!(super::ceiling_can_compete(0.0, f32::NEG_INFINITY));
+        assert!(super::ceiling_can_compete(f32::INFINITY, f32::MAX));
+    }
 
     use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};

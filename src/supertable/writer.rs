@@ -10452,9 +10452,12 @@ pub(crate) async fn try_commit_attempt(
     //     Runs after the pointer fence above so a purged table refuses the
     //     commit before any artifact is written. A prior root that cannot
     //     be loaded is not fatal to the commit — membership is the commit's
-    //     job, routing is derived — so the index restarts from this commit's
-    //     superfiles alone and is marked incomplete; a maintenance rebuild
-    //     makes it whole.
+    //     job, routing is derived. A root that is gone or corrupt restarts
+    //     the index from this commit's superfiles alone, marked incomplete;
+    //     a read that merely failed keeps the reference and the segments it
+    //     has accumulated, and marks the index incomplete because this
+    //     commit's superfiles are not listed. A maintenance rebuild makes
+    //     either whole.
     //
     //     The index is complete only while it lists every live superfile.
     //     A commit that publishes a superfile without postings (a path that
@@ -10465,17 +10468,29 @@ pub(crate) async fn try_commit_attempt(
     let every_new_covered = new_entries
         .iter()
         .all(|e| contributed.contains(&e.superfile_id));
-    if !term_contributions.is_empty() {
-        let prior = match current_manifest.term_index_ref() {
-            Some(reference) => match term_index::load_root(storage.as_ref(), reference).await {
+    // The prior root: loaded, absent (no index yet, or gone for good), or
+    // unreadable for now.
+    let mut unreadable_prior: Option<RoutingRef> = None;
+    let prior = match current_manifest.term_index_ref() {
+        Some(reference) if !term_contributions.is_empty() => {
+            match term_index::load_root(storage.as_ref(), reference).await {
                 Ok(root) => Some(root),
-                Err(e) => {
-                    warn!(error = %e, uri = %reference.uri, "prior term-index root unreadable; restarting the index from this commit");
+                Err(e) if e.object_is_gone_or_corrupt() => {
+                    warn!(error = %e, uri = %reference.uri, "prior term-index root gone or corrupt; restarting the index from this commit");
                     None
                 }
-            },
-            None => None,
-        };
+                Err(e) => {
+                    warn!(error = %e, uri = %reference.uri, "prior term-index root unreadable for now; keeping it and marking the index incomplete");
+                    unreadable_prior = Some(reference.clone());
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    if let Some(reference) = unreadable_prior {
+        new_manifest = new_manifest.with_term_index_ref(reference, false);
+    } else if !term_contributions.is_empty() {
         // A delta on top of a complete index stays complete; the first
         // index on a table that already held superfiles covers only this
         // commit's, and stays incomplete until a maintenance rebuild.

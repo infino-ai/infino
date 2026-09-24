@@ -94,7 +94,7 @@ const RESIDENT_RUNS: usize = 4096;
 pub(crate) enum TermIndexError {
     /// Object storage failed.
     #[error("term-index storage error: {0}")]
-    Storage(String),
+    Storage(StorageError),
     /// Bytes did not parse as the layout `format` describes.
     #[error("term-index artifact malformed: {0}")]
     Malformed(String),
@@ -111,7 +111,21 @@ pub(crate) enum TermIndexError {
 
 impl From<StorageError> for TermIndexError {
     fn from(e: StorageError) -> Self {
-        Self::Storage(e.to_string())
+        Self::Storage(e)
+    }
+}
+
+impl TermIndexError {
+    /// Whether this error says the object is gone or unusable — absent,
+    /// unparseable, or not the bytes its hash promises — as opposed to a
+    /// read that failed and may well succeed next time. A commit that
+    /// cannot load the prior root restarts the index only in the first
+    /// case; in the second it keeps the reference and waits.
+    pub(crate) fn object_is_gone_or_corrupt(&self) -> bool {
+        matches!(
+            self,
+            Self::Storage(StorageError::NotFound { .. }) | Self::Malformed(_) | Self::HashMismatch
+        )
     }
 }
 
@@ -223,7 +237,7 @@ async fn fetch_verified(
     let matches =
         tokio::task::spawn_blocking(move || ContentHash::of(to_check.as_ref()) == expected)
             .await
-            .map_err(|e| TermIndexError::Storage(format!("hash task: {e}")))?;
+            .map_err(|e| TermIndexError::Build(format!("hash task: {e}")))?;
     if !matches {
         return Err(TermIndexError::HashMismatch);
     }
@@ -445,6 +459,14 @@ impl TermIndex {
     /// nothing for it; one the root does not list gets `+∞`, so it is
     /// opened first and unconditionally. `idf_used(term, local_idf)` is the
     /// idf the query scores `term` with given the superfile's own.
+    ///
+    /// **Precondition: the query scores with each column's declared `k1`
+    /// and `b`.** The stored bounds were baked at those parameters and are
+    /// rescaled here by idf alone, never by the factor an override would
+    /// need (`bound_scale`), so under an override they are not upper
+    /// bounds and must not order or skip anything. The ranked path keeps
+    /// an override on the unordered fan-out for exactly this reason; a new
+    /// caller must do the same or rescale first.
     pub(crate) async fn query_ceilings(
         &self,
         column: &str,
@@ -1699,10 +1721,14 @@ mod tests {
         assert_eq!(ceilings[&Uuid::from_u128(1)], f32::INFINITY);
     }
 
-    /// A superfile whose ceiling exactly equals the running k-th score is
-    /// still opened: it may hold a document that ties, and the stable
-    /// `_id` order decides ties, so skipping it would return the wrong
-    /// document. Only a ceiling strictly below the floor is skipped.
+    /// A superfile whose best document ties the running k-th score is still
+    /// opened: the stable `_id` order decides ties, so skipping it would
+    /// return the wrong document. Two things keep it open, and this test
+    /// exercises both together: the skip only fires for a ceiling strictly
+    /// below the floor (`ceiling_can_compete`, pinned at exact equality by
+    /// its own unit test), and the ceiling the query sees is widened by
+    /// [`CEILING_SLACK`], so a real score that rounding put an ulp above
+    /// its stored bound still cannot fall below it.
     #[test]
     fn a_superfile_whose_ceiling_ties_the_floor_is_still_opened() {
         use crate::{
@@ -2765,43 +2791,160 @@ mod tests {
     /// the fixture after a maintenance rebuild (index complete, blooms
     /// ignored); and a fresh table holding the same rows written entirely
     /// by the current writer.
-    #[test]
-    fn old_format_tables_read_and_mix_with_the_new_format() {
-        use std::{fs, path::Path};
-
-        use crate::{
-            Bm25SearchOptions,
-            superfile::{builder::FtsConfig, fts::reader::Bm25Stats},
-            supertable::{Supertable, SupertableOptions},
-        };
-
-        fn copy_dir(from: &Path, to: &Path) {
-            fs::create_dir_all(to).expect("mkdir");
-            for entry in fs::read_dir(from).expect("read_dir") {
-                let entry = entry.expect("entry");
-                let dest = to.join(entry.file_name());
-                if entry.file_type().expect("type").is_dir() {
-                    copy_dir(&entry.path(), &dest);
-                } else {
-                    fs::copy(entry.path(), dest).expect("copy");
-                }
+    /// Recursive copy of a checked-in fixture into a scratch directory.
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        use std::fs;
+        fs::create_dir_all(to).expect("mkdir");
+        for entry in fs::read_dir(from).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let dest = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_dir(&entry.path(), &dest);
+            } else {
+                fs::copy(entry.path(), dest).expect("copy");
             }
         }
-        fn open(dir: &Path) -> (Arc<dyn StorageProvider>, Supertable) {
-            let storage: Arc<dyn StorageProvider> =
-                Arc::new(LocalFsStorageProvider::new(dir).expect("local fs"));
-            let pool = Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(2)
-                    .build()
-                    .expect("pool"),
+    }
+
+    /// Open a table written by the engine before the term index existed
+    /// (the fixture's schema: one FTS column, no positions), with its options
+    /// adjusted by `customize`.
+    fn open_old_format(
+        dir: &std::path::Path,
+        customize: impl FnOnce(
+            crate::supertable::SupertableOptions,
+        ) -> crate::supertable::SupertableOptions,
+    ) -> (Arc<dyn StorageProvider>, crate::supertable::Supertable) {
+        use crate::{
+            superfile::builder::FtsConfig,
+            supertable::{Supertable, SupertableOptions},
+        };
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir).expect("local fs"));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let options = customize(
+            SupertableOptions::new(title_schema(), vec![FtsConfig::new("title")], Vec::new())
+                .expect("options")
+                .with_writer_pool(pool)
+                .with_storage(Arc::clone(&storage)),
+        );
+        (storage, Supertable::open(options).expect("open"))
+    }
+
+    /// An upgraded table whose manifest is loaded lazily: the parts that
+    /// mix superfiles written before the index (bloom-bearing) and after it
+    /// (bloom-less) must keep no part-level bloom, or the part prune would
+    /// treat the old superfiles' bloom as authoritative and drop terms that
+    /// live only in the new superfiles.
+    #[test]
+    fn upgraded_lazy_tables_find_terms_that_only_new_superfiles_hold() {
+        use std::path::Path;
+
+        use crate::Bm25SearchOptions;
+
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/old_format_fts_table");
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir(&fixture, dir.path());
+        let (_storage, st) = open_old_format(dir.path(), |o| o.with_eager_load_threshold(0));
+        for segment in 3..6 {
+            commit_segment(&st, segment);
+        }
+        // Reopen lazily so part selection is what finds the rows.
+        let (_storage, consumer) = open_old_format(dir.path(), |o| o.with_eager_load_threshold(0));
+        let reader = consumer.reader().expect("reader");
+        for token in ["s3d00", "s4d01", "s5d02"] {
+            let batches = reader
+                .bm25_search(
+                    "title",
+                    token,
+                    10,
+                    Bm25SearchOptions::new(),
+                    Some(&["_id", "score"]),
+                )
+                .expect("search");
+            assert_eq!(
+                hits_of(&batches).len(),
+                1,
+                "{token} lives only in a superfile written after the index and must be found"
             );
-            let options =
-                SupertableOptions::new(title_schema(), vec![FtsConfig::new("title")], Vec::new())
-                    .expect("options")
-                    .with_writer_pool(pool)
-                    .with_storage(Arc::clone(&storage));
-            (storage, Supertable::open(options).expect("open"))
+        }
+    }
+
+    /// A read of the prior root that fails for a reason other than the
+    /// object being gone or corrupt — a transient storage error — must not
+    /// restart the index: the commit keeps the reference it had, marks the
+    /// index incomplete (this commit's superfiles are not listed), and the
+    /// next maintenance rebuild makes it whole. Only an absent or corrupt
+    /// root restarts it.
+    #[test]
+    fn a_transient_read_of_the_prior_root_keeps_the_index_and_marks_it_incomplete() {
+        use crate::test_helpers::fault_storage::{FaultOp, FaultStorage};
+
+        let dir = TempDir::new().expect("tempdir");
+        let inner: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let faults = FaultStorage::wrap(inner);
+        let storage: Arc<dyn StorageProvider> = Arc::clone(&faults) as Arc<dyn StorageProvider>;
+        let st = crate::supertable::Supertable::create(fresh_options(&storage)).expect("create");
+        commit_segment(&st, 0);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (live_before, root_before) = live_and_covered(&st, &storage, &rt);
+        let first = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned()
+            .expect("reference");
+
+        faults.fail(FaultOp::Get, "term-index/root-", 1);
+        commit_segment(&st, 1);
+        assert_eq!(faults.fired(), 1, "the prior-root read hit the fault");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        assert_eq!(
+            manifest.term_index_ref(),
+            Some(&first),
+            "the reference is carried forward, not restarted"
+        );
+        assert!(
+            !manifest.term_index_complete(),
+            "this commit's superfiles are not listed"
+        );
+        let (_, root_after) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(
+            root_after, root_before,
+            "the accumulated segments are intact"
+        );
+        let covered: std::collections::HashSet<Uuid> =
+            root_after.superfiles.iter().copied().collect();
+        assert_eq!(covered, live_before);
+
+        stats_only_optimize(&st);
+        let reader = st.reader().expect("reader");
+        assert!(
+            reader.manifest().term_index_complete(),
+            "maintenance makes it whole"
+        );
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        let covered: std::collections::HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        assert_eq!(covered, live);
+    }
+
+    #[test]
+    fn old_format_tables_read_and_mix_with_the_new_format() {
+        use std::path::Path;
+
+        use crate::{Bm25SearchOptions, superfile::fts::reader::Bm25Stats, supertable::Supertable};
+
+        fn open(dir: &Path) -> (Arc<dyn StorageProvider>, Supertable) {
+            open_old_format(dir, |o| o)
         }
         let queries: [(&str, BoolMode); 6] = [
             ("shared", BoolMode::Or),

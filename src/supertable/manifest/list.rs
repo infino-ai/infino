@@ -1155,14 +1155,15 @@ impl FtsSummaryAgg {
     /// - **term range**: widened to span both — `(min(mins), max(maxes))` lex.
     /// - **distinct count**: a deferred planner hint; takes the larger side.
     ///
-    /// **`None` is the identity here** (an empty contributor that leaves the
-    /// other side intact) — what a fold from [`Default::default`] over
-    /// per-superfile summaries needs, since every superfile carries a bloom
-    /// ([`new_with_params`] always yields `Some`). This is deliberately
-    /// *distinct* from the prune-time reading of `term_bloom: None` as "no
-    /// info / always-keep": a sound union of a known bloom with a genuinely
-    /// unknown one is unknown (`None`), so `merge` must only be folded over
-    /// summaries that carry real blooms — never over a true no-info summary.
+    /// **An absent bloom on either side makes the merged bloom absent.** A
+    /// superfile written to storage since the table-level term index carries
+    /// no bloom — the index routes for it — and its terms are therefore
+    /// unknown to any bloom the part could keep. The prune tier reads
+    /// `term_bloom: None` as "no info, always keep", so absent is the only
+    /// sound union of a known bloom with an unknown one; keeping the known
+    /// side would let a part prune away terms that live only in its
+    /// bloom-less superfiles. The term range keeps the identity rule: an
+    /// absent range means an empty column, which widens nothing.
     ///
     /// Folding `merge` over a part's superfiles yields the same bloom-union and
     /// range-union as [`crate::supertable::manifest::aggregates`]'s rollup; the
@@ -1171,9 +1172,7 @@ impl FtsSummaryAgg {
     pub fn merge_with(&mut self, other: &FtsSummaryAgg) {
         self.term_bloom = match (self.term_bloom.take(), other.term_bloom.as_ref()) {
             (Some(a), Some(b)) => union_blooms(&a, b),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b.clone()),
-            (None, None) => None,
+            _ => None,
         };
         self.term_range = match (self.term_range.take(), other.term_range.as_ref()) {
             (Some((amin, amax)), Some((bmin, bmax))) => {
@@ -3651,18 +3650,22 @@ mod tests {
         assert_eq!(a.n_terms_distinct, 3, "distinct hint takes the larger side");
     }
 
+    /// A contributor without a bloom (a superfile the term index routes for)
+    /// makes the merged bloom absent in either order — the prune tier then
+    /// keeps the part — while the term range still adopts the known side.
     #[test]
-    fn fts_agg_merge_none_side_contributes_nothing() {
-        // Some.merge_with(None) keeps self untouched.
+    fn fts_agg_merge_with_an_absent_bloom_is_absent() {
         let mut a = fts_agg(&[b"x"], 16, Some((b"a", b"m")));
         a.merge_with(&FtsSummaryAgg::default());
-        assert!(a.term_bloom.as_ref().expect("kept").contains(b"x"));
+        assert!(
+            a.term_bloom.is_none(),
+            "a known bloom plus an unknown one is unknown"
+        );
         assert_eq!(a.term_range, Some((b"a".to_vec(), b"m".to_vec())));
 
-        // None.merge_with(Some) adopts the other side.
         let mut none_side = FtsSummaryAgg::default();
         none_side.merge_with(&fts_agg(&[b"y"], 16, Some((b"n", b"z"))));
-        assert!(none_side.term_bloom.as_ref().expect("taken").contains(b"y"));
+        assert!(none_side.term_bloom.is_none(), "in either order");
         assert_eq!(none_side.term_range, Some((b"n".to_vec(), b"z".to_vec())));
     }
 
