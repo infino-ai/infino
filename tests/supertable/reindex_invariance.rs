@@ -51,6 +51,9 @@ const IDS_LAYOUT_PACKED: &str = "packed";
 const VEC_LAYOUT_KEY: &str = "inf.vec.layout";
 /// The [`VEC_LAYOUT_KEY`] value for cell-directory subsections.
 const VEC_LAYOUT_MULTI_CELL: &str = "multi_cell_ivf";
+/// Footer key holding the FTS blob's start, which is where the Parquet
+/// body ends.
+const FTS_OFFSET_KEY: &str = "inf.fts.offset";
 /// Footer key holding a superfile's document count, tombstoned rows
 /// included.
 const N_DOCS_KEY: &str = "inf.n_docs";
@@ -537,4 +540,48 @@ fn a_second_run_over_a_table_with_deletions_has_nothing_to_do() {
         "a second run rewrote superfiles the first had already brought \
          current: {second:?}"
     );
+}
+
+/// The Parquet body is carried across byte for byte, not re-encoded.
+///
+/// This is both a correctness claim and the proof that the carrying build
+/// ran at all: the merge path re-encodes the body with the current writer,
+/// so a fixture written by an older release could not come back identical.
+#[test]
+fn a_rewrite_carries_the_parquet_body_byte_for_byte() {
+    let Some((_tmp, table, root)) = open_corpus(SHAPE) else {
+        return;
+    };
+
+    let before = table_bodies(&root);
+    assert!(!before.is_empty(), "the fixture has no superfiles");
+
+    rewrite(&table);
+
+    assert_eq!(
+        table_bodies(&root),
+        before,
+        "a rewrite re-encoded the Parquet body instead of carrying it"
+    );
+}
+
+/// Each superfile's Parquet body — everything before the first spliced
+/// blob — with the bodies sorted so two tables compare without pairing
+/// superfile ids a rewrite has changed.
+fn table_bodies(root: &Path) -> Vec<Vec<u8>> {
+    let mut bodies: Vec<Vec<u8>> = superfile_paths(root)
+        .iter()
+        .map(|path| {
+            let bytes = fs::read(path).expect("read superfile");
+            let kv = read_kv_metadata(&bytes).expect("read superfile key-value metadata");
+            let fts_at: usize = kv
+                .get(FTS_OFFSET_KEY)
+                .expect("a superfile under test has an FTS blob")
+                .parse()
+                .expect("offset is a number");
+            bytes[..fts_at].to_vec()
+        })
+        .collect();
+    bodies.sort();
+    bodies
 }

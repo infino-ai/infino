@@ -73,6 +73,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
     io::{BufReader, BufWriter, Cursor, Error, Seek, SeekFrom, Write},
+    ops::Range,
     str::from_utf8,
     sync::Arc,
 };
@@ -92,7 +93,7 @@ use crate::{
             self,
             footer::{
                 EncodedBody, ParquetBodyEncoder, ParquetLayout, encode_parquet_body,
-                splice_index_streams_to,
+                read_kv_metadata, splice_carried_body_to, splice_index_streams_to,
             },
             kv,
         },
@@ -2261,6 +2262,92 @@ impl SuperfileBuilder {
         // body (empty ⇒ the id column wasn't available; reader falls back to
         // the Parquet id column).
         splice_body_and_blobs_to(body, fts_file, vec_file, ids_bytes, &kvs, output)
+    }
+
+    /// Record that `n_docs` rows were carried in without this builder
+    /// encoding them, so the finish sees the row count the body holds.
+    pub(crate) fn set_carried_doc_count(&mut self, n_docs: u64) {
+        self.next_local_doc_id = n_docs as u32;
+    }
+
+    /// Finish by carrying `source`'s Parquet body and vector subsection
+    /// verbatim, writing only a rebuilt FTS blob.
+    ///
+    /// Valid only when this build kept every one of `source`'s rows in
+    /// order: the body then describes the same rows it always did, and
+    /// because it lands at offset 0 in both files its row-group offsets
+    /// need no adjustment. The caller owns that precondition.
+    ///
+    /// Skips the decode and re-encode of every column — the dominant cost
+    /// of a rewrite, and pure waste when the rows are unchanged.
+    pub(crate) fn finish_carrying_body_to<W: Write>(
+        mut self,
+        source: &SuperfileReader,
+        output: W,
+    ) -> Result<ParquetLayout, BuildError> {
+        let bytes = source
+            .whole_file_bytes()
+            .ok_or_else(|| BuildError::Io(Error::other("carried body needs a resident source")))?;
+        let src_kv = read_kv_metadata(bytes).map_err(BuildError::Footer)?;
+        let region = |offset: &str, length: &str| -> Option<Range<usize>> {
+            let at: usize = src_kv.get(offset)?.parse().ok()?;
+            let len: usize = src_kv.get(length)?.parse().ok()?;
+            (len > 0).then_some(at..at + len)
+        };
+        // Splice order is body, FTS, vector, ids — so the FTS blob starts
+        // where the body ends.
+        let fts_region = region(kv::FTS_OFFSET, kv::FTS_LENGTH)
+            .ok_or_else(|| BuildError::Io(Error::other("carried body needs an FTS region")))?;
+        let body = bytes.slice(..fts_region.start);
+        let vec_bytes = region(kv::VEC_OFFSET, kv::VEC_LENGTH)
+            .map(|r| bytes.slice(r))
+            .unwrap_or_default();
+
+        // The ids sidecar is derived from rows this build never decoded, so
+        // it is carried too — re-packed when the source predates the packed
+        // layout, which is the upgrade a rewrite is expected to perform.
+        let raw_ids = region(kv::IDS_OFFSET, kv::IDS_LENGTH).map(|r| bytes.slice(r));
+        let ids_bytes: Vec<u8> = match (&raw_ids, source.id_sidecar_is_packed()) {
+            (Some(ids), true) => ids.to_vec(),
+            (Some(ids), false) => ids::encode_packed(ids),
+            (None, _) => Vec::new(),
+        };
+
+        let n_docs = self.next_local_doc_id as u64;
+        let fts_builder = self.fts_builder.take();
+        let mut kvs = superfile_kvs(&self.opts, n_docs, None)?;
+        // Every `inf.vec.*` key describes the blob being carried, including
+        // the multi-cell directory this build has no cells to regenerate.
+        kvs.retain(|(k, _)| !k.starts_with("inf.vec."));
+        kvs.extend(
+            src_kv
+                .iter()
+                .filter(|(k, _)| k.starts_with("inf.vec."))
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        if !ids_bytes.is_empty() {
+            kvs.push((
+                kv::IDS_LAYOUT.to_string(),
+                kv::IDS_LAYOUT_PACKED.to_string(),
+            ));
+        }
+
+        let (fts_file, _empty_vec) = stream_index_blobs_to_scratch(fts_builder, None, None, None)?;
+        let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
+        splice_carried_body_to(
+            Cursor::new(&body),
+            body.len() as u64,
+            source.parquet_metadata().as_ref().clone(),
+            BufReader::new(fts_file.reopen().map_err(BuildError::Io)?),
+            fts_length,
+            Cursor::new(&vec_bytes),
+            vec_bytes.len() as u64,
+            Cursor::new(&ids_bytes),
+            ids_bytes.len() as u64,
+            &kvs,
+            output,
+        )
+        .map_err(BuildError::Footer)
     }
 
     /// Finish the build and return the assembled superfile bytes.

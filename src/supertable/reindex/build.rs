@@ -10,7 +10,11 @@
 //! Both builds carry every row: dropping the dead ones would renumber the
 //! survivors, and the job runner carries their tombstones onto the output.
 
-use std::{collections::HashMap, io::Write, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    io::Write,
+    sync::Arc,
+};
 
 use roaring::RoaringBitmap;
 
@@ -25,6 +29,7 @@ use crate::{
     supertable::{
         BuildError,
         compaction::{CompactionMerge, MergeInputs, SuperfileMerge},
+        manifest::SuperfileEntry,
     },
 };
 
@@ -40,12 +45,61 @@ impl SuperfileMerge for RewriteMerge {
         inputs: MergeInputs<'_>,
         output: &mut dyn Write,
     ) -> Result<SuperfileStats, BuildError> {
-        CompactionMerge.build(inputs, output)
+        match carry_body(&inputs) {
+            Some((reader, entry)) => {
+                rewrite_carrying_body_to(reader, entry, inputs.fts_corpus, output)
+            }
+            None => CompactionMerge.build(inputs, output),
+        }
     }
 
     fn preserves_tombstones(&self) -> bool {
         true
     }
+}
+
+/// The single resident input a carrying rewrite needs, or `None` when the
+/// merge path has to run instead.
+///
+/// Three things have to hold: one input (the migration's job shape), a
+/// reader over whole valid bytes (a lazily-opened one has no body to
+/// copy), and no tombstones (the carried body would describe rows the
+/// output no longer has).
+fn carry_body<'a>(
+    inputs: &'a MergeInputs<'a>,
+) -> Option<(&'a Arc<SuperfileReader>, &'a Arc<SuperfileEntry>)> {
+    let ([(reader, deleted)], [entry]) = (inputs.readers, inputs.entries) else {
+        return None;
+    };
+    let carries_every_row = deleted.as_ref().is_none_or(|b| b.is_empty())
+        && inputs.superseded.iter().all(BTreeSet::is_empty);
+    (carries_every_row && reader.is_fully_resident()).then_some((reader, entry))
+}
+
+/// Rebuild the FTS index, and copy every other byte of `source` across.
+///
+/// The output's stats are the input's: a carried body holds the same rows
+/// in the same order, so recomputing them from a decode this build does
+/// not perform would only be a chance to get them wrong.
+fn rewrite_carrying_body_to(
+    source: &Arc<SuperfileReader>,
+    entry: &Arc<SuperfileEntry>,
+    fts_corpus: &HashMap<String, ColumnLengthStats>,
+    output: &mut dyn Write,
+) -> Result<SuperfileStats, BuildError> {
+    let readers = [(Arc::clone(source), None)];
+    let first = &readers[0];
+    let builder_opts = merge_builder_opts(&readers, first, fts_corpus);
+    let mut builder = SuperfileBuilder::new(builder_opts)?;
+    builder.carry_fts_from_reader_scoped(source, None, CarryScope::AllColumns)?;
+    builder.set_carried_doc_count(entry.n_docs);
+    builder.finish_carrying_body_to(source, output)?;
+    Ok(SuperfileStats {
+        n_docs: entry.n_docs,
+        id_min: entry.id_min,
+        id_max: entry.id_max,
+        scalar_stats: entry.scalar_stats.clone(),
+    })
 }
 
 /// Rebuilds each input's FTS index from the text it stored.

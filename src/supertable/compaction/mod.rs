@@ -183,6 +183,10 @@ pub(crate) trait SuperfileMerge: Send + Sync {
 pub(crate) struct MergeInputs<'a> {
     /// Each input reader with the tombstones that apply to it.
     pub(crate) readers: &'a [(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+    /// The manifest entries those readers were opened from, in the same
+    /// order. A build that carries rows unchanged takes its output stats
+    /// from here rather than recomputing them from decoded rows.
+    pub(crate) entries: &'a [Arc<SuperfileEntry>],
     /// Per reader, the hidden-index cells its rows have been superseded in.
     pub(crate) superseded: &'a [BTreeSet<u32>],
     /// Table-wide document-length totals excluding the inputs, so the
@@ -207,6 +211,7 @@ impl SuperfileMerge for CompactionMerge {
             readers,
             superseded,
             fts_corpus,
+            ..
         } = inputs;
         let first_vec = readers.first().and_then(|(reader, _)| reader.vec());
         let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
@@ -826,6 +831,7 @@ impl Supertable {
                 let stats = merge.build(
                     MergeInputs {
                         readers: &readers_with_tombstones,
+                        entries: superfiles,
                         superseded: &superseded_per_reader,
                         fts_corpus: &fts_corpus,
                     },

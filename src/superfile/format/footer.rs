@@ -327,14 +327,14 @@ pub fn splice_index_blobs(
 /// assembly both call here.
 pub(crate) fn splice_index_streams_to<W, F, V, I>(
     body: EncodedBody,
-    mut fts_blob: F,
+    fts_blob: F,
     fts_length: u64,
-    mut vec_blob: V,
+    vec_blob: V,
     vec_length: u64,
-    mut ids_blob: I,
+    ids_blob: I,
     ids_length: u64,
     extra_kv: &[(String, String)],
-    mut output: W,
+    output: W,
 ) -> Result<ParquetLayout, FooterError>
 where
     W: Write,
@@ -347,14 +347,52 @@ where
         body_len,
         metadata,
     } = body;
+    splice_carried_body_to(
+        BufReader::new(body_file.reopen()?),
+        body_len,
+        metadata,
+        fts_blob,
+        fts_length,
+        vec_blob,
+        vec_length,
+        ids_blob,
+        ids_length,
+        extra_kv,
+        output,
+    )
+}
+
+/// As [`splice_index_streams_to`], for a body that is already encoded —
+/// carried verbatim from the superfile being replaced rather than produced
+/// by this build.
+///
+/// The body lands at offset 0 in both files, so the row-group and column
+/// offsets in `metadata` stay valid without adjustment.
+pub(crate) fn splice_carried_body_to<W, B, F, V, I>(
+    mut body: B,
+    body_len: u64,
+    metadata: ParquetMetaData,
+    mut fts_blob: F,
+    fts_length: u64,
+    mut vec_blob: V,
+    vec_length: u64,
+    mut ids_blob: I,
+    ids_length: u64,
+    extra_kv: &[(String, String)],
+    mut output: W,
+) -> Result<ParquetLayout, FooterError>
+where
+    W: Write,
+    B: Read,
+    F: Read,
+    V: Read,
+    I: Read,
+{
     let mut output = CountingWriter {
         output: &mut output,
         written: 0,
     };
-    // Stream the footer-stripped body from its scratch file; `reopen()` reads
-    // from offset 0 independently of the write handle.
-    let mut body_reader = BufReader::new(body_file.reopen()?);
-    let body_copied = io::copy(&mut body_reader, &mut output)?;
+    let body_copied = io::copy(&mut body, &mut output)?;
     if body_copied != body_len {
         return Err(FooterError::Malformed("body stream length mismatch"));
     }
