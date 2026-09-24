@@ -396,7 +396,52 @@ impl SharedTopK {
     }
 }
 
+/// Where each kept superfile's postings for a query's terms sit, per the
+/// term index: superfile → `(term, df, location)`. Empty when the table has
+/// no index, or it could not answer, in which case every cursor build
+/// reads its superfile's dictionary as before.
+pub(crate) type IndexLocations = Arc<HashMap<Uuid, Arc<Vec<(String, u64, term_index::Location)>>>>;
+
+/// A prefetched-term memo for `superfile` built from the index's
+/// locations: the postings ranges are fetched, the dictionary is not.
+/// `None` when the index holds no locations for this superfile or the
+/// fetch failed — the cursor build then reads the dictionary; the cost is
+/// a read, never the answer.
+pub(crate) async fn memo_from_locations(
+    r: &SuperfileReader,
+    locations: &IndexLocations,
+    superfile: Uuid,
+) -> Option<Arc<FetchedTermMemo>> {
+    let locations = locations.get(&superfile)?;
+    let pairs: Vec<(&str, u64, FstValue)> = locations
+        .iter()
+        .filter_map(|(t, df, loc)| loc.to_dict_value().map(|v| (t.as_str(), *df, v)))
+        .collect();
+    r.term_memo_from_dict_values(&pairs)
+        .await
+        .ok()
+        .map(Arc::new)
+}
+
 impl SupertableReader {
+    /// The term index's postings locations for `terms` in every superfile
+    /// of `kept` that it lists; see [`IndexLocations`].
+    pub(crate) async fn index_locations(
+        &self,
+        column: &str,
+        terms: &[&str],
+        kept: &[Arc<SuperfileEntry>],
+    ) -> IndexLocations {
+        let manifest = self.manifest();
+        let Some(index) = manifest.term_index().await else {
+            return Arc::new(HashMap::new());
+        };
+        match index.locations(column, terms, kept).await {
+            Ok(map) => Arc::new(map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()),
+            Err(_) => Arc::new(HashMap::new()),
+        }
+    }
+
     /// Single-column BM25 search across the pinned manifest's
     /// superfiles. Returns up to `k` highest-scoring hits, sorted
     /// descending by score.
@@ -687,14 +732,7 @@ impl SupertableReader {
         // The index also knows where each term's postings sit in every
         // indexed superfile, so a cursor set can be built from those
         // locations and the superfile's dictionary never read.
-        let index_locations: Arc<HashMap<Uuid, Arc<Vec<(String, u64, term_index::Location)>>>> =
-            match &term_index {
-                Some(index) => match index.locations(column, &all_terms, &kept).await {
-                    Ok(map) => Arc::new(map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()),
-                    Err(_) => Arc::new(HashMap::new()),
-                },
-                None => Arc::new(HashMap::new()),
-            };
+        let index_locations = self.index_locations(column, &all_terms, &kept).await;
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
         // Phrase-bearing queries stay per-superfile: the ranged
         // kernel is the pure term-union fast path. So does a search
@@ -811,21 +849,7 @@ impl SupertableReader {
                         // No open-wave memo: build one from the term index's
                         // locations, fetching postings only. A failure here
                         // costs the dictionary read, never the answer.
-                        None => match index_locations.get(&suid) {
-                            Some(locations) => {
-                                let pairs: Vec<(&str, u64, FstValue)> = locations
-                                    .iter()
-                                    .filter_map(|(t, df, loc)| {
-                                        loc.to_dict_value().map(|v| (t.as_str(), *df, v))
-                                    })
-                                    .collect();
-                                r.term_memo_from_dict_values(&pairs)
-                                    .await
-                                    .ok()
-                                    .map(Arc::new)
-                            }
-                            None => None,
-                        },
+                        None => memo_from_locations(&r, &index_locations, suid).await,
                     };
                 // Share the global kth-best floor with every superfile —
                 // single-term queries included — so each prunes its scored
@@ -1553,21 +1577,38 @@ impl SupertableReader {
         let match_mode = match_set.mode;
         let has_negatives = !negatives.is_empty();
         let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
-        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+        // Every plain term the kernel resolves, positive and negated: the
+        // index's locations for them let each superfile skip its dictionary.
+        let all_terms: Vec<&str> = match_set
+            .terms
+            .iter()
+            .chain(negatives.terms.iter())
+            .map(String::as_str)
+            .collect();
+        let locations = self.index_locations(column, &all_terms, &kept).await;
+        let units: Vec<(Arc<SuperfileEntry>, Uuid)> = kept
+            .into_iter()
+            .map(|e| {
+                let id = e.superfile_id;
+                (e, id)
+            })
+            .collect();
         let column_arc = Arc::new(column.to_owned());
         let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
         let phrase_arc: Arc<Vec<Phrase<String>>> = Arc::new(match_set.phrases);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
         let neg_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(negatives.phrases);
         let op_stats = self.op_stats.clone();
-        let kernel = move |r: Arc<SuperfileReader>, _: ()| {
+        let kernel = move |r: Arc<SuperfileReader>, suid: Uuid| {
             let column_arc = Arc::clone(&column_arc);
             let term_arc = Arc::clone(&term_arc);
             let phrase_arc = Arc::clone(&phrase_arc);
             let neg_arc = Arc::clone(&neg_arc);
             let neg_ph_arc = Arc::clone(&neg_ph_arc);
+            let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
             async move {
+                let memo = memo_from_locations(&r, &locations, suid).await;
                 let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                 // Any phrase atom (match or negated) takes the
                 // phrase-aware walk; plain-token queries keep the
@@ -1578,7 +1619,7 @@ impl SupertableReader {
                         .await
                         .map_err(fts_read_error)?,
                     false => r
-                        .token_match(&column_arc, &refs, match_mode)
+                        .token_match_prefetched(&column_arc, &refs, match_mode, memo.as_deref())
                         .await
                         .map_err(fts_read_error)?,
                 };
@@ -1590,7 +1631,12 @@ impl SupertableReader {
                     let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
                     let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
                         true => r
-                            .token_match(&column_arc, &neg_refs, BoolMode::Or)
+                            .token_match_prefetched(
+                                &column_arc,
+                                &neg_refs,
+                                BoolMode::Or,
+                                memo.as_deref(),
+                            )
                             .await
                             .map_err(fts_read_error)?,
                         false => r
@@ -1660,6 +1706,13 @@ impl SupertableReader {
         let single_term = match_set.terms.len() == 1 && !match_set.has_phrases();
         let has_negatives = !negatives.is_empty();
         let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
+        let all_terms: Vec<&str> = match_set
+            .terms
+            .iter()
+            .chain(negatives.terms.iter())
+            .map(String::as_str)
+            .collect();
+        let locations = self.index_locations(column, &all_terms, &kept).await;
         let column_arc = Arc::new(column.to_owned());
         let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
         let phrase_arc: Arc<Vec<Phrase<String>>> = Arc::new(match_set.phrases);
@@ -1684,7 +1737,9 @@ impl SupertableReader {
                 let phrase_arc = Arc::clone(&phrase_arc);
                 let neg_arc = Arc::clone(&neg_arc);
                 let neg_ph_arc = Arc::clone(&neg_ph_arc);
+                let locations = Arc::clone(&locations);
                 async move {
+                    let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                     // Tombstone bitmap for this superfile (None = no deletes).
                     let tomb = match tombstone_cache.as_ref() {
                         Some(c) => {
@@ -1710,7 +1765,12 @@ impl SupertableReader {
                                 .await
                                 .map_err(fts_read_error)?,
                             false => r
-                                .token_match(&column_arc, &refs, match_mode)
+                                .token_match_prefetched(
+                                    &column_arc,
+                                    &refs,
+                                    match_mode,
+                                    memo.as_deref(),
+                                )
                                 .await
                                 .map_err(fts_read_error)?,
                         };
@@ -1718,7 +1778,12 @@ impl SupertableReader {
                             let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
                             let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
                                 true => r
-                                    .token_match(&column_arc, &neg_refs, BoolMode::Or)
+                                    .token_match_prefetched(
+                                        &column_arc,
+                                        &neg_refs,
+                                        BoolMode::Or,
+                                        memo.as_deref(),
+                                    )
                                     .await
                                     .map_err(fts_read_error)?,
                                 false => r
@@ -1779,9 +1844,14 @@ impl SupertableReader {
                             .map_err(fts_read_error)?
                     } else {
                         // Multi-token AND/OR tallies through the counting sink.
-                        r.token_match_count(&column_arc, &refs, match_mode)
-                            .await
-                            .map_err(fts_read_error)?
+                        r.token_match_count_prefetched(
+                            &column_arc,
+                            &refs,
+                            match_mode,
+                            memo.as_deref(),
+                        )
+                        .await
+                        .map_err(fts_read_error)?
                     };
                     if let Some(stats) = &op_stats {
                         stats.add_fts_postings_bytes(work.postings_bytes);
@@ -1834,6 +1904,8 @@ impl SupertableReader {
         if kept.is_empty() {
             return Ok(Vec::new());
         }
+        let token_refs: Vec<&str> = term_strings.iter().map(String::as_str).collect();
+        let locations = self.index_locations(column, &token_refs, &kept).await;
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_arc = Arc::new(column.to_owned());
         let value_arc = Arc::new(value.to_owned());
@@ -1847,14 +1919,16 @@ impl SupertableReader {
             let column_arc = Arc::clone(&column_arc);
             let value_arc = Arc::clone(&value_arc);
             let tokens_arc = Arc::clone(&tokens_arc);
+            let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
             async move {
                 let candidates: Vec<u32> = if tokens_arc.is_empty() {
                     (0..r.n_docs() as u32).collect()
                 } else {
+                    let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                     let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                     let (docs, work) = r
-                        .token_match(&column_arc, &refs, BoolMode::And)
+                        .token_match_prefetched(&column_arc, &refs, BoolMode::And, memo.as_deref())
                         .await
                         .map_err(fts_read_error)?;
                     // The prune pass's posting walk. The verify pass's own

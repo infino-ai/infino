@@ -13,6 +13,7 @@ use super::{
     filter::AtomExcludeFilter,
     options::BoolMode,
     phrase::AnyCursor,
+    search::FetchedTermMemo,
     work::{MatchWork, atom_cursor_bytes, atom_planned_ranges},
 };
 #[cfg(any(test, feature = "test-helpers"))]
@@ -27,6 +28,15 @@ use crate::{
     },
     utils::terms::{FstValue, make_key},
 };
+
+/// Planned dictionary reads for a cursor build over `tokens`: none when a
+/// memo already resolves every token, one otherwise.
+fn dictionary_fetches(tokens: &[&str], prefetched: Option<&FetchedTermMemo>) -> u64 {
+    match prefetched.is_some_and(|m| m.covers(tokens)) {
+        true => 0,
+        false => 1,
+    }
+}
 
 /// One term's entry in a table-level term index, as read from one
 /// superfile: see [`FtsReader::term_index_facts`].
@@ -252,18 +262,34 @@ impl FtsReader {
         tokens: &[&str],
         mode: BoolMode,
     ) -> Result<(Vec<u32>, MatchWork), FtsError> {
+        self.token_match_prefetched(column, tokens, mode, None)
+            .await
+    }
+
+    /// [`Self::token_match`] with the terms a caller has already resolved
+    /// — from a table-level term index that knows where each term's
+    /// postings sit — served from `prefetched`. When the memo covers every
+    /// token the dictionary is never opened; a token it lacks resolves
+    /// through the dictionary as usual.
+    pub(crate) async fn token_match_prefetched(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(Vec<u32>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true, None, None)
+            .build_term_cursors(column_id, tokens, None, true, None, prefetched)
             .await?;
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
-        // +1: the build's dictionary fetch.
+        // +1 for the dictionary fetch, when the build had to make one.
         let mut work = MatchWork::for_cursors(&cursors);
-        work.planned_ranges += 1;
+        work.planned_ranges += dictionary_fetches(tokens, prefetched);
         let (docs, walk_ns) = timed_section(|| match mode {
             BoolMode::And => {
                 // AND needs every token present; a missing token ⇒ empty
@@ -292,15 +318,28 @@ impl FtsReader {
         tokens: &[&str],
         mode: BoolMode,
     ) -> Result<(u64, MatchWork), FtsError> {
+        self.token_match_count_prefetched(column, tokens, mode, None)
+            .await
+    }
+
+    /// [`Self::token_match_count`] served from `prefetched`, as
+    /// [`Self::token_match_prefetched`] is.
+    pub(crate) async fn token_match_count_prefetched(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((0, MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true, None, None)
+            .build_term_cursors(column_id, tokens, None, true, None, prefetched)
             .await?;
         let mut work = MatchWork::for_cursors(&cursors);
-        work.planned_ranges += 1;
+        work.planned_ranges += dictionary_fetches(tokens, prefetched);
         let (n, walk_ns) = timed_section(|| match mode {
             BoolMode::And => {
                 if cursors.len() != tokens.len() {

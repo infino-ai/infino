@@ -1362,6 +1362,25 @@ impl SuperfileReader {
         Ok(fts.token_match(column, tokens, mode).await?)
     }
 
+    /// [`Self::token_match`] with terms a table-level term index already
+    /// resolved served from `prefetched`, so the dictionary is read only
+    /// for tokens the memo lacks. Delegates to
+    /// [`FtsReader::token_match_prefetched`].
+    pub(crate) async fn token_match_prefetched(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .token_match_prefetched(column, tokens, mode, prefetched)
+            .await?)
+    }
+
     /// Widen the tokens of one `LIKE` leaf to the indexed terms of
     /// `column` each covers, in one dictionary pass (a slot is `None` when
     /// more than `max_terms` qualify, or when it needs the whole column
@@ -1398,6 +1417,23 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts.token_match_count(column, tokens, mode).await?)
+    }
+
+    /// [`Self::token_match_count`] served from `prefetched`; see
+    /// [`Self::token_match_prefetched`].
+    pub(crate) async fn token_match_count_prefetched(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(u64, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .token_match_count_prefetched(column, tokens, mode, prefetched)
+            .await?)
     }
 
     /// Phrase-aware unranked match: `local_doc_id`s whose `column`

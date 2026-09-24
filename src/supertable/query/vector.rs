@@ -91,6 +91,7 @@ use super::{
     candidate::{CandidatePlan, CandidateScope},
     dispatch,
     exec::common::{SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source},
+    fts::memo_from_locations,
     provider::prune_leaves_for_filters,
     prune::{PruneLeaf, select_superfiles},
 };
@@ -6419,15 +6420,23 @@ impl SupertableReader {
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
         let filter_col_arc = Arc::new(filter_col.to_owned());
         let tokens_arc: Arc<Vec<String>> = Arc::new(tokens.to_vec());
+        // The term index's locations let each superfile resolve the filter
+        // from its postings alone, without opening its dictionary.
+        let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let locations = self
+            .index_locations(filter_col, &token_refs, superfiles)
+            .await;
         let op_stats = self.op_stats.clone();
-        self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
+        self.fanout_candidate_bitmaps(superfiles, move |r, entry| {
             let filter_col_arc = Arc::clone(&filter_col_arc);
             let tokens_arc = Arc::clone(&tokens_arc);
+            let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
             async move {
+                let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                 let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                 let (docs, work) = r
-                    .token_match(&filter_col_arc, &refs, mode)
+                    .token_match_prefetched(&filter_col_arc, &refs, mode, memo.as_deref())
                     .await
                     .map_err(|e| QueryError::Parquet(e.to_string()))?;
                 // The predicate-resolution leg of filtered vector search

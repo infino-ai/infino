@@ -96,6 +96,12 @@ impl FetchedTermMemo {
         self.map.contains_key(term)
     }
 
+    /// Whether every one of `terms` was resolved into this memo — the
+    /// condition under which a cursor build needs no dictionary at all.
+    pub(crate) fn covers(&self, terms: &[&str]) -> bool {
+        terms.iter().all(|t| self.contains(t))
+    }
+
     /// This superfile's df contribution per term (0 for a miss or an
     /// un-fetched term, 1 for an inline slot).
     pub(crate) fn df(&self, term: &str) -> u64 {

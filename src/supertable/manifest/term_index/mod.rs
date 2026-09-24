@@ -2187,6 +2187,79 @@ mod tests {
         );
     }
 
+    /// An exact-match query resolves each superfile's terms from the
+    /// index's postings locations: the docs are the ones the dictionary
+    /// would give, and the table-level query plans exactly the reads the
+    /// memo-fed superfile call plans — one fewer per superfile than a
+    /// dictionary-first resolution.
+    #[test]
+    fn exact_match_reads_no_dictionary_when_the_index_knows_the_locations() {
+        use crate::{
+            runtime_metrics::op_stats::with_op_stats,
+            superfile::{SuperfileReader, fts::reader::BoolMode},
+        };
+
+        let (dir, storage, st) = fresh_table();
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let reader = st.reader().expect("reader");
+        let entries = reader.manifest().get_all_superfiles().to_vec();
+        let terms = ["alpha", "shared"];
+        let by_sf = rt
+            .block_on(index.locations("title", &terms, &entries))
+            .expect("locations");
+
+        let mut planned_with_memo = 0u64;
+        let mut docs_total = 0usize;
+        for e in &entries {
+            let bytes =
+                std::fs::read(dir.path().join(e.uri.storage_path())).expect("superfile bytes");
+            let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+            let pairs: Vec<(&str, u64, FstValue)> = by_sf[&e.superfile_id]
+                .iter()
+                .filter_map(|(t, df, l)| l.to_dict_value().map(|v| (t.as_str(), *df, v)))
+                .collect();
+            let memo = rt
+                .block_on(sf.term_memo_from_dict_values(&pairs))
+                .expect("memo");
+            let (plain, plain_work) = rt
+                .block_on(sf.token_match("title", &terms, BoolMode::And))
+                .expect("dictionary path");
+            let (memoed, memo_work) = rt
+                .block_on(sf.token_match_prefetched("title", &terms, BoolMode::And, Some(&memo)))
+                .expect("memo path");
+            assert_eq!(memoed, plain, "same docs either way");
+            assert_eq!(
+                memo_work.planned_ranges + 1,
+                plain_work.planned_ranges,
+                "the memo path plans one read fewer: the dictionary"
+            );
+            planned_with_memo += memo_work.planned_ranges;
+            docs_total += plain.len();
+        }
+
+        let ((hits, planned), _) = with_op_stats(|| {
+            let reader = st.reader().expect("reader");
+            let hits = reader
+                .token_match("title", "alpha shared", BoolMode::And)
+                .expect("token_match");
+            let planned = crate::runtime_metrics::op_stats::current()
+                .expect("metered")
+                .snapshot()
+                .planned_read_ranges;
+            (hits, planned)
+        });
+        assert_eq!(hits.len(), docs_total);
+        assert_eq!(
+            planned, planned_with_memo,
+            "the table-level query resolved every superfile from the index's locations"
+        );
+    }
+
     /// Routing is exact: `Or` is the union of the terms' posting sets and
     /// `And` their intersection, term by term, on random corpora.
     #[test]
