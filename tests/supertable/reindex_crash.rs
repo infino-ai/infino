@@ -40,7 +40,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow_array::Decimal128Array;
 use infino::{ReindexOptions, connect, superfile::format::fts::VERSION_CURRENT};
 use tempfile::TempDir;
 
@@ -49,7 +48,7 @@ use crate::{
         N_DOCS, TABLE, assert_scores_equivalent, blob_versions, copy_tree, corpus_dir, hits,
         scores_by_id,
     },
-    reindex_invariance::{DELETED_DOCS, delete_leading_rows},
+    reindex_invariance::{DELETED_DOCS, delete_leading_rows, rows_by_id},
 };
 
 /// Directory the child reindexes. Set by the parent; its presence is what
@@ -301,18 +300,8 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
 
 /// Killing a reindex on a table with deletions does not resurrect a row.
 ///
-/// **The arm this harness existed without.** A rewrite now carries its
-/// input's rows and writes their tombstones onto the superfile that
-/// replaces them, and those are two durable steps with a window between:
-/// the sidecar is written first, the manifest swap publishes second. A
-/// crash lands somewhere in that sequence, and the one ordering that must
-/// never hold — a superfile published live before its tombstones are
-/// readable — is invisible to every test that only asks whether the live
-/// rows survived. The dead rows simply come back.
-///
-/// The kill is the same imprecise one the sibling test uses, for the same
-/// reasons, so this asserts what must hold at *every* point in the window
-/// rather than at a chosen byte.
+/// The sidecar write and the manifest swap are two durable steps; a kill
+/// between them must not publish the output with its tombstones absent.
 #[test]
 fn an_interrupted_reindex_never_resurrects_a_deleted_row() {
     if dispatch_child_if_set().is_some() {
@@ -358,8 +347,7 @@ fn an_interrupted_reindex_never_resurrects_a_deleted_row() {
          this asserted nothing about an interrupted one: {status:?}"
     );
 
-    // The assertion the whole arm exists for, at whatever point in the
-    // window the kill happened to land.
+    // The claim, at whatever point in the window the kill landed.
     let after_crash = live_ids(&victim);
     assert!(
         deleted.iter().all(|id| !after_crash.contains(id)),
@@ -370,15 +358,13 @@ fn an_interrupted_reindex_never_resurrects_a_deleted_row() {
         "the live row set changed across the crash"
     );
 
-    // And it still holds once the migration is driven to completion. The
-    // dead run's seal is taken over the way the sibling test establishes.
+    // And once the migration is driven to completion, taking over the dead
+    // run's seal the way the sibling test establishes.
     let db = connect(victim.to_str().expect("utf-8 path")).expect("the killed table reopens");
     let table = db.open_table(TABLE).expect("the killed table opens");
 
-    // The kill landed mid-migration, so the assertions above were made
-    // about a half-migrated table rather than one the run never touched or
-    // had already finished — either of which would let this pass without
-    // exercising the window at all.
+    // Confirm the kill landed mid-migration; untouched or fully migrated
+    // would let this pass without the window ever opening.
     table.gc(Duration::ZERO).expect("collect orphans");
     let after_crash_versions = blob_versions(&victim);
     let migrated = after_crash_versions
@@ -416,26 +402,9 @@ fn an_interrupted_reindex_never_resurrects_a_deleted_row() {
     );
 }
 
-/// Every `_id` the table reads as live, in id order.
-///
-/// Opens its own connection each call: the point is what a fresh reader
-/// resolves from what is durably on disk, not what a handle held open
-/// across the crash happens to have cached.
+/// Every `_id` the table reads as live, in id order, from a fresh
+/// connection — what is durably on disk, not what a handle cached.
 fn live_ids(root: &Path) -> Vec<i128> {
     let db = connect(root.to_str().expect("utf-8 path")).expect("connect for a live read");
-    let batches = db
-        .query_sql(&format!("SELECT _id FROM {TABLE} ORDER BY _id"))
-        .expect("select live ids");
-    let mut out = Vec::new();
-    for batch in &batches {
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .expect("_id is Decimal128");
-        for i in 0..batch.num_rows() {
-            out.push(ids.value(i));
-        }
-    }
-    out
+    rows_by_id(&db).into_iter().map(|(id, ..)| id).collect()
 }

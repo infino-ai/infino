@@ -1631,30 +1631,20 @@ impl ManifestSnapshot {
         self.list.as_ref().map(|l| &l.superseded_cells)
     }
 
-    /// Record that each superfile in `ids` has a tombstone sidecar, in
-    /// this manifest rather than a successor to it.
+    /// Stamp `id`'s tombstone seq to this manifest's own id, so the
+    /// manifest that publishes a superfile also makes its sidecar visible.
     ///
-    /// The seq map is what makes a sidecar *exist* as far as readers are
-    /// concerned — the cache treats an absent entry as "no tombstones" and
-    /// never fetches. So a superfile published with a sidecar already
-    /// written has to be registered in the very manifest that publishes
-    /// it. Stamping it afterwards, in a successor, would leave a window in
-    /// which the superfile is live and its tombstones are invisible, and
-    /// every read landing there returns deleted rows.
-    ///
-    /// The seq is this manifest's own id, which is what the cache
-    /// validates freshness against.
-    ///
-    /// No-op for an in-process-only manifest: it has no persisted list, so
-    /// it has no sidecars to name.
-    pub(crate) fn register_tombstone_sidecars(&mut self, ids: &[Uuid]) {
-        let Some(list) = self.list.as_mut() else {
+    /// The seq map is what makes a sidecar exist for readers: an absent
+    /// entry means "no tombstones" and the sidecar is never fetched.
+    pub(crate) fn register_tombstone_sidecar(&mut self, id: Option<Uuid>) {
+        let Some(id) = id else {
             return;
         };
-        let seq = list.manifest_id;
-        for id in ids {
-            list.tombstone_seqs.insert(*id, seq);
-        }
+        let Some(list) = self.list.as_mut() else {
+            debug_assert!(false, "a sidecar was written for a manifest with no list");
+            return;
+        };
+        list.tombstone_seqs.insert(id, list.manifest_id);
     }
 
     /// Build a successor manifest identical to `self` except that every

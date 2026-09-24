@@ -1,46 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! A reindex repairs the index regions it names and carries the rest
+//! A reindex repairs the FTS blob and carries every other spliced region
 //! across byte for byte.
 //!
-//! The unit of repair is the FTS blob; everything else in a superfile is
-//! meant to be cargo. That is true today, but true *by accident*: the
-//! rewrite path is compaction's, chosen for compaction's reasons, and a
-//! change made there for compaction's benefit would quietly widen what a
-//! migration touches. These tests are what makes such a change a decision
-//! instead of a side effect.
-//!
-//! The id sidecar is the exception these tests found rather than assumed,
-//! and it is why [`REPAIRED_REGIONS`] is a list of two. The builder writes
-//! the packed sidecar unconditionally, so a rewrite does one of three
-//! things to it depending on how old the input is: adds one to a file that
-//! predates the sidecar entirely, re-encodes a raw `i128` array into the
-//! packed layout, or leaves an already-packed one alone. The ids
-//! themselves are unchanged in every case; only their encoding moves.
-//!
-//! ## Why the region check enumerates instead of listing
-//!
-//! The obvious version asserts "the vector region matches, the id region
-//! matches" and rots the first time a superfile grows a fourth region:
-//! the new one is simply not in the list, and the test passes by not
-//! looking. Instead the check reads the regions a superfile *declares* in
-//! its Parquet key-value metadata and holds every one it is not declared
-//! to repair to byte equality. A region added later is covered the day it
-//! exists, and a region that legitimately has to change forces whoever
-//! changes it to say so here.
-//!
-//! ## What is compared by bytes, and what is not
-//!
-//! Only the spliced index regions are a byte claim. The Parquet body is
-//! not: these fixtures were encoded by a published release and a rewrite
-//! re-encodes them with the current one, so its bytes legitimately differ
-//! down to compression and row-group framing. The body is held to its
-//! *values* instead — same rows, same order.
-//!
-//! Distances are the opposite case and are compared exactly. A splice is
-//! byte-faithful or it is broken, so a tolerance there would hide the one
-//! defect the check exists to catch.
+//! Regions are read from the footer rather than listed here, so one added
+//! later is covered by default. The Parquet body is compared by values
+//! instead: a rewrite re-encodes it, so its bytes legitimately differ.
+//! Distances are compared exactly — a splice is byte-faithful or broken.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -49,14 +16,17 @@ use std::{
     time::Duration,
 };
 
-use arrow_array::{Array, Decimal128Array, Float32Array, LargeStringArray};
+use arrow_array::{Array, Decimal128Array, LargeStringArray};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
     Connection, ReindexOptions, Supertable, superfile::format::footer::read_kv_metadata,
     supertable::wal::tombstones_codec::decode_sidecar,
 };
 
-use super::corpus_shapes::{TABLE, connect_corpus, corpus_dir, open_corpus, superfile_paths};
+use super::corpus_shapes::{
+    TABLE, connect_corpus, corpus_dir, files_with_extension, footer_values, open_corpus,
+    probe_embedding, superfile_paths, vector_hits,
+};
 
 /// The shape every test here runs on: a table carrying both an FTS index
 /// and a vector index, so "nothing but FTS moves" has something to move.
@@ -79,51 +49,24 @@ const IDS_LAYOUT_KEY: &str = "inf.ids.layout";
 const IDS_LAYOUT_PACKED: &str = "packed";
 /// Footer key naming the vector blob's layout.
 const VEC_LAYOUT_KEY: &str = "inf.vec.layout";
-/// The [`VEC_LAYOUT_KEY`] value for cell-directory subsections — the
-/// layout a rewrite has the most work to carry across untouched.
+/// The [`VEC_LAYOUT_KEY`] value for cell-directory subsections.
 const VEC_LAYOUT_MULTI_CELL: &str = "multi_cell_ivf";
 /// Footer key holding a superfile's document count, tombstoned rows
 /// included.
 const N_DOCS_KEY: &str = "inf.n_docs";
 
-/// The regions a rewrite is allowed to change. Everything else is cargo
-/// and is held to byte equality.
+/// Regions a rewrite may change; everything else is held to byte equality.
 ///
-/// The FTS blob is the point of the operation. The id sidecar is not, and
-/// is here because a rewrite re-encodes it whether or not anyone asked:
-/// the builder packs the sidecar unconditionally, so a file written before
-/// the packed layout existed comes out with one regardless. That is a
-/// second format migration riding along with the first — the ids
-/// themselves are unchanged, which
-/// [`a_rewrite_round_trips_the_stored_columns`] is what actually pins.
-///
-/// A region is added here only with its reason. The point of the list is
-/// that everything outside it is held to byte equality, so growing it is
-/// how the boundary moves — deliberately, and in writing.
+/// The id sidecar is here because the builder re-packs it unconditionally.
+/// A region joins this list only with its reason.
 const REPAIRED_REGIONS: &[&str] = &[FTS_REGION, IDS_REGION];
 
-/// Neighbours retrieved by the probe; large enough that a dropped or
-/// reordered row shows up, small enough to stay a cheap assertion.
-const PROBE_NEIGHBOURS: usize = 16;
-/// Dimension of the corpus generators' planted embeddings.
-const EMBEDDING_DIM: usize = 16;
-/// Off-axis weight in the probe vector, mirroring the generators'
-/// `embedding(0)`.
-const PROBE_OFF_AXIS: f32 = 0.05;
-
-/// Rows the deletion test removes. Enough to span more than one superfile
-/// so the tombstone carry is exercised per file, few enough to keep the
-/// predicate readable.
+/// Rows the deletion tests remove; enough to span more than one superfile.
 pub(crate) const DELETED_DOCS: usize = 25;
 
-/// One superfile's spliced regions, as `name -> bytes`.
+/// One superfile's spliced regions as `name -> bytes`, read from its footer.
 ///
-/// Discovered from the key-value metadata rather than named here — see
-/// this module's header for why that distinction is the whole point.
-///
-/// A region declared with a zero length is absent rather than empty, so
-/// it is left out: including it would assert equality between two files
-/// that both simply lack the region.
+/// A zero-length region is absent rather than empty, so it is skipped.
 fn spliced_regions(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
     let kv = read_kv_metadata(bytes).expect("read superfile key-value metadata");
     let mut regions = BTreeMap::new();
@@ -151,15 +94,8 @@ fn spliced_regions(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
     regions
 }
 
-/// Every superfile's regions under `root`, keyed by region name, with the
-/// bytes of each sorted so two tables compare independently of which file
-/// holds what.
-///
-/// A rewrite mints a new superfile id, so input and output cannot be
-/// paired by name. Comparing the whole table's regions as a sorted
-/// collection sidesteps the pairing entirely and still fails on exactly
-/// the things that are wrong: a region whose bytes changed, one that went
-/// missing, and one that appeared.
+/// Every superfile's regions under `root`, bytes sorted per name, so two
+/// tables compare without pairing superfile ids a rewrite has changed.
 fn table_regions(root: &Path) -> BTreeMap<String, Vec<Vec<u8>>> {
     let mut by_name: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
     for path in superfile_paths(root) {
@@ -175,89 +111,18 @@ fn table_regions(root: &Path) -> BTreeMap<String, Vec<Vec<u8>>> {
 }
 
 /// How two versions of a region differ, in a line a failure can print.
-///
-/// A region runs to megabytes, so the assertion cannot simply show them:
-/// the useful facts are how many files carried the region, how long each
-/// was, and where the first byte diverges.
 fn describe_difference(before: &[Vec<u8>], after: &[Vec<u8>]) -> String {
-    let lengths = |regions: &[Vec<u8>]| {
-        regions
-            .iter()
-            .map(|r| r.len().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let first_divergence = before
-        .iter()
-        .zip(after)
-        .enumerate()
-        .find_map(|(file, (b, a))| {
-            b.iter()
-                .zip(a)
-                .position(|(x, y)| x != y)
-                .map(|at| format!("file {file} first differs at byte {at}"))
-                .or_else(|| {
-                    (b.len() != a.len())
-                        .then(|| format!("file {file} differs in length only, at byte {}", b.len()))
-                })
-        })
-        .unwrap_or_else(|| "a different number of files carry the region".to_owned());
+    let lengths = |regions: &[Vec<u8>]| regions.iter().map(Vec::len).collect::<Vec<_>>();
+    let first = before.iter().zip(after).position(|(b, a)| b != a);
     format!(
-        "before: {} region(s) of [{}]\nafter:  {} region(s) of [{}]\n{first_divergence}",
-        before.len(),
+        "before {:?}, after {:?}, first differing file {first:?}",
         lengths(before),
-        after.len(),
-        lengths(after),
+        lengths(after)
     )
 }
 
-/// The probe used against the corpus's planted embeddings; mirrors the
-/// generators' `embedding(0)`.
-fn probe_embedding() -> Vec<f32> {
-    (0..EMBEDDING_DIM)
-        .map(|d| if d == 0 { 1.0 } else { PROBE_OFF_AXIS })
-        .collect()
-}
-
-/// Ids and distances a vector search returns, in rank order.
-///
-/// Distances ride along because ids alone do not say the vectors survived:
-/// a re-encoded index can return the same neighbours with drifted scores,
-/// which is precisely the silent damage a splice is supposed to make
-/// impossible.
-fn vector_hits(table: &Supertable, probe: &[f32]) -> Vec<(i128, f32)> {
-    let batches = table
-        .vector_search("emb", probe, PROBE_NEIGHBOURS, None, None)
-        .expect("vector search");
-    let mut out = Vec::new();
-    for batch in &batches {
-        let ids = batch
-            .column_by_name("_id")
-            .expect("_id column")
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .expect("_id is Decimal128");
-        let scores = batch
-            .column_by_name("score")
-            .expect("score column")
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .expect("score is f32");
-        for i in 0..batch.num_rows() {
-            out.push((ids.value(i), scores.value(i)));
-        }
-    }
-    out
-}
-
-/// Tombstone the first `DELETED_DOCS` rows by id order and return their
-/// `_id`s.
-///
-/// By id order rather than by any property of the text, so the choice does
-/// not depend on which superfile happens to hold what. Shared because
-/// several tests — here and in the crash harness — need the same table
-/// state, and a second copy of the predicate would be a second chance to
-/// delete something different.
+/// Tombstone the first [`DELETED_DOCS`] rows by id order and return their
+/// `_id`s, so the choice does not depend on which superfile holds what.
 pub(crate) fn delete_leading_rows(db: &Connection, table: &Supertable) -> HashSet<i128> {
     let victims: Vec<(i128, String)> = rows_by_id(db)
         .into_iter()
@@ -284,11 +149,8 @@ pub(crate) fn delete_leading_rows(db: &Connection, table: &Supertable) -> HashSe
     victims.into_iter().map(|(id, _)| id).collect()
 }
 
-/// Every row's id and text columns, ordered by id.
-///
-/// The Parquet body's value-level counterpart to the byte check: a
-/// rewrite re-encodes these bytes legitimately, so what has to hold is
-/// that the rows come back identical and in the same order.
+/// Every row's id and text columns, ordered by id — the value-level
+/// counterpart to the byte check.
 pub(crate) fn rows_by_id(db: &Connection) -> Vec<(i128, String, String, Option<String>)> {
     let batches = db
         .query_sql(&format!(
@@ -335,21 +197,11 @@ fn rewrite(table: &Supertable) {
     table.gc(Duration::ZERO).expect("collect superseded bytes");
 }
 
-/// **The check that turns "repairs the index and nothing else" from a
-/// sentence into an invariant.**
+/// Every region except [`REPAIRED_REGIONS`] comes out byte-identical, and
+/// the FTS blob is asserted to have changed — a check where nothing moved
+/// would pass on an engine that did nothing.
 ///
-/// Every region a superfile declares, except the ones a rewrite is
-/// declared to repair, comes out byte-identical. The FTS blob is asserted
-/// to have changed, for the same reason the rewritten count is: a check
-/// where nothing moved would pass on an engine that did nothing at all.
-///
-/// A region this engine grows later is carried by default — it is not in
-/// [`REPAIRED_REGIONS`], so it must survive untouched, and whoever makes
-/// it legitimately change has to come here and say why.
-/// Run against every shape rather than one: the carried regions differ by
-/// shape — only the hybrid shape has a vector subsection to carry — and a
-/// claim about what a rewrite leaves alone is worth exactly as much as the
-/// number of writers it has been checked against.
+/// Run per shape: the claim is worth as many writers as it is checked on.
 fn assert_only_repaired_regions_change(shape: &str) {
     let Some((_tmp, table, root)) = open_corpus(shape) else {
         return;
@@ -369,12 +221,8 @@ fn assert_only_repaired_regions_change(shape: &str) {
     rewrite(&table);
     let after = table_regions(&root);
 
-    // Only the carried regions have to be the same *set*. A repaired
-    // region is allowed to appear: the oldest shapes predate the stable-id
-    // sidecar entirely and resolve `_id` from the Parquet id pages, so a
-    // rewrite gives them a sidecar they never had. Holding the whole key
-    // set equal would call that a defect, and it is the opposite — the
-    // file gains an `_id` resolve that decodes no Parquet page.
+    // Only carried regions must be the same set: the oldest shapes gain an
+    // id sidecar they never had, which is a repair, not a defect.
     let carried_after: Vec<&String> = after
         .keys()
         .filter(|n| !REPAIRED_REGIONS.contains(&n.as_str()))
@@ -383,8 +231,8 @@ fn assert_only_repaired_regions_change(shape: &str) {
         carried, carried_after,
         "{shape}: a rewrite added or dropped a region it does not repair"
     );
-    // Every carried region is reported, not just the first to fail: which
-    // ones moved is the finding, and stopping at one hides the rest.
+    // Report every moved region, not just the first: stopping at one hides
+    // the rest.
     let moved: Vec<String> = carried
         .into_iter()
         .filter(|name| before.get(*name) != after.get(*name))
@@ -409,10 +257,8 @@ fn assert_only_repaired_regions_change(shape: &str) {
     );
 }
 
-// No `v1_positionless` case. A v1-era catalog record names no analyzer,
-// so the table cannot be opened at all, let alone reindexed — the refusal
-// is pinned by `corpus_shapes::v1_positionless`. v1 is outside the claim
-// this module makes rather than an exception to it.
+// No `v1_positionless` case: a v1-era record names no analyzer, so the
+// table cannot be opened at all. `corpus_shapes::v1_positionless` pins it.
 
 #[test]
 fn a_positions_region_rewrite_changes_only_what_it_repairs() {
@@ -484,47 +330,21 @@ fn a_rewrite_round_trips_the_stored_columns() {
 
     let after = rows_by_id(&db);
     assert_eq!(
-        after.len(),
-        before.len(),
-        "a rewrite changed how many rows the table holds"
-    );
-    assert_eq!(
         after, before,
         "a rewrite changed the stored columns or the order they come back in"
     );
 }
 
-/// The id sidecar is upgraded, not merely disturbed.
-///
-/// Pinned because the invariance check above permits the ids region to
-/// change and a permission granted without a matching assertion is how a
-/// region quietly starts changing for the wrong reason. The fixtures
-/// predate the packed layout, so they carry the raw `i128` array in — no
-/// layout key — and must come out naming the packed layout, smaller.
-///
-/// That the *ids themselves* survive is not this test's claim; it is
-/// [`a_rewrite_round_trips_the_stored_columns`], which compares every
-/// row's `_id` in order across the whole table.
+/// The id sidecar is upgraded, not merely disturbed: raw array in, packed
+/// and smaller out. That the ids survive is
+/// [`a_rewrite_round_trips_the_stored_columns`]'s claim, not this one.
 #[test]
 fn a_rewrite_upgrades_the_id_sidecar_to_the_packed_layout() {
     let Some((_tmp, table, root)) = open_corpus(SHAPE) else {
         return;
     };
 
-    let layouts = |root: &Path| -> Vec<Option<String>> {
-        superfile_paths(root)
-            .iter()
-            .map(|path| {
-                let bytes = fs::read(path).expect("read superfile");
-                read_kv_metadata(&bytes)
-                    .expect("read superfile key-value metadata")
-                    .get(IDS_LAYOUT_KEY)
-                    .cloned()
-            })
-            .collect()
-    };
-
-    let before_layouts = layouts(&root);
+    let before_layouts = footer_values(&root, IDS_LAYOUT_KEY);
     assert!(
         before_layouts.iter().all(Option::is_none),
         "the fixture already names an id-sidecar layout, so it cannot show \
@@ -534,7 +354,7 @@ fn a_rewrite_upgrades_the_id_sidecar_to_the_packed_layout() {
 
     rewrite(&table);
 
-    let after_layouts = layouts(&root);
+    let after_layouts = footer_values(&root, IDS_LAYOUT_KEY);
     assert!(
         after_layouts
             .iter()
@@ -558,30 +378,16 @@ fn total_ids_bytes(root: &Path) -> usize {
         .unwrap_or_default()
 }
 
-/// The hybrid fixture's vector subsections really are the multi-cell
-/// layout, so the byte-identity result above is a claim about the layout
-/// that is hardest to carry — not only the single-cell one.
-///
-/// Asserted rather than assumed: "the vector region survives" is worth
-/// what the fixture behind it is worth, and a fixture that quietly
-/// regenerated as single-cell would weaken every vector claim in this
-/// module without failing any of them.
+/// The hybrid fixture really is multi-cell, so the byte-identity claim
+/// covers the layout hardest to carry. A fixture that regenerated as
+/// single-cell would weaken every vector claim here without failing one.
 #[test]
 fn the_hybrid_fixture_carries_multi_cell_vector_subsections() {
     let Some(dir) = corpus_dir(SHAPE) else {
         return;
     };
 
-    let layouts: Vec<Option<String>> = superfile_paths(&dir)
-        .iter()
-        .map(|path| {
-            let bytes = fs::read(path).expect("read superfile");
-            read_kv_metadata(&bytes)
-                .expect("read superfile key-value metadata")
-                .get(VEC_LAYOUT_KEY)
-                .cloned()
-        })
-        .collect();
+    let layouts = footer_values(&dir, VEC_LAYOUT_KEY);
 
     assert!(!layouts.is_empty(), "the hybrid fixture has no superfiles");
     assert!(
@@ -595,16 +401,8 @@ fn the_hybrid_fixture_carries_multi_cell_vector_subsections() {
 
 /// A rewrite does not resurrect a deleted row.
 ///
-/// The interaction nothing else covers: deletions live in a per-superfile
-/// tombstone sidecar keyed by local doc id, and a rewrite mints a new
-/// superfile id. Getting that wrong brings dead rows back, which is worse
-/// than the recall loss the migration exists to repair and is invisible to
-/// any test that only asks whether the live rows are still there.
-///
-/// Pins today's behaviour, where the build applies the deletion bitmap and
-/// the dead rows are dropped from the output entirely. A change to carry
-/// the row set instead has to keep every assertion here passing — the
-/// deleted rows stay gone either way, which is the part that matters.
+/// Tombstones are keyed by local doc id and a rewrite mints a new
+/// superfile id, so the carry is where dead rows come back.
 #[test]
 fn a_rewrite_keeps_deleted_rows_deleted() {
     let Some((_tmp, db, _root)) = connect_corpus(SHAPE) else {
@@ -647,15 +445,10 @@ fn a_rewrite_keeps_deleted_rows_deleted() {
     );
 }
 
-/// The rewrite carries the tombstones rather than dropping the rows.
-///
-/// [`a_rewrite_keeps_deleted_rows_deleted`] proves the *outcome*; this
-/// proves the *mechanism*, and the two fail in different places. A build
-/// that quietly went back to dropping dead rows would still keep them
-/// unreadable and pass that test — while renumbering every surviving row,
-/// which is what makes the vector subsection a byte copy instead of a
-/// remapping. So: the row count is unchanged, and a sidecar exists under
-/// the new superfile id carrying exactly the bits the old one had.
+/// The rewrite carries the tombstones rather than dropping the rows:
+/// unchanged doc count, same bits under the new superfile id. A build that
+/// went back to dropping them would still pass
+/// [`a_rewrite_keeps_deleted_rows_deleted`] while renumbering every row.
 #[test]
 fn a_rewrite_carries_the_tombstone_sidecar_to_the_new_superfile() {
     let Some((_tmp, db, root)) = connect_corpus(SHAPE) else {
@@ -692,13 +485,10 @@ fn a_rewrite_carries_the_tombstone_sidecar_to_the_new_superfile() {
 
 /// Documents every superfile under `root` holds, tombstoned included.
 fn total_docs(root: &Path) -> u64 {
-    superfile_paths(root)
+    footer_values(root, N_DOCS_KEY)
         .iter()
-        .map(|path| {
-            let bytes = fs::read(path).expect("read superfile");
-            read_kv_metadata(&bytes)
-                .expect("read superfile key-value metadata")
-                .get(N_DOCS_KEY)
+        .map(|v| {
+            v.as_ref()
                 .expect("every superfile records its document count")
                 .parse::<u64>()
                 .expect("document count is a number")
@@ -706,43 +496,21 @@ fn total_docs(root: &Path) -> u64 {
         .sum()
 }
 
-/// Set bits in each tombstone sidecar under `root`, in path order.
-///
-/// Read off storage rather than through the cache: the point is what was
-/// durably written for the superfile that now exists, not what a reader
-/// happens to have resolved.
+/// Set bits in each tombstone sidecar under `root`, read off storage
+/// rather than through the cache.
 fn tombstone_bit_counts(root: &Path) -> Vec<u64> {
-    let mut counts = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    let mut paths = Vec::new();
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).expect("read table dir") {
-            let path = entry.expect("dir entry").path();
-            match path.is_dir() {
-                true => stack.push(path),
-                false if path.extension().is_some_and(|e| e == "tombstones") => paths.push(path),
-                false => {}
-            }
-        }
-    }
-    paths.sort();
-    for path in paths {
-        let bytes = fs::read(&path).expect("read sidecar");
-        let sidecar = decode_sidecar(&bytes).expect("decode sidecar");
-        if !sidecar.bitmap.is_empty() {
-            counts.push(sidecar.bitmap.len());
-        }
-    }
-    counts
+    files_with_extension(root, "tombstones")
+        .iter()
+        .filter_map(|path| {
+            let bytes = fs::read(path).expect("read sidecar");
+            let sidecar = decode_sidecar(&bytes).expect("decode sidecar");
+            (!sidecar.bitmap.is_empty()).then(|| sidecar.bitmap.len())
+        })
+        .collect()
 }
 
-/// A migration still terminates on a table with deletions.
-///
-/// Carrying the row set changes what a rewrite produces, and what a
-/// rewrite produces is exactly what the planner selects on — so this is
-/// the property most at risk from the change and least visible when it
-/// breaks. A run that left its output as stale as its input would rewrite
-/// the same files on every pass, forever, reporting success each time.
+/// A migration still terminates on a table with deletions: a run that left
+/// its output as stale as its input would rewrite the same files forever.
 #[test]
 fn a_second_run_over_a_table_with_deletions_has_nothing_to_do() {
     let Some((_tmp, db, _root)) = connect_corpus(SHAPE) else {

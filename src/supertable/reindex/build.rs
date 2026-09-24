@@ -3,29 +3,12 @@
 
 //! How a reindex builds the superfile it commits.
 //!
-//! The migration drives the same seal → build → commit → unseal cycle
-//! compaction does, because that cycle is what makes a rewrite safe across
-//! processes and is worth exactly one implementation. What it *builds* is
-//! its own business, and lives here rather than as a branch inside the
-//! merge path — a tool that rewrites committed data on demand should not
-//! be something the everyday compaction path has to know about.
+//! The migration drives compaction's seal → build → commit → unseal cycle,
+//! because that cycle is what makes a rewrite safe across processes and is
+//! worth exactly one implementation. Only what it *builds* differs.
 //!
-//! Two builds, picked by mode:
-//!
-//! - [`super::ReindexMode::Rewrite`] reuses compaction's build with its
-//!   deletions turned off. Carrying postings into a current container is
-//!   exactly what a merge already does, and restating it here would be a
-//!   second copy that could drift from the one the table is actually
-//!   compacted with.
-//! - [`super::ReindexMode::Reanalyze`] is this module's own: it rebuilds
-//!   terms from stored text, which no merge does or should do.
-//!
-//! Both carry every row, tombstoned ones included. A compaction drops dead
-//! rows to reclaim their space; a migration reclaims nothing, and dropping
-//! them would renumber the survivors — the one change that would turn
-//! carrying a vector subsection from a byte copy into a remapping. The
-//! dead rows stay dead because the job runner carries their tombstones
-//! onto the output, which is what `preserves_tombstones` asks for.
+//! Both builds carry every row: dropping the dead ones would renumber the
+//! survivors, and the job runner carries their tombstones onto the output.
 
 use std::{collections::HashMap, io::Write, sync::Arc};
 
@@ -45,19 +28,10 @@ use crate::{
     },
 };
 
-/// Carries every row, tombstoned ones included, into the current layout.
+/// Compaction's build, carrying the rows it would otherwise drop.
 ///
-/// Compaction's build with its deletions turned off. A compaction drops
-/// dead rows because reclaiming their space is the point of it; a
-/// migration has no business reclaiming anything, and dropping them would
-/// renumber every surviving row — which is the one thing that makes
-/// carrying the vector subsection across a byte copy rather than a
-/// remapping exercise. Keeping the row set is what keeps a migration's
-/// output identical to its input everywhere the FTS index is not.
-///
-/// The dead rows stay dead: the job runner carries their tombstones onto
-/// the output because this build answers `preserves_tombstones`. They are
-/// reclaimed by ordinary compaction, whenever that next runs.
+/// Restating the merge here would be a second copy that could drift from
+/// the one the table is actually compacted with.
 pub(crate) struct RewriteMerge;
 
 impl SuperfileMerge for RewriteMerge {
@@ -66,19 +40,7 @@ impl SuperfileMerge for RewriteMerge {
         inputs: MergeInputs<'_>,
         output: &mut dyn Write,
     ) -> Result<SuperfileStats, BuildError> {
-        let carried: Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> = inputs
-            .readers
-            .iter()
-            .map(|(reader, _deleted)| (Arc::clone(reader), None))
-            .collect();
-        CompactionMerge.build(
-            MergeInputs {
-                readers: &carried,
-                superseded: inputs.superseded,
-                fts_corpus: inputs.fts_corpus,
-            },
-            output,
-        )
+        CompactionMerge.build(inputs, output)
     }
 
     fn preserves_tombstones(&self) -> bool {
@@ -88,15 +50,9 @@ impl SuperfileMerge for RewriteMerge {
 
 /// Rebuilds each input's FTS index from the text it stored.
 ///
-/// The only build that changes a file's *terms*. Every other rebuild
+/// The only build that changes a file's *terms*: every other rebuild
 /// copies postings, which is why a container rewrite leaves an older
-/// analyzer's output exactly where it was: the terms are the stale thing,
-/// and only re-tokenizing the source text replaces them.
-///
-/// Columns whose text was never stored cannot be re-analyzed, so their
-/// postings are carried and they keep the revision they were built at. The
-/// output is then honestly mixed — current terms where there was text,
-/// older terms where there was not — and the run reports which.
+/// analyzer's output where it was.
 pub(crate) struct ReanalyzeMerge;
 
 impl SuperfileMerge for ReanalyzeMerge {
@@ -113,13 +69,13 @@ impl SuperfileMerge for ReanalyzeMerge {
     }
 }
 
-/// Rebuild `readers` into one superfile, re-analyzing every column whose
-/// text is stored.
+/// Rebuild `readers` into one superfile, re-analyzing every stored column.
 ///
-/// Vectors are decoded from the input and re-encoded by the normal append
-/// path rather than spliced, so this costs more than a merge — the trade
-/// for changing terms at all — and only a codec that round-trips exactly
-/// can take it. The caller refuses the rest before anything commits.
+/// A column whose text was never stored cannot be re-analyzed, so its
+/// postings are carried and it keeps the revision it was built at. Vectors
+/// are decoded and re-encoded rather than spliced, so only a codec that
+/// round-trips exactly can take this path — the caller refuses the rest
+/// before anything commits.
 fn reanalyze_to<W: Write>(
     readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     fts_corpus: &HashMap<String, ColumnLengthStats>,
@@ -130,11 +86,12 @@ fn reanalyze_to<W: Write>(
     let mut builder = SuperfileBuilder::new(builder_opts)?;
 
     let mut stats = Vec::with_capacity(readers.len());
-    // Each input's deletion bitmap is deliberately ignored: a reindex
-    // carries the row set, so local doc ids stay put and the tombstones
-    // carried onto the output still name the same rows. See `RewriteMerge`.
-    for (reader, _deleted) in readers {
-        stats.push(builder.add_batch_from_reader_scoped(reader, None, CarryScope::UnstoredOnly)?);
+    for (reader, deleted) in readers {
+        stats.push(builder.add_batch_from_reader_scoped(
+            reader,
+            deleted.clone(),
+            CarryScope::UnstoredOnly,
+        )?);
     }
 
     builder.finish_to(output)?;

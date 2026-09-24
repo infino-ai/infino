@@ -502,15 +502,11 @@ impl Supertable {
             });
         }
 
-        // The build this run drives. `Rewrite` wants what a compaction
-        // produces — postings carried, layout current — with its deletions
-        // turned off, because a migration reshapes nothing. `Reanalyze` is
-        // the one this tool owns. Both carry the row set.
-        let rewrite = build::RewriteMerge;
-        let reanalyze = build::ReanalyzeMerge;
+        // `Rewrite` is compaction's build with deletions off; `Reanalyze`
+        // is this tool's own. Both carry the row set.
         let merge: &dyn SuperfileMerge = match opts.mode {
-            ReindexMode::Rewrite => &rewrite,
-            ReindexMode::Reanalyze => &reanalyze,
+            ReindexMode::Rewrite => &build::RewriteMerge,
+            ReindexMode::Reanalyze => &build::ReanalyzeMerge,
         };
         for (done, job) in plan_jobs(&all, opts.mode).into_iter().enumerate() {
             let superfile_id = job.inputs[0];

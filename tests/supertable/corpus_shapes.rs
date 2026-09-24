@@ -49,9 +49,12 @@ use std::{
 
 use infino::{
     Bm25SearchOptions, Connection, Supertable, connect,
-    superfile::format::fts::{
-        BlobLayout, VERSION_CURRENT, VERSION_V1_LEGACY, VERSION_V2, VERSION_V3, VERSION_V4,
-        VERSION_V5, VERSION_V6, VERSION_V7,
+    superfile::format::{
+        footer::read_kv_metadata,
+        fts::{
+            BlobLayout, VERSION_CURRENT, VERSION_V1_LEGACY, VERSION_V2, VERSION_V3, VERSION_V4,
+            VERSION_V5, VERSION_V6, VERSION_V7,
+        },
     },
 };
 use tempfile::TempDir;
@@ -78,6 +81,13 @@ const DOCS_FOR_MULTI_ENTRY_COARSE: u32 = 4096;
 /// 8-byte magic at the start of an FTS blob; the version is the `u32`
 /// immediately after it.
 const FTS_MAGIC: &[u8; 8] = b"INFFTS01";
+
+/// Dimension of the corpus generators' planted embeddings.
+const EMBEDDING_DIM: usize = 16;
+/// Off-axis weight in the probe vector, mirroring `embedding(0)`.
+const PROBE_OFF_AXIS: f32 = 0.05;
+/// Neighbours retrieved by the probe.
+const PROBE_NEIGHBOURS: usize = 16;
 
 /// The directory holding one shape's table, or `None` when the corpus has
 /// not been generated.
@@ -115,8 +125,8 @@ struct BlobHeader {
     columns_json: String,
 }
 
-/// Every superfile under `root`, in path order.
-pub(crate) fn superfile_paths(root: &Path) -> Vec<PathBuf> {
+/// Every file under `root` with `ext`, in path order.
+pub(crate) fn files_with_extension(root: &Path, ext: &str) -> Vec<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     let mut files = Vec::new();
     while let Some(dir) = stack.pop() {
@@ -124,13 +134,69 @@ pub(crate) fn superfile_paths(root: &Path) -> Vec<PathBuf> {
             let path = entry.expect("dir entry").path();
             match path.is_dir() {
                 true => stack.push(path),
-                false if path.extension().is_some_and(|e| e == "parquet") => files.push(path),
+                false if path.extension().is_some_and(|e| e == ext) => files.push(path),
                 false => {}
             }
         }
     }
     files.sort();
     files
+}
+
+/// Every superfile under `root`, in path order.
+pub(crate) fn superfile_paths(root: &Path) -> Vec<PathBuf> {
+    files_with_extension(root, "parquet")
+}
+
+/// The probe used against the corpus's planted embeddings; mirrors the
+/// generators' `embedding(0)`.
+pub(crate) fn probe_embedding() -> Vec<f32> {
+    (0..EMBEDDING_DIM)
+        .map(|d| if d == 0 { 1.0 } else { PROBE_OFF_AXIS })
+        .collect()
+}
+
+/// Ids and distances a vector search returns, in rank order.
+///
+/// Distances ride along because a re-encoded index can return the same
+/// ids at drifted scores.
+pub(crate) fn vector_hits(table: &Supertable, probe: &[f32]) -> Vec<(i128, f32)> {
+    let batches = table
+        .vector_search("emb", probe, PROBE_NEIGHBOURS, None, None)
+        .expect("vector search");
+    let mut out = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("_id")
+            .expect("_id column")
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .expect("_id is Decimal128");
+        let scores = batch
+            .column_by_name("score")
+            .expect("score column")
+            .as_any()
+            .downcast_ref::<arrow_array::Float32Array>()
+            .expect("score is f32");
+        for i in 0..batch.num_rows() {
+            out.push((ids.value(i), scores.value(i)));
+        }
+    }
+    out
+}
+
+/// One footer key read from every superfile under `root`, in path order.
+pub(crate) fn footer_values(root: &Path, key: &str) -> Vec<Option<String>> {
+    superfile_paths(root)
+        .iter()
+        .map(|path| {
+            let bytes = fs::read(path).expect("read superfile");
+            read_kv_metadata(&bytes)
+                .expect("read superfile key-value metadata")
+                .get(key)
+                .cloned()
+        })
+        .collect()
 }
 
 /// Every superfile's FTS blob header under `root`, in path order.
@@ -174,12 +240,7 @@ fn find_columns_json(bytes: &[u8]) -> Option<String> {
 /// Copy a corpus table into a temp dir and connect to it.
 ///
 /// The checked-in bytes are a fixture: opening a table takes a lock and
-/// can write manifest state, so a test that opened them in place would
-/// mutate the thing it is asserting about.
-///
-/// Hands back the connection as well as the copy, because SQL hangs off
-/// the connection rather than the table handle — a test that compares
-/// stored columns needs it alive.
+/// writes manifest state, so opening them in place would mutate them.
 pub(crate) fn connect_corpus(shape: &str) -> Option<(TempDir, Connection, PathBuf)> {
     let src = corpus_dir(shape)?;
     let tmp = TempDir::new().expect("tempdir");
