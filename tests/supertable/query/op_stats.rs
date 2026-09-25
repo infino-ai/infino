@@ -1669,6 +1669,40 @@ fn a_rejected_projection_does_no_search_work() {
         (0, 0, 0, 0),
         "a rejected hybrid projection must run neither the vector nor the FTS leg"
     );
+
+    // Unranked token match: the same early guard over the FTS entry point,
+    // so no postings are walked and no rows materialized.
+    let (tok_err, tok_stats) = with_op_stats(|| {
+        st.token_match("title", "vec", BoolMode::Or, Some(&bad))
+            .expect_err("unknown projection column must error")
+    });
+    assert!(
+        tok_err.to_string().contains("unknown column"),
+        "token_match must name the unknown column, got {tok_err}"
+    );
+    assert_eq!(
+        (tok_stats.fts_postings_bytes, tok_stats.rows_materialized),
+        (0, 0),
+        "a rejected token_match projection must walk no postings and materialize no rows"
+    );
+
+    // Unranked exact match: the same early guard, likewise idle on rejection.
+    let (exact_err, exact_stats) = with_op_stats(|| {
+        st.exact_match("title", "vec", Some(&bad))
+            .expect_err("unknown projection column must error")
+    });
+    assert!(
+        exact_err.to_string().contains("unknown column"),
+        "exact_match must name the unknown column, got {exact_err}"
+    );
+    assert_eq!(
+        (
+            exact_stats.fts_postings_bytes,
+            exact_stats.rows_materialized
+        ),
+        (0, 0),
+        "a rejected exact_match projection must walk no postings and materialize no rows"
+    );
 }
 
 /// The gapped-placement memo must not pin connection-budget bytes. The

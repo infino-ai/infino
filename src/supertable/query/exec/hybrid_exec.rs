@@ -93,7 +93,7 @@ use crate::{
                 common::{
                     PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
                     fill_top_k, output_schema_with_score, resolve_hits_named,
-                    search_query_df_error, validate_projection,
+                    search_query_df_error,
                 },
                 vector_exec::arg_to_query_vector,
             },
@@ -280,18 +280,9 @@ impl Supertable {
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(text_col, vec_col, k, "hybrid_search");
         let reader = self.reader()?;
-        // Fail fast: reject a projection naming a column the search output does
-        // not carry BEFORE running the search (which fans out a full vector
-        // wave) or resolving placement. The valid set is the resident stored
-        // scalar schema plus the synthesized `score` (no object-store I/O) —
-        // the same source `resolve_hits_named` checks at materialization.
-        let output_schema = output_schema_with_score(&reader.options().stored_schema());
-        validate_projection(
-            projection,
-            reader.options().id_column.as_str(),
-            &output_schema,
-        )
-        .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;
+        reader
+            .check_projection(projection)
+            .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;
         let hits = reader
             .hybrid_search(text_col, q_text, mode, vec_col, q_vec, options, k)
             .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;

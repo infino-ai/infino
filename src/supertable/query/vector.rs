@@ -90,10 +90,7 @@ use super::{
     SuperfileHit,
     candidate::{CandidatePlan, CandidateScope},
     dispatch,
-    exec::common::{
-        SCORE_COLUMN, id_score_batch, output_schema_with_score, resolve_hits_named,
-        take_rows_byte_source, validate_projection,
-    },
+    exec::common::{SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source},
     fts::{memo_from_locations, memos_from_plan_locations},
     provider::prune_leaves_for_filters,
     prune::{PruneLeaf, select_superfiles},
@@ -7432,19 +7429,7 @@ impl SupertableReader {
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
-        // Fail fast: reject a projection naming a column the search output does
-        // not carry BEFORE running the search or resolving placement. The valid
-        // set is the resident stored scalar schema plus the synthesized `score`
-        // (no object-store I/O) — the same source `resolve_hits_named` checks at
-        // materialization. Validating here turns a doomed query into an
-        // immediate error instead of a full (multi-gigabyte, at billion scale)
-        // search and id/placement resolution whose result is then discarded.
-        let output_schema = output_schema_with_score(&self.options().stored_schema());
-        validate_projection(
-            projection,
-            self.options().id_column.as_str(),
-            &output_schema,
-        )?;
+        self.check_projection(projection)?;
 
         let query = calibrated_query(self, column, query);
         let query: &[f32] = &query;
@@ -11721,7 +11706,7 @@ mod tests {
         let opts = options_one_superfile_per_commit(dim);
         let dir = tempfile::TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
-            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
         let st = Supertable::create(opts.with_storage(storage)).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_vector_batch(0, 16, dim, schema.clone()))

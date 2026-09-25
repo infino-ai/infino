@@ -278,6 +278,26 @@ fn unknown_column_message(name: &str, output_schema: &SchemaRef) -> String {
     format!("unknown column {name:?} in projection; valid columns: {available}")
 }
 
+impl SupertableReader {
+    /// Reject a projection naming a column the search output does not carry,
+    /// before any search or placement I/O. Resident-only: the stored scalar
+    /// schema plus the synthesized `score`, no object storage touched. Every
+    /// row-returning search entry point calls this at its top so a doomed
+    /// projection fails fast instead of after a full (at billion scale,
+    /// multi-gigabyte) search whose result is then thrown away. The valid set
+    /// is the same one [`resolve_hits_named`] checks at output materialization,
+    /// so the two share one source of truth and the error message is identical.
+    pub(crate) fn check_projection(&self, projection: Option<&[&str]>) -> Result<(), QueryError> {
+        let output_schema = output_schema_with_score(&self.options().stored_schema());
+        validate_projection(
+            projection,
+            self.options().id_column.as_str(),
+            &output_schema,
+        )?;
+        Ok(())
+    }
+}
+
 /// Lower a search table function's pushed-down `WHERE` filters to the
 /// candidate plan its kernel ranks within: a token-match superset over
 /// the FTS-indexed columns, [`Unbounded`](CandidatePlan::Unbounded) when
