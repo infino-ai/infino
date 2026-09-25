@@ -139,7 +139,10 @@ use crate::{
             SuperfileHit,
             candidate::{CandidatePlan, CandidateScope, TermMemos},
             dispatch,
-            exec::common::{resolve_hits_named, take_rows_byte_source},
+            exec::common::{
+                output_schema_with_score, resolve_hits_named, take_rows_byte_source,
+                validate_projection,
+            },
             prune::{PruneLeaf, select_superfiles},
         },
         reader_cache::{ReadIntent, disk::ForegroundQueryGuard},
@@ -2163,6 +2166,20 @@ impl SupertableReader {
         opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        // Fail fast: reject a projection naming a column the search output does
+        // not carry BEFORE running the search or resolving placement. The valid
+        // set is the resident stored scalar schema plus the synthesized `score`
+        // (no object-store I/O) — the same source `resolve_hits_named` checks at
+        // materialization. Validating here turns a doomed query into an
+        // immediate error instead of a full search and id/placement resolution
+        // whose result is then discarded.
+        let output_schema = output_schema_with_score(&self.options().stored_schema());
+        validate_projection(
+            projection,
+            self.options().id_column.as_str(),
+            &output_schema,
+        )?;
+
         let _foreground = ForegroundQueryGuard::enter();
         self.block_on(async {
             let hits = self.bm25_search_async(column, query, k, opts).await?;
@@ -2542,6 +2559,18 @@ impl Supertable {
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, mode = ?mode, "token_match");
         let reader = self.reader()?;
+        // Fail fast: reject a projection naming a column the search output does
+        // not carry BEFORE running the match or resolving placement, using the
+        // resident stored scalar schema plus the synthesized `score` (no
+        // object-store I/O) — the same source `resolve_hits_named` checks at
+        // materialization.
+        let output_schema = output_schema_with_score(&reader.options().stored_schema());
+        validate_projection(
+            projection,
+            reader.options().id_column.as_str(),
+            &output_schema,
+        )
+        .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
         let hits = reader
             .token_match(column, query, mode)
             .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
@@ -2568,6 +2597,18 @@ impl Supertable {
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, "exact_match");
         let reader = self.reader()?;
+        // Fail fast: reject a projection naming a column the search output does
+        // not carry BEFORE running the match or resolving placement, using the
+        // resident stored scalar schema plus the synthesized `score` (no
+        // object-store I/O) — the same source `resolve_hits_named` checks at
+        // materialization.
+        let output_schema = output_schema_with_score(&reader.options().stored_schema());
+        validate_projection(
+            projection,
+            reader.options().id_column.as_str(),
+            &output_schema,
+        )
+        .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
         let hits = reader
             .exact_match(column, value)
             .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
