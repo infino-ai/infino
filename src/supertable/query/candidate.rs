@@ -75,7 +75,9 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         fts::{
-            reader::{BoolMode, LONG_S_ASCII, MatchWork, TermPattern, has_fold_partner},
+            reader::{
+                BoolMode, FetchedTermMemo, LONG_S_ASCII, MatchWork, TermPattern, has_fold_partner,
+            },
             tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER, Tokenizer},
         },
     },
@@ -186,6 +188,12 @@ const WORD_JOINERS: &[char] = &['\'', '"', '.', ':', ',', ';', '_'];
 /// lowercasing.
 const FINAL_SIGMA: char = 'ς';
 
+/// Per column, the prefetched-term memo a superfile's plan evaluation
+/// serves its exact-match terms from — built from the table-level term
+/// index's postings locations, so the superfile's dictionary is not read
+/// for a term the memo covers. Empty when the table has no index.
+pub(crate) type TermMemos = HashMap<String, Arc<FetchedTermMemo>>;
+
 /// A superfile-independent boolean plan over FTS term retrievals, lowered
 /// once from a SQL `WHERE` clause and [`evaluate`](CandidatePlan::evaluate)d
 /// per superfile to a superset of the rows satisfying the FTS-resolvable
@@ -293,17 +301,55 @@ impl CandidatePlan {
     /// leaf the evaluation touched (an early-out keeps the work already
     /// done), so the caller can flush it per superfile. `pool` is the
     /// reader pool a `LIKE` leaf's dictionary walk runs on.
+    /// Every `(column, terms)` this plan resolves through exact term match,
+    /// deduplicated per column — what a caller asks the table-level term
+    /// index for, so each superfile can resolve them from its postings
+    /// alone. `LIKE` tokens are left out: they expand per superfile.
+    pub(crate) fn term_requests(&self) -> HashMap<String, Vec<String>> {
+        fn walk(plan: &CandidatePlan, out: &mut HashMap<String, Vec<String>>) {
+            match plan {
+                CandidatePlan::TermsAll { column, tokens } => {
+                    out.entry(column.clone())
+                        .or_default()
+                        .extend(tokens.iter().cloned());
+                }
+                CandidatePlan::TermsAny { column, terms } => {
+                    out.entry(column.clone())
+                        .or_default()
+                        .extend(terms.iter().cloned());
+                }
+                CandidatePlan::And(children) | CandidatePlan::Or(children) => {
+                    for c in children {
+                        walk(c, out);
+                    }
+                }
+                CandidatePlan::TermsLike { .. } | CandidatePlan::Unbounded => {}
+            }
+        }
+        let mut out = HashMap::new();
+        walk(self, &mut out);
+        for terms in out.values_mut() {
+            terms.sort_unstable();
+            terms.dedup();
+        }
+        out
+    }
+
     pub(crate) fn evaluate<'a>(
         &'a self,
         reader: &'a SuperfileReader,
         pool: Option<&'a ThreadPool>,
+        memos: &'a TermMemos,
     ) -> BoxFuture<'a, Result<(Option<RoaringBitmap>, MatchWork), ReadError>> {
         Box::pin(async move {
             match self {
                 CandidatePlan::Unbounded => Ok((None, MatchWork::default())),
                 CandidatePlan::TermsAll { column, tokens } => {
                     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-                    let (docs, work) = reader.token_match(column, &refs, BoolMode::And).await?;
+                    let memo = memos.get(column).map(Arc::as_ref);
+                    let (docs, work) = reader
+                        .token_match_prefetched(column, &refs, BoolMode::And, memo)
+                        .await?;
                     Ok((Some(docs.into_iter().collect()), work))
                 }
                 CandidatePlan::TermsAny { column, terms } => {
@@ -313,7 +359,10 @@ impl CandidatePlan {
                         return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
                     }
                     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-                    let (docs, work) = reader.token_match(column, &refs, BoolMode::Or).await?;
+                    let memo = memos.get(column).map(Arc::as_ref);
+                    let (docs, work) = reader
+                        .token_match_prefetched(column, &refs, BoolMode::Or, memo)
+                        .await?;
                     Ok((Some(docs.into_iter().collect()), work))
                 }
                 CandidatePlan::TermsLike {
@@ -323,7 +372,7 @@ impl CandidatePlan {
                 } => {
                     let (expanded, mut work) =
                         expand_like(reader, column, tokens, *fold, true, pool).await?;
-                    let (docs, eval_work) = expanded.evaluate(reader, pool).await?;
+                    let (docs, eval_work) = expanded.evaluate(reader, pool, memos).await?;
                     work.merge(eval_work);
                     Ok((docs, work))
                 }
@@ -331,7 +380,7 @@ impl CandidatePlan {
                     let mut acc: Option<RoaringBitmap> = None;
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.evaluate(reader, pool).await?;
+                        let (child, child_work) = c.evaluate(reader, pool, memos).await?;
                         work.merge(child_work);
                         if let Some(bm) = child {
                             acc = Some(match acc {
@@ -350,7 +399,7 @@ impl CandidatePlan {
                     let mut acc = RoaringBitmap::new();
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.evaluate(reader, pool).await?;
+                        let (child, child_work) = c.evaluate(reader, pool, memos).await?;
                         work.merge(child_work);
                         match child {
                             Some(bm) => acc |= bm,

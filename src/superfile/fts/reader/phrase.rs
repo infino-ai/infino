@@ -1010,7 +1010,7 @@ mod tests {
                 AnyCursor::Term(_) => unreachable!("a phrase atom"),
             }
         };
-        let dl_norm = &r.columns[0].dl_norm_k1;
+        let dl_norm = r.columns[0].dl_norm_k1();
 
         // Every match, by both walks, consecutively.
         let mut unranked = build().await;
@@ -1356,7 +1356,7 @@ mod tests {
             RARE_MATCH_FIRST | RARE_MATCH_SECOND => "x y".to_string(),
             _ => "x".to_string(),
         }));
-        let norms = &r.columns[0].dl_norm_k1;
+        let norms = r.columns[0].dl_norm_k1();
         let mut pc = phrase_cursor(&r, &["x", "y"]).await;
         assert!(
             pc.members[0].cursor.block_count() > 8,
@@ -1388,7 +1388,7 @@ mod tests {
                 .into_iter()
                 .map(str::to_string),
         );
-        let norms = &r.columns[0].dl_norm_k1;
+        let norms = r.columns[0].dl_norm_k1();
         let mut pc = phrase_cursor(&r, &["a", "a"]).await;
         let mut seen: Vec<(u32, u32)> = Vec::new();
         while !pc.is_exhausted() {
@@ -1410,7 +1410,7 @@ mod tests {
                 .into_iter()
                 .map(str::to_string),
         );
-        let norms = &r.columns[0].dl_norm_k1;
+        let norms = r.columns[0].dl_norm_k1();
         let mut pc = phrase_cursor(&r, &["p", "q", "r"]).await;
         let mut seen: Vec<(u32, u32)> = Vec::new();
         while !pc.is_exhausted() {

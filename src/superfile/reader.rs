@@ -62,8 +62,8 @@ use crate::{
         fts::{
             bm25::Bm25Params,
             reader::{
-                self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
-                PreparedClauses, TermPattern,
+                self as fts_reader, BoolMode, ClauseLists, FetchedTermMemo, FtsReader, MatchWork,
+                OrCursorSet, PreparedClauses, TermIndexFact, TermPattern,
             },
             tokenize::{Phrase, Tokenizer},
         },
@@ -74,6 +74,7 @@ use crate::{
         },
     },
     supertable::query::provider::tombstone_access_plan,
+    utils::terms::FstValue,
 };
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
@@ -1376,6 +1377,25 @@ impl SuperfileReader {
         Ok(fts.token_match(column, tokens, mode).await?)
     }
 
+    /// [`Self::token_match`] with terms a table-level term index already
+    /// resolved served from `prefetched`, so the dictionary is read only
+    /// for tokens the memo lacks. Delegates to
+    /// [`FtsReader::token_match_prefetched`].
+    pub(crate) async fn token_match_prefetched(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .token_match_prefetched(column, tokens, mode, prefetched)
+            .await?)
+    }
+
     /// Widen the tokens of one `LIKE` leaf to the indexed terms of
     /// `column` each covers, in one dictionary pass (a slot is `None` when
     /// more than `max_terms` qualify, or when it needs the whole column
@@ -1412,6 +1432,23 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts.token_match_count(column, tokens, mode).await?)
+    }
+
+    /// [`Self::token_match_count`] served from `prefetched`; see
+    /// [`Self::token_match_prefetched`].
+    pub(crate) async fn token_match_count_prefetched(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(u64, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .token_match_count_prefetched(column, tokens, mode, prefetched)
+            .await?)
     }
 
     /// Phrase-aware unranked match: `local_doc_id`s whose `column`
@@ -1463,6 +1500,33 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts.term_df(column, token).await?)
+    }
+
+    /// A prefetched-term memo for terms whose dictionary values are already
+    /// known, fetching only their postings. Delegates to
+    /// [`FtsReader::memo_from_dict_values`].
+    pub(crate) async fn term_memo_from_dict_values(
+        &self,
+        terms: &[(&str, u64, FstValue)],
+    ) -> Result<FetchedTermMemo, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.memo_from_dict_values(terms).await?)
+    }
+
+    /// What a table-level term index records about each of `tokens` in
+    /// `column`, in input order (`None` for an absent token). Delegates to
+    /// [`FtsReader::term_index_facts`].
+    pub(crate) async fn term_index_facts(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<Vec<Option<TermIndexFact>>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_index_facts(column, tokens).await?)
     }
 
     /// Document frequency of each of `tokens` in `column`, in input order

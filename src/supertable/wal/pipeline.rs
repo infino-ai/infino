@@ -76,6 +76,7 @@ use crate::{
         manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::superfile_reader::superfile_reader,
+        reader_cache::ReadIntent,
         utils::vector_split::split_vectors,
         wal::{
             persistence::{Etag, WalStore, WalStoreError},
@@ -87,8 +88,9 @@ use crate::{
         },
         writer::{
             CommitListMetadata, build_column_vector_summary, build_fts_summary,
-            build_packed_update_superfile, build_subsection_offsets, owned_vector_arrays,
-            persist_commit, read_vector_layout_from_bytes, stamp_tombstone_seqs,
+            build_packed_update_superfile, build_subsection_offsets, build_term_contribution,
+            owned_vector_arrays, persist_commit, read_vector_layout_from_bytes,
+            stamp_tombstone_seqs,
         },
     },
 };
@@ -478,6 +480,17 @@ async fn do_apply(
         })?;
     let fts_summary = build_fts_summary(&reader, &inner.options);
     let vector_summary = build_vector_summary(&reader, &inner.options);
+    // The replacement superfile's postings go into the term index in the
+    // same commit as its entry, exactly as an appended superfile's do.
+    let term_contribution = build_term_contribution(
+        &reader,
+        &inner.options,
+        preallocated_superfile_id,
+        if flat_ids.is_empty() { 0 } else { flat_ids[0] },
+    )
+    .map_err(|e| AppendPhaseError::SuperfileBuild {
+        message: format!("term index contribution: {e}"),
+    })?;
     let scalar_stats =
         ScalarStatsAgg::from_batches(&inner.options.scalar_schema(), &[&scalar_with_id]);
 
@@ -538,6 +551,7 @@ async fn do_apply(
         vec![(storage_key, bytes.clone())],
         Vec::new(),
         CommitListMetadata::empty(),
+        term_contribution.into_iter().collect(),
     )
     .map_err(|e| AppendPhaseError::ManifestCommit(Box::new(e)))?;
 
@@ -1416,7 +1430,7 @@ fn lookup_ids_in_superfile(
         &entry.uri,
         &entry.storage_path(),
         entry.subsection_offsets.as_ref(),
-        true,
+        ReadIntent::Warm,
     )) {
         Ok(r) => r,
         Err(e) => {

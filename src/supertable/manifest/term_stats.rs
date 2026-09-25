@@ -33,12 +33,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    storage::{StorageError, StorageProvider},
-    superfile::{
-        SuperfileReader,
-        fts::dict::{DictBuilder, make_key},
-    },
+    storage::StorageProvider,
+    superfile::SuperfileReader,
     supertable::manifest::{RoutingRef, SuperfileEntry, part::ContentHash},
+    utils::terms::{DictBuilder, make_key},
 };
 
 /// Object-store directory prefix for term-stats artifacts, sibling to
@@ -54,9 +52,6 @@ const HEADER_FIXED_LEN: usize = 8 + 4 + 4;
 /// Terms per `term_dfs` batch while building — bounds the coalesced
 /// header-fetch wave and the per-batch scratch.
 const BUILD_DF_BATCH_TERMS: usize = 8_192;
-/// Multipart threshold for the artifact PUT (same figure the
-/// slow-vector-state blob uses; a term-stats FST is far smaller).
-const STATS_MULTIPART_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum TermStatsError {
@@ -198,20 +193,13 @@ pub(crate) async fn write(
     storage: &dyn StorageProvider,
     bytes: Vec<u8>,
 ) -> Result<RoutingRef, TermStatsError> {
-    let content_hash = ContentHash::of(&bytes);
-    let uri = format!("{STORAGE_PREFIX}stats-{}.bin", content_hash.to_hex());
-    match crate::supertable::writer::put_bytes_multipart_or_atomic(
+    crate::supertable::writer::put_content_addressed(
         storage,
-        &uri,
-        Bytes::from(bytes),
-        STATS_MULTIPART_THRESHOLD_BYTES,
+        |hash| format!("{STORAGE_PREFIX}stats-{}.bin", hash.to_hex()),
+        bytes,
     )
     .await
-    {
-        Ok(()) | Err(StorageError::PreconditionFailed { .. }) => {}
-        Err(e) => return Err(TermStatsError::Storage(e.to_string())),
-    }
-    Ok(RoutingRef { uri, content_hash })
+    .map_err(|e| TermStatsError::Storage(e.to_string()))
 }
 
 /// Fetch + verify + decode the artifact a manifest references.

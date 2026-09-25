@@ -485,7 +485,7 @@ mod tests {
             _ => (Vec::new(), Vec::new()),
         };
         let summary = FtsSummaryAgg::new_with_params(
-            bb.finish(),
+            Some(bb.finish()),
             terms.len() as u32,
             term_range,
             ColumnLengthStats::default(),

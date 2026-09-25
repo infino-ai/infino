@@ -39,6 +39,7 @@ use crate::{
             list::Manifest,
             list_prune::{prune_parts_for_fts_prefix, prune_parts_for_fts_terms},
             part::PartId,
+            term_index::TermIndex,
         },
         query::skip::{
             ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip, null_check_may_match,
@@ -170,6 +171,34 @@ fn scalar_value_set_keep_parts(
     })
 }
 
+/// Per-superfile keep mask for a term or prefix leaf: the index's exact
+/// answer where the superfile is indexed, the manifest-summary answer
+/// (`fallback`) where it is not, or everywhere when there is no index or
+/// it could not answer the leaf.
+async fn with_routing(
+    superfiles: &[Arc<SuperfileEntry>],
+    index: Option<&TermIndex>,
+    leaf: &PruneLeaf,
+    fallback: Vec<bool>,
+) -> Vec<bool> {
+    let Some(index) = index else {
+        return fallback;
+    };
+    let Some(routed) = index.route_leaf(leaf).await else {
+        return fallback;
+    };
+    superfiles
+        .iter()
+        .zip(fallback)
+        .map(
+            |(entry, keep)| match index.is_indexed(&entry.superfile_id) {
+                true => routed.contains(&entry.superfile_id),
+                false => keep,
+            },
+        )
+        .collect()
+}
+
 /// Select the superfiles a predicate could match, newest-first in
 /// manifest order, applying the two prune tiers (part aggregates →
 /// per-superfile summaries). Returns the surviving superfile entries; the
@@ -208,6 +237,11 @@ pub(crate) async fn select_superfiles(
         and_into(&mut mask, &scalar_skip(&superfiles, &scalar_preds));
     }
 
+    // The table-level term index answers term and prefix leaves exactly
+    // for every superfile it lists. A live superfile it does not list was
+    // committed before the index existed; it keeps the manifest-summary
+    // answer. With no index at all, every superfile does.
+    let term_index = manifest.term_index().await;
     for leaf in leaves {
         match leaf {
             PruneLeaf::TermPresence {
@@ -216,13 +250,18 @@ pub(crate) async fn select_superfiles(
                 mode,
             } => {
                 let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+                let summaries = fts_bloom_skip(&superfiles, column, &refs, *mode);
                 and_into(
                     &mut mask,
-                    &fts_bloom_skip(&superfiles, column, &refs, *mode),
+                    &with_routing(&superfiles, term_index.as_deref(), leaf, summaries).await,
                 );
             }
             PruneLeaf::Prefix { column, prefix } => {
-                and_into(&mut mask, &fts_prefix_skip(&superfiles, column, prefix));
+                let summaries = fts_prefix_skip(&superfiles, column, prefix);
+                and_into(
+                    &mut mask,
+                    &with_routing(&superfiles, term_index.as_deref(), leaf, summaries).await,
+                );
             }
             PruneLeaf::ScalarValueSet { column, values } => {
                 and_into(
@@ -355,6 +394,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts,
         }
     }
@@ -498,7 +539,7 @@ mod tests {
         fts.insert(
             "title".to_string(),
             FtsSummaryAgg::new_with_params(
-                bb.finish(),
+                Some(bb.finish()),
                 titles.len() as u32,
                 (mn.as_bytes().to_vec(), mx.as_bytes().to_vec()),
                 ColumnLengthStats::default(),
@@ -613,7 +654,7 @@ mod tests {
         fts.insert(
             "title".to_string(),
             FtsSummaryAgg::new_with_params(
-                bb.finish(),
+                Some(bb.finish()),
                 bloom_tokens.len() as u32,
                 term_range,
                 ColumnLengthStats::default(),

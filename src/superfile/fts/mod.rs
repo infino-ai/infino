@@ -7,10 +7,9 @@
 pub mod analysis;
 pub mod bm25;
 pub mod builder;
-pub mod dict;
-pub(crate) mod fst_value;
 pub(crate) mod positions;
 pub mod posting;
 pub mod reader;
 pub(crate) mod short;
+pub(crate) mod sorted_merge;
 pub mod tokenize;

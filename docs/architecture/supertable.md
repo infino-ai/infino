@@ -201,9 +201,12 @@ reading the superfile bytes:
 identifiers it covers.
 - **Scalar statistics.** Per-column minimum and maximum values for the
 scalar columns, used to skip superfiles for predicate queries.
-- **Full-text summary.** Per text column, a term presence filter (a
-bloom filter over the superfile's terms) and the lexicographic range of
-its terms, used to skip superfiles for term and prefix queries.
+- **Full-text summary.** Per text column, the lexicographic range of
+its terms and the length statistics BM25 scores with. Which superfiles
+hold a given term is not recorded here: that is the table-level term
+index's job (below). A table with no storage attached has no term
+index and records a term presence filter (a bloom filter over the
+superfile's terms) in its place.
 - **Vector summary.** Per vector column, a representative centroid and
 radius, used to order and route vector queries.
 
@@ -233,6 +236,64 @@ their entries. This is the path the flat-iteration query APIs use.
 on first access, so opening a large table does not pull every part
 into memory. Coalesced loading ensures concurrent readers of a cold
 part share a single fetch.
+
+### The term index
+
+Which superfiles contain a term is answered by one table-level
+structure rather than by anything carried per superfile. For every
+`(column, term)` the term index records the superfiles that hold it and,
+for each, the term's document frequency there, an upper bound on the
+BM25 score the term can reach there, and where the term's postings sit
+in that superfile's bytes. One artifact therefore answers the three
+questions the manifest used to answer with three structures: where a
+term lives (formerly a bloom filter per superfile and a union per part,
+both of which saturate on a large table and then prune nothing), how
+often it occurs table-wide (the term-stats sidecar's summed frequency),
+and where its postings are (formerly a copy of every superfile's term
+dictionary inlined into its manifest entry, which was most of a decoded
+manifest's bytes).
+
+The index is looked into, not loaded. A small *root* stays resident: the
+superfiles it covers, each with its smallest document id, and per
+*segment* the key range and content hash of every *slice*. A slice is a
+few megabytes covering one contiguous range of `column`-and-term keys —
+a front-coded block dictionary over a postings region — so a lookup
+binary-searches the root for the one slice that can hold the key,
+fetches it, and reads one block; a prefix scan touches one slice or a
+few adjacent ones. Root and slices are content-addressed and immutable,
+cached on local disk like manifest parts, and kept live by garbage
+collection for as long as a manifest names them.
+
+Every commit publishes its superfiles' postings in the same atomic
+step as their entries: the writer already holds each new superfile's
+terms in memory when it finishes building it, spills them, merges the
+batch into a *delta* segment, writes the slices and a new root, and
+stamps the root's reference on the manifest before the pointer swap.
+So a visible superfile always has postings, a crash between the writes
+and the swap leaves only orphans for garbage collection, and a lost
+race is retried against the winner with re-puts of already-written
+slices as no-ops. A maintenance pass folds every delta into one base
+segment. A posting is followed only if its superfile is still live in
+the reader's manifest, so a removal never invalidates the index.
+
+Queries use it at every tier. Superfile selection for a term or prefix
+is exact for every superfile the index lists. The choice of which
+manifest parts to load goes through it too: routed superfiles' smallest
+ids are matched against each part's recorded id range, so a term in one
+part loads one part and a term in no part loads none. A ranked query
+takes each candidate superfile's score ceiling from the index, opens
+superfiles in descending ceiling order through a window the width of the
+reader pool, and never opens one whose ceiling is below the running
+k-th score — the in-superfile block-max reasoning lifted one level. And
+its cursors are built from the index's recorded postings locations, so
+the superfile's own dictionary is not read on that path.
+
+A table written before the index existed keeps working: its entries
+carry their blooms and the reader routes by them, and its first commit
+under the current writer publishes an index that covers only the new
+superfiles — the manifest marks it incomplete, and part loading keeps
+the summary-based choice until a maintenance pass rebuilds the index
+over every superfile. Nothing requires old code to read a new manifest.
 
 ## Commit pipeline
 
@@ -323,8 +384,13 @@ Skip pruning reads only the manifest summaries, never the superfile
 bytes, and is always conservative: when the manifest cannot prove a
 superfile is irrelevant, the superfile is kept. The pruning inputs are:
 
-- **Term queries** use each superfile's term presence filter.
-- **Prefix queries** use each superfile's lexicographic term range.
+- **Term queries** use the table-level term index, which names the
+  superfiles holding each term exactly (a superfile the index does not
+  list — one written before it existed, or on a table with no storage —
+  is tested against its own term presence filter instead).
+- **Prefix queries** scan the term index's slices for the prefix; a
+  superfile the index does not list is tested against its lexicographic
+  term range.
 - **Predicate (SQL) queries** use the per-column scalar statistics
   (min/max and null count). `=` / `IN` / same-column `OR` prune on
   min/max; `IS NULL` / `IS NOT NULL` prune on the null count — an
@@ -370,7 +436,7 @@ nothing. The functions report their filters as inexact, so the
 planner both hands them the predicate and re-checks it above them,
 and each function narrows its search in three tiers. The manifest
 statistics prune superfiles first, with the same leaves a plain scan
-uses (scalar min/max, value sets, term blooms, null counts), so
+uses (scalar min/max, value sets, term-index routing, null counts), so
 `WHERE path = 'x'` on a column with no full-text index still opens
 only the superfiles whose `path` range can hold `x`. Where the
 predicate is on an FTS-indexed column, the candidate plan resolves it

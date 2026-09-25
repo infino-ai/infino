@@ -166,6 +166,12 @@ impl BlockCachedSource {
         Arc::ptr_eq(&self.entry_token, token)
     }
 
+    /// Whether this source charges the budget for the blocks it fills, rather than riding on its
+    /// owning entry's reservation.
+    pub(crate) fn owns_accounting(&self) -> bool {
+        self.owns_accounting
+    }
+
     /// Shared filled-bytes counter, installed as the cache entry's
     /// `size_bytes` so accounting and eviction see live growth.
     pub(crate) fn filled_bytes_handle(&self) -> Arc<AtomicU64> {
@@ -249,10 +255,29 @@ impl BlockCachedSource {
         serialize_index(&filled)
     }
 
-    /// Write a pre-serialized index snapshot, only after its blocks are durable.
-    fn persist_idx(&self, snapshot: &[u8]) {
-        if !self.path.exists() {
-            return;
+    /// Write a pre-serialized index snapshot, only after its blocks are durable
+    /// AND only while `self.path` still names THIS source's own data inode.
+    ///
+    /// The shared, generation-less `.blocks` / `.blocks.idx` paths mean a later
+    /// generation can unlink our data file and publish a fresh inode (all holes)
+    /// at the same path while we are still alive. A plain `path.exists()` guard
+    /// then lets a dropped or superseded generation rename its own filled-block
+    /// bitmap onto the successor's inode — over-claiming that inode's holes. A
+    /// subsequent `try_adopt` trusts the stale bitmap and preads zeros where a
+    /// Parquet page-index (ColumnIndex) tag belongs, so the decode fails with
+    /// `Required field null_pages is missing`. Comparing inodes keeps the
+    /// persisted index faithful to whatever data file the path currently names.
+    fn persist_idx(&self, bf: &BlockFile, snapshot: &[u8]) {
+        use std::os::unix::fs::MetadataExt;
+        let own = match bf.file.metadata() {
+            Ok(meta) => meta.ino(),
+            Err(_) => return,
+        };
+        match fs::metadata(&self.path) {
+            Ok(meta) if meta.ino() == own => {}
+            // Path is gone or now names another generation's inode — never
+            // stamp our bitmap onto it.
+            _ => return,
         }
         let idx = self.idx_path();
         let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -403,7 +428,7 @@ impl BlockCachedSource {
         if filled_any {
             let snapshot = self.snapshot_index();
             if bf.file.sync_data().is_ok() {
-                self.persist_idx(&snapshot);
+                self.persist_idx(bf, &snapshot);
             }
         }
         Ok(true)
@@ -438,7 +463,7 @@ impl Drop for BlockCachedSource {
             if filled > 0 {
                 let snapshot = self.snapshot_index();
                 if bf.file.sync_data().is_ok() {
-                    self.persist_idx(&snapshot);
+                    self.persist_idx(bf, &snapshot);
                 }
             }
         }
@@ -905,6 +930,89 @@ mod tests {
         assert_eq!(
             a_again, want,
             "live reader A must still serve its cached bytes, not zeros"
+        );
+    }
+
+    /// A superseded generation's `.blocks.idx` must never over-claim a
+    /// SUCCESSOR generation's data inode. This is the sibling of the
+    /// truncate race above: `#489` stopped a refetch from truncating a held
+    /// inode by giving each generation a fresh inode; but a dropped
+    /// generation still stamps its own filled-block bitmap onto the shared
+    /// `.blocks.idx` path — which, after eviction + refetch, now names a
+    /// DIFFERENT inode whose corresponding blocks are holes. A later
+    /// generation then `try_adopt`s that data file on a size-match alone,
+    /// trusts the stale bitmap, and preads zeros where a Parquet page-index
+    /// (ColumnIndex) tag belongs → `Required field null_pages is missing`.
+    ///
+    /// Interleaving: A (gen1) fills block b onto inode X and persists idx
+    /// {b}. Eviction unlinks the files (X stays alive under A). B (gen2)
+    /// cold-opens → fresh inode Y (holes), fills a DISJOINT block, persists
+    /// idx {other}. A drops and persists {b} — over Y's path. D (gen3)
+    /// adopts Y (size matches) with bitmap {b} and reads block b → zeros.
+    /// Fails today; passes once `persist_idx` fences its write to its own
+    /// data inode.
+    #[tokio::test]
+    async fn dropped_generation_idx_must_not_overclaim_successor_inode() {
+        const OBJ: usize = 4 * CACHE_BLOCK_BYTES as usize + 1000;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let uri = SuperfileUri::new_v4();
+        let path = dir.path().join("shared.blocks");
+
+        // Gen1 A fills block 0 (covering `start`), persists idx {0} onto inode X.
+        let inner_a = Arc::new(CountingSource::new(OBJ));
+        let a = BlockCachedSource::new(
+            Arc::clone(&inner_a) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(&store),
+            uri,
+            path.clone(),
+        );
+        store.install_block_entry_for_test(uri, Arc::clone(&a));
+        let start = 100u64;
+        let len = CACHE_BLOCK_BYTES; // block 0 (and a sliver of 1)
+        let want = inner_a.blob.slice(start as usize..(start + len) as usize);
+        assert_eq!(a.range(start, len).await.expect("A fill"), want);
+
+        // Real eviction: drop the catalog entry AND unlink the on-disk files,
+        // so the next generation cannot adopt them and gets a FRESH inode. A
+        // survives (held by an in-flight scan) with inode X open.
+        store.remove_block_entry_for_test(&uri);
+        let idx_path = a.idx_path();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&idx_path);
+
+        // Gen2 B cold-opens: try_adopt fails (files gone) → fresh inode Y, all
+        // holes. It fills a DISJOINT trailing block and persists idx {3} for Y.
+        let inner_b = Arc::new(CountingSource::new(OBJ));
+        let b = BlockCachedSource::new(
+            Arc::clone(&inner_b) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(&store),
+            uri,
+            path.clone(),
+        );
+        store.install_block_entry_for_test(uri, Arc::clone(&b));
+        let tail = 3 * CACHE_BLOCK_BYTES + 10;
+        let _ = b.range(tail, 50).await.expect("B fill disjoint block");
+
+        // A drops → persists its {0} bitmap. WITHOUT the inode fence this
+        // renames {0} onto `.blocks.idx`, which now names Y (block 0 = hole).
+        drop(a);
+
+        // Gen3 D cold-opens → try_adopt(size) accepts Y (len matches) with the
+        // over-claimed bitmap {0}, then serves block 0 from a hole = zeros.
+        let inner_d = Arc::new(CountingSource::new(OBJ));
+        let d = BlockCachedSource::new(
+            Arc::clone(&inner_d) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(&store),
+            uri,
+            path.clone(),
+        );
+        store.install_block_entry_for_test(uri, Arc::clone(&d));
+        let d_read = d.range(start, len).await.expect("D read");
+        assert_eq!(
+            d_read, want,
+            "D must serve real bytes, not zeros from a successor inode's hole \
+             claimed by a dropped generation's stale bitmap"
         );
     }
 

@@ -14,10 +14,13 @@
 //!      path; no syscalls.
 //!   2. **Disk cache fallback.** Miss in the in-memory tier
 //!      AND a `DiskCacheStore` is attached →
-//!      `DiskCacheStore::reader(uri)` (`await`ed directly).
+//!      `DiskCacheStore::open_for_query(uri, ...)` (`await`ed directly).
 //!      The cache itself handles cold-fetch from object
 //!      storage, pwrite to the local cache directory, and
-//!      mmap.
+//!      mmap, and degrades to an uncached range-only reader
+//!      when the superfile cannot be admitted (larger than
+//!      the whole budget), so a budget miss never fails the
+//!      query.
 //!   3. **No cache.** Miss in the in-memory tier and no
 //!      cache attached → surface the in-memory tier's
 //!      `ReaderCacheError::NotFound`. The in-process-only
@@ -39,7 +42,8 @@ use crate::{
     supertable::{
         manifest::{SubsectionOffsets, SuperfileUri},
         reader_cache::{
-            DiskCacheStore, ReaderCacheError, SuperfileReaderCache, disk::DiskCacheError,
+            DiskCacheStore, ReadIntent, ReaderCacheError, SuperfileReaderCache,
+            disk::DiskCacheError,
         },
     },
 };
@@ -49,11 +53,9 @@ use crate::{
 /// configured. See the module-level docs for the precise
 /// policy.
 ///
-/// `storage_key` is the object key the superfile's bytes live at — the
-/// manifest entry's `storage_path()`, which carries a source stem when the
-/// superfile was ingested with one. It is passed alongside `uri` rather
-/// than re-derived from it because a named superfile's key is not a
-/// function of its uuid; `uri` still keys every cache tier.
+/// `storage_key` is the object key the bytes live at (the manifest entry's
+/// `storage_path()`); [`DiskCacheStore::open_for_query`] says why it travels
+/// beside `uri`.
 ///
 /// `offsets` is an optional pre-known layout hint
 /// pulled from the manifest's [`SubsectionOffsets`]. When `Some`
@@ -62,6 +64,8 @@ use crate::{
 /// (1 RTT cold open) instead of doing the parquet footer first
 /// and the subsection fetches second (2 RTTs). `None` falls back
 /// to the 2-RTT path — same shape, slower.
+///
+/// `intent` is the read policy; see [`ReadIntent`].
 pub async fn superfile_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
@@ -69,7 +73,7 @@ pub async fn superfile_reader(
     uri: &SuperfileUri,
     storage_key: &str,
     offsets: Option<&SubsectionOffsets>,
-    allow_background_fill: bool,
+    intent: ReadIntent,
 ) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
     // 1. In-memory tier.
     match store.reader(uri) {
@@ -80,24 +84,13 @@ pub async fn superfile_reader(
         Err(other) => return Err(other),
     }
 
-    // 2. Disk cache fallback (when attached).
+    // 2. Disk cache, when attached. It streams uncached when it cannot admit
+    //    the file, so a budget miss never fails here.
     if let Some(cache) = disk_cache {
-        match cache
-            .reader_with_hints(uri, storage_key, offsets, storage, allow_background_fill)
+        return cache
+            .open_for_query(uri, storage_key, offsets, storage, intent)
             .await
-        {
-            Ok(reader) => return Ok(reader),
-            // Cache can't admit this superfile (e.g. it's larger than the
-            // whole budget). Stream it directly via range GETs instead
-            // of failing the query.
-            Err(DiskCacheError::BudgetExceeded) => {
-                return cache
-                    .open_range_only(storage_key, offsets, storage)
-                    .await
-                    .map_err(cache_open_failed);
-            }
-            Err(e) => return Err(cache_open_failed(e)),
-        }
+            .map_err(cache_open_failed);
     }
 
     // 3. Storage-only fallback. This covers reopened LocalFs/S3
@@ -151,8 +144,8 @@ mod tests {
     const N_DOCS: u64 = 3;
 
     /// A `disk_budget_bytes` smaller than any real superfile, so the
-    /// disk cache rejects admission with `BudgetExceeded` and the
-    /// caller is forced down the `open_range_only` fallback.
+    /// disk cache rejects admission with `BudgetExceeded` and
+    /// `open_for_query` degrades to its range-only fallback.
     const TINY_BUDGET_BYTES: u64 = 4;
 
     /// Build minimal valid superfile bytes (parquet body + KV metadata
@@ -219,9 +212,17 @@ mod tests {
 
         // No disk cache, no storage attached: if the in-memory tier is
         // consulted first (it is), neither fallback is needed.
-        let reader = superfile_reader(&store, None, None, &uri, &uri.storage_path(), None, true)
-            .await
-            .expect("in-memory hit");
+        let reader = superfile_reader(
+            &store,
+            None,
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("in-memory hit");
         assert_eq!(reader.n_docs(), N_DOCS);
     }
 
@@ -263,7 +264,7 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect_err("in-memory error must propagate");
@@ -290,7 +291,7 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect("disk cache cold fetch");
@@ -316,7 +317,7 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect("range-only fallback on budget exceeded");
@@ -338,7 +339,7 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect_err("missing storage object must error");
@@ -365,7 +366,7 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect("storage-only fallback");
@@ -386,7 +387,7 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect_err("missing object must error");
@@ -408,7 +409,7 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect_err("in-process-only miss must be NotFound");

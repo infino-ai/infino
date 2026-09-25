@@ -35,12 +35,11 @@ use crate::{
         format,
         fts::{
             bm25,
-            dict::make_key,
-            fst_value::FstValue,
             posting::{BLOCK_LEN, BlockHeader, decode_block},
             short::{decode_short, short_df},
         },
     },
+    utils::terms::{FstValue, make_key},
 };
 
 /// One scored term's open-wave fetch result: the dictionary resolution
@@ -75,6 +74,17 @@ pub(crate) struct FetchedTermMemo {
 }
 
 impl FetchedTermMemo {
+    /// A memo from slots resolved elsewhere — by the open wave, or from a
+    /// table-level term index that already knows where each term's
+    /// postings sit, so the cursor build needs no dictionary at all.
+    pub(crate) fn from_slots(
+        slots: impl IntoIterator<Item = (Box<str>, Option<FetchedTermSlot>)>,
+    ) -> Self {
+        Self {
+            map: slots.into_iter().collect(),
+        }
+    }
+
     /// `Some(entry)` when the open wave resolved this term (entry `None`
     /// = absent from this superfile); `None` when the term was not part
     /// of the fetch (e.g. a negated term — unscored, never gathered).
@@ -84,6 +94,20 @@ impl FetchedTermMemo {
 
     fn contains(&self, term: &str) -> bool {
         self.map.contains_key(term)
+    }
+
+    /// Whether every one of `terms` was resolved into this memo — the
+    /// condition under which a cursor build needs no dictionary at all.
+    pub(crate) fn covers(&self, terms: &[&str]) -> bool {
+        terms.iter().all(|t| self.contains(t))
+    }
+
+    /// Record `term` as resolved absent from this superfile, unless the
+    /// memo already holds it: a caller that knows the term has no postings
+    /// here (a table-level term index lists none) spares the cursor build
+    /// a dictionary read that would only confirm the absence.
+    pub(crate) fn note_absent(&mut self, term: &str) {
+        self.map.entry(Box::from(term)).or_insert(None);
     }
 
     /// This superfile's df contribution per term (0 for a miss or an
@@ -127,6 +151,56 @@ fn seed_blocks_for(k: usize) -> usize {
 }
 
 impl FtsReader {
+    /// Build a [`FetchedTermMemo`] for `terms` whose dictionary values are
+    /// already known — from a table-level term index — fetching only the
+    /// postings ranges those values name, never the dictionary. A value
+    /// whose length is unknown is left out and resolves through the
+    /// dictionary as usual.
+    pub(crate) async fn memo_from_dict_values(
+        &self,
+        terms: &[(&str, u64, FstValue)],
+    ) -> Result<FetchedTermMemo, FtsError> {
+        let mut ranges: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut order: Vec<(usize, u64, bool)> = Vec::new();
+        let mut slots: Vec<(Box<str>, Option<FetchedTermSlot>)> = Vec::with_capacity(terms.len());
+        for (i, (term, df, value)) in terms.iter().enumerate() {
+            match value {
+                FstValue::Inline { doc_id, tf } => slots.push((
+                    Box::from(*term),
+                    Some(FetchedTermSlot::Inline {
+                        doc_id: *doc_id,
+                        tf: *tf,
+                    }),
+                )),
+                FstValue::Pfor {
+                    metadata_offset,
+                    postings_length_hint: Some(len),
+                    short,
+                } => {
+                    ranges.push((*metadata_offset as usize, Some(*len as usize)));
+                    order.push((i, *df, *short));
+                }
+                FstValue::Pfor {
+                    postings_length_hint: None,
+                    ..
+                } => {}
+            }
+        }
+        let fetched = self.fetch_term_postings(&ranges).await?;
+        for ((i, df, short), bytes) in order.into_iter().zip(fetched) {
+            slots.push((
+                Box::from(terms[i].0),
+                Some(FetchedTermSlot::Pfor {
+                    bytes,
+                    header_probed: false,
+                    df,
+                    short,
+                }),
+            ));
+        }
+        Ok(FetchedTermMemo::from_slots(slots))
+    }
+
     /// Ranked search over heterogeneous atoms — the walk every
     /// phrase-bearing query takes. With musts, the match set is their
     /// intersection and shoulds are scoring-only (the clause model);
@@ -152,7 +226,7 @@ impl FtsReader {
         floor_eff: f32,
         live_floor: Option<&LiveFloor>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1;
+        let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1();
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         // The strict-below admission cutoff, refreshed from the live
@@ -1065,7 +1139,7 @@ impl FtsReader {
                 {
                     return Ok((Vec::new(), MatchWork::default(), 0));
                 }
-                let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
+                let dl_norm_k1 = col_meta.dl_norm_k1().get(doc_id);
                 let score = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1);
                 if score <= floor_eff {
                     return Ok((Vec::new(), MatchWork::default(), 0));
@@ -1091,7 +1165,7 @@ impl FtsReader {
                         })?;
                 let idf_weight = global_idf
                     .unwrap_or_else(|| bm25::idf(col_meta.scored_doc_count(), decoded.n as u64));
-                let dl_norm_k1 = &col_meta.dl_norm_k1;
+                let dl_norm_k1 = col_meta.dl_norm_k1();
                 let mut heap: BinaryHeap<TopKEntry> =
                     BinaryHeap::with_capacity(k.min(decoded.n).max(1));
                 for j in 0..decoded.n {
@@ -1154,7 +1228,7 @@ impl FtsReader {
         // same idf and statistics the scores below use, so the skip tests
         // compare like with like. See `BoundDecoder`.
         let bounds = BoundDecoder::new(self.bounds, col_meta, idf_t, local_idf);
-        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let dl_norm_k1 = col_meta.dl_norm_k1();
 
         // Top-k min-heap; see `TopKEntry` for the reversed ordering
         // that makes `peek()` the current kth-best score.
@@ -1533,6 +1607,11 @@ impl FtsReader {
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<Vec<Option<TermCursor>>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
+        // Scoring needs the column's norms; a match-only build does not,
+        // and must not read the length array for them.
+        if !count_only {
+            self.ensure_norms(column_id).await?;
+        }
 
         // Resolve each term to an inline (df=1) value, a PFOR metadata
         // offset, or a miss — preserving query order and arity (a miss is a
@@ -1632,14 +1711,18 @@ impl FtsReader {
                         true => 1,
                         false => tf,
                     };
-                    let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
+                    // A match-only cursor never scores; a fixed idf keeps it
+                    // from consulting the column's statistics or norms.
+                    let (n_scored, dl_norm_k1, gidf) = match count_only {
+                        true => (0, 1.0, Some(0.0)),
+                        false => (
+                            col_meta.scored_doc_count(),
+                            col_meta.dl_norm_k1().get(doc_id),
+                            gidf,
+                        ),
+                    };
                     cursors.push(Some(TermCursor::new_inline(
-                        doc_id,
-                        tf,
-                        col_meta.scored_doc_count(),
-                        dl_norm_k1,
-                        gidf,
-                        weight,
+                        doc_id, tf, n_scored, dl_norm_k1, gidf, weight,
                     )));
                 }
                 Some(Resolved::Memo {
@@ -1653,9 +1736,14 @@ impl FtsReader {
                     gidf,
                 }) => {
                     let cursor = match short {
-                        true => {
-                            TermCursor::new_short(bytes, col_meta, gidf, weight, header_probed)?
-                        }
+                        true => TermCursor::new_short(
+                            bytes,
+                            col_meta,
+                            gidf,
+                            weight,
+                            header_probed,
+                            count_only,
+                        )?,
                         false => TermCursor::new(
                             bytes,
                             col_meta,
@@ -1679,15 +1767,18 @@ impl FtsReader {
                         true => 1,
                         false => tf,
                     };
-                    let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
-                    let cursor = TermCursor::new_inline(
-                        doc_id,
-                        tf,
-                        col_meta.scored_doc_count(),
-                        dl_norm_k1,
-                        gidf,
-                        weight,
-                    );
+                    // A match-only cursor never scores; a fixed idf keeps it
+                    // from consulting the column's statistics or norms.
+                    let (n_scored, dl_norm_k1, gidf) = match count_only {
+                        true => (0, 1.0, Some(0.0)),
+                        false => (
+                            col_meta.scored_doc_count(),
+                            col_meta.dl_norm_k1().get(doc_id),
+                            gidf,
+                        ),
+                    };
+                    let cursor =
+                        TermCursor::new_inline(doc_id, tf, n_scored, dl_norm_k1, gidf, weight);
                     cursors.push(Some(cursor));
                 }
                 Some(Resolved::Pfor {
@@ -1703,6 +1794,7 @@ impl FtsReader {
                             gidf,
                             weight,
                             header_probed,
+                            count_only,
                         )?,
                         false => TermCursor::new(
                             term_bytes,

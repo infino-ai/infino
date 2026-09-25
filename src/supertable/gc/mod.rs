@@ -19,6 +19,7 @@ use crate::{
         manifest::{
             SUPERFILE_DATA_DIR, SuperfileUri,
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
+            term_index::{self, STORAGE_PREFIX as TERM_INDEX_STORAGE_PREFIX},
             term_stats::STORAGE_PREFIX as TERM_STATS_STORAGE_PREFIX,
         },
         slow_vector_state::{self, STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX},
@@ -187,6 +188,27 @@ async fn live_set(
         }
     }
 
+    // The term index: the root the list references, and every slice that
+    // root names — which takes reading the root, one small object. A root
+    // that cannot be read is a permanent failure on that URI, surfaced the
+    // same way as an unreadable slow-state blob: deleting slices we could
+    // not enumerate would be exactly the loss this sweep exists to prevent.
+    if let Some(reference) = manifest.term_index_ref() {
+        uris.insert(reference.uri.clone());
+        let root = term_index::load_root(storage.as_ref(), reference)
+            .await
+            .map_err(|error| {
+                GcError::Storage(StorageError::Permanent {
+                    uri: reference.uri.clone(),
+                    source: Box::new(error),
+                })
+            })?;
+        for segment in &root.segments {
+            for slice in &segment.slices {
+                uris.insert(term_index::slice_uri(&slice.content_hash));
+            }
+        }
+    }
     Ok(LiveSet {
         uris,
         superfiles_complete,
@@ -227,6 +249,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
         MANIFEST_PARTS_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
         TERM_STATS_STORAGE_PREFIX,
+        TERM_INDEX_STORAGE_PREFIX,
         // Tombstone sidecars under `superfiles/` (live set includes the
         // paths for current superfiles; orphans age out past the safety gap).
         SUPERFILES_DIR,
@@ -481,6 +504,8 @@ mod tests {
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
                 term_stats: None,
+                term_index: None,
+                term_index_complete: false,
                 parts: vec![ManifestPartEntry {
                     part_id,
                     uri: format!("manifest-parts/part-{part_id}.avro.zst"),
@@ -558,6 +583,8 @@ mod tests {
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
                 term_stats: None,
+                term_index: None,
+                term_index_complete: false,
                 parts: Vec::new(),
             }),
         );
@@ -627,6 +654,8 @@ mod tests {
                     content_hash: centroid_graph_hash,
                 }),
                 term_stats: None,
+                term_index: None,
+                term_index_complete: false,
                 parts: Vec::new(),
             }),
         );

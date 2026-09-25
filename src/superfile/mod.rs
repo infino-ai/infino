@@ -27,7 +27,6 @@ pub(crate) mod ids;
 pub mod lazy_source;
 pub mod reader;
 pub mod stats;
-pub(crate) mod varint;
 pub mod vector;
 
 pub use error::{BuildError, FtsError, ReadError, VectorError};

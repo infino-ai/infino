@@ -60,7 +60,10 @@ use crate::{
             scalar_cache::DecodedScalarCache,
             sql::{SqlSchemas, build_sql_schemas},
         },
-        reader_cache::disk::{DiskCacheError, skip_background_fill},
+        reader_cache::{
+            ReadIntent,
+            disk::{DiskCacheError, skip_background_fill},
+        },
         stats::process_rss_bytes,
         tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
         utils::idgen::IdGenerator,
@@ -928,7 +931,10 @@ impl Supertable {
     /// artifact describes the post-merge superfile set.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn refresh_term_stats_sync(&self) -> Result<(), BuildError> {
-        self.block_on_query(super::writer::stamp_term_stats(&self.inner))
+        self.block_on_query(async {
+            super::writer::stamp_term_stats(&self.inner).await?;
+            super::writer::stamp_term_index(&self.inner).await
+        })
     }
 
     /// Route undrained user superfiles into the hidden per-cell index. Not part
@@ -1376,7 +1382,7 @@ impl Supertable {
                             &uri,
                             &storage_key,
                             offsets.as_ref(),
-                            true,
+                            ReadIntent::Warm,
                         )
                         .await
                     }.in_current_span())
@@ -1421,7 +1427,7 @@ impl Supertable {
                         &uri,
                         &storage_key,
                         offsets.as_ref(),
-                        true,
+                        ReadIntent::Warm,
                     )
                     .await
                     .map_err(|e| e.to_string())?;
@@ -2138,7 +2144,7 @@ impl SupertableReader {
             &entry.uri,
             &entry.storage_path(),
             entry.subsection_offsets.as_ref(),
-            true,
+            ReadIntent::Stream,
         ))
     }
     }
@@ -2419,7 +2425,7 @@ mod tests {
                 manifest.options.disk_cache.as_ref(),
                 manifest.options.storage.as_ref(),
                 &entry,
-                true,
+                ReadIntent::Warm,
             ))
             .expect("open superfile");
             let vector = reader.vec().expect("vector reader");
@@ -6196,6 +6202,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 list_metadata,
+                Vec::new(),
             ))
             .expect("plant stale law");
         hidden.inner().manifest.store(Arc::new(planted_manifest));
@@ -6394,6 +6401,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 list_metadata,
+                Vec::new(),
             ))
             .expect("plant stale law");
         hidden.inner().manifest.store(Arc::new(planted_manifest));
@@ -6469,6 +6477,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 zero_metadata,
+                Vec::new(),
             ))
             .expect("plant zero law");
         hidden.inner().manifest.store(Arc::new(zero_manifest));
@@ -6673,6 +6682,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 list_metadata,
+                Vec::new(),
             ))
             .expect("plant cleared law");
         hidden.inner().manifest.store(Arc::new(planted_manifest));
@@ -6853,6 +6863,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 list_metadata,
+                Vec::new(),
             ))
             .expect("plant cleared law");
         hidden.inner().manifest.store(Arc::new(planted_manifest));

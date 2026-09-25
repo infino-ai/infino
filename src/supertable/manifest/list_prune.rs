@@ -37,6 +37,7 @@ use crate::{
     supertable::manifest::{
         list::{Manifest, ManifestPartEntry},
         part::PartId,
+        term_range::prefix_upper_bound,
     },
 };
 
@@ -82,27 +83,6 @@ fn part_overlaps_prefix(
         return false;
     }
     !matches!(upper, Some(u) if min_term.as_slice() >= u)
-}
-
-/// Compute the lex-upper-bound for a prefix: the smallest
-/// byte string that doesn't start with `prefix`. `None`
-/// signals "no upper bound" (e.g., a prefix of all 0xFF
-/// bytes — every byte string starts with that or has no
-/// successor in lex order).
-///
-/// `[prefix, prefix_upper_bound())` is the set of all byte
-/// strings starting with `prefix`.
-fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut out = prefix.to_vec();
-    while let Some(&b) = out.last() {
-        if b == 0xff {
-            out.pop();
-        } else {
-            *out.last_mut().expect("non-empty") = b + 1;
-            return Some(out);
-        }
-    }
-    None
 }
 
 /// Filter the list's parts to those whose
@@ -206,14 +186,6 @@ mod tests {
         },
     };
 
-    #[test]
-    fn prefix_upper_bound_basic() {
-        assert_eq!(prefix_upper_bound(b"abc"), Some(b"abd".to_vec()));
-        assert_eq!(prefix_upper_bound(b"ab\xff"), Some(b"ac".to_vec()));
-        assert_eq!(prefix_upper_bound(b"\xff\xff"), None);
-        assert_eq!(prefix_upper_bound(b""), None);
-    }
-
     // ---- Helpers for the aggregates::compute and
     //      prune_parts_for_* tests below.
 
@@ -244,7 +216,7 @@ mod tests {
             fts.insert(
                 "title".into(),
                 FtsSummaryAgg::new_with_params(
-                    bloom.finish(),
+                    Some(bloom.finish()),
                     title_terms.len() as u32,
                     term_range,
                     ColumnLengthStats::default(),
@@ -321,6 +293,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: entries,
         }
     }
@@ -355,7 +329,7 @@ mod tests {
         empty_fts.insert(
             "title".into(),
             FtsSummaryAgg::new_with_params(
-                BloomBuilder::with_n_blocks(16).finish(),
+                Some(BloomBuilder::with_n_blocks(16).finish()),
                 0,
                 (Vec::new(), Vec::new()),
                 ColumnLengthStats::default(),
@@ -392,7 +366,7 @@ mod tests {
         empty_fts.insert(
             "title".into(),
             FtsSummaryAgg::new_with_params(
-                BloomBuilder::with_n_blocks(16).finish(),
+                Some(BloomBuilder::with_n_blocks(16).finish()),
                 0,
                 (Vec::new(), Vec::new()),
                 ColumnLengthStats::default(),

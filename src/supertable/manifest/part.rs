@@ -1100,7 +1100,7 @@ mod tests {
             builder.insert(key.as_bytes());
         }
         FtsSummaryAgg::new_with_params(
-            builder.finish(),
+            Some(builder.finish()),
             n_terms,
             range,
             ColumnLengthStats::default(),

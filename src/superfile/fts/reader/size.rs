@@ -15,20 +15,22 @@ use super::{
     core::{FtsReader, fetch_source_range, header_postings_length},
     cursor::{SubindexKind, TermMeta},
 };
-use crate::superfile::{
-    ReadError,
-    bits::width_of,
-    error::FtsError,
-    format::{self, FST_SEPARATOR, fts::POSITION_SUBINDEX_ENTRIES_PER_BLOCK},
-    fts::{
-        builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
-        fst_value::FstValue,
-        posting::{
-            BLOCK_LEN, BlockHeader, ENCODING_PACKED, ENCODING_PATCHED, decode_block,
-            patched_exception_ranges,
+use crate::{
+    superfile::{
+        ReadError,
+        bits::width_of,
+        error::FtsError,
+        format::{self, FST_SEPARATOR, fts::POSITION_SUBINDEX_ENTRIES_PER_BLOCK},
+        fts::{
+            builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
+            posting::{
+                BLOCK_LEN, BlockHeader, ENCODING_PACKED, ENCODING_PATCHED, decode_block,
+                patched_exception_ranges,
+            },
+            short::{decode_short, short_df},
         },
-        short::{decode_short, short_df},
     },
+    utils::terms::FstValue,
 };
 
 /// Upper edges of the document-frequency bands a term is filed under.

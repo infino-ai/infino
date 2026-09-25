@@ -5,12 +5,17 @@
 //! make room, and the idle-page sweeps that trim resident memory.
 
 use std::{
-    fs,
+    fs, mem,
     sync::{Arc, atomic::Ordering},
 };
 
+use dashmap::mapref::entry::Entry;
 use memmap2::{Mmap, UncheckedAdvice};
 
+#[cfg(test)]
+use crate::supertable::reader_cache::{
+    block_source::BlockCachedSource, disk::test_support::tiny_superfile_bytes,
+};
 use crate::supertable::{
     manifest::SuperfileUri,
     reader_cache::{config::EvictionCandidate, disk::*},
@@ -90,14 +95,17 @@ impl DiskCacheStore {
         n_advised
     }
 
-    /// Drop idle lazy (`Residency::Paged`) entries from the cache.
+    /// Drop idle entries that hold no mmap: lazy (`Residency::Paged`) ones,
+    /// and `Buffered` ones a hybrid fetch has not finalized yet.
     ///
-    /// A lazy reader's cost is anonymous heap — the open-time ranges its
-    /// source holds — and `madvise` cannot touch that, so the mmap sweep
-    /// above sees nothing to do for these entries and their memory
+    /// Their cost is anonymous heap, which `madvise` cannot touch, so the
+    /// mmap sweep above sees nothing to do for them and their memory
     /// accumulates with every superfile a process has ever opened.
     /// Dropping the entry releases it: the cache holds the last `Arc`,
-    /// and the next reader for that URI re-opens.
+    /// and the next reader for that URI re-opens. Its budget is released
+    /// with it, since a Warm lazy or buffered entry is charged its full
+    /// size at open. A background fill still running for it sees the
+    /// reader gone and stops at its next chunk.
     ///
     /// Only entries the cache alone holds are dropped. A reader a query
     /// is still using has a live `Arc`, so removing it from the map would
@@ -120,8 +128,12 @@ impl DiskCacheStore {
             // Re-check under the shard guard: a query may have taken a
             // reference since the snapshot, in which case dropping the
             // entry would free nothing and cost that query a re-open.
-            self.cached
-                .remove_if(&uri, |_, entry| reclaimable_lazy_entry(entry));
+            if let Some((_, removed)) = self
+                .cached
+                .remove_if(&uri, |_, entry| reclaimable_lazy_entry(entry))
+            {
+                self.release_entry_accounting(&removed);
+            }
         }
     }
 
@@ -289,15 +301,9 @@ impl DiskCacheStore {
         freed
     }
 
-    /// Same as [`Self::reserve`] but returns just the
-    /// reserved-bytes count instead of a borrow-lifetimed
-    /// guard. Caller is responsible for either committing
-    /// (no-op — the bytes stay reserved as part of a cached
-    /// entry) or rolling back via
-    /// `self.current_bytes.fetch_sub(bytes, Release)` on
-    /// failure. Used by the hybrid cold-fetch path where the
-    /// reservation outlives the borrow on `&self` via a
-    /// `tokio::spawn`-ed background finalizer.
+    /// Reserve `bytes`, evicting as needed, with no guard: the bytes stay reserved until the caller
+    /// releases them ([`Self::release_block_bytes`]) or hands them to an admitted entry. For a
+    /// reservation that outlives a borrow of `self`, such as a background fill's.
     pub(crate) async fn reserve_manual(&self, bytes: u64) -> Result<(), DiskCacheError> {
         loop {
             let budget = self.disk_budget_bytes();
@@ -322,6 +328,17 @@ impl DiskCacheStore {
         self.reserve_manual(bytes).await
     }
 
+    /// Reserve `bytes` only if the budget has room now, never evicting. For a caller that cannot
+    /// wait, such as an install under a shard lock.
+    pub(crate) fn try_reserve_without_evicting(&self, bytes: u64) -> bool {
+        let budget = self.disk_budget_bytes();
+        self.current_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                cur.checked_add(bytes).filter(|&next| next <= budget)
+            })
+            .is_ok()
+    }
+
     /// Release previously reserved block-cache bytes.
     pub(crate) fn release_block_bytes(&self, bytes: u64) {
         self.current_bytes.fetch_sub(bytes, Ordering::Release);
@@ -343,67 +360,51 @@ impl DiskCacheStore {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_block_entry_for_test(
+    /// Put `entry` in the cache under `uri`. Every admission goes through here, so when admissions
+    /// race on a URI (a compaction read and a query open, two disk reuses) two rules hold:
+    ///
+    /// 1. A lazy entry never replaces a whole file. It is dropped, its budget released, and the
+    ///    whole file is returned instead.
+    /// 2. Whatever is replaced has its budget released, so a lost race leaves no bytes charged.
+    ///
+    /// Returns the entry now in the slot. Callers serve that, not what they passed in.
+    pub(crate) fn admit_entry(
         &self,
         uri: SuperfileUri,
-        block_source: Arc<crate::supertable::reader_cache::block_source::BlockCachedSource>,
-    ) {
-        let reader = SuperfileReader::open(
-            crate::supertable::reader_cache::disk::test_support::tiny_superfile_bytes(),
-        )
-        .expect("tiny superfile opens");
-        let size_bytes = block_source.filled_bytes_handle();
-        self.cached.insert(
-            uri,
-            Arc::new(CachedEntry {
-                reader: Arc::new(reader),
-                residency: Residency::Paged {
-                    block_source,
-                    fill_spawned: AtomicBool::new(false),
-                },
-                size_bytes,
-                accounting: EntryAccounting::SourceOwned,
-                last_access_us: AtomicU64::new(self.now_us()),
-            }),
-        );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn remove_block_entry_for_test(&self, uri: &SuperfileUri) {
-        let _ = self.cached.remove(uri);
-    }
-
-    /// Reserve `bytes` of disk budget via CAS-loop on
-    /// `current_bytes`. On budget pressure runs eviction;
-    /// retries until either reserved or `BudgetExceeded`.
-    pub(crate) async fn reserve(&self, bytes: u64) -> Result<Reservation<'_>, DiskCacheError> {
-        loop {
-            let budget = self.disk_budget_bytes();
-            let cur = self.current_bytes.load(Ordering::Acquire);
-            if cur + bytes <= budget {
-                if self
-                    .current_bytes
-                    .compare_exchange_weak(cur, cur + bytes, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    return Ok(Reservation {
-                        store: self,
-                        bytes,
-                        committed: false,
-                    });
+        entry: Arc<CachedEntry>,
+    ) -> Arc<CachedEntry> {
+        match self.cached.entry(uri) {
+            Entry::Occupied(mut occupied) => {
+                if !entry.has_whole_file() && occupied.get().has_whole_file() {
+                    let existing = Arc::clone(occupied.get());
+                    drop(occupied);
+                    self.release_entry_accounting(&entry);
+                    return existing;
                 }
-                // Lost the race; another reservation slipped
-                // in. Re-read and retry — most of the time
-                // there's still room.
-                continue;
+
+                let replaced = mem::replace(occupied.get_mut(), Arc::clone(&entry));
+                // Leave the shard lock before `replaced` drops: its last reference may fsync a
+                // block index or munmap, and every URI in the shard would wait on that.
+                drop(occupied);
+                self.release_entry_accounting(&replaced);
+                entry
             }
-            // Over budget — try eviction. If eviction frees
-            // enough, the next loop iteration's CAS will
-            // succeed.
-            let needed = (cur + bytes).saturating_sub(budget);
-            self.evict_at_least(needed).await?;
+            Entry::Vacant(slot) => {
+                slot.insert(Arc::clone(&entry));
+                entry
+            }
         }
+    }
+
+    /// Reserve `bytes`, evicting as needed, or fail with `BudgetExceeded`. The guard releases the
+    /// bytes on drop unless committed.
+    pub(crate) async fn reserve(&self, bytes: u64) -> Result<Reservation<'_>, DiskCacheError> {
+        self.reserve_manual(bytes).await?;
+        Ok(Reservation {
+            store: self,
+            bytes,
+            committed: false,
+        })
     }
 
     /// Drive the eviction policy until either `bytes_needed`
@@ -461,6 +462,10 @@ impl DiskCacheStore {
             // double-decrement current_bytes.
             if let Some((_, entry)) = self.cached.remove(&uri) {
                 tracing::info!(target: "infino::cache", uri = %uri.0, "evict: live cached entry (budget pressure)");
+
+                // A leftover coordinator would keep the evicted entry, and its budget, alive.
+                self.coordinators.remove(&uri);
+
                 let path = self.cache_path(&uri);
                 let _ = fs::remove_file(&path);
                 let _ = fs::remove_file(self.blocks_path(&uri));
@@ -470,6 +475,51 @@ impl DiskCacheStore {
             }
         }
         Ok(())
+    }
+
+    // Test helpers. Compiled only for tests, never into the shipped library.
+
+    /// The budget ledger at rest: every charged byte is backed by a live entry, a scanned cache
+    /// file or a scanned block file, and nothing else. Holds only with no fetch or fill in flight.
+    #[cfg(test)]
+    pub(crate) fn assert_budget_consistent(&self) {
+        let entries: u64 = self.cached.iter().map(|e| e.value().charged_bytes()).sum();
+        let unindexed: u64 = self.unindexed.iter().map(|f| f.value().size_bytes).sum();
+        let block_files: u64 = self.block_files.iter().map(|f| f.value().size_bytes).sum();
+        assert_eq!(
+            self.current_bytes.load(Ordering::Acquire),
+            entries + unindexed + block_files,
+            "budget ledger drifted from what the cache holds \
+             (entries {entries}, unindexed {unindexed}, block files {block_files})"
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_block_entry_for_test(
+        &self,
+        uri: SuperfileUri,
+        block_source: Arc<BlockCachedSource>,
+    ) {
+        let reader = SuperfileReader::open(tiny_superfile_bytes()).expect("tiny superfile opens");
+        let size_bytes = block_source.filled_bytes_handle();
+        self.cached.insert(
+            uri,
+            Arc::new(CachedEntry {
+                reader: Arc::new(reader),
+                residency: Residency::Paged {
+                    block_source,
+                    fill_spawned: AtomicBool::new(false),
+                },
+                size_bytes,
+                accounting: EntryAccounting::SourceOwned,
+                last_access_us: AtomicU64::new(self.now_us()),
+            }),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_block_entry_for_test(&self, uri: &SuperfileUri) {
+        let _ = self.cached.remove(uri);
     }
 }
 
@@ -547,6 +597,51 @@ mod tests {
         // And it is re-openable afterwards.
         let again = store.reader(&uri).await.expect("re-open after release");
         assert_eq!(again.n_docs(), 1);
+    }
+
+    /// The sweep gives back the budget of every entry it drops. A Warm lazy entry is charged its
+    /// full size up front, so dropping it without releasing that charge leaves phantom bytes, and
+    /// eviction then deletes real files to make room for them.
+    #[tokio::test]
+    async fn idle_sweep_releases_the_budget_of_what_it_drops() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.mmap_cold_threshold_secs = 0;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let warm = SuperfileUri::new_v4();
+        let stream = SuperfileUri::new_v4();
+        for uri in [&warm, &stream] {
+            put_superfile(&store, uri, tiny_superfile_bytes()).await;
+        }
+        store.reader(&warm).await.expect("warm lazy open");
+        store
+            .open_for_query(
+                &stream,
+                &stream.storage_path(),
+                None,
+                None,
+                ReadIntent::Stream,
+            )
+            .await
+            .expect("stream lazy open");
+        assert!(
+            store.stats().current_bytes > 0,
+            "the warm open charged its full size"
+        );
+
+        store.sweep_once();
+
+        assert!(
+            !store.is_cached(&warm) && !store.is_cached(&stream),
+            "both idle lazy entries are dropped"
+        );
+        store.assert_budget_consistent();
+        assert_eq!(
+            store.stats().current_bytes,
+            0,
+            "nothing is charged once both entries are gone"
+        );
     }
 
     #[tokio::test]

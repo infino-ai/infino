@@ -195,6 +195,16 @@ pub struct Manifest {
     /// attributed, so only a fresh maintenance pass may republish).
     /// Absent on older manifests and until the first maintenance pass.
     pub term_stats: Option<RoutingRef>,
+    /// The table-level term index root (`manifest::term_index`), when
+    /// one has been built. Carried across every commit: its postings are
+    /// per superfile, so a removal leaves it valid (a reader ignores
+    /// postings for superfiles no longer live).
+    pub term_index: Option<RoutingRef>,
+    /// Whether `term_index` lists every live superfile. A table whose first
+    /// index was built after it already held superfiles (an upgrade) is
+    /// incomplete until a maintenance rebuild; a query then routes parts
+    /// by their summaries rather than by the index.
+    pub term_index_complete: bool,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -1145,14 +1155,15 @@ impl FtsSummaryAgg {
     /// - **term range**: widened to span both — `(min(mins), max(maxes))` lex.
     /// - **distinct count**: a deferred planner hint; takes the larger side.
     ///
-    /// **`None` is the identity here** (an empty contributor that leaves the
-    /// other side intact) — what a fold from [`Default::default`] over
-    /// per-superfile summaries needs, since every superfile carries a bloom
-    /// ([`new_with_params`] always yields `Some`). This is deliberately
-    /// *distinct* from the prune-time reading of `term_bloom: None` as "no
-    /// info / always-keep": a sound union of a known bloom with a genuinely
-    /// unknown one is unknown (`None`), so `merge` must only be folded over
-    /// summaries that carry real blooms — never over a true no-info summary.
+    /// **An absent bloom on either side makes the merged bloom absent.** A
+    /// superfile written to storage since the table-level term index carries
+    /// no bloom — the index routes for it — and its terms are therefore
+    /// unknown to any bloom the part could keep. The prune tier reads
+    /// `term_bloom: None` as "no info, always keep", so absent is the only
+    /// sound union of a known bloom with an unknown one; keeping the known
+    /// side would let a part prune away terms that live only in its
+    /// bloom-less superfiles. The term range keeps the identity rule: an
+    /// absent range means an empty column, which widens nothing.
     ///
     /// Folding `merge` over a part's superfiles yields the same bloom-union and
     /// range-union as [`crate::supertable::manifest::aggregates`]'s rollup; the
@@ -1161,9 +1172,7 @@ impl FtsSummaryAgg {
     pub fn merge_with(&mut self, other: &FtsSummaryAgg) {
         self.term_bloom = match (self.term_bloom.take(), other.term_bloom.as_ref()) {
             (Some(a), Some(b)) => union_blooms(&a, b),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b.clone()),
-            (None, None) => None,
+            _ => None,
         };
         self.term_range = match (self.term_range.take(), other.term_range.as_ref()) {
             (Some((amin, amax)), Some((bmin, bmax))) => {
@@ -1216,8 +1225,11 @@ impl FtsSummaryAgg {
     /// present (`Some`); the count widens `u32` → `u64`; and an empty
     /// `(min, max)` range (a 0-term column) becomes `None` — the same
     /// "no range" signal the pruner already understands.
+    /// `term_bloom` is `None` for a superfile whose term membership the
+    /// table-level term index answers exactly; readers treat an absent
+    /// bloom as "no info" and keep the superfile, so the two routes compose.
     pub fn new_with_params(
-        term_bloom: Bloom,
+        term_bloom: Option<Bloom>,
         n_terms_distinct: u32,
         term_range: (Vec<u8>, Vec<u8>),
         length_stats: ColumnLengthStats,
@@ -1228,7 +1240,7 @@ impl FtsSummaryAgg {
             Some(term_range)
         };
         Self {
-            term_bloom: Some(term_bloom),
+            term_bloom,
             n_terms_distinct: u64::from(n_terms_distinct),
             term_range,
             length_stats: Some(length_stats),
@@ -1359,6 +1371,12 @@ struct ManifestDto {
     term_stats_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     term_stats_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    term_index_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    term_index_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    term_index_complete: bool,
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1966,6 +1984,9 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .map(|r| encode_hash(&r.content_hash)),
         term_stats_uri: l.term_stats.as_ref().map(|r| r.uri.clone()),
         term_stats_content_hash: l.term_stats.as_ref().map(|r| encode_hash(&r.content_hash)),
+        term_index_uri: l.term_index.as_ref().map(|r| r.uri.clone()),
+        term_index_content_hash: l.term_index.as_ref().map(|r| encode_hash(&r.content_hash)),
+        term_index_complete: l.term_index_complete,
         parts,
         tombstone_seqs: l
             .tombstone_seqs
@@ -2100,6 +2121,14 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
             }),
             _ => None,
         },
+        term_index: match (d.term_index_uri, d.term_index_content_hash.as_deref()) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
+        term_index_complete: d.term_index_complete,
         parts,
         tombstone_seqs: d
             .tombstone_seqs
@@ -2712,6 +2741,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![],
         }
     }
@@ -3454,6 +3485,44 @@ mod tests {
     }
 
     #[test]
+    fn term_index_ref_round_trips_and_requires_both_halves() {
+        let mut list = empty_list();
+        list.term_index = Some(RoutingRef {
+            uri: "term-index/root-abc.bin".into(),
+            content_hash: ContentHash([7u8; 32]),
+        });
+        list.term_index_complete = true;
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.term_index, list.term_index);
+        assert!(
+            decoded.term_index_complete,
+            "the completeness flag rides along"
+        );
+        // A manifest without the fields decodes to no reference and an
+        // incomplete index (older writers), and writes neither on the wire.
+        let empty_bytes = encode(&empty_list()).expect("encode empty");
+        let s = from_utf8(&empty_bytes).expect("utf8");
+        assert!(
+            !s.contains("term_index"),
+            "absent ref and false flag must not appear on the wire (older manifests stay byte-identical)"
+        );
+        let empty = decode(&empty_bytes).expect("decode empty");
+        assert!(empty.term_index.is_none());
+        assert!(!empty.term_index_complete);
+        // One half without the other is treated as no ref, like the
+        // centroid/graph refs.
+        let with_ref = from_utf8(&bytes).expect("utf8");
+        let uri_only = with_ref.replacen("term_index_content_hash", "term_index_ignored", 1);
+        assert!(
+            decode(uri_only.as_bytes())
+                .expect("decode uri-only")
+                .term_index
+                .is_none()
+        );
+    }
+
+    #[test]
     fn drained_version_ranges_merge_and_contains() {
         let mut d = DrainedVersionRanges::default();
         assert!(!d.contains(1));
@@ -3581,18 +3650,22 @@ mod tests {
         assert_eq!(a.n_terms_distinct, 3, "distinct hint takes the larger side");
     }
 
+    /// A contributor without a bloom (a superfile the term index routes for)
+    /// makes the merged bloom absent in either order — the prune tier then
+    /// keeps the part — while the term range still adopts the known side.
     #[test]
-    fn fts_agg_merge_none_side_contributes_nothing() {
-        // Some.merge_with(None) keeps self untouched.
+    fn fts_agg_merge_with_an_absent_bloom_is_absent() {
         let mut a = fts_agg(&[b"x"], 16, Some((b"a", b"m")));
         a.merge_with(&FtsSummaryAgg::default());
-        assert!(a.term_bloom.as_ref().expect("kept").contains(b"x"));
+        assert!(
+            a.term_bloom.is_none(),
+            "a known bloom plus an unknown one is unknown"
+        );
         assert_eq!(a.term_range, Some((b"a".to_vec(), b"m".to_vec())));
 
-        // None.merge_with(Some) adopts the other side.
         let mut none_side = FtsSummaryAgg::default();
         none_side.merge_with(&fts_agg(&[b"y"], 16, Some((b"n", b"z"))));
-        assert!(none_side.term_bloom.as_ref().expect("taken").contains(b"y"));
+        assert!(none_side.term_bloom.is_none(), "in either order");
         assert_eq!(none_side.term_range, Some((b"n".to_vec(), b"z".to_vec())));
     }
 
@@ -3670,7 +3743,7 @@ mod tests {
         let mut b = BloomBuilder::with_n_blocks(16);
         b.insert(b"alpha");
         let agg = FtsSummaryAgg::new_with_params(
-            b.finish(),
+            Some(b.finish()),
             7,
             (b"a".to_vec(), b"z".to_vec()),
             ColumnLengthStats::default(),
@@ -3687,13 +3760,16 @@ mod tests {
         // A 0-term column: empty (min, max) → `None` range, but a built bloom
         // is still present.
         let empty = FtsSummaryAgg::new_with_params(
-            BloomBuilder::with_n_blocks(16).finish(),
+            Some(BloomBuilder::with_n_blocks(16).finish()),
             0,
             (Vec::new(), Vec::new()),
             ColumnLengthStats::default(),
         );
         assert_eq!(empty.term_range, None);
-        assert!(empty.term_bloom.is_some());
+        assert!(
+            empty.term_bloom.is_some(),
+            "constructed with Some, kept as given"
+        );
     }
 
     #[test]

@@ -42,7 +42,10 @@
 use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
 
 use arrow_array::Decimal128Array;
-use futures::future::try_join_all;
+use futures::{
+    future::try_join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 use roaring::RoaringBitmap;
 use tracing::{Instrument, trace};
 use uuid::Uuid;
@@ -61,7 +64,7 @@ use crate::{
             superfile_reader::superfile_reader,
             vector::row_id_from_manifest_entry,
         },
-        reader_cache::{DiskCacheStore, SuperfileReaderCache},
+        reader_cache::{DiskCacheStore, ReadIntent, SuperfileReaderCache},
         tombstones::SidecarCache,
     },
 };
@@ -79,7 +82,7 @@ pub(crate) async fn open_reader(
     disk_cache: Option<&Arc<DiskCacheStore>>,
     storage: Option<&Arc<dyn StorageProvider>>,
     entry: &SuperfileEntry,
-    allow_background_fill: bool,
+    intent: ReadIntent,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
     superfile_reader(
         store,
@@ -88,7 +91,7 @@ pub(crate) async fn open_reader(
         &entry.uri,
         &entry.storage_path(),
         entry.subsection_offsets.as_ref(),
-        allow_background_fill,
+        intent,
     )
     .await
     .map_err(|e| QueryError::build(e.to_string(), &e))
@@ -205,7 +208,7 @@ pub(crate) async fn open_compaction_input(
         return Ok(Arc::new(reader));
     }
     // Compaction is not a query modality; allow fill so inputs can promote.
-    open_reader(store, disk_cache, storage, entry, true).await
+    open_reader(store, disk_cache, storage, entry, ReadIntent::Warm).await
 }
 
 /// Tag a kernel's results with their source and stamp stable ids immediately
@@ -483,38 +486,129 @@ async fn stable_ids_for_tagged_hits(
     Ok(Some(array.values().to_vec()))
 }
 
-/// Fan out a kernel whose local ids are Parquet-local (FTS and exact-match).
-///
-/// These hits can apply ordinary tombstones directly and defer stable-id
-/// stamping until after global top-k selection. Vector MultiCell hits use
-/// [`fanout`] instead because their local ids include cell-ordering and
-/// boundary stubs.
-pub(crate) async fn fanout_local_hits<P, K, Fut>(
-    reader: &SupertableReader,
-    units: Vec<(Arc<SuperfileEntry>, P)>,
-    kernel: K,
-) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
-where
-    P: Send + 'static,
-    K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
-{
-    fanout_with(
-        reader,
-        units,
-        true,
-        true, // FTS/local-hit path — background fill allowed
-        move |r, entry, tombstone_cache, now, params| {
-            let kernel = kernel.clone();
-            async move {
-                let hits = kernel(r, params).await?;
-                let mut tagged = tag_hits(&entry, hits);
-                apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
-                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
-            }
-        },
-    )
-    .await
+/// Record one superfile open on the operation's stats, when metered.
+fn note_superfile_opened(op_stats: Option<&Arc<OpStatsCollector>>) {
+    if let Some(stats) = op_stats {
+        stats.add_superfiles_opened(1);
+    }
+}
+
+/// What every unit of one fan-out shares: where readers are opened from,
+/// the tombstone cache (warmed for the batch) and the instant it was warmed
+/// at, and the operation's stats. Built once per fan-out; each unit then
+/// opens its reader, checks its vector codecs, counts the open and runs the
+/// body — inline on the current task, or on a task of its own.
+#[derive(Clone)]
+struct FanoutContext {
+    store: Arc<dyn SuperfileReaderCache>,
+    disk_cache: Option<Arc<DiskCacheStore>>,
+    storage: Option<Arc<dyn StorageProvider>>,
+    vector_columns: Arc<Vec<VectorConfig>>,
+    tombstone_cache: Option<Arc<SidecarCache>>,
+    op_stats: Option<Arc<OpStatsCollector>>,
+    now: Instant,
+    intent: ReadIntent,
+}
+
+impl FanoutContext {
+    async fn new<P>(
+        reader: &SupertableReader,
+        units: &[(Arc<SuperfileEntry>, P)],
+        prefetch_tombstones: bool,
+        intent: ReadIntent,
+    ) -> Self {
+        let manifest = reader.manifest();
+        let tombstone_cache = reader.tombstone_cache.clone();
+        let now = Instant::now();
+        // Warm the tombstone sidecars for every distinct superfile in one
+        // concurrent batch before the per-superfile fan-out. Skipped by
+        // callers whose tombstones are resolved elsewhere (the hidden path
+        // filters via the resident deleted-set, so its per-cell sidecars are
+        // always empty and prefetching them is a wasted wave of GETs on the
+        // cold critical path).
+        if prefetch_tombstones && let Some(cache) = tombstone_cache.as_ref() {
+            let mut ids: Vec<Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            cache.prefetch(&ids, now).await;
+        }
+        Self {
+            store: Arc::clone(&manifest.options.store),
+            disk_cache: manifest.options.disk_cache.as_ref().map(Arc::clone),
+            storage: manifest.options.storage.as_ref().map(Arc::clone),
+            vector_columns: Arc::new(manifest.options.vector_columns.clone()),
+            tombstone_cache,
+            op_stats: reader.op_stats.clone(),
+            now,
+            intent,
+        }
+    }
+
+    /// Open `entry`'s reader and run `body` on it, on the current task.
+    async fn run<P, R, B, Fut>(
+        &self,
+        body: B,
+        entry: Arc<SuperfileEntry>,
+        params: P,
+    ) -> Result<R, QueryError>
+    where
+        B: Fn(
+            Arc<SuperfileReader>,
+            Arc<SuperfileEntry>,
+            Option<Arc<SidecarCache>>,
+            Instant,
+            P,
+        ) -> Fut,
+        Fut: Future<Output = Result<R, QueryError>>,
+    {
+        let r = open_reader(
+            &self.store,
+            self.disk_cache.as_ref(),
+            self.storage.as_ref(),
+            &entry,
+            self.intent,
+        )
+        .await?;
+        verify_superfile_vector_codecs(&r, &self.vector_columns)?;
+        note_superfile_opened(self.op_stats.as_ref());
+        body(r, entry, self.tombstone_cache.clone(), self.now, params).await
+    }
+
+    /// [`Self::run`] on its own task on the shared query runtime, so the
+    /// units' cold opens overlap. The join error is flattened into a
+    /// `QueryError` so a collecting caller short-circuits on the first
+    /// failing superfile.
+    fn spawn<P, R, B, Fut>(
+        &self,
+        body: &B,
+        entry: Arc<SuperfileEntry>,
+        params: P,
+    ) -> impl Future<Output = Result<R, QueryError>>
+    where
+        P: Send + 'static,
+        R: Send + 'static,
+        B: Fn(
+                Arc<SuperfileReader>,
+                Arc<SuperfileEntry>,
+                Option<Arc<SidecarCache>>,
+                Instant,
+                P,
+            ) -> Fut
+            + Clone
+            + Send
+            + 'static,
+        Fut: Future<Output = Result<R, QueryError>> + Send + 'static,
+    {
+        let ctx = self.clone();
+        let body = body.clone();
+        let handle =
+            tokio::spawn(async move { ctx.run(body, entry, params).await }.in_current_span());
+        async move {
+            handle
+                .await
+                .map_err(|e| QueryError::Store(format!("fan-out task join: {e}")))?
+        }
+    }
 }
 
 /// Lower-level fan-out primitive: the shared orchestration behind
@@ -539,7 +633,7 @@ pub(crate) async fn fanout_with<P, R, B, Fut>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
     prefetch_tombstones: bool,
-    allow_background_fill: bool,
+    intent: ReadIntent,
     body: B,
 ) -> Result<Vec<R>, QueryError>
 where
@@ -555,25 +649,7 @@ where
         return Ok(Vec::new());
     }
     trace!(units = units.len(), "fanning query out across superfiles");
-    let manifest = reader.manifest();
-    let store = Arc::clone(&manifest.options.store);
-    let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
-    let storage = manifest.options.storage.as_ref().map(Arc::clone);
-    let vector_columns = Arc::new(manifest.options.vector_columns.clone());
-    let tombstone_cache = reader.tombstone_cache.clone();
-    let now = Instant::now();
-
-    // Warm the tombstone sidecars for every distinct superfile in one
-    // concurrent batch before the per-superfile fan-out. Skipped by callers
-    // whose tombstones are resolved elsewhere (the hidden path filters via
-    // the resident deleted-set, so its per-cell sidecars are always empty
-    // and prefetching them is a wasted wave of GETs on the cold critical path).
-    if prefetch_tombstones && let Some(cache) = tombstone_cache.as_ref() {
-        let mut ids: Vec<Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        cache.prefetch(&ids, now).await;
-    }
+    let ctx = FanoutContext::new(reader, &units, prefetch_tombstones, intent).await;
 
     // Single unit (the common case for a compacted, single-superfile
     // table): run the body inline on the current task. `tokio::spawn`
@@ -583,50 +659,158 @@ where
     // fan-out below with a one-element result.
     if units.len() == 1 {
         let (entry, params) = units.into_iter().next().expect("len == 1");
-        let r = open_reader(
-            &store,
-            disk_cache.as_ref(),
-            storage.as_ref(),
-            &entry,
-            allow_background_fill,
-        )
-        .await?;
-        verify_superfile_vector_codecs(&r, &vector_columns)?;
-        let out = body(r, entry, tombstone_cache, now, params).await?;
-        return Ok(vec![out]);
+        return Ok(vec![ctx.run(body, entry, params).await?]);
     }
+    try_join_all(
+        units
+            .into_iter()
+            .map(|(entry, params)| ctx.spawn(&body, entry, params)),
+    )
+    .await
+}
 
-    let handles = units.into_iter().map(|(entry, params)| {
-        let store = Arc::clone(&store);
-        let disk_cache = disk_cache.clone();
-        let storage = storage.clone();
-        let tombstone_cache = tombstone_cache.clone();
-        let body = body.clone();
-        let vector_columns = Arc::clone(&vector_columns);
-        let handle = tokio::spawn(
-            async move {
-                let r = open_reader(
-                    &store,
-                    disk_cache.as_ref(),
-                    storage.as_ref(),
-                    &entry,
-                    allow_background_fill,
-                )
-                .await?;
-                verify_superfile_vector_codecs(&r, &vector_columns)?;
-                body(r, entry, tombstone_cache, now, params).await
+/// [`fanout_with`] for units the caller has ordered by how much they can
+/// still contribute: at most `window` units are in flight, units start in
+/// the given order, and `skip_before_open` is asked about each unit just
+/// before its superfile would be opened — so a unit that can no longer
+/// change the outcome (its score ceiling is below the running k-th score)
+/// is never opened at all. Results come back in completion order, which
+/// the callers here merge order-independently.
+///
+/// The window is the trade: strictly sequential opens maximise skips but
+/// serialise I/O; a wider window keeps the CPU busy while the first results
+/// raise the floor for the rest.
+pub(crate) async fn fanout_with_ordered<P, R, B, Fut, S>(
+    reader: &SupertableReader,
+    units: Vec<(Arc<SuperfileEntry>, P)>,
+    window: usize,
+    skip_before_open: S,
+    body: B,
+) -> Result<Vec<R>, QueryError>
+where
+    P: Send + 'static,
+    R: Send + 'static,
+    S: Fn(&P) -> bool,
+    B: Fn(Arc<SuperfileReader>, Arc<SuperfileEntry>, Option<Arc<SidecarCache>>, Instant, P) -> Fut
+        + Clone
+        + Send
+        + 'static,
+    Fut: Future<Output = Result<R, QueryError>> + Send + 'static,
+{
+    if units.is_empty() {
+        return Ok(Vec::new());
+    }
+    trace!(
+        units = units.len(),
+        window, "fanning query out across superfiles in ceiling order"
+    );
+    let ctx = FanoutContext::new(reader, &units, true, ReadIntent::Warm).await;
+    // One unit: inline, as in [`fanout_with`]; nothing to overlap against.
+    if units.len() == 1 {
+        let (entry, params) = units.into_iter().next().expect("len == 1");
+        return match skip_before_open(&params) {
+            true => Ok(Vec::new()),
+            false => Ok(vec![ctx.run(body, entry, params).await?]),
+        };
+    }
+    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+    let mut out = Vec::with_capacity(units.len());
+    let mut pending = units.into_iter();
+    let window = window.max(1);
+    loop {
+        while in_flight.len() < window {
+            let Some((entry, params)) = pending.next() else {
+                break;
+            };
+            if skip_before_open(&params) {
+                continue;
             }
-            .in_current_span(),
-        );
-        // Flatten the join error into a QueryError so `try_join_all`
-        // short-circuits on the first failing superfile.
-        async move {
-            handle
-                .await
-                .map_err(|e| QueryError::Store(format!("fan-out task join: {e}")))?
+            in_flight.push(ctx.spawn(&body, entry, params));
         }
-    });
-    try_join_all(handles).await
+        match in_flight.next().await {
+            Some(result) => out.push(result?),
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Fan out a kernel whose local ids are Parquet-local (FTS and exact-match).
+///
+/// These hits can apply ordinary tombstones directly and defer stable-id
+/// stamping until after global top-k selection. Vector MultiCell hits use
+/// [`fanout`] instead because their local ids include cell-ordering and
+/// boundary stubs.
+pub(crate) async fn fanout_local_hits<P, K, Fut>(
+    reader: &SupertableReader,
+    units: Vec<(Arc<SuperfileEntry>, P)>,
+    kernel: K,
+) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
+where
+    P: Send + 'static,
+    K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
+{
+    fanout_with(
+        reader,
+        units,
+        true,
+        ReadIntent::Warm, // FTS/local-hit path: warm toward a full mmap
+        local_hits_body(kernel),
+    )
+    .await
+}
+
+/// [`fanout_local_hits`] in ceiling order — see [`fanout_with_ordered`].
+pub(crate) async fn fanout_local_hits_ordered<P, K, Fut, S>(
+    reader: &SupertableReader,
+    units: Vec<(Arc<SuperfileEntry>, P)>,
+    window: usize,
+    skip_before_open: S,
+    kernel: K,
+) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
+where
+    P: Send + 'static,
+    S: Fn(&P) -> bool,
+    K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
+{
+    fanout_with_ordered(
+        reader,
+        units,
+        window,
+        skip_before_open,
+        local_hits_body(kernel),
+    )
+    .await
+}
+
+/// The per-unit body of the local-hits fan-outs: run the kernel, tag its
+/// hits with the superfile, and drop the tombstoned ones.
+fn local_hits_body<P, K, Fut>(
+    kernel: K,
+) -> impl Fn(
+    Arc<SuperfileReader>,
+    Arc<SuperfileEntry>,
+    Option<Arc<SidecarCache>>,
+    Instant,
+    P,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<SuperfileHit>, QueryError>> + Send>>
++ Clone
+where
+    P: Send + 'static,
+    K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
+{
+    move |r, entry, tombstone_cache, now, params| {
+        let kernel = kernel.clone();
+        Box::pin(async move {
+            let hits = kernel(r, params).await?;
+            let mut tagged = tag_hits(&entry, hits);
+            apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
+            Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+        })
+    }
 }
 
 #[cfg(test)]

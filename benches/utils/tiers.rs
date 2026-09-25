@@ -24,7 +24,7 @@ use infino::{
     supertable::{
         SuperfileUri, Supertable, SupertableOptions,
         manifest::SubsectionOffsets,
-        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy, ReadIntent},
         storage::{
             AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
             StorageProvider,
@@ -790,7 +790,13 @@ pub fn open_superfile_cold_reader(
     let offsets = superfile_cold_size_hint(known_size);
     let reader = block_on(async move {
         cache
-            .reader_with_hints(uri, &uri.storage_path(), Some(&offsets), None, true)
+            .open_for_query(
+                uri,
+                &uri.storage_path(),
+                Some(&offsets),
+                None,
+                ReadIntent::Warm,
+            )
             .await
             .expect("cold reader")
     });

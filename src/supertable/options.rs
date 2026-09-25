@@ -219,6 +219,11 @@ const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
 /// triggered them. Lazy load stays available as an explicit opt-in
 /// (`with_eager_load_threshold(0)`).
 const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = u32::MAX;
+/// Default for [`SupertableOptions::bound_ordered_open_window`]. Sixty-four
+/// covers any compacted table up to a few hundred million rows outright, so
+/// the ceiling order changes nothing there; pruning begins where tables have
+/// more superfiles than that, which is where it pays.
+const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 64;
 /// Subdirectory under the disk-cache root that holds the
 /// content-addressed manifest-part byte cache. Kept separate from the
 /// superfile cache files so the two budgets and eviction sets don't
@@ -363,6 +368,14 @@ pub struct SupertableOptions {
     /// restarts. Independent of `disk_cache` (which caches superfile
     /// content) and uses its own byte budget. `None` disables it.
     pub manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+    /// Superfiles a ranked query opens concurrently when it orders them by
+    /// score ceiling. Below this many candidates every superfile opens at
+    /// once, exactly as the unordered fan-out does, so ordering costs no
+    /// parallelism; above it, the first results raise the shared floor and
+    /// a later superfile whose ceiling is below it is never opened. This is
+    /// I/O concurrency, deliberately independent of the reader pool's CPU
+    /// width: a one-thread pool must not serialize fifteen superfile opens.
+    pub bound_ordered_open_window: usize,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with
     /// `disk_cache`, the supertable triggers
@@ -765,6 +778,7 @@ impl SupertableOptions {
             storage: None,
             disk_cache: None,
             manifest_disk_cache: None,
+            bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
             memory_budget_bytes: None,
             // Placeholder: standalone options (tests, direct callers) get an unshared measure-only budget.
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
@@ -939,6 +953,13 @@ impl SupertableOptions {
     /// resulting `Arc<DiskCacheStore>` here.
     pub fn with_disk_cache(mut self, cache: Arc<DiskCacheStore>) -> Self {
         self.disk_cache = Some(cache);
+        self
+    }
+
+    /// Set how many superfiles a ceiling-ordered ranked query opens at once
+    /// (see [`Self::bound_ordered_open_window`]).
+    pub fn with_bound_ordered_open_window(mut self, window: usize) -> Self {
+        self.bound_ordered_open_window = window.max(1);
         self
     }
 

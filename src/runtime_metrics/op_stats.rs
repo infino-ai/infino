@@ -252,6 +252,9 @@ pub(crate) struct OpStatsCollector {
     vector_candidates_scanned: AtomicU64,
     vector_rows_reranked: AtomicU64,
     planned_read_ranges: AtomicU64,
+    /// Superfiles a query entered — opened for reading — across every
+    /// fan-out. What bound-ordered opening is meant to shrink.
+    superfiles_opened: AtomicU64,
     sql_page_bytes: AtomicU64,
     rows_materialized: AtomicU64,
     kernel_cpu_ns: AtomicU64,
@@ -283,6 +286,17 @@ impl OpStatsCollector {
     /// Flush the global-shortlist rerank's row count.
     pub(crate) fn add_vector_rows_reranked(&self, rows: u64) {
         self.vector_rows_reranked.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// Count superfiles a fan-out opened for this operation.
+    pub(crate) fn add_superfiles_opened(&self, n: u64) {
+        self.superfiles_opened.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Superfiles opened so far by this operation.
+    #[cfg(test)]
+    pub(crate) fn superfiles_opened(&self) -> u64 {
+        self.superfiles_opened.load(Ordering::Relaxed)
     }
 
     /// Flush a kernel's planned byte-source range count.

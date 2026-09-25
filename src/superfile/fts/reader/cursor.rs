@@ -609,7 +609,12 @@ impl TermCursor {
             stored,
             false,
         )?;
-        let local_idf = bm25::idf(col.scored_doc_count(), term_meta.df);
+        // A match-only cursor never scores, so it neither needs the idf nor
+        // the norms it would read the length array for.
+        let local_idf = match count_only {
+            true => 0.0,
+            false => bm25::idf(col.scored_doc_count(), term_meta.df),
+        };
         // Effective idf folds in the query-term-frequency `weight` (> 1
         // only for a deduplicated repeated term) on top of any global-idf
         // override. Every stored bound is decoded at this idf too, so the
@@ -685,6 +690,7 @@ impl TermCursor {
         global_idf: Option<f32>,
         weight: u32,
         header_probed: bool,
+        count_only: bool,
     ) -> Result<Self, FtsError> {
         let mut block_doc_ids = vec![0u32; BLOCK_LEN];
         let mut block_tfs = vec![0u32; BLOCK_LEN];
@@ -700,13 +706,23 @@ impl TermCursor {
             ))
         })?;
         let n = decoded.n;
-        let local_idf = bm25::idf(col.scored_doc_count(), n as u64);
-        let idf_weight = global_idf.unwrap_or(local_idf) * weight as f32;
-        let block_max_bm25 = block_doc_ids[..n]
-            .iter()
-            .zip(&block_tfs[..n])
-            .map(|(&d, &t)| bm25::score_with_dl_norm_k1(idf_weight, t, col.dl_norm_k1.get(d)))
-            .fold(0.0f32, f32::max);
+        // A match-only cursor never scores: no idf, no block maximum, and
+        // no read of the length array to compute either.
+        let (idf_weight, block_max_bm25) = match count_only {
+            true => (0.0, 0.0),
+            false => {
+                let local_idf = bm25::idf(col.scored_doc_count(), n as u64);
+                let idf_weight = global_idf.unwrap_or(local_idf) * weight as f32;
+                let block_max_bm25 = block_doc_ids[..n]
+                    .iter()
+                    .zip(&block_tfs[..n])
+                    .map(|(&d, &t)| {
+                        bm25::score_with_dl_norm_k1(idf_weight, t, col.dl_norm_k1().get(d))
+                    })
+                    .fold(0.0f32, f32::max);
+                (idf_weight, block_max_bm25)
+            }
+        };
         let blocks: Arc<[BlockMeta]> = Arc::from([BlockMeta {
             last_doc_id: block_doc_ids[n - 1],
             block_byte_offset: 0,
@@ -2070,7 +2086,7 @@ mod tests {
                 blk += 1;
             }
             let score =
-                bm25::score_with_dl_norm_k1(idf, cursor.current_tf(), col.dl_norm_k1.get(doc));
+                bm25::score_with_dl_norm_k1(idf, cursor.current_tf(), col.dl_norm_k1().get(doc));
             exact[blk] = exact[blk].max(score);
             cursor.next();
         }
@@ -2087,7 +2103,7 @@ mod tests {
     #[tokio::test]
     async fn bounds_are_exact_at_the_declared_statistics_and_sound_under_an_override() {
         let reader = realistic_reader(6_000);
-        assert_eq!(reader.columns[0].bound_scale, 1.0);
+        assert_eq!(reader.columns[0].bound_scale(), 1.0);
         let baked = block_bounds_and_maxima(&reader).await;
         assert!(baked.len() > 30, "need a long posting list to say anything");
         for (i, &(bound, max)) in baked.iter().enumerate() {
@@ -2099,7 +2115,7 @@ mod tests {
 
         let view = reader.with_bm25_override(bm25::Bm25Params::new(0.9, 0.4));
         assert!(
-            view.columns[0].bound_scale > 1.0,
+            view.columns[0].bound_scale() > 1.0,
             "an override owes an inflation factor"
         );
         let overridden = block_bounds_and_maxima(&view).await;
@@ -2208,7 +2224,7 @@ mod tests {
             let doc = cursor.current_doc_id();
             let tf = cursor.current_tf();
             let query_score =
-                bm25::score_with_dl_norm_k1(cursor.idf_weight, tf, col_meta.dl_norm_k1.get(doc));
+                bm25::score_with_dl_norm_k1(cursor.idf_weight, tf, col_meta.dl_norm_k1().get(doc));
             let block_max = cursor.current_block_max_bm25();
             assert!(
                 block_max >= query_score,

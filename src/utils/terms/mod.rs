@@ -40,16 +40,36 @@ use std::{cmp::Ordering, collections::BTreeMap, io::Write, mem::take, ops::Range
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 
-use crate::superfile::{
-    format::{FST_SEPARATOR, fts::DictLayout, u32_le_at, u64_le_at},
-    fts::fst_value::{FstValue, PFOR_LENGTH_UNKNOWN},
+use crate::utils::{
+    bytes::{u32_le_at, u64_le_at},
     varint::{push_u64_varint, push_varint, read_u64_varint, read_varint},
 };
+
+pub(crate) mod value;
+pub(crate) use value::{FstValue, INLINE_TF_MAX, PFOR_LENGTH_UNKNOWN};
+
+/// Reserved separator byte inside dictionary keys (`<column>\x1F<term>`).
+/// User column names must not contain this byte. ASCII Unit Separator
+/// (U+001F) is below every printable ASCII char, so prefix iteration over a
+/// column's terms works via a plain range scan.
+pub const FST_SEPARATOR: u8 = 0x1F;
+
+/// How a term dictionary lays its terms out — by blob version for a
+/// superfile, by choice for any other caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DictLayout {
+    /// One FST keyed `column <SEP> term`, values packed as [`value`]
+    /// describes. Superfile blobs `V1`–`V6`.
+    Fst,
+    /// Front-coded term blocks behind a fixed-width first-key table (the
+    /// block layout in this module). Superfile blobs `V7`+.
+    Blocks,
+}
 
 /// Build a canonical FST key from `(column_name, term)`.
 ///
 /// Encoding: `<column_name_utf8> | 0x1F | <term_utf8>`. The separator
-/// byte (`FST_SEPARATOR`, ASCII Unit Separator) is below every printable
+/// byte ([`FST_SEPARATOR`], ASCII Unit Separator) is below every printable
 /// ASCII byte, so prefix iteration `column_name\x1F` cleanly captures
 /// every term in that column.
 ///
@@ -102,11 +122,13 @@ impl DictBuilder {
     }
 
     /// Number of distinct keys staged so far.
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         self.sorted_buffer.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.sorted_buffer.is_empty()
     }
 
@@ -463,14 +485,16 @@ impl<'a> TermBlocks<'a> {
         None
     }
 
-    /// Visit every `(key, entry)` whose key starts with `prefix`, in
-    /// order, until `visit` returns `false`.
-    pub(crate) fn for_each_prefix(
+    /// Visit every `(key, entry)` whose key starts with `prefix` and is
+    /// `>= from`, in order, until `visit` returns `false`. `from` must be
+    /// `>= prefix`.
+    pub(crate) fn for_each_from(
         &self,
         prefix: &[u8],
+        from: &[u8],
         mut visit: impl FnMut(&[u8], FstValue) -> bool,
     ) {
-        let mut b = self.block_for(prefix).unwrap_or(0);
+        let mut b = self.block_for(from).unwrap_or(0);
         while b < self.n_blocks {
             let Some(range) = self.block_range(b) else {
                 return;
@@ -478,7 +502,7 @@ impl<'a> TermBlocks<'a> {
             let mut cur = BlockCursor::new(&self.bytes[range]);
             while let Some(entry) = cur.next() {
                 let key = cur.key.as_slice();
-                if key < prefix {
+                if key < from {
                     continue;
                 }
                 if !key.starts_with(prefix) || !visit(key, entry) {
@@ -671,18 +695,30 @@ impl<'a> TermDict<'a> {
     pub(crate) fn for_each_prefix(
         &self,
         prefix: &[u8],
+        visit: impl FnMut(&[u8], FstValue) -> bool,
+    ) {
+        self.for_each_from(prefix, prefix, visit);
+    }
+
+    /// [`Self::for_each_prefix`] starting at the first key `>= from`, so a
+    /// walk can resume where an earlier one stopped. `from` must be
+    /// `>= prefix`.
+    pub(crate) fn for_each_from(
+        &self,
+        prefix: &[u8],
+        from: &[u8],
         mut visit: impl FnMut(&[u8], FstValue) -> bool,
     ) {
         match self {
             Self::Fst(map) => {
-                let mut stream = map.range().ge(prefix).into_stream();
+                let mut stream = map.range().ge(from).into_stream();
                 while let Some((key, packed)) = stream.next() {
                     if !key.starts_with(prefix) || !visit(key, FstValue::unpack(packed)) {
                         break;
                     }
                 }
             }
-            Self::Blocks(b) => b.for_each_prefix(prefix, visit),
+            Self::Blocks(b) => b.for_each_from(prefix, from, visit),
         }
     }
 }
@@ -814,6 +850,59 @@ mod tests {
         for (k, v) in items.iter().step_by(97) {
             assert_eq!(a.lookup(k), Some(*v));
             assert_eq!(b.lookup(k), Some(*v));
+        }
+    }
+
+    #[test]
+    fn for_each_from_resumes_at_a_key_in_both_layouts() {
+        // The FST arm has no short form, so use long-form entries only.
+        let items: Vec<(Vec<u8>, FstValue)> = entries(5_000)
+            .into_iter()
+            .map(|(k, v)| match v {
+                FstValue::Pfor {
+                    metadata_offset,
+                    postings_length_hint,
+                    ..
+                } => (
+                    k,
+                    FstValue::Pfor {
+                        metadata_offset,
+                        postings_length_hint,
+                        short: false,
+                    },
+                ),
+                inline => (k, inline),
+            })
+            .collect();
+        let mut blocks = TermBlockWriter::new(Vec::new());
+        let mut fst = TermDictBuilder::new(DictLayout::Fst);
+        for (k, v) in &items {
+            blocks.insert_sorted(k, *v).expect("vec sink");
+            fst.insert(k, *v);
+        }
+        let blocks = blocks.finish().expect("vec sink");
+        let fst = fst.finish();
+        let prefix = make_key("body", "");
+        // Column start, keys on and between block edges, and past the end.
+        let froms = [
+            prefix.clone(),
+            items[0].0.clone(),
+            items[TERM_BLOCK_SIZE].0.clone(),
+            make_key("body", "term02500"),
+            items[items.len() - 1].0.clone(),
+            make_key("body", "zzz"),
+        ];
+        for (bytes, layout) in [(&blocks, DictLayout::Blocks), (&fst, DictLayout::Fst)] {
+            let d = TermDict::open(bytes, layout).expect("opens");
+            for from in &froms {
+                let mut got = Vec::new();
+                d.for_each_from(&prefix, from, |k, v| {
+                    got.push((k.to_vec(), v));
+                    true
+                });
+                let want: Vec<_> = items.iter().filter(|(k, _)| k >= from).cloned().collect();
+                assert_eq!(got, want, "{layout:?} from {from:?}");
+            }
         }
     }
 

@@ -23,34 +23,37 @@ use std::{
 use rayon::prelude::*;
 use tempfile::{tempdir, tempdir_in};
 
-use crate::superfile::{
-    BuildError,
-    format::{
-        self, FST_SEPARATOR, RESERVED_PREFIX,
-        checksum::{crc32c, crc32c_append},
-        vec::{
-            CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES,
-            U32_BYTES, U64_BYTES, cell_dir_entry, sub_hdr,
+use crate::{
+    superfile::{
+        BuildError,
+        format::{
+            self, RESERVED_PREFIX,
+            checksum::{crc32c, crc32c_append},
+            vec::{
+                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES,
+                MAGIC_BYTES, U32_BYTES, U64_BYTES, cell_dir_entry, sub_hdr,
+            },
+        },
+        vector::{
+            cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
+            distance::{
+                Metric, distance, encode_sq16_adaptive_row, encode_sq16_row,
+                mean_f32_cluster_major, normalize, sq16_adaptive_norm_sq, sq16_decoded_norm_sq,
+            },
+            ivf_merge::MergedIvfSubsection,
+            kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
+            quant::BitQuantizer,
+            rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+            reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
+            rotation::RandomRotation,
+            spill::{
+                ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
+                SpilledCellRows,
+            },
+            sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
         },
     },
-    vector::{
-        cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
-        distance::{
-            Metric, distance, encode_sq16_adaptive_row, encode_sq16_row, mean_f32_cluster_major,
-            normalize, sq16_adaptive_norm_sq, sq16_decoded_norm_sq,
-        },
-        ivf_merge::MergedIvfSubsection,
-        kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
-        quant::BitQuantizer,
-        rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
-        reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
-        rotation::RandomRotation,
-        spill::{
-            ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
-            SpilledCellRows,
-        },
-        sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
-    },
+    utils::terms::validate_column_name,
 };
 
 /// Outer-header size (magic + version + n_columns + n_docs + dir_offset).
@@ -499,7 +502,7 @@ impl VectorBuilder {
     /// Register a logical vector index up-front. Returns the assigned
     /// `column_id` (declaration order).
     pub fn register_column(&mut self, config: VectorConfig) -> Result<u32, BuildError> {
-        if config.column.as_bytes().contains(&FST_SEPARATOR) {
+        if !validate_column_name(&config.column) {
             return Err(BuildError::ReservedSeparatorInColumnName(config.column));
         }
         if config.column.starts_with(RESERVED_PREFIX) {
