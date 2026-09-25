@@ -95,6 +95,7 @@ use parquet::{
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
@@ -122,6 +123,7 @@ use crate::{
         reader_cache::{DiskCacheStore, ReadIntent, SuperfileReaderCache},
         tombstones::SidecarCache,
     },
+    utils::trace::detail_span,
 };
 
 /// Logical name the supertable is registered under in the
@@ -806,8 +808,21 @@ impl TableProvider for SupertableProvider {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Superfile selection via the shared two-tier prune (the same
         // path FTS search uses); see `select_survivors`. Survivors go to
-        // DataFusion.
-        let survivor_entries = self.select_survivors(filters).await?;
+        // DataFusion. The span carries both counts, so a trace shows how
+        // much of the snapshot the statistics kept this query away from.
+        let select_span = detail_span!(
+            "scan.select_superfiles",
+            manifest_superfiles = self.manifest.superfiles.len(),
+            survivors = tracing::field::Empty,
+        );
+
+        let survivor_entries = self
+            .select_survivors(filters)
+            .instrument(select_span.clone())
+            .await?;
+
+        select_span.record("survivors", survivor_entries.len());
+
         let survivors: Vec<&Arc<SuperfileEntry>> = survivor_entries.iter().collect();
 
         // Nothing survived (empty table, or every superfile pruned):
@@ -858,8 +873,14 @@ impl TableProvider for SupertableProvider {
         let plan_locations =
             plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await;
         let plan_locations = &plan_locations;
+
+        // Opening every survivor: the part of a scan that pays for a cache
+        // miss. Each file that is not already in memory reports its tier in
+        // a `cache.open` span beneath this one.
         let prepared_files =
-            try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry))).await?;
+            try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry)))
+                .instrument(detail_span!("scan.open_files", files = survivors.len()))
+                .await?;
 
         // Per-superfile scan inputs, resolved into PartitionedFiles once the
         // store is built (row-group counts are read from each superfile's
@@ -998,6 +1019,13 @@ impl TableProvider for SupertableProvider {
                     }
                 }),
         )
+        // The per-superfile predicate work above: index candidate plans,
+        // their evaluation, and the tombstone overlay. Distinct from opening
+        // the files, which was paid for in `scan.open_files`.
+        .instrument(detail_span!(
+            "scan.index_predicates",
+            files = survivors.len()
+        ))
         .await?;
 
         // Whether some superfile's plan came out `Unbounded`. Decides

@@ -55,7 +55,7 @@ use manifest::{
 pub use options::{ColdFetchMode, ConnectOptions};
 pub use table::Supertable;
 use tokio::runtime::{Handle, Runtime};
-use tracing::{debug, info};
+use tracing::{Instrument, debug, info};
 use uri::{Backend, parse_uri};
 
 /// Most `AND` / `OR` connectives allowed in one SQL statement or mutation predicate: past a few
@@ -98,6 +98,7 @@ use crate::{
         query::exec::common::collect_plan_metered,
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
+    utils::trace::{detail_span, record},
 };
 
 /// Subdirectory under a tables cache root holding the manifest-part cache.
@@ -912,8 +913,19 @@ impl Connection {
     #[cfg_attr(
         feature = "detailed-tracing",
         // Connection-level entry: no table handle yet, so no `role` — the
-        // per-table spans beneath this one carry it.
-        tracing::instrument(skip_all, fields(sql = sql, origin = OpOrigin::Query.as_str()))
+        // per-table spans beneath this one carry it. The empty fields are
+        // filled in once the query has run: what it returned, and the
+        // per-op counters the meter collected for it, so the span and the
+        // billed read work can be read against each other.
+        tracing::instrument(skip_all, fields(
+            sql = sql,
+            origin = OpOrigin::Query.as_str(),
+            rows_out = tracing::field::Empty,
+            sql_page_bytes = tracing::field::Empty,
+            planned_read_ranges = tracing::field::Empty,
+            rows_materialized = tracing::field::Empty,
+            kernel_cpu_ns = tracing::field::Empty,
+        ))
     )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(sql, "running sql query");
@@ -978,8 +990,10 @@ impl Connection {
             // planner recursion depth must not hang on a stack the engine does not own. A panic
             // surfaces through the join as a query error.
             let planner_ctx = ctx.clone();
-            let (task_ctx, plan) = Handle::current()
-                .spawn(async move {
+            // The planning task runs on another thread, which inherits no
+            // span on its own: instrument it, or the spans it creates start
+            // a trace of their own and the plan phase vanishes from this one.
+            let planning = async move {
                     // Plan, check, execute. `SessionContext::sql` would run a DDL or session
                     // statement while producing the DataFrame, so the read-only check sits between
                     // planning and execution. It runs on the planned tree, so spelling is
@@ -1015,12 +1029,13 @@ impl Connection {
                         .await
                         .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
                     Ok::<_, InfinoError>((task_ctx, plan))
-                })
-                .await
-                .map_err(|join| {
-                    InfinoError::Query(format!("planning task failed: {join}"))
-                        .with_context("query_sql", None)
-                })??;
+                }
+                .instrument(detail_span!("sql.plan"))
+                .in_current_span();
+            let (task_ctx, plan) = Handle::current().spawn(planning).await.map_err(|join| {
+                InfinoError::Query(format!("planning task failed: {join}"))
+                    .with_context("query_sql", None)
+            })??;
             // The shared meter-collect-harvest step: the root wrapper
             // meters the whole plan (aggregation, sort and join work sits
             // above the scan and is this query's CPU too), the scan
@@ -1028,8 +1043,25 @@ impl Connection {
             // thread never runs, and the shared bracket depth keeps a
             // single-partition plan from counting both.
             let batches = collect_plan_metered(&plan, task_ctx, &op_stats)
+                .instrument(detail_span!("sql.execute"))
                 .await
                 .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
+            // Close out the span with what the query did. The snapshot reads a
+            // dozen atomics, so it is skipped along with the fields it feeds.
+            if cfg!(feature = "detailed-tracing") {
+                record(
+                    "rows_out",
+                    batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(),
+                );
+                if let Some(stats) = op_stats.as_ref() {
+                    let stats = stats.snapshot();
+                    record("sql_page_bytes", stats.sql_page_bytes);
+                    record("planned_read_ranges", stats.planned_read_ranges);
+                    record("rows_materialized", stats.rows_materialized);
+                    record("kernel_cpu_ns", stats.kernel_cpu_ns);
+                }
+            }
+
             if batches.is_empty() {
                 // An empty Vec carries no schema, so hand back one empty batch
                 // instead. Its schema comes from the physical plan, not the

@@ -4,11 +4,15 @@
 //! The public reader API: hand back a [`SuperfileReader`] for a URI, serving it
 //! from memory or disk when it is cached and cold-fetching it when it is not.
 
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 #[cfg(any(test, feature = "test-helpers"))]
 use std::time::{Duration, Instant};
 
 use tokio::sync::OnceCell;
+use tracing::Instrument;
 
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::supertable::reader_cache::disk::fetch::PromotionWaitGuard;
@@ -23,6 +27,7 @@ use crate::{
         manifest::{SubsectionOffsets, SuperfileUri},
         reader_cache::disk::*,
     },
+    utils::trace::{detail_span, record},
 };
 
 /// Shared walks a caller joins before walking alone: the first, plus one retry when the first
@@ -62,8 +67,17 @@ impl DiskCacheStore {
             .await
         {
             // Nothing local and the file cannot be admitted: stream it uncached rather than fail.
+            // The walk's own `cache.open` already ended on the refusal, so this is a second span
+            // for the same file, saying what actually served it.
             Err(DiskCacheError::BudgetExceeded) => {
-                self.open_range_only(storage_key, offsets, storage).await
+                self.open_range_only(storage_key, offsets, storage)
+                    .instrument(detail_span!(
+                        "cache.open",
+                        uri = tracing::field::display(&uri.0),
+                        intent = tracing::field::debug(intent),
+                        tier = "streamed",
+                    ))
+                    .await
             }
             served => served,
         }
@@ -170,9 +184,16 @@ impl DiskCacheStore {
         }
 
         // Tiers 2 to 4, one walk per URI: concurrent callers share it, so N misses cost one stat,
-        // one mmap or one download.
+        // one mmap or one download. The walk records which tier served the file on this span; a
+        // memory hit above never reaches it, so a warm scan emits no `cache.open` at all.
         let entry = self
             .fetch_local_or_source_coalesced(uri, storage_key, intent, offsets, storage)
+            .instrument(detail_span!(
+                "cache.open",
+                uri = tracing::field::display(&uri.0),
+                intent = tracing::field::debug(intent),
+                tier = tracing::field::Empty,
+            ))
             .await?;
 
         Ok(self.serve(uri, storage_key, &entry, intent, storage))
@@ -243,6 +264,7 @@ impl DiskCacheStore {
         // file on disk: a fill that left the vector blob on the block cache wrote a file with a
         // hole, and only the live entry can serve it.
         if let Some(entry) = self.whole_file_in_memory(uri) {
+            record("tier", "memory");
             return Ok(entry);
         }
 
@@ -252,6 +274,7 @@ impl DiskCacheStore {
             .fetch_from_disk_cache(uri, offsets.map(|o| o.total_size))
             .await?
         {
+            record("tier", "disk");
             return Ok(entry);
         }
 
@@ -260,10 +283,12 @@ impl DiskCacheStore {
         if intent != ReadIntent::Load
             && let Some(entry) = self.open_lazy_reader(uri)
         {
+            record("tier", "lazy");
             return Ok(entry);
         }
 
         // Tier 4, object store: nothing is local.
+        record("tier", "source");
         self.fetch_from_source(uri, storage_key, intent, offsets, storage)
             .await
     }
@@ -294,11 +319,19 @@ impl DiskCacheStore {
                 .or_insert_with(|| Arc::new(OnceCell::new()))
                 .clone();
 
+            // Whether this caller ran the walk or waited on another's: only the runner learns
+            // the tier, so a waiter labels itself instead of leaving the field empty. Set and
+            // read on this task alone; it is an atomic only so the future stays `Send`.
+            let ran_walk = AtomicBool::new(false);
             let result = cell
                 .get_or_init(|| {
+                    ran_walk.store(true, Ordering::Relaxed);
                     self.fetch_local_or_source(uri, storage_key, intent, offsets, storage)
                 })
                 .await;
+            if !ran_walk.load(Ordering::Relaxed) {
+                record("tier", "coalesced");
+            }
 
             // Remove only our own cell. A newer one belongs to a retry already in flight.
             self.coordinators
