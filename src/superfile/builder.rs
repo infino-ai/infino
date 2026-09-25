@@ -1804,6 +1804,7 @@ impl SuperfileBuilder {
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
 
+    test_visible! {
     /// Merge FTS/scalar superfiles by **carrying each input's already-built
     /// posting lists across** instead of re-tokenizing the corpus. The vector
     /// merge does the analogous byte-level splice
@@ -1831,7 +1832,7 @@ impl SuperfileBuilder {
         feature = "detailed-tracing",
         tracing::instrument(skip_all, fields(inputs = readers.len()))
     )]
-    pub(crate) fn build_from_readers_fts_merge_to<W: Write>(
+    fn build_from_readers_fts_merge_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
         fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
@@ -1926,6 +1927,7 @@ impl SuperfileBuilder {
         superfile_builder.finish_to_with_body(body, ids_bytes, output)?;
         drop(finish_span);
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
+    }
     }
 
     /// A standalone merge: the output averages document length over its
