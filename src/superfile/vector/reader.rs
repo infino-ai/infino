@@ -10515,6 +10515,77 @@ mod tests {
         );
     }
 
+    /// The multi-cell arm of the coalesce score set: `score_only` carries FLAT
+    /// cluster ids, and the scan must resolve them to `(cell, local)` the same
+    /// way the fetch keying does. The fixture packs two cells (tags 7 and 15,
+    /// two clusters each, rows in each cell's local cluster 0), so flats 0 and
+    /// 2 hold rows. Scoping to one cell's flat must surface that cell's rows
+    /// only — a keying slip would score the wrong cell or nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesce_score_only_resolves_flat_ids_per_cell_on_packed_files() {
+        let (blob, json) = build_multi_cell_blob();
+        let r = VectorReader::open(blob.into(), &json).expect("open");
+        assert!(r.is_multi_cell(), "fixture must be a v2 packed file");
+        let q = vec![0.0f32; 16];
+        let fetch: Vec<u32> = (0..4).collect();
+
+        // Baseline over the whole span: both cells contribute.
+        let baseline = r
+            .search_clusters_scan_async(
+                "embedding",
+                &q,
+                5,
+                &fetch,
+                None,
+                8,
+                8,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("baseline scan");
+        let cells: BTreeSet<usize> = baseline.candidates.iter().map(|c| c.cell_idx).collect();
+        assert_eq!(
+            cells.len(),
+            2,
+            "fixture sanity: candidates from both packed cells, got {cells:?}"
+        );
+
+        // Scope to one cell's flat at a time; only that cell may score.
+        for (flat, cell_idx) in [(0u32, 0usize), (2u32, 1usize)] {
+            let scoped = r
+                .search_clusters_scan_async(
+                    "embedding",
+                    &q,
+                    5,
+                    &fetch,
+                    Some(&[flat]),
+                    8,
+                    8,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("scoped scan");
+            assert!(
+                !scoped.candidates.is_empty(),
+                "flat {flat} resolves to a non-empty cluster; scoping it must score rows"
+            );
+            for c in &scoped.candidates {
+                assert_eq!(
+                    c.cell_idx, cell_idx,
+                    "flat {flat} belongs to cell {cell_idx}; a candidate scored from cell {} \
+                     means the flat-to-cell mapping drifted from the fetch keying",
+                    c.cell_idx
+                );
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn parallel_scan_untruncated_pool_matches_brute_force() {
         // 2600 docs across 4 clusters puts the probed scan over
