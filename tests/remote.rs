@@ -19,8 +19,8 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Bm25SearchOptions, BoolMode, ConnectOptions, IndexSpec, InfinoError, OptimizeError,
-    OptimizeOptions, VectorFilter, VectorSearchOptions,
+    Bm25SearchOptions, BoolMode, ConnectOptions, FtsField, IndexSpec, InfinoError, Metric,
+    OptimizeError, OptimizeOptions, Stemmer, Stopwords, VectorFilter, VectorSearchOptions,
 };
 use serde_json::json;
 use wiremock::{
@@ -552,6 +552,170 @@ fn path_segments(paths: impl Iterator<Item = String>) -> Vec<String> {
 
 /// The request-body schema name the spec defines for `(method, <op>)`, if the
 /// operation carries a JSON body. `None` for bodyless ops (binary/query-param).
+/// Vector columns must be at least this wide; the smallest the engine accepts.
+const CONFORMANCE_VECTOR_DIM: i32 = 16;
+
+/// A schema with one column of each indexable kind, so the conformance
+/// `create_table` can declare every index option the transport knows how to
+/// send.
+fn full_index_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("text", DataType::LargeUtf8, false),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                CONFORMANCE_VECTOR_DIM,
+            ),
+            false,
+        ),
+    ]))
+}
+
+/// Every FTS option set to a non-default value, plus a vector index: the
+/// widest `indexes` object the transport can emit. An empty spec sends no
+/// nested object at all, which is how three per-column options shipped in
+/// the engine before the hosted API knew any of them.
+fn full_index_spec() -> IndexSpec {
+    IndexSpec::new()
+        .fts(
+            FtsField::new("text")
+                .analyzer("standard")
+                .bm25(1.6, 0.4)
+                .stored(false)
+                .positions(true)
+                .stopwords(Stopwords::English)
+                .stemmer(Stemmer::English),
+        )
+        .vector("emb", CONFORMANCE_VECTOR_DIM as usize, Metric::Cosine)
+}
+
+/// Walk `value` against `schema`, following `$ref`s into the spec and trying
+/// each `oneOf` / `anyOf` alternative, and record every structural mismatch:
+/// a required field absent, a field the schema does not define (the server's
+/// `deny_unknown_fields` would 400 it), a value outside an `enum`, or an
+/// element that fits no alternative. `at` names the position for the message.
+fn conform(
+    spec: &serde_json::Value,
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    at: &str,
+    errors: &mut Vec<String>,
+) {
+    if let Some(r) = schema.get("$ref").and_then(serde_json::Value::as_str) {
+        let Some(target) = spec.pointer(r.trim_start_matches('#')) else {
+            errors.push(format!("{at}: unresolvable $ref {r}"));
+            return;
+        };
+        return conform(spec, target, value, at, errors);
+    }
+    if value.is_null() {
+        return; // nullability is the schema's business, not the transport's
+    }
+    // A declared JSON type must match, or a `oneOf` like `[null, Indexes]`
+    // would accept an object through its null arm and never walk the object.
+    if let Some(declared) = schema.get("type") {
+        let allowed: Vec<&str> = match declared {
+            serde_json::Value::String(t) => vec![t.as_str()],
+            serde_json::Value::Array(ts) => {
+                ts.iter().filter_map(serde_json::Value::as_str).collect()
+            }
+            _ => Vec::new(),
+        };
+        let actual = match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        };
+        let fits = allowed
+            .iter()
+            .any(|t| *t == actual || (*t == "number" && actual == "integer"));
+        if !allowed.is_empty() && !fits {
+            errors.push(format!("{at}: is {actual}, schema allows {allowed:?}"));
+            return;
+        }
+    }
+    if let Some(alts) = schema
+        .get("oneOf")
+        .or_else(|| schema.get("anyOf"))
+        .and_then(serde_json::Value::as_array)
+    {
+        // Report the alternative that got past the type check: for a
+        // `[null, Indexes]` union the null arm's "is object" says nothing,
+        // while the Indexes arm names the field the service does not know.
+        let mut attempts: Vec<Vec<String>> = Vec::new();
+        for alt in alts {
+            let mut attempt = Vec::new();
+            conform(spec, alt, value, at, &mut attempt);
+            if attempt.is_empty() {
+                return;
+            }
+            attempts.push(attempt);
+        }
+        let type_only = |a: &Vec<String>| a.len() == 1 && a[0].contains(", schema allows ");
+        let best = attempts
+            .iter()
+            .find(|a| !type_only(a))
+            .or_else(|| attempts.first())
+            .expect("a oneOf has at least one alternative");
+        errors.push(format!(
+            "{at}: fits none of the {} alternatives; closest: {}",
+            alts.len(),
+            best.join("; ")
+        ));
+        return;
+    }
+    if let Some(properties) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    {
+        let Some(obj) = value.as_object() else {
+            errors.push(format!("{at}: expected an object"));
+            return;
+        };
+        let required: BTreeSet<&str> = schema["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default();
+        let sent: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let defined: BTreeSet<&str> = properties.keys().map(String::as_str).collect();
+        for missing in required.difference(&sent) {
+            errors.push(format!("{at}: omits required field `{missing}`"));
+        }
+        for unknown in sent.difference(&defined) {
+            errors.push(format!(
+                "{at}: sends field `{unknown}` the schema does not define (the server would reject it)"
+            ));
+        }
+        for (name, sub) in properties {
+            if let Some(v) = obj.get(name) {
+                conform(spec, sub, v, &format!("{at}.{name}"), errors);
+            }
+        }
+        return;
+    }
+    if let Some(items) = schema.get("items") {
+        let Some(arr) = value.as_array() else {
+            errors.push(format!("{at}: expected an array"));
+            return;
+        };
+        for (i, v) in arr.iter().enumerate() {
+            conform(spec, items, v, &format!("{at}[{i}]"), errors);
+        }
+        return;
+    }
+    if let Some(allowed) = schema.get("enum").and_then(serde_json::Value::as_array)
+        && !allowed.contains(value)
+    {
+        errors.push(format!("{at}: value {value} is not one of {allowed:?}"));
+    }
+}
+
 fn request_schema_name(spec: &serde_json::Value, method: &str, seg: &str) -> Option<String> {
     for (path, methods) in spec["paths"].as_object()? {
         if path.split('/').nth(2) != Some(seg) {
@@ -583,7 +747,10 @@ fn request_schema_name(spec: &serde_json::Value, method: &str, seg: &str) -> Opt
 ///    the client sends conform to the spec's request schema: every required
 ///    field is present, and no field is undefined (the server's
 ///    `deny_unknown_fields` would 400 an undefined one). A renamed, newly
-///    required, or removed field fails here.
+///    required, or removed field fails here. The check walks nested objects
+///    through `$ref` and `oneOf`, so a per-column index option the service
+///    does not know fails here too — `create_table` is driven with every
+///    option set, because an empty spec sends no nested object to check.
 ///
 /// The Rust remote transport is the single place these requests are built; the
 /// node and python bindings call through it, so this one check covers all three
@@ -607,7 +774,7 @@ async fn remote_client_matches_the_published_api_spec() {
     // tracked separately). `optimize`/`gc` short-circuit and send nothing.
     with_connection(server.uri(), |db| {
         let _ = db.create_database();
-        let _ = db.create_table("posts", id_schema(), IndexSpec::new());
+        let _ = db.create_table("posts", full_index_schema(), full_index_spec());
         let _ = db.list_tables();
         let _ = db.drop_table("posts", false);
         let _ = db.query_sql("SELECT id FROM posts");
@@ -659,33 +826,24 @@ async fn remote_client_matches_the_published_api_spec() {
             continue; // bodyless op (binary/query-param) — nothing to conform.
         };
         let schema = &spec["components"]["schemas"][&schema_name];
-        let required: BTreeSet<&str> = schema["required"]
-            .as_array()
-            .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
-            .unwrap_or_default();
-        let properties: BTreeSet<&str> = schema["properties"]
-            .as_object()
-            .map(|o| o.keys().map(String::as_str).collect())
-            .unwrap_or_default();
-
         let body: serde_json::Value =
             serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
-        let Some(obj) = body.as_object() else {
+        if !body.is_object() {
             continue; // non-JSON body — not a schema-typed request.
-        };
-        let sent: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
-
-        let missing: Vec<&&str> = required.difference(&sent).collect();
-        assert!(
-            missing.is_empty(),
-            "{method} /v1/{seg}: client omits required field(s) {missing:?} that \
-             {schema_name} requires — the request signature drifted from the spec"
+        }
+        let mut errors = Vec::new();
+        conform(
+            &spec,
+            schema,
+            &body,
+            &format!("{method} /v1/{seg}"),
+            &mut errors,
         );
-        let unknown: Vec<&&str> = sent.difference(&properties).collect();
         assert!(
-            unknown.is_empty(),
-            "{method} /v1/{seg}: client sends field(s) {unknown:?} not defined by \
-             {schema_name} — the request signature drifted (the server would reject these)"
+            errors.is_empty(),
+            "the request signature drifted from {schema_name} — the hosted API changed, \
+             update the transport (or the service must learn the field):\n  {}",
+            errors.join("\n  ")
         );
     }
 }

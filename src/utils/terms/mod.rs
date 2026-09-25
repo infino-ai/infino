@@ -485,14 +485,16 @@ impl<'a> TermBlocks<'a> {
         None
     }
 
-    /// Visit every `(key, entry)` whose key starts with `prefix`, in
-    /// order, until `visit` returns `false`.
-    pub(crate) fn for_each_prefix(
+    /// Visit every `(key, entry)` whose key starts with `prefix` and is
+    /// `>= from`, in order, until `visit` returns `false`. `from` must be
+    /// `>= prefix`.
+    pub(crate) fn for_each_from(
         &self,
         prefix: &[u8],
+        from: &[u8],
         mut visit: impl FnMut(&[u8], FstValue) -> bool,
     ) {
-        let mut b = self.block_for(prefix).unwrap_or(0);
+        let mut b = self.block_for(from).unwrap_or(0);
         while b < self.n_blocks {
             let Some(range) = self.block_range(b) else {
                 return;
@@ -500,7 +502,7 @@ impl<'a> TermBlocks<'a> {
             let mut cur = BlockCursor::new(&self.bytes[range]);
             while let Some(entry) = cur.next() {
                 let key = cur.key.as_slice();
-                if key < prefix {
+                if key < from {
                     continue;
                 }
                 if !key.starts_with(prefix) || !visit(key, entry) {
@@ -693,18 +695,30 @@ impl<'a> TermDict<'a> {
     pub(crate) fn for_each_prefix(
         &self,
         prefix: &[u8],
+        visit: impl FnMut(&[u8], FstValue) -> bool,
+    ) {
+        self.for_each_from(prefix, prefix, visit);
+    }
+
+    /// [`Self::for_each_prefix`] starting at the first key `>= from`, so a
+    /// walk can resume where an earlier one stopped. `from` must be
+    /// `>= prefix`.
+    pub(crate) fn for_each_from(
+        &self,
+        prefix: &[u8],
+        from: &[u8],
         mut visit: impl FnMut(&[u8], FstValue) -> bool,
     ) {
         match self {
             Self::Fst(map) => {
-                let mut stream = map.range().ge(prefix).into_stream();
+                let mut stream = map.range().ge(from).into_stream();
                 while let Some((key, packed)) = stream.next() {
                     if !key.starts_with(prefix) || !visit(key, FstValue::unpack(packed)) {
                         break;
                     }
                 }
             }
-            Self::Blocks(b) => b.for_each_prefix(prefix, visit),
+            Self::Blocks(b) => b.for_each_from(prefix, from, visit),
         }
     }
 }
@@ -836,6 +850,59 @@ mod tests {
         for (k, v) in items.iter().step_by(97) {
             assert_eq!(a.lookup(k), Some(*v));
             assert_eq!(b.lookup(k), Some(*v));
+        }
+    }
+
+    #[test]
+    fn for_each_from_resumes_at_a_key_in_both_layouts() {
+        // The FST arm has no short form, so use long-form entries only.
+        let items: Vec<(Vec<u8>, FstValue)> = entries(5_000)
+            .into_iter()
+            .map(|(k, v)| match v {
+                FstValue::Pfor {
+                    metadata_offset,
+                    postings_length_hint,
+                    ..
+                } => (
+                    k,
+                    FstValue::Pfor {
+                        metadata_offset,
+                        postings_length_hint,
+                        short: false,
+                    },
+                ),
+                inline => (k, inline),
+            })
+            .collect();
+        let mut blocks = TermBlockWriter::new(Vec::new());
+        let mut fst = TermDictBuilder::new(DictLayout::Fst);
+        for (k, v) in &items {
+            blocks.insert_sorted(k, *v).expect("vec sink");
+            fst.insert(k, *v);
+        }
+        let blocks = blocks.finish().expect("vec sink");
+        let fst = fst.finish();
+        let prefix = make_key("body", "");
+        // Column start, keys on and between block edges, and past the end.
+        let froms = [
+            prefix.clone(),
+            items[0].0.clone(),
+            items[TERM_BLOCK_SIZE].0.clone(),
+            make_key("body", "term02500"),
+            items[items.len() - 1].0.clone(),
+            make_key("body", "zzz"),
+        ];
+        for (bytes, layout) in [(&blocks, DictLayout::Blocks), (&fst, DictLayout::Fst)] {
+            let d = TermDict::open(bytes, layout).expect("opens");
+            for from in &froms {
+                let mut got = Vec::new();
+                d.for_each_from(&prefix, from, |k, v| {
+                    got.push((k.to_vec(), v));
+                    true
+                });
+                let want: Vec<_> = items.iter().filter(|(k, _)| k >= from).cloned().collect();
+                assert_eq!(got, want, "{layout:?} from {from:?}");
+            }
         }
     }
 

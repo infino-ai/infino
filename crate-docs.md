@@ -27,7 +27,7 @@ cargo add infino
 infino installs the [mimalloc](https://github.com/microsoft/mimalloc) global
 allocator by default. If you embed infino in a process that already sets a global
 allocator, turn it off to avoid a second one:
-`infino = { version = "0.1", default-features = false }`.
+`infino = { version = "0.8", default-features = false }`.
 
 ## Quickstart
 

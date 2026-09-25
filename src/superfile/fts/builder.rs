@@ -108,6 +108,7 @@ use crate::{
             },
             reader::ColumnLengthStats,
             short::{SHORT_MAX_DF, encode_short},
+            sorted_merge::{SortedInput, merge_column},
             tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
         },
         id_space::FtsDocId,
@@ -562,6 +563,12 @@ impl ColumnPostings {
     }
     fn is_spilled(&self) -> bool {
         matches!(self, Self::Spilled { .. })
+    }
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::InRam { terms, .. } => terms.is_empty(),
+            Self::Spilled { .. } => false,
+        }
     }
 }
 
@@ -1425,6 +1432,10 @@ pub struct FtsBuilder {
     /// it. `None`, the default, writes the era's version unchanged, so
     /// nothing about a build that does not reorder moves.
     pub(crate) doc_map: Option<Vec<u32>>,
+    /// Prebuilt inputs whose postings the finish merges term by term
+    /// instead of reading the accumulator (the compaction merge). Empty
+    /// for every other build.
+    sorted_inputs: Vec<SortedInput>,
 }
 
 impl FtsBuilder {
@@ -1481,7 +1492,15 @@ impl FtsBuilder {
             bump: Bump::new(),
             era: BlobEra::V7,
             doc_map: None,
+            sorted_inputs: Vec::new(),
         }
+    }
+
+    /// Have the finish merge these inputs' postings term by term instead of
+    /// reading the accumulator, which must stay empty. Inputs are in output
+    /// row order; their doc lengths are appended separately.
+    pub(crate) fn set_sorted_inputs(&mut self, inputs: Vec<SortedInput>) {
+        self.sorted_inputs = inputs;
     }
 
     /// Override the per-column in-RAM accumulator budget. Once a
@@ -2678,7 +2697,14 @@ impl FtsBuilder {
         // builds that *could* be served by either (regression-
         // gated by `build_above_threshold_spills_and_matches_in_
         // ram_byte_for_byte`).
-        if self.postings.iter().any(|c| c.is_spilled()) {
+        // The sorted merge supplies every posting; any the accumulator also
+        // holds would be dropped from the output.
+        if !self.sorted_inputs.is_empty() && self.postings.iter().any(|c| !c.is_empty()) {
+            return Err(BuildError::Io(Error::other(
+                "fts: sorted merge inputs set on a builder that also accumulated postings",
+            )));
+        }
+        if !self.sorted_inputs.is_empty() || self.postings.iter().any(|c| c.is_spilled()) {
             self.finish_to_spilled(w)
         } else {
             self.finish_to_inram(w)
@@ -2713,6 +2739,7 @@ impl FtsBuilder {
             bump,
             era,
             doc_map,
+            sorted_inputs: _,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2897,6 +2924,7 @@ impl FtsBuilder {
             bump,
             era,
             doc_map,
+            sorted_inputs,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -3008,243 +3036,247 @@ impl FtsBuilder {
             // carry tokens, matching what the reader divides by.
             let n_scored = n_scored_per_col[orig_col_idx];
 
-            match posting_state {
-                ColumnPostings::InRam {
-                    terms,
-                    pos_runs: mut col_pos_runs,
-                    bytes: _,
-                } => {
-                    // Sort term keys; per-term doc lists are already
-                    // in insertion order which is monotonically
-                    // increasing local_doc_id per the add_doc
-                    // contract — no per-list sort needed.
-                    type InRamEntries = Vec<(Box<str>, Vec<(u32, u32)>)>;
-                    let mut entries: InRamEntries = terms.into_iter().collect();
-                    // pdqsort: posting-table dictionary entries for
-                    // one in-RAM column can run into millions of
-                    // terms; stability is unnecessary because keys
-                    // are unique.
-                    entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-                    for (term, postings) in entries {
-                        // Positional columns never spill (their
-                        // accumulator is pinned in RAM), so a spilled
-                        // build's positional terms all pass through
-                        // this arm with their runs.
-                        let term_runs: Vec<u8> = match col_positions {
-                            true => col_pos_runs
-                                .remove(&term)
-                                .expect("positional term accumulated a position run"),
-                            false => Vec::new(),
-                        };
-                        let term_positions = match col_positions {
-                            true => Some((&mut positions_sink, term_runs.as_slice())),
-                            false => None,
-                        };
-                        encode_and_emit_term(
-                            &term,
-                            &postings,
-                            col_name_bytes,
-                            col_doc_lengths,
-                            avgdl,
-                            params,
-                            n_scored,
-                            &mut key_buf,
-                            &mut postings_writer,
-                            &mut postings_crc_acc,
-                            &mut postings_len,
-                            None,
-                            Some(&mut fst_streaming),
-                            term_positions,
-                            &mut finish_profile,
-                            &mut term_scratch,
-                            era,
-                        )?;
-                        n_terms_total_usize += 1;
-                    }
-                }
-                ColumnPostings::Spilled {
-                    partitions,
-                    term_to_id,
-                    id_to_term,
-                    dense_doc_tf: _,
-                    dense_doc_poshead: _,
-                    updated_terms: _,
-                    term_arena,
-                } => {
-                    // Term interner is finished being written to;
-                    // drop the forward map (`term_to_id`) immediately
-                    // — the rest of the spilled finish only needs
-                    // the reverse map (`id_to_term`) for FST emit and
-                    // the lex-rank table built from it.
-                    //
-                    // Lifetime sanity: `term_to_id` and `id_to_term`
-                    // hold `&'static str` keys/entries that actually
-                    // borrow from `term_arena`. We must keep
-                    // `term_arena` alive until the **last
-                    // dereference** of those keys/entries, which is
-                    // the FST emit loop's `id_to_term[term_id]`
-                    // index below. End-of-scope `Drop` order does
-                    // not matter for soundness — neither `&str` nor
-                    // its container's `Drop` impls dereference the
-                    // borrowed bytes — but any **use** of `id_to_
-                    // term[i].as_bytes()` must occur before
-                    // `term_arena` goes out of scope. Both this
-                    // arm's body and the helper functions it calls
-                    // observe that.
-                    drop(term_to_id);
-                    let lex_rank_start = finish_profile.enabled.then(Instant::now);
-                    let (lex_rank, term_id_in_lex_order) = build_lex_rank(&id_to_term);
-                    if let Some(t) = lex_rank_start {
-                        finish_profile.lex_rank_build += t.elapsed();
-                    }
-
-                    // Pre-sort every partition to a sorted-triple
-                    // file under scratch. Sorting partition-at-a-
-                    // time bounds the in-RAM sort working set to
-                    // `max_partition_bytes` (one partition at a
-                    // time), then the k-way merge across the
-                    // resulting sorted files runs with
-                    // O(n_partitions) cursors each holding one
-                    // triple + a small read buffer.
-                    let sort_start = finish_profile.enabled.then(Instant::now);
-                    let mut sorted_files: Vec<PathBuf> =
-                        Vec::with_capacity(partitions.n_partitions());
-                    let partition_paths: Vec<PathBuf> = match &partitions {
-                        SpillStore::Plain(parts) => parts.iter().map(|p| p.path.clone()).collect(),
-                        SpillStore::Positional {
-                            partitions: parts, ..
-                        } => parts.iter().map(|p| p.path.clone()).collect(),
-                    };
-                    let sort_span = detail_span!(
-                        "fts_partition_sort",
-                        column = col_name.as_str(),
-                        partitions = partition_paths.len()
+            // The compaction merge: the accumulator is empty (checked in
+            // `finish_to`) and the inputs are merged term by term, already in
+            // output order.
+            if !sorted_inputs.is_empty() {
+                let merge_span = detail_span!(
+                    "fts_sorted_merge",
+                    column = col_name.as_str(),
+                    inputs = sorted_inputs.len(),
+                    terms = tracing::field::Empty,
+                )
+                .entered();
+                let mut n_emitted: usize = 0;
+                merge_column(&sorted_inputs, orig_col_idx as u32, |term, pairs, runs| {
+                    n_emitted += 1;
+                    encode_and_emit_term(
+                        term,
+                        pairs,
+                        col_name_bytes,
+                        col_doc_lengths,
+                        avgdl,
+                        params,
+                        n_scored,
+                        &mut key_buf,
+                        &mut postings_writer,
+                        &mut postings_crc_acc,
+                        &mut postings_len,
+                        None,
+                        Some(&mut fst_streaming),
+                        col_positions.then_some((&mut positions_sink, runs)),
+                        &mut finish_profile,
+                        &mut term_scratch,
+                        era,
                     )
-                    .entered();
-                    for (partition_idx, partition_path) in partition_paths.iter().enumerate() {
-                        let sorted_path = scratch_path.join(format!(
-                            "fts_col{orig_col_idx}_part{partition_idx}.sorted.bin"
-                        ));
-                        match &partitions {
-                            SpillStore::Plain(_) => sort_partition_to_file::<PLAIN_RECORD_LANES>(
-                                partition_path,
-                                &sorted_path,
-                                max_partition_bytes,
-                                &scratch_path,
-                                &format!("c{orig_col_idx}_p{partition_idx}"),
-                                &lex_rank,
-                            )?,
-                            SpillStore::Positional { .. } => {
-                                sort_partition_to_file::<POSITIONAL_RECORD_LANES>(
-                                    partition_path,
-                                    &sorted_path,
-                                    max_partition_bytes,
-                                    &scratch_path,
-                                    &format!("c{orig_col_idx}_p{partition_idx}"),
-                                    &lex_rank,
-                                )?
-                            }
+                })?;
+                n_terms_total_usize += n_emitted;
+                record("terms", n_emitted as u64);
+                drop(merge_span);
+            } else {
+                match posting_state {
+                    ColumnPostings::InRam {
+                        terms,
+                        pos_runs: mut col_pos_runs,
+                        bytes: _,
+                    } => {
+                        // Sort term keys; per-term doc lists are already
+                        // in insertion order which is monotonically
+                        // increasing local_doc_id per the add_doc
+                        // contract — no per-list sort needed.
+                        type InRamEntries = Vec<(Box<str>, Vec<(u32, u32)>)>;
+                        let mut entries: InRamEntries = terms.into_iter().collect();
+                        // pdqsort: posting-table dictionary entries for
+                        // one in-RAM column can run into millions of
+                        // terms; stability is unnecessary because keys
+                        // are unique.
+                        entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                        for (term, postings) in entries {
+                            // Positional columns never spill (their
+                            // accumulator is pinned in RAM), so a spilled
+                            // build's positional terms all pass through
+                            // this arm with their runs.
+                            let term_runs: Vec<u8> = match col_positions {
+                                true => col_pos_runs
+                                    .remove(&term)
+                                    .expect("positional term accumulated a position run"),
+                                false => Vec::new(),
+                            };
+                            let term_positions = match col_positions {
+                                true => Some((&mut positions_sink, term_runs.as_slice())),
+                                false => None,
+                            };
+                            encode_and_emit_term(
+                                &term,
+                                &postings,
+                                col_name_bytes,
+                                col_doc_lengths,
+                                avgdl,
+                                params,
+                                n_scored,
+                                &mut key_buf,
+                                &mut postings_writer,
+                                &mut postings_crc_acc,
+                                &mut postings_len,
+                                None,
+                                Some(&mut fst_streaming),
+                                term_positions,
+                                &mut finish_profile,
+                                &mut term_scratch,
+                                era,
+                            )?;
+                            n_terms_total_usize += 1;
                         }
-                        sorted_files.push(sorted_path);
                     }
-                    drop(sort_span);
-                    if let Some(t) = sort_start {
-                        finish_profile.partition_sort += t.elapsed();
-                    }
+                    ColumnPostings::Spilled {
+                        partitions,
+                        term_to_id,
+                        id_to_term,
+                        dense_doc_tf: _,
+                        dense_doc_poshead: _,
+                        updated_terms: _,
+                        term_arena,
+                    } => {
+                        // Term interner is finished being written to;
+                        // drop the forward map (`term_to_id`) immediately
+                        // — the rest of the spilled finish only needs
+                        // the reverse map (`id_to_term`) for FST emit and
+                        // the lex-rank table built from it.
+                        //
+                        // Lifetime sanity: `term_to_id` and `id_to_term`
+                        // hold `&'static str` keys/entries that actually
+                        // borrow from `term_arena`. We must keep
+                        // `term_arena` alive until the **last
+                        // dereference** of those keys/entries, which is
+                        // the FST emit loop's `id_to_term[term_id]`
+                        // index below. End-of-scope `Drop` order does
+                        // not matter for soundness — neither `&str` nor
+                        // its container's `Drop` impls dereference the
+                        // borrowed bytes — but any **use** of `id_to_
+                        // term[i].as_bytes()` must occur before
+                        // `term_arena` goes out of scope. Both this
+                        // arm's body and the helper functions it calls
+                        // observe that.
+                        drop(term_to_id);
+                        let lex_rank_start = finish_profile.enabled.then(Instant::now);
+                        let (lex_rank, term_id_in_lex_order) = build_lex_rank(&id_to_term);
+                        if let Some(t) = lex_rank_start {
+                            finish_profile.lex_rank_build += t.elapsed();
+                        }
 
-                    // Lex-order partition traversal. Replaces the
-                    // earlier `BinaryHeap`-based k-way merge: since
-                    // partition assignment is `partition =
-                    // term_id & (n_part - 1)` (enforced
-                    // power-of-two in `set_spill_partitions`),
-                    // every posting for a given `term_id` lives
-                    // in exactly one partition. Within that
-                    // partition, the sort-partition phase has
-                    // already arranged triples in
-                    // `(lex_rank[term_id], doc_id)` order, so all
-                    // triples for one `term_id` are contiguous
-                    // there and they emerge in `doc_id` order
-                    // when scanned forward.
-                    //
-                    // The merge therefore reduces to: walk
-                    // `term_id_in_lex_order` (the
-                    // sort-once-globally permutation we already
-                    // produced above) and, for each `term_id`,
-                    // drain the contiguous matching run from
-                    // `sorted_slices[term_id & mask]` starting at
-                    // that partition's cursor. Cost is O(n_postings
-                    // + n_terms) sequential mmap reads + one u32
-                    // compare per posting, versus the heap path's
-                    // O(n_postings · log n_part) compares + heap
-                    // pushes/pops.
-                    //
-                    // We still mmap each sorted partition file
-                    // (zero-copy `&[Triple]` over page-cache-hot
-                    // bytes), so the per-posting access is pointer
-                    // arithmetic against contiguous memory.
-                    let merge_profile_start = Instant::now();
-                    let encode_calls_before = finish_profile.encode_calls;
-                    let encode_df1_before = finish_profile.encode_df1;
-                    let encode_pfor_before = finish_profile.encode_pfor;
-                    let encode_total_before = finish_profile.encode_total;
-                    let encode_block_build_before = finish_profile.encode_block_build;
-                    let encode_meta_write_before = finish_profile.encode_meta_write;
-                    let encode_skip_write_before = finish_profile.encode_skip_write;
-                    let encode_block_write_before = finish_profile.encode_block_write;
-                    let fst_insert_before = finish_profile.fst_insert;
-                    let emit_span = detail_span!(
-                        "fts_emit",
-                        column = col_name.as_str(),
-                        terms = tracing::field::Empty,
-                        encode_ms = tracing::field::Empty,
-                        gather_ms = tracing::field::Empty,
-                        block_build_ms = tracing::field::Empty,
-                        block_write_ms = tracing::field::Empty,
-                        fst_insert_ms = tracing::field::Empty,
-                    )
-                    .entered();
-                    let n_emitted = match &partitions {
-                        SpillStore::Plain(_) => merge_sorted_spill::<PLAIN_RECORD_LANES, _>(
-                            &sorted_files,
-                            None,
-                            &term_id_in_lex_order,
-                            &id_to_term,
-                            col_name_bytes,
-                            col_doc_lengths,
-                            avgdl,
-                            params,
-                            n_scored,
-                            &mut key_buf,
-                            &mut postings_writer,
-                            &mut postings_crc_acc,
-                            &mut postings_len,
-                            &mut fst_streaming,
-                            &mut positions_sink,
-                            &mut finish_profile,
-                            &mut term_scratch,
-                            era,
-                        )?,
-                        SpillStore::Positional { blobs, .. } => {
-                            // mmap each partition's positions blob so
-                            // run assembly is pointer arithmetic; an
-                            // empty blob maps to an empty slice.
-                            let mut blob_mmaps: Vec<Option<Mmap>> = Vec::with_capacity(blobs.len());
-                            for blob in blobs {
-                                let f = File::open(&blob.path)?;
-                                // SAFETY: the blob scratch file is owned
-                                // by this builder's `scratch_dir`; its
-                                // writer was flushed + closed in the
-                                // partition-flush stage and nothing
-                                // mutates it for the Mmap's lifetime.
-                                let mmap = match blob.len {
-                                    0 => None,
-                                    _ => Some(unsafe { Mmap::map(&f)? }),
-                                };
-                                blob_mmaps.push(mmap);
+                        // Pre-sort every partition to a sorted-triple
+                        // file under scratch. Sorting partition-at-a-
+                        // time bounds the in-RAM sort working set to
+                        // `max_partition_bytes` (one partition at a
+                        // time), then the k-way merge across the
+                        // resulting sorted files runs with
+                        // O(n_partitions) cursors each holding one
+                        // triple + a small read buffer.
+                        let sort_start = finish_profile.enabled.then(Instant::now);
+                        let mut sorted_files: Vec<PathBuf> =
+                            Vec::with_capacity(partitions.n_partitions());
+                        let partition_paths: Vec<PathBuf> = match &partitions {
+                            SpillStore::Plain(parts) => {
+                                parts.iter().map(|p| p.path.clone()).collect()
                             }
-                            merge_sorted_spill::<POSITIONAL_RECORD_LANES, _>(
+                            SpillStore::Positional {
+                                partitions: parts, ..
+                            } => parts.iter().map(|p| p.path.clone()).collect(),
+                        };
+                        let sort_span = detail_span!(
+                            "fts_partition_sort",
+                            column = col_name.as_str(),
+                            partitions = partition_paths.len()
+                        )
+                        .entered();
+                        for (partition_idx, partition_path) in partition_paths.iter().enumerate() {
+                            let sorted_path = scratch_path.join(format!(
+                                "fts_col{orig_col_idx}_part{partition_idx}.sorted.bin"
+                            ));
+                            match &partitions {
+                                SpillStore::Plain(_) => {
+                                    sort_partition_to_file::<PLAIN_RECORD_LANES>(
+                                        partition_path,
+                                        &sorted_path,
+                                        max_partition_bytes,
+                                        &scratch_path,
+                                        &format!("c{orig_col_idx}_p{partition_idx}"),
+                                        &lex_rank,
+                                    )?
+                                }
+                                SpillStore::Positional { .. } => {
+                                    sort_partition_to_file::<POSITIONAL_RECORD_LANES>(
+                                        partition_path,
+                                        &sorted_path,
+                                        max_partition_bytes,
+                                        &scratch_path,
+                                        &format!("c{orig_col_idx}_p{partition_idx}"),
+                                        &lex_rank,
+                                    )?
+                                }
+                            }
+                            sorted_files.push(sorted_path);
+                        }
+                        drop(sort_span);
+                        if let Some(t) = sort_start {
+                            finish_profile.partition_sort += t.elapsed();
+                        }
+
+                        // Lex-order partition traversal. Replaces the
+                        // earlier `BinaryHeap`-based k-way merge: since
+                        // partition assignment is `partition =
+                        // term_id & (n_part - 1)` (enforced
+                        // power-of-two in `set_spill_partitions`),
+                        // every posting for a given `term_id` lives
+                        // in exactly one partition. Within that
+                        // partition, the sort-partition phase has
+                        // already arranged triples in
+                        // `(lex_rank[term_id], doc_id)` order, so all
+                        // triples for one `term_id` are contiguous
+                        // there and they emerge in `doc_id` order
+                        // when scanned forward.
+                        //
+                        // The merge therefore reduces to: walk
+                        // `term_id_in_lex_order` (the
+                        // sort-once-globally permutation we already
+                        // produced above) and, for each `term_id`,
+                        // drain the contiguous matching run from
+                        // `sorted_slices[term_id & mask]` starting at
+                        // that partition's cursor. Cost is O(n_postings
+                        // + n_terms) sequential mmap reads + one u32
+                        // compare per posting, versus the heap path's
+                        // O(n_postings · log n_part) compares + heap
+                        // pushes/pops.
+                        //
+                        // We still mmap each sorted partition file
+                        // (zero-copy `&[Triple]` over page-cache-hot
+                        // bytes), so the per-posting access is pointer
+                        // arithmetic against contiguous memory.
+                        let merge_profile_start = Instant::now();
+                        let encode_calls_before = finish_profile.encode_calls;
+                        let encode_df1_before = finish_profile.encode_df1;
+                        let encode_pfor_before = finish_profile.encode_pfor;
+                        let encode_total_before = finish_profile.encode_total;
+                        let encode_block_build_before = finish_profile.encode_block_build;
+                        let encode_meta_write_before = finish_profile.encode_meta_write;
+                        let encode_skip_write_before = finish_profile.encode_skip_write;
+                        let encode_block_write_before = finish_profile.encode_block_write;
+                        let fst_insert_before = finish_profile.fst_insert;
+                        let emit_span = detail_span!(
+                            "fts_emit",
+                            column = col_name.as_str(),
+                            terms = tracing::field::Empty,
+                            encode_ms = tracing::field::Empty,
+                            gather_ms = tracing::field::Empty,
+                            block_build_ms = tracing::field::Empty,
+                            block_write_ms = tracing::field::Empty,
+                            fst_insert_ms = tracing::field::Empty,
+                        )
+                        .entered();
+                        let n_emitted = match &partitions {
+                            SpillStore::Plain(_) => merge_sorted_spill::<PLAIN_RECORD_LANES, _>(
                                 &sorted_files,
-                                Some(&blob_mmaps),
+                                None,
                                 &term_id_in_lex_order,
                                 &id_to_term,
                                 col_name_bytes,
@@ -3261,86 +3293,126 @@ impl FtsBuilder {
                                 &mut finish_profile,
                                 &mut term_scratch,
                                 era,
-                            )?
+                            )?,
+                            SpillStore::Positional { blobs, .. } => {
+                                // mmap each partition's positions blob so
+                                // run assembly is pointer arithmetic; an
+                                // empty blob maps to an empty slice.
+                                let mut blob_mmaps: Vec<Option<Mmap>> =
+                                    Vec::with_capacity(blobs.len());
+                                for blob in blobs {
+                                    let f = File::open(&blob.path)?;
+                                    // SAFETY: the blob scratch file is owned
+                                    // by this builder's `scratch_dir`; its
+                                    // writer was flushed + closed in the
+                                    // partition-flush stage and nothing
+                                    // mutates it for the Mmap's lifetime.
+                                    let mmap = match blob.len {
+                                        0 => None,
+                                        _ => Some(unsafe { Mmap::map(&f)? }),
+                                    };
+                                    blob_mmaps.push(mmap);
+                                }
+                                merge_sorted_spill::<POSITIONAL_RECORD_LANES, _>(
+                                    &sorted_files,
+                                    Some(&blob_mmaps),
+                                    &term_id_in_lex_order,
+                                    &id_to_term,
+                                    col_name_bytes,
+                                    col_doc_lengths,
+                                    avgdl,
+                                    params,
+                                    n_scored,
+                                    &mut key_buf,
+                                    &mut postings_writer,
+                                    &mut postings_crc_acc,
+                                    &mut postings_len,
+                                    &mut fst_streaming,
+                                    &mut positions_sink,
+                                    &mut finish_profile,
+                                    &mut term_scratch,
+                                    era,
+                                )?
+                            }
+                        };
+                        n_terms_total_usize += n_emitted;
+                        record("terms", n_emitted as u64);
+                        if finish_profile.enabled {
+                            let merge_total = merge_profile_start.elapsed();
+                            let encode_total = finish_profile.encode_total - encode_total_before;
+                            let non_encode = merge_total.saturating_sub(encode_total);
+                            record("encode_ms", encode_total.as_millis() as u64);
+                            record("gather_ms", non_encode.as_millis() as u64);
+                            record(
+                                "block_build_ms",
+                                (finish_profile.encode_block_build - encode_block_build_before)
+                                    .as_millis() as u64,
+                            );
+                            record(
+                                "block_write_ms",
+                                (finish_profile.encode_block_write - encode_block_write_before)
+                                    .as_millis() as u64,
+                            );
+                            record(
+                                "fst_insert_ms",
+                                (finish_profile.fst_insert - fst_insert_before).as_millis() as u64,
+                            );
+                            debug!(
+                                "[fts-profile] col='{}' merge_total={:.3}s non_encode_merge={:.3}s encode_total={:.3}s calls={} df1={} pfor={} block_build={:.3}s meta_write={:.3}s skip_write={:.3}s block_write={:.3}s fst_insert={:.3}s",
+                                col_name,
+                                merge_total.as_secs_f64(),
+                                non_encode.as_secs_f64(),
+                                encode_total.as_secs_f64(),
+                                finish_profile.encode_calls - encode_calls_before,
+                                finish_profile.encode_df1 - encode_df1_before,
+                                finish_profile.encode_pfor - encode_pfor_before,
+                                (finish_profile.encode_block_build - encode_block_build_before)
+                                    .as_secs_f64(),
+                                (finish_profile.encode_meta_write - encode_meta_write_before)
+                                    .as_secs_f64(),
+                                (finish_profile.encode_skip_write - encode_skip_write_before)
+                                    .as_secs_f64(),
+                                (finish_profile.encode_block_write - encode_block_write_before)
+                                    .as_secs_f64(),
+                                (finish_profile.fst_insert - fst_insert_before).as_secs_f64(),
+                            );
                         }
-                    };
-                    n_terms_total_usize += n_emitted;
-                    record("terms", n_emitted as u64);
-                    if finish_profile.enabled {
-                        let merge_total = merge_profile_start.elapsed();
-                        let encode_total = finish_profile.encode_total - encode_total_before;
-                        let non_encode = merge_total.saturating_sub(encode_total);
-                        record("encode_ms", encode_total.as_millis() as u64);
-                        record("gather_ms", non_encode.as_millis() as u64);
-                        record(
-                            "block_build_ms",
-                            (finish_profile.encode_block_build - encode_block_build_before)
-                                .as_millis() as u64,
-                        );
-                        record(
-                            "block_write_ms",
-                            (finish_profile.encode_block_write - encode_block_write_before)
-                                .as_millis() as u64,
-                        );
-                        record(
-                            "fst_insert_ms",
-                            (finish_profile.fst_insert - fst_insert_before).as_millis() as u64,
-                        );
-                        debug!(
-                            "[fts-profile] col='{}' merge_total={:.3}s non_encode_merge={:.3}s encode_total={:.3}s calls={} df1={} pfor={} block_build={:.3}s meta_write={:.3}s skip_write={:.3}s block_write={:.3}s fst_insert={:.3}s",
-                            col_name,
-                            merge_total.as_secs_f64(),
-                            non_encode.as_secs_f64(),
-                            encode_total.as_secs_f64(),
-                            finish_profile.encode_calls - encode_calls_before,
-                            finish_profile.encode_df1 - encode_df1_before,
-                            finish_profile.encode_pfor - encode_pfor_before,
-                            (finish_profile.encode_block_build - encode_block_build_before)
-                                .as_secs_f64(),
-                            (finish_profile.encode_meta_write - encode_meta_write_before)
-                                .as_secs_f64(),
-                            (finish_profile.encode_skip_write - encode_skip_write_before)
-                                .as_secs_f64(),
-                            (finish_profile.encode_block_write - encode_block_write_before)
-                                .as_secs_f64(),
-                            (finish_profile.fst_insert - fst_insert_before).as_secs_f64(),
-                        );
-                    }
-                    drop(emit_span);
+                        drop(emit_span);
 
-                    // Sorted-partition scratch files are scoped to
-                    // this column and only consumed by the k-way
-                    // merge above. Drop the mmap views first
-                    // (releases the page-cache references), then
-                    // remove the files so the next spilled column
-                    // doesn't see their disk residency. (Original
-                    // partition files are owned by `partitions`
-                    // and dropped at the next iteration boundary.)
-                    let cleanup_start = finish_profile.enabled.then(Instant::now);
-                    for p in &sorted_files {
-                        let _ = fs::remove_file(p);
-                    }
-                    // The raw spill partition files are also no
-                    // longer needed once the merge finishes — the
-                    // tempdir cleanup will reap them at scope exit
-                    // but doing it here keeps peak resident bytes
-                    // on disk bounded to one column.
-                    drop(partitions);
-                    // Explicit drop sequence: `id_to_term` first
-                    // (its `&'static str` entries borrow from
-                    // `term_arena`; we've finished the last read
-                    // at the FST emit loop above), then
-                    // `term_arena` itself releases the term-byte
-                    // backing store. Soundness does not strictly
-                    // require this order (neither `Vec<&str>::
-                    // drop` nor `Bump::drop` interacts with the
-                    // other), but spelling it out leaves the
-                    // intent unambiguous to future readers.
-                    drop(id_to_term);
-                    drop(term_arena);
-                    drop(lex_rank);
-                    if let Some(t) = cleanup_start {
-                        finish_profile.scratch_cleanup += t.elapsed();
+                        // Sorted-partition scratch files are scoped to
+                        // this column and only consumed by the k-way
+                        // merge above. Drop the mmap views first
+                        // (releases the page-cache references), then
+                        // remove the files so the next spilled column
+                        // doesn't see their disk residency. (Original
+                        // partition files are owned by `partitions`
+                        // and dropped at the next iteration boundary.)
+                        let cleanup_start = finish_profile.enabled.then(Instant::now);
+                        for p in &sorted_files {
+                            let _ = fs::remove_file(p);
+                        }
+                        // The raw spill partition files are also no
+                        // longer needed once the merge finishes — the
+                        // tempdir cleanup will reap them at scope exit
+                        // but doing it here keeps peak resident bytes
+                        // on disk bounded to one column.
+                        drop(partitions);
+                        // Explicit drop sequence: `id_to_term` first
+                        // (its `&'static str` entries borrow from
+                        // `term_arena`; we've finished the last read
+                        // at the FST emit loop above), then
+                        // `term_arena` itself releases the term-byte
+                        // backing store. Soundness does not strictly
+                        // require this order (neither `Vec<&str>::
+                        // drop` nor `Bump::drop` interacts with the
+                        // other), but spelling it out leaves the
+                        // intent unambiguous to future readers.
+                        drop(id_to_term);
+                        drop(term_arena);
+                        drop(lex_rank);
+                        if let Some(t) = cleanup_start {
+                            finish_profile.scratch_cleanup += t.elapsed();
+                        }
                     }
                 }
             }
