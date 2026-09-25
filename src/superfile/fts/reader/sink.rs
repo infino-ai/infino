@@ -13,7 +13,7 @@ use std::{
 };
 
 use super::{cursor::TermCursor, filter::ExcludeFilter, metadata::NormTable};
-use crate::superfile::fts::bm25;
+use crate::superfile::{fts::bm25, id_space::FtsDocId};
 
 /// A monotonically rising score floor shared by every segment of one
 /// query's fan-out, readable and raisable lock-free mid-walk.
@@ -71,19 +71,19 @@ impl LiveFloor {
 /// Tie-break: larger doc_id is "greater", so on equal scores the
 /// smaller doc_id survives in the heap.
 #[derive(Debug, Copy, Clone)]
-pub(super) struct TopKEntry(pub(super) f32, pub(super) u32);
-impl PartialEq for TopKEntry {
+pub(super) struct TopKEntry<I = FtsDocId>(pub(super) f32, pub(super) I);
+impl<I: Eq> PartialEq for TopKEntry<I> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0 && self.1 == other.1
     }
 }
-impl Eq for TopKEntry {}
-impl PartialOrd for TopKEntry {
+impl<I: Eq> Eq for TopKEntry<I> {}
+impl<I: Ord> PartialOrd for TopKEntry<I> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for TopKEntry {
+impl<I: Ord> Ord for TopKEntry<I> {
     fn cmp(&self, other: &Self) -> Ordering {
         // Score is inverted (lower score = greater) so the max-heap's
         // peek is the worst kept entry; the doc-id leg must NOT be
@@ -104,8 +104,8 @@ impl Ord for TopKEntry {
 /// pdqsort: entries are unique by `(score, doc_id)` — every search
 /// path offers each doc_id to its heap at most once — so an unstable
 /// sort has no observable reorderings.
-pub(super) fn drain_top_k_desc(heap: BinaryHeap<TopKEntry>) -> Vec<(u32, f32)> {
-    let mut out: Vec<(u32, f32)> = heap.into_iter().map(|TopKEntry(s, d)| (d, s)).collect();
+pub(super) fn drain_top_k_desc<I: Ord + Copy>(heap: BinaryHeap<TopKEntry<I>>) -> Vec<(I, f32)> {
+    let mut out: Vec<(I, f32)> = heap.into_iter().map(|TopKEntry(s, d)| (d, s)).collect();
     out.sort_unstable_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(Ordering::Equal)
@@ -269,7 +269,7 @@ impl AndSink for MustShouldSink<'_> {
 /// scoring, no top-k. Drives the `token_match` AND path through the
 /// same optimized flat-merge the scorer uses.
 pub(super) struct CollectSink {
-    pub(super) out: Vec<u32>,
+    pub(super) out: Vec<FtsDocId>,
 }
 
 impl AndSink for CollectSink {
@@ -278,7 +278,7 @@ impl AndSink for CollectSink {
     }
 
     fn emit(&mut self, doc: u32, _score: f32) {
-        self.out.push(doc);
+        self.out.push(FtsDocId::new(doc));
     }
 }
 
@@ -320,11 +320,11 @@ pub(super) fn and_heap_push(
         return;
     }
     if heap.len() < k {
-        heap.push(TopKEntry(score, doc_id));
+        heap.push(TopKEntry(score, FtsDocId::new(doc_id)));
     } else if let Some(mut worst) = heap.peek_mut()
-        && (score > worst.0 || (score == worst.0 && doc_id < worst.1))
+        && (score > worst.0 || (score == worst.0 && doc_id < worst.1.get()))
     {
-        *worst = TopKEntry(score, doc_id);
+        *worst = TopKEntry(score, FtsDocId::new(doc_id));
     }
 }
 
@@ -352,38 +352,57 @@ mod tests {
         and_heap_push(&mut heap, 2, None, 1.0, 9);
         // Same score, smaller doc: evicts doc 9.
         and_heap_push(&mut heap, 2, None, 1.0, 7);
-        assert_eq!(drain_top_k_desc(heap.clone()), vec![(5, 1.0), (7, 1.0)]);
+        assert_eq!(
+            drain_top_k_desc(heap.clone()),
+            vec![(FtsDocId::new(5), 1.0), (FtsDocId::new(7), 1.0)]
+        );
         // Same score, larger doc: no change.
         and_heap_push(&mut heap, 2, None, 1.0, 12);
-        assert_eq!(drain_top_k_desc(heap.clone()), vec![(5, 1.0), (7, 1.0)]);
+        assert_eq!(
+            drain_top_k_desc(heap.clone()),
+            vec![(FtsDocId::new(5), 1.0), (FtsDocId::new(7), 1.0)]
+        );
         // Better score: evicts the worst (doc 7, the larger of the tie).
         and_heap_push(&mut heap, 2, None, 2.0, 30);
-        assert_eq!(drain_top_k_desc(heap.clone()), vec![(30, 2.0), (5, 1.0)]);
+        assert_eq!(
+            drain_top_k_desc(heap.clone()),
+            vec![(FtsDocId::new(30), 2.0), (FtsDocId::new(5), 1.0)]
+        );
         // Worse score than the worst: no change.
         and_heap_push(&mut heap, 2, None, 0.5, 1);
-        assert_eq!(drain_top_k_desc(heap), vec![(30, 2.0), (5, 1.0)]);
+        assert_eq!(
+            drain_top_k_desc(heap),
+            vec![(FtsDocId::new(30), 2.0), (FtsDocId::new(5), 1.0)]
+        );
     }
 
     #[test]
     fn replace_worst_is_pop_then_push() {
         let mut a: BinaryHeap<TopKEntry> = [(1.0, 4), (2.0, 1), (3.0, 7)]
             .into_iter()
-            .map(|(s, d)| TopKEntry(s, d))
+            .map(|(s, d)| TopKEntry(s, FtsDocId::new(d)))
             .collect();
         let mut b = a.clone();
-        replace_worst(&mut a, TopKEntry(2.5, 9));
+        replace_worst(&mut a, TopKEntry(2.5, FtsDocId::new(9)));
         b.pop();
-        b.push(TopKEntry(2.5, 9));
+        b.push(TopKEntry(2.5, FtsDocId::new(9)));
         assert_eq!(drain_top_k_desc(a), drain_top_k_desc(b));
     }
 
     #[test]
     fn drain_top_k_desc_orders_descending_with_tiebreak() {
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::new();
-        heap.push(TopKEntry(1.0, 4));
-        heap.push(TopKEntry(2.0, 1));
-        heap.push(TopKEntry(2.0, 0)); // tie with doc 1
+        heap.push(TopKEntry(1.0, FtsDocId::new(4)));
+        heap.push(TopKEntry(2.0, FtsDocId::new(1)));
+        heap.push(TopKEntry(2.0, FtsDocId::new(0))); // tie with doc 1
         let out = drain_top_k_desc(heap);
-        assert_eq!(out, vec![(0, 2.0), (1, 2.0), (4, 1.0)]);
+        assert_eq!(
+            out,
+            vec![
+                (FtsDocId::new(0), 2.0),
+                (FtsDocId::new(1), 2.0),
+                (FtsDocId::new(4), 1.0)
+            ]
+        );
     }
 }

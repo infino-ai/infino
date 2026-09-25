@@ -169,6 +169,44 @@ pub mod fts {
     /// Readers accept `V1`–`V7`.
     pub const VERSION_V7: u32 = 7;
 
+    /// The version new code writes when a superfile's documents are
+    /// stored in the FTS blob under an ordering of their own. Byte for
+    /// byte the [`VERSION_V7`] layout for every term, block, skip entry
+    /// and dictionary value; what it adds is one region, the **doc-id
+    /// map**, and the header field at [`hdr::DOC_MAP_OFFSET_OFF`] that
+    /// locates it.
+    ///
+    /// Through `V7` an FTS doc id *is* a Parquet row index, so postings
+    /// are ordered by arrival. `V8` separates the two: postings are
+    /// ordered by whatever grouping the writer chose, and the map gives
+    /// the row a doc id belongs to, one `u32` per document followed by a
+    /// CRC. Compaction uses this to place documents that share terms
+    /// next to each other, which shortens posting deltas and narrows the
+    /// id span a block covers, without moving a single Parquet row: row
+    /// groups keep the statistics arrival order gave them, the vector
+    /// blob keeps its own ordering, and the table stays time ordered.
+    ///
+    /// The map is the whole of the difference. A reader that has it can
+    /// serve a `V8` blob; the search kernels never see it, because they
+    /// work in the blob's own id space throughout and the ids are
+    /// translated once, on the way out. The region sits between the
+    /// positions region and the doc-lengths directory, and the open-time
+    /// tail fetch starts at the map rather than at the directory, so the
+    /// two arrive in one range read instead of two.
+    ///
+    /// One thing a caller can observe changes, and it is not a bug: a
+    /// top-k breaks equal scores by the blob's own doc id, so a `V8`
+    /// blob and a `V7` blob of the same documents can name different
+    /// rows among a group that scores identically. Both are correct
+    /// rankings and every returned row carries the score its rank
+    /// claims; which of several tied documents is chosen is not part of
+    /// the ordering the scorer defines, and reordering is precisely a
+    /// change to the id that breaks the tie.
+    ///
+    /// Readers accept `V1`–`V8`. Nothing older carries a map and nothing
+    /// older needs one, since for those blobs the identity is the map.
+    pub const VERSION_V8: u32 = 8;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.
@@ -246,6 +284,10 @@ pub mod fts {
     /// [`hdr::POSITIONS_OFFSET_OFF`]).
     pub const HEADER_SIZE_V2: usize = 56;
 
+    /// Header size for [`VERSION_V8`]: the v2 fields plus the trailing
+    /// doc-id-map offset (`u64` at [`hdr::DOC_MAP_OFFSET_OFF`]).
+    pub const HEADER_SIZE_V8: usize = 64;
+
     /// Width of the 8-byte FTS magic field.
     pub const MAGIC_BYTES: usize = 8;
     /// Width of a little-endian `u32` header field.
@@ -287,6 +329,13 @@ pub mod fts {
         /// between the postings region and the doc-lengths directory
         /// so the lazy-open doc-lengths tail fetch stays small.
         pub const POSITIONS_OFFSET_OFF: usize = 48;
+        /// `[56..64]` doc-id-map region offset (`u64` LE).
+        /// [`VERSION_V8`](super::VERSION_V8) headers only; a `V2`–`V7`
+        /// header ends at
+        /// [`HEADER_SIZE_V2`](super::HEADER_SIZE_V2). The region sits
+        /// between the positions region and the doc-lengths directory,
+        /// so the lazy-open tail fetch does not grow by the map.
+        pub const DOC_MAP_OFFSET_OFF: usize = 56;
     }
 
     /// Per-term metadata header field offsets (relative to a term's
@@ -398,7 +447,10 @@ pub mod fts {
                     bitset_blocks: true,
                     ..legacy
                 },
-                VERSION_V7 => Self {
+                // `V8` adds a region and a header field, nothing that
+                // changes how a term, block, skip entry or dictionary
+                // value is laid out, so it reads as `V7` does.
+                VERSION_V7 | VERSION_V8 => Self {
                     coarse: true,
                     short_form: true,
                     grouped_positions: true,
@@ -412,6 +464,20 @@ pub mod fts {
                 _ => return None,
             })
         }
+    }
+
+    /// Bytes of fixed header a blob of `version` carries, or `None` for
+    /// a version this crate does not know. One place so the writer's
+    /// assembly and the reader's parse cannot drift.
+    pub fn header_size(version: u32) -> Option<usize> {
+        Some(match version {
+            VERSION_V1_LEGACY => HEADER_SIZE_V1_LEGACY,
+            VERSION_V2 | VERSION_V3 | VERSION_V4 | VERSION_V5 | VERSION_V6 | VERSION_V7 => {
+                HEADER_SIZE_V2
+            }
+            VERSION_V8 => HEADER_SIZE_V8,
+            _ => return None,
+        })
     }
 
     /// How a term's skip table locates its blocks — by blob version.
@@ -896,7 +962,29 @@ mod tests {
         assert_eq!(v7.skip, SkipLayout::Length);
         assert_eq!(v7.dict, DictLayout::Blocks);
         assert_eq!(v7.doc_length_bytes, fts::DOC_LENGTH_BYTES_V7);
-        assert_eq!(BlobLayout::for_version(fts::VERSION_V7 + 1), None);
+        // `V8` adds a region and a header field, not a posting layout,
+        // so it reads exactly as `V7` does.
+        assert_eq!(BlobLayout::for_version(fts::VERSION_V8), Some(v7));
+        assert_eq!(BlobLayout::for_version(fts::VERSION_V8 + 1), None);
+
+        // Header size is the one thing `V8` does move, and the helper is
+        // the single place the writer and the reader read it from.
+        assert_eq!(
+            fts::header_size(fts::VERSION_V1_LEGACY),
+            Some(fts::HEADER_SIZE_V1_LEGACY)
+        );
+        for v in [
+            fts::VERSION_V2,
+            fts::VERSION_V3,
+            fts::VERSION_V4,
+            fts::VERSION_V5,
+            fts::VERSION_V6,
+            fts::VERSION_V7,
+        ] {
+            assert_eq!(fts::header_size(v), Some(fts::HEADER_SIZE_V2), "v{v}");
+        }
+        assert_eq!(fts::header_size(fts::VERSION_V8), Some(fts::HEADER_SIZE_V8));
+        assert_eq!(fts::header_size(fts::VERSION_V8 + 1), None);
         assert_eq!(BlobLayout::for_version(0), None);
     }
 

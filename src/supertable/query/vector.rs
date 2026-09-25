@@ -109,6 +109,7 @@ use crate::{
         SuperfileReader,
         error::ReadError,
         fts::reader::BoolMode,
+        id_space::RowId,
         vector::{
             cell_posting::EncodedCellRow,
             distance::{
@@ -6477,7 +6478,7 @@ impl SupertableReader {
                     stats.add_planned_read_ranges(work.planned_ranges);
                     stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                 }
-                Ok(docs.into_iter().collect::<RoaringBitmap>())
+                Ok(docs.into_iter().map(RowId::get).collect::<RoaringBitmap>())
             }
         })
         .await

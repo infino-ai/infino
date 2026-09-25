@@ -53,6 +53,7 @@ use infino::{
         BytesLazyByteSource, LazyByteSource, LazyByteSourceError, SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         fts::reader::BoolMode,
+        id_space::RowId,
     },
     supertable::{
         StorageRangeSource,
@@ -194,7 +195,7 @@ async fn open_lazy_reads_positional_v2_blob_like_eager() {
         .expect("eager match")
         .0;
     assert_eq!(lazy_hits, eager_hits);
-    assert_eq!(lazy_hits, vec![0, 2]);
+    assert_eq!(lazy_hits, vec![RowId::new(0), RowId::new(2)]);
 }
 
 // ============================================================
@@ -329,8 +330,8 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
         .search("title", &["alpha"], LAZY_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("lazy bm25");
-    let eager_ids: Vec<_> = eager_hits.iter().map(|(d, _)| *d).collect();
-    let lazy_ids: Vec<_> = lazy_hits.iter().map(|(d, _)| *d).collect();
+    let eager_ids: Vec<_> = eager_hits.iter().map(|(d, _)| d.get()).collect();
+    let lazy_ids: Vec<_> = lazy_hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(lazy_ids, eager_ids);
 }
 

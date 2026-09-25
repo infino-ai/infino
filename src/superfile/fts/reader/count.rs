@@ -25,6 +25,7 @@ use crate::{
         error::FtsError,
         format::fts::U32_BYTES,
         fts::{builder::TERM_META_SIZE, short::short_df, tokenize::Phrase},
+        id_space::{FtsDocId, RowId},
     },
     utils::terms::{FstValue, make_key},
 };
@@ -155,7 +156,7 @@ impl FtsReader {
         terms: &[&str],
         phrases: &[Phrase<String>],
         mode: BoolMode,
-    ) -> Result<(Vec<u32>, MatchWork), FtsError> {
+    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: idf is irrelevant to the match set, so build local.
         let (built, dict_ranges) = self
@@ -172,11 +173,11 @@ impl FtsReader {
         }
         let (walk, walk_ns) = timed_section(|| {
             let mut out = Vec::new();
-            self.walk_atoms_match(atoms, mode, None, |d| out.push(d))
+            self.walk_atoms_match(atoms, mode, None, |d| out.push(FtsDocId::new(d)))
                 .map(|()| out)
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((walk?, work))
+        Ok((self.ids_to_rows(walk?), work))
     }
 
     /// Phrase-aware unranked match **count** — the atoms sibling of
@@ -261,7 +262,7 @@ impl FtsReader {
         column: &str,
         tokens: &[&str],
         mode: BoolMode,
-    ) -> Result<(Vec<u32>, MatchWork), FtsError> {
+    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
         self.token_match_prefetched(column, tokens, mode, None)
             .await
     }
@@ -277,7 +278,7 @@ impl FtsReader {
         tokens: &[&str],
         mode: BoolMode,
         prefetched: Option<&FetchedTermMemo>,
-    ) -> Result<(Vec<u32>, MatchWork), FtsError> {
+    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
@@ -300,10 +301,13 @@ impl FtsReader {
                 }
                 self.collect_and_intersect(column_id, cursors)
             }
-            BoolMode::Or => or_merge_unranked(cursors),
+            BoolMode::Or => or_merge_unranked(cursors)
+                .into_iter()
+                .map(FtsDocId::new)
+                .collect(),
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((docs, work))
+        Ok((self.ids_to_rows(docs), work))
     }
 
     /// Unranked token-match **count** — the cardinality

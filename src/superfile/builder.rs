@@ -104,6 +104,7 @@ use crate::{
             sorted_merge::SortedInput,
             tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
         },
+        id_space::FtsDocId,
         ids,
         stats::SuperfileStats,
         vector::{
@@ -1140,9 +1141,16 @@ impl SuperfileBuilder {
                         "non-utf8 term in FTS merge input".into(),
                     ))
                 })?;
-                if let Err(e) =
-                    fb.add_prebuilt_term_posting(column_id, term_str, out_doc, tf, positions)
-                {
+                if let Err(e) = fb.add_prebuilt_term_posting(
+                    column_id,
+                    term_str,
+                    // Every merge on this path appends in arrival
+                    // order, so an output row is the doc id the
+                    // output blob stores it under.
+                    FtsDocId::new(out_doc),
+                    tf,
+                    positions,
+                ) {
                     push_err = Some(e);
                     return Err(FtsError::Read(ReadError::MalformedVersion(
                         "prebuilt push aborted".into(),
@@ -3226,7 +3234,7 @@ mod tests {
             .expect("phrase search");
         let mut got: Vec<i128> = hits
             .iter()
-            .map(|(d, _)| stable_of_local[*d as usize])
+            .map(|(d, _)| stable_of_local[d.get() as usize])
             .collect();
         got.sort_unstable();
         let mut want: Vec<i128> = stable_of_local

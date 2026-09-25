@@ -23,6 +23,7 @@ use super::{
 use crate::superfile::{
     error::FtsError,
     fts::{bm25, posting::BLOCK_LEN},
+    id_space::FtsDocId,
 };
 
 /// Left-pack control table: for each 8-bit survivor mask, the lane indices that
@@ -381,9 +382,9 @@ fn wand_two_term_tail(
             }
             if score > *threshold {
                 if heap.len() < k {
-                    heap.push(TopKEntry(score, doc));
+                    heap.push(TopKEntry(score, FtsDocId::new(doc)));
                 } else {
-                    replace_worst(heap, TopKEntry(score, doc));
+                    replace_worst(heap, TopKEntry(score, FtsDocId::new(doc)));
                 }
                 if heap.len() == k {
                     *threshold = heap.peek().expect("non-empty").0;
@@ -429,7 +430,7 @@ impl FtsReader {
         column_id: u32,
         mut cursors: Vec<TermCursor>,
         k: usize,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1();
 
@@ -606,14 +607,14 @@ impl FtsReader {
 
             // Update heap.
             if heap.len() < k {
-                heap.push(TopKEntry(score, pivot_doc));
+                heap.push(TopKEntry(score, FtsDocId::new(pivot_doc)));
                 if heap.len() == k {
                     threshold = heap.peek().expect("non-empty").0;
                 }
             } else if heap.peek().is_some_and(|worst| score > worst.0) {
                 // Replace the evicted entry in place: one sift instead of
                 // the pop's sift-down plus the push's sift-up.
-                replace_worst(&mut heap, TopKEntry(score, pivot_doc));
+                replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(pivot_doc)));
                 threshold = heap.peek().expect("non-empty").0;
             }
 
@@ -672,7 +673,7 @@ impl FtsReader {
         k: usize,
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         self.run_max_score_bmm_range(column_id, cursors, k, 0, u32::MAX, filter, floor_eff)
     }
 
@@ -702,7 +703,7 @@ impl FtsReader {
         k: usize,
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
@@ -907,7 +908,7 @@ impl FtsReader {
         k: usize,
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         debug_assert!(
             !must_cursors.is_empty() && !should_cursors.is_empty(),
             "dispatch routes empty-side shapes to the AND/OR kernels"
@@ -943,7 +944,7 @@ impl FtsReader {
         &self,
         column_id: u32,
         mut cursors: Vec<TermCursor>,
-    ) -> Vec<u32> {
+    ) -> Vec<FtsDocId> {
         if cursors.is_empty() {
             return Vec::new();
         }
@@ -1349,7 +1350,7 @@ impl FtsReader {
         doc_id_end: u32,
         mut filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1();
 
@@ -1501,7 +1502,7 @@ impl FtsReader {
                     }
 
                     if heap.len() < k {
-                        heap.push(TopKEntry(score, candidate));
+                        heap.push(TopKEntry(score, FtsDocId::new(candidate)));
                         if heap.len() == k {
                             // max(): a seeded floor must never be
                             // lowered by a weaker local kth-best.
@@ -1513,7 +1514,7 @@ impl FtsReader {
                             }
                         }
                     } else if score > threshold {
-                        replace_worst(&mut heap, TopKEntry(score, candidate));
+                        replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(candidate)));
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                         let new_f = recompute_f(&partial_max, threshold);
                         if new_f != f_essential {
@@ -1682,13 +1683,13 @@ impl FtsReader {
                 // (max(): a seeded floor must never be lowered by a
                 // weaker local kth-best.)
                 if heap.len() < k {
-                    heap.push(TopKEntry(score, candidate));
+                    heap.push(TopKEntry(score, FtsDocId::new(candidate)));
                     if heap.len() == k {
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                         f_essential = recompute_f(&partial_max, threshold);
                     }
                 } else if score > threshold {
-                    replace_worst(&mut heap, TopKEntry(score, candidate));
+                    replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(candidate)));
                     threshold = heap.peek().expect("non-empty").0.max(threshold);
                     f_essential = recompute_f(&partial_max, threshold);
                 }
@@ -1744,7 +1745,7 @@ impl FtsReader {
         floor_eff: f32,
         doc_id_start: u32,
         doc_id_end: u32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         // A top-0 request admits nothing. Guard here too (callers already
         // short-circuit) so the heap-admission `else if` below can never
         // run against an empty heap.
@@ -1865,12 +1866,12 @@ impl FtsReader {
                         continue;
                     }
                     if heap.len() < k {
-                        heap.push(TopKEntry(score, doc));
+                        heap.push(TopKEntry(score, FtsDocId::new(doc)));
                         if heap.len() == k {
                             threshold = heap.peek().expect("non-empty").0.max(threshold);
                         }
                     } else if score > threshold {
-                        replace_worst(&mut heap, TopKEntry(score, doc));
+                        replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(doc)));
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                     }
                 }
@@ -1907,7 +1908,7 @@ impl FtsReader {
         floor_eff: f32,
         doc_id_start: u32,
         doc_id_end: u32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -2075,13 +2076,13 @@ impl FtsReader {
                     }
                     let mut raised = false;
                     if heap.len() < k {
-                        heap.push(TopKEntry(score, candidate));
+                        heap.push(TopKEntry(score, FtsDocId::new(candidate)));
                         if heap.len() == k {
                             threshold = heap.peek().expect("non-empty").0.max(threshold);
                             raised = true;
                         }
                     } else if score > threshold {
-                        replace_worst(&mut heap, TopKEntry(score, candidate));
+                        replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(candidate)));
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                         raised = true;
                     }
@@ -2339,12 +2340,12 @@ impl FtsReader {
                             continue;
                         }
                         if heap.len() < k {
-                            heap.push(TopKEntry(score, doc));
+                            heap.push(TopKEntry(score, FtsDocId::new(doc)));
                             if heap.len() == k {
                                 threshold = heap.peek().expect("non-empty").0.max(threshold);
                             }
                         } else if score > threshold {
-                            replace_worst(&mut heap, TopKEntry(score, doc));
+                            replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(doc)));
                             threshold = heap.peek().expect("non-empty").0.max(threshold);
                         }
                     }
@@ -2408,12 +2409,12 @@ impl FtsReader {
             for (idx, &doc) in win_docs.iter().enumerate() {
                 let score = win_scores[idx];
                 if heap.len() < k {
-                    heap.push(TopKEntry(score, doc));
+                    heap.push(TopKEntry(score, FtsDocId::new(doc)));
                     if heap.len() == k {
                         threshold = heap.peek().expect("non-empty").0.max(threshold);
                     }
                 } else if score > threshold {
-                    replace_worst(&mut heap, TopKEntry(score, doc));
+                    replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(doc)));
                     threshold = heap.peek().expect("non-empty").0.max(threshold);
                 }
             }
@@ -2482,7 +2483,7 @@ impl FtsReader {
         column_id: u32,
         mut cursors: Vec<TermCursor>,
         k: usize,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1();
 
@@ -2536,12 +2537,12 @@ impl FtsReader {
             // Top-K update. `threshold` mirrors `heap.peek().0` so
             // the replace-or-skip branch doesn't re-peek per iter.
             if heap.len() < k {
-                heap.push(TopKEntry(score, candidate));
+                heap.push(TopKEntry(score, FtsDocId::new(candidate)));
                 if heap.len() == k {
                     threshold = heap.peek().expect("non-empty").0;
                 }
             } else if score > threshold {
-                replace_worst(&mut heap, TopKEntry(score, candidate));
+                replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(candidate)));
                 threshold = heap.peek().expect("non-empty").0;
             }
         }
@@ -2567,7 +2568,7 @@ impl FtsReader {
         k: usize,
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         // A 2-term OR of one rare + one common term is a worst case for a
         // union scan: it walks the common term's long posting list end to end.
         // WAND+BMW pivots on the rare (short) term and skips most of the common
@@ -2609,6 +2610,11 @@ impl FtsReader {
     ///
     /// **Not part of the stable API** — production code should use
     /// `search`, which routes through `dispatch_or_algo`.
+    /// Hits in the blob's own id space, deliberately untranslated: the
+    /// benches this serves compare one algorithm against another over
+    /// the same blob, so both sides are in the same space and the
+    /// translation every other search entry point performs would only
+    /// add work to the thing being measured.
     #[doc(hidden)]
     pub async fn search_with_algo_for_bench(
         &self,
@@ -2616,7 +2622,7 @@ impl FtsReader {
         terms: &[&str],
         k: usize,
         algo: OrAlgo,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if terms.is_empty() || k == 0 {
             return Ok(Vec::new());
@@ -2656,11 +2662,14 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::{
-        builder::FtsBuilder,
-        posting::{ENCODING_BITSET, block_encoding},
-        reader::BoolMode,
-        tokenize::AsciiLowerTokenizer,
+    use crate::superfile::{
+        fts::{
+            builder::FtsBuilder,
+            posting::{ENCODING_BITSET, block_encoding},
+            reader::BoolMode,
+            tokenize::AsciiLowerTokenizer,
+        },
+        id_space::{FtsDocId, RowId},
     };
 
     #[tokio::test]
@@ -2668,7 +2677,7 @@ mod tests {
         // token_match(Or) must return exactly the doc set bm25 ranks.
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open FtsReader");
-        let mut bm25: Vec<u32> = r
+        let mut bm25: Vec<RowId> = r
             .search("body", &["rust", "java"], 10, BoolMode::Or)
             .await
             .expect("search")
@@ -3507,7 +3516,7 @@ mod tests {
                 // The unpruned ranking: above the match count the heap never
                 // fills, the bar stays at negative infinity and no bound is
                 // consulted, so these are the true scores.
-                let truth: HashMap<u32, f32> = r
+                let truth: HashMap<FtsDocId, f32> = r
                     .search_with_algo_for_bench("body", terms, N_DOCS as usize + 1, OrAlgo::Bmm)
                     .await
                     .expect("truth")
@@ -3523,7 +3532,7 @@ mod tests {
                     checked_ranges += claims.len();
                     for claim in claims {
                         for doc in claim.from..claim.to {
-                            let Some(&score) = truth.get(&doc) else {
+                            let Some(&score) = truth.get(&FtsDocId::new(doc)) else {
                                 continue;
                             };
                             checked_docs += 1;
