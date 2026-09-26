@@ -42,7 +42,7 @@ use crate::{
     supertable::{
         manifest::{SubsectionOffsets, SuperfileUri},
         reader_cache::{
-            DiskCacheStore, ReadIntent, ReaderCacheError, SuperfileReaderCache,
+            DiskCacheStore, OpenTier, ReadIntent, ReaderCacheError, SuperfileReaderCache,
             disk::DiskCacheError,
         },
     },
@@ -75,9 +75,35 @@ pub async fn superfile_reader(
     offsets: Option<&SubsectionOffsets>,
     intent: ReadIntent,
 ) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
+    superfile_reader_tiered(
+        store,
+        disk_cache,
+        storage,
+        uri,
+        storage_key,
+        offsets,
+        intent,
+    )
+    .await
+    .map(|(reader, _)| reader)
+}
+
+/// [`superfile_reader`], also saying which tier served the file: the
+/// in-memory tier is [`OpenTier::Memory`], the disk cache reports its own
+/// walk, and the storage-only fallback is a whole-object GET, so
+/// [`OpenTier::Source`]. For a scan that counts where its files came from.
+pub async fn superfile_reader_tiered(
+    store: &Arc<dyn SuperfileReaderCache>,
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+    storage: Option<&Arc<dyn StorageProvider>>,
+    uri: &SuperfileUri,
+    storage_key: &str,
+    offsets: Option<&SubsectionOffsets>,
+    intent: ReadIntent,
+) -> Result<(Arc<SuperfileReader>, OpenTier), ReaderCacheError> {
     // 1. In-memory tier.
     match store.reader(uri) {
-        Ok(r) => return Ok(r),
+        Ok(r) => return Ok((r, OpenTier::Memory)),
         Err(ReaderCacheError::NotFound { .. }) => {
             // Fall through to the cache.
         }
@@ -88,7 +114,7 @@ pub async fn superfile_reader(
     //    the file, so a budget miss never fails here.
     if let Some(cache) = disk_cache {
         return cache
-            .open_for_query(uri, storage_key, offsets, storage, intent)
+            .open_for_query_tiered(uri, storage_key, offsets, storage, intent)
             .await
             .map_err(cache_open_failed);
     }
@@ -109,7 +135,7 @@ pub async fn superfile_reader(
                 })?;
         let reader = SuperfileReader::open(bytes)
             .map_err(|source| ReaderCacheError::OpenFailed { source })?;
-        return Ok(Arc::new(reader));
+        return Ok((Arc::new(reader), OpenTier::Source));
     }
 
     Err(ReaderCacheError::NotFound { uri: *uri })
@@ -224,6 +250,48 @@ mod tests {
         .await
         .expect("in-memory hit");
         assert_eq!(reader.n_docs(), N_DOCS);
+    }
+
+    /// The tiered accessor names where the reader came from: the in-memory
+    /// tier is `Memory`, and the storage-only fallback, a whole-object GET
+    /// with no cache attached, is `Source`.
+    #[tokio::test]
+    async fn tiered_accessor_reports_memory_and_source() {
+        let store = empty_store();
+        let uri = SuperfileUri::new_v4();
+        store
+            .insert(uri, minimal_superfile_bytes())
+            .expect("insert into in-memory tier");
+        let (_, tier) = superfile_reader_tiered(
+            &store,
+            None,
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("in-memory hit");
+        assert_eq!(tier, OpenTier::Memory);
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage = local_storage(&dir);
+        let cold = SuperfileUri::new_v4();
+        put_at_storage(&storage, &cold, minimal_superfile_bytes()).await;
+        let (reader, tier) = superfile_reader_tiered(
+            &empty_store(),
+            None,
+            Some(&storage),
+            &cold,
+            &cold.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("storage-only fallback");
+        assert_eq!(reader.n_docs(), N_DOCS);
+        assert_eq!(tier, OpenTier::Source);
     }
 
     // ---- tier 1: non-NotFound error short-circuits ---------------------

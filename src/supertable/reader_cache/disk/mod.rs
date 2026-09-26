@@ -167,6 +167,24 @@ pub(crate) struct CachedEntry {
     last_access_us: AtomicU64,
 }
 
+/// Which tier of the cache's walk served an open. Returned beside the reader so a scan can say
+/// how much of it was local, as counts, rather than tracing every file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenTier {
+    /// The whole file was already mmapped or buffered in this process. No I/O.
+    Memory,
+    /// The whole file was on local disk from a prior run or a finished fill; mmapped, no GETs.
+    Disk,
+    /// A lazy reader was already open for the file; the read rides its block cache.
+    Lazy,
+    /// Nothing was local: opened against the object store.
+    Source,
+    /// Another caller's walk for the same file was in flight, and this open waited on it.
+    Coalesced,
+    /// The file could not be admitted to the cache, so it is read uncached, range by range.
+    Streamed,
+}
+
 /// What a read needs locally. It decides two things: whether a cached entry is a hit (a whole
 /// file serves every intent, a lazy [`Residency::Paged`] entry serves `Stream` and `Warm` but not
 /// `Load`), and how a miss is fetched.
