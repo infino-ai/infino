@@ -937,7 +937,11 @@ impl TableProvider for SupertableProvider {
             try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry)))
                 .instrument(open_span.clone())
                 .await?;
-        OpenTierCounts::tally(&prepared_files).record_on(&open_span);
+        // The tally is a pass over the files; without the feature the span
+        // is `none` and would drop the counts, so skip the pass too.
+        if cfg!(feature = "detailed-tracing") {
+            OpenTierCounts::tally(&prepared_files).record_on(&open_span);
+        }
 
         // Per-superfile scan inputs, resolved into PartitionedFiles once the
         // store is built (row-group counts are read from each superfile's

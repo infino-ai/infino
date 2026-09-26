@@ -921,6 +921,38 @@ mod tests {
         assert_eq!(store.stats().n_entries, 1);
     }
 
+    /// The tier an open reports is the one that served it: the first open of a cold file comes
+    /// from the source, a second query rides the lazy reader, and once a Load has mmapped the
+    /// whole file the next open is a memory hit. A scan's tier counts are built from this.
+    #[tokio::test]
+    async fn an_open_reports_the_tier_that_served_it() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        let (_, first) = store
+            .open_for_query_tiered(&uri, &uri.storage_path(), None, None, ReadIntent::Stream)
+            .await
+            .expect("cold open");
+        assert_eq!(first, OpenTier::Source);
+
+        let (_, second) = store
+            .open_for_query_tiered(&uri, &uri.storage_path(), None, None, ReadIntent::Stream)
+            .await
+            .expect("second open");
+        assert_eq!(second, OpenTier::Lazy);
+
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("whole file mmapped");
+        let (_, third) = store
+            .open_for_query_tiered(&uri, &uri.storage_path(), None, None, ReadIntent::Warm)
+            .await
+            .expect("open after load");
+        assert_eq!(third, OpenTier::Memory);
+    }
+
     /// A lazy admission must never displace a whole-file entry, and whatever an admission drops
     /// has its budget released. Drives `cold_fetch_lazy` straight at a URI that is already
     /// mmapped, the shape a compaction read racing a query open produces.

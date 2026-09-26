@@ -914,9 +914,10 @@ impl Connection {
         feature = "detailed-tracing",
         // Connection-level entry: no table handle yet, so no `role` — the
         // per-table spans beneath this one carry it. The empty fields are
-        // filled in once the query has run: what it returned, and the
-        // per-op counters the meter collected for it, so the span and the
-        // billed read work can be read against each other.
+        // filled in once the query has run: what it returned, the per-op
+        // counters the meter collected for it, and the object-store
+        // requests and bytes the connection issued meanwhile, so the span,
+        // the billed read work and the GETs can be read against each other.
         tracing::instrument(skip_all, fields(
             sql = sql,
             origin = OpOrigin::Query.as_str(),

@@ -252,6 +252,48 @@ mod tests {
         assert_eq!(reader.n_docs(), N_DOCS);
     }
 
+    /// The tiered accessor names where the reader came from: the in-memory
+    /// tier is `Memory`, and the storage-only fallback, a whole-object GET
+    /// with no cache attached, is `Source`.
+    #[tokio::test]
+    async fn tiered_accessor_reports_memory_and_source() {
+        let store = empty_store();
+        let uri = SuperfileUri::new_v4();
+        store
+            .insert(uri, minimal_superfile_bytes())
+            .expect("insert into in-memory tier");
+        let (_, tier) = superfile_reader_tiered(
+            &store,
+            None,
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("in-memory hit");
+        assert_eq!(tier, OpenTier::Memory);
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage = local_storage(&dir);
+        let cold = SuperfileUri::new_v4();
+        put_at_storage(&storage, &cold, minimal_superfile_bytes()).await;
+        let (reader, tier) = superfile_reader_tiered(
+            &empty_store(),
+            None,
+            Some(&storage),
+            &cold,
+            &cold.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("storage-only fallback");
+        assert_eq!(reader.n_docs(), N_DOCS);
+        assert_eq!(tier, OpenTier::Source);
+    }
+
     // ---- tier 1: non-NotFound error short-circuits ---------------------
 
     /// In-memory tier that always fails with a non-`NotFound` error.
