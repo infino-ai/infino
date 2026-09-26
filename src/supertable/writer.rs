@@ -2092,6 +2092,32 @@ impl SupertableWriter {
                 .first()
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
+            // Fine-centroid drain placement: assemble the global fine centroids
+            // and their owning cells from the PRE-COMMIT manifest, so each new
+            // row lands in the cell of its nearest fine centroid — matching how
+            // queries route (they walk the same fine centroids) — instead of the
+            // coarse cell grid, which lands rows in cells the fine router ranks
+            // deep and forces a wide, slow probe. `None` on the first commit (no
+            // prior fine centroids) or any load failure: placement degrades to
+            // the cell grid, it never fails the commit.
+            let fine_assign: Option<crate::supertable::query::vector::FineAssignRouter> = self
+                .inner
+                .options
+                .vector_columns
+                .first()
+                .map(|vc| vc.column.clone())
+                .and_then(|column| {
+                    let reader = crate::supertable::handle::SupertableReader::from_inner_pinned(
+                        Arc::clone(&self.inner),
+                        self.inner.manifest.load_full(),
+                        self.inner.tombstone_cache.clone(),
+                        self.op_stats.clone(),
+                    );
+                    bridge_on_runtime(
+                        reader.build_global_fine_assign_router(&column),
+                        &self.inner.query_runtime(),
+                    )
+                });
             // Pipelined publish on storage-backed tables: shards stream
             // to the uploader as each finishes packing, so the commit
             // pays ~max(pack, PUT) instead of pack + PUT. The manifest
@@ -2119,6 +2145,7 @@ impl SupertableWriter {
                     buffer,
                     &self.inner,
                     &pack_grid,
+                    fine_assign.as_ref(),
                     metric,
                     packed_cell_shard_count(&self.inner.options),
                     &self.op_stats,
@@ -2179,6 +2206,7 @@ impl SupertableWriter {
                     buffer,
                     &self.inner,
                     &pack_grid,
+                    fine_assign.as_ref(),
                     metric,
                     packed_cell_shard_count(&self.inner.options),
                     &self.op_stats,
@@ -6067,9 +6095,17 @@ fn pack_row_stable_id(row: PackRow<'_>) -> i128 {
 /// budget applied once, cell buckets out. Does **not** build IVF subsections —
 /// that runs in the shard-stage pack (parallel). Boundary replicas are vector
 /// postings only; callers decide which primaries become Parquet rows.
+///
+/// `fine` selects placement: `Some` walks the centroid-router HNSW to place each
+/// row in the cell of its nearest fine centroid (matching how queries route),
+/// falling back per row to the coarse `clusters` cell grid when the graph cannot
+/// place it; `None` places every row on the coarse cell grid. `assignment.primary`
+/// and `assignment.replicas` are cell ids in both modes, so the bucketing below
+/// is identical.
 fn assign_cells<'a>(
     rows: &[PackRow<'a>],
     clusters: &ClusterCentroids,
+    fine: Option<&crate::supertable::query::vector::FineAssignRouter>,
     metric: Metric,
     rot_seed: u64,
     replica_target_factor: f32,
@@ -6078,20 +6114,23 @@ fn assign_cells<'a>(
         return Ok(Vec::new());
     }
     let replica_extra_budget = drain_replica_extra_budget(rows.len(), replica_target_factor);
-    // Per-row nearest-cell scoring is the commit CPU wave: run it on the
-    // ambient rayon pool (callers wrap this in `writer_pool.install`).
-    // One shared admit context per batch (rotation / quantizer / cosine
-    // table); each row is 1-bit shortlisted over the grid and exact-scored
-    // only inside the 20% window, so assignment compute scales with the
-    // window instead of the full cell count.
+    // Per-row placement is the commit CPU wave: run it on the ambient rayon pool
+    // (callers wrap this in `writer_pool.install`). Fine placement walks the
+    // shared centroid-router HNSW (log-N, scale-invariant); the coarse fallback
+    // 1-bit shortlists the row over the cell grid and exact-scores only inside
+    // the window. One shared admit context per batch (rotation / quantizer /
+    // cosine table) serves the coarse path (and the fine path's per-row
+    // fallback).
     let admit_ctx = RabitqAdmitContext::new(clusters.dim as usize, rot_seed);
     let window = opann::assignment_shortlist_window(clusters.n_cent as usize);
     let assignments: Vec<opann::BoundaryAssignment> = rows
         .par_iter()
         .map(|row| match *row {
-            PackRow::Fp32 { vector, .. } => {
-                opann::boundary_assignment_fp32(clusters, metric, vector, &admit_ctx, window)
-            }
+            PackRow::Fp32 { vector, .. } => fine
+                .and_then(|fr| fr.assign_row_to_cells(vector))
+                .unwrap_or_else(|| {
+                    opann::boundary_assignment_fp32(clusters, metric, vector, &admit_ctx, window)
+                }),
         })
         .collect();
 
@@ -6494,6 +6533,7 @@ fn commit_shards_via_drain(
     buffer: &[BufferedBatch],
     inner: &SupertableInner,
     clusters: &ClusterCentroids,
+    fine: Option<&crate::supertable::query::vector::FineAssignRouter>,
     metric: Metric,
     n_packed_shards: usize,
     op_stats: &Option<Arc<OpStatsCollector>>,
@@ -6582,7 +6622,7 @@ fn commit_shards_via_drain(
     let assigned = inner
         .options
         .writer_pool
-        .install(|| assign_cells(&rows, clusters, metric, vc.rot_seed, replica_target))?;
+        .install(|| assign_cells(&rows, clusters, fine, metric, vc.rot_seed, replica_target))?;
     let assign_elapsed = stage_t0.elapsed().saturating_sub(flatten_elapsed);
     let assigned_cells: Vec<(u32, AssignedCellGroup<'_>)> = assigned
         .into_iter()
@@ -6707,6 +6747,9 @@ pub(in crate::supertable) fn build_packed_update_superfile(
         &buffer,
         inner,
         &pack_grid,
+        // Replacement rows keep coarse cell-grid placement; fine-centroid
+        // placement is applied on the drain/append path.
+        None,
         metric,
         UPDATE_PACKED_SHARDS,
         op_stats,
@@ -13387,6 +13430,7 @@ mod tests {
         let assigned = assign_cells(
             &rows,
             &clusters,
+            None,
             Metric::L2Sq,
             COMMIT_AS_DRAIN_TEST_ROT_SEED,
             BOUNDARY_STUB_TARGET_FACTOR,

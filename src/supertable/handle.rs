@@ -2279,7 +2279,7 @@ impl SupertableReader {
     /// `call()` time (the consumer is always alive while a query runs).
     /// Module-private (takes the module-private `SupertableInner`); the
     /// only caller is [`WeakReader::upgrade`] in this file.
-    fn from_inner_pinned(
+    pub(in crate::supertable) fn from_inner_pinned(
         inner: Arc<SupertableInner>,
         manifest: Arc<ManifestSnapshot>,
         tombstone_cache: Option<Arc<SidecarCache>>,

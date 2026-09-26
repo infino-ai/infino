@@ -846,6 +846,73 @@ pub(crate) struct StampedCentroidRouter {
     pub(crate) graph: CentroidRouterGraph,
 }
 
+/// Drain-side placement over the centroid-router HNSW: the graph plus a
+/// node -> global-cell map. Built by
+/// [`SupertableReader::build_global_fine_assign_router`] from the pre-commit
+/// manifest and shared read-only across the per-row assign. Placing a row in
+/// the cell of its nearest fine centroid (found by walking this graph) matches
+/// how queries route (they walk the same graph), so placement and routing agree
+/// at every scale.
+pub(crate) struct FineAssignRouter {
+    router: Arc<StampedCentroidRouter>,
+    /// `node_to_cell[node]` = global cell owning graph node `node`; `u32::MAX`
+    /// for a node whose cell could not be resolved (skipped at assign time).
+    node_to_cell: Vec<u32>,
+}
+
+impl FineAssignRouter {
+    /// Place one row: walk the centroid-router HNSW and map the nearest distinct
+    /// cells to a primary + boundary replicas (deduped by cell, since several
+    /// fine centroids collapse into one cell). Replica margin is the score gap
+    /// to the primary — smaller means closer to the boundary, matching the
+    /// coarse assigner's convention. `None` when no walked node resolves to a
+    /// cell, so the caller falls back to the coarse cell grid. Thread-safe: the
+    /// HNSW search is read-only per call, so this runs under the writer pool.
+    pub(crate) fn assign_row_to_cells(
+        &self,
+        vector: &[f32],
+    ) -> Option<crate::supertable::opann::BoundaryAssignment> {
+        use crate::supertable::opann::REPLICA_CLOSURE_MAX_REPLICAS;
+        let graph = &self.router.graph;
+        let mut q = vector.to_vec();
+        gfc_prepare_for_metric(graph.metric, &mut q);
+        // Over-fetch graph nodes so the primary + replica CELLS survive the
+        // dedup when several fine centroids share a cell.
+        let n_place = ((REPLICA_CLOSURE_MAX_REPLICAS + 1) * 8).min(graph.node_map.len().max(1));
+        let ef = n_place.saturating_mul(2).max(n_place);
+        let hits = graph.graph.search(&graph.scorer, &q, n_place, ef);
+        let best = hits.first()?.1;
+        let mut primary: Option<u32> = None;
+        let mut replicas = [None; REPLICA_CLOSURE_MAX_REPLICAS];
+        let mut n_rep = 0usize;
+        let mut seen = [u32::MAX; REPLICA_CLOSURE_MAX_REPLICAS + 1];
+        let mut n_seen = 0usize;
+        for (node, score) in hits {
+            let Some(&cell) = self.node_to_cell.get(node as usize) else {
+                continue;
+            };
+            if cell == u32::MAX || seen[..n_seen].contains(&cell) {
+                continue;
+            }
+            seen[n_seen] = cell;
+            n_seen += 1;
+            if primary.is_none() {
+                primary = Some(cell);
+            } else if n_rep < REPLICA_CLOSURE_MAX_REPLICAS {
+                replicas[n_rep] = Some((cell, (best - score).abs()));
+                n_rep += 1;
+            }
+            if primary.is_some() && n_rep == REPLICA_CLOSURE_MAX_REPLICAS {
+                break;
+            }
+        }
+        Some(crate::supertable::opann::BoundaryAssignment {
+            primary: primary?,
+            replicas,
+        })
+    }
+}
+
 /// The column the eager centroid-router build should target, or `None` when
 /// the router is disabled or no column is eligible. The single-slot cache
 /// serves one column, so the eager path pre-warms the first vector column (any
@@ -4504,6 +4571,73 @@ impl SupertableReader {
         )
         .await?;
         Ok(())
+    }
+
+    /// Build the drain-side fine-centroid placement router: the centroid-router
+    /// HNSW (the SAME graph queries walk) plus a node -> global-cell map. A
+    /// drain assigns each new row to the cell of its nearest fine centroid by
+    /// walking this graph, so placement matches routing — instead of placing by
+    /// the coarse cell grid, which lands rows in cells the fine router ranks deep
+    /// and forces a wide (slow) probe to reach them. Using the graph (not a
+    /// linear scan of the fine centroids) keeps placement log-N, so the same
+    /// path is exercised at 10M, 100M and 1B, and an approximate pick is
+    /// self-consistent (a nearby query walks the same graph to the same node).
+    ///
+    /// Returns `None` — so the caller keeps coarse cell-grid placement — when
+    /// there is nothing to place against yet (first drain, no centroid section,
+    /// no superfiles) or on any load failure; placement degrades to the cell
+    /// grid rather than failing the commit.
+    pub(crate) async fn build_global_fine_assign_router(
+        &self,
+        column: &str,
+    ) -> Option<FineAssignRouter> {
+        let manifest = self.manifest();
+        let vc = manifest
+            .options
+            .vector_columns
+            .iter()
+            .find(|vc| vc.column == column)?;
+        let dim = vc.dim;
+        let metric = vc.metric;
+        let section = self.centroid_section().await?;
+        let entries = manifest.get_all_superfiles_loaded().await.ok()?;
+        if entries.is_empty() {
+            return None;
+        }
+        let readers = self.open_superfile_readers(&entries).await.ok()?;
+        let stamped = self
+            .resident_centroid_router(
+                column,
+                manifest.manifest_id,
+                dim,
+                metric,
+                &entries,
+                &readers,
+                section.as_ref(),
+            )
+            .await
+            .ok()?;
+        // Precompute node -> global cell via the SAME per-superfile flat->cell
+        // mapping the query path uses. A node that cannot be resolved is left as
+        // the `u32::MAX` sentinel and skipped at assign time.
+        let node_map = &stamped.graph.node_map;
+        let mut node_to_cell = vec![u32::MAX; node_map.len()];
+        let mut any = false;
+        for (node, &(si, flat)) in node_map.iter().enumerate() {
+            if let Some(vr) = readers.get(si).and_then(|r| r.vec())
+                && let Some(cell) = vr.global_cell_of_flat(flat)
+            {
+                node_to_cell[node] = cell;
+                any = true;
+            }
+        }
+        if !any {
+            return None;
+        }
+        Some(FineAssignRouter {
+            router: stamped,
+            node_to_cell,
+        })
     }
 
     /// kNN fan-out over exactly `superfiles`, optionally admitting only the
@@ -9190,6 +9324,66 @@ mod tests {
             touched(&superseded),
             HashSet::from([1, 3]),
             "superseded cell is not fine-scored or fetched"
+        );
+    }
+
+    /// Drain-side fine placement: a row lands in the cell of its NEAREST FINE
+    /// centroid (found by walking the centroid-router HNSW), which can differ
+    /// from its nearest COARSE cell — the whole point of the placement fix. Two
+    /// fine centroids: node 0 at 0.9 owned by cell 0, node 1 at 0.45 owned by
+    /// cell 1. A row at 0.45 is nearest fine centroid node 1 (exact) so fine
+    /// placement -> cell 1, whereas the coarse cell grid (cell 0 at 0.4, cell 1
+    /// at 0.6) would place it in cell 0. That divergence is the bite.
+    #[test]
+    fn fine_assign_router_places_row_in_nearest_fine_centroids_cell() {
+        let dim = 8usize;
+        let row = vec![0.45f32; dim];
+
+        // Fine placement via the centroid-router HNSW.
+        let graph = super::build_centroid_router_from_cluster_vectors(
+            vec![(0, 0, vec![0.9f32; dim]), (0, 1, vec![0.45f32; dim])],
+            dim,
+            Metric::L2Sq,
+        )
+        .expect("router builds");
+        let fine = super::FineAssignRouter {
+            router: Arc::new(super::StampedCentroidRouter {
+                generation: 0,
+                column: "emb".into(),
+                graph,
+            }),
+            node_to_cell: vec![0, 1],
+        };
+        let placed = fine
+            .assign_row_to_cells(&row)
+            .expect("row places against a non-empty router");
+        assert_eq!(
+            placed.primary, 1,
+            "fine placement follows the nearest fine centroid (node 1) into cell 1"
+        );
+
+        // The coarse cell grid would have placed the same row in cell 0.
+        let mut cell_centroids = vec![0.4f32; dim * 2];
+        for v in cell_centroids[dim..].iter_mut() {
+            *v = 0.6;
+        }
+        let grid = crate::supertable::manifest::ClusterCentroids::from_fp32(
+            2,
+            dim as u32,
+            &cell_centroids,
+            vec![1, 1],
+        );
+        let admit = crate::supertable::manifest::RabitqAdmitContext::new(dim, 7);
+        let coarse = crate::supertable::opann::boundary_assignment_fp32(
+            &grid,
+            Metric::L2Sq,
+            &row,
+            &admit,
+            crate::supertable::opann::assignment_shortlist_window(2),
+        );
+        assert_eq!(
+            coarse.primary, 0,
+            "coarse cell grid places the same row in cell 0 — the divergence fine placement fixes"
         );
     }
 

@@ -248,9 +248,11 @@ vector:
   centroid_graph_concentration_ratio: 0.5
 
   # For ivf_router = auto: the scale floor (hidden-table doc count) below which
-  # auto picks stamped. The selected clusters coalesce into a cold-read win only
-  # at large N (measured win at 10M+, loss at 1M). Documented starting point.
-  centroid_graph_scale_floor_docs: 10000000
+  # auto picks stamped. 0 (the default) means no floor — the fine-centroid graph
+  # is eligible at every scale (concentration still gates), available uniformly
+  # like the always-built cell grid. Drain-side fine-centroid placement removes
+  # the below-scale loss the floor once guarded against.
+  centroid_graph_scale_floor_docs: 0
 
   # Ceiling on the fanout the router's recall calibration considers: the widest
   # number of global fine clusters the calibration selects + scores per query,

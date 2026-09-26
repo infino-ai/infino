@@ -320,10 +320,14 @@ const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 128;
 /// when the calibrated fanout selects under half the fine clusters (a real
 /// subset to concentrate on). A documented starting point, tuned per corpus.
 const DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO: f64 = 0.5;
-/// Default `ivf_router = auto` scale floor: `centroid_graph` only at or above
-/// 10M docs, where the selected clusters coalesce into a cold-read win (the
-/// graph measured a win at 10M+, a loss at 1M). A documented starting point.
-const DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS: u64 = 10_000_000;
+/// Default `ivf_router = auto` scale floor: `0` means no floor — `auto` may
+/// pick `centroid_graph` at every scale (subject to the concentration gate),
+/// so the fine-centroid graph is available uniformly, like the always-built
+/// cell grid. The earlier 10M floor guarded a below-scale recall loss that came
+/// from placement/routing misalignment (docs placed by the coarse cell grid but
+/// routed by fine centroids); with drain-side fine-centroid placement that
+/// misalignment is gone, so the floor is no longer needed.
+const DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS: u64 = 0;
 const DEFAULT_CENTROID_GRAPH_MAX_FANOUT: usize = 4096;
 /// Default `ivf_router = auto` parity gap: how far below `hnsw_register_floor`
 /// the router-fanout acceptance bar may relax toward the router's OWN measured
@@ -692,11 +696,12 @@ pub struct VectorSettings {
     /// starting point, tunable; the final value comes from a real-corpus sweep.
     pub centroid_graph_concentration_ratio: f64,
     /// For `ivf_router = auto`: the scale floor (hidden-table doc count) below
-    /// which `auto` picks `stamped`. The selected clusters coalesce into a
-    /// cold-read win only at large N — the centroid graph measured a win at 10M+
-    /// and a loss at 1M, where the selection is spread too thin across cells to
-    /// coalesce. Documented starting point, tunable; final value from a
-    /// real-corpus sweep.
+    /// which `auto` picks `stamped`. `0` (the default) means no floor — the
+    /// graph is eligible at every scale, gated only by concentration — so the
+    /// fine-centroid graph is available uniformly like the always-built cell
+    /// grid. A positive value keeps `auto` on `stamped` below that many docs.
+    /// Tunable; the below-scale loss the floor once guarded against is removed
+    /// by drain-side fine-centroid placement (aligned placement and routing).
     pub centroid_graph_scale_floor_docs: u64,
     /// Ceiling on the fanout the router's recall calibration considers — the
     /// widest number of global fine clusters the calibration sweep selects and
@@ -1312,17 +1317,10 @@ impl Config {
             );
             v.centroid_graph_concentration_ratio = DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO;
         }
-        // Scale floor: a 0 floor treats every table as "at scale", routing tiny
-        // tables to the graph the floor exists to keep them off of (measured
-        // loss below ~10M). Require a positive floor.
-        if v.centroid_graph_scale_floor_docs == 0 {
-            tracing::warn!(
-                default = DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS,
-                "vector.centroid_graph_scale_floor_docs must be positive; falling back to the \
-                 default (a 0 floor routes below-scale tables to a graph that loses there)"
-            );
-            v.centroid_graph_scale_floor_docs = DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS;
-        }
+        // Scale floor: `0` is valid and means "no floor" — the graph is
+        // eligible at every scale (concentration still gates the choice). With
+        // drain-side fine-centroid placement the below-scale recall loss the
+        // floor once guarded against is gone, so no positivity requirement.
         // Max fanout: the calibration sweep's ceiling. A 0 collapses the sweep
         // to a single cluster (`max(1)`), stamping a degenerate fanout of 1.
         if v.centroid_graph_max_fanout == 0 {
@@ -1634,7 +1632,7 @@ mod tests {
     fn centroid_graph_auto_thresholds_default_and_override() {
         let cfg = Config::defaults().expect("defaults parse");
         assert_eq!(cfg.vector.centroid_graph_concentration_ratio, 0.5);
-        assert_eq!(cfg.vector.centroid_graph_scale_floor_docs, 10_000_000);
+        assert_eq!(cfg.vector.centroid_graph_scale_floor_docs, 0);
         assert_eq!(
             cfg.vector.ivf_router,
             IvfRouter::Auto,
@@ -1683,11 +1681,12 @@ mod tests {
                 .centroid_graph_concentration_ratio,
             DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
         );
-        // A 0 scale floor and a 0 max fanout both revert to their defaults.
+        // A 0 scale floor is valid — it means "no floor" (graph eligible at
+        // every scale), so it is kept, not clamped. Only a 0 max fanout reverts.
         assert_eq!(
             clamped(json!({ "vector": { "centroid_graph_scale_floor_docs": 0 } }))
                 .centroid_graph_scale_floor_docs,
-            DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS,
+            0,
         );
         assert_eq!(
             clamped(json!({ "vector": { "centroid_graph_max_fanout": 0 } }))
