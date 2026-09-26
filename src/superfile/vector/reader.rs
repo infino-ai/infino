@@ -3734,7 +3734,7 @@ impl VectorReader {
         // Resolve the coalesce score set to per-cell local cluster ids, mirroring
         // how `per_cell` was keyed above: a fetched span is scored down to only
         // these clusters. `None` scores every fetched cluster.
-        let score_by_cell: Option<HashMap<usize, HashSet<usize>>> = score_only.map(|sel| {
+        let score_by_cell: Option<HashMap<usize, Arc<HashSet<usize>>>> = score_only.map(|sel| {
             let mut m: HashMap<usize, HashSet<usize>> = HashMap::new();
             if self.is_multi_cell() {
                 for &flat in sel {
@@ -3747,7 +3747,24 @@ impl VectorReader {
                     .or_default()
                     .extend(sel.iter().map(|&f| f as usize));
             }
-            m
+            // Drift guards for the two keyings (`per_cell` groups the FETCH by
+            // the same resolution). A selected flat that fails to resolve would
+            // silently never score — lost recall; a score key outside the
+            // fetched cells would mean the two resolutions disagree. A fetched
+            // cell with NO entry is neither: a span's gap-only cell scores
+            // nothing, which is the span doing its job.
+            debug_assert_eq!(
+                m.values().map(|set| set.len()).sum::<usize>(),
+                sel.iter().collect::<HashSet<_>>().len(),
+                "a selected flat cluster failed to resolve into the score set"
+            );
+            debug_assert!(
+                m.keys()
+                    .all(|cell| per_cell.iter().any(|(c, _, _)| c == cell)),
+                "score set keyed to a cell the fetch does not cover"
+            );
+            // `Arc` so each probed cell clones a pointer, not the set.
+            m.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()
         });
         // Estimates pool cross-superfile keyed by this seed; report the
         // REQUESTED column's seed (every cell of one column shares it),
@@ -3792,10 +3809,12 @@ impl VectorReader {
                 return None;
             }
             // Clusters to SCORE in this cell (coalesce fetches a wider span);
-            // `None` scores every fetched cluster.
-            let cell_score: Option<HashSet<usize>> = score_by_cell
+            // `None` scores every fetched cluster. A cell absent from the map
+            // holds only gap clusters — it was fetched for read contiguity and
+            // scores nothing. The drift cases are asserted at the map build.
+            let cell_score: Option<Arc<HashSet<usize>>> = score_by_cell
                 .as_ref()
-                .map(|m| m.get(&cell_idx).cloned().unwrap_or_default());
+                .map(|m| m.get(&cell_idx).map(Arc::clone).unwrap_or_default());
             let pool = pool.clone();
             let budget = budget.clone();
             Some(async move {
@@ -3835,7 +3854,7 @@ impl VectorReader {
                     cells_scanned: 1,
                     candidates_scanned: cluster_meta
                         .iter()
-                        .filter(|&&(c, _, _)| cell_score.as_ref().is_none_or(|s| s.contains(&c)))
+                        .filter(|&&(c, _, _)| cell_score.as_deref().is_none_or(|s| s.contains(&c)))
                         .map(|(_, _, cnt)| u64::from(*cnt))
                         .sum(),
                     ranges_requested: 1 + prefix_ranges.len() as u64,
@@ -3860,7 +3879,7 @@ impl VectorReader {
                     // clusters. Dropping the gap clusters here keeps
                     // `scan_shortlist` unchanged and its survivor heap free of
                     // rows that carry no recall benefit.
-                    retain_scored_clusters(&mut cluster_meta, &mut blocks, cell_score.as_ref());
+                    retain_scored_clusters(&mut cluster_meta, &mut blocks, cell_score.as_deref());
                     let ctx = ProbeCtx {
                         q_rot: q_rot_shared,
                         k,
@@ -3919,7 +3938,7 @@ impl VectorReader {
                         &ctx,
                         &cluster_idx,
                         &locals,
-                        cell_score.as_ref(),
+                        cell_score.as_deref(),
                     )
                     .await?;
                 // Only the rerank rows come from the probe: this scan
