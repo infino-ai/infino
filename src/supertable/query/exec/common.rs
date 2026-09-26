@@ -216,29 +216,53 @@ pub(crate) async fn resolve_hits_named(
     // bare call never touches user-column data pages — projecting
     // those is an explicit opt-in by name.
     let id_column = reader.options().id_column.clone();
-    let bare: [&str; 2] = [id_column.as_str(), SCORE_COLUMN];
-    let names: &[&str] = match projection {
-        Some(names) => names,
-        None => &bare,
-    };
     // Resolving a projected name to a column is caller-input validation, not
     // query execution: the single-table search methods run their own kernels
     // (no SQL engine involved), so an unknown column must read as a bad request
     // that names the column and the valid set — never as an internal execution
-    // failure.
-    let indices: Vec<usize> = names
-        .iter()
-        .map(|name| {
-            output_schema
-                .index_of(name)
-                .map_err(|_| QueryError::InvalidQuery(unknown_column_message(name, &output_schema)))
-        })
-        .collect::<Result<_, _>>()?;
+    // failure. The same check runs early (before any search I/O) at the search
+    // entry points via [`validate_projection`]; this call is the one source of
+    // truth so the two never drift.
+    let indices = validate_projection(projection, id_column.as_str(), &output_schema)?;
     // Past name resolution, any failure is a store/decode fault reading the
     // projected columns — not the caller's mistake.
     resolve_hits(reader, hits, &scalar_schema, &output_schema, Some(&indices))
         .await
         .map_err(|e| QueryError::Store(e.to_string()))
+}
+
+/// Resolve each projected column name to its index in the search output
+/// schema, erroring with [`unknown_column_message`] on the first name the
+/// output does not carry. `projection` of `None` is the engine-native
+/// `_id` + `score` result, whose names are always resolvable.
+///
+/// This is the single source of truth for projection-name validation. It
+/// runs at output-materialization time inside [`resolve_hits_named`], and —
+/// for the row-returning search entry points — early, before any search or
+/// placement I/O, so a projection naming a nonexistent column fails fast
+/// instead of after a full (at billion scale, multi-gigabyte) search whose
+/// result is then thrown away. `output_schema` is resident
+/// ([`output_schema_with_score`] over the stored scalar schema), so the
+/// early check touches no object storage.
+pub(crate) fn validate_projection(
+    projection: Option<&[&str]>,
+    id_column: &str,
+    output_schema: &SchemaRef,
+) -> Result<Vec<usize>, QueryError> {
+    // `None` decodes `_id` + `score` only; both are always resolvable.
+    let bare: [&str; 2] = [id_column, SCORE_COLUMN];
+    let names: &[&str] = match projection {
+        Some(names) => names,
+        None => &bare,
+    };
+    names
+        .iter()
+        .map(|name| {
+            output_schema
+                .index_of(name)
+                .map_err(|_| QueryError::InvalidQuery(unknown_column_message(name, output_schema)))
+        })
+        .collect()
 }
 
 /// Message for a projection naming a column the search output does not
@@ -252,6 +276,26 @@ fn unknown_column_message(name: &str, output_schema: &SchemaRef) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("unknown column {name:?} in projection; valid columns: {available}")
+}
+
+impl SupertableReader {
+    /// Reject a projection naming a column the search output does not carry,
+    /// before any search or placement I/O. Resident-only: the stored scalar
+    /// schema plus the synthesized `score`, no object storage touched. Every
+    /// row-returning search entry point calls this at its top so a doomed
+    /// projection fails fast instead of after a full (at billion scale,
+    /// multi-gigabyte) search whose result is then thrown away. The valid set
+    /// is the same one [`resolve_hits_named`] checks at output materialization,
+    /// so the two share one source of truth and the error message is identical.
+    pub(crate) fn check_projection(&self, projection: Option<&[&str]>) -> Result<(), QueryError> {
+        let output_schema = output_schema_with_score(&self.options().stored_schema());
+        validate_projection(
+            projection,
+            self.options().id_column.as_str(),
+            &output_schema,
+        )?;
+        Ok(())
+    }
 }
 
 /// Lower a search table function's pushed-down `WHERE` filters to the
@@ -1262,6 +1306,43 @@ mod tests {
         assert_eq!(out.fields().len(), 2);
         assert_eq!(out.field(1).name(), "score");
         assert_eq!(out.field(1).data_type(), &DataType::Float32);
+    }
+
+    /// [`validate_projection`] is the shared, resident-only (no I/O)
+    /// projection-name check the search entry points run *before* any search,
+    /// so a doomed projection fails fast. It resolves known names to output
+    /// indices, defaults `None` to `_id` + `score`, and rejects an unknown
+    /// name with the exact `unknown column … in projection` message
+    /// `resolve_hits_named` produces at materialization.
+    #[test]
+    fn validate_projection_rejects_unknown_and_resolves_known() {
+        let output_schema = output_schema_with_score(&Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Int64, false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ])));
+        // score is appended after _id (0) and title (1).
+        assert_eq!(
+            validate_projection(None, "_id", &output_schema).expect("default is valid"),
+            vec![0, 2],
+            "None resolves to the engine-native _id + score pair"
+        );
+        assert_eq!(
+            validate_projection(Some(&["title", "_id", "score"]), "_id", &output_schema)
+                .expect("known columns resolve"),
+            vec![1, 0, 2],
+            "known names resolve to their output-schema indices in order"
+        );
+        let err = validate_projection(Some(&["title", "nope"]), "_id", &output_schema)
+            .expect_err("an unknown projected column must error");
+        assert!(
+            matches!(err, QueryError::InvalidQuery(_)),
+            "expected InvalidQuery, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown column") && msg.contains("in projection"),
+            "message must name the unknown column and the projection, got {msg:?}"
+        );
     }
 
     /// The pushed predicate binds to the function's output by bare column

@@ -2077,6 +2077,7 @@ impl SuperfileReader {
             query,
             k,
             clusters,
+            None,
             rerank_mult,
             cold_rerank_mult,
             allow,

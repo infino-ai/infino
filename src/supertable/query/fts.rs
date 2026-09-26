@@ -2175,6 +2175,8 @@ impl SupertableReader {
         opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        self.check_projection(projection)?;
+
         let _foreground = ForegroundQueryGuard::enter();
         self.block_on(async {
             let hits = self.bm25_search_async(column, query, k, opts).await?;
@@ -2566,6 +2568,9 @@ impl Supertable {
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, mode = ?mode, "token_match");
         let reader = self.reader()?;
+        reader
+            .check_projection(projection)
+            .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
         let hits = reader
             .token_match(column, query, mode)
             .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
@@ -2592,6 +2597,9 @@ impl Supertable {
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, "exact_match");
         let reader = self.reader()?;
+        reader
+            .check_projection(projection)
+            .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
         let hits = reader
             .exact_match(column, value)
             .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;

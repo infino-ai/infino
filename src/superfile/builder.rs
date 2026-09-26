@@ -1273,6 +1273,10 @@ impl SuperfileBuilder {
                         "non-utf8 term in FTS merge input".into(),
                     ))
                 })?;
+                // `remap` already names the output blob's doc ids: the
+                // reordering merge converts through the chosen order and
+                // the arrival-order carries convert from the row, so
+                // nothing is left to translate here.
                 if let Err(e) =
                     fb.add_prebuilt_term_posting(column_id, term_str, out_doc, tf, positions)
                 {
