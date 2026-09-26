@@ -425,10 +425,14 @@ pub(crate) fn boundary_assignment_graph_encoded(
     boundary_assignment_graph(graph, scorer, node_to_cell, clusters, metric, &row_fp, ef)
 }
 
-/// Shared closure tail: primary = best-ranked cell; replicas = ranked
-/// cells within the closure distance ratio, carrying their margin to the
-/// shared Voronoi boundary.
-fn boundary_from_ranked(
+/// Shared closure tail: primary = the FIRST ranked cell; replicas = the ranked
+/// cells within the closure distance ratio, carrying their margin to the shared
+/// Voronoi boundary. `ranked[0]` is taken as the primary verbatim (callers that
+/// want the nearest-by-score primary sort before calling); the tail after it
+/// MUST be ascending by score, since the closure loop breaks at the first cell
+/// outside the window, and MUST be at most [`REPLICA_CLOSURE_MAX_REPLICAS`]
+/// entries past the primary (the fixed replica array is not grown).
+pub(crate) fn boundary_from_ranked(
     clusters: &ClusterCentroids,
     metric: Metric,
     ranked: &[(u32, f32)],

@@ -2001,6 +2001,38 @@ impl SupertableWriter {
         }
     }
 
+    /// Whether this table's configured router resolves to `centroid_graph` for
+    /// `column`, the gate for engaging fine-centroid drain placement. Explicit
+    /// `centroid_graph` always qualifies; `auto` qualifies only when the hidden
+    /// vector index actually resolves to the graph (same predicate the eager
+    /// warm uses, [`auto_prefers_centroid_graph`], evaluated on the hidden
+    /// manifest where the router lives); `stamped` / `hnsw_ivf` never do. When
+    /// the gate is false the drain places on the coarse cell grid — the layout
+    /// the stamped router expects — so placement always matches the router the
+    /// table will serve with.
+    fn commit_resolves_to_centroid_graph(&self, column: &str) -> bool {
+        let vcfg = &crate::config::global().vector;
+        if vcfg.search_mode != crate::config::VectorSearchMode::Ivf {
+            return false;
+        }
+        match vcfg.ivf_router {
+            crate::config::IvfRouter::CentroidGraph => true,
+            crate::config::IvfRouter::Auto => self
+                .inner
+                .vector_index_table
+                .as_ref()
+                .map(|hidden| hidden.inner().manifest.load_full())
+                .is_some_and(|hidden_manifest| {
+                    crate::supertable::query::vector::auto_prefers_centroid_graph(
+                        &hidden_manifest,
+                        column,
+                        vcfg,
+                    )
+                }),
+            _ => false,
+        }
+    }
+
     /// Body of [`Self::commit_appends_internal`] after the buffer has been
     /// taken. On `Err`, the caller restores `buffer` onto the writer. `stem`
     /// is the source label every superfile this commit produces is keyed
@@ -2075,10 +2107,15 @@ impl SupertableWriter {
         // this path. No slow CAS.
         if !self.inner.options.vector_columns.is_empty() {
             let commit_t0 = time::Instant::now();
+            // ONE pinned pre-commit snapshot drives both the pack grid and the
+            // fine-placement router, so a split landing mid-commit cannot give
+            // them divergent cell numbering (the per-row bounds check in
+            // `assign_row_to_cells` is the backstop; this removes the window).
+            let pinned_manifest = self.inner.manifest.load_full();
             let pack_grid = pending_gvi
                 .as_ref()
                 .cloned()
-                .or_else(|| self.inner.manifest.load().get_global_vector_index())
+                .or_else(|| pinned_manifest.get_global_vector_index())
                 .ok_or_else(|| {
                     BuildError::Store(
                         "vector columns present but global cell grid missing after Phase A".into(),
@@ -2092,24 +2129,27 @@ impl SupertableWriter {
                 .first()
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
-            // Fine-centroid drain placement: assemble the global fine centroids
-            // and their owning cells from the PRE-COMMIT manifest, so each new
-            // row lands in the cell of its nearest fine centroid — matching how
-            // queries route (they walk the same fine centroids) — instead of the
-            // coarse cell grid, which lands rows in cells the fine router ranks
-            // deep and forces a wide, slow probe. `None` on the first commit (no
-            // prior fine centroids) or any load failure: placement degrades to
-            // the cell grid, it never fails the commit.
+            // Fine-centroid drain placement: place each new row in the cell of
+            // its nearest fine centroid (walking the same centroid-router graph
+            // queries use) instead of the coarse cell grid, so placement matches
+            // routing. Only attempted when the table's router RESOLVES to
+            // centroid_graph — a stamped / hnsw_ivf table places coarse, and an
+            // `auto` table only when it resolves to the graph on the hidden index
+            // — so the router build (opening superfiles + the graph) never runs
+            // for a table that will not route through it. `None` (first commit /
+            // no centroid section / any load failure) degrades to the coarse cell
+            // grid; it never fails the commit.
             let fine_assign: Option<crate::supertable::query::vector::FineAssignRouter> = self
                 .inner
                 .options
                 .vector_columns
                 .first()
                 .map(|vc| vc.column.clone())
+                .filter(|column| self.commit_resolves_to_centroid_graph(column))
                 .and_then(|column| {
                     let reader = crate::supertable::handle::SupertableReader::from_inner_pinned(
                         Arc::clone(&self.inner),
-                        self.inner.manifest.load_full(),
+                        Arc::clone(&pinned_manifest),
                         self.inner.tombstone_cache.clone(),
                         self.op_stats.clone(),
                     );
@@ -2119,13 +2159,13 @@ impl SupertableWriter {
                     )
                 });
             match &fine_assign {
-                Some(_) => tracing::info!(
+                Some(_) => tracing::debug!(
                     target: "infino::gfc",
-                    "drain placement: fine-centroid router ENGAGED (rows placed by nearest fine centroid)"
+                    "drain placement: fine-centroid router engaged (rows placed by nearest fine centroid)"
                 ),
-                None => tracing::info!(
+                None => tracing::debug!(
                     target: "infino::gfc",
-                    "drain placement: fell back to coarse cell grid (no fine router — first drain / no section)"
+                    "drain placement: coarse cell grid (router not centroid_graph, first drain, or no section)"
                 ),
             }
             // Pipelined publish on storage-backed tables: shards stream
@@ -6137,33 +6177,40 @@ fn assign_cells<'a>(
         .par_iter()
         .map(|row| match *row {
             PackRow::Fp32 { vector, .. } => fine
-                .and_then(|fr| fr.assign_row_to_cells(vector))
+                .and_then(|fr| fr.assign_row_to_cells(clusters, metric, vector))
                 .unwrap_or_else(|| {
                     opann::boundary_assignment_fp32(clusters, metric, vector, &admit_ctx, window)
                 }),
         })
         .collect();
 
-    let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
-        .iter()
-        .enumerate()
-        .flat_map(|(row_idx, assignment)| {
-            assignment
-                .replicas
-                .iter()
-                .flatten()
-                .map(move |&(cell, margin)| (row_idx, cell, margin))
-        })
-        .collect();
-    replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
-
     let mut buckets: HashMap<u32, Vec<(i128, bool, PackRow<'a>)>> = HashMap::new();
-    for (row_idx, cell, _) in replica_candidates.into_iter().take(replica_extra_budget) {
-        let row = rows[row_idx];
-        buckets
-            .entry(cell)
-            .or_default()
-            .push((pack_row_stable_id(row), false, row));
+    // Boundary-replica materialization. The default replica budget is 0
+    // (`drain_replica_target_factor <= 1.0`), so the common path materializes NO
+    // replicas and skips the candidate vector entirely — building and sorting a
+    // ~3×rows candidate list only to `.take(0)` it charged the drain hundreds of
+    // MB per shard for nothing. Only when a budget is set do we collect the
+    // candidates and keep the `replica_extra_budget` thinnest-margin ones.
+    if replica_extra_budget > 0 {
+        let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
+            .iter()
+            .enumerate()
+            .flat_map(|(row_idx, assignment)| {
+                assignment
+                    .replicas
+                    .iter()
+                    .flatten()
+                    .map(move |&(cell, margin)| (row_idx, cell, margin))
+            })
+            .collect();
+        replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+        for (row_idx, cell, _) in replica_candidates.into_iter().take(replica_extra_budget) {
+            let row = rows[row_idx];
+            buckets
+                .entry(cell)
+                .or_default()
+                .push((pack_row_stable_id(row), false, row));
+        }
     }
     for (row, assignment) in rows.iter().zip(&assignments) {
         buckets
@@ -8835,7 +8882,6 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     let router_column = crate::supertable::query::vector::select_eager_router_column(
         vcfg.search_mode,
         vcfg.ivf_router,
-        vcfg.global_fine_fanout,
         &inner.options.vector_columns,
     );
     let router_eligible = router_column.as_deref() == Some(column.as_str())
@@ -9349,7 +9395,6 @@ async fn build_and_publish_centroid_router_section(
     let column = crate::supertable::query::vector::select_eager_router_column(
         vcfg.search_mode,
         vcfg.ivf_router,
-        vcfg.global_fine_fanout,
         &inner.options.vector_columns,
     )?;
     let dim = inner

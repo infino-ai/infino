@@ -976,7 +976,6 @@ impl Supertable {
         let Some(column) = crate::supertable::query::vector::select_eager_router_column(
             vcfg.search_mode,
             vcfg.ivf_router,
-            vcfg.global_fine_fanout,
             &self.inner.options.vector_columns,
         ) else {
             return;
