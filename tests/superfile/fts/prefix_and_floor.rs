@@ -78,7 +78,7 @@ async fn assert_prefix_matches_oracle(
     let terms = expansion(corp, prefix);
     let want = oracle.top_k_terms(&terms, k);
 
-    let got_ids: HashSet<u64> = got.iter().map(|(d, _)| *d as u64).collect();
+    let got_ids: HashSet<u64> = got.iter().map(|(d, _)| u64::from(d.get())).collect();
     let want_ids: HashSet<u64> = want.iter().map(|(d, _)| *d).collect();
     if k >= want.len() {
         assert_eq!(got_ids, want_ids, "prefix {prefix:?}: match sets disagree");
@@ -90,7 +90,7 @@ async fn assert_prefix_matches_oracle(
     }
     let want_scores: std::collections::HashMap<u64, f32> = want.into_iter().collect();
     for (d, s) in &got {
-        let w = want_scores[&(*d as u64)];
+        let w = want_scores[&(u64::from(d.get()))];
         assert!(
             (s - w).abs() <= SCORE_ABS_TOLERANCE,
             "prefix {prefix:?} doc {d}: reader={s} oracle={w}"
@@ -184,8 +184,8 @@ async fn assert_floor_preserves_topk(reader: &SuperfileReader, terms: &[&str], m
         .await
         .expect("floored top-k");
 
-    let full_ids: HashSet<u64> = full.iter().map(|(d, _)| *d as u64).collect();
-    let got_ids: HashSet<u64> = floored.iter().map(|(d, _)| *d as u64).collect();
+    let full_ids: HashSet<u64> = full.iter().map(|(d, _)| u64::from(d.get())).collect();
+    let got_ids: HashSet<u64> = floored.iter().map(|(d, _)| u64::from(d.get())).collect();
     assert_eq!(
         got_ids, full_ids,
         "floor={kth} on {terms:?} {mode:?}: floored top-k dropped/added a doc vs unfloored"
@@ -193,9 +193,9 @@ async fn assert_floor_preserves_topk(reader: &SuperfileReader, terms: &[&str], m
 
     // Scores identical (compare per doc; the floor must not perturb them).
     let full_scores: std::collections::HashMap<u64, f32> =
-        full.iter().map(|(d, s)| (*d as u64, *s)).collect();
+        full.iter().map(|(d, s)| (u64::from(d.get()), *s)).collect();
     for (d, s) in &floored {
-        let w = full_scores[&(*d as u64)];
+        let w = full_scores[&(u64::from(d.get()))];
         assert!(
             (s - w).abs() <= SCORE_ABS_TOLERANCE,
             "floor perturbed a top-k score on doc {d}: floored={s} unfloored={w}"

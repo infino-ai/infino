@@ -130,6 +130,7 @@ use crate::{
             },
             tokenize::Phrase,
         },
+        id_space::RowId,
     },
     supertable::{
         error::QueryError,
@@ -1079,10 +1080,16 @@ impl SupertableReader {
                         match prep {
                             // Already-final shapes: the walk (and its
                             // kernel time) happened inside
-                            // `prepare_clauses`; `run_prepared` would be
-                            // a no-op move and the bracket two wasted
-                            // schedstat reads.
-                            PreparedClauses::Done { hits, .. } => hits,
+                            // `prepare_clauses`. It still goes through
+                            // `run_prepared`, which is where a blob
+                            // storing its documents in an order of its
+                            // own turns them back into rows; taking the
+                            // hits directly would hand the caller blob
+                            // ids, and everything downstream reads them
+                            // as rows.
+                            prep @ PreparedClauses::Done { .. } => {
+                                r.run_prepared(prep, bm25_params).map_err(fts_read_error)?
+                            }
                             // Gate on posting mass, not term count: this
                             // scan isn't sliced, so a rare-term query
                             // with many terms can be cheaper than a
@@ -1118,13 +1125,13 @@ impl SupertableReader {
                 match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
                     Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
                         hits.iter()
-                            .filter(|(d, _)| !bitmap.contains(*d))
+                            .filter(|(d, _)| !bitmap.contains(d.get()))
                             .map(|(_, s)| *s),
                     ),
                     Some(Err(_)) => {}
                     _ => shared.merge(hits.iter().map(|(_, s)| *s)),
                 }
-                Ok(hits)
+                Ok(rows_as_local_ids(hits))
             }
         };
         let per_unit = match ceilings.is_some() {
@@ -1511,6 +1518,7 @@ impl SupertableReader {
                             .await
                             .map_err(|e| QueryError::Execute(e.to_string()))?
                             .map_err(fts_read_error)
+                            .map(rows_as_local_ids)
                         } else {
                             op_stats::timed_kernel(&op_stats, || {
                                 r.bm25_search_or_range_prebuilt(
@@ -1523,6 +1531,7 @@ impl SupertableReader {
                                 )
                             })
                             .map_err(fts_read_error)
+                            .map(rows_as_local_ids)
                         }
                     }
                     None => {
@@ -1535,7 +1544,7 @@ impl SupertableReader {
                             stats.add_planned_read_ranges(work.planned_ranges);
                             stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                         }
-                        Ok(hits)
+                        Ok(rows_as_local_ids(hits))
                     }
                 }
             }
@@ -1772,9 +1781,9 @@ impl SupertableReader {
                             .map_err(fts_read_error)?,
                     };
                     work.merge(neg_work);
-                    let excluded: RoaringBitmap = neg_docs.into_iter().collect();
+                    let excluded: RoaringBitmap = neg_docs.into_iter().map(RowId::get).collect();
                     docs.into_iter()
-                        .filter(|d| !excluded.contains(*d))
+                        .filter(|d| !excluded.contains(d.get()))
                         .collect::<Vec<_>>()
                 } else {
                     docs
@@ -1785,7 +1794,10 @@ impl SupertableReader {
                     stats.add_planned_read_ranges(work.planned_ranges);
                     stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                 }
-                Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
+                Ok(docs
+                    .into_iter()
+                    .map(|d| (d.get(), 0.0f32))
+                    .collect::<Vec<_>>())
             }
         };
         let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
@@ -1924,7 +1936,7 @@ impl SupertableReader {
                                     .map_err(fts_read_error)?,
                             };
                             work.merge(neg_work);
-                            neg_docs.into_iter().collect()
+                            neg_docs.into_iter().map(RowId::get).collect()
                         } else {
                             RoaringBitmap::new()
                         };
@@ -1936,8 +1948,8 @@ impl SupertableReader {
                         let n = docs
                             .iter()
                             .filter(|d| {
-                                !excluded.contains(**d)
-                                    && tomb.as_ref().is_none_or(|b| !b.contains(**d))
+                                !excluded.contains(d.get())
+                                    && tomb.as_ref().is_none_or(|b| !b.contains(d.get()))
                             })
                             .count() as u64;
                         return Ok::<u64, QueryError>(n);
@@ -2068,7 +2080,7 @@ impl SupertableReader {
                         stats.add_planned_read_ranges(work.planned_ranges);
                         stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                     }
-                    docs
+                    docs.into_iter().map(RowId::get).collect()
                 };
                 if candidates.is_empty() {
                     return Ok(Vec::new());
@@ -2280,6 +2292,18 @@ struct WorkUnit {
 /// the scales we benchmark (1.25M docs/superfile after 10M × cpus/2
 /// row-shard) are well above this floor.
 const SUBRANGE_MIN_DOCS: u32 = 50_000;
+
+/// Unwrap FTS hits out of row space for the shared per-superfile hit
+/// shape.
+///
+/// A [`SuperfileHit`] carries a bare local id because the vector path
+/// fills the same field from its own numbering, which is not the
+/// superfile's Parquet rows. FTS hits *are* rows by the time they leave
+/// the reader, so the type comes off here, at the one place they enter
+/// that shape.
+fn rows_as_local_ids(hits: Vec<(RowId, f32)>) -> Vec<(u32, f32)> {
+    hits.into_iter().map(|(row, s)| (row.get(), s)).collect()
+}
 
 /// Map a per-superfile FTS read error to the query-layer error. A
 /// phrase query against a column indexed without positions, or a query
@@ -3696,7 +3720,7 @@ mod tests {
             .expect("oracle");
         // Oracle should find exactly 3 docs containing `nimblefox`.
         assert_eq!(oracle_hits.len(), 3);
-        let oracle_set: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();
+        let oracle_set: HashSet<u32> = oracle_hits.iter().map(|(d, _)| d.get()).collect();
         assert_eq!(oracle_set, [0u32, 4, 8].iter().copied().collect());
 
         let st_reader = st.reader().expect("reader");
@@ -3752,7 +3776,7 @@ mod tests {
         let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5, None))
             .expect("oracle")
             .0;
-        let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();
+        let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| d.get()).collect();
 
         let st_reader = st.reader().expect("reader");
         let st_hits = st_reader

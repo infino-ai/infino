@@ -149,6 +149,7 @@ pub mod fts {
     use infino::superfile::{
         SuperfileReader,
         fts::reader::{BoolMode as InfinoBoolMode, OrAlgo},
+        id_space::RowId,
     };
 
     use crate::{
@@ -288,7 +289,8 @@ pub mod fts {
                 .expect("search df=1");
         assert_eq!(hits.len(), 1, "df=1 term should return exactly one hit");
         assert_eq!(
-            hits[0].0 as usize, probe_doc_id,
+            hits[0].0.get() as usize,
+            probe_doc_id,
             "{probe_token} should match doc_id {probe_doc_id}"
         );
 
@@ -342,7 +344,7 @@ pub mod fts {
         const SCORE_EPSILON: f32 = 1e-4;
 
         for (label, terms) in battery {
-            let bmw_top10: Vec<(u32, f32)> = block_on_inmem(reader.bm25_search_pretokenized(
+            let bmw_top10: Vec<(RowId, f32)> = block_on_inmem(reader.bm25_search_pretokenized(
                 FTS_COLUMN,
                 terms,
                 K,
@@ -361,7 +363,7 @@ pub mod fts {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.0.cmp(&b.0))
             });
-            let brute_top10: Vec<(u32, f32)> = brute_full.into_iter().take(K).collect();
+            let brute_top10: Vec<(RowId, f32)> = brute_full.into_iter().take(K).collect();
 
             assert_eq!(
                 bmw_top10.len(),
@@ -448,11 +450,12 @@ pub mod fts {
                 .expect("negation oracle search");
             assert!(!hits.is_empty(), "{name}: no hits");
             for (doc_id, _) in &hits {
-                let text = docs[*doc_id as usize].1;
+                let text = docs[doc_id.get() as usize].1;
                 for neg in &negated {
                     assert!(
                         !text.split_whitespace().any(|w| w == *neg),
-                        "{name}: doc {doc_id} contains negated term {neg:?}"
+                        "{name}: doc {} contains negated term {neg:?}",
+                        doc_id.get()
                     );
                 }
             }

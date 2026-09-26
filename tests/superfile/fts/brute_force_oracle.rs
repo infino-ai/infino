@@ -171,7 +171,7 @@ async fn infino_top_k(reader: &SuperfileReader, query: &str, k: usize) -> Vec<u6
         .bm25_hits_async("title", query, k, BoolMode::Or)
         .await
         .expect("BM25 search");
-    hits.into_iter().map(|(d, _)| d as u64).collect()
+    hits.into_iter().map(|(d, _)| u64::from(d.get())).collect()
 }
 
 /// Compare top-k *sets* between infino and brute-force for a query.
@@ -339,7 +339,7 @@ async fn oracle_sparse_column_scores_match_by_value() {
             .await
             .expect("BM25 search")
             .into_iter()
-            .map(|(d, s)| (d as u64, s))
+            .map(|(d, s)| (u64::from(d.get()), s))
             .collect();
         let terms: Vec<String> = tok.tokenize(query).collect();
         let want: HashMap<u64, f32> = match mode {
@@ -602,7 +602,7 @@ async fn infino_top_k_and(reader: &SuperfileReader, query: &str, k: usize) -> Ve
         .bm25_hits_async("title", query, k, BoolMode::And)
         .await
         .expect("AND BM25 search");
-    hits.into_iter().map(|(d, _)| d as u64).collect()
+    hits.into_iter().map(|(d, _)| u64::from(d.get())).collect()
 }
 
 async fn assert_top_k_and_set_matches(
@@ -712,7 +712,7 @@ async fn oracle_and_scores_match_brute_force_ordering() {
         .await
         .expect("AND search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let oracle_hits = oracle.top_k_terms_and(&terms, 10);
     assert_eq!(
@@ -773,7 +773,7 @@ async fn oracle_and_membership_path_matches_brute_force() {
         .await
         .expect("AND search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let want_set: HashSet<u64> = (0..N).filter(|i| i % 100 == 0).collect();
     let got_set: HashSet<u64> = got.iter().map(|&(d, _)| d).collect();
@@ -838,7 +838,7 @@ async fn oracle_and_membership_rejects_partial_matches() {
         .await
         .expect("AND search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let want_set: HashSet<u64> = (0..N).filter(|i| i % 240 == 0).collect();
     let got_set: HashSet<u64> = got.iter().map(|&(d, _)| d).collect();
@@ -963,7 +963,7 @@ async fn oracle_and_membership_middle_tier_multiblock_matches_brute_force() {
         .await
         .expect("AND search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let want_set: HashSet<u64> = (0..N).filter(|i| i % 20 == 0).collect();
     let got_set: HashSet<u64> = got.iter().map(|&(d, _)| d).collect();
@@ -1009,7 +1009,7 @@ async fn oracle_and_membership_middle_tier_multiblock_matches_brute_force() {
         .await
         .expect("truncated AND search")
         .into_iter()
-        .map(|(d, _)| d as u64)
+        .map(|(d, _)| u64::from(d.get()))
         .collect();
     let want_topk: HashSet<u64> = oracle
         .top_k_terms_and(&terms, k)
@@ -1069,7 +1069,7 @@ async fn oracle_and_membership_reads_tf_above_one() {
         .await
         .expect("AND search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     // rare docs (i % 100 == 0) also carry common and mid (i % 100 == 0 ⇒ i % 4 ==
     // 0), so the intersection is exactly the 10 rare docs.
@@ -1109,14 +1109,14 @@ async fn dedup_repeated_query_term_scores_as_weighted() {
         .await
         .expect("single-term AND")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let dup: Vec<(u64, f32)> = infino
         .bm25_hits_async("title", "+common +common", 10, BoolMode::And)
         .await
         .expect("repeated-term AND")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     assert_eq!(single.len(), dup.len(), "dedup changed the result count");
     assert!(!single.is_empty(), "expected hits");
@@ -1146,14 +1146,14 @@ async fn dedup_repeated_should_term_scores_as_weighted() {
         .await
         .expect("single-term OR")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let dup: Vec<(u64, f32)> = infino
         .bm25_hits_async("title", "common common", 10, BoolMode::Or)
         .await
         .expect("repeated-term OR")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     assert_eq!(single.len(), dup.len(), "dedup changed the OR result count");
     assert!(!single.is_empty(), "expected hits");
@@ -1185,7 +1185,7 @@ async fn dedup_partial_repeat_preserves_matches_and_weights_one_term() {
             .await
             .expect("AND search")
             .into_iter()
-            .map(|(d, s)| (d as u64, s))
+            .map(|(d, s)| (u64::from(d.get()), s))
             .collect()
     }
 
@@ -1236,7 +1236,7 @@ async fn oracle_dedup_repeated_terms_match_brute_force() {
         .await
         .expect("repeated-AND search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let oracle_and = oracle.top_k_terms_and(&and_terms, 10);
     assert_eq!(
@@ -1314,7 +1314,7 @@ async fn oracle_dedup_repeated_term_block_max_skip_matches_brute_force() {
         .await
         .expect("repeated-term OR search")
         .into_iter()
-        .map(|(d, _)| d as u64)
+        .map(|(d, _)| u64::from(d.get()))
         .collect();
     assert_eq!(
         infino_top1,
@@ -1486,7 +1486,11 @@ async fn oracle_or_multi_block_scores_match_brute_force() {
     for ((infino_doc, infino_score), (oracle_doc, oracle_score)) in
         infino_hits.iter().zip(&oracle_hits)
     {
-        assert_eq!(*infino_doc as u64, *oracle_doc, "OR doc-id mismatch");
+        assert_eq!(
+            u64::from(infino_doc.get()),
+            *oracle_doc,
+            "OR doc-id mismatch"
+        );
         let delta = (infino_score - oracle_score).abs();
         assert!(
             delta < BM25_SCORE_ABS_TOLERANCE,
@@ -1691,7 +1695,7 @@ async fn oracle_and_multi_block_two_term_score_values_match_brute_force() {
     assert_eq!(infino_full.len(), 67, "full AND(alpha, gamma) count");
     for (doc, score) in &infino_full {
         let expected = oracle_by_doc
-            .get(&(*doc as u64))
+            .get(&(u64::from(doc.get())))
             .expect("returned doc not in oracle intersection");
         let delta = (score - expected).abs();
         assert!(

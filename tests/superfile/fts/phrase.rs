@@ -42,7 +42,7 @@ pub async fn search_hits(
         .await
         .expect("phrase query")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect()
 }
 

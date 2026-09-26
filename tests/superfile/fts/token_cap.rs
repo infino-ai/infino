@@ -49,7 +49,7 @@ async fn hits(r: &SuperfileReader, query: &str) -> HashSet<u64> {
         .await
         .expect("search")
         .iter()
-        .map(|(d, _)| *d as u64)
+        .map(|(d, _)| u64::from(d.get()))
         .collect()
 }
 

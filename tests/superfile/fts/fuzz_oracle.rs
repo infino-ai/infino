@@ -444,7 +444,7 @@ fn run_case(
             ))
         })?
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
 
     // Oracle full match set (k = n) via the same parsed clauses, so the
