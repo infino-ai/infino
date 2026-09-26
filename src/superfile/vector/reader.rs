@@ -358,6 +358,16 @@ pub struct VectorReader {
 }
 
 impl VectorReader {
+    /// Base flat-cluster id for `cell_id` on a multi-cell (v2) blob: the global
+    /// flat cluster the centroid-graph router indexes is
+    /// `flat_cluster_base_for_cell(cell) + local_fine_ordinal`. `None` on the v1
+    /// single-cell layout or an unknown cell. Lets the recalibration scan map a
+    /// per-cell row to its router node without re-deriving the prefix sums.
+    pub(crate) fn flat_cluster_base_for_cell(&self, cell_id: u32) -> Option<u32> {
+        let idx = self.cell_ids.iter().position(|&c| c == cell_id)?;
+        self.flat_cluster_base.get(idx).copied()
+    }
+
     /// The column at `idx`, or a typed error. Cell maps resolve to column
     /// indices by construction, so a miss is inconsistent index state
     /// rather than bad input — surfaced as an error, on the same
@@ -1945,39 +1955,51 @@ impl VectorReader {
         Ok(out)
     }
 
-    /// Every resident row of `column` tagged with its GLOBAL flat fine-cluster
-    /// id — the id the centroid router's node map uses — plus its stable id and
-    /// Sq16 rerank codes. The fanout calibrator needs each row's fine cluster to
-    /// attribute it to the cluster the router selects (by rank), so it can score
-    /// recall at each candidate fanout as a PREFIX of one corpus scan rather
-    /// than re-reading per fanout. `flat = flat_cluster_base[cell] + row.cluster`
-    /// matches [`Self::global_fine_cluster_vectors`]'s node numbering exactly.
-    /// Superseded cells are dropped (their rows survive under the split
-    /// successors). Multi-cell (v2) readers only — the router requires them;
-    /// `None` for v1 or an absent column. Reads one superfile's plane, so peak
-    /// memory is bounded to a single superfile.
-    pub(crate) async fn calibration_flat_cluster_rows(
+    /// Emit the fp32 centroid VECTORS of every fine cluster in this superfile,
+    /// tagged with their per-superfile `flat` cluster ids, from the superfile's
+    /// OWN resident centroid region (no [`CentroidSection`] fetch) — the
+    /// recalibration-side source for the centroid router. Iterates cells and
+    /// per-cell fine clusters in the exact same order as
+    /// [`Self::global_fine_cluster_vectors`] (the section-backed walk), so a
+    /// router built from these nodes matches the settle-published one node for
+    /// node (byte-identical fp32 fine centroids in identical `flat` order).
+    /// Resident-only (`try_get_range_sync`); `None` on any non-resident or
+    /// malformed range, or a non-multi-cell / absent-column reader.
+    ///
+    /// [`CentroidSection`]: crate::supertable::slow_vector_state::CentroidSection
+    pub(crate) fn resident_fine_cluster_vectors(
         &self,
         column: &str,
-        superseded: Option<&BTreeSet<u32>>,
-    ) -> Option<Vec<(u32, EncodedCellRow)>> {
+    ) -> Option<Vec<(u32, Vec<f32>)>> {
         if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
             return None;
         }
-        let cells = self.materialized_cells_rows_async(None).await?;
         let mut out = Vec::new();
-        for (ci, (cell_id, rows)) in cells.into_iter().enumerate() {
-            if superseded.is_some_and(|s| s.contains(&cell_id)) {
+        for (ci, col) in self.columns.iter().enumerate() {
+            if col.n_docs == 0 || col.n_cent == 0 {
                 continue;
             }
+            let sub = self
+                .source
+                .try_get_range_sync(col.subsection_range.clone())?;
+            let n_fine = col.n_cent as usize;
+            let dim = col.dim;
+            let centroids_len = n_fine.checked_mul(dim)?.checked_mul(F32_BYTES)?;
+            let centroids_end = col.centroids_off.checked_add(centroids_len)?;
+            if centroids_end > sub.len() {
+                return None;
+            }
+            let region = sub.get(col.centroids_off..centroids_end)?;
             let base = self.flat_cluster_base.get(ci).copied().unwrap_or(0);
-            for row in rows {
-                // Carry the row's full encoded body (codec + per-cluster ruler),
-                // not just the raw codes: the calibrator decodes each row against
-                // its own quantizer, so an adaptive-grid (L2Sq/NegDot) row is
-                // measured in the space the served path scores it in. The stable
-                // id rides along inside `EncodedCellRow`.
-                out.push((base + row.cluster, row.encoded));
+            let stride = dim * F32_BYTES;
+            for local in 0..n_fine {
+                let off = local * stride;
+                let slab = region.get(off..off + stride)?;
+                let vec: Vec<f32> = slab
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                out.push((base + local as u32, vec));
             }
         }
         Some(out)

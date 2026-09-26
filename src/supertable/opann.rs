@@ -28,7 +28,7 @@
 
 use std::{
     cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicU32, Ordering as AtomicOrdering},
@@ -1194,6 +1194,14 @@ pub(crate) struct WidthLawCalibration {
     /// Rerank-law observation state, armed by [`Self::freeze`]; `None`
     /// (e.g. planted test fixtures) measures no rerank law.
     rerank: Option<RerankLawObservation>,
+    /// Per-query centroid-router prefix pools — the nearest SELECTED rows
+    /// (each tagged with its fine cluster's router selection rank), filled by
+    /// [`Self::score_slice`] on the SAME scan that measures width/fine/rerank
+    /// and read by [`Self::finish`] to derive the fanout law. Only the
+    /// compaction recalibration arms these (via a [`FanoutScoreCtx`] passed to
+    /// [`Self::score_rows`]); the drain leaves them empty. Lock poisoning is
+    /// recovered like [`Self::tops`].
+    prefix_pools: Mutex<Vec<BinaryHeap<PrefixCand>>>,
 }
 
 /// Streaming state for the rerank law: per query, the 1-bit-encoded query
@@ -1252,6 +1260,11 @@ pub(crate) struct CalibratedLaws {
     /// against — the stamp records it so a later, wider law knows
     /// whether the budget's evidence still covers it.
     pub(crate) pool_cells: u32,
+    /// Centroid-router per-`k` fanout knee, measured by real recall on the
+    /// SAME scan (prefix pools) when a [`FanoutCalibCtx`] is supplied to
+    /// [`WidthLawCalibration::finish`]; all-zero (sentinel) otherwise — the
+    /// drain leaves it uncalibrated and the recalibration stamps it.
+    pub(crate) fanout_for_k: [u32; WIDTH_LAW_KS.len()],
 }
 
 #[cfg(test)]
@@ -1459,6 +1472,89 @@ mod pool_hint_tests {
         let knee = fanout_knee_from_recalls(&ladder, 0.98, 0.03);
         assert_eq!(knee, [0, 0, 0, 0]);
     }
+
+    /// The nested-prefix evaluation ([`recall_by_fanout_for_query`]) gives the
+    /// SAME per-fanout recall as re-selecting + reading each fanout separately:
+    /// recall at fanout `F` uses exactly the pool rows whose cluster rank `< F`
+    /// (a prefix of one ranked read), takes the `k` nearest DISTINCT, and
+    /// intersects the truth. This is the crux of the scale-safe redesign — one
+    /// read, all rungs — so it is checked against a hand-computed reference AND
+    /// an independent "separate reads" reference on the same fixture.
+    #[test]
+    fn nested_prefix_recall_matches_separate_per_fanout() {
+        let pc = |dist: f32, rank: u32, sid: i128| PrefixCand { dist, rank, sid };
+        // Rows tagged (dist, cluster rank, stable id). Ranks: cluster 0 nearest.
+        // sid 11 is a false positive (not in the truth); sid 1 also appears as a
+        // boundary REPLICA at rank 2 (must collapse to one truth slot).
+        let pool = vec![
+            pc(0.10, 0, 1),
+            pc(0.20, 0, 2),
+            pc(0.30, 1, 3),
+            pc(0.35, 1, 11),
+            pc(0.40, 2, 4),
+            pc(0.15, 2, 1), // replica of sid 1, farther-ranked cluster
+        ];
+        // Exact top-10 truth (nearest first); sids 1..=10 are the true neighbours.
+        let gt: Vec<i128> = (1..=10).collect();
+        let ladder = [1u32, 2, 3];
+
+        // Reference: "run each fanout separately" — for fanout F, take only rows
+        // from clusters with rank < F, dedup by stable id keeping the nearest,
+        // sort by distance, take k, intersect the truth.
+        let separate = |fanout: u32, k: usize| -> f64 {
+            let mut rows: Vec<PrefixCand> =
+                pool.iter().copied().filter(|c| c.rank < fanout).collect();
+            rows.sort_by(|a, b| a.dist.total_cmp(&b.dist));
+            let mut seen = HashSet::new();
+            let got: HashSet<i128> = rows
+                .iter()
+                .filter(|c| seen.insert(c.sid))
+                .take(k)
+                .map(|c| c.sid)
+                .collect();
+            let truth: HashSet<i128> = gt[..k].iter().copied().collect();
+            truth.iter().filter(|t| got.contains(t)).count() as f64 / k as f64
+        };
+
+        let got = recall_by_fanout_for_query(&pool, &gt, &ladder, 100);
+        let k1 = WIDTH_LAW_KS
+            .iter()
+            .position(|&k| k == 1)
+            .expect("k=1 anchor");
+        let k10 = WIDTH_LAW_KS
+            .iter()
+            .position(|&k| k == 10)
+            .expect("k=10 anchor");
+        // Hand-computed expectations.
+        //   F=1 (rank<1 → {1,2}):        recall@1 = 1.0,  recall@10 = 2/10
+        //   F=2 (rank<2 → {1,2,3,11}):   recall@1 = 1.0,  recall@10 = 3/10 (11 excluded)
+        //   F=3 (rank<3 → {1,2,3,11,4}): recall@1 = 1.0,  recall@10 = 4/10 (replica of 1 collapses)
+        let expect = [(1.0, 0.2), (1.0, 0.3), (1.0, 0.4)];
+        for (fi, &fanout) in ladder.iter().enumerate() {
+            let r1 = got[fi][k1].expect("recall@1 measured");
+            let r10 = got[fi][k10].expect("recall@10 measured");
+            assert!((r1 - expect[fi].0).abs() < 1e-9, "F={fanout} recall@1");
+            assert!((r10 - expect[fi].1).abs() < 1e-9, "F={fanout} recall@10");
+            // Prefix evaluation == independent per-fanout evaluation.
+            assert!(
+                (r1 - separate(fanout, 1)).abs() < 1e-9,
+                "F={fanout} k=1 vs separate"
+            );
+            assert!(
+                (r10 - separate(fanout, 10)).abs() < 1e-9,
+                "F={fanout} k=10 vs separate"
+            );
+        }
+        // Anchors deeper than the measured max stay unmeasured (→ sentinel).
+        let k1000 = WIDTH_LAW_KS
+            .iter()
+            .position(|&k| k == 1000)
+            .expect("k=1000 anchor");
+        assert!(
+            got.iter().all(|arr| arr[k1000].is_none()),
+            "k=1000 is never measured (> ROUTER_CALIB_MAX_ANCHOR)"
+        );
+    }
 }
 
 /// Post-stamp guard shared by both stamp sites (drain max-merge and
@@ -1519,6 +1615,204 @@ fn floor_monotone(law: &mut [u32; WIDTH_LAW_KS.len()]) {
     }
 }
 
+// ---------- Centroid-router fanout law (measured on the SAME scan) ----------
+
+/// Deepest `k` the router fanout is calibrated at. Anchors above this (only
+/// `k = 1000` in [`WIDTH_LAW_KS`]) stay the sentinel `0`: the fanout to serve
+/// recall@1000 would be near the whole corpus, and computing a top-1000 ground
+/// truth over the full plane deepens the exact scan for a `k` the router does
+/// not usefully serve. So the fanout is measured at `k ∈ {1, 10, 100}` and the
+/// deepest anchor is left uncalibrated (the reader falls back to the constant
+/// there).
+pub(crate) const ROUTER_CALIB_MAX_ANCHOR: usize = 100;
+
+/// Headroom over the calibrated depth for the per-query PREFIX candidate pool:
+/// enough of each query's nearest SELECTED rows are kept (by exact distance,
+/// tagged with their cluster's selection rank) that the top-`k` distinct
+/// survivors of every fanout prefix — the nearest clusters dominate, so their
+/// rows sit at the front of this pool — are retained before the stable-id dedup.
+pub(crate) const PREFIX_POOL_HEADROOM: usize = 16;
+
+/// A PREFIX candidate: a selected row's exact distance, the SELECTION RANK of
+/// the fine cluster it came from (0 = the query's nearest selected centroid),
+/// and its stable id. Recall at fanout `F` uses only the rows whose cluster
+/// rank is `< F` — a prefix over the one ranked read. Ordered by distance so a
+/// bounded max-heap keeps the nearest and evicts the farthest.
+#[derive(Clone, Copy)]
+pub(crate) struct PrefixCand {
+    pub(crate) dist: f32,
+    pub(crate) rank: u32,
+    pub(crate) sid: i128,
+}
+impl PartialEq for PrefixCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for PrefixCand {}
+impl PartialOrd for PrefixCand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PrefixCand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.dist
+            .total_cmp(&other.dist)
+            .then(self.rank.cmp(&other.rank))
+            .then(self.sid.cmp(&other.sid))
+    }
+}
+
+/// Push `cand` into a bounded max-heap that keeps the `cap` NEAREST prefix
+/// candidates: grow until full, then replace the current farthest only when
+/// `cand` ranks ahead of it. The comparison is the full [`PrefixCand`] order
+/// (`dist`, then `rank`, then `sid`), not `dist` alone, so a distance tie at
+/// the cap boundary resolves deterministically — the parallel per-cell merge
+/// reaches this in nondeterministic order, and a `dist`-only test would keep
+/// whichever replica arrived first. On a tie it keeps the smaller-`rank`
+/// replica: the fanout at which the router first surfaces that row.
+fn prefix_push(heap: &mut BinaryHeap<PrefixCand>, cand: PrefixCand, cap: usize) {
+    if cap == 0 {
+        return;
+    }
+    if heap.len() < cap {
+        heap.push(cand);
+    } else if let Some(top) = heap.peek()
+        && cand < *top
+    {
+        heap.pop();
+        heap.push(cand);
+    }
+}
+
+/// Keep the ascending-best `cap` prefix candidates in place.
+fn truncate_prefix_ascending(cand: &mut Vec<PrefixCand>, cap: usize) {
+    if cand.len() > cap {
+        cand.sort_unstable();
+        cand.truncate(cap);
+    }
+}
+
+/// Ascending candidate fanouts to measure recall at, seeded around the grid's
+/// `width × fine` prior but NOT capped by it — a doubling ladder from 1 up to
+/// (and including) `max_fanout`, with the prior and its neighbours injected for
+/// resolution near the expected knee. `max_fanout` (the calibration ceiling,
+/// `centroid_graph_max_fanout`, NOT the total cluster count) is the last rung:
+/// if recall does not clear the target by it, the calibration stamps the
+/// sentinel. Reading more fine clusters than the grid's `W × F` is still
+/// cheaper than the grid's whole-cell reads, so the ladder deliberately climbs
+/// past the prior (the old proxy's cap under-stamped exactly here).
+fn router_fanout_ladder(prior_max: usize, max_fanout: usize) -> Vec<usize> {
+    let total = max_fanout.max(1);
+    let mut rungs: Vec<usize> = Vec::new();
+    let mut f = 1usize;
+    while f < total {
+        rungs.push(f);
+        f = f.saturating_mul(2);
+    }
+    rungs.push(total);
+    for extra in [prior_max / 2, prior_max, prior_max.saturating_mul(2)] {
+        if (1..=total).contains(&extra) {
+            rungs.push(extra);
+        }
+    }
+    rungs.sort_unstable();
+    rungs.dedup();
+    rungs.retain(|&r| (1..=total).contains(&r));
+    rungs
+}
+
+/// Recall@`k` at each fanout for ONE query, evaluated as nested PREFIXES over a
+/// single ranked read — this is the crux of the scale-safe design. `pool` holds
+/// the query's nearest selected rows, each tagged with its fine cluster's
+/// selection rank; `gt[..k]` is the exact top-`k` truth. For fanout `F` the
+/// served path would read only the top-`F` clusters, so recall at `F` uses only
+/// pool rows with `rank < F` (a prefix), takes the `k` nearest DISTINCT of
+/// those (stable-id dedup, matching the served collapse), and intersects the
+/// truth. Reading once and cutting prefixes gives the SAME per-fanout recall as
+/// re-selecting + re-reading each fanout separately, without the per-rung cold
+/// re-read that made the sweep non-terminating at 100M. Anchors deeper than
+/// `measured_anchor_max` (or than the computed truth) return `None`
+/// (uncalibrated → sentinel).
+fn recall_by_fanout_for_query(
+    pool: &[PrefixCand],
+    gt: &[i128],
+    ladder: &[u32],
+    measured_anchor_max: usize,
+) -> Vec<[Option<f64>; WIDTH_LAW_KS.len()]> {
+    // One ascending-by-distance ordering of the pool, reused for every fanout.
+    let mut ordered: Vec<PrefixCand> = pool.to_vec();
+    ordered.sort_unstable();
+    ladder
+        .iter()
+        .map(|&fanout| {
+            // Prefix: distinct nearest stable ids whose cluster rank < fanout.
+            let mut seen: HashSet<i128> = HashSet::new();
+            let mut ranked_ids: Vec<i128> = Vec::new();
+            for c in &ordered {
+                if c.rank < fanout && seen.insert(c.sid) {
+                    ranked_ids.push(c.sid);
+                }
+            }
+            let mut out = [None; WIDTH_LAW_KS.len()];
+            for (ki, &k) in WIDTH_LAW_KS.iter().enumerate() {
+                if k > measured_anchor_max || k > gt.len() {
+                    continue;
+                }
+                let truth: HashSet<i128> = gt[..k].iter().copied().collect();
+                let got: HashSet<i128> = ranked_ids.iter().copied().take(k).collect();
+                let hit = truth.iter().filter(|t| got.contains(t)).count();
+                out[ki] = Some(hit as f64 / k as f64);
+            }
+            out
+        })
+        .collect()
+}
+
+/// Everything [`WidthLawCalibration::finish`] needs to also derive the
+/// centroid-router fanout law from the prefix pools filled during the shared
+/// scan. Absent (`None`) on the drain path, which does not calibrate the router
+/// fanout — only the compaction recalibration (where the router graph is cheap
+/// to build over the settled fine centroids) passes it.
+pub(crate) struct FanoutCalibCtx {
+    /// Router node count = the total selectable fine clusters (the prior clamp
+    /// and the fanout ceiling both key off it).
+    pub(crate) total_fine: u32,
+    /// Ladder ceiling (`centroid_graph_max_fanout`, clamped to `total_fine`) —
+    /// the deepest fanout rung measured.
+    pub(crate) max_fanout: usize,
+    /// Router acceptance floor (`hnsw_register_floor`).
+    pub(crate) register_floor: f64,
+    /// Parity relaxation below the floor (`centroid_graph_parity_gap`).
+    pub(crate) parity_gap: f64,
+    /// Corpus rows the scan covered — caps the deepest calibrated anchor.
+    pub(crate) n_rows: usize,
+}
+
+/// Per-scoring-call fanout inputs threaded into [`WidthLawCalibration::score_rows`]:
+/// the cell's global flat-cluster base (so `flat = flat_base + row.cluster`),
+/// the per-query selected-cluster → rank map for THIS superfile, and the prefix
+/// pool cap. `None` on the drain / width-only path.
+pub(crate) struct FanoutScoreCtx<'a> {
+    pub(crate) flat_base: u32,
+    /// `selection[qi]` maps this superfile's selected flat clusters → the
+    /// router's ascending-distance selection rank for query `qi`.
+    pub(crate) selection: &'a [HashMap<u32, u32>],
+    pub(crate) prefix_cap: usize,
+}
+
+/// The mutable per-cell accumulators [`WidthLawCalibration::score_slice`]
+/// appends into: the width/rerank candidate partials, the estimate-histogram
+/// deltas, and (only when the fanout is being calibrated) the prefix-pool
+/// partials. Bundled so the scoring core stays under the argument limit.
+struct ScoreSink<'a> {
+    partial: &'a mut [Vec<(f32, u32, i128, f32)>],
+    hist_local: &'a mut HashMap<usize, Vec<u64>>,
+    /// Empty when the fanout is not being calibrated.
+    prefix_partial: &'a mut [Vec<PrefixCand>],
+}
+
 impl WidthLawCalibration {
     pub(crate) fn new(dim: usize, metric: Metric, target_recall: f64) -> Self {
         // The target arrives from user YAML, so validate it here rather than
@@ -1561,7 +1855,16 @@ impl WidthLawCalibration {
             pool_cells: RERANK_LAW_POOL_CELLS,
             target_recall,
             rerank: None,
+            prefix_pools: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The frozen calibration queries as a flat `n_queries × dim` fp32 buffer
+    /// (raw dequantized reservoir rows), or `None` before [`Self::freeze`]. The
+    /// recalibration uses these to build the router's per-query fine-cluster
+    /// selection (on jittered copies) without re-sampling the corpus.
+    pub(crate) fn frozen_queries(&self) -> Option<&[f32]> {
+        self.frozen.as_ref().map(|f| f.queries.as_slice())
     }
 
     /// Offer one spilled row as a calibration-query candidate.
@@ -1614,6 +1917,11 @@ impl WidthLawCalibration {
         let n_queries = ids.len();
         *self.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![Vec::new(); n_queries];
         *self.est_tops.lock().unwrap_or_else(PoisonError::into_inner) =
+            (0..n_queries).map(|_| BinaryHeap::new()).collect();
+        *self
+            .prefix_pools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
             (0..n_queries).map(|_| BinaryHeap::new()).collect();
         if n_queries > 0 && grid.n_cent > 0 {
             let rotation = RandomRotation::new(self.dim, rot_seed);
@@ -1674,23 +1982,31 @@ impl WidthLawCalibration {
         let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
         let members = self.pool_members(cell);
         let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
+        // The drain never calibrates the router fanout (no `FanoutScoreCtx`),
+        // so the prefix partials stay empty here.
+        let mut prefix_partial: Vec<Vec<PrefixCand>> = Vec::new();
         let mut reader = spill.reader()?;
         let mut remaining = spill.n_rows();
         let mut scratch = vec![0f32; self.dim];
         while remaining > 0 {
             let chunk = reader.next_chunk(WIDTH_LAW_SCORE_CHUNK.min(remaining))?;
             remaining -= chunk.len();
+            let mut sink = ScoreSink {
+                partial: &mut partial,
+                hist_local: &mut hist_local,
+                prefix_partial: &mut prefix_partial,
+            };
             self.score_slice(
                 frozen,
                 cell,
                 &chunk,
                 &members,
                 &mut scratch,
-                &mut partial,
-                &mut hist_local,
+                &mut sink,
+                None,
             );
         }
-        self.merge_partial(partial, hist_local);
+        self.merge_partial(partial, hist_local, None);
         Ok(())
     }
 
@@ -1704,6 +2020,7 @@ impl WidthLawCalibration {
         &self,
         cell: u32,
         rows: &[MaterializedIvfRow],
+        fanout: Option<&FanoutScoreCtx>,
     ) -> Result<(), BuildError> {
         let Some(frozen) = self.frozen.as_ref() else {
             return Err(BuildError::Store(
@@ -1717,19 +2034,35 @@ impl WidthLawCalibration {
         let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
         let members = self.pool_members(cell);
         let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
+        // Prefix pools are collected only when the caller calibrates the router
+        // fanout on this scan; otherwise the slice never touches them.
+        let mut prefix_partial: Vec<Vec<PrefixCand>> = if fanout.is_some() {
+            vec![Vec::new(); n_queries]
+        } else {
+            Vec::new()
+        };
         let mut scratch = vec![0f32; self.dim];
         for chunk in rows.chunks(WIDTH_LAW_SCORE_CHUNK) {
+            let mut sink = ScoreSink {
+                partial: &mut partial,
+                hist_local: &mut hist_local,
+                prefix_partial: &mut prefix_partial,
+            };
             self.score_slice(
                 frozen,
                 cell,
                 chunk,
                 &members,
                 &mut scratch,
-                &mut partial,
-                &mut hist_local,
+                &mut sink,
+                fanout,
             );
         }
-        self.merge_partial(partial, hist_local);
+        self.merge_partial(
+            partial,
+            hist_local,
+            fanout.map(|ctx| (prefix_partial, ctx.prefix_cap)),
+        );
         Ok(())
     }
 
@@ -1977,6 +2310,7 @@ impl WidthLawCalibration {
         cell: u32,
         rows: &[MaterializedIvfRow],
         survivors: &HashMap<i128, Vec<usize>>,
+        fanout: Option<&FanoutScoreCtx>,
     ) {
         let Some(frozen) = self.frozen.as_ref() else {
             return;
@@ -1986,6 +2320,15 @@ impl WidthLawCalibration {
             return;
         }
         let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
+        // Router prefix candidates, collected only when this scan calibrates
+        // the router fanout (see `score_slice`). The survivors carry the exact
+        // top-k NNs the fanout law reads, so the survivor-only prefix pool is
+        // equivalent to the exhaustive one for the law's per-query knee.
+        let mut prefix_partial: Vec<Vec<PrefixCand>> = if fanout.is_some() {
+            vec![Vec::new(); n_queries]
+        } else {
+            Vec::new()
+        };
         let mut scratch = vec![0f32; self.dim];
         // Each candidate carries its own 1-bit estimate so `finish` can read
         // its survivor rank — but ONLY for queries whose distractor pool
@@ -2003,6 +2346,9 @@ impl WidthLawCalibration {
             if self.metric == Metric::Cosine {
                 normalize(&mut scratch);
             }
+            // Router prefix tag (see `score_slice`): the row's global flat
+            // cluster, matched against each query's router selection below.
+            let flat = fanout.map(|ctx| ctx.flat_base + row.cluster);
             for &qi in query_indices {
                 // Self-hit already excluded from the shortlist, but guard again
                 // so a stale id can never occupy a query's own slot.
@@ -2022,12 +2368,29 @@ impl WidthLawCalibration {
                     _ => f32::NEG_INFINITY,
                 };
                 let q = &frozen.queries[qi * self.dim..(qi + 1) * self.dim];
-                partial[qi].push((distance(self.metric, q, &scratch), cell, row.stable_id, est));
+                let dist = distance(self.metric, q, &scratch);
+                partial[qi].push((dist, cell, row.stable_id, est));
+                // Same raw-query distance feeds the router prefix pool, so the
+                // GT/prefix ordering matches the width walk's.
+                if let (Some(ctx), Some(flat)) = (fanout, flat)
+                    && let Some(&rank) = ctx.selection[qi].get(&flat)
+                {
+                    prefix_partial[qi].push(PrefixCand {
+                        dist,
+                        rank,
+                        sid: row.stable_id,
+                    });
+                }
             }
         }
         // The gated path derives the rerank histogram in pass 1, so pass 2
-        // merges only the exact top-k candidates (empty histogram delta).
-        self.merge_partial(partial, HashMap::new());
+        // merges only the exact top-k candidates (empty histogram delta) plus
+        // the router prefix pool when the fanout law is being calibrated.
+        self.merge_partial(
+            partial,
+            HashMap::new(),
+            fanout.map(|ctx| (prefix_partial, ctx.prefix_cap)),
+        );
     }
 
     /// One-lock merge of a cell's scored partials into the per-query
@@ -2038,6 +2401,7 @@ impl WidthLawCalibration {
         &self,
         partial: Vec<Vec<(f32, u32, i128, f32)>>,
         hist_local: HashMap<usize, Vec<u64>>,
+        prefix: Option<(Vec<Vec<PrefixCand>>, usize)>,
     ) {
         let k_max = WIDTH_LAW_MAX_K;
         let mut tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2045,6 +2409,20 @@ impl WidthLawCalibration {
             merge_candidates(&mut tops[qi], cand, k_max);
         }
         drop(tops);
+        if let Some((prefix_partial, prefix_cap)) = prefix {
+            let mut pools = self
+                .prefix_pools
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (qi, cands) in prefix_partial.into_iter().enumerate() {
+                let Some(heap) = pools.get_mut(qi) else {
+                    continue;
+                };
+                for cand in cands {
+                    prefix_push(heap, cand, prefix_cap);
+                }
+            }
+        }
         if let Some(rl) = self.rerank.as_ref()
             && !hist_local.is_empty()
         {
@@ -2087,8 +2465,8 @@ impl WidthLawCalibration {
         rows: &[MaterializedIvfRow],
         members: &[usize],
         scratch: &mut [f32],
-        partial: &mut [Vec<(f32, u32, i128, f32)>],
-        hist_local: &mut HashMap<usize, Vec<u64>>,
+        sink: &mut ScoreSink,
+        fanout: Option<&FanoutScoreCtx>,
     ) {
         let k_max = WIDTH_LAW_MAX_K;
         let rl = self.rerank.as_ref();
@@ -2119,7 +2497,8 @@ impl WidthLawCalibration {
                     // the dedup tie-break already treat conservatively.
                     if est.is_finite() {
                         est_of[qi] = est;
-                        let bins = hist_local
+                        let bins = sink
+                            .hist_local
                             .entry(qi)
                             .or_insert_with(|| vec![0u64; RERANK_LAW_EST_BINS]);
                         let bin = rl.bin(qi, est);
@@ -2136,17 +2515,33 @@ impl WidthLawCalibration {
                 // monotone and cannot reorder its candidates.
                 normalize(scratch);
             }
+            // Router prefix tag: the global flat cluster this row lives in, so a
+            // selected row can be attributed to the fine cluster the router
+            // picked (by its selection rank). `flat = flat_base + row.cluster`
+            // matches the router node map's numbering exactly.
+            let flat = fanout.map(|ctx| ctx.flat_base + row.cluster);
             for (qi, q) in frozen.queries.chunks_exact(self.dim).enumerate() {
                 // Self-hit: a sampled query trivially covers itself.
                 if row.stable_id == frozen.ids[qi] {
                     continue;
                 }
-                partial[qi].push((
-                    distance(self.metric, q, scratch),
-                    cell,
-                    row.stable_id,
-                    est_of[qi],
-                ));
+                // The exact distance is computed ONCE and shared by the width
+                // walk and the router prefix pool: the fanout selection is
+                // measured on a norm-relative-jittered COPY of the query, but
+                // the GT/prefix ordering reuses this raw-query distance (the
+                // self-hit exclusion above is the guard that keeps the query's
+                // own row out of both).
+                let dist = distance(self.metric, q, scratch);
+                sink.partial[qi].push((dist, cell, row.stable_id, est_of[qi]));
+                if let (Some(ctx), Some(flat)) = (fanout, flat)
+                    && let Some(&rank) = ctx.selection[qi].get(&flat)
+                {
+                    sink.prefix_partial[qi].push(PrefixCand {
+                        dist,
+                        rank,
+                        sid: row.stable_id,
+                    });
+                }
             }
             if rl.is_some() {
                 for &qi in members {
@@ -2155,8 +2550,13 @@ impl WidthLawCalibration {
             }
         }
         // Bound the per-cell partials the same way the merge does.
-        for cand in partial.iter_mut() {
+        for cand in sink.partial.iter_mut() {
             truncate_ascending(cand, k_max);
+        }
+        if let Some(ctx) = fanout {
+            for cand in sink.prefix_partial.iter_mut() {
+                truncate_prefix_ascending(cand, ctx.prefix_cap);
+            }
         }
     }
 
@@ -2241,7 +2641,16 @@ impl WidthLawCalibration {
     /// query excludes itself, not the whole sample. Points NO query can
     /// support stay `0` (uncalibrated). Measured points are floored to be
     /// monotone in `k`. `None` when nothing was sampled.
-    pub(crate) fn finish(self, grid: &ClusterCentroids) -> Option<CalibratedLaws> {
+    ///
+    /// When `fanout` is `Some`, the centroid-router per-`k` fanout law is also
+    /// derived from the prefix pools filled on this same scan — one shared
+    /// ground-truth pass instead of a second corpus scan. `None` (the drain
+    /// path) leaves `fanout_for_k` the all-zero sentinel.
+    pub(crate) fn finish(
+        self,
+        grid: &ClusterCentroids,
+        fanout: Option<FanoutCalibCtx>,
+    ) -> Option<CalibratedLaws> {
         let frozen = self.frozen?;
         let n_queries = frozen.ids.len();
         if n_queries == 0 || grid.n_cent == 0 {
@@ -2431,22 +2840,110 @@ impl WidthLawCalibration {
         floor_monotone(&mut law);
         floor_monotone(&mut fine_law);
         floor_monotone(&mut rerank_law);
-        // The centroid-graph router fanout is NOT calibrated here. Its coverage
-        // proxy (home-cluster within the top-fanout centroids) is an upper bound
-        // on real recall — it ignores the within-cluster Sq16 + shortlist +
-        // rerank loss — so it under-stamps the fanout. The fanout is now measured
-        // by real recall at the router's post-commit build stage (see
-        // `crate::supertable::query::vector::calibrate_centroid_router_fanout`),
-        // which runs the actual selection → per-cluster scan → shortlist →
-        // rerank the reader serves and stamps the knee into
-        // `CellRoutingParams::fanout_for_k`.
+        // The centroid-graph router fanout is measured by REAL recall on the
+        // SAME scan: `tops` already holds each query's exact top-k truth (raw
+        // distance, self-hit excluded), and the prefix pools hold its nearest
+        // SELECTED rows tagged with their fine cluster's router selection rank.
+        // Recall at fanout `F` is a prefix of that one ranked read, so the knee
+        // is derived here without a second corpus scan. The old coverage proxy
+        // (home-cluster within the top-fanout centroids) over-counted real
+        // recall (ignoring the within-cluster Sq16 + shortlist + rerank loss)
+        // and its `width × fine` cap under-stamped; this measures the actual
+        // selection → scan → shortlist → rerank the reader serves.
+        let fanout_for_k = match fanout {
+            Some(ctx) => {
+                let prefix_pools = self
+                    .prefix_pools
+                    .into_inner()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .into_iter()
+                    .map(BinaryHeap::into_vec)
+                    .collect::<Vec<_>>();
+                router_fanout_law(&law, &fine_law, &tops, &prefix_pools, &ctx)
+            }
+            None => [0u32; WIDTH_LAW_KS.len()],
+        };
         (law.iter().any(|&w| w > 0)).then_some(CalibratedLaws {
             width_for_k: law,
             fine_for_k: fine_law,
             rerank_for_k: rerank_law,
             pool_cells: self.pool_cells as u32,
+            fanout_for_k,
         })
     }
+}
+
+/// Derive the centroid-router per-`k` fanout knee from the shared scan's
+/// accumulators: `tops[qi]` is query `qi`'s exact top-k truth (nearest
+/// first once sorted by distance) and `prefix_pools[qi]` its nearest
+/// SELECTED rows tagged with router rank. Seeds the fanout ladder around
+/// the freshly measured `width × fine` prior (a start, not a cap) up to
+/// `ctx.max_fanout`, averages each rung's per-query prefix recall, and
+/// stamps the smallest fanout clearing the parity-relaxed floor
+/// ([`fanout_knee_from_recalls`]). All-zero when nothing is calibratable.
+fn router_fanout_law(
+    width_for_k: &[u32; WIDTH_LAW_KS.len()],
+    fine_for_k: &[u32; WIDTH_LAW_KS.len()],
+    tops: &[Vec<(f32, u32, i128, f32)>],
+    prefix_pools: &[Vec<PrefixCand>],
+    ctx: &FanoutCalibCtx,
+) -> [u32; WIDTH_LAW_KS.len()] {
+    let sentinel = [0u32; WIDTH_LAW_KS.len()];
+    // Deepest anchor the corpus supports and the router usefully serves.
+    let calib_k = WIDTH_LAW_KS
+        .iter()
+        .copied()
+        .filter(|&k| k <= ctx.n_rows && k <= ROUTER_CALIB_MAX_ANCHOR)
+        .max()
+        .unwrap_or(0);
+    if calib_k == 0 {
+        return sentinel;
+    }
+    // Ladder seeded around the grid's `width × fine` prior (a start, not a
+    // cap), capped at `max_fanout`.
+    let prior = fanout_prior_for_k(width_for_k, fine_for_k, ctx.total_fine);
+    let prior_max = prior.iter().copied().max().unwrap_or(0) as usize;
+    let ladder: Vec<u32> = router_fanout_ladder(prior_max, ctx.max_fanout)
+        .into_iter()
+        .map(|f| f as u32)
+        .collect();
+    if ladder.is_empty() {
+        return sentinel;
+    }
+    // Average the per-query prefix recalls into the ladder the knee reads.
+    let mut sum = vec![[0f64; WIDTH_LAW_KS.len()]; ladder.len()];
+    let mut cnt = vec![[0usize; WIDTH_LAW_KS.len()]; ladder.len()];
+    for (qi, pool) in prefix_pools.iter().enumerate() {
+        // GT ids: the query's exact top-k, nearest first. `tops` already
+        // holds one entry per stable id (merge dedups), so ordering by
+        // distance yields the distinct-neighbour truth.
+        let mut gt_sorted = tops.get(qi).cloned().unwrap_or_default();
+        gt_sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let gt_ids: Vec<i128> = gt_sorted.iter().map(|c| c.2).collect();
+        let per_fanout = recall_by_fanout_for_query(pool, &gt_ids, &ladder, calib_k);
+        for (fi, arr) in per_fanout.iter().enumerate() {
+            for ki in 0..WIDTH_LAW_KS.len() {
+                if let Some(r) = arr[ki] {
+                    sum[fi][ki] += r;
+                    cnt[fi][ki] += 1;
+                }
+            }
+        }
+    }
+    let recall_ladder: Vec<(u32, [f64; WIDTH_LAW_KS.len()])> = ladder
+        .iter()
+        .enumerate()
+        .map(|(fi, &f)| {
+            let mut rk = [0f64; WIDTH_LAW_KS.len()];
+            for ki in 0..WIDTH_LAW_KS.len() {
+                if cnt[fi][ki] > 0 {
+                    rk[ki] = sum[fi][ki] / cnt[fi][ki] as f64;
+                }
+            }
+            (f, rk)
+        })
+        .collect();
+    fanout_knee_from_recalls(&recall_ladder, ctx.register_floor, ctx.parity_gap)
 }
 
 /// Merge one cell's candidates into a query's accumulator: collapse to the
@@ -2781,7 +3278,7 @@ mod tests {
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
 
         let law = cal
-            .finish(&grid)
+            .finish(&grid, None)
             .expect("law from planted candidates")
             .width_for_k;
         // k=1: the best copy of id 1 sits in the top-ranked cell.
@@ -2843,7 +3340,9 @@ mod tests {
         };
         cal.observe_shard_views(&[view]);
 
-        let laws = cal.finish(&grid).expect("laws from planted candidates");
+        let laws = cal
+            .finish(&grid, None)
+            .expect("laws from planted candidates");
         assert_eq!(laws.width_for_k[..2], [1, 1], "one cell holds everything");
         assert_eq!(
             laws.fine_for_k[0], 2,
@@ -2945,10 +3444,10 @@ mod tests {
             let cal_a = build();
             for (cell, rows) in &per_cell {
                 cal_a
-                    .score_rows(*cell, rows)
+                    .score_rows(*cell, rows, None)
                     .expect("exhaustive score_rows");
             }
-            let laws_a = cal_a.finish(&grid).expect("exhaustive laws");
+            let laws_a = cal_a.finish(&grid, None).expect("exhaustive laws");
 
             // Gated two-pass path.
             let cal_b = build();
@@ -2958,10 +3457,10 @@ mod tests {
             let survivors = cal_b.survivors_by_cell();
             for (cell, rows) in &per_cell {
                 if let Some(s) = survivors.get(cell) {
-                    cal_b.score_survivors(*cell, rows, s);
+                    cal_b.score_survivors(*cell, rows, s, None);
                 }
             }
-            let laws_b = cal_b.finish(&grid).expect("gated laws");
+            let laws_b = cal_b.finish(&grid, None).expect("gated laws");
 
             assert_eq!(
                 laws_a.width_for_k, laws_b.width_for_k,
@@ -3106,7 +3605,9 @@ mod tests {
         merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
 
-        let laws = cal.finish(&grid).expect("laws from planted candidates");
+        let laws = cal
+            .finish(&grid, None)
+            .expect("laws from planted candidates");
         assert_eq!(
             laws.rerank_for_k[0], 3,
             "k=1 budget = the best candidate's distractor count"
@@ -3161,7 +3662,9 @@ mod tests {
         };
         cal.observe_shard_views(&[view]);
 
-        let laws = cal.finish(&grid).expect("laws from planted candidates");
+        let laws = cal
+            .finish(&grid, None)
+            .expect("laws from planted candidates");
         assert_eq!(laws.fine_for_k[0], 1, "top-1 was observed at rank 0");
         assert_eq!(
             laws.fine_for_k[1], 0,
@@ -3222,7 +3725,7 @@ mod tests {
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc_a, acc_b];
 
         let law = cal
-            .finish(&grid)
+            .finish(&grid, None)
             .expect("law from planted candidates")
             .width_for_k;
         assert_eq!(law[0], 1, "top-1: both queries covered by the nearest cell");
@@ -3269,7 +3772,7 @@ mod tests {
         );
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
         assert!(
-            cal.finish(&grid).is_none(),
+            cal.finish(&grid, None).is_none(),
             "inconsistent calibration input must abandon the law, not panic"
         );
     }
