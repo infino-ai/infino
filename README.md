@@ -470,6 +470,11 @@ The same pages are available as Markdown source on GitHub:
 [embeddings](https://github.com/infino-ai/docs/blob/main/guides/embeddings.mdx),
 [storage](https://github.com/infino-ai/docs/blob/main/guides/storage.mdx).
 
+In this repo:
+
+- [FAQ](docs/faq.md) — short answers to common questions
+- [How Infino compares](docs/comparisons.md) — how it relates to vector databases, search engines, and query engines
+
 Design references (in this repo):
 
 - [Overview](docs/architecture/overview.md) — the mental model, and how this compares
