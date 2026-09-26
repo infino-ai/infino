@@ -6804,8 +6804,12 @@ pub(in crate::supertable) fn build_packed_update_superfile(
         &buffer,
         inner,
         &pack_grid,
-        // Replacement rows keep coarse cell-grid placement; fine-centroid
-        // placement is applied on the drain/append path.
+        // Update replacement rows deliberately place on the coarse cell grid.
+        // They are a small, latency-sensitive WAL-append batch, and a later
+        // drain/merge re-clusters them into the hidden index anyway; building a
+        // fine-placement router here (opening superfiles + walking the graph)
+        // would not pay off. Fine-centroid placement engages on the commit-append
+        // path, gated on the router resolving to centroid_graph.
         None,
         metric,
         UPDATE_PACKED_SHARDS,
