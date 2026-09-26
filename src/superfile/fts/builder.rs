@@ -3785,10 +3785,17 @@ fn assemble_and_write_blob<W: Write>(
     header.extend_from_slice(&postings_offset.to_le_bytes()); // 8
     header.extend_from_slice(&doc_lengths_table_offset.to_le_bytes()); // 8
     header.extend_from_slice(&positions_offset.to_le_bytes()); // 8
-    if doc_map.is_some() {
-        header.extend_from_slice(&doc_map_offset.to_le_bytes()); // 8
-    }
+    // The doc-id map needs no field: it is the last region before the
+    // doc-lengths directory and its size follows from the document
+    // count, so a reader derives where it starts. That is what keeps
+    // every version's header one width, and a cold open to one read.
     debug_assert_eq!(header.len(), header_size as usize, "header size mismatch");
+    debug_assert!(
+        doc_map.as_ref().is_none_or(|m| doc_lengths_table_offset
+            == doc_map_offset + (m.len() * format::fts::U32_BYTES + format::CRC_BYTES) as u64),
+        "the doc-id map must be the last region before the doc-lengths directory, \
+         or a reader cannot derive where it starts"
+    );
 
     w.write_all(&header)?;
     match fst_source {

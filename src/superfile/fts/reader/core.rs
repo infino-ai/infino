@@ -580,14 +580,14 @@ impl FtsReader {
         // Length of the FTS subsection itself (≈ `kv::FTS_LENGTH`), not
         // the whole superfile: `source` is the FTS-scoped sub-source.
         let fts_blob_len = source.size() as usize;
-        // One GET covers every header size: any real FTS blob is larger
-        // than the widest header (header + FST CRC + postings CRC + a
-        // non-empty doc-lengths directory), so fetching the widest span
-        // up front costs no extra round-trip on a narrower one and saves
-        // one on the widest. Sized off the largest rather than a
-        // particular version, because a header short of what the version
-        // declares cannot be parsed and there is no second fetch here.
-        let header_fetch = format::fts::HEADER_SIZE_V8.min(fts_blob_len);
+        // One GET covers every header size: every version's header is
+        // this wide, `V8` included, because the doc-id map's position is
+        // derived from the document count rather than stored in a field
+        // of its own. Fetching a byte more would overfetch, and eight
+        // spare bytes are enough to break the coalesced group a cold
+        // query's reads form -- the same bytes then arrive as two
+        // requests instead of one.
+        let header_fetch = format::fts::HEADER_SIZE_V2.min(fts_blob_len);
         let header = fetch_lazy_range(source.as_ref(), 0..header_fetch, "fts header").await?;
         if header.len() < FTS_HEADER_SIZE {
             return Err(FtsError::Read(ReadError::MissingKv("fts header")));
@@ -741,18 +741,17 @@ impl FtsReader {
 
         // The doc-id map region, `VERSION_V8` only: one `u32` per document
         // giving the Parquet row that document's postings belong to, then
-        // a CRC. It sits between the positions region and the doc-lengths
-        // directory, so on a blob that has one the positions region ends
-        // where the map begins rather than at the directory.
+        // a CRC. It is the last thing before the doc-lengths directory,
+        // and its size follows from the document count, so where it
+        // starts is arithmetic rather than a field: the directory offset
+        // less the map's own length. That keeps every version's header
+        // the same width, which is what lets a cold open read one header
+        // span and no more.
+        let doc_map_len = (n_docs as usize)
+            .saturating_mul(U32_BYTES)
+            .saturating_add(format::CRC_BYTES);
         let doc_map_offset: Option<usize> = match version == format::fts::VERSION_V8 {
-            true => {
-                let ext = fetch_source_range(
-                    &source,
-                    format::fts::HEADER_SIZE_V2..format::fts::HEADER_SIZE_V8,
-                    "fts header doc-map ext",
-                )?;
-                Some(read_u64_le(&ext[0..U64_BYTES]) as usize)
-            }
+            true => Some(doc_lengths_table_offset.saturating_sub(doc_map_len)),
             false => None,
         };
 
@@ -998,11 +997,14 @@ impl FtsReader {
             None => DocMap::Identity,
             Some(mo) => {
                 let body_end = doc_lengths_table_offset.saturating_sub(format::CRC_BYTES);
-                let expect = (n_docs as usize) * U32_BYTES;
-                if body_end < mo || body_end - mo != expect {
+                // The map's start is derived, so it cannot disagree with
+                // its length; what a corrupt header can still do is put
+                // the directory too early for a map of this many
+                // documents to fit between it and the regions before it.
+                if doc_lengths_table_offset < doc_map_len {
                     return Err(FtsError::Read(ReadError::MalformedVersion(format!(
-                        "fts doc-map is {} bytes for {n_docs} docs, expected {expect}",
-                        body_end.saturating_sub(mo)
+                        "fts doc-map of {doc_map_len} bytes for {n_docs} docs does not fit \
+                         below the doc-lengths directory at {doc_lengths_table_offset}"
                     ))));
                 }
                 let body = fetch_source_range(&source, mo..body_end, "fts/doc-map")?;
@@ -2603,17 +2605,13 @@ mod tests {
         );
         FtsReader::open(Bytes::from(blob.clone()), json).expect("the fixture opens clean");
 
-        let map_off =
-            read_u64_le(&blob[hdr::DOC_MAP_OFFSET_OFF..hdr::DOC_MAP_OFFSET_OFF + U64_BYTES])
-                as usize;
         let dls_off =
             read_u64_le(&blob[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
                 as usize;
-        assert_eq!(
-            dls_off - map_off,
-            N_DOCS as usize * U32_BYTES + 4,
-            "the region is one entry per document plus its checksum"
-        );
+        // Where the map starts is derived, not stored: the directory
+        // offset less one entry per document and the region's checksum.
+        let map_len = N_DOCS as usize * U32_BYTES + format::CRC_BYTES;
+        let map_off = dls_off - map_len;
 
         // A flipped byte inside the region.
         let mut flipped = blob.clone();
@@ -2630,16 +2628,15 @@ mod tests {
             "expected a doc-map checksum failure, got {err:?}"
         );
 
-        // A moved region boundary. The map's own length check is the
-        // backstop here rather than the first line of defence: moving
-        // where it starts also moves where the region before it ends, so
-        // that region's checksum is what fails. Either way the file is
-        // refused rather than read with the boundary the header claims.
-        let mut moved_start = blob.clone();
-        let moved = (map_off + U32_BYTES) as u64;
-        moved_start[hdr::DOC_MAP_OFFSET_OFF..hdr::DOC_MAP_OFFSET_OFF + U64_BYTES]
-            .copy_from_slice(&moved.to_le_bytes());
-        let err = FtsReader::open(Bytes::from(moved_start), json).expect_err("moved map");
+        // A moved directory. Deriving the map's start from the directory
+        // means moving the directory moves the map with it, so the bytes
+        // read as the map are no longer the bytes written as one and its
+        // checksum fails. Nothing is read at the boundary the header
+        // claims without being checked first.
+        let mut moved_dir = blob.clone();
+        moved_dir[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES]
+            .copy_from_slice(&((dls_off - U32_BYTES) as u64).to_le_bytes());
+        let err = FtsReader::open(Bytes::from(moved_dir), json).expect_err("moved directory");
         assert!(
             matches!(
                 err,
@@ -2649,16 +2646,13 @@ mod tests {
             "expected the moved boundary to be refused, got {err:?}"
         );
 
-        // A header claiming the map starts where the doc-lengths
-        // directory does leaves no room for one entry per document. The
-        // offsets are range-checked before anything is sliced, so that
-        // check is what refuses it, and the length check behind it is
-        // the backstop for a header that passes the range test with a
-        // region still the wrong size.
-        let mut empty_map = blob.clone();
-        empty_map[hdr::DOC_MAP_OFFSET_OFF..hdr::DOC_MAP_OFFSET_OFF + U64_BYTES]
-            .copy_from_slice(&(dls_off as u64).to_le_bytes());
-        let err = FtsReader::open(Bytes::from(empty_map), json).expect_err("empty map");
+        // A document count the region cannot hold. The map's size comes
+        // from it, so inflating it claims a region larger than the blob
+        // has room for below the directory.
+        let mut huge_docs = blob.clone();
+        huge_docs[hdr::N_DOCS_OFF..hdr::N_DOCS_OFF + U32_BYTES]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = FtsReader::open(Bytes::from(huge_docs), json).expect_err("impossible map");
         assert!(
             matches!(err, FtsError::Read(ReadError::MalformedVersion(_))),
             "expected a malformed-header failure, got {err:?}"
@@ -3831,13 +3825,7 @@ mod tests {
         let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
             .await
             .expect("open_lazy");
-        // The open fetches one header span sized off the widest header
-        // there is, so on a blob whose header is narrower the span
-        // necessarily carries the first few dictionary bytes with it --
-        // in the same GET, at no extra round-trip. What is under test is
-        // that the open does not fetch the dictionary, so the probe
-        // region is the dictionary past that span.
-        let dictionary = r.fst_range.start.max(format::fts::HEADER_SIZE_V8)..r.fst_range.end;
+        let dictionary = r.fst_range.clone();
         let lengths = r.columns[0].doc_lengths_range.clone();
         let opened = recording.len();
         assert_eq!(
