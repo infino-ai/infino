@@ -261,6 +261,13 @@ const FILTERED_HIDDEN_CELL_NPROBE: usize = 256;
 /// is in-cell loss, recovered by probing deeper, not wider.
 const FILTERED_HIDDEN_FINE_NPROBE: usize = 16;
 
+/// Fraction of the pooled warm survivors kept for the global exact rerank,
+/// as a percent. The true top-10 sit within the top ~2-3% of the pool by
+/// the 1-bit estimate (dummy-assign probe + placement model); 3% is the
+/// recall-neutral cut versus a full rerank, and cutting below it drops true
+/// neighbours (the #821 warm-recall inversion).
+const GLOBAL_FINE_SHORTLIST_POOL_PCT: usize = 3;
+
 /// Fold one probe's work tallies into the op's collector.
 ///
 /// Three fan-out sites produce the same five tallies — the stamped scan
@@ -4322,13 +4329,22 @@ impl SupertableReader {
         // one cross-cell shortlist cut, reranked where the winners live.
         if !pooled.is_empty() {
             // Size the exact-rerank shortlist to the pool: true neighbours sit within the
-            // top ~2% of the pool by the 1-bit estimate at billion scale, so a global cut
+            // top ~2-3% of the pool by the 1-bit estimate at billion scale, so a global cut
             // proportional to the pool captures them, while a fixed k*rerank_mult (top
             // ~0.05%) dropped them (the #821 warm-recall inversion). No per-cell floor:
             // pooling everything and cutting once globally on the estimate is sufficient
             // once the cut is wide enough, and far cheaper than a per-cell floor that
             // exact-reranks ~the whole pool.
-            let shortlist_limit = k.saturating_mul(rerank_mult).max(pooled.len() * 3 / 100);
+            //
+            // Deliberately NOT capped by an absolute bound: recall needs the full ~3%, so
+            // capping the shortlist would re-open the inversion this fixes. The proportional
+            // term is self-limiting in practice because the pool itself is bounded by the
+            // fanout law (routed fanout x cluster size) — recall is the side we protect
+            // here, and latency is bounded by the fanout knob upstream, not by capping this
+            // shortlist.
+            let shortlist_limit = k
+                .saturating_mul(rerank_mult)
+                .max(pooled.len().saturating_mul(GLOBAL_FINE_SHORTLIST_POOL_PCT) / 100);
             let winners = select_global_shortlist(pooled, shortlist_limit, 0);
             let mut by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
             for (si, c) in winners {
@@ -7416,15 +7432,16 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN,
-        ScanCandidate, VectorFilter, VectorSearchOptions, admit_extension_round,
-        admit_shortlist_window, apply_width_pin, assemble_flat_sections, assemble_hnsw_sections,
-        build_centroid_router, calibrated_query_for, cells_ranked_by_fine_score,
-        decode_centroid_router_section, encode_centroid_router_section, free_column_slot,
-        free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_prepare_for_metric,
-        gfc_unit_normalize, hidden_hits_user_ids, id_score_projection_indices,
-        is_hidden_vector_manifest, law_floor_serve_selection, postings_by_cell_from_summaries,
-        rerank_mult_from_law, score_fine_candidates, select_global_shortlist, union_cell_selection,
+        CentroidRouterGraph, GLOBAL_FINE_SHORTLIST_POOL_PCT, IndexUnavailable,
+        RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
+        VectorSearchOptions, admit_extension_round, admit_shortlist_window, apply_width_pin,
+        assemble_flat_sections, assemble_hnsw_sections, build_centroid_router,
+        calibrated_query_for, cells_ranked_by_fine_score, decode_centroid_router_section,
+        encode_centroid_router_section, free_column_slot, free_columns_unambiguous,
+        gate_fine_candidates_by_fragment, gfc_prepare_for_metric, gfc_unit_normalize,
+        hidden_hits_user_ids, id_score_projection_indices, is_hidden_vector_manifest,
+        law_floor_serve_selection, postings_by_cell_from_summaries, rerank_mult_from_law,
+        score_fine_candidates, select_global_shortlist, union_cell_selection,
         vector_read_query_error,
     };
     use crate::{
@@ -10161,6 +10178,63 @@ mod tests {
             kept.iter().filter(|(_, c)| c.cell_idx == 0).count(),
             4,
             "the global prefix is untouched by the rescue"
+        );
+    }
+
+    /// The pool-proportional shortlist rescues a true neighbour whose 1-bit
+    /// estimate lands mid-pool: past the fixed `k*rerank_mult` cut (top
+    /// ~0.5% here) but inside the proportional top-`GLOBAL_FINE_SHORTLIST_POOL_PCT`
+    /// (3%) cut. The neighbour IS kept under the proportional limit and is
+    /// DROPPED under the old fixed limit — the #821 warm-recall inversion —
+    /// so this asserts both that the fix recalls it and that the fix matters.
+    ///
+    /// Asserted on a synthetic pool with explicit estimate values (the cut
+    /// is on the estimate, so placement is controlled directly); the
+    /// end-to-end proof is the N=50 az1 recall aggregate on the PR.
+    #[test]
+    fn select_global_shortlist_proportional_cut_rescues_mid_pool_neighbour() {
+        let cand = |est: f32, cell: usize, pos: u32, did: u32| ScanCandidate {
+            did,
+            estimate: est,
+            pos,
+            cluster_id: 0,
+            cell_idx: cell,
+        };
+        const POOL: usize = 2_000;
+        const K: usize = 10;
+        const RERANK_MULT: usize = 1;
+        // The planted true neighbour ranks 41st by 1-bit estimate: well past
+        // the fixed top-10 (k*rerank_mult) cut, comfortably inside the
+        // proportional top-60 (3% of 2000) cut.
+        const PLANTED_DID: u32 = 40;
+
+        // Strictly decreasing estimates: did=i is the (i+1)-th best in the
+        // pool, so a candidate's did IS its rank. cell_floor is 0 here, so
+        // cell_idx is irrelevant to the cut.
+        let pooled: Vec<(usize, ScanCandidate)> = (0..POOL)
+            .map(|i| (0usize, cand((POOL - i) as f32, 0, i as u32, i as u32)))
+            .collect();
+
+        let fixed_limit = K.saturating_mul(RERANK_MULT);
+        let proportional_limit =
+            fixed_limit.max(pooled.len().saturating_mul(GLOBAL_FINE_SHORTLIST_POOL_PCT) / 100);
+        assert_eq!(fixed_limit, 10, "old fixed cut is the top k*rerank_mult");
+        assert_eq!(proportional_limit, 60, "proportional cut is 3% of the pool");
+
+        let has_planted =
+            |winners: &[(usize, ScanCandidate)]| winners.iter().any(|(_, c)| c.did == PLANTED_DID);
+
+        let kept_proportional = select_global_shortlist(pooled.clone(), proportional_limit, 0);
+        assert!(
+            has_planted(&kept_proportional),
+            "the proportional cut must keep the mid-pool true neighbour"
+        );
+
+        let kept_fixed = select_global_shortlist(pooled, fixed_limit, 0);
+        assert!(
+            !has_planted(&kept_fixed),
+            "the old fixed cut drops the mid-pool true neighbour — the bite \
+             that proves the proportional cut matters"
         );
     }
 
