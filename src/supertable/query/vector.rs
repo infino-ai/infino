@@ -261,6 +261,13 @@ const FILTERED_HIDDEN_CELL_NPROBE: usize = 256;
 /// is in-cell loss, recovered by probing deeper, not wider.
 const FILTERED_HIDDEN_FINE_NPROBE: usize = 16;
 
+/// Fraction of the pooled warm survivors kept for the global exact rerank,
+/// as a percent. The true top-10 sit within the top ~2-3% of the pool by
+/// the 1-bit estimate (dummy-assign probe + placement model); 3% is the
+/// recall-neutral cut versus a full rerank, and cutting below it drops true
+/// neighbours (the #821 warm-recall inversion).
+const GLOBAL_FINE_SHORTLIST_POOL_PCT: usize = 3;
+
 /// Fold one probe's work tallies into the op's collector.
 ///
 /// Three fan-out sites produce the same five tallies — the stamped scan
@@ -846,6 +853,73 @@ pub(crate) struct StampedCentroidRouter {
     pub(crate) graph: CentroidRouterGraph,
 }
 
+/// Drain-side placement over the centroid-router HNSW: the graph plus a
+/// node -> global-cell map. Built by
+/// [`SupertableReader::build_global_fine_assign_router`] from the pre-commit
+/// manifest and shared read-only across the per-row assign. Placing a row in
+/// the cell of its nearest fine centroid (found by walking this graph) matches
+/// how queries route (they walk the same graph), so placement and routing agree
+/// at every scale.
+pub(crate) struct FineAssignRouter {
+    router: Arc<StampedCentroidRouter>,
+    /// `node_to_cell[node]` = global cell owning graph node `node`; `u32::MAX`
+    /// for a node whose cell could not be resolved (skipped at assign time).
+    node_to_cell: Vec<u32>,
+}
+
+impl FineAssignRouter {
+    /// Place one row: walk the centroid-router HNSW and map the nearest distinct
+    /// cells to a primary + boundary replicas (deduped by cell, since several
+    /// fine centroids collapse into one cell). Replica margin is the score gap
+    /// to the primary — smaller means closer to the boundary, matching the
+    /// coarse assigner's convention. `None` when no walked node resolves to a
+    /// cell, so the caller falls back to the coarse cell grid. Thread-safe: the
+    /// HNSW search is read-only per call, so this runs under the writer pool.
+    pub(crate) fn assign_row_to_cells(
+        &self,
+        vector: &[f32],
+    ) -> Option<crate::supertable::opann::BoundaryAssignment> {
+        use crate::supertable::opann::REPLICA_CLOSURE_MAX_REPLICAS;
+        let graph = &self.router.graph;
+        let mut q = vector.to_vec();
+        gfc_prepare_for_metric(graph.metric, &mut q);
+        // Over-fetch graph nodes so the primary + replica CELLS survive the
+        // dedup when several fine centroids share a cell.
+        let n_place = ((REPLICA_CLOSURE_MAX_REPLICAS + 1) * 8).min(graph.node_map.len().max(1));
+        let ef = n_place.saturating_mul(2).max(n_place);
+        let hits = graph.graph.search(&graph.scorer, &q, n_place, ef);
+        let best = hits.first()?.1;
+        let mut primary: Option<u32> = None;
+        let mut replicas = [None; REPLICA_CLOSURE_MAX_REPLICAS];
+        let mut n_rep = 0usize;
+        let mut seen = [u32::MAX; REPLICA_CLOSURE_MAX_REPLICAS + 1];
+        let mut n_seen = 0usize;
+        for (node, score) in hits {
+            let Some(&cell) = self.node_to_cell.get(node as usize) else {
+                continue;
+            };
+            if cell == u32::MAX || seen[..n_seen].contains(&cell) {
+                continue;
+            }
+            seen[n_seen] = cell;
+            n_seen += 1;
+            if primary.is_none() {
+                primary = Some(cell);
+            } else if n_rep < REPLICA_CLOSURE_MAX_REPLICAS {
+                replicas[n_rep] = Some((cell, (best - score).abs()));
+                n_rep += 1;
+            }
+            if primary.is_some() && n_rep == REPLICA_CLOSURE_MAX_REPLICAS {
+                break;
+            }
+        }
+        Some(crate::supertable::opann::BoundaryAssignment {
+            primary: primary?,
+            replicas,
+        })
+    }
+}
+
 /// The column the eager centroid-router build should target, or `None` when
 /// the router is disabled or no column is eligible. The single-slot cache
 /// serves one column, so the eager path pre-warms the first vector column (any
@@ -870,7 +944,12 @@ pub(crate) fn select_eager_router_column(
         ivf_router,
         config::IvfRouter::CentroidGraph | config::IvfRouter::Auto
     );
-    if search_mode != config::VectorSearchMode::Ivf || !router_engaged || global_fine_fanout == 0 {
+    // `global_fine_fanout == 0` no longer means "off" — it means "use the
+    // per-table stamped fanout" (auto-calibrated). Whether the router engages is
+    // decided by `ivf_router` alone, so do not gate the eager build on the
+    // fanout value.
+    let _ = global_fine_fanout;
+    if search_mode != config::VectorSearchMode::Ivf || !router_engaged {
         return None;
     }
     vector_columns.first().map(|vc| vc.column.clone())
@@ -4321,7 +4400,23 @@ impl SupertableReader {
         // Phase C: single global exact rerank of the pooled warm survivors —
         // one cross-cell shortlist cut, reranked where the winners live.
         if !pooled.is_empty() {
-            let shortlist_limit = k.saturating_mul(rerank_mult);
+            // Size the exact-rerank shortlist to the pool: true neighbours sit within the
+            // top ~2-3% of the pool by the 1-bit estimate at billion scale, so a global cut
+            // proportional to the pool captures them, while a fixed k*rerank_mult (top
+            // ~0.05%) dropped them (the #821 warm-recall inversion). No per-cell floor:
+            // pooling everything and cutting once globally on the estimate is sufficient
+            // once the cut is wide enough, and far cheaper than a per-cell floor that
+            // exact-reranks ~the whole pool.
+            //
+            // Deliberately NOT capped by an absolute bound: recall needs the full ~3%, so
+            // capping the shortlist would re-open the inversion this fixes. The proportional
+            // term is self-limiting in practice because the pool itself is bounded by the
+            // fanout law (routed fanout x cluster size) — recall is the side we protect
+            // here, and latency is bounded by the fanout knob upstream, not by capping this
+            // shortlist.
+            let shortlist_limit = k
+                .saturating_mul(rerank_mult)
+                .max(pooled.len().saturating_mul(GLOBAL_FINE_SHORTLIST_POOL_PCT) / 100);
             let winners = select_global_shortlist(pooled, shortlist_limit, 0);
             let mut by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
             for (si, c) in winners {
@@ -4506,6 +4601,73 @@ impl SupertableReader {
         Ok(())
     }
 
+    /// Build the drain-side fine-centroid placement router: the centroid-router
+    /// HNSW (the SAME graph queries walk) plus a node -> global-cell map. A
+    /// drain assigns each new row to the cell of its nearest fine centroid by
+    /// walking this graph, so placement matches routing — instead of placing by
+    /// the coarse cell grid, which lands rows in cells the fine router ranks deep
+    /// and forces a wide (slow) probe to reach them. Using the graph (not a
+    /// linear scan of the fine centroids) keeps placement log-N, so the same
+    /// path is exercised at 10M, 100M and 1B, and an approximate pick is
+    /// self-consistent (a nearby query walks the same graph to the same node).
+    ///
+    /// Returns `None` — so the caller keeps coarse cell-grid placement — when
+    /// there is nothing to place against yet (first drain, no centroid section,
+    /// no superfiles) or on any load failure; placement degrades to the cell
+    /// grid rather than failing the commit.
+    pub(crate) async fn build_global_fine_assign_router(
+        &self,
+        column: &str,
+    ) -> Option<FineAssignRouter> {
+        let manifest = self.manifest();
+        let vc = manifest
+            .options
+            .vector_columns
+            .iter()
+            .find(|vc| vc.column == column)?;
+        let dim = vc.dim;
+        let metric = vc.metric;
+        let section = self.centroid_section().await?;
+        let entries = manifest.get_all_superfiles_loaded().await.ok()?;
+        if entries.is_empty() {
+            return None;
+        }
+        let readers = self.open_superfile_readers(&entries).await.ok()?;
+        let stamped = self
+            .resident_centroid_router(
+                column,
+                manifest.manifest_id,
+                dim,
+                metric,
+                &entries,
+                &readers,
+                section.as_ref(),
+            )
+            .await
+            .ok()?;
+        // Precompute node -> global cell via the SAME per-superfile flat->cell
+        // mapping the query path uses. A node that cannot be resolved is left as
+        // the `u32::MAX` sentinel and skipped at assign time.
+        let node_map = &stamped.graph.node_map;
+        let mut node_to_cell = vec![u32::MAX; node_map.len()];
+        let mut any = false;
+        for (node, &(si, flat)) in node_map.iter().enumerate() {
+            if let Some(vr) = readers.get(si).and_then(|r| r.vec())
+                && let Some(cell) = vr.global_cell_of_flat(flat)
+            {
+                node_to_cell[node] = cell;
+                any = true;
+            }
+        }
+        if !any {
+            return None;
+        }
+        Some(FineAssignRouter {
+            router: stamped,
+            node_to_cell,
+        })
+    }
+
     /// kNN fan-out over exactly `superfiles`, optionally admitting only the
     /// rows in `allow` (per superfile; a superfile absent from the map has
     /// no admitted row). The user-table kernel behind both the plain
@@ -4586,17 +4748,29 @@ impl SupertableReader {
         // The centroid router scores per the column's configured metric
         // (Cosine unit-normalizes and ranks by −dot; NegDot ranks by raw −dot;
         // L2Sq by squared distance), so it engages for any metric.
-        // Per-table calibrated fanout wins over the scale-blind
-        // `vector.global_fine_fanout` constant: a drain stamps `width × fine`
-        // (clamped to the table's cluster count) per k, so a ~1M table no
-        // longer over-reads to a full scan. A table stamped before this feature
-        // (or with the router off at drain) has no stamp and falls back to the
-        // constant. There is no caller-set fanout knob, so precedence is
-        // stamp-then-constant.
+        // Fanout precedence: an explicit `vector.global_fine_fanout` (> 0)
+        // overrides everything (manual tuning / fanout sweeps); otherwise the
+        // per-table calibrated `fanout_for_k` stamp wins — a drain stamps
+        // `width × fine` (clamped to the table's cluster count) per k, so a
+        // ~1M table no longer over-reads to a full scan. A table with neither
+        // (config 0 and no stamp — router off at drain) yields 0 and skips the
+        // global-fine path below.
         let stamped_fanout = manifest
             .vector_cell_routing()
             .and_then(|routing| routing.fanout_for_k_at(k));
-        let resolved_fanout = stamped_fanout.unwrap_or(vcfg.global_fine_fanout);
+        let resolved_fanout = if vcfg.global_fine_fanout > 0 {
+            vcfg.global_fine_fanout
+        } else {
+            stamped_fanout.unwrap_or(0)
+        };
+        tracing::info!(
+            target: "infino::gfc",
+            stamped_fanout = ?stamped_fanout,
+            config_fanout = vcfg.global_fine_fanout,
+            resolved_fanout,
+            k,
+            "gfc fanout resolved"
+        );
         // `auto` picks the router per hidden-vector table by scale +
         // concentration; explicit `stamped` / `centroid_graph` are honored
         // verbatim (no gating). The per-table inputs are resident (no I/O) and
@@ -7409,15 +7583,16 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN,
-        ScanCandidate, VectorFilter, VectorSearchOptions, admit_extension_round,
-        admit_shortlist_window, apply_width_pin, assemble_flat_sections, assemble_hnsw_sections,
-        build_centroid_router, calibrated_query_for, cells_ranked_by_fine_score,
-        decode_centroid_router_section, encode_centroid_router_section, free_column_slot,
-        free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_prepare_for_metric,
-        gfc_unit_normalize, hidden_hits_user_ids, id_score_projection_indices,
-        is_hidden_vector_manifest, law_floor_serve_selection, postings_by_cell_from_summaries,
-        rerank_mult_from_law, score_fine_candidates, select_global_shortlist, union_cell_selection,
+        CentroidRouterGraph, GLOBAL_FINE_SHORTLIST_POOL_PCT, IndexUnavailable,
+        RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
+        VectorSearchOptions, admit_extension_round, admit_shortlist_window, apply_width_pin,
+        assemble_flat_sections, assemble_hnsw_sections, build_centroid_router,
+        calibrated_query_for, cells_ranked_by_fine_score, decode_centroid_router_section,
+        encode_centroid_router_section, free_column_slot, free_columns_unambiguous,
+        gate_fine_candidates_by_fragment, gfc_prepare_for_metric, gfc_unit_normalize,
+        hidden_hits_user_ids, id_score_projection_indices, is_hidden_vector_manifest,
+        law_floor_serve_selection, postings_by_cell_from_summaries, rerank_mult_from_law,
+        score_fine_candidates, select_global_shortlist, union_cell_selection,
         vector_read_query_error,
     };
     use crate::{
@@ -7526,10 +7701,12 @@ mod tests {
             select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::Stamped, 32, &cols),
             None,
         );
-        // Gated off: fanout of zero.
+        // Fanout of zero no longer gates off — it means "use the per-table
+        // stamped fanout", so the router still engages and is pre-warmed.
         assert_eq!(
-            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, 0, &cols),
-            None,
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, 0, &cols)
+                .as_deref(),
+            Some("nd"),
         );
         // Gated off: the HNSW search mode serves via its own graph.
         assert_eq!(
@@ -9193,6 +9370,66 @@ mod tests {
         );
     }
 
+    /// Drain-side fine placement: a row lands in the cell of its NEAREST FINE
+    /// centroid (found by walking the centroid-router HNSW), which can differ
+    /// from its nearest COARSE cell — the whole point of the placement fix. Two
+    /// fine centroids: node 0 at 0.9 owned by cell 0, node 1 at 0.45 owned by
+    /// cell 1. A row at 0.45 is nearest fine centroid node 1 (exact) so fine
+    /// placement -> cell 1, whereas the coarse cell grid (cell 0 at 0.4, cell 1
+    /// at 0.6) would place it in cell 0. That divergence is the bite.
+    #[test]
+    fn fine_assign_router_places_row_in_nearest_fine_centroids_cell() {
+        let dim = 8usize;
+        let row = vec![0.45f32; dim];
+
+        // Fine placement via the centroid-router HNSW.
+        let graph = super::build_centroid_router_from_cluster_vectors(
+            vec![(0, 0, vec![0.9f32; dim]), (0, 1, vec![0.45f32; dim])],
+            dim,
+            Metric::L2Sq,
+        )
+        .expect("router builds");
+        let fine = super::FineAssignRouter {
+            router: Arc::new(super::StampedCentroidRouter {
+                generation: 0,
+                column: "emb".into(),
+                graph,
+            }),
+            node_to_cell: vec![0, 1],
+        };
+        let placed = fine
+            .assign_row_to_cells(&row)
+            .expect("row places against a non-empty router");
+        assert_eq!(
+            placed.primary, 1,
+            "fine placement follows the nearest fine centroid (node 1) into cell 1"
+        );
+
+        // The coarse cell grid would have placed the same row in cell 0.
+        let mut cell_centroids = vec![0.4f32; dim * 2];
+        for v in cell_centroids[dim..].iter_mut() {
+            *v = 0.6;
+        }
+        let grid = crate::supertable::manifest::ClusterCentroids::from_fp32(
+            2,
+            dim as u32,
+            &cell_centroids,
+            vec![1, 1],
+        );
+        let admit = crate::supertable::manifest::RabitqAdmitContext::new(dim, 7);
+        let coarse = crate::supertable::opann::boundary_assignment_fp32(
+            &grid,
+            Metric::L2Sq,
+            &row,
+            &admit,
+            crate::supertable::opann::assignment_shortlist_window(2),
+        );
+        assert_eq!(
+            coarse.primary, 0,
+            "coarse cell grid places the same row in cell 0 — the divergence fine placement fixes"
+        );
+    }
+
     /// Metric-aware selection: the centroid graph, built with each metric's
     /// scorer + centroid transform, selects the same clusters a brute-force
     /// nearest-centroid scan does under that metric. Uses magnitude-varying
@@ -10154,6 +10391,63 @@ mod tests {
             kept.iter().filter(|(_, c)| c.cell_idx == 0).count(),
             4,
             "the global prefix is untouched by the rescue"
+        );
+    }
+
+    /// The pool-proportional shortlist rescues a true neighbour whose 1-bit
+    /// estimate lands mid-pool: past the fixed `k*rerank_mult` cut (top
+    /// ~0.5% here) but inside the proportional top-`GLOBAL_FINE_SHORTLIST_POOL_PCT`
+    /// (3%) cut. The neighbour IS kept under the proportional limit and is
+    /// DROPPED under the old fixed limit — the #821 warm-recall inversion —
+    /// so this asserts both that the fix recalls it and that the fix matters.
+    ///
+    /// Asserted on a synthetic pool with explicit estimate values (the cut
+    /// is on the estimate, so placement is controlled directly); the
+    /// end-to-end proof is the N=50 az1 recall aggregate on the PR.
+    #[test]
+    fn select_global_shortlist_proportional_cut_rescues_mid_pool_neighbour() {
+        let cand = |est: f32, cell: usize, pos: u32, did: u32| ScanCandidate {
+            did,
+            estimate: est,
+            pos,
+            cluster_id: 0,
+            cell_idx: cell,
+        };
+        const POOL: usize = 2_000;
+        const K: usize = 10;
+        const RERANK_MULT: usize = 1;
+        // The planted true neighbour ranks 41st by 1-bit estimate: well past
+        // the fixed top-10 (k*rerank_mult) cut, comfortably inside the
+        // proportional top-60 (3% of 2000) cut.
+        const PLANTED_DID: u32 = 40;
+
+        // Strictly decreasing estimates: did=i is the (i+1)-th best in the
+        // pool, so a candidate's did IS its rank. cell_floor is 0 here, so
+        // cell_idx is irrelevant to the cut.
+        let pooled: Vec<(usize, ScanCandidate)> = (0..POOL)
+            .map(|i| (0usize, cand((POOL - i) as f32, 0, i as u32, i as u32)))
+            .collect();
+
+        let fixed_limit = K.saturating_mul(RERANK_MULT);
+        let proportional_limit =
+            fixed_limit.max(pooled.len().saturating_mul(GLOBAL_FINE_SHORTLIST_POOL_PCT) / 100);
+        assert_eq!(fixed_limit, 10, "old fixed cut is the top k*rerank_mult");
+        assert_eq!(proportional_limit, 60, "proportional cut is 3% of the pool");
+
+        let has_planted =
+            |winners: &[(usize, ScanCandidate)]| winners.iter().any(|(_, c)| c.did == PLANTED_DID);
+
+        let kept_proportional = select_global_shortlist(pooled.clone(), proportional_limit, 0);
+        assert!(
+            has_planted(&kept_proportional),
+            "the proportional cut must keep the mid-pool true neighbour"
+        );
+
+        let kept_fixed = select_global_shortlist(pooled, fixed_limit, 0);
+        assert!(
+            !has_planted(&kept_fixed),
+            "the old fixed cut drops the mid-pool true neighbour — the bite \
+             that proves the proportional cut matters"
         );
     }
 

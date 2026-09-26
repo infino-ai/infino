@@ -222,10 +222,11 @@ vector:
   # For ivf_router = centroid_graph: the NUMBER of fine clusters the
   # query fans out to (globally scored), clamped to the table's cluster
   # total. Higher reads more clusters — more cold bytes, higher recall.
-  # 1024 is the ~0.99 point at 10M; it over-serves smaller tables and
-  # under-serves larger ones (the fanout for a recall target grows ~sqrt(N)),
-  # pending a per-table calibrated stamp. Ignored under ivf_router = stamped.
-  global_fine_fanout: 1024
+  # 0 (default) uses the per-table stamped fanout_for_k (auto-calibrated at
+  # drain, grows ~sqrt(N) with scale); a non-zero value overrides that stamp
+  # for the whole table (manual tuning / fanout sweeps). Ignored under
+  # ivf_router = stamped.
+  global_fine_fanout: 0
 
   # For ivf_router = centroid_graph: exact-rerank over-fetch multiplier
   # for this path only (a caller-set rerank_mult still wins). Scoped here so
@@ -248,9 +249,11 @@ vector:
   centroid_graph_concentration_ratio: 0.5
 
   # For ivf_router = auto: the scale floor (hidden-table doc count) below which
-  # auto picks stamped. The selected clusters coalesce into a cold-read win only
-  # at large N (measured win at 10M+, loss at 1M). Documented starting point.
-  centroid_graph_scale_floor_docs: 10000000
+  # auto picks stamped. 0 (the default) means no floor — the fine-centroid graph
+  # is eligible at every scale (concentration still gates), available uniformly
+  # like the always-built cell grid. Drain-side fine-centroid placement removes
+  # the below-scale loss the floor once guarded against.
+  centroid_graph_scale_floor_docs: 0
 
   # Ceiling on the fanout the router's recall calibration considers: the widest
   # number of global fine clusters the calibration selects + scores per query,
