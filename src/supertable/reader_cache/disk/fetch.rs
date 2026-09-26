@@ -52,7 +52,7 @@ use crate::{
             disk::{sources::mmap_readonly_with_handle, *},
         },
     },
-    utils::trace::{OpOrigin, detached, record},
+    utils::trace::{OpOrigin, detached},
 };
 
 impl DiskCacheStore {
@@ -183,14 +183,6 @@ impl DiskCacheStore {
     /// the same URI either see the in-flight OnceCell (same
     /// foreground reader) or, once finalize completes, hit
     /// the mmap-backed cache entry.
-    #[cfg_attr(
-        feature = "detailed-tracing",
-        tracing::instrument(
-            name = "cache.fetch_source",
-            skip_all,
-            fields(uri = %uri.0, bytes = tracing::field::Empty)
-        )
-    )]
     pub(crate) async fn cold_fetch_hybrid(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -201,7 +193,6 @@ impl DiskCacheStore {
         let head = fetch_storage.head(&storage_uri).await?;
 
         let size = head.size;
-        record("bytes", size);
         // Guarded: any `?` below hands the bytes back. Committed once the entry is admitted; from
         // then on the entry's own accounting carries them.
         let reservation = self.reserve(size).await?;
@@ -712,14 +703,6 @@ impl DiskCacheStore {
 
     /// Download the whole file to local disk and admit it as a mapped entry. What a `Load` miss
     /// uses.
-    #[cfg_attr(
-        feature = "detailed-tracing",
-        tracing::instrument(
-            name = "cache.fetch_source",
-            skip_all,
-            fields(uri = %uri.0, bytes = tracing::field::Empty)
-        )
-    )]
     pub(crate) async fn cold_fetch(
         &self,
         uri: &SuperfileUri,
@@ -729,8 +712,6 @@ impl DiskCacheStore {
         let storage_uri = storage_key.to_owned();
         let head = fetch_storage.head(&storage_uri).await?;
         let size = head.size;
-
-        record("bytes", size);
 
         // Reserve budget (CAS-loop with eviction on miss).
         let reservation = self.reserve(size).await?;

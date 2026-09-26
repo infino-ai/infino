@@ -42,7 +42,7 @@ use crate::{
     supertable::{
         manifest::{SubsectionOffsets, SuperfileUri},
         reader_cache::{
-            DiskCacheStore, ReadIntent, ReaderCacheError, SuperfileReaderCache,
+            DiskCacheStore, OpenTier, ReadIntent, ReaderCacheError, SuperfileReaderCache,
             disk::DiskCacheError,
         },
     },
@@ -75,9 +75,35 @@ pub async fn superfile_reader(
     offsets: Option<&SubsectionOffsets>,
     intent: ReadIntent,
 ) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
+    superfile_reader_tiered(
+        store,
+        disk_cache,
+        storage,
+        uri,
+        storage_key,
+        offsets,
+        intent,
+    )
+    .await
+    .map(|(reader, _)| reader)
+}
+
+/// [`superfile_reader`], also saying which tier served the file: the
+/// in-memory tier is [`OpenTier::Memory`], the disk cache reports its own
+/// walk, and the storage-only fallback is a whole-object GET, so
+/// [`OpenTier::Source`]. For a scan that counts where its files came from.
+pub async fn superfile_reader_tiered(
+    store: &Arc<dyn SuperfileReaderCache>,
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+    storage: Option<&Arc<dyn StorageProvider>>,
+    uri: &SuperfileUri,
+    storage_key: &str,
+    offsets: Option<&SubsectionOffsets>,
+    intent: ReadIntent,
+) -> Result<(Arc<SuperfileReader>, OpenTier), ReaderCacheError> {
     // 1. In-memory tier.
     match store.reader(uri) {
-        Ok(r) => return Ok(r),
+        Ok(r) => return Ok((r, OpenTier::Memory)),
         Err(ReaderCacheError::NotFound { .. }) => {
             // Fall through to the cache.
         }
@@ -88,7 +114,7 @@ pub async fn superfile_reader(
     //    the file, so a budget miss never fails here.
     if let Some(cache) = disk_cache {
         return cache
-            .open_for_query(uri, storage_key, offsets, storage, intent)
+            .open_for_query_tiered(uri, storage_key, offsets, storage, intent)
             .await
             .map_err(cache_open_failed);
     }
@@ -109,7 +135,7 @@ pub async fn superfile_reader(
                 })?;
         let reader = SuperfileReader::open(bytes)
             .map_err(|source| ReaderCacheError::OpenFailed { source })?;
-        return Ok(Arc::new(reader));
+        return Ok((Arc::new(reader), OpenTier::Source));
     }
 
     Err(ReaderCacheError::NotFound { uri: *uri })

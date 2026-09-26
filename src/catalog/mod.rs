@@ -925,6 +925,11 @@ impl Connection {
             planned_read_ranges = tracing::field::Empty,
             rows_materialized = tracing::field::Empty,
             kernel_cpu_ns = tracing::field::Empty,
+            store_heads = tracing::field::Empty,
+            store_gets = tracing::field::Empty,
+            store_get_bytes = tracing::field::Empty,
+            store_bg_gets = tracing::field::Empty,
+            store_bg_get_bytes = tracing::field::Empty,
         ))
     )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
@@ -985,6 +990,12 @@ impl Connection {
         // Caller-thread pickup, same as reader mint: the drive future may
         // poll on runtime threads where the scope's slot is invisible.
         let op_stats = op_stats::current();
+        // What the span records when the query is done: the meter's counters
+        // for this query, and the connection's object-store ledger before it
+        // ran, so the delta is what this query fetched. Both are a few atomic
+        // loads, skipped along with the fields they feed.
+        let close_out = cfg!(feature = "detailed-tracing")
+            .then(|| (op_stats.clone(), self.inner.usage_meter.snapshot()));
         let drive = async move {
             // Plan on this runtime's 16 MiB workers, not the calling thread `block_on` polls on:
             // planner recursion depth must not hang on a stack the engine does not own. A panic
@@ -1046,22 +1057,6 @@ impl Connection {
                 .instrument(detail_span!("sql.execute"))
                 .await
                 .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
-            // Close out the span with what the query did. The snapshot reads a
-            // dozen atomics, so it is skipped along with the fields it feeds.
-            if cfg!(feature = "detailed-tracing") {
-                record(
-                    "rows_out",
-                    batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(),
-                );
-                if let Some(stats) = op_stats.as_ref() {
-                    let stats = stats.snapshot();
-                    record("sql_page_bytes", stats.sql_page_bytes);
-                    record("planned_read_ranges", stats.planned_read_ranges);
-                    record("rows_materialized", stats.rows_materialized);
-                    record("kernel_cpu_ns", stats.kernel_cpu_ns);
-                }
-            }
-
             if batches.is_empty() {
                 // An empty Vec carries no schema, so hand back one empty batch
                 // instead. Its schema comes from the physical plan, not the
@@ -1078,13 +1073,37 @@ impl Connection {
         // runtime; otherwise the connection's own. The fallback still has to
         // be multi-thread: a table-free query can be a search TVF, which
         // fans out object-store reads under the hood.
-        match handles.first() {
+        let result = match handles.first() {
             Some(table) => table
                 .block_on_query(drive)
                 .map_err(|e: InfinoError| e.with_context("query_sql", None)),
             None => bridge_on_runtime(drive, &self.query_runtime())
                 .map_err(|e: InfinoError| e.with_context("query_sql", None)),
+        };
+
+        if let (Some((op_stats, usage_before)), Ok(batches)) = (close_out, &result) {
+            record(
+                "rows_out",
+                batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(),
+            );
+            if let Some(stats) = op_stats {
+                let stats = stats.snapshot();
+                record("sql_page_bytes", stats.sql_page_bytes);
+                record("planned_read_ranges", stats.planned_read_ranges);
+                record("rows_materialized", stats.rows_materialized);
+                record("kernel_cpu_ns", stats.kernel_cpu_ns);
+            }
+            // The ledger is the connection's, not the query's: a second query
+            // on the same connection at the same time lands in this delta too.
+            let used = self.inner.usage_meter.snapshot().since(&usage_before);
+            record("store_heads", used.head_count);
+            record("store_gets", used.get_count);
+            record("store_get_bytes", used.get_bytes);
+            record("store_bg_gets", used.bg_get_count);
+            record("store_bg_get_bytes", used.bg_get_bytes);
         }
+
+        result
     }
 
     /// Runtime for the table-free `query_sql` fallback.

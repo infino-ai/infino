@@ -118,9 +118,9 @@ use crate::{
             fts::{memos_from_plan_locations, plan_locations_for},
             prune::{PruneLeaf, select_superfiles},
             skip::{ScalarOp, ScalarPredicate},
-            superfile_reader::superfile_reader,
+            superfile_reader::superfile_reader_tiered,
         },
-        reader_cache::{DiskCacheStore, ReadIntent, SuperfileReaderCache},
+        reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
         tombstones::SidecarCache,
     },
     utils::trace::detail_span,
@@ -162,6 +162,51 @@ struct PreparedScanFile {
     path: ObjPath,
     size: u64,
     row_counts: Arc<[u32]>,
+    /// Which cache tier the first open of this file was served from. A
+    /// later scan of the same provider reuses the prepared file and reports
+    /// the same tier: what it paid, not what it would pay now.
+    tier: OpenTier,
+}
+
+/// How many of a scan's files each cache tier served. One line of counts on
+/// the `scan.open_files` span instead of a span per file: what a trace
+/// needs to say whether a slow scan was a cold one, at a cost that does not
+/// grow with the table.
+#[derive(Default)]
+struct OpenTierCounts {
+    memory: u64,
+    disk: u64,
+    lazy: u64,
+    source: u64,
+    coalesced: u64,
+    streamed: u64,
+}
+
+impl OpenTierCounts {
+    fn tally<'a>(files: impl IntoIterator<Item = &'a Arc<PreparedScanFile>>) -> Self {
+        let mut counts = Self::default();
+        for file in files {
+            let slot = match file.tier {
+                OpenTier::Memory => &mut counts.memory,
+                OpenTier::Disk => &mut counts.disk,
+                OpenTier::Lazy => &mut counts.lazy,
+                OpenTier::Source => &mut counts.source,
+                OpenTier::Coalesced => &mut counts.coalesced,
+                OpenTier::Streamed => &mut counts.streamed,
+            };
+            *slot += 1;
+        }
+        counts
+    }
+
+    fn record_on(&self, span: &tracing::Span) {
+        span.record("memory", self.memory);
+        span.record("disk", self.disk);
+        span.record("lazy", self.lazy);
+        span.record("source", self.source);
+        span.record("coalesced", self.coalesced);
+        span.record("streamed", self.streamed);
+    }
 }
 
 /// Concurrent first-open coalescing for one immutable superfile.
@@ -454,7 +499,7 @@ impl SupertableProvider {
         let entry = Arc::clone(entry);
         let prepared = cell
             .get_or_try_init(|| async move {
-                let reader = superfile_reader(
+                let (reader, tier) = superfile_reader_tiered(
                     &store,
                     disk_cache.as_ref(),
                     storage.as_ref(),
@@ -491,6 +536,7 @@ impl SupertableProvider {
                     size,
                     row_counts,
                     reader,
+                    tier,
                 }))
             })
             .await?;
@@ -875,12 +921,23 @@ impl TableProvider for SupertableProvider {
         let plan_locations = &plan_locations;
 
         // Opening every survivor: the part of a scan that pays for a cache
-        // miss. Each file that is not already in memory reports its tier in
-        // a `cache.open` span beneath this one.
+        // miss. The span says how many files each tier served, so a cold
+        // scan is legible from one line.
+        let open_span = detail_span!(
+            "scan.open_files",
+            files = survivors.len(),
+            memory = tracing::field::Empty,
+            disk = tracing::field::Empty,
+            lazy = tracing::field::Empty,
+            source = tracing::field::Empty,
+            coalesced = tracing::field::Empty,
+            streamed = tracing::field::Empty,
+        );
         let prepared_files =
             try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry)))
-                .instrument(detail_span!("scan.open_files", files = survivors.len()))
+                .instrument(open_span.clone())
                 .await?;
+        OpenTierCounts::tally(&prepared_files).record_on(&open_span);
 
         // Per-superfile scan inputs, resolved into PartitionedFiles once the
         // store is built (row-group counts are read from each superfile's

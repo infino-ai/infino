@@ -4,15 +4,11 @@
 //! The public reader API: hand back a [`SuperfileReader`] for a URI, serving it
 //! from memory or disk when it is cached and cold-fetching it when it is not.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, OnceLock, atomic::Ordering};
 #[cfg(any(test, feature = "test-helpers"))]
 use std::time::{Duration, Instant};
 
 use tokio::sync::OnceCell;
-use tracing::Instrument;
 
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::supertable::reader_cache::disk::fetch::PromotionWaitGuard;
@@ -27,7 +23,6 @@ use crate::{
         manifest::{SubsectionOffsets, SuperfileUri},
         reader_cache::disk::*,
     },
-    utils::trace::{detail_span, record},
 };
 
 /// Shared walks a caller joins before walking alone: the first, plus one retry when the first
@@ -55,6 +50,21 @@ impl DiskCacheStore {
         storage: Option<&Arc<dyn StorageProvider>>,
         intent: ReadIntent,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
+        self.open_for_query_tiered(uri, storage_key, offsets, storage, intent)
+            .await
+            .map(|(reader, _)| reader)
+    }
+
+    /// [`Self::open_for_query`], also saying which tier served the file. For a scan that wants
+    /// to report how much of itself was local; everything else takes the reader alone.
+    pub async fn open_for_query_tiered(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        storage_key: &str,
+        offsets: Option<&SubsectionOffsets>,
+        storage: Option<&Arc<dyn StorageProvider>>,
+        intent: ReadIntent,
+    ) -> Result<(Arc<SuperfileReader>, OpenTier), DiskCacheError> {
         if intent == ReadIntent::Load {
             return Err(DiskCacheError::SuperfileOpen(
                 "Load reads go through reader_synchronous_with_storage; they must never degrade"
@@ -67,17 +77,9 @@ impl DiskCacheStore {
             .await
         {
             // Nothing local and the file cannot be admitted: stream it uncached rather than fail.
-            // The walk's own `cache.open` already ended on the refusal, so this is a second span
-            // for the same file, saying what actually served it.
             Err(DiskCacheError::BudgetExceeded) => {
-                self.open_range_only(storage_key, offsets, storage)
-                    .instrument(detail_span!(
-                        "cache.open",
-                        uri = tracing::field::display(&uri.0),
-                        intent = tracing::field::debug(intent),
-                        tier = "streamed",
-                    ))
-                    .await
+                let reader = self.open_range_only(storage_key, offsets, storage).await?;
+                Ok((reader, OpenTier::Streamed))
             }
             served => served,
         }
@@ -133,6 +135,7 @@ impl DiskCacheStore {
             Some(&fetch_storage),
         )
         .await
+        .map(|(reader, _)| reader)
     }
 
     /// The lookup: four tiers, cheapest first, and the first hit serves. `intent` is the only
@@ -171,10 +174,11 @@ impl DiskCacheStore {
         intent: ReadIntent,
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
-    ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
+    ) -> Result<(Arc<SuperfileReader>, OpenTier), DiskCacheError> {
         // Tier 1, memory: the whole file is already mmapped or buffered in this process. No I/O.
         if let Some(entry) = self.whole_file_in_memory(uri) {
-            return Ok(self.serve(uri, storage_key, &entry, intent, storage));
+            let reader = self.serve(uri, storage_key, &entry, intent, storage);
+            return Ok((reader, OpenTier::Memory));
         }
 
         // A Load needs the whole file, so a lazy entry is no use to it. Drop it and free its budget
@@ -184,19 +188,12 @@ impl DiskCacheStore {
         }
 
         // Tiers 2 to 4, one walk per URI: concurrent callers share it, so N misses cost one stat,
-        // one mmap or one download. The walk records which tier served the file on this span; a
-        // memory hit above never reaches it, so a warm scan emits no `cache.open` at all.
-        let entry = self
+        // one mmap or one download.
+        let (entry, tier) = self
             .fetch_local_or_source_coalesced(uri, storage_key, intent, offsets, storage)
-            .instrument(detail_span!(
-                "cache.open",
-                uri = tracing::field::display(&uri.0),
-                intent = tracing::field::debug(intent),
-                tier = tracing::field::Empty,
-            ))
             .await?;
 
-        Ok(self.serve(uri, storage_key, &entry, intent, storage))
+        Ok((self.serve(uri, storage_key, &entry, intent, storage), tier))
     }
 
     /// Tier 1: a cached entry holding the whole file (mmapped or buffered). It serves any read
@@ -259,13 +256,12 @@ impl DiskCacheStore {
         intent: ReadIntent,
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
-    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+    ) -> Result<(Arc<CachedEntry>, OpenTier), DiskCacheError> {
         // A fill may have installed the whole file since the memory check. Use its entry, not the
         // file on disk: a fill that left the vector blob on the block cache wrote a file with a
         // hole, and only the live entry can serve it.
         if let Some(entry) = self.whole_file_in_memory(uri) {
-            record("tier", "memory");
-            return Ok(entry);
+            return Ok((entry, OpenTier::Memory));
         }
 
         // Tier 2, disk: the whole file is on local disk (a prior run, or a finished fill). Mmap
@@ -274,8 +270,7 @@ impl DiskCacheStore {
             .fetch_from_disk_cache(uri, offsets.map(|o| o.total_size))
             .await?
         {
-            record("tier", "disk");
-            return Ok(entry);
+            return Ok((entry, OpenTier::Disk));
         }
 
         // Tier 3, lazy reader: a query rides its block cache. Not for a Load, which needs the
@@ -283,14 +278,14 @@ impl DiskCacheStore {
         if intent != ReadIntent::Load
             && let Some(entry) = self.open_lazy_reader(uri)
         {
-            record("tier", "lazy");
-            return Ok(entry);
+            return Ok((entry, OpenTier::Lazy));
         }
 
         // Tier 4, object store: nothing is local.
-        record("tier", "source");
-        self.fetch_from_source(uri, storage_key, intent, offsets, storage)
-            .await
+        let entry = self
+            .fetch_from_source(uri, storage_key, intent, offsets, storage)
+            .await?;
+        Ok((entry, OpenTier::Source))
     }
 
     /// Tiers 2 to 4 as one walk per URI. The first caller runs [`Self::fetch_local_or_source`] and
@@ -311,7 +306,7 @@ impl DiskCacheStore {
         intent: ReadIntent,
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
-    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+    ) -> Result<(Arc<CachedEntry>, OpenTier), DiskCacheError> {
         for _ in 0..COALESCED_FETCH_ATTEMPTS {
             let cell = self
                 .coordinators
@@ -319,19 +314,20 @@ impl DiskCacheStore {
                 .or_insert_with(|| Arc::new(OnceCell::new()))
                 .clone();
 
-            // Whether this caller ran the walk or waited on another's: only the runner learns
-            // the tier, so a waiter labels itself instead of leaving the field empty. Set and
-            // read on this task alone; it is an atomic only so the future stays `Send`.
-            let ran_walk = AtomicBool::new(false);
+            // The cell shares only the entry. The tier belongs to whoever ran the walk: it lands
+            // in this slot, which a waiter never touches, so a waiter reports itself as
+            // coalesced rather than borrowing the runner's tier.
+            let walked = OnceLock::new();
             let result = cell
-                .get_or_init(|| {
-                    ran_walk.store(true, Ordering::Relaxed);
-                    self.fetch_local_or_source(uri, storage_key, intent, offsets, storage)
+                .get_or_init(|| async {
+                    let (entry, tier) = self
+                        .fetch_local_or_source(uri, storage_key, intent, offsets, storage)
+                        .await?;
+                    let _ = walked.set(tier);
+                    Ok(entry)
                 })
                 .await;
-            if !ran_walk.load(Ordering::Relaxed) {
-                record("tier", "coalesced");
-            }
+            let tier = walked.get().copied().unwrap_or(OpenTier::Coalesced);
 
             // Remove only our own cell. A newer one belongs to a retry already in flight.
             self.coordinators
@@ -340,7 +336,7 @@ impl DiskCacheStore {
             match result {
                 // Joined a query's lazy walk. A Load needs the whole file, so walk again.
                 Ok(entry) if intent == ReadIntent::Load && !entry.has_whole_file() => continue,
-                Ok(entry) => return Ok(Arc::clone(entry)),
+                Ok(entry) => return Ok((Arc::clone(entry), tier)),
                 Err(_) => continue,
             }
         }
@@ -362,6 +358,7 @@ impl DiskCacheStore {
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         self.reader_tiered(uri, &uri.storage_path(), ReadIntent::Warm, None, None)
             .await
+            .map(|(reader, _)| reader)
     }
 
     /// Test shorthand for [`Self::reader_synchronous_with_storage`] using the cache's own storage:
