@@ -786,6 +786,21 @@ impl SuperfileReader {
         self.bytes.is_some() && self.source.is_none()
     }
 
+    /// Whether the stable-id sidecar is in the packed layout.
+    pub(crate) fn id_sidecar_is_packed(&self) -> bool {
+        self.id_sidecar_packed
+    }
+
+    /// Whole-file bytes, but only when every region of them is valid.
+    ///
+    /// `bytes` alone is not enough: a hybrid-promoted reader carries a
+    /// fill-file mmap whose vector region is left sparse, so a caller
+    /// copying blob ranges out of it would copy zeros. Gated on
+    /// [`Self::is_fully_resident`], which that promotion never satisfies.
+    pub(crate) fn whole_file_bytes(&self) -> Option<&Bytes> {
+        self.is_fully_resident().then_some(self.bytes.as_ref())?
+    }
+
     /// Install resident whole-file bytes on a lazily-opened reader so the
     /// synchronous parquet paths (`take_by_local_doc_ids`,
     /// `get_record_batch`, `id_lookup`) run main-style sync decodes instead

@@ -1,0 +1,16 @@
+# Writes one corpus table with the engine as it shipped in 0.8.3: the last
+# release before the term-block dictionary and short-form terms, so the
+# bounds are already in the scorer's scale and the coarse table is present.
+# Detached from the engine workspace (`[workspace]` below) so this pinned
+# dependency graph never takes part in resolving the engine's own.
+[package]
+name = "corpus-gen-0-8-3"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+# Exact: the point of this crate is the bytes this one release writes.
+infino = "=0.8.3"

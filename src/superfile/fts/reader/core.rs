@@ -506,6 +506,14 @@ pub struct FtsReader {
     /// How this blob lays out its term dictionary (front-coded blocks
     /// from `VERSION_V7`, an FST of packed values before).
     pub(super) dict_layout: DictLayout,
+    /// The blob version from the header, kept verbatim.
+    ///
+    /// The decode fields above carry everything the read path needs to
+    /// interpret the bytes, but each groups the versions that decode
+    /// alike — so together they still cannot say which version a file
+    /// actually is. A migration has to report and plan on that, hence
+    /// the raw number.
+    pub(super) version: u32,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
 }
@@ -945,6 +953,7 @@ impl FtsReader {
                 stopwords,
                 stemmer,
                 stored: col_cfg.stored,
+                analysis_rev: col_cfg.analysis_rev,
                 source: source.clone(),
                 n_docs,
                 doc_length_bytes,
@@ -978,6 +987,7 @@ impl FtsReader {
             positions_grouped,
             doc_length_bytes,
             has_bitset_blocks,
+            version,
             bounds,
             dict_layout,
             columns,

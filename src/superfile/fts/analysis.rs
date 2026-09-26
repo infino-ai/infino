@@ -184,6 +184,16 @@ pub(crate) const ENGLISH_STOPWORDS: &[&str] = &[
 const ENGLISH_STOPWORD_MAX_LEN: usize = 5;
 
 impl Stopwords {
+    /// This filter's analysis revision (see [`chain_revision`]).
+    ///
+    /// The shipped list has not changed since it was introduced, so a
+    /// column filtered by it holds the same terms it always did.
+    pub(crate) fn revision(self) -> u32 {
+        match self {
+            Self::None | Self::English => 0,
+        }
+    }
+
     /// Whether `token` — already lowercased by the base tokenizer, and
     /// not yet stemmed — is in this set.
     #[inline]
@@ -215,6 +225,20 @@ impl Base {
     /// no filters.
     pub(crate) fn name(self) -> &'static str {
         chain_name(self, Stopwords::None, Stemmer::None)
+    }
+
+    /// This base's analysis revision (see [`chain_revision`]).
+    ///
+    /// Both bases are at 1: the token-length cap applies to each, and
+    /// folding every entry point through one emitter changed what the
+    /// ASCII fast paths emitted. `Standard` also began emitting emoji as
+    /// tokens in the same change, which is a second reason for the same
+    /// bump rather than a separate revision — a revision numbers a
+    /// chain's output, not the changes that produced it.
+    pub(crate) fn revision(self) -> u32 {
+        match self {
+            Base::AsciiLower | Base::Standard => 1,
+        }
     }
 
     /// Resolve a base tokenizer name.
@@ -415,6 +439,30 @@ pub(crate) fn chain_name(base: Base, stopwords: Stopwords, stemmer: Stemmer) -> 
     }
 }
 
+/// The revision of the terms a chain emits.
+///
+/// A column's stored `tokenizer` name says *which* analysis produced its
+/// postings; it cannot say which **version** of that analysis, because a
+/// name does not change when the tokens behind it do. Two files can name
+/// `standard` and hold different terms for the same text, and nothing in
+/// the file distinguishes them — so a query analyzed by today's chain can
+/// look up a term an older index never wrote, and match nothing.
+///
+/// This number closes that gap: it is stamped per column and compared
+/// rather than inferred. Bump the component that actually moved whenever a
+/// change can alter the tokens a chain emits for any input — a new
+/// boundary rule, a different fold, a cap, a filter's word list. A change
+/// that cannot alter output (a faster path over identical tokens) leaves it
+/// alone.
+///
+/// The chain's revision is the highest of its parts, so adding a filter
+/// never lowers it and each part moves independently.
+pub(crate) fn chain_revision(base: Base, stopwords: Stopwords, stemmer: Stemmer) -> u32 {
+    base.revision()
+        .max(stopwords.revision())
+        .max(stemmer.revision())
+}
+
 /// Build the tokenizer for a chain: the bare base tokenizer when no
 /// filter is active, otherwise a [`ChainTokenizer`].
 ///
@@ -477,6 +525,16 @@ impl Stopwords {
 }
 
 impl Stemmer {
+    /// This filter's analysis revision (see [`chain_revision`]).
+    ///
+    /// The algorithm is Snowball English via `rust-stemmers`, unchanged
+    /// since it was introduced.
+    pub(crate) fn revision(self) -> u32 {
+        match self {
+            Self::None | Self::English => 0,
+        }
+    }
+
     /// The name this stemmer persists under; see
     /// [`Stopwords::as_str`].
     pub(crate) fn as_str(self) -> Option<&'static str> {

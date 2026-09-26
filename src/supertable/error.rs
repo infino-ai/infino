@@ -419,6 +419,41 @@ impl OpenError {
     }
 }
 
+/// Failures from [`crate::Supertable::reindex`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReindexError {
+    /// No durable storage backend is configured (e.g. `memory://`);
+    /// a reindex rewrites committed files, so it needs one.
+    #[error("reindex requires a storage backend")]
+    NoStorage,
+    /// Another compaction or reindex is already running in this process.
+    ///
+    /// Both reshape the same superfiles through the same slot, so they are
+    /// serialized rather than allowed to race. This is a signal to retry
+    /// later, not a failure of the migration.
+    #[error("a compaction or reindex is already running")]
+    AlreadyRunning,
+    /// Reading a superfile to decide whether it is stale failed.
+    #[error("failed to assess superfiles: {0}")]
+    Assess(String),
+    /// Rewriting one superfile failed. The migration stops here; the
+    /// superfiles already rewritten stay rewritten, and re-running picks
+    /// up what is left.
+    ///
+    /// The cause is carried as text rather than as the underlying error:
+    /// that type is internal, and exposing it here would make every
+    /// compaction failure mode part of the public surface for the sake of
+    /// one message.
+    #[error("failed to rewrite superfile {superfile_id}: {cause}")]
+    Rewrite {
+        /// The superfile whose rewrite failed.
+        superfile_id: uuid::Uuid,
+        /// What went wrong underneath.
+        cause: String,
+    },
+}
+
 /// Errors raised by [`crate::Supertable::optimize`].
 #[derive(Debug, thiserror::Error)]
 pub enum OptimizeError {

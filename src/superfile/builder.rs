@@ -73,6 +73,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
     io::{BufReader, BufWriter, Cursor, Error, Seek, SeekFrom, Write},
+    ops::Range,
     str::from_utf8,
     sync::Arc,
 };
@@ -92,12 +93,12 @@ use crate::{
             self,
             footer::{
                 EncodedBody, ParquetBodyEncoder, ParquetLayout, encode_parquet_body,
-                splice_index_streams_to,
+                read_kv_metadata, splice_carried_body_to, splice_index_streams_to,
             },
             kv,
         },
         fts::{
-            analysis::{Base, Stemmer, Stopwords, chain_name, chain_tokenizer},
+            analysis::{Base, Stemmer, Stopwords, chain_name, chain_revision, chain_tokenizer},
             bm25,
             builder::FtsBuilder,
             reader::{ColumnLengthStats, ColumnMeta},
@@ -138,6 +139,34 @@ enum PostingMerge {
 }
 
 /// Per-column FTS configuration. The `column` must exist in
+/// Which of a source superfile's FTS columns a rebuild copies postings
+/// for, rather than producing terms of its own.
+///
+/// A rebuild that re-analyzes text still has to carry the columns it
+/// cannot re-analyze: an index-only column's text was never written to the
+/// Parquet body, so nothing in the file can regenerate its terms. Those
+/// columns are copied across exactly as a plain merge copies them, and
+/// keep the analysis revision they were built at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarryScope {
+    /// Copy every column's postings. What a merge does: the output holds
+    /// the inputs' terms unchanged.
+    AllColumns,
+    /// Copy only the columns whose text is absent, and leave the rest for
+    /// the caller to re-analyze from the batch.
+    UnstoredOnly,
+}
+
+impl CarryScope {
+    /// Whether `column`'s postings are copied under this scope.
+    fn carries(self, column: &FtsConfig) -> bool {
+        match self {
+            Self::AllColumns => true,
+            Self::UnstoredOnly => !column.stored,
+        }
+    }
+}
+
 /// `BuilderOptions.schema` and be `LargeUtf8` (an unstored column may
 /// be absent — the merge-source shape).
 ///
@@ -194,6 +223,21 @@ pub struct FtsConfig {
     /// keeps the built bytes identical to a file written before the
     /// parameters were declarable.
     pub bm25: bm25::Bm25Params,
+    /// The analysis revision of postings **carried in** from an existing
+    /// file, when they were not produced by this build.
+    ///
+    /// `None` means this build analyzes the column's text itself, so the
+    /// column records the revision this engine's chain emits. `Some(rev)`
+    /// means the postings came from a file at `rev` and were copied
+    /// across unchanged — a merge, a container rewrite — so the column
+    /// must keep claiming `rev`.
+    ///
+    /// The distinction is the whole point of the field: a revision
+    /// describes the terms in the file, never the writer that last
+    /// touched it. Stamping this build's revision onto carried postings
+    /// would certify terms nothing re-analyzed, which is exactly the
+    /// silent mismatch the revision exists to detect.
+    pub carried_analysis_rev: Option<u32>,
 }
 
 impl FtsConfig {
@@ -208,6 +252,7 @@ impl FtsConfig {
             positions: false,
             stored: true,
             bm25: bm25::Bm25Params::STANDARD,
+            carried_analysis_rev: None,
         }
     }
 
@@ -234,6 +279,27 @@ impl FtsConfig {
     /// persisted; see [`crate::superfile::fts::analysis`].
     pub(crate) fn chain_name(&self) -> Option<&'static str> {
         Base::from_name(&self.analyzer).map(|b| chain_name(b, self.stopwords, self.stemmer))
+    }
+
+    /// Carry an existing file's analysis revision (see the field docs).
+    pub(crate) fn carried_analysis_rev(mut self, rev: u32) -> Self {
+        self.carried_analysis_rev = Some(rev);
+        self
+    }
+
+    /// The analysis revision this column records: whatever was carried
+    /// in, else the revision this engine's chain emits.
+    ///
+    /// An analyzer name this engine cannot resolve yields `0` rather than
+    /// an error — the build fails on the unknown name elsewhere, with a
+    /// message that names the column, and returning a revision here would
+    /// only obscure it.
+    pub(crate) fn analysis_rev(&self) -> u32 {
+        self.carried_analysis_rev.unwrap_or_else(|| {
+            Base::from_name(&self.analyzer)
+                .map(|b| chain_revision(b, self.stopwords, self.stemmer))
+                .unwrap_or(0)
+        })
     }
 
     /// Record token positions (see the field docs).
@@ -441,6 +507,60 @@ impl BuilderOptions {
         self
     }
 
+    /// Lower each FTS column's carried analysis revision to the lowest
+    /// any input holds.
+    ///
+    /// [`Self::new_from_reader`] takes the revisions of one input; a merge
+    /// has several, and they need not agree. The output holds the union of
+    /// their postings, so it is only as current as its *oldest* input —
+    /// taking the first input's revision, or this engine's, would certify
+    /// terms that came from an older chain.
+    ///
+    /// Recording the minimum rather than refusing the merge is deliberate.
+    /// A mixed-revision set cannot always be resolved by re-analyzing —
+    /// an index-only column has no text to re-analyze from — so refusing
+    /// would stop compaction outright on such a table, and forever. The
+    /// merge proceeds, the output stays honestly marked stale, and a
+    /// reindex that re-analyzes is the only thing that clears it.
+    ///
+    /// Columns are matched by name; a column the reader does not have is
+    /// left alone, since a shape mismatch is the carry compatibility
+    /// check's error to report, not this function's.
+    pub(crate) fn lower_analysis_rev_to(&mut self, reader: &SuperfileReader) {
+        let Some(fts) = reader.fts() else {
+            return;
+        };
+        for remote in fts.fts_columns_config() {
+            let Some(own) = self
+                .fts_columns
+                .iter_mut()
+                .find(|own| own.column == remote.name)
+            else {
+                continue;
+            };
+            let carried = own.analysis_rev().min(remote.analysis_rev);
+            own.carried_analysis_rev = Some(carried);
+        }
+    }
+
+    /// Clear the carried analysis revision on every column whose text is
+    /// stored, because the build is about to re-analyze it.
+    ///
+    /// The inverse of the rule in [`Self::new_from_reader`], and for the
+    /// same reason: a revision describes the terms in the file. A column
+    /// this build tokenizes itself holds this engine's terms and records
+    /// this engine's revision. An index-only column has no text to
+    /// tokenize, so it keeps whatever it carried in — and stays stale,
+    /// honestly.
+    pub(crate) fn reanalyze_stored_columns(mut self) -> Self {
+        for column in &mut self.fts_columns {
+            if column.stored {
+                column.carried_analysis_rev = None;
+            }
+        }
+        self
+    }
+
     /// See [`Self::fts_corpus_stats`].
     pub(crate) fn with_fts_corpus_stats(
         mut self,
@@ -479,6 +599,14 @@ impl BuilderOptions {
         // kept theirs, so one column would score two ways depending on
         // which superfile a document landed in — and a compaction, not
         // any user action, would be what changed the ranking.
+        //
+        // The analysis revision rides along too, and it is the one field
+        // here that must *not* take this engine's value. A rebuild copies
+        // postings; it does not re-analyze them. Letting the output record
+        // the current revision would certify terms produced by an older
+        // chain as current, and the file would then look migrated while
+        // still holding terms a query cannot reach — the exact failure the
+        // revision exists to surface.
         let fts_columns: Vec<FtsConfig> = if let Some(fts) = &reader.fts() {
             fts.fts_columns_config()
                 .map(|c| {
@@ -489,6 +617,7 @@ impl BuilderOptions {
                         .positions(c.positions)
                         .stored(c.stored)
                         .bm25(c.params.k1, c.params.b)
+                        .carried_analysis_rev(c.analysis_rev)
                 })
                 .collect()
         } else {
@@ -1029,8 +1158,24 @@ impl SuperfileBuilder {
         reader: &SuperfileReader,
         deleted: Option<&RoaringBitmap>,
     ) -> Result<(), BuildError> {
-        if let Some(remap) = self.carry_fts_doc_lengths(reader, deleted)? {
-            self.carry_fts_postings_with_remap(reader, &remap)?;
+        self.carry_fts_from_reader_scoped(reader, deleted, CarryScope::AllColumns)
+    }
+
+    /// As [`Self::carry_fts_from_reader`], carrying only the columns
+    /// `scope` selects.
+    ///
+    /// Only a rebuild that re-analyzes some columns needs this: it carries
+    /// the ones it cannot re-analyze and leaves the rest for the caller to
+    /// tokenize. Every merge carries everything and takes the entry point
+    /// above.
+    pub(crate) fn carry_fts_from_reader_scoped(
+        &mut self,
+        reader: &SuperfileReader,
+        deleted: Option<&RoaringBitmap>,
+        scope: CarryScope,
+    ) -> Result<(), BuildError> {
+        if let Some(remap) = self.carry_fts_doc_lengths(reader, deleted, scope)? {
+            self.carry_fts_postings_with_remap_scoped(reader, &remap, scope)?;
         }
         Ok(())
     }
@@ -1042,6 +1187,7 @@ impl SuperfileBuilder {
         &mut self,
         reader: &SuperfileReader,
         deleted: Option<&RoaringBitmap>,
+        scope: CarryScope,
     ) -> Result<Option<Vec<Option<u32>>>, BuildError> {
         // Config compatibility first, before any early return — a
         // presence or per-column mismatch must fail loud, never carry
@@ -1074,9 +1220,14 @@ impl SuperfileBuilder {
         }
 
         // Dense remap preserves input order, so the surviving lengths
-        // append in output order.
+        // append in output order. A column being re-analyzed recomputes
+        // its lengths from the tokens it emits, so carrying the input's
+        // would double-count it.
         let n_fts_columns = self.opts.fts_columns.len() as u32;
         for column_id in 0..n_fts_columns {
+            if !scope.carries(&self.opts.fts_columns[column_id as usize]) {
+                continue;
+            }
             let dls = fts.read_doc_lengths(column_id).map_err(|e| {
                 BuildError::Io(Error::other(format!(
                     "fts merge column {column_id}: read doc-lengths failed: {e}"
@@ -1111,6 +1262,17 @@ impl SuperfileBuilder {
         reader: &SuperfileReader,
         remap: &[Option<u32>],
     ) -> Result<(), BuildError> {
+        self.carry_fts_postings_with_remap_scoped(reader, remap, CarryScope::AllColumns)
+    }
+
+    /// As [`Self::carry_fts_postings_with_remap`], carrying only the
+    /// columns `scope` selects.
+    fn carry_fts_postings_with_remap_scoped(
+        &mut self,
+        reader: &SuperfileReader,
+        remap: &[Option<u32>],
+        scope: CarryScope,
+    ) -> Result<(), BuildError> {
         // Same compatibility gate as `carry_fts_from_reader`, so callers
         // that feed this directly (the multi-cell merge) get it too.
         let remote_cfg = reader
@@ -1122,6 +1284,9 @@ impl SuperfileBuilder {
         };
         let n_fts_columns = self.opts.fts_columns.len() as u32;
         for column_id in 0..n_fts_columns {
+            if !scope.carries(&self.opts.fts_columns[column_id as usize]) {
+                continue;
+            }
             let fb = self
                 .fts_builder
                 .as_mut()
@@ -1250,8 +1415,7 @@ impl SuperfileBuilder {
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts =
-            BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
+        let builder_opts = merge_builder_opts(readers, first, fts_corpus);
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         let vec_col = first
@@ -1340,8 +1504,7 @@ impl SuperfileBuilder {
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts =
-            BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
+        let builder_opts = merge_builder_opts(readers, first, fts_corpus);
         if builder_opts.vector_layout != VectorLayout::MultiCellIvf {
             return Err(BuildError::VectorSchemaMismatch(
                 "build_from_multi_cell_sq8_ivf_readers requires multi-cell inputs".into(),
@@ -1718,6 +1881,24 @@ impl SuperfileBuilder {
         reader: &SuperfileReader,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<SuperfileStats, BuildError> {
+        self.add_batch_from_reader_scoped(reader, deleted_docs_bitmap, CarryScope::AllColumns)
+    }
+
+    /// As [`Self::add_batch_from_reader`], but `scope` decides which FTS
+    /// columns are copied across and which are left to be re-analyzed
+    /// from the batch's own text.
+    ///
+    /// With [`CarryScope::UnstoredOnly`] the two halves compose exactly:
+    /// the carry copies the columns whose text is gone, and the batch
+    /// append tokenizes the ones still present — `index_fts_batch` skips
+    /// any column absent from the schema, which is precisely the set the
+    /// carry handled.
+    pub(crate) fn add_batch_from_reader_scoped(
+        &mut self,
+        reader: &SuperfileReader,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+        scope: CarryScope,
+    ) -> Result<SuperfileStats, BuildError> {
         self.opts.check_mergeability(
             reader.id_column(),
             reader.schema(),
@@ -1784,8 +1965,10 @@ impl SuperfileBuilder {
         // the merge is cheaper, byte-faithful to the input's index, and an
         // unstored column — whose text isn't in the batch at all — still
         // merges losslessly.
-        self.carry_fts_from_reader(reader, deleted_docs_bitmap.as_deref())?;
-        self.add_batch_inner(&record_batch, &slices, false)?;
+        self.carry_fts_from_reader_scoped(reader, deleted_docs_bitmap.as_deref(), scope)?;
+        // Re-analyze exactly what the carry left behind.
+        let index_fts = scope != CarryScope::AllColumns;
+        self.add_batch_inner(&record_batch, &slices, index_fts)?;
         Ok(superfile_stats)
     }
 
@@ -1815,8 +1998,7 @@ impl SuperfileBuilder {
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
 
-        let builder_opts =
-            BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
+        let builder_opts = merge_builder_opts(readers, first, fts_corpus);
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         let mut stats_collector = Vec::with_capacity(readers.len());
@@ -1874,8 +2056,7 @@ impl SuperfileBuilder {
         merge: PostingMerge,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts =
-            BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
+        let builder_opts = merge_builder_opts(readers, first, fts_corpus);
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         // Encode the Parquet body incrementally: each input's surviving rows are
@@ -1934,9 +2115,11 @@ impl SuperfileBuilder {
             // The term-by-term path carries only doc-lengths now; the finish
             // merges the postings.
             if merge == PostingMerge::TermByTerm {
-                if let Some(remap) =
-                    superfile_builder.carry_fts_doc_lengths(reader, deleted.as_deref())?
-                {
+                if let Some(remap) = superfile_builder.carry_fts_doc_lengths(
+                    reader,
+                    deleted.as_deref(),
+                    CarryScope::AllColumns,
+                )? {
                     sorted_inputs.push(SortedInput {
                         reader: Arc::clone(reader),
                         remap,
@@ -2136,6 +2319,111 @@ impl SuperfileBuilder {
         // body (empty ⇒ the id column wasn't available; reader falls back to
         // the Parquet id column).
         splice_body_and_blobs_to(body, fts_file, vec_file, ids_bytes, &kvs, output)
+    }
+
+    /// Rebuild the FTS index from `source`'s stored text, touching nothing
+    /// else.
+    ///
+    /// The FTS half of [`Self::add_batch_from_reader_scoped`] without the
+    /// body encode or the vector re-encode, for a build that carries both.
+    /// A column whose text was never stored has nothing to re-analyze, so
+    /// its postings are carried and it keeps the revision it came in at.
+    pub(crate) fn reanalyze_fts_from_reader(
+        &mut self,
+        source: &SuperfileReader,
+    ) -> Result<(), BuildError> {
+        self.carry_fts_from_reader_scoped(source, None, CarryScope::UnstoredOnly)?;
+        let batch = source
+            .get_record_batch(None)
+            .map_err(|_| BuildError::BatchReadError)?;
+        let n_rows = u32::try_from(batch.num_rows()).map_err(|_| BuildError::BatchReadError)?;
+        self.index_fts_batch(&batch, n_rows)
+    }
+
+    /// Record that `n_docs` rows were carried in without this builder
+    /// encoding them, so the finish sees the row count the body holds.
+    pub(crate) fn set_carried_doc_count(&mut self, n_docs: u64) {
+        self.next_local_doc_id = n_docs as u32;
+    }
+
+    /// Finish by carrying `source`'s Parquet body and vector subsection
+    /// verbatim, writing only a rebuilt FTS blob.
+    ///
+    /// Valid only when this build kept every one of `source`'s rows in
+    /// order: the body then describes the same rows it always did, and
+    /// because it lands at offset 0 in both files its row-group offsets
+    /// need no adjustment. The caller owns that precondition.
+    ///
+    /// Skips the decode and re-encode of every column — the dominant cost
+    /// of a rewrite, and pure waste when the rows are unchanged.
+    pub(crate) fn finish_carrying_body_to<W: Write>(
+        mut self,
+        source: &SuperfileReader,
+        output: W,
+    ) -> Result<ParquetLayout, BuildError> {
+        let bytes = source
+            .whole_file_bytes()
+            .ok_or_else(|| BuildError::Io(Error::other("carried body needs a resident source")))?;
+        let src_kv = read_kv_metadata(bytes).map_err(BuildError::Footer)?;
+        let region = |offset: &str, length: &str| -> Option<Range<usize>> {
+            let at: usize = src_kv.get(offset)?.parse().ok()?;
+            let len: usize = src_kv.get(length)?.parse().ok()?;
+            (len > 0).then_some(at..at + len)
+        };
+        // Splice order is body, FTS, vector, ids — so the FTS blob starts
+        // where the body ends.
+        let fts_region = region(kv::FTS_OFFSET, kv::FTS_LENGTH)
+            .ok_or_else(|| BuildError::Io(Error::other("carried body needs an FTS region")))?;
+        let body = bytes.slice(..fts_region.start);
+        let vec_bytes = region(kv::VEC_OFFSET, kv::VEC_LENGTH)
+            .map(|r| bytes.slice(r))
+            .unwrap_or_default();
+
+        // The ids sidecar is derived from rows this build never decoded, so
+        // it is carried too — re-packed when the source predates the packed
+        // layout, which is the upgrade a rewrite is expected to perform.
+        let raw_ids = region(kv::IDS_OFFSET, kv::IDS_LENGTH).map(|r| bytes.slice(r));
+        let ids_bytes: Vec<u8> = match (&raw_ids, source.id_sidecar_is_packed()) {
+            (Some(ids), true) => ids.to_vec(),
+            (Some(ids), false) => ids::encode_packed(ids),
+            (None, _) => Vec::new(),
+        };
+
+        let n_docs = self.next_local_doc_id as u64;
+        let fts_builder = self.fts_builder.take();
+        let mut kvs = superfile_kvs(&self.opts, n_docs, None)?;
+        // Every `inf.vec.*` key describes the blob being carried, including
+        // the multi-cell directory this build has no cells to regenerate.
+        kvs.retain(|(k, _)| !k.starts_with("inf.vec."));
+        kvs.extend(
+            src_kv
+                .iter()
+                .filter(|(k, _)| k.starts_with("inf.vec."))
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        if !ids_bytes.is_empty() {
+            kvs.push((
+                kv::IDS_LAYOUT.to_string(),
+                kv::IDS_LAYOUT_PACKED.to_string(),
+            ));
+        }
+
+        let (fts_file, _empty_vec) = stream_index_blobs_to_scratch(fts_builder, None, None, None)?;
+        let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
+        splice_carried_body_to(
+            Cursor::new(&body),
+            body.len() as u64,
+            source.parquet_metadata().as_ref().clone(),
+            BufReader::new(fts_file.reopen().map_err(BuildError::Io)?),
+            fts_length,
+            Cursor::new(&vec_bytes),
+            vec_bytes.len() as u64,
+            Cursor::new(&ids_bytes),
+            ids_bytes.len() as u64,
+            &kvs,
+            output,
+        )
+        .map_err(BuildError::Footer)
     }
 
     /// Finish the build and return the assembled superfile bytes.
@@ -2555,6 +2843,25 @@ fn fts_param_json(v: f32) -> String {
     format!("{v:?}")
 }
 
+/// Builder options for a merge: the first input's shape, with every FTS
+/// column's analysis revision lowered to the lowest any input holds.
+///
+/// A merge's output is only as re-analyzed as its oldest input, and
+/// `new_from_reader` can only see one — see
+/// [`BuilderOptions::lower_analysis_rev_to`].
+pub(crate) fn merge_builder_opts(
+    readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+    first: &(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>),
+    fts_corpus: &HashMap<String, ColumnLengthStats>,
+) -> BuilderOptions {
+    let mut opts =
+        BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
+    for (reader, _) in readers.iter().skip(1) {
+        opts.lower_analysis_rev_to(reader);
+    }
+    opts
+}
+
 fn fts_columns_json(cols: &[FtsConfig]) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
@@ -2597,6 +2904,15 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         // columns existed (the reader defaults a missing field to true).
         if !c.stored {
             s.push_str(r#","stored":false"#);
+        }
+        // Emitted only when non-zero, so an entry whose postings come
+        // from a file written before revisions existed stays
+        // byte-identical to what that file carried. A reader defaults a
+        // missing field to 0, which is what such a file means.
+        let analysis_rev = c.analysis_rev();
+        if analysis_rev != 0 {
+            s.push_str(r#","analysis_rev":"#);
+            s.push_str(&analysis_rev.to_string());
         }
         s.push('}');
     }
@@ -2979,6 +3295,153 @@ mod tests {
         assert!(!kv.contains_key("inf.fts.offset"));
     }
 
+    /// A build that analyzes its own text records the revision this
+    /// engine's chain emits, and a file whose postings predate the field
+    /// keeps recording nothing — the JSON stays byte-identical to what
+    /// such a file carried.
+    #[test]
+    fn analysis_rev_emitted_only_when_non_zero() {
+        let fresh = fts_columns_json(&[FtsConfig::new("title")]);
+        assert!(
+            fresh.contains(r#""analysis_rev":1"#),
+            "a freshly analyzed column records this engine's revision: {fresh}"
+        );
+
+        let carried = fts_columns_json(&[FtsConfig::new("title").carried_analysis_rev(0)]);
+        assert!(
+            !carried.contains("analysis_rev"),
+            "postings carried from a pre-revision file record no revision at all: {carried}"
+        );
+    }
+
+    /// Build one superfile, then rebuild it through the merge path with
+    /// itself as the only input.
+    fn rebuild_single(carried: Option<u32>) -> (u32, u32) {
+        let schema = schema_with_fts();
+        let mut col = FtsConfig::new("title");
+        if let Some(rev) = carried {
+            col = col.carried_analysis_rev(rev);
+        }
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![col], vec![]);
+        let mut b = SuperfileBuilder::new(opts).expect("new builder");
+        b.add_batch(&batch_two_rows(&schema), &[]).expect("add");
+        let source = Arc::new(
+            SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"),
+        );
+        let before = column_rev(&source);
+
+        let (bytes, _) =
+            SuperfileBuilder::build_from_readers_fts_merge(&[(Arc::clone(&source), None)])
+                .expect("rebuild");
+        let rebuilt = SuperfileReader::open(Bytes::from(bytes)).expect("open rebuilt");
+        (before, column_rev(&rebuilt))
+    }
+
+    fn column_rev(reader: &SuperfileReader) -> u32 {
+        reader
+            .fts()
+            .expect("fts blob")
+            .fts_columns_config()
+            .next()
+            .expect("one column")
+            .analysis_rev
+    }
+
+    /// Rewriting a file's container does not re-analyze its terms, so the
+    /// rebuilt file must keep claiming the revision its postings were
+    /// produced at.
+    ///
+    /// This is the assertion that catches the tempting mistake: the
+    /// rebuild runs on today's engine, so every other field it writes is
+    /// today's, and stamping the current revision here would mark a file
+    /// migrated while its terms are still the old chain's. The file would
+    /// then never be re-analyzed, and the recall loss it carries would be
+    /// permanent and invisible.
+    #[test]
+    fn a_rebuild_carries_the_revision_it_did_not_re_analyze() {
+        let (before, after) = rebuild_single(Some(0));
+        assert_eq!(before, 0, "the source stands in for a pre-revision file");
+        assert_eq!(
+            after, 0,
+            "a rebuild copies postings; it must not certify them as re-analyzed"
+        );
+    }
+
+    /// The same path on a current file leaves it current — the rule is
+    /// "carry what the postings are", not "always lower".
+    #[test]
+    fn a_rebuild_of_a_current_file_stays_current() {
+        let (before, after) = rebuild_single(None);
+        assert_eq!(before, 1);
+        assert_eq!(after, 1);
+    }
+
+    /// A merge whose inputs disagree records the lowest revision present
+    /// and merges anyway.
+    ///
+    /// Refusing instead would be the worse failure: an index-only column
+    /// cannot be re-analyzed at all, so a table holding one could never
+    /// compact again. The output is marked with what it actually holds
+    /// and stays queued for a reindex.
+    #[test]
+    fn a_mixed_revision_merge_takes_the_minimum_and_does_not_refuse() {
+        let schema = schema_with_fts();
+        let build = |carried: Option<u32>| {
+            let mut col = FtsConfig::new("title");
+            if let Some(rev) = carried {
+                col = col.carried_analysis_rev(rev);
+            }
+            let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![col], vec![]);
+            let mut b = SuperfileBuilder::new(opts).expect("new builder");
+            b.add_batch(&batch_two_rows(&schema), &[]).expect("add");
+            Arc::new(SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"))
+        };
+
+        let current = build(None);
+        let stale = build(Some(0));
+        assert_eq!((column_rev(&current), column_rev(&stale)), (1, 0));
+
+        let (bytes, _) = SuperfileBuilder::build_from_readers_fts_merge(&[
+            (Arc::clone(&current), None),
+            (Arc::clone(&stale), None),
+        ])
+        .expect("a mixed-revision merge must succeed, not refuse");
+        let merged = SuperfileReader::open(Bytes::from(bytes)).expect("open merged");
+        assert_eq!(
+            column_rev(&merged),
+            0,
+            "the output is only as re-analyzed as its oldest input"
+        );
+    }
+
+    /// The order of inputs does not decide the recorded revision.
+    #[test]
+    fn the_minimum_does_not_depend_on_input_order() {
+        let schema = schema_with_fts();
+        let build = |carried: Option<u32>| {
+            let mut col = FtsConfig::new("title");
+            if let Some(rev) = carried {
+                col = col.carried_analysis_rev(rev);
+            }
+            let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![col], vec![]);
+            let mut b = SuperfileBuilder::new(opts).expect("new builder");
+            b.add_batch(&batch_two_rows(&schema), &[]).expect("add");
+            Arc::new(SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"))
+        };
+        let current = build(None);
+        let stale = build(Some(0));
+
+        // Stale first: `new_from_reader` already sees 0 and the fold must
+        // not raise it back to the later input's 1.
+        let (bytes, _) = SuperfileBuilder::build_from_readers_fts_merge(&[
+            (Arc::clone(&stale), None),
+            (Arc::clone(&current), None),
+        ])
+        .expect("merge");
+        let merged = SuperfileReader::open(Bytes::from(bytes)).expect("open merged");
+        assert_eq!(column_rev(&merged), 0);
+    }
+
     #[test]
     fn fts_columns_json_round_trip_shape() {
         let cols = vec![FtsConfig::new("title"), FtsConfig::new("body")];
@@ -3005,12 +3468,14 @@ mod tests {
         let s = fts_columns_json(&cols);
         assert!(
             s.contains(
-                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}"#
+                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true,"analysis_rev":1}"#
             ),
             "positional column carries the flag: {s}"
         );
         assert!(
-            s.contains(r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}"#),
+            s.contains(
+                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_rev":1}"#
+            ),
             "positionless column carries no positions key at all: {s}"
         );
     }
@@ -3026,11 +3491,15 @@ mod tests {
         ];
         let s = fts_columns_json(&cols);
         assert!(
-            s.contains(r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}"#),
+            s.contains(
+                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_rev":1}"#
+            ),
             "title uses the standard analyzer: {s}"
         );
         assert!(
-            s.contains(r#"{"name":"body","tokenizer":"ascii_lower","k1":1.2,"b":0.75}"#),
+            s.contains(
+                r#"{"name":"body","tokenizer":"ascii_lower","k1":1.2,"b":0.75,"analysis_rev":1}"#
+            ),
             "body uses ascii_lower: {s}"
         );
     }
@@ -3045,12 +3514,14 @@ mod tests {
         ];
         let s = fts_columns_json(&cols);
         assert!(
-            s.contains(r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}"#),
+            s.contains(
+                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_rev":1}"#
+            ),
             "stored column carries no stored key at all: {s}"
         );
         assert!(
             s.contains(
-                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stored":false}"#
+                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stored":false,"analysis_rev":1}"#
             ),
             "index-only column carries the flag: {s}"
         );

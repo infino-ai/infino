@@ -1021,6 +1021,72 @@ pub enum RecalibratePolicy {
     Skip,
 }
 
+/// What a reindex repairs.
+///
+/// Two repairs, because two independent things go out of date and they
+/// cost very different amounts. Naming them separately keeps the
+/// expensive one an explicit choice rather than something a caller pays
+/// for by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReindexMode {
+    /// Bring each superfile's index into the current on-disk layout,
+    /// keeping its terms.
+    ///
+    /// Cheap: postings are copied, not rebuilt. Recovers the pruning the
+    /// newer layout allows. Does not fix terms produced by an older
+    /// analyzer — nothing that copies postings can.
+    #[default]
+    Rewrite,
+    /// Rebuild terms by re-analyzing the text each superfile stored, and
+    /// bring the layout current as a side effect.
+    ///
+    /// Expensive: every document is tokenized again and every index
+    /// rebuilt. This is what repairs a table whose terms predate a change
+    /// in how text is analyzed — a query analyzed one way cannot find
+    /// terms written another. Columns whose text was never stored cannot
+    /// be repaired and are reported.
+    Reanalyze,
+}
+
+/// Knobs for [`crate::Supertable::reindex`].
+///
+/// Only the seal timeout, because a reindex has nothing else to decide: it
+/// rewrites every stale superfile, one in and one out, so there is no
+/// target size to pack toward and no fill threshold to clear. Taking
+/// [`CompactionSettings`] instead would hand a caller three knobs the
+/// operation ignores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReindexOptions {
+    /// What to repair. Defaults to [`ReindexMode::Rewrite`], the cheap
+    /// one — re-analyzing a corpus is not something a caller should get
+    /// without asking.
+    pub mode: ReindexMode,
+    /// How old a sealed tombstone sidecar has to be, in milliseconds,
+    /// before a rewrite treats it as abandoned and takes it over. Shared
+    /// meaning with [`CompactionSettings::stale_seal_timeout_ms`] — the
+    /// seal is the same guard, and a reindex job takes it the same way.
+    pub stale_seal_timeout_ms: u64,
+}
+
+impl Default for ReindexOptions {
+    fn default() -> Self {
+        Self {
+            mode: ReindexMode::Rewrite,
+            stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
+        }
+    }
+}
+
+impl ReindexOptions {
+    /// Re-analyze stored text rather than only rewriting the layout.
+    pub fn reanalyzing() -> Self {
+        Self {
+            mode: ReindexMode::Reanalyze,
+            ..Self::default()
+        }
+    }
+}
+
 /// Persistent storage backend selected by [`StorageSettings`].
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]

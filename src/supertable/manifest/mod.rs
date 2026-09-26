@@ -1729,6 +1729,22 @@ impl ManifestSnapshot {
         self.list.as_ref().map(|l| &l.superseded_cells)
     }
 
+    /// Stamp `id`'s tombstone seq to this manifest's own id, so the
+    /// manifest that publishes a superfile also makes its sidecar visible.
+    ///
+    /// The seq map is what makes a sidecar exist for readers: an absent
+    /// entry means "no tombstones" and the sidecar is never fetched.
+    pub(crate) fn register_tombstone_sidecar(&mut self, id: Option<Uuid>) {
+        let Some(id) = id else {
+            return;
+        };
+        let Some(list) = self.list.as_mut() else {
+            debug_assert!(false, "a sidecar was written for a manifest with no list");
+            return;
+        };
+        list.tombstone_seqs.insert(id, list.manifest_id);
+    }
+
     /// Build a successor manifest identical to `self` except that every
     /// superfile in `touched` has its tombstone seq set to the successor's
     /// `manifest_id`. This is the mutation pipeline's post-sidecar stamp:

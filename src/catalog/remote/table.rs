@@ -20,8 +20,10 @@ use serde_json::{Value, json};
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
     Bm25SearchOptions, Bm25Stats, BoolMode, GcError, GcReport, InfinoError, MutationStats,
-    OptimizeError, OptimizeOptions, VectorFilter, catalog::table::Table,
+    OptimizeError, OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
+    catalog::table::Table,
     superfile::VectorSearchOptions,
+    supertable::reindex::{ReindexReport, StalenessReport},
 };
 
 /// A hosted table handle. Holds its `RemoteCatalog`, the table name, and the
@@ -300,6 +302,21 @@ impl Table for RemoteTable {
         // Compaction on a hosted table is the platform optimizer's job, not a
         // client's; it is deliberately not exposed over the remote transport.
         Err(OptimizeError::NoStorage)
+    }
+
+    fn reindex(&self, _opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
+        // A reindex rewrites committed superfiles in place, which is the
+        // hosted side's job for the same reason compaction is: it needs the
+        // storage backend and the writer slot, neither of which a client
+        // holds. Deliberately not exposed over the remote transport.
+        Err(ReindexError::NoStorage)
+    }
+
+    fn index_staleness(&self) -> Result<StalenessReport, ReindexError> {
+        // Reads every superfile's index metadata off the storage backend a
+        // client does not hold. Server-side for the same reason the
+        // reindex it describes is.
+        Err(ReindexError::NoStorage)
     }
 
     fn gc(&self, _safety_gap: Duration) -> Result<GcReport, GcError> {

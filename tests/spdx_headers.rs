@@ -11,6 +11,11 @@ use std::path::{Path, PathBuf};
 const EXPECTED_SPDX: &str = "// SPDX-License-Identifier: Apache-2.0";
 /// Crate subtrees scanned for source files.
 const SCAN_DIRS: &[&str] = &["src", "benches", "examples", "tests"];
+/// Directory name holding build output, skipped wherever it appears. The
+/// corpus generators are their own cargo crates under `tests/`, so their
+/// `target/` trees sit inside a scanned subtree and hold generated
+/// third-party sources this gate has no claim over.
+const BUILD_OUTPUT_DIR: &str = "target";
 /// How many leading lines may precede the SPDX line (shebang / blank
 /// lines / tooling directives); the header is always at the very top in
 /// this repo, so a small window is plenty.
@@ -23,6 +28,12 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            if path
+                .file_name()
+                .is_some_and(|name| name == BUILD_OUTPUT_DIR)
+            {
+                continue;
+            }
             collect_rs_files(&path, out);
         } else if path.extension().is_some_and(|ext| ext == "rs") {
             out.push(path);
