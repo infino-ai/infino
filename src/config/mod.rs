@@ -310,8 +310,10 @@ const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
 const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 8.0;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
-/// Default fine-cluster fanout for `ivf_router = centroid_graph`.
-const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
+/// Default fine-cluster fanout for `ivf_router = centroid_graph`. `0` means
+/// "use the per-table stamped `fanout_for_k`" (auto-calibrated at drain); a
+/// non-zero value overrides that stamp for the whole table.
+const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 0;
 /// Default exact-rerank over-fetch for `ivf_router = centroid_graph` —
 /// the measured knee; scoped to this path so it never shifts the stamped,
 /// filtered, or user-table defaults.
@@ -674,8 +676,10 @@ pub struct VectorSettings {
     /// Ignored under `search_mode = hnsw_ivf`.
     pub ivf_router: IvfRouter,
     /// For `ivf_router = centroid_graph`: number of fine clusters the query
-    /// reads (globally scored, clamped to the table's total). See `config.yaml`
-    /// for sizing guidance. Ignored otherwise.
+    /// reads (globally scored, clamped to the table's total). `0` (default)
+    /// uses the per-table stamped `fanout_for_k` (auto-calibrated at drain); a
+    /// non-zero value overrides the stamp for the whole table (manual tuning /
+    /// fanout sweeps). See `config.yaml` for sizing guidance. Ignored otherwise.
     pub global_fine_fanout: usize,
     /// For `ivf_router = centroid_graph`: the exact-rerank over-fetch
     /// multiplier for this path specifically (a caller-set `rerank_mult`

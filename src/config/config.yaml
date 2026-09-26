@@ -222,10 +222,11 @@ vector:
   # For ivf_router = centroid_graph: the NUMBER of fine clusters the
   # query fans out to (globally scored), clamped to the table's cluster
   # total. Higher reads more clusters — more cold bytes, higher recall.
-  # 1024 is the ~0.99 point at 10M; it over-serves smaller tables and
-  # under-serves larger ones (the fanout for a recall target grows ~sqrt(N)),
-  # pending a per-table calibrated stamp. Ignored under ivf_router = stamped.
-  global_fine_fanout: 1024
+  # 0 (default) uses the per-table stamped fanout_for_k (auto-calibrated at
+  # drain, grows ~sqrt(N) with scale); a non-zero value overrides that stamp
+  # for the whole table (manual tuning / fanout sweeps). Ignored under
+  # ivf_router = stamped.
+  global_fine_fanout: 0
 
   # For ivf_router = centroid_graph: exact-rerank over-fetch multiplier
   # for this path only (a caller-set rerank_mult still wins). Scoped here so

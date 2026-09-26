@@ -2118,6 +2118,16 @@ impl SupertableWriter {
                         &self.inner.query_runtime(),
                     )
                 });
+            match &fine_assign {
+                Some(_) => tracing::info!(
+                    target: "infino::gfc",
+                    "drain placement: fine-centroid router ENGAGED (rows placed by nearest fine centroid)"
+                ),
+                None => tracing::info!(
+                    target: "infino::gfc",
+                    "drain placement: fell back to coarse cell grid (no fine router — first drain / no section)"
+                ),
+            }
             // Pipelined publish on storage-backed tables: shards stream
             // to the uploader as each finishes packing, so the commit
             // pays ~max(pack, PUT) instead of pack + PUT. The manifest

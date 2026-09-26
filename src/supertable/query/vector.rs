@@ -944,7 +944,12 @@ pub(crate) fn select_eager_router_column(
         ivf_router,
         config::IvfRouter::CentroidGraph | config::IvfRouter::Auto
     );
-    if search_mode != config::VectorSearchMode::Ivf || !router_engaged || global_fine_fanout == 0 {
+    // `global_fine_fanout == 0` no longer means "off" — it means "use the
+    // per-table stamped fanout" (auto-calibrated). Whether the router engages is
+    // decided by `ivf_router` alone, so do not gate the eager build on the
+    // fanout value.
+    let _ = global_fine_fanout;
+    if search_mode != config::VectorSearchMode::Ivf || !router_engaged {
         return None;
     }
     vector_columns.first().map(|vc| vc.column.clone())
@@ -4743,17 +4748,29 @@ impl SupertableReader {
         // The centroid router scores per the column's configured metric
         // (Cosine unit-normalizes and ranks by −dot; NegDot ranks by raw −dot;
         // L2Sq by squared distance), so it engages for any metric.
-        // Per-table calibrated fanout wins over the scale-blind
-        // `vector.global_fine_fanout` constant: a drain stamps `width × fine`
-        // (clamped to the table's cluster count) per k, so a ~1M table no
-        // longer over-reads to a full scan. A table stamped before this feature
-        // (or with the router off at drain) has no stamp and falls back to the
-        // constant. There is no caller-set fanout knob, so precedence is
-        // stamp-then-constant.
+        // Fanout precedence: an explicit `vector.global_fine_fanout` (> 0)
+        // overrides everything (manual tuning / fanout sweeps); otherwise the
+        // per-table calibrated `fanout_for_k` stamp wins — a drain stamps
+        // `width × fine` (clamped to the table's cluster count) per k, so a
+        // ~1M table no longer over-reads to a full scan. A table with neither
+        // (config 0 and no stamp — router off at drain) yields 0 and skips the
+        // global-fine path below.
         let stamped_fanout = manifest
             .vector_cell_routing()
             .and_then(|routing| routing.fanout_for_k_at(k));
-        let resolved_fanout = stamped_fanout.unwrap_or(vcfg.global_fine_fanout);
+        let resolved_fanout = if vcfg.global_fine_fanout > 0 {
+            vcfg.global_fine_fanout
+        } else {
+            stamped_fanout.unwrap_or(0)
+        };
+        tracing::info!(
+            target: "infino::gfc",
+            stamped_fanout = ?stamped_fanout,
+            config_fanout = vcfg.global_fine_fanout,
+            resolved_fanout,
+            k,
+            "gfc fanout resolved"
+        );
         // `auto` picks the router per hidden-vector table by scale +
         // concentration; explicit `stamped` / `centroid_graph` are honored
         // verbatim (no gating). The per-table inputs are resident (no I/O) and
@@ -7684,10 +7701,12 @@ mod tests {
             select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::Stamped, 32, &cols),
             None,
         );
-        // Gated off: fanout of zero.
+        // Fanout of zero no longer gates off — it means "use the per-table
+        // stamped fanout", so the router still engages and is pre-warmed.
         assert_eq!(
-            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, 0, &cols),
-            None,
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, 0, &cols)
+                .as_deref(),
+            Some("nd"),
         );
         // Gated off: the HNSW search mode serves via its own graph.
         assert_eq!(
