@@ -12,7 +12,7 @@
 //! eagerly at `open()`; per-query work happens on demand.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt,
     ops::Range,
     sync::{
@@ -3366,7 +3366,7 @@ impl VectorReader {
             budget,
         };
         let (hits, mut tally) = self
-            .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
+            .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen, None)
             .await?;
         tally.kernel_cpu_ns += rot_ns;
         // The centroid + cluster-index span above was one planned range.
@@ -3452,7 +3452,7 @@ impl VectorReader {
             budget,
         };
         let (hits, mut tally) = self
-            .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
+            .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen, None)
             .await?;
         tally.kernel_cpu_ns += rot_ns;
         // The cluster-index fetch above was one planned range.
@@ -3615,7 +3615,7 @@ impl VectorReader {
                     budget,
                 };
                 let (hits, mut tally) = self
-                    .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
+                    .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals, None)
                     .await?;
                 // Each probed cell fetched its own cluster index above.
                 tally.ranges_requested += 1;
@@ -3673,6 +3673,14 @@ impl VectorReader {
     ///   as [`Self::search_clusters_async`] does, under the width-divided
     ///   `cold_rerank_mult` — deferring a cold cell would hold its fetched
     ///   blocks and budget reservation across the whole fan-out.
+    ///
+    /// `clusters` names the flat clusters to FETCH; `score_only`, when set,
+    /// names the subset to SCORE. They differ only under
+    /// `vector.global_fine_coalesce`, which widens each cell's selection to a
+    /// contiguous `[min..max]` span in `clusters` so the gap clusters ride one
+    /// larger read, while `score_only` carries the originally selected clusters
+    /// so the gap clusters are fetched but never admitted or reranked. Pass
+    /// `score_only = None` to score every fetched cluster.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn search_clusters_scan_async(
         &self,
@@ -3680,6 +3688,7 @@ impl VectorReader {
         query: &[f32],
         k: usize,
         clusters: &[u32],
+        score_only: Option<&[u32]>,
         rerank_mult: usize,
         cold_rerank_mult: usize,
         allow: Option<Arc<RoaringBitmap>>,
@@ -3744,6 +3753,41 @@ impl VectorReader {
         if per_cell.is_empty() {
             return Ok(outcome);
         }
+        // Resolve the coalesce score set to per-cell local cluster ids, mirroring
+        // how `per_cell` was keyed above: a fetched span is scored down to only
+        // these clusters. `None` scores every fetched cluster.
+        let score_by_cell: Option<HashMap<usize, Arc<HashSet<usize>>>> = score_only.map(|sel| {
+            let mut m: HashMap<usize, HashSet<usize>> = HashMap::new();
+            if self.is_multi_cell() {
+                for &flat in sel {
+                    if let Some((cell_idx, local)) = self.resolve_flat_cluster(flat) {
+                        m.entry(cell_idx).or_default().insert(local as usize);
+                    }
+                }
+            } else if let Some(&cid) = self.column_id_by_name.get(column) {
+                m.entry(cid as usize)
+                    .or_default()
+                    .extend(sel.iter().map(|&f| f as usize));
+            }
+            // Drift guards for the two keyings (`per_cell` groups the FETCH by
+            // the same resolution). A selected flat that fails to resolve would
+            // silently never score — lost recall; a score key outside the
+            // fetched cells would mean the two resolutions disagree. A fetched
+            // cell with NO entry is neither: a span's gap-only cell scores
+            // nothing, which is the span doing its job.
+            debug_assert_eq!(
+                m.values().map(|set| set.len()).sum::<usize>(),
+                sel.iter().collect::<HashSet<_>>().len(),
+                "a selected flat cluster failed to resolve into the score set"
+            );
+            debug_assert!(
+                m.keys()
+                    .all(|cell| per_cell.iter().any(|(c, _, _)| c == cell)),
+                "score set keyed to a cell the fetch does not cover"
+            );
+            // `Arc` so each probed cell clones a pointer, not the set.
+            m.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()
+        });
         // Estimates pool cross-superfile keyed by this seed; report the
         // REQUESTED column's seed (every cell of one column shares it),
         // not `columns[0]`'s — a multi-column file's first column can be
@@ -3786,6 +3830,13 @@ impl VectorReader {
             if cell_allow.as_ref().is_some_and(|bm| bm.is_empty()) {
                 return None;
             }
+            // Clusters to SCORE in this cell (coalesce fetches a wider span);
+            // `None` scores every fetched cluster. A cell absent from the map
+            // holds only gap clusters — it was fetched for read contiguity and
+            // scores nothing. The drift cases are asserted at the map build.
+            let cell_score: Option<Arc<HashSet<usize>>> = score_by_cell
+                .as_ref()
+                .map(|m| m.get(&cell_idx).map(Arc::clone).unwrap_or_default());
             let pool = pool.clone();
             let budget = budget.clone();
             Some(async move {
@@ -3801,7 +3852,7 @@ impl VectorReader {
                 // Per-cell metadata assembly: a pass over this cell's chosen
                 // clusters, on the worker that probes it. Scales with probe
                 // width, so at a wide sweep it is paid once per cell.
-                let ((cluster_meta, prefix_ranges), meta_ns) =
+                let ((mut cluster_meta, prefix_ranges), meta_ns) =
                     timed_section(|| chosen_cluster_meta(col, &cluster_idx, &locals));
                 if cluster_meta.is_empty() {
                     // The cluster-index read itself was one planned range,
@@ -3814,14 +3865,18 @@ impl VectorReader {
                     return Ok((Vec::new(), Vec::new(), tally));
                 }
                 // Work-stats tallies, taken before the warm/cold branch so
-                // both arms count the codes their clusters hold. Ranges:
-                // the cluster index plus one per prefix span (the warm
-                // arm's fetches; the cold arm's whole-cluster blocks are
-                // one range per chosen cluster, the same count).
+                // both arms count the codes their clusters hold. Candidates:
+                // only the SCORED clusters — coalesce fetches the gap clusters
+                // but never scans them. Ranges: the cluster index plus one per
+                // prefix span (the warm arm's fetches; the cold arm's
+                // whole-cluster blocks are one range per fetched cluster, the
+                // same count), so they follow the fetched span, not the scored
+                // subset.
                 let mut tally = ProbeTally {
                     cells_scanned: 1,
                     candidates_scanned: cluster_meta
                         .iter()
+                        .filter(|&&(c, _, _)| cell_score.as_deref().is_none_or(|s| s.contains(&c)))
                         .map(|(_, _, cnt)| u64::from(*cnt))
                         .sum(),
                     ranges_requested: 1 + prefix_ranges.len() as u64,
@@ -3841,7 +3896,12 @@ impl VectorReader {
                 });
                 tally.kernel_cpu_ns += fetch_ns;
                 let rabitq_only = matches!(col.rerank_codec, RerankCodec::RabitqOnly);
-                if let (Some(blocks), false) = (prefix_blocks, rabitq_only) {
+                if let (Some(mut blocks), false) = (prefix_blocks, rabitq_only) {
+                    // Fetched the coalesced span; scan only the selected
+                    // clusters. Dropping the gap clusters here keeps
+                    // `scan_shortlist` unchanged and its survivor heap free of
+                    // rows that carry no recall benefit.
+                    retain_scored_clusters(&mut cluster_meta, &mut blocks, cell_score.as_deref());
                     let ctx = ProbeCtx {
                         q_rot: q_rot_shared,
                         k,
@@ -3894,7 +3954,14 @@ impl VectorReader {
                     budget,
                 };
                 let (hits, probe_tally) = self
-                    .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
+                    .probe_clusters_async(
+                        col,
+                        query,
+                        &ctx,
+                        &cluster_idx,
+                        &locals,
+                        cell_score.as_deref(),
+                    )
                     .await?;
                 // Only the rerank rows come from the probe: this scan
                 // already counted the cell, its candidates, and its
@@ -4142,6 +4209,13 @@ impl VectorReader {
     /// Returns the hits plus the number of rows the probe reranked at
     /// full precision (0 on the `RabitqOnly` and empty-shortlist paths),
     /// for the per-query work stats.
+    ///
+    /// `chosen` names the clusters to FETCH; `score_only`, when set, restricts
+    /// scoring/rerank to that subset of the fetched clusters. They differ only
+    /// on the coalesced global-fine path, where `chosen` is a contiguous span
+    /// and `score_only` is the originally selected clusters — the gap clusters
+    /// are fetched (one larger read) but never admitted. `None` scores every
+    /// fetched cluster.
     async fn probe_clusters_async(
         &self,
         col: &ColumnReader,
@@ -4149,9 +4223,10 @@ impl VectorReader {
         ctx: &ProbeCtx<'_>,
         cluster_idx: &[u8],
         chosen: &[usize],
+        score_only: Option<&HashSet<usize>>,
     ) -> Result<(Vec<(u32, f32)>, ProbeTally), VectorError> {
         let cb = col.quant.code_bytes();
-        let ((cluster_meta, cluster_prefix_ranges), meta_ns) =
+        let ((mut cluster_meta, cluster_prefix_ranges), meta_ns) =
             timed_section(|| chosen_cluster_meta(col, cluster_idx, chosen));
         if cluster_meta.is_empty() {
             // The metadata walk was real work; keep its CPU on the tally.
@@ -4190,7 +4265,7 @@ impl VectorReader {
         // reserve nothing.
         let mut _cold_guard: Option<Reservation> = None;
 
-        let (cluster_blocks, lazy_sq8_meta_bytes, survivor_only_rerank_fetch) =
+        let (mut cluster_blocks, lazy_sq8_meta_bytes, survivor_only_rerank_fetch) =
             if let Some(prefix_blocks) = prefix_blocks_sync {
                 // Warm: prefixes resident. Keep the survivor-only rerank
                 // split — the survivor `full[]` rows resolve sync/zero-copy
@@ -4264,6 +4339,17 @@ impl VectorReader {
                 (blocks, meta, false)
             };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
+
+        // Fetched the (possibly coalesced) cluster span; scan only the selected
+        // clusters. Dropping the gap clusters keeps `build_shortlist` and the
+        // survivor rerank free of rows that carry no recall benefit.
+        retain_scored_clusters(&mut cluster_meta, &mut cluster_blocks, score_only);
+        if score_only.is_some() {
+            tally.candidates_scanned = cluster_meta.iter().map(|&(_, _, cnt)| u64::from(cnt)).sum();
+        }
+        if cluster_meta.is_empty() {
+            return Ok((Vec::new(), tally));
+        }
 
         // Shared pure-CPU shortlist + candidate-build stage (see
         // [`build_shortlist`]); only the survivor-row fetch below
@@ -4561,6 +4647,38 @@ fn chosen_cluster_meta(
         cluster_meta.push((c, off, cnt));
     }
     (cluster_meta, prefix_ranges)
+}
+
+/// Drop the gap clusters a coalesced read pulled in, keeping metadata and
+/// fetched blocks in lockstep.
+///
+/// Under `vector.global_fine_coalesce` a cell's selected clusters are widened
+/// to their contiguous `[min..max]` id span so the unselected clusters between
+/// them ride one larger read instead of scattered per-cluster GETs. That span
+/// is an I/O plan only: the bytes are fetched, but only the originally selected
+/// clusters are scored and reranked. Given the fetched span in cluster order,
+/// this keeps every cluster whose local id is in `score_only` and discards the
+/// rest — from both `cluster_meta` and `cluster_blocks` — before the scan.
+/// `score_only == None` keeps the whole fetched set (the non-coalesced path).
+fn retain_scored_clusters(
+    cluster_meta: &mut Vec<(usize, u32, u32)>,
+    cluster_blocks: &mut Vec<Bytes>,
+    score_only: Option<&HashSet<usize>>,
+) {
+    let Some(selected) = score_only else {
+        return;
+    };
+    debug_assert_eq!(cluster_meta.len(), cluster_blocks.len());
+    let mut meta_out = Vec::with_capacity(cluster_meta.len());
+    let mut blocks_out = Vec::with_capacity(cluster_blocks.len());
+    for (meta, block) in cluster_meta.drain(..).zip(cluster_blocks.drain(..)) {
+        if selected.contains(&meta.0) {
+            meta_out.push(meta);
+            blocks_out.push(block);
+        }
+    }
+    *cluster_meta = meta_out;
+    *cluster_blocks = blocks_out;
 }
 
 /// Wave cap for concurrent per-cell probes: the pool's width — the same
@@ -10290,6 +10408,7 @@ mod tests {
                 &all[7],
                 k,
                 &clusters,
+                None,
                 rerank_mult,
                 rerank_mult,
                 None,
@@ -10313,6 +10432,199 @@ mod tests {
             immediate.0, deferred,
             "deferred scan+select+rerank must equal the immediate probe's top-k"
         );
+    }
+
+    /// Coalesce (`vector.global_fine_coalesce`) is an I/O plan only: it fetches
+    /// each cell's selected clusters as one contiguous `[min..max]` span so the
+    /// unselected gap clusters ride a single larger read, but scoring and rerank
+    /// stay on the originally selected clusters. This asserts the gap clusters
+    /// are NOT admitted — `search_clusters_scan_async` fetches the whole span
+    /// yet only the selected clusters reach the candidate pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesce_span_fetches_gap_but_scores_only_selected() {
+        let n_cent = 8usize;
+        let (blob, json, all) =
+            build_large_corpus(16, n_cent, 2600, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let q = &all[7];
+        let k = 25usize;
+        // Undivided budget (k * rerank_mult >= corpus): the warm deferred scan
+        // truncates nothing, so every scored cluster contributes candidates.
+        let rerank_mult = 128usize;
+        let full_span: Vec<u32> = (0..n_cent as u32).collect();
+
+        // Baseline: score the whole fetched span. Each candidate is tagged with
+        // the cluster it was scored from, so this reveals the non-empty probed
+        // clusters.
+        let baseline = r
+            .search_clusters_scan_async(
+                "v",
+                q,
+                k,
+                &full_span,
+                None,
+                rerank_mult,
+                rerank_mult,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("baseline scan");
+        assert!(
+            baseline.hits.is_empty(),
+            "a fully-resident reader defers every cell (no cold hits)"
+        );
+        let present: BTreeSet<u32> = baseline.candidates.iter().map(|c| c.cluster_id).collect();
+        assert!(
+            present.len() >= 3,
+            "need >=3 non-empty clusters so the span has a gap, got {present:?}"
+        );
+
+        // Select the lowest and highest non-empty clusters; every non-empty
+        // cluster between them is a gap the coalesced span fetches but must not
+        // score.
+        let selected: Vec<u32> = vec![
+            *present.iter().next().expect("min present"),
+            *present.iter().next_back().expect("max present"),
+        ];
+        let gap: Vec<u32> = present
+            .iter()
+            .copied()
+            .filter(|c| !selected.contains(c))
+            .collect();
+        assert!(
+            !gap.is_empty(),
+            "the span between the selected clusters must contain a gap"
+        );
+
+        // Fetch the same span, but score only the selected clusters.
+        let scoped = r
+            .search_clusters_scan_async(
+                "v",
+                q,
+                k,
+                &full_span,
+                Some(&selected),
+                rerank_mult,
+                rerank_mult,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("scoped scan");
+        let scored: BTreeSet<u32> = scoped.candidates.iter().map(|c| c.cluster_id).collect();
+
+        // Only the selected clusters are admitted.
+        for c in &scored {
+            assert!(
+                selected.contains(c),
+                "cluster {c} leaked into scoring; selected={selected:?}"
+            );
+        }
+        // The gap clusters were fetched but never scored.
+        for g in &gap {
+            assert!(
+                !scored.contains(g),
+                "gap cluster {g} was scored under coalesce; it must be fetch-only"
+            );
+        }
+        // The selected clusters still produce candidates (fetch + score intact).
+        for s in &selected {
+            assert!(
+                scored.contains(s),
+                "selected cluster {s} produced no candidates"
+            );
+        }
+        // Scoping to the selected clusters cuts the scanned work: fewer
+        // candidates in the pool, and the work-stat counts only what was scored,
+        // not the fetched span.
+        assert!(
+            scoped.candidates.len() < baseline.candidates.len(),
+            "scoping must scan fewer candidates ({} vs {})",
+            scoped.candidates.len(),
+            baseline.candidates.len()
+        );
+        assert!(
+            scoped.candidates_scanned < baseline.candidates_scanned,
+            "candidates_scanned must count only the selected clusters ({} vs {})",
+            scoped.candidates_scanned,
+            baseline.candidates_scanned
+        );
+    }
+
+    /// The multi-cell arm of the coalesce score set: `score_only` carries FLAT
+    /// cluster ids, and the scan must resolve them to `(cell, local)` the same
+    /// way the fetch keying does. The fixture packs two cells (tags 7 and 15,
+    /// two clusters each, rows in each cell's local cluster 0), so flats 0 and
+    /// 2 hold rows. Scoping to one cell's flat must surface that cell's rows
+    /// only — a keying slip would score the wrong cell or nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesce_score_only_resolves_flat_ids_per_cell_on_packed_files() {
+        let (blob, json) = build_multi_cell_blob();
+        let r = VectorReader::open(blob.into(), &json).expect("open");
+        assert!(r.is_multi_cell(), "fixture must be a v2 packed file");
+        let q = vec![0.0f32; 16];
+        let fetch: Vec<u32> = (0..4).collect();
+
+        // Baseline over the whole span: both cells contribute.
+        let baseline = r
+            .search_clusters_scan_async(
+                "embedding",
+                &q,
+                5,
+                &fetch,
+                None,
+                8,
+                8,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("baseline scan");
+        let cells: BTreeSet<usize> = baseline.candidates.iter().map(|c| c.cell_idx).collect();
+        assert_eq!(
+            cells.len(),
+            2,
+            "fixture sanity: candidates from both packed cells, got {cells:?}"
+        );
+
+        // Scope to one cell's flat at a time; only that cell may score.
+        for (flat, cell_idx) in [(0u32, 0usize), (2u32, 1usize)] {
+            let scoped = r
+                .search_clusters_scan_async(
+                    "embedding",
+                    &q,
+                    5,
+                    &fetch,
+                    Some(&[flat]),
+                    8,
+                    8,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("scoped scan");
+            assert!(
+                !scoped.candidates.is_empty(),
+                "flat {flat} resolves to a non-empty cluster; scoping it must score rows"
+            );
+            for c in &scoped.candidates {
+                assert_eq!(
+                    c.cell_idx, cell_idx,
+                    "flat {flat} belongs to cell {cell_idx}; a candidate scored from cell {} \
+                     means the flat-to-cell mapping drifted from the fetch keying",
+                    c.cell_idx
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
