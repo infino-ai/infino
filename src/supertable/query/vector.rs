@@ -4321,7 +4321,14 @@ impl SupertableReader {
         // Phase C: single global exact rerank of the pooled warm survivors —
         // one cross-cell shortlist cut, reranked where the winners live.
         if !pooled.is_empty() {
-            let shortlist_limit = k.saturating_mul(rerank_mult);
+            // Size the exact-rerank shortlist to the pool: true neighbours sit within the
+            // top ~2% of the pool by the 1-bit estimate at billion scale, so a global cut
+            // proportional to the pool captures them, while a fixed k*rerank_mult (top
+            // ~0.05%) dropped them (the #821 warm-recall inversion). No per-cell floor:
+            // pooling everything and cutting once globally on the estimate is sufficient
+            // once the cut is wide enough, and far cheaper than a per-cell floor that
+            // exact-reranks ~the whole pool.
+            let shortlist_limit = k.saturating_mul(rerank_mult).max(pooled.len() * 3 / 100);
             let winners = select_global_shortlist(pooled, shortlist_limit, 0);
             let mut by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
             for (si, c) in winners {
