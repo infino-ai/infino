@@ -91,6 +91,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use tracing::debug;
 
 use crate::{
+    config::scratch_root,
     superfile::{
         BuildError,
         bits::PackScratch,
@@ -1439,9 +1440,9 @@ pub struct FtsBuilder {
 }
 
 impl FtsBuilder {
-    /// Construct a builder with the default scratch directory
-    /// (under `$TMPDIR` via `tempfile::tempdir()`) and the default
-    /// 256 MiB spill threshold. Mirror of `VectorBuilder::new`.
+    /// Construct a builder with the scratch directory at `storage.scratch_root`
+    /// (will default to `$TMPDIR` via `tempfile::tempdir()`) and the
+    /// default 256 MiB spill threshold. Mirror of `VectorBuilder::new`.
     ///
     /// Panics if creating the scratch tempdir fails — same policy
     /// as `VectorBuilder::new` for the same reason (no realistic
@@ -1450,7 +1451,13 @@ impl FtsBuilder {
     /// [`Self::with_scratch`] pointing at an instance-store NVMe
     /// partition.
     pub fn new(tokenizer: Arc<dyn Tokenizer>) -> Self {
-        let scratch_dir = tempfile::tempdir().expect("create FtsBuilder scratch tempdir");
+        let scratch_root = scratch_root();
+
+        let scratch_dir = tempfile::Builder::new()
+            .prefix("infino-fts-")
+            .tempdir_in(&scratch_root)
+            .expect("create FtsBuilder scratch tempdir");
+
         Self::from_parts(tokenizer, scratch_dir)
     }
 

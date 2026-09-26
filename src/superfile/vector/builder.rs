@@ -24,6 +24,7 @@ use rayon::prelude::*;
 use tempfile::{tempdir, tempdir_in};
 
 use crate::{
+    config::scratch_root,
     superfile::{
         BuildError,
         format::{
@@ -420,7 +421,10 @@ impl ScratchDir {
             let tmp = if let Some(parent) = &self.parent {
                 tempfile::TempDir::new_in(parent)?
             } else {
-                tempfile::tempdir()?
+                let scratch_root = scratch_root();
+                tempfile::Builder::new()
+                    .prefix("infino-vector-")
+                    .tempdir_in(scratch_root)?
             };
             self.tempdir = Some(tmp);
         }
@@ -454,8 +458,8 @@ impl Default for VectorBuilder {
 }
 
 impl VectorBuilder {
-    /// Construct a builder with the default scratch directory
-    /// (under `$TMPDIR` via `tempfile::tempdir()`) and the
+    /// Construct a builder with the scratch directory at `storage.scratch_root`
+    /// (will default to `$TMPDIR` via `tempfile::tempdir()`) and the
     /// default 256 MiB spill threshold.
     ///
     /// The scratch tempdir is created lazily when the build first
