@@ -464,7 +464,7 @@ pub(crate) fn boundary_from_ranked(
 }
 
 /// Dequantize one Sq8+ε residual row to fp32.
-fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
+pub(crate) fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
     let mut out = vec![0f32; dim];
     dequantize_row_into(row, &mut out);
     out

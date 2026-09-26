@@ -442,6 +442,14 @@ vector:
   #           faster as the grid grows; small grids fall back to exact.
   #   false — kill-switch back to the 1-bit shortlist + exact rescore path.
   drain_graph_assign: true
+  # Place each drained row in the cell of its nearest FINE centroid (walking the
+  # centroid-router graph, read from the hidden slow-state section) instead of the
+  # nearest coarse cell centroid, so placement matches how the centroid_graph
+  # router routes. Only takes effect when the router resolves to centroid_graph and
+  # the drain graph-assign path is active.
+  #   true  — fine-centroid placement (default).
+  #   false — coarse cell-centroid placement (the isolation switch for a placement A/B).
+  global_fine_drain_placement: true
 
   # Read fan-out for the drain's superfile opens. `auto` resolves to
   # one in-flight read per hardware thread, floored at the

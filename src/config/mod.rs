@@ -442,6 +442,9 @@ const DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES: i64 = 64;
 /// rescore. The graph reaches the same placement much faster as the grid
 /// grows; `false` is the kill-switch back to the shortlist path.
 const DEFAULT_VECTOR_DRAIN_GRAPH_ASSIGN: bool = true;
+/// Fine-centroid drain placement is on by default; `false` forces coarse
+/// cell-centroid placement (the isolation switch for a placement A/B).
+const DEFAULT_VECTOR_GLOBAL_FINE_DRAIN_PLACEMENT: bool = true;
 /// Default boundary-replication budget (commit + drain). `<= 1.0` disables
 /// replication, which is the default: at 10M it was a measured net loss —
 /// the extra boundary copies inflated cell size (159K → 232K rows), crowding
@@ -841,6 +844,14 @@ pub struct VectorSettings {
     /// grows; `false` is the kill-switch back to the shortlist path. Small
     /// grids always take the exact path regardless of this flag.
     pub drain_graph_assign: bool,
+    /// Place each drained row in the cell of its nearest FINE centroid (found by
+    /// walking the centroid-router graph, read from the hidden table's slow-state
+    /// section) instead of the nearest coarse cell centroid, so drain placement
+    /// matches how the `centroid_graph` router routes queries (default `true`).
+    /// Only takes effect when the table's router resolves to `centroid_graph` and
+    /// the drain graph-assign path is active; `false` forces coarse cell-centroid
+    /// placement even then (the isolation switch for a placement A/B).
+    pub global_fine_drain_placement: bool,
     /// Read fan-out for the drain's superfile opens. `auto` resolves
     /// to one in-flight read per hardware thread, floored at the
     /// background-fill default and capped at 64.
@@ -916,6 +927,7 @@ impl Default for VectorSettings {
             drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,
             drain_consolidate: DrainConsolidate::Kmeans,
             drain_graph_assign: DEFAULT_VECTOR_DRAIN_GRAPH_ASSIGN,
+            global_fine_drain_placement: DEFAULT_VECTOR_GLOBAL_FINE_DRAIN_PLACEMENT,
             drain_read_concurrency: ThreadCount::Auto,
             maintenance_threads: ThreadCount::Auto,
             user_cell_count: DEFAULT_VECTOR_USER_CELL_COUNT,
@@ -1539,6 +1551,25 @@ mod tests {
         assert!(
             !off.vector.drain_graph_assign,
             "drain_graph_assign: false must reach the exact path"
+        );
+    }
+
+    /// Fine-centroid drain placement ships on, and the isolation switch parses
+    /// to `false` (the coarse arm of a placement A/B).
+    #[test]
+    fn global_fine_drain_placement_defaults_on_and_toggles() {
+        let cfg = Config::defaults().expect("defaults parse");
+        assert!(
+            cfg.vector.global_fine_drain_placement,
+            "fine-centroid drain placement is the shipped default"
+        );
+        let off = Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+            Serialized::defaults(json!({ "vector": { "global_fine_drain_placement": false } })),
+        ))
+        .expect("isolation-switch config loads");
+        assert!(
+            !off.vector.global_fine_drain_placement,
+            "global_fine_drain_placement: false must force coarse cell-centroid placement"
         );
     }
 

@@ -2001,38 +2001,6 @@ impl SupertableWriter {
         }
     }
 
-    /// Whether this table's configured router resolves to `centroid_graph` for
-    /// `column`, the gate for engaging fine-centroid drain placement. Explicit
-    /// `centroid_graph` always qualifies; `auto` qualifies only when the hidden
-    /// vector index actually resolves to the graph (same predicate the eager
-    /// warm uses, [`auto_prefers_centroid_graph`], evaluated on the hidden
-    /// manifest where the router lives); `stamped` / `hnsw_ivf` never do. When
-    /// the gate is false the drain places on the coarse cell grid — the layout
-    /// the stamped router expects — so placement always matches the router the
-    /// table will serve with.
-    fn commit_resolves_to_centroid_graph(&self, column: &str) -> bool {
-        let vcfg = &crate::config::global().vector;
-        if vcfg.search_mode != crate::config::VectorSearchMode::Ivf {
-            return false;
-        }
-        match vcfg.ivf_router {
-            crate::config::IvfRouter::CentroidGraph => true,
-            crate::config::IvfRouter::Auto => self
-                .inner
-                .vector_index_table
-                .as_ref()
-                .map(|hidden| hidden.inner().manifest.load_full())
-                .is_some_and(|hidden_manifest| {
-                    crate::supertable::query::vector::auto_prefers_centroid_graph(
-                        &hidden_manifest,
-                        column,
-                        vcfg,
-                    )
-                }),
-            _ => false,
-        }
-    }
-
     /// Body of [`Self::commit_appends_internal`] after the buffer has been
     /// taken. On `Err`, the caller restores `buffer` onto the writer. `stem`
     /// is the source label every superfile this commit produces is keyed
@@ -2129,45 +2097,15 @@ impl SupertableWriter {
                 .first()
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
-            // Fine-centroid drain placement: place each new row in the cell of
-            // its nearest fine centroid (walking the same centroid-router graph
-            // queries use) instead of the coarse cell grid, so placement matches
-            // routing. Only attempted when the table's router RESOLVES to
-            // centroid_graph — a stamped / hnsw_ivf table places coarse, and an
-            // `auto` table only when it resolves to the graph on the hidden index
-            // — so the router build (opening superfiles + the graph) never runs
-            // for a table that will not route through it. `None` (first commit /
-            // no centroid section / any load failure) degrades to the coarse cell
-            // grid; it never fails the commit.
-            let fine_assign: Option<crate::supertable::query::vector::FineAssignRouter> = self
-                .inner
-                .options
-                .vector_columns
-                .first()
-                .map(|vc| vc.column.clone())
-                .filter(|column| self.commit_resolves_to_centroid_graph(column))
-                .and_then(|column| {
-                    let reader = crate::supertable::handle::SupertableReader::from_inner_pinned(
-                        Arc::clone(&self.inner),
-                        Arc::clone(&pinned_manifest),
-                        self.inner.tombstone_cache.clone(),
-                        self.op_stats.clone(),
-                    );
-                    bridge_on_runtime(
-                        reader.build_global_fine_assign_router(&column),
-                        &self.inner.query_runtime(),
-                    )
-                });
-            match &fine_assign {
-                Some(_) => tracing::debug!(
-                    target: "infino::gfc",
-                    "drain placement: fine-centroid router engaged (rows placed by nearest fine centroid)"
-                ),
-                None => tracing::debug!(
-                    target: "infino::gfc",
-                    "drain placement: coarse cell grid (router not centroid_graph, first drain, or no section)"
-                ),
-            }
+            // The user/commit append path places on the coarse cell grid. Rows
+            // land in the user table's own cell grid here; fine-centroid
+            // placement (matching how the centroid_graph router routes) is
+            // applied where hidden-cell membership is decided — the bulk drain
+            // `drain_user_superfiles_to_hidden_cells`. The user manifest carries
+            // the cell grid but not the fine centroid section (that lives on the
+            // hidden vector-index manifest), so there is nothing to place against
+            // here.
+            let fine_assign: Option<crate::supertable::query::vector::FineAssignRouter> = None;
             // Pipelined publish on storage-backed tables: shards stream
             // to the uploader as each finishes packing, so the commit
             // pays ~max(pack, PUT) instead of pack + PUT. The manifest
@@ -4492,6 +4430,50 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let drain_graph_assign = config::global().vector.drain_graph_assign;
     let drain_timers = config::global().diagnostics.drain_build_timers;
     let mut coarse_router: Option<(opann::Fp32Scorer, opann::Hnsw, Vec<u32>)> = None;
+    // Fine-centroid drain placement: when the table routes through the
+    // centroid_graph router, place each row in the cell of its nearest FINE
+    // centroid (walking the same graph queries use) instead of the coarse cell
+    // grid, so placement matches routing. The router is read from the hidden
+    // table's slow-state centroid section (loading the persisted graph topology
+    // when present), never re-materializing the older superfiles, and built once
+    // for the whole drain. `None` — placement toggled off, router not
+    // centroid_graph, first drain / no section, or a load failure — leaves the
+    // coarse cell-grid path in place, so it never fails the drain.
+    let fine_router: Option<crate::supertable::query::vector::FineAssignRouter> = {
+        let vcfg = &config::global().vector;
+        let router_is_centroid_graph = drain_graph_assign
+            && vcfg.global_fine_drain_placement
+            && metric == Metric::Cosine
+            && vcfg.search_mode == config::VectorSearchMode::Ivf
+            && match vcfg.ivf_router {
+                config::IvfRouter::CentroidGraph => true,
+                config::IvfRouter::Auto => {
+                    crate::supertable::query::vector::auto_prefers_centroid_graph(
+                        &hidden_manifest,
+                        &column,
+                        vcfg,
+                    )
+                }
+                _ => false,
+            };
+        if router_is_centroid_graph {
+            let reader = crate::supertable::handle::SupertableReader::from_inner_pinned(
+                Arc::clone(&hidden_inner),
+                Arc::clone(&hidden_manifest),
+                hidden_inner.tombstone_cache.clone(),
+                None,
+            );
+            reader.build_global_fine_assign_router(&column).await
+        } else {
+            None
+        }
+    };
+    if fine_router.is_some() {
+        debug!(
+            target: "infino::gfc",
+            "drain placement: fine-centroid router engaged (rows placed by nearest fine centroid, read from slow-state)"
+        );
+    }
     let mut drain_assign_total_ms = 0.0f64;
     // Drain batch-loop sub-phase accumulators (ms), summed across batches:
     // `materialize` (open + read + row-materialize) and `assign_spill` (assign +
@@ -4775,40 +4757,78 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         // No rows to assign: never build the router (skip-empty).
                         Vec::new()
                     } else if use_graph_assign {
-                        // Graph-routed assign. Build the coarse centroid router
-                        // ONCE for the drain, lazily on the first batch with
-                        // rows. The build is serial + deterministic (see
-                        // `Hnsw::build_serial`) so cell placement is reproducible
-                        // run to run; the writer-pool install below is for the
-                        // per-row assignment fan-out. The result type is
-                        // identical to the shortlist path, so the spill/replica
-                        // code below is untouched.
-                        // Cosine-only path (gated above), so ef is the cosine
-                        // beam: max(16, round(sqrt(n_cent)/4)).
-                        let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize, metric);
-                        hidden_inner.options.writer_pool.install(|| {
-                            let router = coarse_router.get_or_insert_with(|| {
-                                opann::build_coarse_router(clusters_ref, metric)
-                            });
-                            // Shared reborrows so the parallel closure captures
-                            // `&` (Sync), not the `&mut` from `get_or_insert_with`.
-                            let (scorer, graph, node_to_cell) =
-                                (&router.0, &router.1, &router.2[..]);
-                            distinct_rows
-                                .par_iter()
-                                .map(|row| {
-                                    opann::boundary_assignment_graph_encoded(
-                                        graph,
-                                        scorer,
-                                        node_to_cell,
-                                        clusters_ref,
-                                        metric,
-                                        &row.encoded,
-                                        ef,
-                                    )
-                                })
-                                .collect()
-                        })
+                        if let Some(fr) = fine_router.as_ref() {
+                            // Fine-centroid placement: place each row in the cell
+                            // of its nearest FINE centroid (walking the router the
+                            // hidden table serves queries with), so placement
+                            // matches routing. Dequantize the encoded row to fp32
+                            // for the graph walk — the same reconstruction the
+                            // coarse graph path applies. A row the fine router
+                            // cannot place (no in-range, live cell survives its
+                            // bounds/superseded checks) falls back to the exact
+                            // shortlist assign for that row. The result type is
+                            // identical, so the spill/replica code below is
+                            // untouched.
+                            let dim = clusters_ref.dim as usize;
+                            let admit_ctx = RabitqAdmitContext::new(dim, drain_rot_seed);
+                            let window =
+                                opann::assignment_shortlist_window(clusters_ref.n_cent as usize);
+                            hidden_inner.options.writer_pool.install(|| {
+                                distinct_rows
+                                    .par_iter()
+                                    .map(|row| {
+                                        let row_fp = opann::dequantize_row(&row.encoded, dim);
+                                        fr.assign_row_to_cells(clusters_ref, metric, &row_fp)
+                                            .unwrap_or_else(|| {
+                                                opann::boundary_assignment_encoded(
+                                                    clusters_ref,
+                                                    metric,
+                                                    &row.encoded,
+                                                    &admit_ctx,
+                                                    window,
+                                                )
+                                            })
+                                    })
+                                    .collect()
+                            })
+                        } else {
+                            // Graph-routed assign over the COARSE cell centroids.
+                            // Build the coarse centroid router ONCE for the drain,
+                            // lazily on the first batch with rows. The build is
+                            // serial + deterministic (see `Hnsw::build_serial`) so
+                            // cell placement is reproducible run to run; the
+                            // writer-pool install below is for the per-row
+                            // assignment fan-out. The result type is identical to
+                            // the shortlist path, so the spill/replica code below
+                            // is untouched.
+                            // Cosine-only path (gated above), so ef is the cosine
+                            // beam: max(16, round(sqrt(n_cent)/4)).
+                            let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize, metric);
+                            hidden_inner.options.writer_pool.install(|| {
+                                let router = coarse_router.get_or_insert_with(|| {
+                                    opann::build_coarse_router(clusters_ref, metric)
+                                });
+                                // Shared reborrows so the parallel closure captures
+                                // `&` (Sync), not the `&mut` from
+                                // `get_or_insert_with`.
+                                let (scorer, graph, node_to_cell) =
+                                    (&router.0, &router.1, &router.2[..]);
+                                distinct_rows
+                                    .par_iter()
+                                    .map(|row| {
+                                        opann::boundary_assignment_graph_encoded(
+                                            graph,
+                                            scorer,
+                                            node_to_cell,
+                                            clusters_ref,
+                                            metric,
+                                            &row.encoded,
+                                            ef,
+                                        )
+                                    })
+                                    .collect()
+                            })
+                        }
                     } else {
                         // Shared admit context + 20% shortlist window: the same
                         // 1-bit prefilter the commit assign uses, so drain
@@ -4834,6 +4854,21 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     };
                     let assign_ms = assign_t0.elapsed().as_secs_f64() * 1e3;
                     drain_assign_total_ms += assign_ms;
+                    // Tripwire: every assigned cell (primary and replicas) must
+                    // index the live grid. The fine-placement path bounds-checks
+                    // and drops out-of-range cells before this point; this catches
+                    // any future path that forgets to, before a bad cell reaches
+                    // the spill and corrupts the drained layout.
+                    debug_assert!(
+                        assignments.iter().all(|a| {
+                            (a.primary as usize) < clusters_ref.n_cent as usize
+                                && a.replicas.iter().flatten().all(|&(cell, _)| {
+                                    (cell as usize) < clusters_ref.n_cent as usize
+                                })
+                        }),
+                        "drain assignment emitted a cell id >= n_cent ({})",
+                        clusters_ref.n_cent
+                    );
                     if drain_timers {
                         debug!(
                             batch = batch_idx + 1,
