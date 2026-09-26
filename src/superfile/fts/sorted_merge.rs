@@ -21,6 +21,7 @@ use crate::{
     superfile::{
         BuildError, FtsError, SuperfileReader,
         fts::{positions::encode_run, reader::FtsReader},
+        id_space::FtsDocId,
     },
     utils::terms::FstValue,
 };
@@ -31,9 +32,13 @@ pub(crate) const TERMS_PER_CHUNK: usize = 4096;
 /// One merge input: a superfile and where its rows land in the output.
 pub(crate) struct SortedInput {
     pub(crate) reader: Arc<SuperfileReader>,
-    /// Input-local doc id → output doc id; `None` drops the row. Must
-    /// never go down, and must sit above every earlier input's ids.
-    pub(crate) remap: Vec<Option<u32>>,
+    /// The output blob doc id each of this input's own doc ids becomes;
+    /// `None` drops the row. Must never go down, and must sit above every
+    /// earlier input's ids — this merge joins each input's postings for a
+    /// term in input order and never sorts, so a remap that falls would
+    /// emit a posting list out of order. A caller whose remap cannot rise
+    /// takes the accumulator instead.
+    pub(crate) remap: Vec<Option<FtsDocId>>,
 }
 
 /// Merge `column_id` across `inputs` and call `emit(term, postings, runs)`
@@ -95,10 +100,10 @@ pub(crate) fn merge_column(
                             // Nothing sorts these postings, so a remap that
                             // goes down would write a wrong posting list.
                             debug_assert!(
-                                postings.last().is_none_or(|&(d, _)| d < out_doc),
+                                postings.last().is_none_or(|&(d, _)| d < out_doc.get()),
                                 "sorted merge: output doc ids must ascend"
                             );
-                            postings.push((out_doc, tf));
+                            postings.push((out_doc.get(), tf));
                             encode_run(&mut runs, pos);
                         }
                         Ok(())

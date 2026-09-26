@@ -1103,6 +1103,7 @@ mod tests {
         ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::{col, lit};
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
     use tokio::task;
@@ -2753,6 +2754,213 @@ mod tests {
              adjust small_compact_cfg() if needed"
         );
         assert!(reader_after.n_superfiles() < before_n);
+    }
+
+    /// After a compaction large enough that the merged blob stores its
+    /// documents in an order of its own, a search must still name the
+    /// row that actually carries the term.
+    ///
+    /// The existing compaction search test runs twenty documents, far
+    /// below the size at which an order is chosen, so it cannot reach
+    /// this path at all. Here every document carries a token unique to
+    /// it, so a returned row can be checked against the text it should
+    /// hold: an untranslated id would come back in range, with a real
+    /// score, naming the wrong document.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_compacted_table_names_the_right_rows_when_the_blob_reorders() {
+        // Comfortably past the threshold below which arrival order is kept.
+        const BATCHES: usize = 60;
+        const PER_BATCH: usize = 80;
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        let mut expected: Vec<String> = Vec::with_capacity(BATCHES * PER_BATCH);
+        for b in 0..BATCHES {
+            let titles: Vec<String> = (0..PER_BATCH)
+                .map(|i| {
+                    let n = b * PER_BATCH + i;
+                    format!("uq{n} shared t{} t{}", n % 37, n % 53)
+                })
+                .collect();
+            expected.extend(titles.iter().cloned());
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            commit_titles(&st, &refs);
+        }
+
+        let before = st.manifest_id();
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+        assert!(
+            st.manifest_id() > before,
+            "compact must have run; adjust small_compact_cfg() if needed"
+        );
+
+        // Spread over the corpus so the check does not depend on where a
+        // document happened to land.
+        for &n in &[0usize, 1, 977, 2500, 4095, 4096, 4799] {
+            let want = expected[n].clone();
+            let token = format!("uq{n}");
+
+            // Ranked: the row a score is attached to must be the row
+            // holding the token.
+            let batches = st
+                .bm25_search(
+                    "title",
+                    &token,
+                    5,
+                    Bm25SearchOptions::new()
+                        .with_mode(BoolMode::And)
+                        .with_stats(Bm25Stats::Global),
+                    Some(&["title"]),
+                )
+                .unwrap_or_else(|e| panic!("bm25_search for {token}: {e}"));
+            assert_eq!(
+                titles_of(&batches),
+                vec![want.clone()],
+                "bm25_search for {token} named the wrong row"
+            );
+
+            // Unranked: the same, through the walk that returns bare ids.
+            let batches = st
+                .token_match("title", &token, BoolMode::And, Some(&["title"]))
+                .unwrap_or_else(|e| panic!("token_match for {token}: {e}"));
+            assert_eq!(
+                titles_of(&batches),
+                vec![want],
+                "token_match for {token} named the wrong row"
+            );
+        }
+
+        // A term every document carries still matches all of them, so the
+        // translation has not dropped or duplicated anything.
+        let n_shared: usize = st
+            .token_match("title", "shared", BoolMode::And, None)
+            .expect("token_match shared")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(n_shared, BATCHES * PER_BATCH, "every document carries it");
+    }
+
+    /// A `WHERE` on an indexed column pushes a row-keyed allow-set into
+    /// the kernel, which walks the blob's own ids. On a reordered blob
+    /// the two are different spaces, so the set has to be consulted with
+    /// the row a blob id stands for and not with the id itself.
+    ///
+    /// The failure this guards is quiet rather than wrong: the predicate
+    /// is re-applied after the search, so a mismatched set returns an
+    /// empty result. In a hybrid query the full-text leg simply drops
+    /// out and the ranking degrades with nothing to show for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scoped_search_after_a_reordering_compaction_finds_the_row() {
+        const BATCHES: usize = 60;
+        const PER_BATCH: usize = 80;
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let mut expected: Vec<String> = Vec::new();
+        for b in 0..BATCHES {
+            let titles: Vec<String> = (0..PER_BATCH)
+                .map(|i| {
+                    let n = b * PER_BATCH + i;
+                    format!("uq{n} shared t{} t{}", n % 37, n % 53)
+                })
+                .collect();
+            expected.extend(titles.iter().cloned());
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            commit_titles(&st, &refs);
+        }
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+
+        for n in [0usize, 7, 977, 2500, 4799] {
+            let sql = format!(
+                "SELECT title FROM bm25_search('title', 'shared', 10) WHERE title = '{}'",
+                expected[n]
+            );
+            let got = st.reader().expect("reader").query_sql(&sql).expect("sql");
+            assert_eq!(titles_of(&got), vec![expected[n].clone()], "doc {n}");
+        }
+    }
+
+    /// Compacting an already-reordered superfile again must keep every
+    /// document with its own postings.
+    ///
+    /// This is ordinary operation, not an edge case: a reordered output
+    /// is usually below the target size, so the next pass picks it up
+    /// again. The merge reads an input's postings and stored lengths by
+    /// the input's own doc ids while its tombstones and rows are keyed by
+    /// row, and on a reordered input those are different numbers. Reading
+    /// one as the other files a posting under a different document and
+    /// writes the result to storage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_compaction_of_a_reordered_superfile_keeps_the_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let mut expected: Vec<String> = Vec::new();
+        let mut commit = |st: &Supertable, from: usize, to: usize| {
+            for b in from..to {
+                let titles: Vec<String> = (0..80)
+                    .map(|i| {
+                        let n = b * 80 + i;
+                        format!("uq{n} shared t{} t{}", n % 37, n % 53)
+                    })
+                    .collect();
+                expected.extend(titles.iter().cloned());
+                let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+                commit_titles(st, &refs);
+            }
+        };
+        commit(&st, 0, 60);
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact 1");
+
+        // The reordered output is below target, so the next compaction
+        // merges it again.
+        let deleted = [3usize, 1000, 2222, 4000];
+        for n in deleted {
+            let title = format!("uq{n} shared t{} t{}", n % 37, n % 53);
+            st.delete(col("title").eq(lit(title))).expect("delete");
+        }
+        commit(&st, 60, 75);
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact 2");
+
+        for n in (0..expected.len()).step_by(97) {
+            let want = match deleted.contains(&n) {
+                true => vec![],
+                false => vec![expected[n].clone()],
+            };
+            let got = st
+                .token_match("title", &format!("uq{n}"), BoolMode::And, Some(&["title"]))
+                .expect("token_match");
+            assert_eq!(titles_of(&got), want, "doc {n}");
+        }
+        for n in deleted {
+            let got = st
+                .token_match("title", &format!("uq{n}"), BoolMode::And, Some(&["title"]))
+                .expect("token_match");
+            assert!(titles_of(&got).is_empty(), "deleted doc {n} still matches");
+        }
+    }
+
+    /// The `title` column of every row in a result, in order.
+    fn titles_of(batches: &[RecordBatch]) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in batches {
+            let col = b.column_by_name("title").expect("title projected");
+            let arr = col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title is LargeUtf8");
+            for i in 0..b.num_rows() {
+                out.push(arr.value(i).to_string());
+            }
+        }
+        out
     }
 
     #[tokio::test(flavor = "multi_thread")]

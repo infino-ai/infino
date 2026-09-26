@@ -10,6 +10,7 @@ pub mod builder;
 pub(crate) mod positions;
 pub mod posting;
 pub mod reader;
+pub(crate) mod reorder;
 pub(crate) mod short;
 pub(crate) mod sorted_merge;
 pub mod tokenize;
