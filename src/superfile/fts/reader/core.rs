@@ -1153,13 +1153,13 @@ impl FtsReader {
         if col.norms_loaded() {
             return Ok(());
         }
-        let n = col.n_docs as usize;
-        let array_len = n * col.doc_length_bytes;
-        let start = col.doc_lengths_range.start;
-        // The array plus its CRC, checked when verification is on.
+        // The array plus its CRC, checked when verification is on. The
+        // range is the open path's, bounded against the blob there; a source
+        // that answers short errors (`ShortRead`) rather than handing up a
+        // truncated buffer, so the slice below is within what came back.
         let array = self
             .source
-            .range_async(start..start + array_len + 4)
+            .range_async(col.array_with_crc_range())
             .await
             .map_err(|e| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
@@ -1167,7 +1167,7 @@ impl FtsReader {
                 )))
             })?;
         col.check_array_crc(&array)?;
-        let norms = col.norms_from_array(&array[..array_len]);
+        let norms = col.norms_from_array(&array[..col.array_len()]);
         // A concurrent prewarm may have won; either set is the same table.
         let _ = col.base_norms.set(norms);
         Ok(())

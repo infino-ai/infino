@@ -16,7 +16,7 @@ use serde::Deserialize;
 use crate::superfile::{
     ReadError,
     error::FtsError,
-    format::checksum::crc32c,
+    format::{CRC_BYTES, checksum::crc32c},
     fts::{
         analysis::{Base, Stemmer, Stopwords},
         bm25,
@@ -440,12 +440,9 @@ impl ColumnMeta {
         if let Some(norms) = self.base_norms.get() {
             return norms;
         }
-        let n = self.n_docs as usize;
-        let array_len = n * self.doc_length_bytes;
-        let start = self.doc_lengths_range.start;
         let fetched = self
             .source
-            .get_range(start..start + array_len + 4)
+            .get_range(self.array_with_crc_range())
             .map_err(|e| e.to_string())
             .and_then(|array| {
                 self.check_array_crc(&array)
@@ -453,13 +450,28 @@ impl ColumnMeta {
                     .map_err(|e| e.to_string())
             });
         let norms = match fetched {
-            Ok(array) => self.norms_from_array(&array[..array_len]),
+            Ok(array) => self.norms_from_array(&array[..self.array_len()]),
             Err(error) => {
                 tracing::error!(column = %self.name, %error, "doc-length array unreadable; scoring against empty norms");
                 ColumnNorms::empty()
             }
         };
         self.base_norms.get_or_init(|| norms)
+    }
+
+    /// The length array's byte length, `n_docs × doc_length_bytes`: the
+    /// span of [`Self::doc_lengths_range`], which the open path computed and
+    /// bounded against the blob. Read off the range rather than recomputed,
+    /// so no reader of the array carries arithmetic of its own.
+    pub(super) fn array_len(&self) -> usize {
+        self.doc_lengths_range.len()
+    }
+
+    /// The length array with the CRC that trails it: what a reader fetches.
+    /// The open path refused a column whose array plus CRC ran past the
+    /// source, so this end is within the blob, and the sum cannot overflow.
+    pub(super) fn array_with_crc_range(&self) -> Range<usize> {
+        self.doc_lengths_range.start..self.doc_lengths_range.end + CRC_BYTES
     }
 
     /// Check the CRC that trails the length array in `array_with_crc`, when
@@ -469,8 +481,8 @@ impl ColumnMeta {
         if !self.verify_crc {
             return Ok(());
         }
-        let len = self.n_docs as usize * self.doc_length_bytes;
-        let Some(crc_bytes) = array_with_crc.get(len..len + 4) else {
+        let len = self.array_len();
+        let Some(crc_bytes) = array_with_crc.get(len..len + CRC_BYTES) else {
             return Err(FtsError::Read(ReadError::MalformedVersion(
                 "doc-lengths array shorter than its CRC".into(),
             )));
