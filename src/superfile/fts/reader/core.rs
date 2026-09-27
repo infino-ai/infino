@@ -2216,10 +2216,19 @@ mod tests {
             );
         }
     }
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
 
     use async_trait::async_trait;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use tokio::{
+        spawn,
+        sync::Notify,
+        time::{sleep, timeout},
+    };
 
     use super::{super::test_util::*, *};
     use crate::superfile::{
@@ -3985,5 +3994,105 @@ mod tests {
             .expect("search over lazy reader");
         let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0) && ids.contains(&1));
+    }
+
+    /// How long the second of two racing searches may take while the first
+    /// is held on its read: far above a search over three documents.
+    const RACING_SEARCH_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Poll cadence while waiting for a paused read to be reached.
+    const PAUSE_POLL: Duration = Duration::from_millis(5);
+
+    /// A whole-blob source that serves bytes only asynchronously, the way
+    /// an object store does, and parks the first read touching `region`
+    /// until told to go on.
+    struct PausingSource {
+        inner: BytesLazyByteSource,
+        region: Range<usize>,
+        armed: AtomicBool,
+        paused: AtomicBool,
+        resume: Notify,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for PausingSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let touches = (start as usize) < self.region.end
+                && (start + len) as usize > self.region.start;
+            if touches && self.armed.swap(false, Ordering::SeqCst) {
+                self.paused.store(true, Ordering::SeqCst);
+                self.resume.notified().await;
+            }
+            self.inner.range(start, len).await
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// Two scored single-term searches racing on a cold column: the second
+    /// completes while the first is still waiting for the length array.
+    ///
+    /// The single-term path used to reach the norms through the synchronous
+    /// fallback, whose initializer held the norms cell's lock across the
+    /// read, so the second search parked on that lock — a thread, and on an
+    /// `infino-io` worker the core the read needed — for as long as the
+    /// read took. Two workers, so a parked one is visible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cold_scored_search_does_not_hold_a_racing_one_on_the_norms() {
+        let (blob, json) = build_blob();
+        let eager = FtsReader::open(blob.clone(), &json).expect("eager open");
+        let lengths = eager.columns[0].doc_lengths_range.clone();
+        let source = Arc::new(PausingSource {
+            inner: BytesLazyByteSource::new(blob),
+            region: lengths,
+            armed: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            resume: Notify::new(),
+        });
+        let src: Arc<dyn LazyByteSource> = source.clone();
+        let reader = Arc::new(
+            FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+                .await
+                .expect("open_lazy"),
+        );
+        // Armed after the open, so only a query's read of the array pauses.
+        source.armed.store(true, Ordering::SeqCst);
+
+        let first = {
+            let reader = Arc::clone(&reader);
+            spawn(async move { reader.search("body", &["rust"], 10, BoolMode::Or).await })
+        };
+        // Bounded: a reader that stopped reading the array on a scored
+        // search would otherwise wait here forever instead of failing.
+        timeout(RACING_SEARCH_DEADLINE, async {
+            while !source.paused.load(Ordering::SeqCst) {
+                sleep(PAUSE_POLL).await;
+            }
+        })
+        .await
+        .expect("the first scored search must read the length array");
+        let second = {
+            let reader = Arc::clone(&reader);
+            spawn(async move { reader.search("body", &["rust"], 10, BoolMode::Or).await })
+        };
+        let second_done = timeout(RACING_SEARCH_DEADLINE, second).await;
+        // Release the first read before asserting, so a failure leaves no
+        // thread parked behind it.
+        source.resume.notify_one();
+        let first_hits = first.await.expect("first search task").expect("first search");
+        let second_hits = second_done
+            .expect("the second search must not wait on the first search's read")
+            .expect("second search task")
+            .expect("second search");
+        let first_ids: HashSet<u32> = first_hits.iter().map(|(d, _)| d.get()).collect();
+        let second_ids: HashSet<u32> = second_hits.iter().map(|(d, _)| d.get()).collect();
+        assert_eq!(first_ids, second_ids);
+        assert!(first_ids.contains(&0) && first_ids.contains(&1));
     }
 }

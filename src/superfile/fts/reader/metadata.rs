@@ -427,28 +427,39 @@ impl ColumnMeta {
     /// in-memory source it costs nothing, on a lazy one it is the read the
     /// prewarm would have made. A read that fails here logs and scores
     /// against an empty table rather than aborting mid-kernel.
+    ///
+    /// The read runs outside the cell rather than inside `get_or_init`. An
+    /// initializer that fetches holds the cell's lock across the fetch, and
+    /// every other thread reaching the same cold column then parks on that
+    /// lock with no way to yield — on an `infino-io` worker that is the
+    /// runtime's own core, and the fetch that would release it is driven by
+    /// that runtime. Two threads racing here may both read the array; the
+    /// first to set wins and either is the same table, the trade the async
+    /// prewarm already makes.
     fn base_norms(&self) -> &ColumnNorms {
-        self.base_norms.get_or_init(|| {
-            let n = self.n_docs as usize;
-            let array_len = n * self.doc_length_bytes;
-            let start = self.doc_lengths_range.start;
-            let fetched = self
-                .source
-                .get_range(start..start + array_len + 4)
-                .map_err(|e| e.to_string())
-                .and_then(|array| {
-                    self.check_array_crc(&array)
-                        .map(|()| array)
-                        .map_err(|e| e.to_string())
-                });
-            match fetched {
-                Ok(array) => self.norms_from_array(&array[..array_len]),
-                Err(error) => {
-                    tracing::error!(column = %self.name, %error, "doc-length array unreadable; scoring against empty norms");
-                    ColumnNorms::empty()
-                }
+        if let Some(norms) = self.base_norms.get() {
+            return norms;
+        }
+        let n = self.n_docs as usize;
+        let array_len = n * self.doc_length_bytes;
+        let start = self.doc_lengths_range.start;
+        let fetched = self
+            .source
+            .get_range(start..start + array_len + 4)
+            .map_err(|e| e.to_string())
+            .and_then(|array| {
+                self.check_array_crc(&array)
+                    .map(|()| array)
+                    .map_err(|e| e.to_string())
+            });
+        let norms = match fetched {
+            Ok(array) => self.norms_from_array(&array[..array_len]),
+            Err(error) => {
+                tracing::error!(column = %self.name, %error, "doc-length array unreadable; scoring against empty norms");
+                ColumnNorms::empty()
             }
-        })
+        };
+        self.base_norms.get_or_init(|| norms)
     }
 
     /// Check the CRC that trails the length array in `array_with_crc`, when
