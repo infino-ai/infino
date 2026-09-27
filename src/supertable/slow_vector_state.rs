@@ -378,6 +378,42 @@ impl CentroidSection {
         Ok(Some(buf))
     }
 
+    /// Every fine centroid the section holds for `column`, each tagged with
+    /// its owning `(superfile_id, cell_id)`. Reads the spilled section blob
+    /// ONLY — no superfile is opened — so a router built from this touches no
+    /// hidden-index data, keeping drain-time memory to the centroid set (small)
+    /// rather than the whole resident index. Centroids are cluster-major within
+    /// each cell (`n_cent × dim` fp32); an empty or unreadable cell is skipped.
+    pub(crate) fn fine_centroids_for_column(
+        &self,
+        column: &str,
+    ) -> Vec<(Uuid, Option<u32>, Vec<f32>)> {
+        let mut out = Vec::new();
+        for ((superfile_id, col), cells) in &self.cells {
+            if col != column {
+                continue;
+            }
+            for cell in cells {
+                let dim = cell.dim as usize;
+                if dim == 0 || cell.n_cent == 0 {
+                    continue;
+                }
+                let Ok(Some(bytes)) = self.read_cell_bytes(*superfile_id, column, cell.cell_id)
+                else {
+                    continue;
+                };
+                for chunk in bytes.chunks_exact(dim * 4) {
+                    let v: Vec<f32> = chunk
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes(b.try_into().expect("chunks_exact(4)")))
+                        .collect();
+                    out.push((*superfile_id, cell.cell_id, v));
+                }
+            }
+        }
+        out
+    }
+
     /// Read one cell's fp32 fine centroids (cluster-major, `n_cent × dim`).
     /// `Ok(None)` when the `(superfile, column, cell)` triple is not in the
     /// section; a spill-read fault is an error, never "absent" — mapping it

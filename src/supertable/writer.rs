@@ -4456,7 +4456,25 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 }
                 _ => false,
             };
-        if router_is_centroid_graph {
+        // Charge the router build against the compaction memory budget. The
+        // build materializes the full fine-centroid set as fp32 plus decode /
+        // copy amplification, which reaches GBs at billion scale; left
+        // unbudgeted it is the drain-OOM class. Estimate the footprint from the
+        // fine-cluster count and skip fine placement (drain coarse) when it
+        // would exceed the budget, rather than risk the OOM. A `0` budget means
+        // unlimited (the estimate is advisory only).
+        let n_fine =
+            crate::supertable::query::vector::total_fine_clusters(&hidden_manifest, &column);
+        // fp32 centroid set (n_fine * dim * 4) times a factor for the graph
+        // nodes and the decode-time copy that briefly coexists with the section.
+        const ROUTER_BUILD_BYTES_PER_CENTROID_FACTOR: u64 = 3;
+        let est_router_bytes = (n_fine as u64)
+            .saturating_mul(running_clusters.dim as u64)
+            .saturating_mul(4)
+            .saturating_mul(ROUTER_BUILD_BYTES_PER_CENTROID_FACTOR);
+        let budget_bytes = vcfg.compaction_max_memory_mb.saturating_mul(1024 * 1024);
+        let within_budget = budget_bytes == 0 || est_router_bytes <= budget_bytes;
+        if router_is_centroid_graph && within_budget {
             let reader = crate::supertable::handle::SupertableReader::from_inner_pinned(
                 Arc::clone(&hidden_inner),
                 Arc::clone(&hidden_manifest),
@@ -4465,6 +4483,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             );
             reader.build_global_fine_assign_router(&column).await
         } else {
+            if router_is_centroid_graph && !within_budget {
+                debug!(
+                    target: "infino::gfc",
+                    est_router_bytes,
+                    budget_bytes,
+                    "drain placement: coarse cell grid (fine router estimate exceeds the compaction memory budget)"
+                );
+            }
             None
         }
     };
@@ -4472,6 +4498,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         debug!(
             target: "infino::gfc",
             "drain placement: fine-centroid router engaged (rows placed by nearest fine centroid, read from slow-state)"
+        );
+    }
+    if drain_timers {
+        eprintln!(
+            "[gfc-drain] fine placement router engaged={} (read from slow-state centroid section)",
+            fine_router.is_some()
         );
     }
     let mut drain_assign_total_ms = 0.0f64;
@@ -4773,24 +4805,50 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             let admit_ctx = RabitqAdmitContext::new(dim, drain_rot_seed);
                             let window =
                                 opann::assignment_shortlist_window(clusters_ref.n_cent as usize);
-                            hidden_inner.options.writer_pool.install(|| {
-                                distinct_rows
-                                    .par_iter()
-                                    .map(|row| {
-                                        let row_fp = opann::dequantize_row(&row.encoded, dim);
-                                        fr.assign_row_to_cells(clusters_ref, metric, &row_fp)
-                                            .unwrap_or_else(|| {
-                                                opann::boundary_assignment_encoded(
+                            // Count rows actually placed by the fine router vs. the
+                            // per-row coarse fallback, so a run can VERIFY placement
+                            // engaged (surfaced below, not via `tracing`, which the
+                            // Python binding drops) rather than inferring it from a
+                            // noisy recall delta.
+                            let fine_hits = std::sync::atomic::AtomicUsize::new(0);
+                            let out: Vec<opann::BoundaryAssignment> =
+                                hidden_inner.options.writer_pool.install(|| {
+                                    distinct_rows
+                                        .par_iter()
+                                        .map(|row| {
+                                            let row_fp = opann::dequantize_row(&row.encoded, dim);
+                                            match fr.assign_row_to_cells(
+                                                clusters_ref,
+                                                metric,
+                                                &row_fp,
+                                            ) {
+                                                Some(a) => {
+                                                    fine_hits.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    a
+                                                }
+                                                None => opann::boundary_assignment_encoded(
                                                     clusters_ref,
                                                     metric,
                                                     &row.encoded,
                                                     &admit_ctx,
                                                     window,
-                                                )
-                                            })
-                                    })
-                                    .collect()
-                            })
+                                                ),
+                                            }
+                                        })
+                                        .collect()
+                                });
+                            if drain_timers {
+                                eprintln!(
+                                    "[gfc-drain] batch {} fine placement engaged: {}/{} rows placed by nearest fine centroid (rest coarse fallback)",
+                                    batch_idx + 1,
+                                    fine_hits.load(std::sync::atomic::Ordering::Relaxed),
+                                    distinct_rows.len()
+                                );
+                            }
+                            out
                         } else {
                             // Graph-routed assign over the COARSE cell centroids.
                             // Build the coarse centroid router ONCE for the drain,

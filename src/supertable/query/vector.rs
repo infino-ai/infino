@@ -1079,7 +1079,7 @@ fn resolve_ivf_router(
 /// selecting `centroid_graph` where the calibrated fanout is not actually a
 /// concentrated subset of the routable clusters. Counting only cells with at
 /// least one indexed doc realigns the denominator with the calibration input.
-fn total_fine_clusters(manifest: &ManifestSnapshot, column: &str) -> usize {
+pub(crate) fn total_fine_clusters(manifest: &ManifestSnapshot, column: &str) -> usize {
     manifest
         .get_all_superfiles()
         .iter()
@@ -4693,52 +4693,62 @@ impl SupertableReader {
             .find(|vc| vc.column == column)?;
         let dim = vc.dim;
         let metric = vc.metric;
+        // Build the router from the STANDALONE slow-state centroid section only.
+        // The section (its own blob, spilled to a temp file — never a superfile)
+        // holds every fine centroid tagged with its owning `(superfile, cell)`,
+        // so this opens NO superfile and drain-time memory stays at the (small)
+        // centroid set rather than the whole resident hidden index.
         let section = self.centroid_section().await?;
-        let entries = manifest.get_all_superfiles_loaded().await.ok()?;
-        if entries.is_empty() {
+        let centroids = section.fine_centroids_for_column(column);
+        if centroids.is_empty() {
             return None;
         }
-        let readers = self.open_superfile_readers(&entries).await.ok()?;
-        let stamped = self
-            .resident_centroid_router(
-                column,
-                manifest.manifest_id,
-                dim,
-                metric,
-                &entries,
-                &readers,
-                section.as_ref(),
-                // Placement build: serial so a retried/resumed commit that
-                // rebuilds the router scatters identical rows identically.
-                true,
-            )
-            .await
-            .ok()?;
-        // Precompute node -> global cell via the SAME per-superfile flat->cell
-        // mapping the query path uses. A node whose cell cannot be resolved, or
-        // whose cell has been SUPERSEDED by an in-place split, is left as the
-        // `u32::MAX` sentinel and skipped at assign time — so a row is never
-        // placed into a superseded parent cell (which every query path filters
-        // out), and the row falls back to a live cell instead.
+        // `node_to_cell[node]` is the owning cell straight from the section. A
+        // node whose cell has been SUPERSEDED by an in-place split is left as the
+        // `u32::MAX` sentinel and skipped at assign time, so a row is never
+        // placed into a superseded parent (which every query path filters out);
+        // it falls back to a live cell instead.
         let empty_superseded = BTreeMap::new();
         let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
-        let node_map = &stamped.graph.node_map;
-        let mut node_to_cell = vec![u32::MAX; node_map.len()];
+        let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(centroids.len());
+        let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(centroids.len());
+        let mut node_to_cell: Vec<u32> = Vec::with_capacity(centroids.len());
         let mut any = false;
-        for (node, &(si, flat)) in node_map.iter().enumerate() {
-            if let Some(vr) = readers.get(si).and_then(|r| r.vec())
-                && let Some(cell) = vr.global_cell_of_flat(flat)
-                && !superseded
-                    .get(&entries[si].superfile_id)
-                    .is_some_and(|s| s.contains(&cell))
-            {
-                node_to_cell[node] = cell;
-                any = true;
-            }
+        for (node, (superfile_id, cell_id, mut v)) in centroids.into_iter().enumerate() {
+            let cell = match cell_id {
+                Some(c)
+                    if !superseded
+                        .get(&superfile_id)
+                        .is_some_and(|s| s.contains(&c)) =>
+                {
+                    any = true;
+                    c
+                }
+                _ => u32::MAX,
+            };
+            gfc_prepare_for_metric(metric, &mut v);
+            vecs.push(v);
+            node_map.push((node, node as u32));
+            node_to_cell.push(cell);
         }
         if !any {
             return None;
         }
+        // Serial build so a retried/resumed drain that rebuilds the router from
+        // the same section scatters identical rows into identical cells.
+        use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
+        let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
+        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+        let stamped = Arc::new(StampedCentroidRouter {
+            generation: manifest.manifest_id,
+            column: column.to_string(),
+            graph: CentroidRouterGraph {
+                scorer,
+                graph,
+                node_map,
+                metric,
+            },
+        });
         Some(FineAssignRouter {
             router: stamped,
             node_to_cell,
