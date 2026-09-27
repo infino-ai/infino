@@ -112,6 +112,10 @@ use crate::{
 /// live-set sweep so all three agree on the superfile namespace.
 pub(crate) const SUPERFILE_DATA_DIR: &str = "data";
 
+/// Extension every superfile object carries, in storage and in the disk cache alike. Shared by the
+/// key builders and parsers below and by the GC sweep, which tells a superfile apart by it.
+pub(crate) const SUPERFILE_KEY_SUFFIX: &str = ".sf.parquet";
+
 /// Extra extension an in-flight cold-fetch tempfile carries on top of [`SuperfileUri::cache_filename`];
 /// the file is atomically renamed to the bare name once complete.
 pub(crate) const CACHE_TMP_EXTENSION: &str = ".tmp";
@@ -2917,7 +2921,10 @@ impl SuperfileEntry {
     /// same string by construction.
     pub fn storage_path(&self) -> String {
         match &self.stem {
-            Some(stem) => format!("{SUPERFILE_DATA_DIR}/{stem}-{}.sf.parquet", self.uri.0),
+            Some(stem) => format!(
+                "{SUPERFILE_DATA_DIR}/{stem}-{}{SUPERFILE_KEY_SUFFIX}",
+                self.uri.0
+            ),
             None => self.uri.storage_path(),
         }
     }
@@ -3000,12 +3007,12 @@ impl SuperfileUri {
     /// footer), while the `.sf` marker flags it as a Superfile
     /// superfile without making the file look non-standard.
     pub fn storage_path(self) -> String {
-        format!("{SUPERFILE_DATA_DIR}/seg-{}.sf.parquet", self.0)
+        format!("{SUPERFILE_DATA_DIR}/seg-{}{SUPERFILE_KEY_SUFFIX}", self.0)
     }
 
     /// Disk-cache filename for a promoted superfile.
     pub fn cache_filename(self) -> String {
-        format!("seg-{}.sf.parquet", self.0)
+        format!("seg-{}{SUPERFILE_KEY_SUFFIX}", self.0)
     }
 
     /// Disk-cache tempfile name for download number `seq` of this superfile. Each download gets its
@@ -3023,7 +3030,9 @@ impl SuperfileUri {
     /// `seg-<uuid>.sf.parquet`, including in-flight tempfiles (see
     /// [`Self::from_cache_tmp_filename`]).
     pub fn from_cache_filename(name: &str) -> Option<Self> {
-        let body = name.strip_prefix("seg-")?.strip_suffix(".sf.parquet")?;
+        let body = name
+            .strip_prefix("seg-")?
+            .strip_suffix(SUPERFILE_KEY_SUFFIX)?;
         Uuid::parse_str(body).ok().map(SuperfileUri)
     }
 
@@ -3061,7 +3070,7 @@ impl SuperfileUri {
         if name.contains('/') {
             return None;
         }
-        let body = name.strip_suffix(".sf.parquet")?;
+        let body = name.strip_suffix(SUPERFILE_KEY_SUFFIX)?;
         let uuid_text = body.strip_prefix("seg-").or_else(|| uuid_suffix(body))?;
         Uuid::parse_str(uuid_text).ok().map(SuperfileUri)
     }

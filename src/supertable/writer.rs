@@ -702,10 +702,11 @@ fn schedule_background_storage_reclaim(inner: Arc<SupertableInner>) {
             if let Err(e) = super::gc::gc_storage_sweep_for_inner(
                 &inner,
                 super::gc::DEFAULT_SUPERFILE_RECLAIM_GRACE,
+                super::gc::GcTrigger::DeferredReclaim,
             )
             .await
             {
-                tracing::debug!("supertable: deferred storage reclaim: {e}");
+                warn!(error = %e, "supertable: deferred storage reclaim failed");
             }
         });
     }
