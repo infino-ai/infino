@@ -4443,7 +4443,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let vcfg = &config::global().vector;
         let router_is_centroid_graph = drain_graph_assign
             && vcfg.global_fine_drain_placement
-            && metric == Metric::Cosine
+            && (running_clusters.n_cent as usize) >= opann::GRAPH_ASSIGN_MIN_N_CENT
             && vcfg.search_mode == config::VectorSearchMode::Ivf
             && match vcfg.ivf_router {
                 config::IvfRouter::CentroidGraph => true,
@@ -4788,105 +4788,101 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     let assignments: Vec<opann::BoundaryAssignment> = if distinct_rows.is_empty() {
                         // No rows to assign: never build the router (skip-empty).
                         Vec::new()
-                    } else if use_graph_assign {
-                        if let Some(fr) = fine_router.as_ref() {
-                            // Fine-centroid placement: place each row in the cell
-                            // of its nearest FINE centroid (walking the router the
-                            // hidden table serves queries with), so placement
-                            // matches routing. Dequantize the encoded row to fp32
-                            // for the graph walk — the same reconstruction the
-                            // coarse graph path applies. A row the fine router
-                            // cannot place (no in-range, live cell survives its
-                            // bounds/superseded checks) falls back to the exact
-                            // shortlist assign for that row. The result type is
-                            // identical, so the spill/replica code below is
-                            // untouched.
-                            let dim = clusters_ref.dim as usize;
-                            let admit_ctx = RabitqAdmitContext::new(dim, drain_rot_seed);
-                            let window =
-                                opann::assignment_shortlist_window(clusters_ref.n_cent as usize);
-                            // Count rows actually placed by the fine router vs. the
-                            // per-row coarse fallback, so a run can VERIFY placement
-                            // engaged (surfaced below, not via `tracing`, which the
-                            // Python binding drops) rather than inferring it from a
-                            // noisy recall delta.
-                            let fine_hits = std::sync::atomic::AtomicUsize::new(0);
-                            let out: Vec<opann::BoundaryAssignment> =
-                                hidden_inner.options.writer_pool.install(|| {
-                                    distinct_rows
-                                        .par_iter()
-                                        .map(|row| {
-                                            let row_fp = opann::dequantize_row(&row.encoded, dim);
-                                            match fr.assign_row_to_cells(
-                                                clusters_ref,
-                                                metric,
-                                                &row_fp,
-                                            ) {
-                                                Some(a) => {
-                                                    fine_hits.fetch_add(
-                                                        1,
-                                                        std::sync::atomic::Ordering::Relaxed,
-                                                    );
-                                                    a
-                                                }
-                                                None => opann::boundary_assignment_encoded(
-                                                    clusters_ref,
-                                                    metric,
-                                                    &row.encoded,
-                                                    &admit_ctx,
-                                                    window,
-                                                ),
-                                            }
-                                        })
-                                        .collect()
-                                });
-                            if drain_timers {
-                                eprintln!(
-                                    "[gfc-drain] batch {} fine placement engaged: {}/{} rows placed by nearest fine centroid (rest coarse fallback)",
-                                    batch_idx + 1,
-                                    fine_hits.load(std::sync::atomic::Ordering::Relaxed),
-                                    distinct_rows.len()
-                                );
-                            }
-                            out
-                        } else {
-                            // Graph-routed assign over the COARSE cell centroids.
-                            // Build the coarse centroid router ONCE for the drain,
-                            // lazily on the first batch with rows. The build is
-                            // serial + deterministic (see `Hnsw::build_serial`) so
-                            // cell placement is reproducible run to run; the
-                            // writer-pool install below is for the per-row
-                            // assignment fan-out. The result type is identical to
-                            // the shortlist path, so the spill/replica code below
-                            // is untouched.
-                            // Cosine-only path (gated above), so ef is the cosine
-                            // beam: max(16, round(sqrt(n_cent)/4)).
-                            let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize, metric);
+                    } else if let Some(fr) = fine_router.as_ref() {
+                        // Fine-centroid placement (any metric the router
+                        // resolves for): place each row in the cell of its
+                        // nearest FINE centroid (walking the router the
+                        // hidden table serves queries with), so placement
+                        // matches routing. Dequantize the encoded row to fp32
+                        // for the graph walk — the same reconstruction the
+                        // coarse graph path applies. A row the fine router
+                        // cannot place (no in-range, live cell survives its
+                        // bounds/superseded checks) falls back to the exact
+                        // shortlist assign for that row. The result type is
+                        // identical, so the spill/replica code below is
+                        // untouched.
+                        let dim = clusters_ref.dim as usize;
+                        let admit_ctx = RabitqAdmitContext::new(dim, drain_rot_seed);
+                        let window =
+                            opann::assignment_shortlist_window(clusters_ref.n_cent as usize);
+                        // Count rows actually placed by the fine router vs. the
+                        // per-row coarse fallback, so a run can VERIFY placement
+                        // engaged (surfaced below, not via `tracing`, which the
+                        // Python binding drops) rather than inferring it from a
+                        // noisy recall delta.
+                        let fine_hits = std::sync::atomic::AtomicUsize::new(0);
+                        let out: Vec<opann::BoundaryAssignment> =
                             hidden_inner.options.writer_pool.install(|| {
-                                let router = coarse_router.get_or_insert_with(|| {
-                                    opann::build_coarse_router(clusters_ref, metric)
-                                });
-                                // Shared reborrows so the parallel closure captures
-                                // `&` (Sync), not the `&mut` from
-                                // `get_or_insert_with`.
-                                let (scorer, graph, node_to_cell) =
-                                    (&router.0, &router.1, &router.2[..]);
                                 distinct_rows
                                     .par_iter()
                                     .map(|row| {
-                                        opann::boundary_assignment_graph_encoded(
-                                            graph,
-                                            scorer,
-                                            node_to_cell,
-                                            clusters_ref,
-                                            metric,
-                                            &row.encoded,
-                                            ef,
-                                        )
+                                        let row_fp = opann::dequantize_row(&row.encoded, dim);
+                                        match fr.assign_row_to_cells(clusters_ref, metric, &row_fp)
+                                        {
+                                            Some(a) => {
+                                                fine_hits.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                a
+                                            }
+                                            None => opann::boundary_assignment_encoded(
+                                                clusters_ref,
+                                                metric,
+                                                &row.encoded,
+                                                &admit_ctx,
+                                                window,
+                                            ),
+                                        }
                                     })
                                     .collect()
-                            })
+                            });
+                        if drain_timers {
+                            eprintln!(
+                                "[gfc-drain] batch {} fine placement engaged: {}/{} rows placed by nearest fine centroid (rest coarse fallback)",
+                                batch_idx + 1,
+                                fine_hits.load(std::sync::atomic::Ordering::Relaxed),
+                                distinct_rows.len()
+                            );
                         }
+                        out
+                    } else if use_graph_assign {
+                        // Graph-routed assign over the COARSE cell centroids.
+                        // Build the coarse centroid router ONCE for the drain,
+                        // lazily on the first batch with rows. The build is
+                        // serial + deterministic (see `Hnsw::build_serial`) so
+                        // cell placement is reproducible run to run; the
+                        // writer-pool install below is for the per-row
+                        // assignment fan-out. The result type is identical to
+                        // the shortlist path, so the spill/replica code below
+                        // is untouched.
+                        // Cosine-only path (gated above), so ef is the cosine
+                        // beam: max(16, round(sqrt(n_cent)/4)).
+                        let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize, metric);
+                        hidden_inner.options.writer_pool.install(|| {
+                            let router = coarse_router.get_or_insert_with(|| {
+                                opann::build_coarse_router(clusters_ref, metric)
+                            });
+                            // Shared reborrows so the parallel closure captures
+                            // `&` (Sync), not the `&mut` from
+                            // `get_or_insert_with`.
+                            let (scorer, graph, node_to_cell) =
+                                (&router.0, &router.1, &router.2[..]);
+                            distinct_rows
+                                .par_iter()
+                                .map(|row| {
+                                    opann::boundary_assignment_graph_encoded(
+                                        graph,
+                                        scorer,
+                                        node_to_cell,
+                                        clusters_ref,
+                                        metric,
+                                        &row.encoded,
+                                        ef,
+                                    )
+                                })
+                                .collect()
+                        })
                     } else {
                         // Shared admit context + 20% shortlist window: the same
                         // 1-bit prefilter the commit assign uses, so drain
