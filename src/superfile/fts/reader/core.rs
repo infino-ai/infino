@@ -4098,4 +4098,76 @@ mod tests {
         assert_eq!(first_ids, second_ids);
         assert!(first_ids.contains(&0) && first_ids.contains(&1));
     }
+
+    /// A whole-blob source whose first read touching `region` fails the
+    /// way a truncated object does, and serves every read after it.
+    struct FailingOnceSource {
+        inner: BytesLazyByteSource,
+        region: Range<usize>,
+        armed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for FailingOnceSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let touches =
+                (start as usize) < self.region.end && (start + len) as usize > self.region.start;
+            if touches && self.armed.swap(false, Ordering::SeqCst) {
+                return Err(LazyByteSourceError::ShortRead {
+                    start,
+                    requested: len,
+                    got: 0,
+                });
+            }
+            self.inner.range(start, len).await
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// A length-array read that fails in the synchronous fallback scores
+    /// that call against the empty table and leaves the column's cell
+    /// empty, so the next read fills it: the failure is not what every
+    /// later query on the reader scores against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_fallback_read_of_the_norms_is_not_cached() {
+        let (blob, json) = build_blob();
+        let eager = FtsReader::open(blob.clone(), &json).expect("eager open");
+        let lengths = eager.columns[0].doc_lengths_range.clone();
+        let source = Arc::new(FailingOnceSource {
+            inner: BytesLazyByteSource::new(blob),
+            region: lengths,
+            armed: AtomicBool::new(false),
+        });
+        let src: Arc<dyn LazyByteSource> = source.clone();
+        let reader = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        // Armed after the open, so the first read of the array is the
+        // fallback's.
+        source.armed.store(true, Ordering::SeqCst);
+        let column = &reader.columns[0];
+
+        // The fallback survives the failure without publishing it.
+        let _empty = column.norms();
+        assert!(
+            !column.norms_loaded(),
+            "a failed read must not fill the norms cell"
+        );
+
+        // The next scoring entry point reads the array again, and scores.
+        let hits = reader
+            .search("body", &["rust"], 10, BoolMode::Or)
+            .await
+            .expect("search after the failed read");
+        assert!(column.norms_loaded(), "the retry must fill the norms cell");
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
+        assert!(ids.contains(&0) && ids.contains(&1));
+    }
 }

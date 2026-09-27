@@ -354,7 +354,17 @@ impl ColumnNorms {
             bound_scale: 1.0,
         }
     }
+}
 
+/// The one empty table a failed read scores against, shared by every
+/// column in the process: it belongs to no column, so it is never put in a
+/// column's cell, which stays empty for the next read to fill.
+fn empty_norms() -> &'static ColumnNorms {
+    static EMPTY: OnceLock<ColumnNorms> = OnceLock::new();
+    EMPTY.get_or_init(ColumnNorms::empty)
+}
+
+impl ColumnNorms {
     /// These norms re-derived at `params`, for a view that scores with
     /// parameters other than `declared` — the ones the stored bounds were
     /// baked at. The per-doc length buckets are shared, not copied; the
@@ -426,7 +436,9 @@ impl ColumnMeta {
     /// fallback exists so a kernel can never find the norms absent — on an
     /// in-memory source it costs nothing, on a lazy one it is the read the
     /// prewarm would have made. A read that fails here logs and scores
-    /// against an empty table rather than aborting mid-kernel.
+    /// against an empty table rather than aborting mid-kernel — and leaves
+    /// the cell empty, so the next scoring entry point's prewarm reads
+    /// again rather than every later query scoring against the failure.
     ///
     /// The read runs outside the cell rather than inside `get_or_init`. An
     /// initializer that fetches holds the cell's lock across the fetch, and
@@ -449,14 +461,21 @@ impl ColumnMeta {
                     .map(|()| array)
                     .map_err(|e| e.to_string())
             });
-        let norms = match fetched {
-            Ok(array) => self.norms_from_array(&array[..self.array_len()]),
+        match fetched {
+            Ok(array) => {
+                let norms = self.norms_from_array(&array[..self.array_len()]);
+                self.base_norms.get_or_init(|| norms)
+            }
             Err(error) => {
                 tracing::error!(column = %self.name, %error, "doc-length array unreadable; scoring against empty norms");
-                ColumnNorms::empty()
+                // A racing reader may have set the cell meanwhile; its
+                // table is the real one.
+                match self.base_norms.get() {
+                    Some(norms) => norms,
+                    None => empty_norms(),
+                }
             }
-        };
-        self.base_norms.get_or_init(|| norms)
+        }
     }
 
     /// The length array's byte length, `n_docs × doc_length_bytes`: the
@@ -510,15 +529,16 @@ impl ColumnMeta {
     }
 
     /// The norms this column scores with: the declared ones, or the
-    /// override view's, derived from them on first use.
+    /// override view's, derived from them on first use. A view is derived
+    /// only from a base that was read: derived from the empty fallback it
+    /// would outlive the failure it stood in for.
     pub(super) fn norms(&self) -> &ColumnNorms {
-        if self.params == self.declared_params {
-            return self.base_norms();
+        let base = self.base_norms();
+        if self.params == self.declared_params || !self.norms_loaded() {
+            return base;
         }
-        self.view_norms.get_or_init(|| {
-            self.base_norms()
-                .rescored(self.declared_params, self.params)
-        })
+        self.view_norms
+            .get_or_init(|| base.rescored(self.declared_params, self.params))
     }
 
     /// Whether the declared-parameter norms have been built.
