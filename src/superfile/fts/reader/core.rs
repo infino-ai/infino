@@ -4021,8 +4021,8 @@ mod tests {
         }
 
         async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
-            let touches = (start as usize) < self.region.end
-                && (start + len) as usize > self.region.start;
+            let touches =
+                (start as usize) < self.region.end && (start + len) as usize > self.region.start;
             if touches && self.armed.swap(false, Ordering::SeqCst) {
                 self.paused.store(true, Ordering::SeqCst);
                 self.resume.notified().await;
@@ -4085,7 +4085,10 @@ mod tests {
         // Release the first read before asserting, so a failure leaves no
         // thread parked behind it.
         source.resume.notify_one();
-        let first_hits = first.await.expect("first search task").expect("first search");
+        let first_hits = first
+            .await
+            .expect("first search task")
+            .expect("first search");
         let second_hits = second_done
             .expect("the second search must not wait on the first search's read")
             .expect("second search task")
