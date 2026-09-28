@@ -439,7 +439,7 @@ fn assert_shape(shape: &str, expected_version: u32, coarse: CoarseTable) {
     // tokenization fix, and would prove nothing.
     for (i, h) in headers.iter().enumerate() {
         assert!(
-            !h.columns_json.contains("analysis_rev"),
+            !h.columns_json.contains("analysis_revision"),
             "{shape}: superfile {i} records an analysis revision, so it was \
              not written by a pre-fix release: {}",
             h.columns_json

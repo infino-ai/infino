@@ -395,7 +395,7 @@ pub struct ColumnMeta {
     /// query's terms can disagree for the same text, so the column is
     /// stale and a reindex must re-analyze it. Carried across a rewrite
     /// unchanged: copying postings does not re-analyze them.
-    pub analysis_rev: u32,
+    pub analysis_revision: u32,
     /// Where the length array is read from when the norms are first needed.
     pub(super) source: Source,
     pub(super) n_docs: u32,
@@ -627,7 +627,7 @@ pub struct FtsColumnConfig {
     /// as oldest", so the default can never make a stale column look
     /// current.
     #[serde(default)]
-    pub analysis_rev: u32,
+    pub analysis_revision: u32,
 }
 
 impl FtsColumnConfig {

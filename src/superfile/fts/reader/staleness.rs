@@ -109,9 +109,9 @@ impl FtsReader {
                 // analyzed with `ascii_lower` is not stale because
                 // `standard` moved.
                 let current = chain_revision(c.base, c.stopwords, c.stemmer);
-                (c.analysis_rev < current).then(|| StaleColumn {
+                (c.analysis_revision < current).then(|| StaleColumn {
                     name: c.name.clone(),
-                    recorded: c.analysis_rev,
+                    recorded: c.analysis_revision,
                     current,
                     stored: c.stored,
                 })
@@ -148,8 +148,8 @@ mod tests {
             Field::new("title", DataType::LargeUtf8, false),
         ]));
         let mut col = FtsConfig::new("title").stored(stored);
-        if let Some(rev) = carried {
-            col = col.carried_analysis_rev(rev);
+        if let Some(revision) = carried {
+            col = col.carried_analysis_revision(revision);
         }
         let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![col], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("new builder");

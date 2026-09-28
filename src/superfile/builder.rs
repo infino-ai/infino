@@ -355,17 +355,17 @@ pub struct FtsConfig {
     /// file, when they were not produced by this build.
     ///
     /// `None` means this build analyzes the column's text itself, so the
-    /// column records the revision this engine's chain emits. `Some(rev)`
-    /// means the postings came from a file at `rev` and were copied
-    /// across unchanged — a merge, a container rewrite — so the column
-    /// must keep claiming `rev`.
+    /// column records the revision this engine's chain emits. `Some(n)`
+    /// means the postings came from a file at revision `n` and were
+    /// copied across unchanged — a merge, a container rewrite — so the
+    /// column must keep claiming `n`.
     ///
     /// The distinction is the whole point of the field: a revision
     /// describes the terms in the file, never the writer that last
     /// touched it. Stamping this build's revision onto carried postings
     /// would certify terms nothing re-analyzed, which is exactly the
     /// silent mismatch the revision exists to detect.
-    pub carried_analysis_rev: Option<u32>,
+    pub carried_analysis_revision: Option<u32>,
 }
 
 impl FtsConfig {
@@ -380,7 +380,7 @@ impl FtsConfig {
             positions: false,
             stored: true,
             bm25: bm25::Bm25Params::STANDARD,
-            carried_analysis_rev: None,
+            carried_analysis_revision: None,
         }
     }
 
@@ -410,8 +410,8 @@ impl FtsConfig {
     }
 
     /// Carry an existing file's analysis revision (see the field docs).
-    pub(crate) fn carried_analysis_rev(mut self, rev: u32) -> Self {
-        self.carried_analysis_rev = Some(rev);
+    pub(crate) fn carried_analysis_revision(mut self, revision: u32) -> Self {
+        self.carried_analysis_revision = Some(revision);
         self
     }
 
@@ -422,8 +422,8 @@ impl FtsConfig {
     /// an error — the build fails on the unknown name elsewhere, with a
     /// message that names the column, and returning a revision here would
     /// only obscure it.
-    pub(crate) fn analysis_rev(&self) -> u32 {
-        self.carried_analysis_rev.unwrap_or_else(|| {
+    pub(crate) fn analysis_revision(&self) -> u32 {
+        self.carried_analysis_revision.unwrap_or_else(|| {
             Base::from_name(&self.analyzer)
                 .map(|b| chain_revision(b, self.stopwords, self.stemmer))
                 .unwrap_or(0)
@@ -654,7 +654,7 @@ impl BuilderOptions {
     /// Columns are matched by name; a column the reader does not have is
     /// left alone, since a shape mismatch is the carry compatibility
     /// check's error to report, not this function's.
-    pub(crate) fn lower_analysis_rev_to(&mut self, reader: &SuperfileReader) {
+    pub(crate) fn lower_analysis_revision_to(&mut self, reader: &SuperfileReader) {
         let Some(fts) = reader.fts() else {
             return;
         };
@@ -666,8 +666,8 @@ impl BuilderOptions {
             else {
                 continue;
             };
-            let carried = own.analysis_rev().min(remote.analysis_rev);
-            own.carried_analysis_rev = Some(carried);
+            let carried = own.analysis_revision().min(remote.analysis_revision);
+            own.carried_analysis_revision = Some(carried);
         }
     }
 
@@ -683,7 +683,7 @@ impl BuilderOptions {
     pub(crate) fn reanalyze_stored_columns(mut self) -> Self {
         for column in &mut self.fts_columns {
             if column.stored {
-                column.carried_analysis_rev = None;
+                column.carried_analysis_revision = None;
             }
         }
         self
@@ -745,7 +745,7 @@ impl BuilderOptions {
                         .positions(c.positions)
                         .stored(c.stored)
                         .bm25(c.params.k1, c.params.b)
-                        .carried_analysis_rev(c.analysis_rev)
+                        .carried_analysis_revision(c.analysis_revision)
                 })
                 .collect()
         } else {
@@ -3227,7 +3227,7 @@ fn fts_param_json(v: f32) -> String {
 ///
 /// A merge's output is only as re-analyzed as its oldest input, and
 /// `new_from_reader` can only see one — see
-/// [`BuilderOptions::lower_analysis_rev_to`].
+/// [`BuilderOptions::lower_analysis_revision_to`].
 pub(crate) fn merge_builder_opts(
     readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     first: &(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>),
@@ -3236,7 +3236,7 @@ pub(crate) fn merge_builder_opts(
     let mut opts =
         BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
     for (reader, _) in readers.iter().skip(1) {
-        opts.lower_analysis_rev_to(reader);
+        opts.lower_analysis_revision_to(reader);
     }
     opts
 }
@@ -3288,10 +3288,10 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         // from a file written before revisions existed stays
         // byte-identical to what that file carried. A reader defaults a
         // missing field to 0, which is what such a file means.
-        let analysis_rev = c.analysis_rev();
-        if analysis_rev != 0 {
-            s.push_str(r#","analysis_rev":"#);
-            s.push_str(&analysis_rev.to_string());
+        let analysis_revision = c.analysis_revision();
+        if analysis_revision != 0 {
+            s.push_str(r#","analysis_revision":"#);
+            s.push_str(&analysis_revision.to_string());
         }
         s.push('}');
     }
@@ -3679,16 +3679,16 @@ mod tests {
     /// keeps recording nothing — the JSON stays byte-identical to what
     /// such a file carried.
     #[test]
-    fn analysis_rev_emitted_only_when_non_zero() {
+    fn analysis_revision_emitted_only_when_non_zero() {
         let fresh = fts_columns_json(&[FtsConfig::new("title")]);
         assert!(
-            fresh.contains(r#""analysis_rev":1"#),
+            fresh.contains(r#""analysis_revision":1"#),
             "a freshly analyzed column records this engine's revision: {fresh}"
         );
 
-        let carried = fts_columns_json(&[FtsConfig::new("title").carried_analysis_rev(0)]);
+        let carried = fts_columns_json(&[FtsConfig::new("title").carried_analysis_revision(0)]);
         assert!(
-            !carried.contains("analysis_rev"),
+            !carried.contains("analysis_revision"),
             "postings carried from a pre-revision file record no revision at all: {carried}"
         );
     }
@@ -3698,8 +3698,8 @@ mod tests {
     fn rebuild_single(carried: Option<u32>) -> (u32, u32) {
         let schema = schema_with_fts();
         let mut col = FtsConfig::new("title");
-        if let Some(rev) = carried {
-            col = col.carried_analysis_rev(rev);
+        if let Some(revision) = carried {
+            col = col.carried_analysis_revision(revision);
         }
         let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![col], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("new builder");
@@ -3707,23 +3707,23 @@ mod tests {
         let source = Arc::new(
             SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"),
         );
-        let before = column_rev(&source);
+        let before = column_revision(&source);
 
         let (bytes, _) =
             SuperfileBuilder::build_from_readers_fts_merge(&[(Arc::clone(&source), None)])
                 .expect("rebuild");
         let rebuilt = SuperfileReader::open(Bytes::from(bytes)).expect("open rebuilt");
-        (before, column_rev(&rebuilt))
+        (before, column_revision(&rebuilt))
     }
 
-    fn column_rev(reader: &SuperfileReader) -> u32 {
+    fn column_revision(reader: &SuperfileReader) -> u32 {
         reader
             .fts()
             .expect("fts blob")
             .fts_columns_config()
             .next()
             .expect("one column")
-            .analysis_rev
+            .analysis_revision
     }
 
     /// Rewriting a file's container does not re-analyze its terms, so the
@@ -3767,8 +3767,8 @@ mod tests {
         let schema = schema_with_fts();
         let build = |carried: Option<u32>| {
             let mut col = FtsConfig::new("title");
-            if let Some(rev) = carried {
-                col = col.carried_analysis_rev(rev);
+            if let Some(revision) = carried {
+                col = col.carried_analysis_revision(revision);
             }
             let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![col], vec![]);
             let mut b = SuperfileBuilder::new(opts).expect("new builder");
@@ -3778,7 +3778,7 @@ mod tests {
 
         let current = build(None);
         let stale = build(Some(0));
-        assert_eq!((column_rev(&current), column_rev(&stale)), (1, 0));
+        assert_eq!((column_revision(&current), column_revision(&stale)), (1, 0));
 
         let (bytes, _) = SuperfileBuilder::build_from_readers_fts_merge(&[
             (Arc::clone(&current), None),
@@ -3787,7 +3787,7 @@ mod tests {
         .expect("a mixed-revision merge must succeed, not refuse");
         let merged = SuperfileReader::open(Bytes::from(bytes)).expect("open merged");
         assert_eq!(
-            column_rev(&merged),
+            column_revision(&merged),
             0,
             "the output is only as re-analyzed as its oldest input"
         );
@@ -3799,8 +3799,8 @@ mod tests {
         let schema = schema_with_fts();
         let build = |carried: Option<u32>| {
             let mut col = FtsConfig::new("title");
-            if let Some(rev) = carried {
-                col = col.carried_analysis_rev(rev);
+            if let Some(revision) = carried {
+                col = col.carried_analysis_revision(revision);
             }
             let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![col], vec![]);
             let mut b = SuperfileBuilder::new(opts).expect("new builder");
@@ -3818,7 +3818,7 @@ mod tests {
         ])
         .expect("merge");
         let merged = SuperfileReader::open(Bytes::from(bytes)).expect("open merged");
-        assert_eq!(column_rev(&merged), 0);
+        assert_eq!(column_revision(&merged), 0);
     }
 
     #[test]
@@ -3847,13 +3847,13 @@ mod tests {
         let s = fts_columns_json(&cols);
         assert!(
             s.contains(
-                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true,"analysis_rev":1}"#
+                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true,"analysis_revision":1}"#
             ),
             "positional column carries the flag: {s}"
         );
         assert!(
             s.contains(
-                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_rev":1}"#
+                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
             ),
             "positionless column carries no positions key at all: {s}"
         );
@@ -3871,13 +3871,13 @@ mod tests {
         let s = fts_columns_json(&cols);
         assert!(
             s.contains(
-                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_rev":1}"#
+                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
             ),
             "title uses the standard analyzer: {s}"
         );
         assert!(
             s.contains(
-                r#"{"name":"body","tokenizer":"ascii_lower","k1":1.2,"b":0.75,"analysis_rev":1}"#
+                r#"{"name":"body","tokenizer":"ascii_lower","k1":1.2,"b":0.75,"analysis_revision":1}"#
             ),
             "body uses ascii_lower: {s}"
         );
@@ -3894,13 +3894,13 @@ mod tests {
         let s = fts_columns_json(&cols);
         assert!(
             s.contains(
-                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_rev":1}"#
+                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
             ),
             "stored column carries no stored key at all: {s}"
         );
         assert!(
             s.contains(
-                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stored":false,"analysis_rev":1}"#
+                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stored":false,"analysis_revision":1}"#
             ),
             "index-only column carries the flag: {s}"
         );

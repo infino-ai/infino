@@ -977,7 +977,7 @@ impl FtsReader {
                 stopwords,
                 stemmer,
                 stored: col_cfg.stored,
-                analysis_rev: col_cfg.analysis_rev,
+                analysis_revision: col_cfg.analysis_revision,
                 source: source.clone(),
                 n_docs,
                 doc_length_bytes,
