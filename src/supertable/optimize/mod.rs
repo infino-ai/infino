@@ -1,3 +1,8 @@
+/// Compaction: the one phase this module owns outright. Every other
+/// phase `optimize` runs is a maintenance operation with callers of its
+/// own, sequenced here rather than implemented here.
+pub(crate) mod compact;
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
