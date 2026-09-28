@@ -750,7 +750,7 @@ impl Supertable {
             match try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
-                current,
+                Arc::clone(&current),
                 &new_entries,
                 &entries_to_remove,
                 NewEntryBirthVersions::Preserve,
@@ -761,6 +761,9 @@ impl Supertable {
             .await
             {
                 Ok(new_manifest) => {
+                    // This attempt's own removals, resolved against its own base above, so a
+                    // retry that found fewer inputs records only those.
+                    inner.note_superseded(&current, &new_manifest, &entries_to_remove);
                     inner.manifest.store(Arc::new(new_manifest));
                     // Warm the merged superfile into the in-memory reader
                     // cache, same as a normal writer commit does. Without

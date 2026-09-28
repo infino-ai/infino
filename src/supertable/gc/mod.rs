@@ -9,6 +9,8 @@ use std::{
 
 use tracing::{debug, error, info, warn};
 
+pub(in crate::supertable) mod superseded;
+
 use crate::{
     runtime_bridge::bridge_on_runtime,
     storage::{StorageError, StorageProvider},
@@ -44,27 +46,6 @@ const MAX_MISSING_SUPERFILE_PROBES: usize = 64;
 /// delete.
 const YOUNG_SUPERFILE_DELETE_AGE: Duration =
     Duration::from_secs(3 * DEFAULT_SUPERFILE_RECLAIM_GRACE.as_secs());
-
-/// Which caller ran a sweep, carried on every line it logs so a deleted object can be traced back
-/// to the path that deleted it.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum GcTrigger {
-    /// [`Supertable::gc`], including the one `optimize` runs. The only trigger that runs the
-    /// missing-superfile check.
-    Explicit,
-    /// The deferred sweep a commit schedules after dropping superfile references. Skips the
-    /// missing-superfile check, which would otherwise run once per commit.
-    DeferredReclaim,
-}
-
-impl GcTrigger {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Explicit => "explicit",
-            Self::DeferredReclaim => "deferred_reclaim",
-        }
-    }
-}
 
 /// Outcome of a [`crate::Supertable::gc`] sweep: what was reclaimed and what was
 /// intentionally kept.
@@ -146,8 +127,14 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
 
 impl Supertable {
     /// Delete orphaned storage objects left by compaction or interrupted
-    /// writes. Only objects older than `safety_gap` are removed, so a
-    /// concurrent reader or writer is never raced. Requires durable storage.
+    /// writes. Only objects older than `safety_gap` are removed. Requires
+    /// durable storage.
+    ///
+    /// A commit uploads its files before it publishes them, so until it lands
+    /// they look exactly like orphans. `safety_gap` must be longer than any
+    /// commit can take, or a slow commit loses its own files; `optimize` uses
+    /// a day. What commits replace is reclaimed separately, minutes after each
+    /// commit, without this sweep.
     #[doc(alias = "vacuum")]
     pub fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         bridge_on_runtime(self.gc_async(safety_gap), &self.inner().query_runtime())
@@ -158,7 +145,7 @@ impl Supertable {
         tracing::instrument(name = "gc", skip_all, fields(role = self.role().as_str()))
     )]
     pub(crate) async fn gc_async(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
-        gc_storage_sweep_for_inner(self.inner(), safety_gap, GcTrigger::Explicit).await
+        gc_storage_sweep_for_inner(self.inner(), safety_gap).await
     }
 }
 
@@ -260,10 +247,10 @@ async fn live_set(
 ///
 /// The same listing doubles as an integrity check: a superfile the committed manifest references
 /// but storage does not hold is data already lost, and every read or compaction touching it fails
-/// from then on. Only an explicit sweep runs it ([`Supertable::gc`], which `optimize` calls once per
-/// table per maintenance pass), and only over a fully resident membership, the one case `data/` is
-/// listed. The deferred sweep every commit schedules skips it, so ingest never pays for it, not even
-/// on a table already broken. On a healthy table it costs one pass over the keep-set and a counter:
+/// from then on. It runs only over a fully resident membership, the one case `data/` is listed.
+/// This sweep serves [`Supertable::gc`], which `optimize` calls once per table per maintenance
+/// pass; the deferred sweep a commit schedules never lists (see [`superseded`]), so ingest never
+/// pays for the check. On a healthy table it costs one pass over the keep-set and a counter:
 ///
 /// ```text
 ///   list every prefix ── count the referenced superfiles `data/` returned
@@ -285,7 +272,6 @@ async fn live_set(
 pub(super) async fn gc_storage_sweep_for_inner(
     inner: &SupertableInner,
     safety_gap: Duration,
-    trigger: GcTrigger,
 ) -> Result<GcReport, GcError> {
     let storage = inner.options.storage.clone().ok_or(GcError::NoStorage)?;
 
@@ -318,7 +304,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
     }
 
     // `data/` is only listed when membership is complete, so the check needs that too.
-    let check_integrity = superfiles_complete && matches!(trigger, GcTrigger::Explicit);
+    let check_integrity = superfiles_complete;
 
     let mut candidates: Vec<(String, u64, SystemTime)> = Vec::new();
     // Referenced superfiles the `data/` listing returned. Only a shortfall against the referenced
@@ -358,7 +344,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
     };
 
     let mut absent = if listed_referenced_superfiles < referenced_superfiles {
-        absent_superfiles(&storage, &live_uris, trigger).await?
+        absent_superfiles(&storage, &live_uris).await?
     } else {
         AbsentSuperfiles::default()
     };
@@ -402,7 +388,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
         }
     }
 
-    absent.report(checked_manifest_id, trigger);
+    absent.report(checked_manifest_id);
 
     let now = SystemTime::now();
     let mut young_superfiles_deleted = 0u64;
@@ -427,7 +413,6 @@ pub(super) async fn gc_storage_sweep_for_inner(
                         bytes = size,
                         age_secs = age.as_secs(),
                         manifest_id = checked_manifest_id,
-                        trigger = trigger.as_str(),
                         "gc: deleted a young superfile unreferenced by the committed manifest"
                     );
                 }
@@ -436,7 +421,6 @@ pub(super) async fn gc_storage_sweep_for_inner(
                 warn!(
                     object = %key,
                     error = %e,
-                    trigger = trigger.as_str(),
                     "gc: failed to delete orphan object"
                 );
                 report.delete_errors += 1;
@@ -454,7 +438,6 @@ pub(super) async fn gc_storage_sweep_for_inner(
             bytes_freed = report.bytes_freed,
             delete_errors = report.delete_errors,
             manifest_id = checked_manifest_id,
-            trigger = trigger.as_str(),
             "gc sweep complete"
         );
     } else {
@@ -462,7 +445,6 @@ pub(super) async fn gc_storage_sweep_for_inner(
             deleted = report.objects_deleted,
             bytes_freed = report.bytes_freed,
             manifest_id = checked_manifest_id,
-            trigger = trigger.as_str(),
             superfiles_complete,
             "gc sweep complete"
         );
@@ -496,12 +478,11 @@ impl AbsentSuperfiles {
 
     /// One `error` per confirmed key, plus one for the unprobed remainder. Keep the message text
     /// stable: operators alert on it.
-    fn report(&self, manifest_id: u64, trigger: GcTrigger) {
+    fn report(&self, manifest_id: u64) {
         for key in &self.confirmed {
             error!(
                 object = %key,
                 manifest_id,
-                trigger = trigger.as_str(),
                 "manifest references a superfile missing from storage"
             );
         }
@@ -509,7 +490,6 @@ impl AbsentSuperfiles {
             error!(
                 unprobed = self.unprobed.len(),
                 manifest_id,
-                trigger = trigger.as_str(),
                 "manifest references a superfile missing from storage: more than the sweep probes"
             );
         }
@@ -525,7 +505,6 @@ impl AbsentSuperfiles {
 async fn absent_superfiles(
     storage: &Arc<dyn StorageProvider>,
     referenced: &HashSet<String>,
-    trigger: GcTrigger,
 ) -> Result<AbsentSuperfiles, GcError> {
     let listed: HashSet<String> = storage
         .list_with_prefix(SUPERFILE_DATA_DIR)
@@ -553,7 +532,6 @@ async fn absent_superfiles(
             Err(e) => warn!(
                 object = %key,
                 error = %e,
-                trigger = trigger.as_str(),
                 "gc: could not confirm a superfile the listing did not return"
             ),
         }
@@ -1075,11 +1053,11 @@ mod tests {
             .collect()
     }
 
-    /// Sweep `st` with no grace as `trigger`, capturing every line it logs at `info` and above.
+    /// Sweep `st` with no grace, capturing every line it logs at `info` and above.
     ///
     /// A multi-thread runtime, so `block_on` drives the sweep on this thread and the thread-local
     /// subscriber sees its events.
-    fn sweep_logging(st: &Supertable, trigger: GcTrigger) -> (GcReport, String) {
+    fn sweep_logging(st: &Supertable) -> (GcReport, String) {
         let logs = CapturedLogs::default();
         let writer = logs.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -1092,11 +1070,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .expect("runtime")
-                .block_on(gc_storage_sweep_for_inner(
-                    st.inner(),
-                    Duration::ZERO,
-                    trigger,
-                ))
+                .block_on(gc_storage_sweep_for_inner(st.inner(), Duration::ZERO))
                 .expect("sweep")
         });
         let text = String::from_utf8_lossy(&logs.0.lock().expect("log buffer")).into_owned();
@@ -1121,7 +1095,7 @@ mod tests {
         let [lost, kept] = <[String; 2]>::try_from(superfile_keys(&st)).expect("two superfiles");
         std::fs::remove_file(dir.path().join(&lost)).expect("delete behind the table");
 
-        let (report, logs) = sweep_logging(&st, GcTrigger::Explicit);
+        let (report, logs) = sweep_logging(&st);
 
         let lines = loss_lines(&logs);
         assert_eq!(lines.len(), 1, "exactly the lost superfile: {logs}");
@@ -1172,7 +1146,7 @@ mod tests {
         });
         let (_, sweeper) = DataListHook::sweeper(Arc::clone(&local), Some(hook), None);
 
-        let (report, logs) = sweep_logging(&sweeper, GcTrigger::Explicit);
+        let (report, logs) = sweep_logging(&sweeper);
 
         assert!(
             loss_lines(&logs).is_empty(),
@@ -1197,7 +1171,7 @@ mod tests {
 
         let (_, sweeper) = DataListHook::sweeper(local, None, Some(key.clone()));
 
-        let (_, logs) = sweep_logging(&sweeper, GcTrigger::Explicit);
+        let (_, logs) = sweep_logging(&sweeper);
 
         assert!(loss_lines(&logs).is_empty(), "{logs}");
         assert!(
@@ -1218,7 +1192,7 @@ mod tests {
             .chain([POINTER_PATH.to_string()])
             .collect();
 
-        let absent = absent_superfiles(&storage, &referenced, GcTrigger::Explicit)
+        let absent = absent_superfiles(&storage, &referenced)
             .await
             .expect("probe");
 
@@ -1257,7 +1231,7 @@ mod tests {
             )
             .expect("backdate old orphan");
 
-        let (report, logs) = sweep_logging(&st, GcTrigger::Explicit);
+        let (report, logs) = sweep_logging(&st);
 
         assert!(
             !dir.path().join(&young).exists() && !dir.path().join(&old).exists(),
@@ -1283,7 +1257,7 @@ mod tests {
         // Each commit supersedes the manifest list before it, which the sweep then reclaims.
         let st = table_with_superfiles(&storage, &["alphatoken marker", "betatoken marker"]);
 
-        let (report, logs) = sweep_logging(&st, GcTrigger::Explicit);
+        let (report, logs) = sweep_logging(&st);
 
         assert!(
             report.objects_deleted > 0,
@@ -1301,30 +1275,11 @@ mod tests {
         table_with_superfiles(&local, &["alphatoken marker", "betatoken marker"]);
         let (hooked, sweeper) = DataListHook::sweeper(local, None, None);
 
-        let (_, logs) = sweep_logging(&sweeper, GcTrigger::Explicit);
+        let (_, logs) = sweep_logging(&sweeper);
 
         assert!(loss_lines(&logs).is_empty(), "{logs}");
         assert_eq!(hooked.heads(), 0, "no HEAD on a healthy table");
         assert_eq!(hooked.data_lists(), 1, "data/ listed once");
-    }
-
-    /// The sweep every commit schedules skips the check, so ingest pays nothing for it even on a
-    /// table that has already lost a superfile.
-    #[test]
-    fn a_deferred_sweep_skips_the_check() {
-        let dir = tempdir().expect("tempdir");
-        let local: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let writer = table_with_superfiles(&local, &["alphatoken marker", "betatoken marker"]);
-        let lost = superfile_keys(&writer).remove(0);
-        std::fs::remove_file(dir.path().join(&lost)).expect("delete behind the table");
-        let (hooked, sweeper) = DataListHook::sweeper(local, None, None);
-
-        let (_, logs) = sweep_logging(&sweeper, GcTrigger::DeferredReclaim);
-
-        assert!(loss_lines(&logs).is_empty(), "{logs}");
-        assert_eq!(hooked.heads(), 0, "no probe from a deferred sweep");
-        assert_eq!(hooked.data_lists(), 1, "no re-list from a deferred sweep");
     }
 
     /// A HEAD that fails for another reason proves nothing either way: it is logged at `warn`,
@@ -1343,7 +1298,7 @@ mod tests {
         std::fs::remove_file(dir.path().join(&lost)).expect("delete behind the table");
         faulty.fail(FaultOp::Head, &lost, usize::MAX);
 
-        let (_, logs) = sweep_logging(&st, GcTrigger::Explicit);
+        let (_, logs) = sweep_logging(&st);
 
         assert!(
             loss_lines(&logs).is_empty(),

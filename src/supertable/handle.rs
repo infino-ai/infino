@@ -53,6 +53,7 @@ use crate::{
     },
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
+        gc::superseded::Superseded,
         manifest::commit::{PointerProbe, probe_pointer, read_pointer},
         options::Consistency,
         query::{
@@ -235,6 +236,9 @@ pub(super) struct SupertableInner {
     /// (which rewrite the pointer without capturing its new etag) —
     /// the next probe then takes the full-read path and re-seeds it.
     pub(super) last_pointer_etag: Mutex<Option<String>>,
+    /// Keys this handle's commits dropped since its last deferred sweep was scheduled. Every
+    /// pointer-swapping commit adds to it (`note_superseded`); scheduling a sweep takes it all.
+    pub(super) superseded: Mutex<Superseded>,
     /// Set once this handle's pointer is seen deleted — its table was dropped
     /// and purged elsewhere. Latched: the handle can only be discarded, and
     /// `Connection::open_table` checks this before serving it from cache.
@@ -1810,6 +1814,7 @@ async fn build_handle(
         hidden_index_open_error: std::sync::OnceLock::new(),
         last_pointer_check: Mutex::new(None),
         last_pointer_etag: Mutex::new(None),
+        superseded: Mutex::default(),
         pointer_vanished: OnceLock::new(),
         hidden_deleted_cache: Mutex::new(None),
         sql_schemas: OnceLock::new(),
