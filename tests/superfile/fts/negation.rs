@@ -69,7 +69,7 @@ async fn search_set(
         .await
         .expect("bm25_search")
         .into_iter()
-        .map(|(d, _)| d as u64)
+        .map(|(d, _)| u64::from(d.get()))
         .collect()
 }
 
@@ -381,7 +381,7 @@ async fn negation_with_multi_block_negated_list() {
         .await
         .expect("multi-block negation")
         .into_iter()
-        .map(|(d, _)| d as u64)
+        .map(|(d, _)| u64::from(d.get()))
         .collect();
     let want: HashSet<u64> = (0..corp.len() as u64)
         .filter(|d| d % 3 == 0 && d % 4 != 0)

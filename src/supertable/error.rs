@@ -323,6 +323,11 @@ pub enum ManifestError {
     /// silently overwrite that assignment.
     #[error("superfile entry already partitioned: {detail}")]
     EntryAlreadyPartitioned { detail: String },
+    /// A commit tried to add a superfile the manifest already lists. A
+    /// superfile listed twice has its rows read twice, by queries and by
+    /// merges.
+    #[error("superfile {superfile_id} is already listed in the manifest")]
+    SuperfileAlreadyListed { superfile_id: uuid::Uuid },
     /// Manifest load error
     #[error("manifest load error: {0}")]
     ManifestLoadError(#[from] ManifestLoadError),

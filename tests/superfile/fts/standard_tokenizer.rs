@@ -84,7 +84,7 @@ async fn assert_matches_oracle(
         .await
         .expect("bm25 search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     // Score the same clauses the reader parsed, so the comparison can't
     // diverge on tokenization of the query string itself.
@@ -149,7 +149,7 @@ async fn standard_tokenizer_indexes_non_ascii_terms() {
         .bm25_hits_async("title", "café", K_ALL, BoolMode::Or)
         .await
         .expect("search café");
-    let cafe_ids: HashSet<u64> = cafe.iter().map(|(d, _)| *d as u64).collect();
+    let cafe_ids: HashSet<u64> = cafe.iter().map(|(d, _)| u64::from(d.get())).collect();
     assert_eq!(
         cafe_ids,
         HashSet::from([1, 2, 6]),
@@ -160,7 +160,7 @@ async fn standard_tokenizer_indexes_non_ascii_terms() {
         .bm25_hits_async("title", "naïve", K_ALL, BoolMode::Or)
         .await
         .expect("search naïve");
-    let naive_ids: HashSet<u64> = naive.iter().map(|(d, _)| *d as u64).collect();
+    let naive_ids: HashSet<u64> = naive.iter().map(|(d, _)| u64::from(d.get())).collect();
     assert_eq!(
         naive_ids,
         HashSet::from([1, 7]),
@@ -171,7 +171,7 @@ async fn standard_tokenizer_indexes_non_ascii_terms() {
         .bm25_hits_async("title", "🚀", K_ALL, BoolMode::Or)
         .await
         .expect("search 🚀");
-    let rocket_ids: HashSet<u64> = rocket.iter().map(|(d, _)| *d as u64).collect();
+    let rocket_ids: HashSet<u64> = rocket.iter().map(|(d, _)| u64::from(d.get())).collect();
     assert_eq!(
         rocket_ids,
         HashSet::from([1]),

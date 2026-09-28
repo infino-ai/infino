@@ -95,6 +95,7 @@ use parquet::{
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
@@ -117,11 +118,12 @@ use crate::{
             fts::{memos_from_plan_locations, plan_locations_for},
             prune::{PruneLeaf, select_superfiles},
             skip::{ScalarOp, ScalarPredicate},
-            superfile_reader::superfile_reader,
+            superfile_reader::superfile_reader_tiered,
         },
-        reader_cache::{DiskCacheStore, ReadIntent, SuperfileReaderCache},
+        reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
         tombstones::SidecarCache,
     },
+    utils::trace::detail_span,
 };
 
 /// Logical name the supertable is registered under in the
@@ -160,6 +162,51 @@ struct PreparedScanFile {
     path: ObjPath,
     size: u64,
     row_counts: Arc<[u32]>,
+    /// Which cache tier the first open of this file was served from. A
+    /// later scan of the same provider reuses the prepared file and reports
+    /// the same tier: what it paid, not what it would pay now.
+    tier: OpenTier,
+}
+
+/// How many of a scan's files each cache tier served. One line of counts on
+/// the `scan.open_files` span instead of a span per file: what a trace
+/// needs to say whether a slow scan was a cold one, at a cost that does not
+/// grow with the table.
+#[derive(Default)]
+struct OpenTierCounts {
+    memory: u64,
+    disk: u64,
+    lazy: u64,
+    source: u64,
+    coalesced: u64,
+    streamed: u64,
+}
+
+impl OpenTierCounts {
+    fn tally<'a>(files: impl IntoIterator<Item = &'a Arc<PreparedScanFile>>) -> Self {
+        let mut counts = Self::default();
+        for file in files {
+            let slot = match file.tier {
+                OpenTier::Memory => &mut counts.memory,
+                OpenTier::Disk => &mut counts.disk,
+                OpenTier::Lazy => &mut counts.lazy,
+                OpenTier::Source => &mut counts.source,
+                OpenTier::Coalesced => &mut counts.coalesced,
+                OpenTier::Streamed => &mut counts.streamed,
+            };
+            *slot += 1;
+        }
+        counts
+    }
+
+    fn record_on(&self, span: &tracing::Span) {
+        span.record("memory", self.memory);
+        span.record("disk", self.disk);
+        span.record("lazy", self.lazy);
+        span.record("source", self.source);
+        span.record("coalesced", self.coalesced);
+        span.record("streamed", self.streamed);
+    }
 }
 
 /// Concurrent first-open coalescing for one immutable superfile.
@@ -452,7 +499,7 @@ impl SupertableProvider {
         let entry = Arc::clone(entry);
         let prepared = cell
             .get_or_try_init(|| async move {
-                let reader = superfile_reader(
+                let (reader, tier) = superfile_reader_tiered(
                     &store,
                     disk_cache.as_ref(),
                     storage.as_ref(),
@@ -489,6 +536,7 @@ impl SupertableProvider {
                     size,
                     row_counts,
                     reader,
+                    tier,
                 }))
             })
             .await?;
@@ -806,8 +854,21 @@ impl TableProvider for SupertableProvider {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Superfile selection via the shared two-tier prune (the same
         // path FTS search uses); see `select_survivors`. Survivors go to
-        // DataFusion.
-        let survivor_entries = self.select_survivors(filters).await?;
+        // DataFusion. The span carries both counts, so a trace shows how
+        // much of the snapshot the statistics kept this query away from.
+        let select_span = detail_span!(
+            "scan.select_superfiles",
+            manifest_superfiles = self.manifest.superfiles.len(),
+            survivors = tracing::field::Empty,
+        );
+
+        let survivor_entries = self
+            .select_survivors(filters)
+            .instrument(select_span.clone())
+            .await?;
+
+        select_span.record("survivors", survivor_entries.len());
+
         let survivors: Vec<&Arc<SuperfileEntry>> = survivor_entries.iter().collect();
 
         // Nothing survived (empty table, or every superfile pruned):
@@ -858,8 +919,29 @@ impl TableProvider for SupertableProvider {
         let plan_locations =
             plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await;
         let plan_locations = &plan_locations;
+
+        // Opening every survivor: the part of a scan that pays for a cache
+        // miss. The span says how many files each tier served, so a cold
+        // scan is legible from one line.
+        let open_span = detail_span!(
+            "scan.open_files",
+            files = survivors.len(),
+            memory = tracing::field::Empty,
+            disk = tracing::field::Empty,
+            lazy = tracing::field::Empty,
+            source = tracing::field::Empty,
+            coalesced = tracing::field::Empty,
+            streamed = tracing::field::Empty,
+        );
         let prepared_files =
-            try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry))).await?;
+            try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry)))
+                .instrument(open_span.clone())
+                .await?;
+        // The tally is a pass over the files; without the feature the span
+        // is `none` and would drop the counts, so skip the pass too.
+        if cfg!(feature = "detailed-tracing") {
+            OpenTierCounts::tally(&prepared_files).record_on(&open_span);
+        }
 
         // Per-superfile scan inputs, resolved into PartitionedFiles once the
         // store is built (row-group counts are read from each superfile's
@@ -998,6 +1080,13 @@ impl TableProvider for SupertableProvider {
                     }
                 }),
         )
+        // The per-superfile predicate work above: index candidate plans,
+        // their evaluation, and the tombstone overlay. Distinct from opening
+        // the files, which was paid for in `scan.open_files`.
+        .instrument(detail_span!(
+            "scan.index_predicates",
+            files = survivors.len()
+        ))
         .await?;
 
         // Whether some superfile's plan came out `Unbounded`. Decides

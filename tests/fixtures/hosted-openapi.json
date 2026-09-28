@@ -1420,6 +1420,27 @@
             "format": "float",
             "description": "BM25 term-frequency saturation for this column. Omitted means the\nengine default. Must be given together with `b`: the two interact\nthrough the length norm, so half a pair scores with a combination\nthe caller never chose."
           },
+          "positions": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Record token positions, which exact phrase queries (`\"climate\npolicy\"`) need. Omitted means the engine default, `false`. Positions\nroughly double the column's full-text index, so they are a per-column\nopt-in. A column without them answers a phrase query with an error\nnaming the column, never a bag-of-words fallback. Recorded with the\ntable; it cannot be changed afterwards."
+          },
+          "stemmer": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stemmer applied at index and query time (`\"english\"`). Omitted means\nnone. Recorded with the table; it cannot be changed afterwards."
+          },
+          "stopwords": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stopword set removed at index and query time (`\"english\"`). Omitted\nmeans none. Recorded with the table; it cannot be changed afterwards."
+          },
           "stored": {
             "type": [
               "boolean",
@@ -1573,7 +1594,7 @@
       },
       "SchemaField": {
         "type": "object",
-        "description": "One column in a `create_table` schema. A scalar column is `{name, type}` where `type` is a scalar spelling (`\"i32\"`, `\"large_utf8\"`, …); a vector column is `{name, type: \"vector\", dim}`; a list column is `{name, type: \"list\", item}`. `dim` is required for `\"vector\"` and `item` for `\"list\"`.",
+        "description": "One column in a `create_table` schema. A scalar column is `{name, type}` where `type` is one of `\"utf8\"`, `\"large_utf8\"`, `\"bool\"`, `\"i32\"`, `\"i64\"`, `\"u32\"`, `\"u64\"`, `\"f32\"`, `\"f64\"`, `\"date32\"`, `\"date64\"`, or a timezone-naive timestamp with its unit: `\"timestamp_s\"`, `\"timestamp_ms\"` (also `\"timestamp\"`), `\"timestamp_us\"`, `\"timestamp_ns\"`. A vector column is `{name, type: \"vector\", dim}`; a list column is `{name, type: \"list\", item}`. `dim` is required for `\"vector\"` and `item` for `\"list\"`. The `schema` endpoint returns this shape for every column, including ones this form cannot declare: a zoned timestamp carries `tz`, a decimal is `{type: \"decimal\", precision, scale}`, a struct is `{type: \"struct\", fields}`, a map is `{type: \"map\", key, value}`; declare those with `schema_ipc`.",
         "required": [
           "name",
           "type"
@@ -1608,7 +1629,7 @@
           },
           "type": {
             "type": "string",
-            "description": "Scalar spelling, or `\"vector\"` / `\"list\"`."
+            "description": "Scalar spelling (`\"i32\"`, `\"large_utf8\"`, `\"date32\"`, `\"timestamp_ms\"`, …),\nor `\"vector\"` / `\"list\"`."
           }
         },
         "additionalProperties": false

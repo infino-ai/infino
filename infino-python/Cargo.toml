@@ -1,6 +1,6 @@
 [package]
 name = "infino-python"
-version = "0.8.7"
+version = "0.8.9"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -42,6 +42,9 @@ numpy = "0.28"
 # datafusion version so the `Expr` type unifies with the core signatures;
 # feature unification reuses infino's already-compiled datafusion.
 datafusion = "54"
+# Diagnostic: RUST_LOG-driven subscriber so engine tracing timers surface from
+# the Python path (bench/scale-run instrumentation only).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 # Diagnostic wheel: exposes `nprobe` / `rerank_mult` kwargs on

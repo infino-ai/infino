@@ -681,7 +681,7 @@ pub mod fts {
         if hits.is_empty() {
             return 0;
         }
-        let locals: Vec<u32> = hits.iter().map(|&(doc, _)| doc).collect();
+        let locals: Vec<u32> = hits.iter().map(|&(row, _)| row.get()).collect();
         reader
             .take_by_local_doc_ids(&locals, &[column])
             .expect("superfile take rows")
@@ -725,7 +725,7 @@ pub mod fts {
             if hits.is_empty() {
                 return (search, (0, 0));
             }
-            let locals: Vec<u32> = hits.iter().map(|&(doc, _)| doc).collect();
+            let locals: Vec<u32> = hits.iter().map(|&(row, _)| row.get()).collect();
             let batch = self
                 .take_by_local_doc_ids(&locals, &[column])
                 .expect("superfile take rows");

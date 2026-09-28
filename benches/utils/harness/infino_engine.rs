@@ -171,7 +171,7 @@ impl FtsEngine for InfinoFtsEngine {
         .expect("bm25 search");
         hits.into_iter()
             .map(|(doc_id, score)| Hit {
-                doc_id: u64::from(doc_id),
+                doc_id: u64::from(doc_id.get()),
                 score,
             })
             .collect()

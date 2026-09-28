@@ -86,14 +86,14 @@ async fn end_to_end_routing_per_column() {
         .search("title", &["rust"], FTS_PIPELINE_SEARCH_K, BoolMode::Or)
         .await
         .expect("FTS search");
-    let title_ids: Vec<u32> = title_hits.iter().map(|(d, _)| *d).collect();
+    let title_ids: Vec<u32> = title_hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(title_ids, vec![0]);
 
     let body_hits = r
         .search("body", &["rust"], FTS_PIPELINE_SEARCH_K, BoolMode::Or)
         .await
         .expect("FTS search");
-    let body_ids: Vec<u32> = body_hits.iter().map(|(d, _)| *d).collect();
+    let body_ids: Vec<u32> = body_hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(body_ids, vec![1]);
 }
 
@@ -111,7 +111,7 @@ async fn end_to_end_and_intersection() {
         )
         .await
         .expect("search");
-    let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(ids, vec![0]);
 }
 
@@ -129,7 +129,7 @@ async fn end_to_end_or_union() {
         )
         .await
         .expect("search");
-    let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     ids.sort();
     assert_eq!(ids, vec![0, 1]);
 }
@@ -148,7 +148,7 @@ async fn end_to_end_missing_term_or_drops() {
         )
         .await
         .expect("search");
-    let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(ids, vec![0]);
 }
 
@@ -223,7 +223,7 @@ async fn end_to_end_search_multi_weighted_combine() {
         )
         .await
         .expect("FTS multi-column search");
-    let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     // doc 0 (title: "rust runtime") and doc 1 (body: "rust ecosystem mature") should both rank.
     assert!(ids.contains(&0));
     assert!(ids.contains(&1));
@@ -289,8 +289,8 @@ async fn bmw_single_term_matches_brute_force() {
         .await
         .expect("search");
 
-    let bmw_ids: Vec<u32> = bmw_hits.iter().map(|(d, _)| *d).collect();
-    let mt_ids: Vec<u32> = mt_hits.iter().map(|(d, _)| *d).collect();
+    let bmw_ids: Vec<u32> = bmw_hits.iter().map(|(d, _)| d.get()).collect();
+    let mt_ids: Vec<u32> = mt_hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(bmw_ids, mt_ids, "BMW and multi-term paths must agree");
 
     // Scores should match within FP noise.
@@ -370,8 +370,8 @@ async fn bmw_single_term_multispan_matches_brute_force() {
         .expect("search");
 
     assert_eq!(bmw_hits.len(), FTS_PIPELINE_SEARCH_K);
-    let bmw_ids: Vec<u32> = bmw_hits.iter().map(|(d, _)| *d).collect();
-    let mt_ids: Vec<u32> = mt_hits.iter().map(|(d, _)| *d).collect();
+    let bmw_ids: Vec<u32> = bmw_hits.iter().map(|(d, _)| d.get()).collect();
+    let mt_ids: Vec<u32> = mt_hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(
         bmw_ids, mt_ids,
         "coarse-skip BMW and full-decode paths must agree across many spans"

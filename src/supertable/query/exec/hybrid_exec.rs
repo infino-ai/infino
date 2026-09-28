@@ -280,6 +280,9 @@ impl Supertable {
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(text_col, vec_col, k, "hybrid_search");
         let reader = self.reader()?;
+        reader
+            .check_projection(projection)
+            .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;
         let hits = reader
             .hybrid_search(text_col, q_text, mode, vec_col, q_vec, options, k)
             .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;

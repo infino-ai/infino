@@ -38,6 +38,7 @@ use crate::{
             posting::{BLOCK_LEN, BlockHeader, decode_block},
             short::{decode_short, short_df},
         },
+        id_space::{FtsDocId, RowId, RowSet},
     },
     utils::terms::{FstValue, make_key},
 };
@@ -225,7 +226,7 @@ impl FtsReader {
         mut filter: Option<AtomExcludeFilter>,
         floor_eff: f32,
         live_floor: Option<&LiveFloor>,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1();
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
@@ -405,7 +406,7 @@ impl FtsReader {
         terms: &[&str],
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         self.search_with_floor(column, terms, k, mode, f32::NEG_INFINITY)
             .await
     }
@@ -426,7 +427,7 @@ impl FtsReader {
         k: usize,
         mode: BoolMode,
         floor: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         // A flat term list under one mode is the degenerate clause
         // shape: `And` makes every term a must, `Or` a should.
         // `prepare_clauses` resolves the column and, on the `<= threshold`
@@ -464,7 +465,7 @@ impl FtsReader {
         terms: &[&str],
         k: usize,
         mode: BoolMode,
-    ) -> Result<(Vec<(u32, f32)>, MatchWork), FtsError> {
+    ) -> Result<(Vec<(RowId, f32)>, MatchWork), FtsError> {
         let (musts, shoulds): (&[&str], &[&str]) = match mode {
             BoolMode::And => (terms, &[]),
             BoolMode::Or => (&[], terms),
@@ -489,12 +490,12 @@ impl FtsReader {
         let hits = match prep {
             PreparedClauses::Done { hits, .. } => hits,
             prep => {
-                let (hits, run_ns) = timed_section(|| self.run_prepared(prep));
+                let (hits, run_ns) = timed_section(|| self.run_prepared_in_blob_ids(prep));
                 work.kernel_cpu_ns += run_ns;
                 hits?
             }
         };
-        Ok((hits, work))
+        Ok((self.hits_to_rows(hits), work))
     }
 
     /// BM25 search over explicit clause lists, with negated terms
@@ -517,7 +518,7 @@ impl FtsReader {
         lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         let prep = self.prepare_clauses(column, lists, k, floor).await?;
         self.run_prepared(prep)
     }
@@ -634,7 +635,11 @@ impl FtsReader {
             // atom, or a pushed-down row set.
             let filter = match (negative_atoms.is_empty(), lists.allow.clone()) {
                 (true, None) => None,
-                (_, allow) => Some(AtomExcludeFilter::with_allow(negative_atoms, allow)),
+                (_, allow) => Some(AtomExcludeFilter::with_allow(
+                    negative_atoms,
+                    allow.map(RowSet::new),
+                    self.doc_map.clone(),
+                )),
             };
             // The atom walk is the whole kernel for phrase shapes —
             // `run_prepared` sees only the finished `Done` — so bracket
@@ -675,7 +680,11 @@ impl FtsReader {
         // term present in this superfile, or a pushed-down row set.
         let neg_filter = match (neg_cursors.is_empty(), lists.allow.clone()) {
             (true, None) => None,
-            (_, allow) => Some(ExcludeFilter::with_allow(neg_cursors, allow)),
+            (_, allow) => Some(ExcludeFilter::with_allow(
+                neg_cursors,
+                allow.map(RowSet::new),
+                self.doc_map.clone(),
+            )),
         };
 
         // Fold repeated MUST/SHOULD terms into one weighted cursor each: the
@@ -833,7 +842,56 @@ impl FtsReader {
 
     /// CPU half paired with [`Self::prepare_clauses`] — scores the
     /// cursors it fetched. No I/O, so it can run on the reader pool.
-    pub(crate) fn run_prepared(&self, prep: PreparedClauses) -> Result<Vec<(u32, f32)>, FtsError> {
+    /// Translate a ranked kernel's doc ids into Parquet rows.
+    ///
+    /// The kernels work in the blob's own id space from end to end, so
+    /// anything handing hits to a caller passes them through here, once.
+    /// A no-op on any blob without a doc-id map, which is every blob
+    /// through `V7`.
+    ///
+    /// Order is left alone: a ranked result is ordered by score, and
+    /// translating ids does not disturb that. The unranked siblings
+    /// promise ascending ids instead, which translation *does* disturb,
+    /// so they use [`Self::ids_to_rows`].
+    #[inline]
+    pub(super) fn hits_to_rows(&self, hits: Vec<(FtsDocId, f32)>) -> Vec<(RowId, f32)> {
+        hits.into_iter()
+            .map(|(doc, score)| (self.row_of(doc), score))
+            .collect()
+    }
+
+    /// Translate an unranked kernel's doc ids into Parquet rows, kept
+    /// ascending.
+    ///
+    /// The unranked walks emit ids in blob order, which callers read as
+    /// ascending row order: a row-keyed bitmap is built from them, a
+    /// membership filter is probed with them, and the exact-match second
+    /// pass decodes them in order. On a blob storing its documents in an
+    /// order of its own those are different orders, so this re-sorts;
+    /// there is nothing to re-sort when there is no map.
+    #[inline]
+    pub(super) fn ids_to_rows(&self, ids: Vec<FtsDocId>) -> Vec<RowId> {
+        let mut rows: Vec<RowId> = ids.into_iter().map(|id| self.row_of(id)).collect();
+        if self.has_doc_map() {
+            rows.sort_unstable();
+        }
+        rows
+    }
+
+    pub(crate) fn run_prepared(
+        &self,
+        prep: PreparedClauses,
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
+        self.run_prepared_in_blob_ids(prep)
+            .map(|h| self.hits_to_rows(h))
+    }
+
+    /// [`Self::run_prepared`] without the translation, for the one caller
+    /// that reports work alongside the hits and does its own.
+    fn run_prepared_in_blob_ids(
+        &self,
+        prep: PreparedClauses,
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         match prep {
             PreparedClauses::Done { hits, .. } => Ok(hits),
             PreparedClauses::Must {
@@ -900,7 +958,7 @@ impl FtsReader {
         k: usize,
         doc_id_start: u32,
         doc_id_end: u32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         self.search_or_range_pretokenized_with_floor(
             column,
             terms,
@@ -924,7 +982,7 @@ impl FtsReader {
         doc_id_end: u32,
         floor: f32,
         global_idf: Option<&GlobalTermIdf>,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         let set = self
             .build_or_cursor_set(column, terms, global_idf, None)
             .await?;
@@ -975,11 +1033,14 @@ impl FtsReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         if set.cursors.is_empty() || k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
         let cursors = set.cursors.clone();
+        // The range is a slice of the blob's id space, taken to split one
+        // superfile across threads; it carries no row meaning, so a
+        // reordered blob slices exactly as an unreordered one does.
         self.run_windowed_maxscore(
             set.column_id,
             cursors,
@@ -989,6 +1050,7 @@ impl FtsReader {
             doc_id_start,
             doc_id_end,
         )
+        .map(|h| self.hits_to_rows(h))
     }
 
     /// Multi-column BM25 search (most_fields semantics): each
@@ -1000,21 +1062,23 @@ impl FtsReader {
         query: &str,
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         // Tokenize the query with each column's configured tokenizer so
         // per-column analyzers are honored — a table may index different
         // columns with different analyzers.
         // FxHashMap: the combine does a per-doc insert across columns; the
         // default SipHash is needless work for small integer (doc-id) keys.
-        let mut combined: FxHashMap<u32, f32> = FxHashMap::default();
+        // Each column's hits come back already translated into rows, so
+        // the cross-column merge is keyed by rows, not blob ids.
+        let mut combined: FxHashMap<RowId, f32> = FxHashMap::default();
         for (col_name, weight) in columns {
             let col_id = self.resolve_column_id(col_name)?;
             let tok = &self.columns[col_id as usize].tokenizer;
             let term_strings: Vec<String> = tok.tokenize(query).collect();
             let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
             let per_col = self.search(col_name, &term_refs, usize::MAX, mode).await?;
-            for (doc_id, s) in per_col {
-                *combined.entry(doc_id).or_insert(0.0) += s * weight;
+            for (row, s) in per_col {
+                *combined.entry(row).or_insert(0.0) += s * weight;
             }
         }
         Ok(top_k(combined, k))
@@ -1050,7 +1114,7 @@ impl FtsReader {
         floor_eff: f32,
         global_idf: Option<f32>,
         prefetched: Option<&FetchedTermMemo>,
-    ) -> Result<(Vec<(u32, f32)>, MatchWork, u64), FtsError> {
+    ) -> Result<(Vec<(FtsDocId, f32)>, MatchWork, u64), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         // Resolve the term: from the open-wave memo when the df gather
         // prefetched it (global stats — the bytes below are the ones that
@@ -1144,7 +1208,11 @@ impl FtsReader {
                 if score <= floor_eff {
                     return Ok((Vec::new(), MatchWork::default(), 0));
                 }
-                return Ok((vec![(doc_id, score)], MatchWork::default(), 0));
+                return Ok((
+                    vec![(FtsDocId::new(doc_id), score)],
+                    MatchWork::default(),
+                    0,
+                ));
             }
             SingleSource::Bytes {
                 bytes,
@@ -1181,11 +1249,11 @@ impl FtsReader {
                         continue;
                     }
                     if heap.len() < k {
-                        heap.push(TopKEntry(score, doc_id));
+                        heap.push(TopKEntry(score, FtsDocId::new(doc_id)));
                     } else if let Some(mut worst) = heap.peek_mut()
                         && score > worst.0
                     {
-                        *worst = TopKEntry(score, doc_id);
+                        *worst = TopKEntry(score, FtsDocId::new(doc_id));
                     }
                 }
                 return Ok((
@@ -1315,11 +1383,11 @@ impl FtsReader {
                         continue;
                     }
                     if seed_heap.len() < k {
-                        seed_heap.push(TopKEntry(score, buf_d[j]));
+                        seed_heap.push(TopKEntry(score, FtsDocId::new(buf_d[j])));
                     } else if let Some(mut worst) = seed_heap.peek_mut()
                         && score > worst.0
                     {
-                        *worst = TopKEntry(score, buf_d[j]);
+                        *worst = TopKEntry(score, FtsDocId::new(buf_d[j]));
                     }
                 }
             }
@@ -1435,11 +1503,11 @@ impl FtsReader {
                     continue;
                 }
                 if heap.len() < k {
-                    heap.push(TopKEntry(score, doc_id));
+                    heap.push(TopKEntry(score, FtsDocId::new(doc_id)));
                 } else if let Some(mut worst) = heap.peek_mut()
                     && score > worst.0
                 {
-                    *worst = TopKEntry(score, doc_id);
+                    *worst = TopKEntry(score, FtsDocId::new(doc_id));
                 }
             }
             i += 1;
@@ -1836,7 +1904,7 @@ mod tests {
             .await
             .expect("FTS search");
         // "rust" appears in doc 0 and doc 1.
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0), "doc 0 should match");
         assert!(ids.contains(&1), "doc 1 should match");
         assert!(!ids.contains(&2), "doc 2 should not match");
@@ -1873,7 +1941,7 @@ mod tests {
             .search("body", &["rust", "runtime"], 10, BoolMode::And)
             .await
             .expect("search");
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(!ids.contains(&2));
@@ -1958,7 +2026,7 @@ mod tests {
             .await
             .expect("FTS search");
         // uniqtwo → doc 2; rust → docs 0, 1.
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(ids.contains(&2));
@@ -1973,7 +2041,7 @@ mod tests {
             .search("body", &["uniqzero", "rust"], 10, BoolMode::And)
             .await
             .expect("FTS search");
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert_eq!(ids, vec![0]);
         // uniqzero ∩ uniqtwo = ∅ (different docs).
         let hits = r
@@ -2012,7 +2080,7 @@ mod tests {
             )
             .await
             .expect("search excluding");
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert_eq!(ids, vec![1], "doc 0 excluded by negated 'async'");
     }
 
@@ -2024,8 +2092,8 @@ mod tests {
     async fn allow_set_bounds_every_clause_shape() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
-        let ids = |hits: &[(u32, f32)]| {
-            let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids = |hits: &[(RowId, f32)]| {
+            let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
             ids.sort_unstable();
             ids
         };
@@ -2199,7 +2267,7 @@ mod tests {
             .search_multi(&[("title", 1.0), ("body", 1.0)], "rust", 10, BoolMode::Or)
             .await
             .expect("multi");
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(!ids.contains(&2));
@@ -2223,7 +2291,7 @@ mod tests {
             .search_or_range_pretokenized("body", &["alpha", "beta"], 100, 2, 5)
             .await
             .expect("ranged search");
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert_eq!(
             ids,
             [2u32, 3, 4].into_iter().collect(),
@@ -2296,11 +2364,11 @@ mod tests {
                 .await
                 .expect("un-ranged search");
             let mut full_sorted: Vec<(u32, u32)> =
-                full.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                full.iter().map(|&(d, s)| (d.get(), s.to_bits())).collect();
             full_sorted.sort_unstable();
 
             for cuts in partitions {
-                let mut merged: Vec<(u32, f32)> = Vec::new();
+                let mut merged: Vec<(RowId, f32)> = Vec::new();
                 for &(lo, hi) in cuts {
                     merged.extend(
                         r.search_or_range_pretokenized("body", terms, K_ALL, lo, hi)
@@ -2308,8 +2376,10 @@ mod tests {
                             .expect("ranged search"),
                     );
                 }
-                let mut merged_sorted: Vec<(u32, u32)> =
-                    merged.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                let mut merged_sorted: Vec<(u32, u32)> = merged
+                    .iter()
+                    .map(|&(d, s)| (d.get(), s.to_bits()))
+                    .collect();
                 merged_sorted.sort_unstable();
                 assert_eq!(
                     merged_sorted, full_sorted,
@@ -2326,11 +2396,12 @@ mod tests {
                         .then(a.0.cmp(&b.0))
                 });
                 pool.truncate(K_TOP);
-                let top: Vec<(u32, u32)> = pool.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                let top: Vec<(u32, u32)> =
+                    pool.iter().map(|&(d, s)| (d.get(), s.to_bits())).collect();
                 let full_top: Vec<(u32, u32)> = full
                     .iter()
                     .take(K_TOP)
-                    .map(|&(d, s)| (d, s.to_bits()))
+                    .map(|&(d, s)| (d.get(), s.to_bits()))
                     .collect();
                 assert_eq!(
                     top, full_top,
@@ -2395,8 +2466,9 @@ mod tests {
                 .search_or_range_prebuilt(&set, K_ALL, lo, hi, f32::NEG_INFINITY)
                 .expect("prebuilt ranged search");
             let fresh_bits: Vec<(u32, u32)> =
-                fresh.iter().map(|&(d, s)| (d, s.to_bits())).collect();
-            let pre_bits: Vec<(u32, u32)> = pre.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                fresh.iter().map(|&(d, s)| (d.get(), s.to_bits())).collect();
+            let pre_bits: Vec<(u32, u32)> =
+                pre.iter().map(|&(d, s)| (d.get(), s.to_bits())).collect();
             assert_eq!(pre_bits, fresh_bits, "window ({lo},{hi})");
         }
     }

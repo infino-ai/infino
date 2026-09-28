@@ -27,6 +27,7 @@ use infino::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         fts::reader::BoolMode,
+        id_space::RowId,
     },
     test_helpers::{brute_force_bm25::BruteForceBm25, decimal128_ids, default_tokenizer},
 };
@@ -130,7 +131,7 @@ async fn assert_multi_matches_oracle(
         .expect("bm25_search_multi");
     let want = multi_column_oracle(&[(title_w, title_oracle), (body_w, body_oracle)], query, k);
 
-    let got_ids: HashSet<u64> = got.iter().map(|(d, _)| *d as u64).collect();
+    let got_ids: HashSet<u64> = got.iter().map(|(d, _)| u64::from(d.get())).collect();
     let want_ids: HashSet<u64> = want.iter().map(|(d, _)| *d).collect();
     // Full k (k >= match count): the sets must be identical.
     if k >= want.len() {
@@ -148,7 +149,7 @@ async fn assert_multi_matches_oracle(
     // Per-doc weighted score must match the oracle within tolerance.
     let want_scores: HashMap<u64, f32> = want.iter().map(|(d, s)| (*d, *s)).collect();
     for (d, s) in &got {
-        let w = want_scores[&(*d as u64)];
+        let w = want_scores[&(u64::from(d.get()))];
         assert!(
             (s - w).abs() <= SCORE_ABS_TOLERANCE,
             "multi({title_w},{body_w}) {query:?} doc {d}: reader={s} oracle={w}"
@@ -213,9 +214,9 @@ async fn multi_column_weight_scales_single_column_match_linearly() {
     let corp = corpus();
     let reader = build_two_column(&corp);
 
-    let score_of = |hits: Vec<(u32, f32)>, doc: u32| -> f32 {
+    let score_of = |hits: Vec<(RowId, f32)>, doc: u32| -> f32 {
         hits.iter()
-            .find(|(d, _)| *d == doc)
+            .find(|(d, _)| d.get() == doc)
             .map(|(_, s)| *s)
             .expect("doc present in results")
     };

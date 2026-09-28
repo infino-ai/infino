@@ -756,10 +756,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::{
-        builder::FtsBuilder,
-        reader::{FtsReader, core::ClauseLists},
-        tokenize::{AsciiLowerTokenizer, Phrase},
+    use crate::superfile::{
+        fts::{
+            builder::FtsBuilder,
+            reader::{FtsReader, core::ClauseLists},
+            tokenize::{AsciiLowerTokenizer, Phrase},
+        },
+        id_space::FtsDocId,
     };
 
     fn phrase(terms: &[&str]) -> Vec<Phrase<String>> {
@@ -808,7 +811,7 @@ mod tests {
             )
             .await
             .expect("phrase search");
-        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         ids.sort_unstable();
         assert_eq!(
             ids,
@@ -853,14 +856,14 @@ mod tests {
                 false => vec![0, 1 << 20],
             };
             let beta: Vec<u32> = alpha.iter().map(|p| p + 1).collect();
-            b.add_prebuilt_term_posting(0, "alpha", d, alpha.len() as u32, &alpha)
+            b.add_prebuilt_term_posting(0, "alpha", FtsDocId::new(d), alpha.len() as u32, &alpha)
                 .expect("alpha");
-            b.add_prebuilt_term_posting(0, "beta", d, beta.len() as u32, &beta)
+            b.add_prebuilt_term_posting(0, "beta", FtsDocId::new(d), beta.len() as u32, &beta)
                 .expect("beta");
             if d < 3 {
                 // Short-form member (df = 3) with two positions each.
                 let rare = [beta[0] + 1, beta[0] + 7];
-                b.add_prebuilt_term_posting(0, "rare", d, 2, &rare)
+                b.add_prebuilt_term_posting(0, "rare", FtsDocId::new(d), 2, &rare)
                     .expect("rare");
             }
         }
@@ -880,7 +883,7 @@ mod tests {
             )
             .await
             .expect("phrase search");
-        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         ids.sort_unstable();
         assert_eq!(ids, (0..N_DOCS).collect::<Vec<_>>());
 
@@ -896,7 +899,7 @@ mod tests {
             )
             .await
             .expect("phrase search");
-        let mut ids: Vec<u32> = rare_hits.iter().map(|(d, _)| *d).collect();
+        let mut ids: Vec<u32> = rare_hits.iter().map(|(d, _)| d.get()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![0, 1, 2], "short-form member's packed group");
     }
@@ -1122,9 +1125,9 @@ mod tests {
             .collect();
         let filler: Vec<u32> = alpha.iter().map(|p| p + 1).collect();
         for d in 0..N_DOCS {
-            b.add_prebuilt_term_posting(0, "alpha", d, TF, &alpha)
+            b.add_prebuilt_term_posting(0, "alpha", FtsDocId::new(d), TF, &alpha)
                 .expect("alpha");
-            b.add_prebuilt_term_posting(0, "filler", d, TF, &filler)
+            b.add_prebuilt_term_posting(0, "filler", FtsDocId::new(d), TF, &filler)
                 .expect("filler");
         }
         b.append_prebuilt_doc_lengths(0, &vec![2 * TF + OUTLIER_GAP; N_DOCS as usize]);
@@ -1144,7 +1147,7 @@ mod tests {
             )
             .await
             .expect("phrase search");
-        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         ids.sort_unstable();
         assert_eq!(ids, (0..N_DOCS).collect::<Vec<_>>());
     }
@@ -1166,7 +1169,7 @@ mod tests {
             )
             .await
             .expect("phrase search");
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 2, 4], "adjacency in order only");
@@ -1205,7 +1208,7 @@ mod tests {
             )
             .await
             .expect("phrase search");
-        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         ids.sort_unstable();
         assert_eq!(
             ids,
@@ -1241,7 +1244,7 @@ mod tests {
             .await
             .expect("must phrase + term");
         assert_eq!(
-            hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+            hits.iter().map(|(d, _)| d.get()).collect::<Vec<_>>(),
             vec![2],
             "+\"new york\" +the"
         );
@@ -1260,7 +1263,7 @@ mod tests {
             )
             .await
             .expect("negated phrase");
-        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 3], "haven docs don't contain the phrase");
     }

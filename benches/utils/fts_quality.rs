@@ -1110,7 +1110,7 @@ fn superfile_hits(
         .expect("quality bm25_hits_async")
         .into_iter()
         .map(|(doc, score)| EngineHit {
-            row: doc,
+            row: doc.get(),
             score: f64::from(score),
         })
         .collect()

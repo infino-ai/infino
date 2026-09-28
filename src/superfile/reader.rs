@@ -67,6 +67,7 @@ use crate::{
             },
             tokenize::{Phrase, Tokenizer},
         },
+        id_space::RowId,
         ids,
         vector::{
             layout::VectorLayout,
@@ -1268,7 +1269,7 @@ impl SuperfileReader {
         query: &str,
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         // Tokenize with the target column's configured tokenizer so query
         // terms match how the column was indexed (ascii_lower / standard).
         // A column this superfile has no full-text index for fails here,
@@ -1336,7 +1337,7 @@ impl SuperfileReader {
         terms: &[&str],
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         self.bm25_search_pretokenized_with_floor(column, terms, k, mode, f32::NEG_INFINITY)
             .await
     }
@@ -1354,7 +1355,7 @@ impl SuperfileReader {
         k: usize,
         mode: BoolMode,
         floor: f32,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1370,7 +1371,7 @@ impl SuperfileReader {
         column: &str,
         tokens: &[&str],
         mode: BoolMode,
-    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1387,7 +1388,7 @@ impl SuperfileReader {
         tokens: &[&str],
         mode: BoolMode,
         prefetched: Option<&FetchedTermMemo>,
-    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1462,7 +1463,7 @@ impl SuperfileReader {
         terms: &[&str],
         phrases: &[Phrase<String>],
         mode: BoolMode,
-    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1578,7 +1579,7 @@ impl SuperfileReader {
         &self,
         column: &str,
         value: &str,
-    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
         // Pass 1 — candidate rows via the index: the term-AND of the
         // string's tokens (a superset of the exact matches). Tokenize
         // with the column's configured tokenizer to match the index; a
@@ -1589,9 +1590,12 @@ impl SuperfileReader {
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         let tok: Arc<dyn Tokenizer> = fts.column_tokenizer(column)?;
         let tokens: Vec<String> = tok.tokenize(value).collect();
-        let (candidates, work): (Vec<u32>, MatchWork) = if tokens.is_empty() {
+        let (candidates, work): (Vec<RowId>, MatchWork) = if tokens.is_empty() {
             // No tokens to prune with: every row is a candidate.
-            ((0..self.n_docs() as u32).collect(), MatchWork::default())
+            (
+                (0..self.n_docs() as u32).map(RowId::new).collect(),
+                MatchWork::default(),
+            )
         } else {
             let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
             self.token_match(column, &refs, BoolMode::And).await?
@@ -1601,7 +1605,8 @@ impl SuperfileReader {
         }
 
         // Pass 2 — verify raw-string equality on the decoded text.
-        let batch = self.take_by_local_doc_ids(&candidates, &[column])?;
+        let candidate_rows: Vec<u32> = candidates.iter().copied().map(RowId::get).collect();
+        let batch = self.take_by_local_doc_ids(&candidate_rows, &[column])?;
         let col = batch
             .column(0)
             .as_any()
@@ -1637,7 +1642,7 @@ impl SuperfileReader {
         lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1670,7 +1675,7 @@ impl SuperfileReader {
         &self,
         prep: PreparedClauses,
         bm25: Option<Bm25Params>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self.fts_scored(bm25)?;
         Ok(fts.run_prepared(prep)?)
     }
@@ -1726,7 +1731,7 @@ impl SuperfileReader {
         prefix: &str,
         k: usize,
         pool: Option<&ThreadPool>,
-    ) -> Result<(Vec<(u32, f32)>, MatchWork), ReadError> {
+    ) -> Result<(Vec<(RowId, f32)>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1775,7 +1780,7 @@ impl SuperfileReader {
         k: usize,
         doc_id_start: u32,
         doc_id_end: u32,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         self.bm25_search_or_range_pretokenized_with_floor(
             column,
             terms,
@@ -1799,7 +1804,7 @@ impl SuperfileReader {
         doc_id_end: u32,
         floor: f32,
         global_idf: Option<&fts_reader::GlobalTermIdf>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1873,7 +1878,7 @@ impl SuperfileReader {
         doc_id_end: u32,
         floor: f32,
         bm25: Option<Bm25Params>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self.fts_scored(bm25)?;
         Ok(fts.search_or_range_prebuilt(set, k, doc_id_start, doc_id_end, floor)?)
     }
@@ -1894,7 +1899,7 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         pool: Option<&ThreadPool>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         if k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
@@ -1919,7 +1924,7 @@ impl SuperfileReader {
         query: &str,
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -2087,6 +2092,7 @@ impl SuperfileReader {
             query,
             k,
             clusters,
+            None,
             rerank_mult,
             cold_rerank_mult,
             allow,
@@ -2833,7 +2839,7 @@ mod tests {
             .await
             .expect("BM25 search");
         // docs 0 and 2 contain "rust"; both should appear.
-        let doc_ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let doc_ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(doc_ids.contains(&0));
         assert!(doc_ids.contains(&2));
     }
@@ -3028,7 +3034,7 @@ mod tests {
             .await
             .expect("BM25 multi-column search");
         // Both doc 0 (title:rust) and doc 1 (body:rust) hit.
-        let doc_ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let doc_ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(doc_ids.contains(&0));
         assert!(doc_ids.contains(&1));
     }
@@ -3173,7 +3179,7 @@ mod tests {
             .bm25_search_pretokenized("title", &["rust"], 5, BoolMode::Or)
             .await
             .expect("pretokenized search");
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&2));
     }
@@ -3199,7 +3205,7 @@ mod tests {
             .bm25_hits_async("title", "rust -embedded", 5, BoolMode::Or)
             .await
             .expect("negated search");
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(!ids.contains(&2));
     }
@@ -3261,7 +3267,7 @@ mod tests {
             work.postings_bytes > 0 && work.planned_ranges > 0,
             "a matching prefix expansion reports its posting work"
         );
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&2));
         // No indexed term begins with "zz".
@@ -3291,7 +3297,7 @@ mod tests {
             .bm25_search_or_range_pretokenized("title", &["rust", "embedded"], 10, 0, 2)
             .await
             .expect("ranged search");
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(!ids.contains(&2));
     }
@@ -3324,7 +3330,7 @@ mod tests {
             .bm25_search_prefix_range("title", "ru", 10, 0, 2, None)
             .await
             .expect("prefix range");
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(!ids.contains(&2));
         // Degenerate range / k short-circuits.

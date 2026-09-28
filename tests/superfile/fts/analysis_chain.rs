@@ -139,7 +139,7 @@ async fn matching(reader: &SuperfileReader, query: &str) -> HashSet<u64> {
         .await
         .expect("query")
         .into_iter()
-        .map(|(d, _)| d as u64)
+        .map(|(d, _)| u64::from(d.get()))
         .collect()
 }
 
@@ -159,7 +159,7 @@ async fn assert_matches_oracle(
         .await
         .expect("chained-column query")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
 
     let got_ids: HashSet<u64> = got.iter().map(|(d, _)| *d).collect();

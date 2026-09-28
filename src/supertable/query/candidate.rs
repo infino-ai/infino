@@ -80,6 +80,7 @@ use crate::{
             },
             tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER, Tokenizer},
         },
+        id_space::RowId,
     },
     supertable::{
         error::QueryError,
@@ -350,7 +351,7 @@ impl CandidatePlan {
                     let (docs, work) = reader
                         .token_match_prefetched(column, &refs, BoolMode::And, memo)
                         .await?;
-                    Ok((Some(docs.into_iter().collect()), work))
+                    Ok((Some(docs.into_iter().map(RowId::get).collect()), work))
                 }
                 CandidatePlan::TermsAny { column, terms } => {
                     // No qualifying term in this superfile ⇒ no row, decided
@@ -363,7 +364,7 @@ impl CandidatePlan {
                     let (docs, work) = reader
                         .token_match_prefetched(column, &refs, BoolMode::Or, memo)
                         .await?;
-                    Ok((Some(docs.into_iter().collect()), work))
+                    Ok((Some(docs.into_iter().map(RowId::get).collect()), work))
                 }
                 CandidatePlan::TermsLike {
                     column,

@@ -16,6 +16,7 @@ use infino::{
         SuperfileReader, VectorSearchOptions,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig},
         fts::reader::BoolMode,
+        id_space::RowId,
         vector::{
             distance::{Metric, normalize},
             rerank_codec::RerankCodec,
@@ -148,7 +149,7 @@ async fn end_to_end_bm25_finds_rust_docs() {
         .bm25_hits_async("title", "rust", SEARCH_K, BoolMode::Or)
         .await
         .expect("BM25 search");
-    let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     // docs 0, 2, 5 have "rust" in title
     assert!(doc_ids.contains(&0));
     assert!(doc_ids.contains(&2));
@@ -170,7 +171,7 @@ async fn end_to_end_bm25_multi_combines_columns() {
         .expect("BM25 multi-column search");
     // doc 2 has both "rust" (title) and "embedded" (body) → should rank well.
     assert!(!hits.is_empty());
-    let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     assert!(doc_ids.contains(&2));
 }
 
@@ -296,7 +297,7 @@ async fn end_to_end_fts_only_blob_offsets_within_file() {
         .await
         .expect("BM25 search");
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].0, 0);
+    assert_eq!(hits[0].0, RowId::new(0));
 }
 
 #[tokio::test]
@@ -342,7 +343,7 @@ async fn end_to_end_three_batches_doc_ids_continuous() {
         .await
         .expect("BM25 search");
     // alpha appears at local_doc_ids 0, 2, 4 (one per chunk).
-    let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     assert!(doc_ids.contains(&0));
     assert!(doc_ids.contains(&2));
     assert!(doc_ids.contains(&4));
@@ -999,7 +1000,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_fts() {
     });
 
     assert_eq!(hits.len(), 2, "Expected 2 rust docs");
-    let local_doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let local_doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     // After filtering and merging, local_doc_ids are 0 and 1
     assert_eq!(
         local_doc_ids,
@@ -1307,7 +1308,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_partial_deletes_mixed_indexes(
             .expect("BM25 search")
     });
     assert_eq!(hits.len(), 2, "Expected 2 rust docs");
-    let local_doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let local_doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     // After filtering out docs 1 and 3, only docs 0 and 2 remain (reassigned as 0 and 1)
     assert_eq!(
         local_doc_ids,

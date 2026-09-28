@@ -53,7 +53,7 @@ use infino::{
         footer::read_kv_metadata,
         fts::{
             BlobLayout, VERSION_CURRENT, VERSION_V1_LEGACY, VERSION_V2, VERSION_V3, VERSION_V4,
-            VERSION_V5, VERSION_V6, VERSION_V7,
+            VERSION_V5, VERSION_V6, VERSION_V7, VERSION_V8,
         },
     },
 };
@@ -680,10 +680,11 @@ enum CorpusCoverage {
     /// is the payload, because it is the whole justification for the
     /// absence and it has been wrong before.
     Unreachable(&'static str),
-    /// No published release writes it yet, so no generator can pin one.
-    /// Only [`VERSION_CURRENT`] may sit here; see
-    /// [`only_the_current_version_may_await_a_writer`].
-    AwaitingPublishedWriter,
+    /// At or above [`VERSION_CURRENT`], so no migration ever reads it as
+    /// an input and there is nothing for a corpus table to prove. Only
+    /// versions that high may sit here; see
+    /// [`only_versions_at_or_above_the_target_may_skip_coverage`].
+    NotAMigrationSource,
 }
 
 /// Every blob version this engine reads, and what covers it.
@@ -700,7 +701,8 @@ const CORPUS_COVERAGE: &[(u32, CorpusCoverage)] = &[
     (VERSION_V4, CorpusCoverage::Shape("v4_bitset_blocks")),
     (VERSION_V5, CorpusCoverage::Shape("v5_positional")),
     (VERSION_V6, CorpusCoverage::Shape("v6_positional")),
-    (VERSION_V7, CorpusCoverage::AwaitingPublishedWriter),
+    (VERSION_V7, CorpusCoverage::NotAMigrationSource),
+    (VERSION_V8, CorpusCoverage::NotAMigrationSource),
 ];
 
 /// Highest version number probed when asking the reader what it accepts.
@@ -797,33 +799,32 @@ fn every_named_shape_is_one_the_generator_writes() {
     }
 }
 
-/// Only the version this engine writes may be waiting for a published
-/// writer, and this is the check that makes a format bump carry its
-/// migration evidence.
+/// Only a version at or above the migration target may skip coverage, and
+/// this is the check that makes a format bump carry its migration evidence.
 ///
-/// A version older than [`VERSION_CURRENT`] has, by definition, had a
-/// release that wrote it — so it can be pinned as a generator and must be,
-/// or declared unreachable with a reason. Raising `VERSION_CURRENT` leaves
-/// the version it replaced sitting here and fails this test, which is the
-/// point: the shape that just became superseded is exactly the one whose
-/// migration nothing yet proves.
+/// Staleness is `version < VERSION_CURRENT`, so a version below the target
+/// is one a migration reads as an input and must be proven against real
+/// bytes; a version at or above it never is. Raising `VERSION_CURRENT`
+/// pushes the version it replaced below the line and fails this test, which
+/// is the point: the shape that just became superseded is exactly the one
+/// whose migration nothing yet proves.
 ///
 /// This is the failure that went unnoticed when V7 landed. V6 slipped from
 /// "the control every other shape must become" to "a superseded shape with
 /// no coverage" with nothing to say so, and was caught by a person looking
 /// rather than by a test.
 #[test]
-fn only_the_current_version_may_await_a_writer() {
+fn only_versions_at_or_above_the_target_may_skip_coverage() {
     for (version, coverage) in CORPUS_COVERAGE {
-        if !matches!(coverage, CorpusCoverage::AwaitingPublishedWriter) {
+        if !matches!(coverage, CorpusCoverage::NotAMigrationSource) {
             continue;
         }
-        assert_eq!(
-            *version, VERSION_CURRENT,
-            "blob V{version} is superseded but still declares that no published \
-             release writes it. A release that writes it has shipped, so add a \
-             generator crate pinned to it under tests/corpus/generators, give it \
-             a generate.sh entry, and point its CORPUS_COVERAGE row at the new \
+        assert!(
+            *version >= VERSION_CURRENT,
+            "blob V{version} is below the migration target V{VERSION_CURRENT}, so \
+             a migration reads it as an input. Add a generator crate pinned to a \
+             release that writes it under tests/corpus/generators, give it a \
+             generate.sh entry, and point its CORPUS_COVERAGE row at the new \
              shape — a migration from V{version} is otherwise untested"
         );
     }

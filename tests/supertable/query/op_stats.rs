@@ -1568,6 +1568,143 @@ fn id_only_projection_costs_no_more_than_the_native_result() {
     }
 }
 
+/// A projection naming a column the table does not carry is a caller
+/// error, and every row-returning search entry point rejects it BEFORE
+/// running any search — not after a full search whose result is then
+/// discarded.
+///
+/// The `*_unknown_projection_column_errors` coverage pins the error and
+/// its message; a late-only check inside the row materializer produces
+/// that identical error, so it cannot tell the fail-fast path from a
+/// full search that is thrown away at materialization. This pins the
+/// property that motivates validating up front: with the projection
+/// rejected at the entry point, the op-stats collector sees zero cells
+/// scanned, zero candidates, zero postings walked, and zero rows
+/// materialized. Remove the early guard and each leg reports a full
+/// search's tallies here, so this test bites.
+#[test]
+fn a_rejected_projection_does_no_search_work() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+    // `does_not_exist` is carried by none of `_id`, `title`, or `score`.
+    let bad = ["_id", "does_not_exist", "score"];
+
+    // Vector search: the motivating case — a full search plus id/placement
+    // resolution is gigabytes of object-store I/O at billion scale.
+    let (vec_err, vec_stats) = with_op_stats(|| {
+        st.vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            None,
+            Some(&bad),
+        )
+        .expect_err("unknown projection column must error")
+    });
+    assert!(
+        vec_err.to_string().contains("unknown column"),
+        "vector_search must name the unknown column, got {vec_err}"
+    );
+    assert_eq!(
+        (
+            vec_stats.vector_cells_scanned,
+            vec_stats.vector_candidates_scanned,
+            vec_stats.vector_rows_reranked,
+            vec_stats.rows_materialized,
+        ),
+        (0, 0, 0, 0),
+        "a rejected vector projection must scan no cells, generate no \
+         candidates, rerank nothing, and materialize no rows"
+    );
+
+    // BM25 search: the same early guard over the FTS entry point.
+    let (bm25_err, bm25_stats) = with_op_stats(|| {
+        st.bm25_search(
+            "title",
+            "vec",
+            VECTOR_K,
+            Bm25SearchOptions::new(),
+            Some(&bad),
+        )
+        .expect_err("unknown projection column must error")
+    });
+    assert!(
+        bm25_err.to_string().contains("unknown column"),
+        "bm25_search must name the unknown column, got {bm25_err}"
+    );
+    assert_eq!(
+        (bm25_stats.fts_postings_bytes, bm25_stats.rows_materialized),
+        (0, 0),
+        "a rejected BM25 projection must walk no postings and materialize no rows"
+    );
+
+    // Hybrid search: fuses a full vector wave with an FTS walk, so failing
+    // late is nearly as costly as the vector path — both legs must stay idle.
+    let (hyb_err, hyb_stats) = with_op_stats(|| {
+        st.hybrid_search(
+            "title",
+            "vec",
+            BoolMode::Or,
+            "emb",
+            &query,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            VECTOR_K,
+            Some(&bad),
+        )
+        .expect_err("unknown projection column must error")
+    });
+    assert!(
+        hyb_err.to_string().contains("unknown column"),
+        "hybrid_search must name the unknown column, got {hyb_err}"
+    );
+    assert_eq!(
+        (
+            hyb_stats.vector_cells_scanned,
+            hyb_stats.vector_candidates_scanned,
+            hyb_stats.fts_postings_bytes,
+            hyb_stats.rows_materialized,
+        ),
+        (0, 0, 0, 0),
+        "a rejected hybrid projection must run neither the vector nor the FTS leg"
+    );
+
+    // Unranked token match: the same early guard over the FTS entry point,
+    // so no postings are walked and no rows materialized.
+    let (tok_err, tok_stats) = with_op_stats(|| {
+        st.token_match("title", "vec", BoolMode::Or, Some(&bad))
+            .expect_err("unknown projection column must error")
+    });
+    assert!(
+        tok_err.to_string().contains("unknown column"),
+        "token_match must name the unknown column, got {tok_err}"
+    );
+    assert_eq!(
+        (tok_stats.fts_postings_bytes, tok_stats.rows_materialized),
+        (0, 0),
+        "a rejected token_match projection must walk no postings and materialize no rows"
+    );
+
+    // Unranked exact match: the same early guard, likewise idle on rejection.
+    let (exact_err, exact_stats) = with_op_stats(|| {
+        st.exact_match("title", "vec", Some(&bad))
+            .expect_err("unknown projection column must error")
+    });
+    assert!(
+        exact_err.to_string().contains("unknown column"),
+        "exact_match must name the unknown column, got {exact_err}"
+    );
+    assert_eq!(
+        (
+            exact_stats.fts_postings_bytes,
+            exact_stats.rows_materialized
+        ),
+        (0, 0),
+        "a rejected exact_match projection must walk no postings and materialize no rows"
+    );
+}
+
 /// The gapped-placement memo must not pin connection-budget bytes. The
 /// budget gates MANDATORY work — ingest and compaction both hard-fail
 /// when refused — so a discretionary, rebuildable read cache that holds

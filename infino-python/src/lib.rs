@@ -1222,6 +1222,15 @@ fn coerce_to_record_batch(
 #[pymodule]
 #[pyo3(name = "_infino")]
 fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Diagnostic: surface engine tracing (e.g. [optphase]/[optdrain] timers)
+    // from the Python path when RUST_LOG is set. Idempotent; defaults to warn.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(bench_serve::bench_serve_tcp, m)?)?;
     m.add_function(wrap_pyfunction!(bench_serve::bench_serve_build_tcp, m)?)?;

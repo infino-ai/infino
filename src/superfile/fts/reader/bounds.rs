@@ -31,6 +31,11 @@ use crate::superfile::{
 /// arm's decode by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StoredBound {
+    /// [`format::fts::VERSION_V8`]: as [`Self::V7`] for every slot. The
+    /// version adds the doc-id map and the header field locating it,
+    /// neither of which a bound is expressed in: a stored maximum is the
+    /// same number whatever order the documents it covers are in.
+    V8,
     /// [`format::fts::VERSION_V7`]: as [`Self::V6`] for every slot —
     /// the version changes the rare-term layout and the dictionary
     /// value, not the bounds or the average they are baked at.
@@ -58,6 +63,7 @@ impl StoredBound {
     /// across `V1`–`V4`.
     fn layout(self) -> BlobLayout {
         let version = match self {
+            Self::V8 => format::fts::VERSION_V8,
             Self::V7 => format::fts::VERSION_V7,
             Self::V6 => format::fts::VERSION_V6,
             Self::V5 => format::fts::VERSION_V5,
@@ -81,6 +87,7 @@ impl StoredBound {
     /// unsupported-version error.
     pub(super) fn for_version(version: u32) -> Option<Self> {
         match version {
+            format::fts::VERSION_V8 => Some(Self::V8),
             format::fts::VERSION_V7 => Some(Self::V7),
             format::fts::VERSION_V6 => Some(Self::V6),
             format::fts::VERSION_V5 => Some(Self::V5),
@@ -101,7 +108,7 @@ impl StoredBound {
     /// Whether the file's declared average document length is the one to
     /// score it at, or a row-count average the reader must correct.
     pub(super) fn declares_scoring_average(self) -> bool {
-        matches!(self, Self::V6 | Self::V7)
+        matches!(self, Self::V6 | Self::V7 | Self::V8)
     }
 }
 
@@ -148,7 +155,9 @@ impl BoundDecoder {
     #[inline]
     pub(super) fn bound(&self, raw: u32) -> f32 {
         let stored = match self.stored {
-            StoredBound::V7 | StoredBound::V6 | StoredBound::V5 => f32::from_bits(raw).next_up(),
+            StoredBound::V8 | StoredBound::V7 | StoredBound::V6 | StoredBound::V5 => {
+                f32::from_bits(raw).next_up()
+            }
             StoredBound::V1ToV4 => {
                 raw.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE
             }
@@ -183,6 +192,7 @@ mod tests {
             (format::fts::VERSION_V5, StoredBound::V5),
             (format::fts::VERSION_V6, StoredBound::V6),
             (format::fts::VERSION_V7, StoredBound::V7),
+            (format::fts::VERSION_V8, StoredBound::V8),
         ];
         for (version, want) in accepted {
             assert_eq!(
@@ -191,15 +201,17 @@ mod tests {
                 "version {version}"
             );
         }
-        assert_eq!(StoredBound::for_version(format::fts::VERSION_V7 + 1), None);
+        assert_eq!(StoredBound::for_version(format::fts::VERSION_V8 + 1), None);
         assert_eq!(StoredBound::for_version(0), None);
 
         assert!(
-            StoredBound::V7.has_coarse()
+            StoredBound::V8.has_coarse()
+                && StoredBound::V7.has_coarse()
                 && StoredBound::V6.has_coarse()
                 && StoredBound::V5.has_coarse()
         );
         assert!(!StoredBound::V1ToV4.has_coarse());
+        assert!(StoredBound::V8.declares_scoring_average());
         assert!(StoredBound::V7.declares_scoring_average());
         assert!(StoredBound::V6.declares_scoring_average());
         assert!(!StoredBound::V5.declares_scoring_average());
