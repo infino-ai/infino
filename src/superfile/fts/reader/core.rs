@@ -2227,6 +2227,7 @@ mod tests {
     use tokio::{
         spawn,
         sync::Notify,
+        task::spawn_blocking,
         time::{sleep, timeout},
     };
 
@@ -4035,16 +4036,10 @@ mod tests {
         }
     }
 
-    /// Two scored single-term searches racing on a cold column: the second
-    /// completes while the first is still waiting for the length array.
-    ///
-    /// The single-term path used to reach the norms through the synchronous
-    /// fallback, whose initializer held the norms cell's lock across the
-    /// read, so the second search parked on that lock — a thread, and on an
-    /// `infino-io` worker the core the read needed — for as long as the
-    /// read took. Two workers, so a parked one is visible.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cold_scored_search_does_not_hold_a_racing_one_on_the_norms() {
+    /// A lazy reader over a [`PausingSource`] parked on the column's length
+    /// array, armed after the open so only a query's read of the array
+    /// pauses; the source is returned so a test can watch and release it.
+    async fn reader_pausing_on_the_length_array() -> (Arc<PausingSource>, Arc<FtsReader>) {
         let (blob, json) = build_blob();
         let eager = FtsReader::open(blob.clone(), &json).expect("eager open");
         let lengths = eager.columns[0].doc_lengths_range.clone();
@@ -4061,8 +4056,23 @@ mod tests {
                 .await
                 .expect("open_lazy"),
         );
-        // Armed after the open, so only a query's read of the array pauses.
         source.armed.store(true, Ordering::SeqCst);
+        (source, reader)
+    }
+
+    /// Two scored single-term searches racing on a cold column: the second
+    /// completes while the first is still waiting for the length array.
+    ///
+    /// The single-term path used to reach the norms through the synchronous
+    /// fallback, whose initializer held the norms cell's lock across the
+    /// read, so the second search parked on that lock — a thread, and on an
+    /// `infino-io` worker the core the read needed — for as long as the
+    /// read took. Two workers, so a parked one is visible. This pins the
+    /// prewarm on the single-term path; the fallback's own lock behaviour
+    /// is pinned below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cold_scored_search_does_not_hold_a_racing_one_on_the_norms() {
+        let (source, reader) = reader_pausing_on_the_length_array().await;
 
         let first = {
             let reader = Arc::clone(&reader);
@@ -4097,6 +4107,49 @@ mod tests {
         let second_ids: HashSet<u32> = second_hits.iter().map(|(d, _)| d.get()).collect();
         assert_eq!(first_ids, second_ids);
         assert!(first_ids.contains(&0) && first_ids.contains(&1));
+    }
+
+    /// Two threads reaching a cold column's norms through the synchronous
+    /// fallback itself, the first parked on its read: the second returns
+    /// while the first is still parked, because the read runs outside the
+    /// cell. This is the assertion that fails if the read ever moves back
+    /// inside `get_or_init`, where the initializer's lock would hold the
+    /// second thread for as long as the first's read takes; the racing
+    /// search above no longer reaches the fallback, so it cannot tell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_fallback_read_does_not_hold_a_racing_one() {
+        let (source, reader) = reader_pausing_on_the_length_array().await;
+        let fallback = |reader: Arc<FtsReader>| {
+            spawn_blocking(move || {
+                reader.columns[0].norms();
+            })
+        };
+
+        let first = fallback(Arc::clone(&reader));
+        timeout(RACING_SEARCH_DEADLINE, async {
+            while !source.paused.load(Ordering::SeqCst) {
+                sleep(PAUSE_POLL).await;
+            }
+        })
+        .await
+        .expect("the first fallback must read the length array");
+        let second = timeout(RACING_SEARCH_DEADLINE, fallback(Arc::clone(&reader))).await;
+        let first_still_parked = !first.is_finished();
+        // Release the first read before asserting, so a failure leaves no
+        // thread parked behind it.
+        source.resume.notify_one();
+        first.await.expect("first fallback task");
+        second
+            .expect("the second fallback must not wait on the first's read")
+            .expect("second fallback task");
+        assert!(
+            first_still_parked,
+            "the first read was still parked when the second returned"
+        );
+        assert!(
+            reader.columns[0].norms_loaded(),
+            "either read fills the cell; both are the same table"
+        );
     }
 
     /// A whole-blob source whose first read touching `region` fails the

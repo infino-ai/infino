@@ -530,13 +530,19 @@ impl ColumnMeta {
 
     /// The norms this column scores with: the declared ones, or the
     /// override view's, derived from them on first use. A view is derived
-    /// only from a base that was read: derived from the empty fallback it
-    /// would outlive the failure it stood in for.
+    /// only from the base in the cell, never from what [`Self::base_norms`]
+    /// returned: that may be the empty fallback of a read that failed, and
+    /// a racing reader may fill the cell between the fallback and here — a
+    /// view cached from the fallback would outlive the failure it stood in
+    /// for, and its empty table is one `get` must never see.
     pub(super) fn norms(&self) -> &ColumnNorms {
         let base = self.base_norms();
-        if self.params == self.declared_params || !self.norms_loaded() {
+        if self.params == self.declared_params {
             return base;
         }
+        let Some(base) = self.base_norms.get() else {
+            return base;
+        };
         self.view_norms
             .get_or_init(|| base.rescored(self.declared_params, self.params))
     }
