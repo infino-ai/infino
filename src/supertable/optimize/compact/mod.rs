@@ -12,7 +12,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::{BufWriter, Write},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Instant,
@@ -42,7 +42,10 @@ use crate::{
         BuildError, CommitError, ManifestSnapshot, SuperfileEntry, Supertable,
         error::CompactionError,
         handle::hidden_vector_index_compaction_settings,
-        manifest::{list::PartitionStrategy, listed_once},
+        manifest::{
+            SuperfileUri, list::PartitionStrategy, listed_once,
+            term_index::Contribution as TermContribution,
+        },
         opann::rerank_pool_hint,
         query::dispatch::open_compaction_input,
         reader_cache::disk::mmap_readonly_bytes,
@@ -73,7 +76,18 @@ pub(crate) mod plan;
 use plan::split_stats_at_drain_watermark;
 pub(crate) use plan::{CompactionJob, SuperfileStats, select};
 
+/// Cap on compaction input opens in flight, across the whole process.
+/// Process-wide rather than per job: concurrent jobs would otherwise each
+/// claim this many, and the combined fanout saturates the object-store
+/// connection pool until requests start timing out.
 const MAX_CONCURRENT_INPUT_OPENS: usize = 64;
+
+/// The shared permit pool behind [`MAX_CONCURRENT_INPUT_OPENS`].
+static INPUT_OPEN_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn input_open_permits() -> &'static Arc<Semaphore> {
+    INPUT_OPEN_PERMITS.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_INPUT_OPENS)))
+}
 
 impl Supertable {
     /// Compaction entry point.
@@ -236,6 +250,9 @@ impl Supertable {
         };
         // Optimize phase timers ([optphase]); gated, off by default.
         let phase_timers = crate::config::global().diagnostics.optimize_phase_timers;
+        // How many merges this pass keeps in flight. Resolved once: the jobs
+        // are planned from one snapshot, so the width must not drift mid-pass.
+        let concurrency = crate::config::global().compaction_concurrency(cfg);
         let mut __pt = Instant::now();
         if hidden_ivf {
             split_overflow_cells(Arc::clone(inner))
@@ -334,18 +351,15 @@ impl Supertable {
             info!(
                 role = table.role().as_str(),
                 jobs = jobs.len(),
+                concurrency,
                 "compaction jobs planned"
             );
             if phase_timers {
                 __pt = Instant::now();
             }
-            for job in jobs {
-                table.run_compaction_job(job, stale_seal_timeout).await?;
-                table
-                    .refresh()
-                    .await
-                    .map_err(|e| CompactionError::Refresh(e.to_string()))?;
-            }
+            table
+                .run_compaction_jobs(jobs, stale_seal_timeout, concurrency)
+                .await?;
             if phase_timers {
                 info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   merge");
             }
@@ -437,7 +451,7 @@ impl Supertable {
             .try_reserve(estimated_bytes)
             .map_err(|e| BuildError::MemoryBudgetExceeded(e.to_string()))?;
 
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_INPUT_OPENS));
+        let semaphore = input_open_permits();
         let mut superfile_readers_tasks = JoinSet::new();
         for (idx, entry) in superfiles.iter().enumerate() {
             #[cfg(feature = "detailed-tracing")]
@@ -600,10 +614,16 @@ impl Supertable {
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)
     }
 
+    /// Seal, merge, and stage one job for commit. Everything up to the
+    /// manifest CAS: the caller decides whether to commit this job alone or
+    /// batched with its siblings.
+    ///
+    /// On any failure here the job's own seals are cleared before returning,
+    /// so a failed prepare leaves nothing behind for a sibling to trip over.
     #[cfg_attr(
         feature = "detailed-tracing",
         tracing::instrument(
-            name = "run_compaction_job",
+            name = "prepare_compaction_job",
             skip_all,
             fields(
                 role = self.role().as_str(),
@@ -613,11 +633,11 @@ impl Supertable {
             )
         )
     )]
-    pub(crate) async fn run_compaction_job(
+    pub(crate) async fn prepare_compaction_job(
         &self,
         job: CompactionJob,
         stale_seal_timeout: std::time::Duration,
-    ) -> Result<(), CompactionError> {
+    ) -> Result<PreparedJob, CompactionError> {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
         let storage = manifest
@@ -693,7 +713,7 @@ impl Supertable {
 
         let (
             new_entries,
-            mut pending_storage_writes,
+            pending_storage_writes,
             bytes_for_store,
             bytes_for_cache,
             merged_superfile_id,
@@ -723,9 +743,16 @@ impl Supertable {
                     ..(*merged_prepared).clone()
                 });
                 let id = merged_entry.superfile_id;
+                let storage_write = match bytes_for_storage {
+                    Some(w) => w,
+                    None => {
+                        unseal_all(&wal_store, sealed).await;
+                        return Err(CompactionError::EmptyMergedSuperfile);
+                    }
+                };
                 (
                     vec![merged_entry],
-                    vec![bytes_for_storage.ok_or(CompactionError::EmptyMergedSuperfile)?],
+                    vec![storage_write],
                     bytes_for_store,
                     bytes_for_cache,
                     id,
@@ -736,15 +763,109 @@ impl Supertable {
             None => (Vec::new(), Vec::new(), None, None, Uuid::nil(), Vec::new()),
         };
 
+        Ok(PreparedJob {
+            input_ids: job.inputs,
+            sealed,
+            new_entries,
+            pending_storage_writes,
+            bytes_for_store,
+            bytes_for_cache,
+            merged_superfile_id,
+            term_contributions,
+        })
+    }
+
+    /// Commit a batch of prepared merges in ONE manifest CAS: every new entry
+    /// added and every input removed together.
+    ///
+    /// The jobs a pass plans never share an input, so a batch's removals are
+    /// disjoint and its additions independent — the manifest cannot tell a
+    /// batch of N from N separate commits, except that it produces one
+    /// generation instead of N.
+    ///
+    /// A single-job batch is exactly the historical per-job commit, which is
+    /// what keeps a serial pass byte-for-byte what it was.
+    pub(crate) async fn commit_compaction_batch(
+        &self,
+        mut batch: Vec<PreparedJob>,
+    ) -> Result<(), CompactionError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let inner = self.inner();
+        let manifest = inner.manifest.load_full();
+        let storage = manifest
+            .options
+            .storage
+            .as_ref()
+            .ok_or(CompactionError::NoStorage)?
+            .clone();
+        let wal_store = WalStore::new(storage.clone());
+        let opts = Arc::clone(&inner.options);
+        let max_retries = opts.max_commit_retries.max(1);
+
+        // Raised by a job that lost its inputs to another compactor after we
+        // had already merged. The remaining jobs still commit; the error is
+        // surfaced once the batch has settled.
+        let mut deferred_error: Option<CompactionError> = None;
+
         for attempt in 0..max_retries {
             let current = inner.manifest.load_full();
 
-            // Another compactor already merged our inputs — nothing left to commit.
-            let entries_to_remove = match resolve_entries_to_remove(&current, &job.inputs) {
-                Ok(entries) => entries,
-                Err(_missing) => return Ok(()),
-            };
+            // Another compactor already merged some job's inputs — that job has
+            // nothing left to commit, so drop it and keep the rest. On a retry
+            // this is a lost race rather than a benign no-op, because we had
+            // resolved those inputs once already.
+            let mut resolved: Vec<(usize, Vec<Arc<SuperfileEntry>>)> = Vec::new();
+            let mut vanished: Vec<usize> = Vec::new();
+            for (i, prepared) in batch.iter().enumerate() {
+                match resolve_entries_to_remove(&current, &prepared.input_ids) {
+                    Ok(entries) => resolved.push((i, entries)),
+                    Err(missing) => {
+                        if attempt > 0 {
+                            deferred_error
+                                .get_or_insert(CompactionError::SuperfileNotFound(missing));
+                        }
+                        vanished.push(i);
+                    }
+                }
+            }
+            // Drop the vanished jobs back-to-front so the surviving indices
+            // stay valid. Their seals go with them: on a retry the inputs are
+            // gone, so there is no sidecar left to clear.
+            for i in vanished.into_iter().rev() {
+                batch.remove(i);
+            }
+            if batch.is_empty() {
+                return match deferred_error {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                };
+            }
 
+            let entries_to_remove: Vec<Arc<SuperfileEntry>> =
+                resolved.into_iter().flat_map(|(_, e)| e).collect();
+            let new_entries: Vec<Arc<SuperfileEntry>> = batch
+                .iter()
+                .flat_map(|p| p.new_entries.iter().cloned())
+                .collect();
+            // A term contribution owns a spilled file and is not cloneable, so
+            // the batch's are borrowed out for the attempt and handed back if
+            // it has to be retried. `owners` records which job each came from.
+            let mut term_contributions: Vec<TermContribution> = Vec::new();
+            let mut contribution_owners: Vec<usize> = Vec::new();
+            for (i, prepared) in batch.iter_mut().enumerate() {
+                for contribution in prepared.term_contributions.drain(..) {
+                    term_contributions.push(contribution);
+                    contribution_owners.push(i);
+                }
+            }
+            // Successful PUTs are drained from this vec, so a retry re-writes
+            // only what the previous attempt failed to land.
+            let mut pending_storage_writes: Vec<(String, Bytes)> = batch
+                .iter_mut()
+                .flat_map(|p| p.pending_storage_writes.drain(..))
+                .collect();
             let mut pending_storage_replaces: Vec<(String, Bytes)> = Vec::new();
 
             match try_commit_attempt(
@@ -762,18 +883,20 @@ impl Supertable {
             {
                 Ok(new_manifest) => {
                     inner.manifest.store(Arc::new(new_manifest));
-                    // Warm the merged superfile into the in-memory reader
+                    // Warm each merged superfile into the in-memory reader
                     // cache, same as a normal writer commit does. Without
                     // this every query against it misses and re-fetches +
                     // re-opens from storage every single time.
-                    if let Some((uri, bytes)) = bytes_for_store
-                        && let Err(e) = opts.store.insert(uri, bytes)
-                    {
-                        warn!(
-                            superfile_id = %merged_superfile_id,
-                            error = %e,
-                            "compact: failed to warm reader cache for merged superfile"
-                        );
+                    for prepared in &batch {
+                        if let Some((uri, bytes)) = prepared.bytes_for_store.clone()
+                            && let Err(e) = opts.store.insert(uri, bytes)
+                        {
+                            warn!(
+                                superfile_id = %prepared.merged_superfile_id,
+                                error = %e,
+                                "compact: failed to warm reader cache for merged superfile"
+                            );
+                        }
                     }
 
                     // Drop the merged-away inputs so the in-memory cache
@@ -787,7 +910,10 @@ impl Supertable {
                     // Disk-cache warm + background storage reclaim ride the
                     // shared post-commit finalizer (the same path writer
                     // commits use), so the two paths can't drift.
-                    let pending_cache_inserts = bytes_for_cache.into_iter().collect::<Vec<_>>();
+                    let pending_cache_inserts: Vec<_> = batch
+                        .iter()
+                        .filter_map(|p| p.bytes_for_cache.clone())
+                        .collect();
                     finalize_compaction_commit(
                         Arc::clone(inner),
                         &storage,
@@ -797,42 +923,143 @@ impl Supertable {
                     )
                     .await;
 
-                    return Ok(());
+                    return match deferred_error {
+                        Some(e) => Err(e),
+                        None => Ok(()),
+                    };
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
                     warn!(
-                        superfile_id = %merged_superfile_id,
-                        attempt,
-                        max_retries,
-                        "compaction commit lost race, retrying"
+                        jobs = batch.len(),
+                        attempt, max_retries, "compaction commit lost race, retrying"
                     );
-                    if let Err(e) = self.refresh().await {
-                        unseal_all(&wal_store, sealed).await;
-                        return Err(CompactionError::Refresh(e.to_string()));
-                    }
-                    // Input vanished mid-retry (someone else merged it away).
-                    // Our built output no longer matches reality, so abort
-                    // instead of retrying the commit.
-                    if let Err(missing) =
-                        resolve_entries_to_remove(&inner.manifest.load_full(), &job.inputs)
+                    // Put the undrained writes and the borrowed contributions
+                    // back so the next attempt still knows what it owes.
+                    redistribute_pending_writes(&mut batch, pending_storage_writes);
+                    for (contribution, owner) in
+                        term_contributions.into_iter().zip(contribution_owners)
                     {
-                        unseal_all(&wal_store, sealed).await;
-                        return Err(CompactionError::SuperfileNotFound(missing));
+                        batch[owner].term_contributions.push(contribution);
+                    }
+                    if let Err(e) = self.refresh().await {
+                        unseal_batch(&wal_store, batch).await;
+                        return Err(CompactionError::Refresh(e.to_string()));
                     }
                     time::sleep(backoff_delay(attempt)).await;
                 }
                 Err(e) => {
-                    unseal_all(&wal_store, sealed).await;
+                    unseal_batch(&wal_store, batch).await;
                     return Err(CompactionError::Commit(e.to_string()));
                 }
             }
         }
 
-        unseal_all(&wal_store, sealed).await;
+        unseal_batch(&wal_store, batch).await;
         Err(CompactionError::Commit(
             "commit retries exhausted".to_string(),
         ))
     }
+
+    /// Seal, merge and commit one job on its own, with no refresh after.
+    /// Production runs jobs through [`Self::run_compaction_jobs`]; this is the
+    /// single-job shorthand the compaction tests drive directly.
+    #[cfg(test)]
+    pub(crate) async fn run_compaction_job(
+        &self,
+        job: CompactionJob,
+        stale_seal_timeout: std::time::Duration,
+    ) -> Result<(), CompactionError> {
+        let prepared = self.prepare_compaction_job(job, stale_seal_timeout).await?;
+        self.commit_compaction_batch(vec![prepared]).await
+    }
+
+    /// Run a pass's planned jobs, up to `concurrency` merges in flight, and
+    /// commit each wave in one manifest CAS.
+    ///
+    /// The waves are chunks of the plan in order, so a serial pass (the
+    /// default `concurrency` of 1) is prepare-commit-refresh per job, exactly
+    /// as before. A merge that fails does not cost its wave-mates their work:
+    /// the successful merges commit and the first error surfaces after.
+    async fn run_compaction_jobs(
+        &self,
+        jobs: Vec<CompactionJob>,
+        stale_seal_timeout: std::time::Duration,
+        concurrency: usize,
+    ) -> Result<(), CompactionError> {
+        let concurrency = concurrency.max(1);
+        for wave in jobs.chunks(concurrency) {
+            let prepared: Vec<Result<PreparedJob, CompactionError>> =
+                stream::iter(wave.iter().cloned().map(|job| async move {
+                    self.prepare_compaction_job(job, stale_seal_timeout).await
+                }))
+                // Ordered, not `buffer_unordered`: the batch commits in plan
+                // order so a pass's manifest is reproducible from its plan.
+                .buffered(concurrency)
+                .collect()
+                .await;
+
+            let mut ready = Vec::with_capacity(prepared.len());
+            let mut first_error: Option<CompactionError> = None;
+            for outcome in prepared {
+                match outcome {
+                    Ok(p) => ready.push(p),
+                    // A failed prepare already cleared its own seals.
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                    }
+                }
+            }
+
+            let commit = self.commit_compaction_batch(ready).await;
+            self.refresh()
+                .await
+                .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+            commit?;
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One merge that has run and is waiting for its manifest commit.
+pub(crate) struct PreparedJob {
+    /// Inputs this job claimed, in plan order.
+    input_ids: Vec<Uuid>,
+    /// Seals placed on those inputs, cleared if the job never commits.
+    sealed: Vec<SealedInput>,
+    /// The merged superfile's entry. Empty on a pure reclaim, where every
+    /// input was fully dead and the commit removes them with no replacement.
+    new_entries: Vec<Arc<SuperfileEntry>>,
+    /// Superfile bytes still owed to object storage, drained as they land.
+    pending_storage_writes: Vec<(String, Bytes)>,
+    bytes_for_store: Option<(SuperfileUri, Bytes)>,
+    bytes_for_cache: Option<(SuperfileUri, Bytes)>,
+    merged_superfile_id: Uuid,
+    term_contributions: Vec<TermContribution>,
+}
+
+/// Hand the writes a failed attempt did not land back to the jobs that owe
+/// them, so the next attempt re-PUTs exactly the outstanding bytes. Keyed by
+/// storage path, which is unique per superfile.
+fn redistribute_pending_writes(batch: &mut [PreparedJob], outstanding: Vec<(String, Bytes)>) {
+    for (path, bytes) in outstanding {
+        // A job dropped from the batch this attempt owns none of these; its
+        // bytes are an orphan for gc, not something to retry.
+        if let Some(owner) = batch
+            .iter_mut()
+            .find(|p| p.new_entries.iter().any(|e| e.storage_path() == path))
+        {
+            owner.pending_storage_writes.push((path, bytes));
+        }
+    }
+}
+
+/// Clear every seal a batch placed. Called when the batch will not commit.
+async fn unseal_batch(wal_store: &WalStore, batch: Vec<PreparedJob>) {
+    let sealed: Vec<SealedInput> = batch.into_iter().flat_map(|p| p.sealed).collect();
+    unseal_all(wal_store, sealed).await;
 }
 
 /// One superfile this attempt sealed: enough to unseal it later with
@@ -936,7 +1163,7 @@ async fn seal_with_bounded_retry(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, mem, str, sync::Arc};
+    use std::{collections::HashSet, mem, str, sync::Arc, time::Duration};
 
     use arrow_array::{
         ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
@@ -953,7 +1180,7 @@ mod tests {
     };
     use crate::{
         Bm25Stats, BoolMode, VectorSearchOptions,
-        config::{DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
+        config::{DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions, ThreadCount},
         memory::ConnectionMemoryBudget,
         superfile::{
             builder::{FtsConfig, VectorConfig},
@@ -3693,6 +3920,365 @@ mod tests {
         for id in &stranded_ids {
             assert!(remaining_ids.contains(id));
         }
+    }
+
+    // ---- concurrent jobs ------------------------------------------------
+
+    /// Jobs per wave when a test exercises the concurrent path. Four is enough
+    /// that a wave holds several merges without needing a large fixture.
+    const TEST_CONCURRENT_JOBS: usize = 4;
+
+    /// Build a table whose superfiles the selector packs into several jobs,
+    /// then compact it at `concurrency` and report what the pass produced:
+    /// total docs, the per-superfile doc counts, and how many manifest
+    /// generations the pass burned.
+    async fn compact_a_fragmented_table(concurrency: usize) -> (u64, Vec<u64>, u64) {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        // Each superfile must be big enough that a handful overflow the 1 MiB
+        // target, so the selector emits more than one job and the waves are
+        // exercised rather than degenerating to a single batch.
+        let commit_bulk = |titles: &[&str]| {
+            let mut w = st.writer().expect("writer");
+            for _ in 0..4096 {
+                w.append(&build_title_batch(titles)).expect("append");
+            }
+            w.commit().expect("commit");
+        };
+        // Thirty-two superfiles: the packer fills several 1 MiB jobs from them,
+        // which is what makes the waves meaningful.
+        for round in 0..2 {
+            for term in [
+                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+                "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+            ] {
+                commit_bulk(&[
+                    &format!("{term} first {round}"),
+                    &format!("{term} second {round}"),
+                ]);
+            }
+        }
+
+        let cfg = CompactionSettings {
+            max_concurrent_jobs: ThreadCount::Fixed(concurrency),
+            ..small_compact_cfg()
+        };
+        let before = st.manifest_id();
+        st.compact_async(&cfg).await.expect("compact");
+        let generations = st.manifest_id() - before;
+
+        let reader = st.reader().expect("reader");
+        let total = reader.n_docs_total();
+        let mut per_superfile: Vec<u64> = reader
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.n_docs)
+            .collect();
+        per_superfile.sort_unstable();
+        (total, per_superfile, generations)
+    }
+
+    /// The gate on running jobs concurrently: a wider pass must land the same
+    /// table. Same doc count, same superfile shape — the plan is identical, so
+    /// only the order the merges run in changed.
+    ///
+    /// It must also cost FEWER manifest generations, since a wave commits in
+    /// one CAS. That half is what proves the batching actually happened and
+    /// the pass did not quietly fall back to committing one job at a time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_jobs_land_the_same_table_as_a_serial_pass() {
+        let (serial_docs, serial_shape, serial_generations) = compact_a_fragmented_table(1).await;
+        let (concurrent_docs, concurrent_shape, concurrent_generations) =
+            compact_a_fragmented_table(TEST_CONCURRENT_JOBS).await;
+
+        assert!(
+            serial_generations >= 2,
+            "fixture must plan more than one job to be a real test of batching, \
+             got {serial_generations} generations"
+        );
+        assert_eq!(
+            serial_docs, concurrent_docs,
+            "a concurrent pass must preserve every doc"
+        );
+        assert_eq!(
+            serial_shape, concurrent_shape,
+            "a concurrent pass must produce the same superfiles as a serial one"
+        );
+        assert!(
+            concurrent_generations < serial_generations,
+            "a wave must commit in one CAS: {concurrent_generations} generations \
+             concurrently vs {serial_generations} serially"
+        );
+    }
+
+    /// One job failing must not cost its wave-mates their merges. The failure
+    /// here is an input that vanished between planning and preparing, which
+    /// `prepare_compaction_job` reports as `SuperfileNotFound`.
+    ///
+    /// The surviving job still commits, and the error still surfaces.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_job_still_lets_its_wave_mates_commit() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        for term in ["alpha", "bravo", "charlie", "delta"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let live: Vec<Uuid> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert_eq!(live.len(), 4, "fixture");
+
+        // Two jobs in one wave: the first names a superfile that is not in the
+        // manifest, the second is real.
+        let doomed = CompactionJob {
+            partition_key: Vec::new(),
+            inputs: vec![Uuid::new_v4(), live[0]],
+            estimated_output_bytes: 0,
+        };
+        let good = CompactionJob {
+            partition_key: Vec::new(),
+            inputs: vec![live[1], live[2]],
+            estimated_output_bytes: 0,
+        };
+
+        let err = st
+            .run_compaction_jobs(vec![doomed, good], DEFAULT_STALE_SEAL_TIMEOUT, 2)
+            .await
+            .expect_err("the doomed job must surface its error");
+        assert!(
+            matches!(err, CompactionError::SuperfileNotFound(_)),
+            "unexpected error: {err:?}"
+        );
+
+        // The healthy job committed anyway: its two inputs are gone, replaced
+        // by one merged superfile, and the untouched fourth is still listed.
+        let after: Vec<Uuid> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert!(
+            !after.contains(&live[1]) && !after.contains(&live[2]),
+            "the healthy job's inputs must have been merged away"
+        );
+        assert!(
+            after.contains(&live[0]) && after.contains(&live[3]),
+            "the failed job must not have touched anything"
+        );
+    }
+
+    /// A batch that loses the manifest CAS retries as a batch: the merges are
+    /// already done and their outputs already staged, so the second attempt
+    /// re-resolves the inputs against the refreshed manifest and commits the
+    /// same wave. Nothing is re-merged and nothing is lost.
+    ///
+    /// The race is a real concurrent writer rather than an injected fault,
+    /// because that is the contention the retry loop is built for: a writer
+    /// moves the pointer between the batch's manifest read and its CAS.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_commits_alongside_a_racing_writer() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        for term in ["alpha", "bravo", "charlie", "delta"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let before_docs = st.reader().expect("reader").n_docs_total();
+        let live: Vec<Uuid> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert_eq!(live.len(), 4, "fixture");
+
+        // Two jobs in one wave, racing a writer commit. The wave may lose its
+        // pointer CAS to the writer and retry, or win outright; either way
+        // both the merge and the append must land.
+        let racing = st.clone();
+        let writer = task::spawn_blocking(move || {
+            commit_titles(&racing, &["echo first", "echo second"]);
+        });
+        let jobs = vec![
+            CompactionJob {
+                partition_key: Vec::new(),
+                inputs: vec![live[0], live[1]],
+                estimated_output_bytes: 0,
+            },
+            CompactionJob {
+                partition_key: Vec::new(),
+                inputs: vec![live[2], live[3]],
+                estimated_output_bytes: 0,
+            },
+        ];
+        st.run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 2)
+            .await
+            .expect("the batch must commit despite a racing writer");
+        writer.await.expect("writer task");
+
+        st.refresh().await.expect("refresh");
+        let listed: Vec<Uuid> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        for input in &live {
+            assert!(
+                !listed.contains(input),
+                "every merged input must be gone: {input}"
+            );
+        }
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            before_docs + 2,
+            "the merge kept its rows and the racing writer's two landed"
+        );
+    }
+
+    /// The retry path hands a failed attempt's unwritten superfile bytes back
+    /// to the jobs that own them, keyed by storage path, so the next attempt
+    /// re-PUTs exactly what is still owed and no job re-PUTs a sibling's
+    /// bytes. Bytes whose owner was dropped from the batch are orphans for gc
+    /// and must not be handed to anyone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retry_hands_unwritten_bytes_back_to_the_job_that_owes_them() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        for term in ["alpha", "bravo", "charlie", "delta"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let live: Vec<Uuid> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+
+        let mut batch = Vec::new();
+        for pair in [[live[0], live[1]], [live[2], live[3]]] {
+            batch.push(
+                st.prepare_compaction_job(
+                    CompactionJob {
+                        partition_key: Vec::new(),
+                        inputs: pair.to_vec(),
+                        estimated_output_bytes: 0,
+                    },
+                    DEFAULT_STALE_SEAL_TIMEOUT,
+                )
+                .await
+                .expect("prepare"),
+            );
+        }
+
+        // Drain what a commit attempt would have taken, then hand it back with
+        // one extra entry nobody in the batch owns.
+        let outstanding: Vec<(String, Bytes)> = batch
+            .iter_mut()
+            .flat_map(|p| p.pending_storage_writes.drain(..))
+            .collect();
+        assert_eq!(outstanding.len(), 2, "one staged superfile per job");
+        let owners: Vec<String> = batch
+            .iter()
+            .map(|p| p.new_entries[0].storage_path())
+            .collect();
+
+        let mut handed_back = outstanding.clone();
+        handed_back.push(("orphan-of-a-dropped-job".to_string(), Bytes::new()));
+        redistribute_pending_writes(&mut batch, handed_back);
+
+        for (i, prepared) in batch.iter().enumerate() {
+            let paths: Vec<&str> = prepared
+                .pending_storage_writes
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect();
+            assert_eq!(
+                paths,
+                vec![owners[i].as_str()],
+                "job {i} must get back exactly its own bytes"
+            );
+        }
+
+        // Nothing is left holding the orphan.
+        let total: usize = batch.iter().map(|p| p.pending_storage_writes.len()).sum();
+        assert_eq!(total, outstanding.len(), "the orphan must be dropped");
+
+        // Leave no seals behind for the tempdir teardown.
+        st.commit_compaction_batch(batch).await.expect("commit");
+    }
+
+    /// A job whose inputs another compactor merged away between planning and
+    /// commit is dropped from its wave, not treated as a failure: there is
+    /// nothing left for it to remove, and its output is an orphan for gc.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_whose_inputs_vanished_before_commit_is_dropped_not_failed() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        for term in ["alpha", "bravo", "charlie", "delta"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let live: Vec<Uuid> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+
+        // Prepare a job over the first two, then merge them away underneath it.
+        let staged = st
+            .prepare_compaction_job(
+                CompactionJob {
+                    partition_key: Vec::new(),
+                    inputs: vec![live[0], live[1]],
+                    estimated_output_bytes: 0,
+                },
+                DEFAULT_STALE_SEAL_TIMEOUT,
+            )
+            .await
+            .expect("prepare");
+        // The racing compactor treats every seal as stale, which is how a
+        // second compactor takes over after the first one dies. Here the first
+        // one has not died, but from the second's point of view the situation
+        // is identical, and it is the only way to reach a committed merge over
+        // inputs another job has already staged.
+        st.run_compaction_job(
+            CompactionJob {
+                partition_key: Vec::new(),
+                inputs: vec![live[0], live[1]],
+                estimated_output_bytes: 0,
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect("the racing compactor commits");
+
+        let docs_before = st.reader().expect("reader").n_docs_total();
+        st.commit_compaction_batch(vec![staged])
+            .await
+            .expect("a vanished job is benign, not an error");
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            docs_before,
+            "the dropped job must not have changed the table"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -36,8 +36,10 @@
 use std::{
     collections::HashMap,
     env, fmt,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::OnceLock,
+    thread::available_parallelism,
     time::Duration,
 };
 
@@ -51,7 +53,10 @@ use serde::{
     ser::Serializer,
 };
 
-use crate::supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT;
+use crate::{
+    runtime_metrics::rss::available_memory_bytes,
+    supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT,
+};
 
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
@@ -257,6 +262,22 @@ const DEFAULT_COMPACTION_MIN_FILL_PERCENT: u8 = 80;
 const DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE: u64 = 50;
 const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB + 2048;
 
+/// How many compaction merges run at once by default. One: merging
+/// concurrently multiplies peak memory by the same factor, so the wider
+/// setting is opt-in until a host's headroom is known. `auto` derives the
+/// width from available memory and the maintenance pool -- see
+/// [`CompactionSettings::resolve_max_concurrent_jobs`].
+const DEFAULT_COMPACTION_MAX_CONCURRENT_JOBS: ThreadCount = ThreadCount::Fixed(1);
+
+/// Upper bound on the resolved concurrent-job width. A compaction pass that
+/// keeps this many merges in flight already saturates any realistic
+/// object-store connection pool, and each one holds `max_memory_mb`; a
+/// mis-derived `auto` must not run away past it.
+const MAX_COMPACTION_CONCURRENT_JOBS: usize = 64;
+
+/// Bytes per mebibyte — the unit the memory budgets are expressed in.
+const MIB_BYTES: u64 = 1024 * 1024;
+
 /// How old a tombstone sidecar seal has to be before compaction treats
 /// its owner as dead and takes over, instead of backing off.
 /// Scale this up if target_superfile_size_mb is raised well past the default
@@ -279,7 +300,16 @@ pub struct CompactionSettings {
     /// is a no-op rewrite.
     pub min_superfiles_for_merge: u64,
     /// Maximum memory budget for materializing inputs during a single merge, in MiB.
+    /// Independent of `target_superfile_size_mb`: raising the target does not
+    /// raise this. Bounds the raw input bytes a merge materializes, not the
+    /// merge's peak resident set.
     pub max_memory_mb: u64,
+    /// How many of a pass's merge jobs run at once. The jobs a pass plans
+    /// never share an input, so they are safe to run concurrently; the limit
+    /// is memory, since each in-flight job holds up to `max_memory_mb` of raw
+    /// input. `auto` resolves from available memory and the maintenance pool
+    /// width. Defaults to 1 (serial), matching the historical behavior.
+    pub max_concurrent_jobs: ThreadCount,
     /// How old a sealed tombstone sidecar has to be, in milliseconds,
     /// before it's treated as abandoned
     pub stale_seal_timeout_ms: u64,
@@ -292,6 +322,7 @@ impl Default for CompactionSettings {
             min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
             min_superfiles_for_merge: DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE,
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
+            max_concurrent_jobs: DEFAULT_COMPACTION_MAX_CONCURRENT_JOBS,
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
         }
     }
@@ -1252,6 +1283,37 @@ impl Serialize for ThreadCount {
 }
 
 impl Config {
+    /// How many compaction merge jobs a pass may run at once.
+    ///
+    /// An explicit setting is honored (clamped to the sane band); `auto`
+    /// derives the width from the two things that actually bound it:
+    ///
+    /// - **Memory.** Each in-flight job materializes up to
+    ///   `compaction.max_memory_mb` of raw input, so available memory divided
+    ///   by that budget is the number the host can hold. Where the OS won't
+    ///   say (no procfs), this falls back to 1 rather than guessing.
+    /// - **CPU.** Merges run on the maintenance pool, so more concurrent jobs
+    ///   than that pool is width without throughput.
+    /// `compaction` is the settings the pass actually runs with, not
+    /// necessarily `self.compaction`: the hidden vector index compacts under
+    /// its own derived settings and resolves its own width from them.
+    pub(crate) fn compaction_concurrency(&self, compaction: &CompactionSettings) -> usize {
+        let maintenance = self
+            .vector
+            .maintenance_threads
+            .resolve_or_default(available_parallelism().map(NonZeroUsize::get).unwrap_or(1));
+        let budget_bytes = compaction.max_memory_mb.saturating_mul(MIB_BYTES);
+        let by_memory = match (available_memory_bytes(), budget_bytes) {
+            (Some(available), budget) if budget > 0 => (available / budget) as usize,
+            // No procfs, or a zero budget: stay serial rather than invent a width.
+            _ => 1,
+        };
+        compaction
+            .max_concurrent_jobs
+            .resolve_or_default(by_memory.min(maintenance))
+            .clamp(1, MAX_COMPACTION_CONCURRENT_JOBS)
+    }
+
     /// Load from the standard hierarchy. See module docs for the
     /// precedence order.
     pub fn load() -> Result<Self, ConfigError> {

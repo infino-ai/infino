@@ -49,6 +49,8 @@ const RSS_P90_PERCENTILE: usize = 90;
 const PERCENT_SCALE: f64 = 100.0;
 /// Process status file carrying `VmRSS`.
 const PROC_SELF_STATUS: &str = "/proc/self/status";
+/// System memory summary carrying `MemAvailable`.
+const PROC_MEMINFO: &str = "/proc/meminfo";
 /// Aggregated smaps rollup (Anonymous / Rss / Shmem).
 const PROC_SELF_SMAPS_ROLLUP: &str = "/proc/self/smaps_rollup";
 
@@ -57,6 +59,24 @@ pub fn current_rss_bytes() -> Option<u64> {
     let s = fs::read_to_string(PROC_SELF_STATUS).ok()?;
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * KIB_TO_BYTES);
+        }
+    }
+    None
+}
+
+/// One-shot read of the memory the kernel estimates is available for a new
+/// allocation without swapping (Linux `MemAvailable`), in bytes.
+///
+/// Unlike total RAM this already discounts what other processes hold, which
+/// is what a sizing decision actually has to spend. Returns `None` on
+/// platforms without procfs, so every caller needs a conservative fallback
+/// rather than a guess at the machine's size.
+pub fn available_memory_bytes() -> Option<u64> {
+    let s = fs::read_to_string(PROC_MEMINFO).ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
             let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
             return Some(kb * KIB_TO_BYTES);
         }
