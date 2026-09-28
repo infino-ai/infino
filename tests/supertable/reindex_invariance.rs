@@ -30,7 +30,7 @@ use super::corpus_shapes::{
 
 /// The shape every test here runs on: a table carrying both an FTS index
 /// and a vector index, so "nothing but FTS moves" has something to move.
-const SHAPE: &str = "v6_hybrid";
+const SHAPE: &str = "v6_with_vectors";
 
 /// Prefix on every key a superfile uses to declare a spliced region.
 const REGION_KEY_PREFIX: &str = "inf.";

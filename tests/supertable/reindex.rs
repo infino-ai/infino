@@ -253,7 +253,7 @@ fn a_mixed_table_reads_cleanly_across_versions_and_revisions() {
 /// removes the decode, and with it the limitation.
 #[test]
 fn a_vector_bearing_table_can_be_rewritten_and_reanalyzed() {
-    let Some((_tmp, table, root)) = open_corpus("v6_hybrid") else {
+    let Some((_tmp, table, root)) = open_corpus("v6_with_vectors") else {
         return;
     };
 

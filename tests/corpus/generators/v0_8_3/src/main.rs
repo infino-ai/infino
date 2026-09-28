@@ -11,10 +11,9 @@
 //!
 //! Usage: `cargo run -- <output-dir> <table-name> [profile]`
 //!
-//! `profile` is `hybrid` to add a vector column beside the text ones.
-//! That shape exists to pin a limitation rather than a format: the rerank
-//! codec is internal and never `Fp32` through the public API, so a
-//! re-analysis of any table with a vector index is refused.
+//! `profile` is `vectors` to add a vector column beside the text ones.
+//! That shape exists so a repair can be held to leaving a vector index
+//! byte-identical while it rebuilds the terms beside it.
 
 use std::{env, sync::Arc};
 
@@ -31,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let out_dir = args.next().ok_or("usage: <output-dir> <table-name>")?;
     let table = args.next().ok_or("usage: <output-dir> <table-name>")?;
-    let hybrid = args.next().as_deref() == Some("hybrid");
+    let with_vectors = args.next().as_deref() == Some("vectors");
 
     let mut fields = vec![
         Field::new("body", DataType::LargeUtf8, false),
@@ -42,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fts(FtsField::new("body"))
         .fts(FtsField::new("title").positions(true))
         .fts(FtsField::new("notes"));
-    if hybrid {
+    if with_vectors {
         fields.push(Field::new(
             "emb",
             DataType::FixedSizeList(
@@ -69,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(LargeStringArray::from(titles)),
         Arc::new(LargeStringArray::from(notes)),
     ];
-    if hybrid {
+    if with_vectors {
         let flat: Vec<f32> = (0..N_DOCS).flat_map(embedding).collect();
         columns.push(Arc::new(FixedSizeListArray::try_new(
             Arc::new(Field::new("item", DataType::Float32, true)),

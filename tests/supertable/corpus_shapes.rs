@@ -551,10 +551,10 @@ shape_tests! {
 /// Both repairs are available to it: a rewrite moves the container, and
 /// re-analysis rebuilds the terms while carrying the vector subsection
 /// across untouched rather than decoding it.
-mod v6_hybrid {
+mod v6_with_vectors {
     use super::*;
 
-    const SHAPE: &str = "v6_hybrid";
+    const SHAPE: &str = "v6_with_vectors";
 
     /// Sharding across five superfiles puts each below the coarse-table
     /// threshold; `v6_positional`, the same writer without the vector

@@ -20,7 +20,7 @@ shapes=(
   "v5_positionless:v0_8_0:5"
   "v5_positional:v0_8_2:5"
   "v6_positional:v0_8_3:6"
-  "v6_hybrid:v0_8_3:6:hybrid"
+  "v6_with_vectors:v0_8_3:6:vectors"
 )
 
 wanted=("$@")
