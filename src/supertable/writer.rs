@@ -176,7 +176,7 @@ use crate::{
                 CellRoutingParams, CellSplitCheck, DrainedVersionRanges, GlobalVectorIndex,
                 PartitionStrategy, WIDTH_LAW_KS,
             },
-            options_hash,
+            listed_once, options_hash,
             part::{self as part_mod, ContentHash, PartId},
             term_index::{self, Contribution as TermContribution, TermIndexError},
             term_stats,
@@ -702,10 +702,11 @@ fn schedule_background_storage_reclaim(inner: Arc<SupertableInner>) {
             if let Err(e) = super::gc::gc_storage_sweep_for_inner(
                 &inner,
                 super::gc::DEFAULT_SUPERFILE_RECLAIM_GRACE,
+                super::gc::GcTrigger::DeferredReclaim,
             )
             .await
             {
-                tracing::debug!("supertable: deferred storage reclaim: {e}");
+                warn!(error = %e, "supertable: deferred storage reclaim failed");
             }
         });
     }
@@ -3556,7 +3557,7 @@ async fn persist_superfile_publish_batch_async(
         )
         .await
         .map_err(BuildError::from)?;
-        inner.manifest.store(Arc::new(new_manifest));
+        inner.manifest.store(new_manifest);
         apply_pending_store_inserts(inner, batch.pending_store_inserts);
         // Already async — await the warm-cache fill directly. Do NOT call
         // `warm_cache_after_commit` here: its sync `block_in_place` + nested
@@ -4084,10 +4085,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // A cold-open user manifest is parts-backed and may have an empty flat
     // view. Drain must hydrate the authoritative user parts; reading only
     // `get_all_superfiles()` silently turns drain into a no-op after reopen.
-    let sources = user_manifest
-        .get_all_superfiles_loaded()
-        .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+    // Each superfile once: the per-batch row dedupe below can't see a copy
+    // listed in another batch.
+    let sources: Vec<Arc<SuperfileEntry>> = listed_once(
+        user_manifest
+            .get_all_superfiles_loaded()
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?,
+        |entry| entry.superfile_id,
+    )
+    .collect();
     if sources.is_empty() {
         return Ok(());
     }
@@ -5325,7 +5332,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         )
         .await
         .map_err(BuildError::from)?;
-        hidden_inner.manifest.store(Arc::new(new_manifest));
+        hidden_inner.manifest.store(new_manifest);
         // Simulate a crash AFTER the membership commit landed but BEFORE settle.
         // With the atomic fix the commit already carries the graph, so the
         // just-drained rows stay visible without the settle; a test asserts
@@ -7742,7 +7749,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
             return Err(unpin_after_failed_publish(inner, BuildError::from(error)).await);
         }
     };
-    inner.manifest.store(Arc::new(new_manifest));
+    inner.manifest.store(new_manifest);
     apply_pending_store_inserts(inner, pending_store_inserts);
 
     schedule_background_storage_reclaim(Arc::clone(inner));
@@ -8228,7 +8235,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
             return Err(unpin_after_failed_publish(inner, BuildError::from(error)).await);
         }
     };
-    inner.manifest.store(Arc::new(new_manifest));
+    inner.manifest.store(new_manifest);
     apply_pending_store_inserts(inner, pending_store_inserts);
     schedule_background_storage_reclaim(Arc::clone(inner));
 
@@ -8574,7 +8581,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
         )
         .await
         .map_err(BuildError::from)?;
-        inner.manifest.store(Arc::new(committed));
+        inner.manifest.store(committed);
     }
     Ok(())
 }
@@ -9229,10 +9236,12 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 ///  2. Derive `new_superfile_list = old.superfile_list.with_appended(new_entries.clone())`.
 ///  3. Try `try_commit_attempt` (write superfiles → write part +
 ///     list → conditional pointer PUT).
-///  4. On `WriteContentionExhausted` with retries left: refresh
-///     `inner.manifest` from storage (inheriting unchanged
-///     parts via content-addressed Arc::clone), sleep with
-///     jittered backoff, loop.
+///  4. On `WriteContentionExhausted`: refresh `inner.manifest`
+///     from storage (inheriting unchanged parts via
+///     content-addressed Arc::clone). If it already lists this
+///     commit's superfiles, the attempt published behind a lost
+///     response: return it. Otherwise sleep with jittered
+///     backoff, loop.
 ///  5. After `opts.max_commit_retries` exhausted: surface
 ///     `CommitError::WriteContentionExhausted` to the caller.
 ///
@@ -9244,7 +9253,9 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 /// content-addressed; identical content yields identical URIs
 /// and the part-write path already swallows
 /// `PreconditionFailed`. Only the pointer PUT must win the
-/// CAS; everything below it is idempotent.
+/// CAS; everything below it is idempotent. The pointer PUT
+/// itself is not, which is why step 4 checks for a published
+/// attempt before retrying it.
 ///
 /// When no real partitioning is configured, all post-commit
 /// superfiles go into one `ManifestPart` with a fresh `PartId`.
@@ -10227,13 +10238,12 @@ pub(in crate::supertable) async fn persist_commit_async(
     mut pending_storage_replaces: Vec<(String, Bytes)>,
     list_metadata: CommitListMetadata,
     term_contributions: Vec<TermContribution>,
-) -> Result<ManifestSnapshot, SupertableCommitError> {
+) -> Result<Arc<ManifestSnapshot>, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
     let max_retries = opts.max_commit_retries.max(1);
     let contributions: &[TermContribution] = &term_contributions;
     let drive = async move {
-        let mut last_err: Option<SupertableCommitError> = None;
         let mut next_id_floor: u64 = 0;
         for attempt in 0..max_retries {
             let old = inner.manifest.load_full();
@@ -10268,15 +10278,27 @@ pub(in crate::supertable) async fn persist_commit_async(
             )
             .await
             {
-                Ok(new_manifest) => return Ok(new_manifest),
-                Err(SupertableCommitError::WriteContentionExhausted)
-                    if attempt + 1 < max_retries =>
-                {
-                    next_id_floor = next_id_floor.max(
-                        refresh_and_orphaned_id_floor(inner, &storage_async, attempted_id).await?,
-                    );
-                    last_err = Some(SupertableCommitError::WriteContentionExhausted);
-                    sleep(backoff_delay(attempt)).await;
+                Ok(new_manifest) => return Ok(Arc::new(new_manifest)),
+                Err(SupertableCommitError::WriteContentionExhausted) => {
+                    let last_attempt = attempt + 1 == max_retries;
+                    // After the last attempt, refresh only to learn whether it
+                    // published: a plain refresh, since no retry needs the
+                    // orphan-skipping id floor, and none for a commit that adds
+                    // no superfiles, which can't show that it published.
+                    if !last_attempt {
+                        next_id_floor = next_id_floor.max(
+                            refresh_and_orphaned_id_floor(inner, &storage_async, attempted_id)
+                                .await?,
+                        );
+                    } else if !new_entries.is_empty() {
+                        refresh_inner_state_async(inner, &storage_async).await?;
+                    }
+                    if let Some(published) = published_by_earlier_attempt(inner, &new_entries) {
+                        return Ok(published);
+                    }
+                    if !last_attempt {
+                        sleep(backoff_delay(attempt)).await;
+                    }
                 }
                 Err(e) => {
                     inner.note_commit_error(&e);
@@ -10284,7 +10306,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 }
             }
         }
-        Err(last_err.unwrap_or(SupertableCommitError::WriteContentionExhausted))
+        Err(SupertableCommitError::WriteContentionExhausted)
     };
     // Genuinely async: callers `.await` this from async contexts already driven
     // on `query_runtime`. Driving it to completion here with a nested `block_on`
@@ -10295,6 +10317,32 @@ pub(in crate::supertable) async fn persist_commit_async(
     // whatever the outcome. A failed commit's postings are rebuilt from the
     // superfile by the next maintenance pass.
     drive.await
+}
+
+/// The refreshed manifest, when it already lists any of `new_entries`. Call
+/// it after a contention refresh: a hit means the attempt that reported the
+/// lost race published, and committing again would list its superfiles twice.
+/// Superfile ids are minted per build, so no other commit lists them.
+///
+/// How a published attempt reports a lost race:
+///  - the pointer PUT lands, but its response is a 500 or a timeout.
+///  - the storage client re-issues the PUT, finds the etag moved by that same
+///    write, and reports `PreconditionFailed`.
+///  - the commit sees `WriteContentionExhausted`, as for a real lost race.
+///
+/// Always `None` for a commit that adds no superfiles.
+fn published_by_earlier_attempt(
+    inner: &SupertableInner,
+    new_entries: &[Arc<SuperfileEntry>],
+) -> Option<Arc<ManifestSnapshot>> {
+    let refreshed = inner.manifest.load_full();
+    let superfile_id = refreshed.first_listed(new_entries)?;
+    warn!(
+        %superfile_id,
+        manifest_id = refreshed.get_manifest_id(),
+        "commit already published by an earlier attempt; not committing it again"
+    );
+    Some(refreshed)
 }
 
 pub(in crate::supertable) fn persist_commit(
@@ -10318,7 +10366,7 @@ pub(in crate::supertable) fn persist_commit(
         term_contributions,
     );
     let new_manifest = bridge_on_runtime(drive, &inner.query_runtime())?;
-    inner.manifest.store(Arc::new(new_manifest));
+    inner.manifest.store(new_manifest);
     inner.reconcile_tombstone_seqs();
     Ok(())
 }
@@ -11228,7 +11276,7 @@ mod tests {
         supertable::{
             SupertableOptions,
             handle::Supertable,
-            manifest::{CellVectorSummary, ClusterCentroids, VectorSummary},
+            manifest::{CellVectorSummary, ClusterCentroids, VectorSummary, commit::POINTER_PATH},
             storage::LocalFsStorageProvider,
             wal::{recovery::scan_and_recover, state_doc::SupertableHandleId},
         },
@@ -11246,6 +11294,8 @@ mod tests {
     const COMMIT_AS_DRAIN_TEST_ROT_SEED: u64 = 7;
     /// Boundary test target that permits one extra posting per input row.
     const BOUNDARY_STUB_TARGET_FACTOR: f32 = 2.0;
+    /// Rows in the append whose pointer response is lost.
+    const LOST_RESPONSE_ROWS: usize = 8;
 
     /// End-to-end coverage of the opt-in `hnsw_ivf` drain-build path, which the
     /// default `ivf` mode no longer exercises (the caller now gates the build).
@@ -12786,6 +12836,114 @@ mod tests {
         assert_eq!(
             w.buffer_visible_scalar_bytes, reserved,
             "the reserve counter was restored with the buffer it describes"
+        );
+    }
+
+    #[test]
+    fn a_commit_whose_pointer_response_is_lost_lists_its_superfiles_once() {
+        // The commit's pointer PUT lands, but its response is lost.
+        //  - the storage client re-issues the PUT, which fails its etag check
+        //    against our own write.
+        //  - the commit sees a lost race, refreshes, and finds its superfiles
+        //    already published.
+        // The commit returns success without committing again, both with
+        // retries left and on its last attempt, so each superfile is listed
+        // once, in this handle and on reopen.
+        let retry_budgets = [1, options_id_title_serial().max_commit_retries];
+        for max_commit_retries in retry_budgets {
+            let options = || options_id_title_serial().with_max_commit_retries(max_commit_retries);
+            let directory = TempDir::new().expect("tempdir");
+            let local: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+            let faults = FaultStorage::wrap(Arc::clone(&local));
+            let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+            let st = Supertable::create(options().with_storage(storage)).expect("create");
+
+            let mut w = st.writer().expect("writer");
+            w.append(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+                .expect("append buffers");
+            faults.fail_with(
+                FaultKind::ResponseLost,
+                FaultOp::PutIfMatch,
+                POINTER_PATH,
+                1,
+            );
+            w.commit()
+                .unwrap_or_else(|e| panic!("retries {max_commit_retries}: commit: {e:?}"));
+            assert_eq!(faults.fired(), 1, "the pointer response was lost once");
+
+            let reopened = Supertable::open(options().with_storage(local)).expect("reopen");
+            assert_lists_each_superfile_once(&st, "writer handle");
+            assert_lists_each_superfile_once(&reopened, "reopened handle");
+        }
+    }
+
+    #[test]
+    fn a_commit_that_really_loses_the_race_retries_or_fails() {
+        // The pointer PUT fails its etag check and does NOT land: a real lost
+        // race, which the published-attempt check must not mistake for its own.
+        //  - with retries left, the commit retries and lists its superfiles once.
+        //  - on its last attempt, the commit fails and lists nothing.
+        for max_commit_retries in [options_id_title_serial().max_commit_retries, 1] {
+            let options = || options_id_title_serial().with_max_commit_retries(max_commit_retries);
+            let directory = TempDir::new().expect("tempdir");
+            let local: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+            let faults = FaultStorage::wrap(Arc::clone(&local));
+            let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+            let st = Supertable::create(options().with_storage(storage)).expect("create");
+
+            let mut w = st.writer().expect("writer");
+            w.append(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+                .expect("append buffers");
+            faults.fail_with(
+                FaultKind::Precondition,
+                FaultOp::PutIfMatch,
+                POINTER_PATH,
+                1,
+            );
+            let committed = w.commit();
+            assert_eq!(faults.fired(), 1, "the pointer PUT lost its race once");
+
+            let reopened = Supertable::open(options().with_storage(local)).expect("reopen");
+            if max_commit_retries > 1 {
+                committed.expect("the retry commits");
+                assert_lists_each_superfile_once(&st, "writer handle");
+                assert_lists_each_superfile_once(&reopened, "reopened handle");
+            } else {
+                let err = committed.expect_err("the only attempt lost its race");
+                assert!(
+                    format!("{err:?}").contains("WriteContention"),
+                    "a lost race, not a false success: {err:?}"
+                );
+                let manifest = reopened.inner().manifest.load_full();
+                assert!(
+                    manifest.get_all_superfiles().is_empty(),
+                    "nothing was committed"
+                );
+            }
+        }
+    }
+
+    /// Assert `handle` lists each superfile once, holding `LOST_RESPONSE_ROWS`
+    /// rows in all.
+    fn assert_lists_each_superfile_once(handle: &Supertable, name: &str) {
+        let manifest = handle.inner().manifest.load_full();
+        let listed: Vec<Uuid> = manifest
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        let distinct: HashSet<Uuid> = listed.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            listed.len(),
+            "{name}: a superfile is listed twice: {listed:?}"
+        );
+        assert_eq!(
+            manifest.n_docs_total(),
+            LOST_RESPONSE_ROWS as u64,
+            "{name}: every row is listed once"
         );
     }
 

@@ -62,6 +62,12 @@ pub enum FaultKind {
     /// it to check that the condition survives every wrapper it passes
     /// through instead of arriving as a generic fault.
     PermissionDenied,
+    /// The call lands, but its response is lost and the caller gets what a
+    /// re-issue of the same call returns. This is what a storage client's
+    /// own retry sees after a write that succeeded but answered with a 500
+    /// or a timeout: a conditional write meets itself and fails its
+    /// precondition.
+    ResponseLost,
 }
 
 /// One armed fault: the next `remaining` calls of `op` whose URI
@@ -139,46 +145,59 @@ impl FaultStorage {
         }
     }
 
-    fn check(&self, op: FaultOp, uri: &str) -> Result<(), StorageError> {
+    /// `Err` for a rule that fails the call, `Ok(true)` for a
+    /// [`FaultKind::ResponseLost`] rule (the caller issues the call once and
+    /// drops its result before issuing it again), `Ok(false)` when no rule
+    /// matches.
+    fn check(&self, op: FaultOp, uri: &str) -> Result<bool, StorageError> {
         let mut rules = self.rules_guard();
         for rule in rules.iter_mut() {
             if rule.op == op && rule.remaining > 0 && uri.contains(&rule.uri_fragment) {
                 rule.remaining -= 1;
                 self.fired.fetch_add(1, Ordering::SeqCst);
-                return Err(match rule.kind {
-                    FaultKind::Transient => StorageError::TransientExhausted {
+                return match rule.kind {
+                    FaultKind::ResponseLost => Ok(true),
+                    FaultKind::Transient => Err(StorageError::TransientExhausted {
                         uri: uri.to_string(),
                         source: Box::new(IoError::other("injected fault")),
-                    },
-                    FaultKind::Precondition => StorageError::PreconditionFailed {
+                    }),
+                    FaultKind::Precondition => Err(StorageError::PreconditionFailed {
                         uri: uri.to_string(),
-                    },
-                    FaultKind::PermissionDenied => StorageError::PermissionDenied {
+                    }),
+                    FaultKind::PermissionDenied => Err(StorageError::PermissionDenied {
                         uri: uri.to_string(),
-                    },
-                });
+                    }),
+                };
             }
         }
-        Ok(())
+        Ok(false)
     }
 }
 
 #[async_trait]
 impl StorageProvider for FaultStorage {
     async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
-        self.check(FaultOp::Head, uri)?;
+        if self.check(FaultOp::Head, uri)? {
+            let _ = self.inner.head(uri).await;
+        }
         self.inner.head(uri).await
     }
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
-        self.check(FaultOp::Get, uri)?;
+        if self.check(FaultOp::Get, uri)? {
+            let _ = self.inner.get(uri).await;
+        }
         self.inner.get(uri).await
     }
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
-        self.check(FaultOp::GetRange, uri)?;
+        if self.check(FaultOp::GetRange, uri)? {
+            let _ = self.inner.get_range(uri, range.clone()).await;
+        }
         self.inner.get_range(uri, range).await
     }
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
-        self.check(FaultOp::PutAtomic, uri)?;
+        if self.check(FaultOp::PutAtomic, uri)? {
+            let _ = self.inner.put_atomic(uri, bytes.clone()).await;
+        }
         self.inner.put_atomic(uri, bytes).await
     }
     async fn put_if_match(
@@ -187,7 +206,12 @@ impl StorageProvider for FaultStorage {
         bytes: Bytes,
         expected_etag: Option<&str>,
     ) -> Result<Option<String>, StorageError> {
-        self.check(FaultOp::PutIfMatch, uri)?;
+        if self.check(FaultOp::PutIfMatch, uri)? {
+            let _ = self
+                .inner
+                .put_if_match(uri, bytes.clone(), expected_etag)
+                .await;
+        }
         self.inner.put_if_match(uri, bytes, expected_etag).await
     }
     async fn put_multipart(
@@ -197,7 +221,9 @@ impl StorageProvider for FaultStorage {
         self.inner.put_multipart(uri).await
     }
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
-        self.check(FaultOp::Delete, uri)?;
+        if self.check(FaultOp::Delete, uri)? {
+            let _ = self.inner.delete(uri).await;
+        }
         self.inner.delete(uri).await
     }
     async fn list_with_prefix_metadata(
@@ -285,5 +311,31 @@ mod tests {
             .await
             .expect("listing delegates");
         assert_eq!(listed.len(), 1, "only the seeded object");
+    }
+
+    /// A lost response lands the call and returns what its re-issue sees: a
+    /// create-only PUT meets the object it just wrote.
+    #[tokio::test]
+    async fn a_lost_response_lands_the_call_and_returns_its_reissue() {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
+        let faults = FaultStorage::wrap(local);
+
+        faults.fail_with(FaultKind::ResponseLost, FaultOp::PutAtomic, "data/", 1);
+        let err = faults
+            .put_atomic("data/a.bin", Bytes::from_static(b"abc"))
+            .await
+            .expect_err("the re-issue meets the first write");
+        assert!(
+            matches!(err, StorageError::PreconditionFailed { .. }),
+            "expected PreconditionFailed, got {err:?}"
+        );
+        assert_eq!(faults.fired(), 1);
+        let (bytes, _) = faults
+            .get("data/a.bin")
+            .await
+            .expect("the first write landed");
+        assert_eq!(bytes.as_ref(), b"abc");
     }
 }

@@ -6205,7 +6205,7 @@ mod tests {
                 Vec::new(),
             ))
             .expect("plant stale law");
-        hidden.inner().manifest.store(Arc::new(planted_manifest));
+        hidden.inner().manifest.store(planted_manifest);
 
         // (2) Recalibration re-measures both laws over the post-split grid
         // from stored bytes and stamps the difference.
@@ -6404,7 +6404,7 @@ mod tests {
                 Vec::new(),
             ))
             .expect("plant stale law");
-        hidden.inner().manifest.store(Arc::new(planted_manifest));
+        hidden.inner().manifest.store(planted_manifest);
 
         // (1) Heavily tombstoned recalibration measures from the live rows.
         let stamped = hidden
@@ -6480,7 +6480,7 @@ mod tests {
                 Vec::new(),
             ))
             .expect("plant zero law");
-        hidden.inner().manifest.store(Arc::new(zero_manifest));
+        hidden.inner().manifest.store(zero_manifest);
         let stamped = hidden
             .block_on_query(recalibrate_probe_laws(hidden.inner()))
             .expect("recalibrate on an uncalibrated grid is a clean no-op");
@@ -6685,7 +6685,7 @@ mod tests {
                 Vec::new(),
             ))
             .expect("plant cleared law");
-        hidden.inner().manifest.store(Arc::new(planted_manifest));
+        hidden.inner().manifest.store(planted_manifest);
         let achievable = |hidden: &Supertable| {
             let strategy = hidden
                 .reader()
@@ -6866,7 +6866,7 @@ mod tests {
                 Vec::new(),
             ))
             .expect("plant cleared law");
-        hidden.inner().manifest.store(Arc::new(planted_manifest));
+        hidden.inner().manifest.store(planted_manifest);
         let achievable = |hidden: &Supertable| {
             let PartitionStrategy::VectorCell { clusters, .. } = hidden
                 .reader()

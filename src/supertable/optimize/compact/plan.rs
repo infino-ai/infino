@@ -16,7 +16,10 @@ use std::{collections::BTreeMap, mem};
 
 use uuid::Uuid;
 
-use crate::{config::CompactionSettings, supertable::manifest::list::DrainedVersionRanges};
+use crate::{
+    config::CompactionSettings,
+    supertable::manifest::{list::DrainedVersionRanges, listed_once},
+};
 
 /// Bytes in a mebibyte, the unit the settings are expressed in.
 pub(super) const MIB: u64 = 1024 * 1024;
@@ -83,8 +86,16 @@ pub struct CompactionJob {
 
 /// Plan compaction: pack each partition's small superfiles into
 /// as many target-sized jobs as they fill. Leftovers that can't
-/// reach the floor are left for next time.
+/// reach the floor are left for next time. Each `superfile_id` must appear
+/// once: `compact_one_table` drops repeats with [`listed_once`] before the
+/// drain-watermark split.
 pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<CompactionJob> {
+    debug_assert_eq!(
+        listed_once(superfiles, |s| s.superfile_id).count(),
+        superfiles.len(),
+        "select was given a superfile_id twice"
+    );
+
     let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
     // Size leg of the merge trigger: a job's combined live bytes must reach this
     // fraction of the target. The count leg (`min_superfiles_for_merge`) fires
@@ -275,6 +286,25 @@ pub(in crate::supertable::optimize::compact) mod tests {
 
     pub(in crate::supertable::optimize::compact) fn default_cfg() -> CompactionSettings {
         CompactionSettings::default() // 1 GiB target, 80% floor
+    }
+
+    #[test]
+    fn listed_once_keeps_the_first_copy_of_each_id() {
+        // Superfile 1 listed at versions 5 and 9, superfile 2 once.
+        //  - the repeat is dropped, so the plan holds each superfile once.
+        //  - the kept copy is the earlier one, at version 5, so a merge of it
+        //    inherits the earlier `birth_version`.
+        let mut first = seg(1, 1, 1000, 0);
+        first.birth_version = 5;
+        let mut repeat = seg(1, 1, 1000, 0);
+        repeat.birth_version = 9;
+        let other = seg(2, 1, 1000, 0);
+        let kept: Vec<SuperfileStats> =
+            listed_once(vec![first.clone(), repeat, other.clone()], |s| {
+                s.superfile_id
+            })
+            .collect();
+        assert_eq!(kept, vec![first, other]);
     }
 
     #[test]
