@@ -240,28 +240,9 @@ impl SuperfileList {
     /// Build a successor SuperfileList with `new_entries` appended to
     /// the end of `superfiles`. Original is unchanged. `manifest_id`
     /// of the result is `self.next_manifest_id()`.
-    ///
-    /// An entry whose `superfile_id` is already listed, or repeats within
-    /// `new_entries`, is skipped with a warning, since a superfile listed twice
-    /// has its rows read twice. [`ManifestSnapshot::update`] refuses the same
-    /// input instead; this path can't fail, and only serves tables without
-    /// storage, which have no commit retry to repeat an append.
     pub fn with_appended(&self, new_entries: Vec<Arc<SuperfileEntry>>) -> Self {
-        let incoming: FxHashSet<Uuid> = new_entries.iter().map(|e| e.superfile_id).collect();
-        // Starts as the incoming ids already listed; each accepted entry joins it.
-        let mut skip: FxHashSet<Uuid> = self.already_listed(&incoming).collect();
         let mut superfiles = self.superfiles.clone();
-
-        for entry in new_entries {
-            if skip.insert(entry.superfile_id) {
-                superfiles.push(entry);
-            } else {
-                warn!(
-                    superfile_id = %entry.superfile_id,
-                    "skipping a superfile the manifest already lists"
-                );
-            }
-        }
+        superfiles.extend(new_entries);
         Self {
             manifest_id: self.next_manifest_id(),
             options: self.options.clone(),
@@ -269,28 +250,6 @@ impl SuperfileList {
             vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
             next_manifest_id_floor: self.next_manifest_id_floor,
         }
-    }
-
-    /// The ids in `ids` that this list already holds, in list order. One pass
-    /// over the list, with no allocation of its own, and none at all when
-    /// `ids` is empty (a commit that adds no superfiles).
-    ///
-    /// Runs on every commit, so `ids` is an Fx set: its hash is several times
-    /// cheaper per lookup than the default SipHash, and SipHash's protection
-    /// against crafted keys buys nothing for engine-minted superfile ids.
-    pub(crate) fn already_listed<'a>(
-        &'a self,
-        ids: &'a FxHashSet<Uuid>,
-    ) -> impl Iterator<Item = Uuid> + 'a {
-        let listed: &[Arc<SuperfileEntry>] = match ids.is_empty() {
-            true => &[],
-            false => &self.superfiles,
-        };
-
-        listed
-            .iter()
-            .map(|e| e.superfile_id)
-            .filter(move |id| ids.contains(id))
     }
 
     /// Total documents across all superfiles.
@@ -1942,13 +1901,15 @@ impl ManifestSnapshot {
     /// the caller can decide to write to storage.
     ///
     /// Refuses with [`ManifestError::SuperfileAlreadyListed`] a new entry the
-    /// manifest already lists, or one repeated in `new_entries`.
+    /// manifest already lists.
     pub async fn update(
         &self,
         new_entries: &[Arc<SuperfileEntry>],
         entries_to_remove: &[Arc<SuperfileEntry>],
     ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
-        self.refuse_listed(new_entries)?;
+        if let Some(superfile_id) = self.first_listed(new_entries) {
+            return Err(ManifestError::SuperfileAlreadyListed { superfile_id });
+        }
 
         self.update_inner(new_entries, entries_to_remove, false)
             .await
@@ -1963,7 +1924,9 @@ impl ManifestSnapshot {
         new_entries: &[Arc<SuperfileEntry>],
         entries_to_remove: &[Arc<SuperfileEntry>],
     ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
-        self.refuse_listed(new_entries)?;
+        if let Some(superfile_id) = self.first_listed(new_entries) {
+            return Err(ManifestError::SuperfileAlreadyListed { superfile_id });
+        }
 
         self.update_inner(new_entries, entries_to_remove, true)
             .await
@@ -1980,23 +1943,21 @@ impl ManifestSnapshot {
     }
 
     /// The first of `entries` whose `superfile_id` this manifest already
-    /// lists, if any.
+    /// lists, if any. One pass over the listed superfiles; none when
+    /// `entries` is empty.
+    ///
+    /// Runs on every commit, so the ids go in an Fx set: its hash is several
+    /// times cheaper per lookup than the default SipHash, and SipHash's
+    /// protection against crafted keys buys nothing for engine-minted ids.
     pub(crate) fn first_listed(&self, entries: &[Arc<SuperfileEntry>]) -> Option<Uuid> {
+        if entries.is_empty() {
+            return None;
+        }
         let ids: FxHashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
-        self.already_listed(&ids).next()
-    }
-
-    /// Refuse an id repeated within `new_entries`, then one already listed.
-    fn refuse_listed(&self, new_entries: &[Arc<SuperfileEntry>]) -> Result<(), ManifestError> {
-        let mut incoming = FxHashSet::default();
-        let repeated = new_entries
+        self.get_all_superfiles()
             .iter()
             .map(|e| e.superfile_id)
-            .find(|id| !incoming.insert(*id));
-        match repeated.or_else(|| self.already_listed(&incoming).next()) {
-            Some(superfile_id) => Err(ManifestError::SuperfileAlreadyListed { superfile_id }),
-            None => Ok(()),
-        }
+            .find(|id| ids.contains(id))
     }
 
     async fn update_inner(
@@ -4977,42 +4938,19 @@ mod tests {
         assert_eq!(m0.n_docs_total(), 0);
     }
 
-    #[test]
-    fn with_appended_skips_a_superfile_already_listed_or_repeated() {
-        // `a` is listed; the append brings `a` again and `b` twice. Only the
-        // first `b` is added, so every superfile is listed once.
-        let a = seg_entry(Uuid::new_v4(), 10);
-        let b = seg_entry(Uuid::new_v4(), 20);
-        let m1 = ManifestSnapshot::empty(opts()).with_appended(vec![Arc::clone(&a)]);
-        let m2 = m1.with_appended(vec![Arc::clone(&a), Arc::clone(&b), Arc::clone(&b)]);
-        let ids: Vec<Uuid> = m2.superfiles.iter().map(|e| e.superfile_id).collect();
-        assert_eq!(ids, vec![a.superfile_id, b.superfile_id]);
-        assert_eq!(m2.n_docs_total(), 30);
-    }
-
     #[tokio::test]
-    async fn update_refuses_a_superfile_already_listed_or_repeated() {
-        // `update` refuses to list a superfile twice and names it:
-        //  - an entry the manifest already lists.
-        //  - an entry repeated within one commit.
-        // A fresh entry still commits.
+    async fn update_refuses_a_superfile_already_listed() {
+        // `update` refuses to list a superfile twice and names it; a fresh
+        // entry still commits.
         let listed = seg_entry(Uuid::new_v4(), 10);
         let fresh = seg_entry(Uuid::new_v4(), 20);
         let m = ManifestSnapshot::empty(opts()).with_appended(vec![Arc::clone(&listed)]);
-        for (new_entries, named) in [
-            (vec![Arc::clone(&listed)], listed.superfile_id),
-            (
-                vec![Arc::clone(&fresh), Arc::clone(&fresh)],
-                fresh.superfile_id,
-            ),
-        ] {
-            match m.update(&new_entries, &[]).await {
-                Err(ManifestError::SuperfileAlreadyListed { superfile_id }) => {
-                    assert_eq!(superfile_id, named);
-                }
-                Err(other) => panic!("expected SuperfileAlreadyListed, got {other:?}"),
-                Ok(_) => panic!("a superfile was listed twice"),
+        match m.update(from_ref(&listed), &[]).await {
+            Err(ManifestError::SuperfileAlreadyListed { superfile_id }) => {
+                assert_eq!(superfile_id, listed.superfile_id);
             }
+            Err(other) => panic!("expected SuperfileAlreadyListed, got {other:?}"),
+            Ok(_) => panic!("a superfile was listed twice"),
         }
         let (after, _parts) = m.update(from_ref(&fresh), &[]).await.expect("fresh entry");
         assert_eq!(after.superfiles.len(), 2);

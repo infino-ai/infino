@@ -57,8 +57,8 @@ use crate::{
         writer::{
             NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
             finalize_compaction_commit, maint_pool, prepare_superfile_named,
-            published_by_earlier_attempt, recalibrate_probe_laws, refresh_slow_vector_state,
-            split_overflow_cells, try_commit_attempt,
+            recalibrate_probe_laws, refresh_slow_vector_state, split_overflow_cells,
+            try_commit_attempt,
         },
     },
     utils::trace::detail_span,
@@ -920,9 +920,6 @@ impl Supertable {
             None => (Vec::new(), Vec::new(), None, None, Uuid::nil(), Vec::new()),
         };
 
-        // The inputs this merge removed, once its commit is published.
-        let mut committed: Option<Vec<Arc<SuperfileEntry>>> = None;
-
         for attempt in 0..max_retries {
             let current = inner.manifest.load_full();
 
@@ -949,38 +946,54 @@ impl Supertable {
             {
                 Ok(new_manifest) => {
                     inner.manifest.store(Arc::new(new_manifest));
-                    committed = Some(entries_to_remove);
-                    break;
+                    // Warm the merged superfile into the in-memory reader
+                    // cache, same as a normal writer commit does. Without
+                    // this every query against it misses and re-fetches +
+                    // re-opens from storage every single time.
+                    if let Some((uri, bytes)) = bytes_for_store
+                        && let Err(e) = opts.store.insert(uri, bytes)
+                    {
+                        warn!(
+                            superfile_id = %merged_superfile_id,
+                            error = %e,
+                            "compact: failed to warm reader cache for merged superfile"
+                        );
+                    }
+
+                    // Drop the merged-away inputs so the in-memory cache
+                    // doesn't grow forever across repeated compactions.
+                    // The disk cache is already size-bounded (LRU), so its
+                    // stale entries just age out on their own.
+                    for entry in &entries_to_remove {
+                        opts.store.remove(&entry.uri);
+                    }
+
+                    // Disk-cache warm + background storage reclaim ride the
+                    // shared post-commit finalizer (the same path writer
+                    // commits use), so the two paths can't drift.
+                    let pending_cache_inserts = bytes_for_cache.into_iter().collect::<Vec<_>>();
+                    finalize_compaction_commit(
+                        Arc::clone(inner),
+                        &storage,
+                        &new_entries,
+                        &entries_to_remove,
+                        pending_cache_inserts,
+                    )
+                    .await;
+
+                    return Ok(());
                 }
-                Err(CommitError::WriteContentionExhausted) => {
+                Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
                     warn!(
                         superfile_id = %merged_superfile_id,
                         attempt,
                         max_retries,
-                        "compaction commit lost race"
+                        "compaction commit lost race, retrying"
                     );
-                    let last_attempt = attempt + 1 == max_retries;
-                    // After the last attempt, refresh only to learn whether it
-                    // published, which a pure reclaim (no merged superfile)
-                    // can't show.
-                    if last_attempt && new_entries.is_empty() {
-                        break;
-                    }
                     if let Err(e) = self.refresh().await {
                         unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::Refresh(e.to_string()));
                     }
-                    // The "lost" attempt published, and its inputs are gone
-                    // because this merge replaced them: finish as a success.
-                    if published_by_earlier_attempt(inner, &new_entries).is_some() {
-                        committed = Some(entries_to_remove);
-                        break;
-                    }
-
-                    if last_attempt {
-                        break;
-                    }
-
                     // Input vanished mid-retry (someone else merged it away).
                     // Our built output no longer matches reality, so abort
                     // instead of retrying the commit.
@@ -998,47 +1011,11 @@ impl Supertable {
                 }
             }
         }
-        let Some(entries_to_remove) = committed else {
-            unseal_all(&wal_store, sealed).await;
-            return Err(CompactionError::Commit(
-                CommitError::WriteContentionExhausted.to_string(),
-            ));
-        };
 
-        // Warm the merged superfile into the in-memory reader cache, same as
-        // a normal writer commit does. Without this every query against it
-        // misses and re-fetches + re-opens from storage every single time.
-        if let Some((uri, bytes)) = bytes_for_store
-            && let Err(e) = opts.store.insert(uri, bytes)
-        {
-            warn!(
-                superfile_id = %merged_superfile_id,
-                error = %e,
-                "compact: failed to warm reader cache for merged superfile"
-            );
-        }
-
-        // Drop the merged-away inputs so the in-memory cache doesn't grow
-        // forever across repeated compactions. The disk cache is already
-        // size-bounded (LRU), so its stale entries just age out on their own.
-        for entry in &entries_to_remove {
-            opts.store.remove(&entry.uri);
-        }
-
-        // Disk-cache warm + background storage reclaim ride the shared
-        // post-commit finalizer (the same path writer commits use), so the
-        // two paths can't drift.
-        let pending_cache_inserts = bytes_for_cache.into_iter().collect::<Vec<_>>();
-        finalize_compaction_commit(
-            Arc::clone(inner),
-            &storage,
-            &new_entries,
-            &entries_to_remove,
-            pending_cache_inserts,
-        )
-        .await;
-
-        Ok(())
+        unseal_all(&wal_store, sealed).await;
+        Err(CompactionError::Commit(
+            "commit retries exhausted".to_string(),
+        ))
     }
 }
 
@@ -2739,14 +2716,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn compact_whose_pointer_response_is_lost_reports_success() {
+    async fn compact_whose_pointer_response_is_lost_lists_the_merge_once() {
         // The merge's pointer PUT lands, but its response is lost.
         //  - the storage client re-issues the PUT, which fails its etag check
         //    against the merge's own write.
-        //  - the compaction sees a lost race, refreshes, and finds its merged
-        //    superfile published and its inputs gone.
-        // It finishes as a success, both with retries left and on its last
-        // attempt, instead of reporting its inputs missing or its retries spent.
+        //  - the compaction sees a lost race. Its inputs are gone because the
+        //    merge replaced them, so it stops instead of committing again, and
+        //    reports an error although the merge is published.
+        // Whatever it returns, the table lists the merged superfile once and
+        // each row once, with retries left and on the last attempt.
         let retry_budgets = [1, default_supertable_options().max_commit_retries];
         for max_commit_retries in retry_budgets {
             let dir = TempDir::new().expect("tempdir");
@@ -2769,11 +2747,11 @@ mod tests {
                 POINTER_PATH,
                 1,
             );
-            st.compact_async(&small_compact_cfg())
-                .await
-                .unwrap_or_else(|e| panic!("retries {max_commit_retries}: compact: {e:?}"));
+            // An error here is expected: the published merge looks like lost inputs.
+            let _ = st.compact_async(&small_compact_cfg()).await;
             assert_eq!(faults.fired(), 1, "the pointer response was lost once");
 
+            st.refresh().await.expect("refresh");
             let listed = assert_listed_once(&st, &rows).await;
             assert_eq!(listed.len(), 1, "one merged superfile: {listed:?}");
         }

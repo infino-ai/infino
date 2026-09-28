@@ -10330,7 +10330,7 @@ pub(in crate::supertable) async fn persist_commit_async(
 ///  - the commit sees `WriteContentionExhausted`, as for a real lost race.
 ///
 /// Always `None` for a commit that adds no superfiles.
-pub(in crate::supertable) fn published_by_earlier_attempt(
+fn published_by_earlier_attempt(
     inner: &SupertableInner,
     new_entries: &[Arc<SuperfileEntry>],
 ) -> Option<Arc<ManifestSnapshot>> {
