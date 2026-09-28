@@ -11,7 +11,7 @@
 //! Each `commit` here internally spawns many superfile builders,
 //! one per piece of the split buffer.
 //!
-//! Acquired via [`Supertable::writer`](super::Supertable::writer);
+//! Acquired via [`Supertable::writer`](crate::supertable::Supertable::writer);
 //! at most one writer is outstanding per supertable at a time
 //! (enforced by the inner state's `writer_outstanding` flag, with
 //! release on `Drop`). Holds an in-memory buffer of
@@ -92,32 +92,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 #[cfg(not(test))]
-use super::gc::{DEFAULT_SUPERFILE_RECLAIM_GRACE, superseded::reclaim};
-use super::{
-    build::{fanout_shards, fanout_shards_metered},
-    error::BuildError,
-    handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
-    manifest::{
-        CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, RoutingRef, ScalarStatsAgg,
-        SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary, bloom::BloomBuilder,
-        superfile_stem,
-    },
-    mutations::{
-        CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
-        PendingDelete, PendingUpdate,
-    },
-    opann,
-    options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
-    utils::vector_split::split_vectors,
-    wal::{
-        WalStore,
-        pipeline::{self, TombstonePhaseOutcome},
-        state_doc::{
-            IdSpan, OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry,
-            TombstoneOutcome, WalId, WalState, WalStateDoc,
-        },
-    },
-};
+use crate::supertable::gc::{DEFAULT_SUPERFILE_RECLAIM_GRACE, superseded::reclaim};
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
@@ -169,10 +144,18 @@ use crate::{
     },
     supertable::{
         CommitError as SupertableCommitError, ManifestLoadError,
-        error::ManifestError,
+        build::{fanout_shards, fanout_shards_metered},
+        error::{BuildError, ManifestError},
+        handle::{
+            GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner,
+            hidden_vector_cell_count, user_vector_cell_count,
+        },
         hidden_deleted::{self, encode_deleted_ids},
         manifest::{
-            ClusterCentroids, RabitqAdmitContext,
+            CellVectorSummary, ClusterCentroids, FtsSummaryAgg, ManifestSnapshot,
+            RabitqAdmitContext, RoutingRef, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry,
+            SuperfileUri, VectorSummary,
+            bloom::BloomBuilder,
             commit::{get_current_manifest_etag, manifest_uri},
             list::{
                 CellRoutingParams, CellSplitCheck, DrainedVersionRanges, GlobalVectorIndex,
@@ -180,9 +163,16 @@ use crate::{
             },
             listed_once, options_hash,
             part::{self as part_mod, ContentHash, PartId},
+            superfile_stem,
             term_index::{self, Contribution as TermContribution, TermIndexError},
             term_stats,
         },
+        mutations::{
+            CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
+            PendingDelete, PendingUpdate,
+        },
+        opann,
+        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
         query::{
             dispatch::{open_compaction_input, open_reader},
             vector::{IndexOutcome, stable_ids_by_local_for_routing},
@@ -191,9 +181,15 @@ use crate::{
             DiskCacheStore, ReadIntent, SuperfileReaderCache, disk::mmap_readonly_bytes,
         },
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
+        utils::vector_split::split_vectors,
         wal::{
-            Lease,
+            Lease, WalStore,
             lease::{self, DEFAULT_LEASE_DURATION},
+            pipeline::{self, TombstonePhaseOutcome},
+            state_doc::{
+                IdSpan, OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry,
+                TombstoneOutcome, WalId, WalState, WalStateDoc,
+            },
         },
     },
     utils::terms::make_key,
@@ -2029,10 +2025,10 @@ impl SupertableWriter {
             && let Some(grid) = bootstrap_centroids_from_batch(
                 buffer,
                 vc.dim,
-                super::handle::hidden_vector_cell_count(&self.inner.options),
+                hidden_vector_cell_count(&self.inner.options),
             ) {
-            let hidden_cells = super::handle::hidden_vector_cell_count(&self.inner.options);
-            let user_cells = super::handle::user_vector_cell_count(&self.inner.options);
+            let hidden_cells = hidden_vector_cell_count(&self.inner.options);
+            let user_cells = user_vector_cell_count(&self.inner.options);
             let user_grid = (user_cells != hidden_cells)
                 .then(|| bootstrap_centroids_from_batch(buffer, vc.dim, user_cells))
                 .flatten();
