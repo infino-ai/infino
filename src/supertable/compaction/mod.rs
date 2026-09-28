@@ -43,7 +43,10 @@ use crate::{
         BuildError, CommitError, ManifestSnapshot, SuperfileEntry, Supertable,
         error::CompactionError,
         handle::hidden_vector_index_compaction_settings,
-        manifest::list::{DrainedVersionRanges, PartitionStrategy},
+        manifest::{
+            list::{DrainedVersionRanges, PartitionStrategy},
+            listed_once,
+        },
         opann::rerank_pool_hint,
         query::dispatch::open_compaction_input,
         reader_cache::disk::mmap_readonly_bytes,
@@ -134,8 +137,16 @@ pub struct CompactionJob {
 
 /// Plan compaction: pack each partition's small superfiles into
 /// as many target-sized jobs as they fill. Leftovers that can't
-/// reach the floor are left for next time.
+/// reach the floor are left for next time. Each `superfile_id` must appear
+/// once: `compact_one_table` drops repeats with [`listed_once`] before the
+/// drain-watermark split.
 pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<CompactionJob> {
+    debug_assert_eq!(
+        listed_once(superfiles, |s| s.superfile_id).count(),
+        superfiles.len(),
+        "select was given a superfile_id twice"
+    );
+
     let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
     // Size leg of the merge trigger: a job's combined live bytes must reach this
     // fraction of the target. The count leg (`min_superfiles_for_merge`) fires
@@ -449,12 +460,13 @@ impl Supertable {
                 HashMap::new()
             };
 
-        // Build SuperfileStats for every superfile in the snapshot.
+        // Build SuperfileStats for every superfile in the snapshot, once per
+        // id. Deduped here, not in `select`: the drain-watermark split below
+        // could otherwise put two copies of one superfile in different jobs.
         let now = Utc::now();
         let stale_seal_timeout = std::time::Duration::from_millis(cfg.stale_seal_timeout_ms);
-        let stats: Vec<SuperfileStats> = manifest
-            .get_all_superfiles()
-            .iter()
+        let listed = manifest.get_all_superfiles();
+        let stats: Vec<SuperfileStats> = listed_once(listed, |entry| entry.superfile_id)
             .map(|entry| {
                 let (bitmap, seal) = sidecar_map
                     .get(&entry.superfile_id)
@@ -479,6 +491,14 @@ impl Supertable {
                 }
             })
             .collect();
+
+        if stats.len() < listed.len() {
+            warn!(
+                role = table.role().as_str(),
+                repeats = listed.len() - stats.len(),
+                "manifest lists some superfiles more than once; compacting each once"
+            );
+        }
 
         // A user table with a hidden vector index selects jobs per side of
         // the drain watermark, never across it (see
@@ -939,6 +959,7 @@ impl Supertable {
                             "compact: failed to warm reader cache for merged superfile"
                         );
                     }
+
                     // Drop the merged-away inputs so the in-memory cache
                     // doesn't grow forever across repeated compactions.
                     // The disk cache is already size-bounded (LRU), so its
@@ -946,6 +967,7 @@ impl Supertable {
                     for entry in &entries_to_remove {
                         opts.store.remove(&entry.uri);
                     }
+
                     // Disk-cache warm + background storage reclaim ride the
                     // shared post-commit finalizer (the same path writer
                     // commits use), so the two paths can't drift.
@@ -958,6 +980,7 @@ impl Supertable {
                         pending_cache_inserts,
                     )
                     .await;
+
                     return Ok(());
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
@@ -1103,6 +1126,7 @@ mod tests {
         ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::{col, lit};
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
     use tokio::task;
@@ -1110,15 +1134,24 @@ mod tests {
     use super::*;
     use crate::{
         Bm25Stats, BoolMode, VectorSearchOptions,
-        config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
+        config::{DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
         memory::ConnectionMemoryBudget,
-        superfile::{builder::FtsConfig, fts::reader::Bm25SearchOptions, reader::SuperfileReader},
+        superfile::{
+            builder::{FtsConfig, VectorConfig},
+            fts::reader::Bm25SearchOptions,
+            reader::SuperfileReader,
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        },
         supertable::{
             Supertable, SupertableOptions,
             error::CompactionError,
+            manifest::commit::{POINTER_PATH, get_current_manifest_etag},
             storage::{LocalFsStorageProvider, StorageProvider},
         },
-        test_helpers::{build_title_batch, default_supertable_options, default_vector_config},
+        test_helpers::{
+            build_title_batch, default_supertable_options, default_vector_config,
+            fault_storage::{FaultKind, FaultOp, FaultStorage},
+        },
     };
 
     const DEFAULT_STALE_SEAL_TIMEOUT: std::time::Duration =
@@ -1190,6 +1223,25 @@ mod tests {
 
     fn default_cfg() -> CompactionSettings {
         CompactionSettings::default() // 1 GiB target, 80% floor
+    }
+
+    #[test]
+    fn listed_once_keeps_the_first_copy_of_each_id() {
+        // Superfile 1 listed at versions 5 and 9, superfile 2 once.
+        //  - the repeat is dropped, so the plan holds each superfile once.
+        //  - the kept copy is the earlier one, at version 5, so a merge of it
+        //    inherits the earlier `birth_version`.
+        let mut first = seg(1, 1, 1000, 0);
+        first.birth_version = 5;
+        let mut repeat = seg(1, 1, 1000, 0);
+        repeat.birth_version = 9;
+        let other = seg(2, 1, 1000, 0);
+        let kept: Vec<SuperfileStats> =
+            listed_once(vec![first.clone(), repeat, other.clone()], |s| {
+                s.superfile_id
+            })
+            .collect();
+        assert_eq!(kept, vec![first, other]);
     }
 
     #[test]
@@ -2540,6 +2592,389 @@ mod tests {
         );
     }
 
+    /// Ten small commits, one superfile each, that `small_compact_cfg` merges
+    /// into one job.
+    fn commit_mergeable_superfiles(st: &Supertable) {
+        for titles in &[
+            ["alpha first", "alpha second"],
+            ["bravo first", "bravo second"],
+            ["charlie first", "charlie second"],
+            ["delta first", "delta second"],
+            ["echo first", "echo second"],
+            ["foxtrot first", "foxtrot second"],
+            ["golf first", "golf second"],
+            ["hotel first", "hotel second"],
+            ["india first", "india second"],
+            ["juliet first", "juliet second"],
+        ] {
+            commit_titles(st, titles);
+        }
+    }
+
+    /// Assert the manifest lists each superfile once and each of `rows` once,
+    /// and nothing else. Returns the listed superfile ids.
+    async fn assert_listed_once(st: &Supertable, rows: &HashSet<i128>) -> Vec<Uuid> {
+        let listed: Vec<Uuid> = st
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert_eq!(
+            listed.iter().collect::<HashSet<_>>().len(),
+            listed.len(),
+            "no superfile is listed twice: {listed:?}"
+        );
+        let ids = listed_row_ids(st).await;
+        let distinct: HashSet<i128> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), distinct.len(), "every row id appears once");
+        assert_eq!(&distinct, rows, "no row was lost or added");
+        listed
+    }
+
+    /// Publish a successor manifest listing the table's first superfile a
+    /// second time, as an append committed twice left it: same id and uri, a
+    /// later `birth_version`. Returns that superfile's id.
+    async fn list_first_superfile_twice(st: &Supertable) -> Uuid {
+        let inner = st.inner();
+        let storage = inner.options.storage.clone().expect("storage-backed table");
+        let current = inner.manifest.load_full();
+        let first = Arc::clone(&current.get_all_superfiles()[0]);
+        // `update` stamps the partition key, so the copy arrives unstamped.
+        let again = Arc::new(SuperfileEntry {
+            partition_key: Vec::new(),
+            ..(*first).clone()
+        });
+        let (successor, parts) = current
+            .update_admitting_duplicates(&[again])
+            .await
+            .expect("successor listing the superfile twice");
+        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&current))
+            .await
+            .expect("pointer etag");
+        let encoded: Vec<&[u8]> = parts
+            .iter()
+            .flat_map(|p| [Some(p.encoded.as_slice()), p.routing_encoded.as_deref()])
+            .flatten()
+            .collect();
+        successor
+            .write(storage.as_ref(), prev_etag.as_deref(), &encoded)
+            .await
+            .expect("publish");
+        st.refresh().await.expect("refresh");
+        first.superfile_id
+    }
+
+    /// Row ids of every superfile the manifest lists, read from storage. A
+    /// superfile listed twice contributes its ids twice.
+    async fn listed_row_ids(st: &Supertable) -> Vec<i128> {
+        let inner = st.inner();
+        let storage = inner.options.storage.clone().expect("storage-backed table");
+        let mut ids = Vec::new();
+        for entry in inner.manifest.load_full().get_all_superfiles() {
+            let (bytes, _) = storage
+                .get(&entry.storage_path())
+                .await
+                .expect("superfile bytes");
+            ids.extend(read_ids(
+                &SuperfileReader::open(bytes).expect("open superfile"),
+            ));
+        }
+        ids
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_repairs_a_superfile_listed_twice() {
+        // An append committed twice left one superfile listed at two birth
+        // versions.
+        //  - every read sees that superfile's rows twice.
+        //  - compaction plans it once, so the merge reads its rows once.
+        //  - the commit removes it by id, which drops both copies.
+        // One pass leaves no superfile listed twice and every row id once.
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_mergeable_superfiles(&st);
+        let twice = list_first_superfile_twice(&st).await;
+
+        let before = listed_row_ids(&st).await;
+        let distinct: HashSet<i128> = before.iter().copied().collect();
+        assert!(
+            distinct.len() < before.len(),
+            "guard: the fixture lists some rows twice"
+        );
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact a manifest listing a superfile twice");
+
+        let listed = assert_listed_once(&st, &distinct).await;
+        assert!(
+            !listed.contains(&twice),
+            "the merge replaced the superfile listed twice: {listed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_whose_pointer_response_is_lost_lists_the_merge_once() {
+        // The merge's pointer PUT lands, but its response is lost.
+        //  - the storage client re-issues the PUT, which fails its etag check
+        //    against the merge's own write.
+        //  - the compaction sees a lost race. Its inputs are gone because the
+        //    merge replaced them, so it stops instead of committing again, and
+        //    reports an error although the merge is published.
+        // Whatever it returns, the table lists the merged superfile once and
+        // each row once, with retries left and on the last attempt.
+        let retry_budgets = [1, default_supertable_options().max_commit_retries];
+        for max_commit_retries in retry_budgets {
+            let dir = TempDir::new().expect("tempdir");
+            let local: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+            let faults = FaultStorage::wrap(local);
+            let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+            let st = Supertable::create(
+                default_supertable_options()
+                    .with_storage(storage)
+                    .with_max_commit_retries(max_commit_retries),
+            )
+            .expect("create supertable");
+            commit_mergeable_superfiles(&st);
+            let rows: HashSet<i128> = listed_row_ids(&st).await.into_iter().collect();
+
+            faults.fail_with(
+                FaultKind::ResponseLost,
+                FaultOp::PutIfMatch,
+                POINTER_PATH,
+                1,
+            );
+            // An error here is expected: the published merge looks like lost inputs.
+            let _ = st.compact_async(&small_compact_cfg()).await;
+            assert_eq!(faults.fired(), 1, "the pointer response was lost once");
+
+            st.refresh().await.expect("refresh");
+            let listed = assert_listed_once(&st, &rows).await;
+            assert_eq!(listed.len(), 1, "one merged superfile: {listed:?}");
+        }
+    }
+
+    /// Vector dimension of the multi-cell fixture.
+    const MULTI_CELL_DIM: usize = 16;
+    /// Rows per commit in the multi-cell fixture.
+    const MULTI_CELL_ROWS: usize = 8;
+    /// Commits per batch of the multi-cell fixture: enough inputs for a job.
+    const MULTI_CELL_COMMITS: usize = 4;
+
+    /// A user table shaped like the one that failed in production: a `title`
+    /// column beside an Sq16 `emb` column. Every commit writes one multi-cell
+    /// superfile, so its merges take the multi-cell path, which refuses a
+    /// repeated row id (the check needs a scalar column besides the id).
+    fn make_multi_cell_st(dir: &TempDir) -> Supertable {
+        let emb_item = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(emb_item, MULTI_CELL_DIM as i32),
+                false,
+            ),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let opts = SupertableOptions::new(
+            schema,
+            vec![FtsConfig::new("title")],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim: MULTI_CELL_DIM,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq16,
+                provided_centroids: None,
+            }],
+        )
+        .expect("options with a multi-cell vector column")
+        .with_writer_pool(Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("1-thread writer pool"),
+        ))
+        .with_storage(storage);
+        Supertable::create(opts).expect("create supertable")
+    }
+
+    /// `MULTI_CELL_COMMITS` commits of one-hot rows, numbered from `first`.
+    fn commit_multi_cell_superfiles(st: &Supertable, first: usize) {
+        let schema = st.options().schema.clone();
+        let emb_item = Arc::new(Field::new("item", DataType::Float32, true));
+        for commit in first..first + MULTI_CELL_COMMITS {
+            let mut flat = vec![0.0f32; MULTI_CELL_ROWS * MULTI_CELL_DIM];
+            let titles: Vec<String> = (0..MULTI_CELL_ROWS)
+                .map(|row| {
+                    flat[row * MULTI_CELL_DIM
+                        + (commit * MULTI_CELL_ROWS + row) % MULTI_CELL_DIM] = 1.0;
+                    format!("commit {commit} row {row}")
+                })
+                .collect();
+            let emb = FixedSizeListArray::try_new(
+                Arc::clone(&emb_item),
+                MULTI_CELL_DIM as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            )
+            .expect("fixed-size list");
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(titles)) as ArrayRef,
+                    Arc::new(emb) as ArrayRef,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+    }
+
+    /// Guard: the table's superfiles take the multi-cell merge, the branch
+    /// `merge_superfiles` picks for a multi-cell, IVF-mergeable first input.
+    async fn assert_merges_are_multi_cell(st: &Supertable) {
+        let storage = st.inner().options.storage.clone().expect("storage");
+        let first = Arc::clone(&st.inner().manifest.load_full().get_all_superfiles()[0]);
+        let (bytes, _) = storage.get(&first.storage_path()).await.expect("bytes");
+        let reader = SuperfileReader::open(bytes).expect("open superfile");
+        let vec = reader.vec().expect("vector index");
+        assert!(vec.is_multi_cell(), "guard: a multi-cell superfile");
+        assert!(
+            vec.vector_columns_config()
+                .next()
+                .is_some_and(|c| c.rerank_codec.is_ivf_mergeable()),
+            "guard: an IVF-mergeable codec"
+        );
+    }
+
+    /// Merge any two small superfiles of the multi-cell fixture.
+    fn multi_cell_compact_cfg() -> CompactionSettings {
+        CompactionSettings {
+            min_superfiles_for_merge: 2,
+            ..small_compact_cfg()
+        }
+    }
+
+    #[test]
+    fn optimize_repairs_a_multi_cell_superfile_listed_twice() {
+        // The production case: an append committed twice left one multi-cell
+        // superfile listed at two birth versions, both not yet drained.
+        //  - the drain takes the superfile once, so the vector index holds its
+        //    rows once. The table's own options drain one superfile per batch,
+        //    so the drain's per-batch row dedupe can't catch the copy.
+        //  - compaction plans the superfile once, so the multi-cell merge sees
+        //    each row id once instead of failing on "duplicate stable_id".
+        //  - the commit removes it by id, which drops both copies.
+        // One optimize leaves each superfile and each row listed once, in the
+        // table and in its vector index, and a search returns each row once.
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_multi_cell_st(&dir);
+        commit_multi_cell_superfiles(&st, 0);
+        st.block_on_query(assert_merges_are_multi_cell(&st));
+        let twice = st.block_on_query(list_first_superfile_twice(&st));
+
+        let before = st.block_on_query(listed_row_ids(&st));
+        let rows: HashSet<i128> = before.iter().copied().collect();
+        assert!(
+            rows.len() < before.len(),
+            "guard: some rows are listed twice"
+        );
+
+        st.optimize(&OptimizeOptions::compact(multi_cell_compact_cfg()))
+            .expect("optimize a table listing a multi-cell superfile twice");
+
+        let listed = st.block_on_query(assert_listed_once(&st, &rows));
+        assert!(
+            !listed.contains(&twice),
+            "the merge replaced the superfile listed twice: {listed:?}"
+        );
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("vector index")
+            .clone();
+        let indexed = st.block_on_query(listed_row_ids(&hidden));
+        let indexed_once: HashSet<i128> = indexed.iter().copied().collect();
+        assert_eq!(
+            indexed.len(),
+            indexed_once.len(),
+            "the vector index holds each row once"
+        );
+        assert_eq!(indexed_once, rows, "the vector index holds every row");
+
+        let mut query = vec![0.0f32; MULTI_CELL_DIM];
+        query[0] = 1.0;
+        let batches = st
+            .vector_search(
+                "emb",
+                &query,
+                rows.len(),
+                VectorSearchOptions::new(),
+                None,
+                None,
+            )
+            .expect("vector search");
+        let mut hits = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(batch.schema().index_of("_id").expect("_id"))
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("decimal ids");
+            hits.extend(ids.values().iter().copied());
+        }
+        let distinct_hits: HashSet<i128> = hits.iter().copied().collect();
+        assert_eq!(
+            hits.len(),
+            distinct_hits.len(),
+            "each row is returned once: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn compact_repairs_a_multi_cell_superfile_listed_twice_across_the_drain_watermark() {
+        // The second copy of a superfile can land after a drain, so the two
+        // copies sit on opposite sides of the drain watermark.
+        //  - compaction splits candidates into drained and undrained groups.
+        //  - planning each id once, before that split, keeps the earlier copy
+        //    in the drained group and drops the later one.
+        //  - without it, the drained job removes both copies by id and the
+        //    undrained job then fails on an input that is gone.
+        // One compaction leaves each superfile and each row listed once.
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_multi_cell_st(&dir);
+        commit_multi_cell_superfiles(&st, 0);
+        st.drain_vectors_to_cells_sync().expect("drain");
+        commit_multi_cell_superfiles(&st, MULTI_CELL_COMMITS);
+        st.block_on_query(assert_merges_are_multi_cell(&st));
+        let twice = st.block_on_query(list_first_superfile_twice(&st));
+
+        let before = st.block_on_query(listed_row_ids(&st));
+        let rows: HashSet<i128> = before.iter().copied().collect();
+        assert!(
+            rows.len() < before.len(),
+            "guard: some rows are listed twice"
+        );
+
+        st.compact(&multi_cell_compact_cfg())
+            .expect("compact copies on both sides of the drain watermark");
+
+        let listed = st.block_on_query(assert_listed_once(&st, &rows));
+        assert!(
+            !listed.contains(&twice),
+            "the merge replaced the superfile listed twice: {listed:?}"
+        );
+    }
+
     // ─── End-to-end compact() tests ────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2753,6 +3188,213 @@ mod tests {
              adjust small_compact_cfg() if needed"
         );
         assert!(reader_after.n_superfiles() < before_n);
+    }
+
+    /// After a compaction large enough that the merged blob stores its
+    /// documents in an order of its own, a search must still name the
+    /// row that actually carries the term.
+    ///
+    /// The existing compaction search test runs twenty documents, far
+    /// below the size at which an order is chosen, so it cannot reach
+    /// this path at all. Here every document carries a token unique to
+    /// it, so a returned row can be checked against the text it should
+    /// hold: an untranslated id would come back in range, with a real
+    /// score, naming the wrong document.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_compacted_table_names_the_right_rows_when_the_blob_reorders() {
+        // Comfortably past the threshold below which arrival order is kept.
+        const BATCHES: usize = 60;
+        const PER_BATCH: usize = 80;
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        let mut expected: Vec<String> = Vec::with_capacity(BATCHES * PER_BATCH);
+        for b in 0..BATCHES {
+            let titles: Vec<String> = (0..PER_BATCH)
+                .map(|i| {
+                    let n = b * PER_BATCH + i;
+                    format!("uq{n} shared t{} t{}", n % 37, n % 53)
+                })
+                .collect();
+            expected.extend(titles.iter().cloned());
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            commit_titles(&st, &refs);
+        }
+
+        let before = st.manifest_id();
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+        assert!(
+            st.manifest_id() > before,
+            "compact must have run; adjust small_compact_cfg() if needed"
+        );
+
+        // Spread over the corpus so the check does not depend on where a
+        // document happened to land.
+        for &n in &[0usize, 1, 977, 2500, 4095, 4096, 4799] {
+            let want = expected[n].clone();
+            let token = format!("uq{n}");
+
+            // Ranked: the row a score is attached to must be the row
+            // holding the token.
+            let batches = st
+                .bm25_search(
+                    "title",
+                    &token,
+                    5,
+                    Bm25SearchOptions::new()
+                        .with_mode(BoolMode::And)
+                        .with_stats(Bm25Stats::Global),
+                    Some(&["title"]),
+                )
+                .unwrap_or_else(|e| panic!("bm25_search for {token}: {e}"));
+            assert_eq!(
+                titles_of(&batches),
+                vec![want.clone()],
+                "bm25_search for {token} named the wrong row"
+            );
+
+            // Unranked: the same, through the walk that returns bare ids.
+            let batches = st
+                .token_match("title", &token, BoolMode::And, Some(&["title"]))
+                .unwrap_or_else(|e| panic!("token_match for {token}: {e}"));
+            assert_eq!(
+                titles_of(&batches),
+                vec![want],
+                "token_match for {token} named the wrong row"
+            );
+        }
+
+        // A term every document carries still matches all of them, so the
+        // translation has not dropped or duplicated anything.
+        let n_shared: usize = st
+            .token_match("title", "shared", BoolMode::And, None)
+            .expect("token_match shared")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(n_shared, BATCHES * PER_BATCH, "every document carries it");
+    }
+
+    /// A `WHERE` on an indexed column pushes a row-keyed allow-set into
+    /// the kernel, which walks the blob's own ids. On a reordered blob
+    /// the two are different spaces, so the set has to be consulted with
+    /// the row a blob id stands for and not with the id itself.
+    ///
+    /// The failure this guards is quiet rather than wrong: the predicate
+    /// is re-applied after the search, so a mismatched set returns an
+    /// empty result. In a hybrid query the full-text leg simply drops
+    /// out and the ranking degrades with nothing to show for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scoped_search_after_a_reordering_compaction_finds_the_row() {
+        const BATCHES: usize = 60;
+        const PER_BATCH: usize = 80;
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let mut expected: Vec<String> = Vec::new();
+        for b in 0..BATCHES {
+            let titles: Vec<String> = (0..PER_BATCH)
+                .map(|i| {
+                    let n = b * PER_BATCH + i;
+                    format!("uq{n} shared t{} t{}", n % 37, n % 53)
+                })
+                .collect();
+            expected.extend(titles.iter().cloned());
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            commit_titles(&st, &refs);
+        }
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+
+        for n in [0usize, 7, 977, 2500, 4799] {
+            let sql = format!(
+                "SELECT title FROM bm25_search('title', 'shared', 10) WHERE title = '{}'",
+                expected[n]
+            );
+            let got = st.reader().expect("reader").query_sql(&sql).expect("sql");
+            assert_eq!(titles_of(&got), vec![expected[n].clone()], "doc {n}");
+        }
+    }
+
+    /// Compacting an already-reordered superfile again must keep every
+    /// document with its own postings.
+    ///
+    /// This is ordinary operation, not an edge case: a reordered output
+    /// is usually below the target size, so the next pass picks it up
+    /// again. The merge reads an input's postings and stored lengths by
+    /// the input's own doc ids while its tombstones and rows are keyed by
+    /// row, and on a reordered input those are different numbers. Reading
+    /// one as the other files a posting under a different document and
+    /// writes the result to storage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_compaction_of_a_reordered_superfile_keeps_the_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let mut expected: Vec<String> = Vec::new();
+        let mut commit = |st: &Supertable, from: usize, to: usize| {
+            for b in from..to {
+                let titles: Vec<String> = (0..80)
+                    .map(|i| {
+                        let n = b * 80 + i;
+                        format!("uq{n} shared t{} t{}", n % 37, n % 53)
+                    })
+                    .collect();
+                expected.extend(titles.iter().cloned());
+                let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+                commit_titles(st, &refs);
+            }
+        };
+        commit(&st, 0, 60);
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact 1");
+
+        // The reordered output is below target, so the next compaction
+        // merges it again.
+        let deleted = [3usize, 1000, 2222, 4000];
+        for n in deleted {
+            let title = format!("uq{n} shared t{} t{}", n % 37, n % 53);
+            st.delete(col("title").eq(lit(title))).expect("delete");
+        }
+        commit(&st, 60, 75);
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact 2");
+
+        for n in (0..expected.len()).step_by(97) {
+            let want = match deleted.contains(&n) {
+                true => vec![],
+                false => vec![expected[n].clone()],
+            };
+            let got = st
+                .token_match("title", &format!("uq{n}"), BoolMode::And, Some(&["title"]))
+                .expect("token_match");
+            assert_eq!(titles_of(&got), want, "doc {n}");
+        }
+        for n in deleted {
+            let got = st
+                .token_match("title", &format!("uq{n}"), BoolMode::And, Some(&["title"]))
+                .expect("token_match");
+            assert!(titles_of(&got).is_empty(), "deleted doc {n} still matches");
+        }
+    }
+
+    /// The `title` column of every row in a result, in order.
+    fn titles_of(batches: &[RecordBatch]) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in batches {
+            let col = b.column_by_name("title").expect("title projected");
+            let arr = col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title is LargeUtf8");
+            for i in 0..b.num_rows() {
+                out.push(arr.value(i).to_string());
+            }
+        }
+        out
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -59,6 +59,7 @@ use futures::{future, stream, stream::StreamExt};
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
 pub use list::{FtsSummaryAgg, GlobalVectorIndex, RoutingRef, ScalarStatsAgg};
 use rayon::{ThreadPool, prelude::*};
+use rustc_hash::FxHashSet;
 use tokio::{sync::OnceCell, task::spawn_blocking};
 use tracing::warn;
 use uuid::Uuid;
@@ -111,6 +112,10 @@ use crate::{
 /// [`SuperfileUri::storage_path`], [`SuperfileEntry::storage_path`] and the GC
 /// live-set sweep so all three agree on the superfile namespace.
 pub(crate) const SUPERFILE_DATA_DIR: &str = "data";
+
+/// Extension every superfile object carries, in storage and in the disk cache alike. Shared by the
+/// key builders and parsers below and by the GC sweep, which tells a superfile apart by it.
+pub(crate) const SUPERFILE_KEY_SUFFIX: &str = ".sf.parquet";
 
 /// Extra extension an in-flight cold-fetch tempfile carries on top of [`SuperfileUri::cache_filename`];
 /// the file is atomically renamed to the bare name once complete.
@@ -181,6 +186,27 @@ pub struct SuperfileList {
     /// conditional-create and never overwritten), so re-deriving the same
     /// id can never publish. 0 means unconstrained.
     pub(crate) next_manifest_id_floor: u64,
+}
+
+/// `items` with every repeat of a superfile id dropped, keeping the
+/// first-listed copy.
+///
+/// A manifest can list one superfile twice when an earlier engine committed
+/// the same append twice. Maintenance reads such a manifest through this, so
+/// each superfile is taken once:
+///  - the drain indexes its rows once, whatever its batch size.
+///  - a merge reads its rows once. With both copies, a multi-cell merge fails
+///    on the repeated row ids and the other merges copy them twice.
+///  - the merge commit removes it by id, which drops both copies and repairs
+///    the manifest.
+///  - the kept copy is the earlier one, so it carries the earlier
+///    `birth_version`, the one the drain watermark saw first.
+pub(crate) fn listed_once<T>(
+    items: impl IntoIterator<Item = T>,
+    id: impl Fn(&T) -> Uuid,
+) -> impl Iterator<Item = T> {
+    let mut seen = FxHashSet::default();
+    items.into_iter().filter(move |item| seen.insert(id(item)))
 }
 
 impl SuperfileList {
@@ -1877,11 +1903,18 @@ impl ManifestSnapshot {
     /// Returns the new ManifestPartEntries when `new_entries` are added to `old` manifest. This
     /// operation may create new ManifestParts. The function also returns the new ManifestParts that
     /// the caller can decide to write to storage.
+    ///
+    /// Refuses with [`ManifestError::SuperfileAlreadyListed`] a new entry the
+    /// manifest already lists.
     pub async fn update(
         &self,
         new_entries: &[Arc<SuperfileEntry>],
         entries_to_remove: &[Arc<SuperfileEntry>],
     ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
+        if let Some(superfile_id) = self.first_listed(new_entries) {
+            return Err(ManifestError::SuperfileAlreadyListed { superfile_id });
+        }
+
         self.update_inner(new_entries, entries_to_remove, false)
             .await
     }
@@ -1889,14 +1922,46 @@ impl ManifestSnapshot {
     /// Compaction replaces physical files without changing the logical user
     /// commits already represented by those files. Preserve each replacement
     /// entry's inherited `birth_version` so the hidden drain watermark keeps
-    /// recognizing that data as drained.
+    /// recognizing that data as drained. Refuses duplicates like [`Self::update`].
     pub(crate) async fn update_preserving_birth_versions(
         &self,
         new_entries: &[Arc<SuperfileEntry>],
         entries_to_remove: &[Arc<SuperfileEntry>],
     ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
+        if let Some(superfile_id) = self.first_listed(new_entries) {
+            return Err(ManifestError::SuperfileAlreadyListed { superfile_id });
+        }
+
         self.update_inner(new_entries, entries_to_remove, true)
             .await
+    }
+
+    /// [`Self::update`] without the duplicate refusal, so a test can write the
+    /// manifest an older engine could publish: one superfile listed twice.
+    #[cfg(test)]
+    pub(crate) async fn update_admitting_duplicates(
+        &self,
+        new_entries: &[Arc<SuperfileEntry>],
+    ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
+        self.update_inner(new_entries, &[], false).await
+    }
+
+    /// The first of `entries` whose `superfile_id` this manifest already
+    /// lists, if any. One pass over the listed superfiles; none when
+    /// `entries` is empty.
+    ///
+    /// Runs on every commit, so the ids go in an Fx set: its hash is several
+    /// times cheaper per lookup than the default SipHash, and SipHash's
+    /// protection against crafted keys buys nothing for engine-minted ids.
+    pub(crate) fn first_listed(&self, entries: &[Arc<SuperfileEntry>]) -> Option<Uuid> {
+        if entries.is_empty() {
+            return None;
+        }
+        let ids: FxHashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
+        self.get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .find(|id| ids.contains(id))
     }
 
     async fn update_inner(
@@ -2917,7 +2982,10 @@ impl SuperfileEntry {
     /// same string by construction.
     pub fn storage_path(&self) -> String {
         match &self.stem {
-            Some(stem) => format!("{SUPERFILE_DATA_DIR}/{stem}-{}.sf.parquet", self.uri.0),
+            Some(stem) => format!(
+                "{SUPERFILE_DATA_DIR}/{stem}-{}{SUPERFILE_KEY_SUFFIX}",
+                self.uri.0
+            ),
             None => self.uri.storage_path(),
         }
     }
@@ -3000,12 +3068,12 @@ impl SuperfileUri {
     /// footer), while the `.sf` marker flags it as a Superfile
     /// superfile without making the file look non-standard.
     pub fn storage_path(self) -> String {
-        format!("{SUPERFILE_DATA_DIR}/seg-{}.sf.parquet", self.0)
+        format!("{SUPERFILE_DATA_DIR}/seg-{}{SUPERFILE_KEY_SUFFIX}", self.0)
     }
 
     /// Disk-cache filename for a promoted superfile.
     pub fn cache_filename(self) -> String {
-        format!("seg-{}.sf.parquet", self.0)
+        format!("seg-{}{SUPERFILE_KEY_SUFFIX}", self.0)
     }
 
     /// Disk-cache tempfile name for download number `seq` of this superfile. Each download gets its
@@ -3023,7 +3091,9 @@ impl SuperfileUri {
     /// `seg-<uuid>.sf.parquet`, including in-flight tempfiles (see
     /// [`Self::from_cache_tmp_filename`]).
     pub fn from_cache_filename(name: &str) -> Option<Self> {
-        let body = name.strip_prefix("seg-")?.strip_suffix(".sf.parquet")?;
+        let body = name
+            .strip_prefix("seg-")?
+            .strip_suffix(SUPERFILE_KEY_SUFFIX)?;
         Uuid::parse_str(body).ok().map(SuperfileUri)
     }
 
@@ -3061,7 +3131,7 @@ impl SuperfileUri {
         if name.contains('/') {
             return None;
         }
-        let body = name.strip_suffix(".sf.parquet")?;
+        let body = name.strip_suffix(SUPERFILE_KEY_SUFFIX)?;
         let uuid_text = body.strip_prefix("seg-").or_else(|| uuid_suffix(body))?;
         Uuid::parse_str(uuid_text).ok().map(SuperfileUri)
     }
@@ -4875,6 +4945,24 @@ mod tests {
         assert_eq!(m0.manifest_id, 0);
         assert_eq!(m0.superfiles.len(), 0);
         assert_eq!(m0.n_docs_total(), 0);
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_superfile_already_listed() {
+        // `update` refuses to list a superfile twice and names it; a fresh
+        // entry still commits.
+        let listed = seg_entry(Uuid::new_v4(), 10);
+        let fresh = seg_entry(Uuid::new_v4(), 20);
+        let m = ManifestSnapshot::empty(opts()).with_appended(vec![Arc::clone(&listed)]);
+        match m.update(from_ref(&listed), &[]).await {
+            Err(ManifestError::SuperfileAlreadyListed { superfile_id }) => {
+                assert_eq!(superfile_id, listed.superfile_id);
+            }
+            Err(other) => panic!("expected SuperfileAlreadyListed, got {other:?}"),
+            Ok(_) => panic!("a superfile was listed twice"),
+        }
+        let (after, _parts) = m.update(from_ref(&fresh), &[]).await.expect("fresh entry");
+        assert_eq!(after.superfiles.len(), 2);
     }
 
     #[test]

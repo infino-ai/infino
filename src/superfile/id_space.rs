@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! The positional identifier spaces a superfile addresses its documents
-//! in, as distinct types rather than two shapes of bare integer.
+//! The three identifier spaces a superfile addresses its documents in,
+//! as distinct types rather than three shapes of bare integer.
 //!
-//! A superfile numbers the same document two ways by position, and the
-//! numbers are not interchangeable:
+//! A superfile numbers the same document three ways, and the numbers are
+//! not interchangeable:
 //!
 //! * [`RowId`] — the document's position among the superfile's Parquet
 //!   rows. Tombstones, the `_id` pages, the vector blob, row groups and
@@ -13,11 +13,14 @@
 //! * [`FtsDocId`] — the document's position inside the superfile's FTS
 //!   blob. Postings, skip tables, the term dictionary and the
 //!   doc-length arrays are all expressed here.
+//! * [`StableId`] — the `_id` the user sees, minted once at ingest and
+//!   carried unchanged through every compaction. The only one of the
+//!   three that means anything outside the superfile that holds it.
 //!
-//! The two were the same number for the whole life of the format up to
-//! and including version 7: the FTS blob stored its documents in arrival
-//! order, so blob position and row position were equal and the
-//! distinction cost nothing to ignore. Version 8 lets a
+//! The two positional spaces were the same number for the whole life of
+//! the format up to and including version 7: the FTS blob stored its
+//! documents in arrival order, so blob position and row position were
+//! equal and the distinction cost nothing to ignore. Version 8 lets a
 //! compaction store the blob's documents in an order of its own, which
 //! makes them different numbers for the same document, and a value that
 //! crosses from one space to the other untranslated is not a crash but a
@@ -116,6 +119,31 @@ impl Display for FtsDocId {
 impl PartialEq<u32> for FtsDocId {
     fn eq(&self, other: &u32) -> bool {
         self.0 == *other
+    }
+}
+
+/// The `_id` a document carries for as long as it exists.
+///
+/// Minted once by the writer that ingested the row and never rewritten,
+/// so it survives compaction, reordering and the move from one superfile
+/// into another. Unlike [`RowId`] and [`FtsDocId`] it identifies a
+/// document across the whole table rather than a position within one
+/// file.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct StableId(i128);
+
+impl StableId {
+    /// The id with value `v`.
+    #[inline]
+    pub const fn new(v: i128) -> Self {
+        Self(v)
+    }
+
+    /// The value as a plain integer, the form it is stored and compared
+    /// in.
+    #[inline]
+    pub const fn get(self) -> i128 {
+        self.0
     }
 }
 
