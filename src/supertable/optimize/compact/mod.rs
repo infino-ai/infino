@@ -4220,6 +4220,87 @@ mod tests {
         );
     }
 
+    /// A delete must not be starved by a wave that seals the whole table.
+    ///
+    /// The writer's sealed-retry budget is refunded on forward progress, and
+    /// serially that was enough: one job's inputs were sealed at a time, so a
+    /// delete could almost always land something. A wave seals every one of
+    /// its inputs at once, and a delete whose targets all sit inside it lands
+    /// nothing at all until the wave commits — so it has to survive on the
+    /// compactor's progress instead of its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_lands_while_a_wave_has_every_superfile_sealed() {
+        // A wave seals ALL of its inputs from prepare until commit. Widen it
+        // far enough and every superfile a delete could target is sealed at
+        // once, so the delete lands nothing and cannot refund its retry budget
+        // the usual way. It has to survive on the compactor's progress
+        // instead: the wave commits, the manifest advances, and the re-resolve
+        // routes to the merged output.
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let doomed = "delta first";
+        for term in ["alpha", "bravo", "charlie", "delta"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let before_docs = st.reader().expect("reader").n_docs_total();
+        let live: Vec<Uuid> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert_eq!(live.len(), 4, "fixture");
+
+        // Stage a wave over EVERY superfile, holding all four sealed.
+        let mut wave = Vec::new();
+        for pair in [[live[0], live[1]], [live[2], live[3]]] {
+            wave.push(
+                st.prepare_compaction_job(
+                    CompactionJob {
+                        partition_key: Vec::new(),
+                        inputs: pair.to_vec(),
+                        estimated_output_bytes: 0,
+                        input_bytes: 0,
+                    },
+                    DEFAULT_STALE_SEAL_TIMEOUT,
+                )
+                .await
+                .expect("prepare"),
+            );
+        }
+
+        // Delete a row whose superfile is sealed, while the wave is held.
+        let deleting = st.clone();
+        let title = doomed.to_string();
+        let delete = task::spawn_blocking(move || {
+            deleting
+                .delete(col("title").eq(lit(title)))
+                .map(|s| (s.matched(), s.n_tombstoned()))
+        });
+
+        // Let the delete reach its sealed retry loop, then publish.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        st.commit_compaction_batch(wave)
+            .await
+            .expect("the wave commits");
+
+        let (matched, tombstoned) = delete
+            .await
+            .expect("delete task")
+            .expect("a delete must survive a fully-sealed table, not exhaust its retries");
+        assert_eq!(matched, 1, "the predicate must have resolved its row");
+        // The point of the test: the bit actually LANDED. Surviving the call
+        // without an error is not enough — a delete that resolved its row and
+        // then failed to tombstone it anywhere has silently lost the deletion.
+        assert_eq!(
+            tombstoned, 1,
+            "the tombstone must have landed once the wave published"
+        );
+        assert_eq!(before_docs, st.reader().expect("reader").n_docs_total());
+    }
+
     /// A batch that loses the manifest CAS retries as a batch: the merges are
     /// already done and their outputs already staged, so the second attempt
     /// re-resolves the inputs against the refreshed manifest and commits the

@@ -934,6 +934,22 @@ const LEASE_RENEW_FRACTION: i32 = 3;
 /// compactor never exhausts it under realistic loads.
 const MAX_SEALED_RETRIES: u32 = 16;
 
+/// Whether a sealed-retry attempt earns its budget back.
+///
+/// Two kinds of progress count. Ours: we landed a bit somewhere, so the batch
+/// is working through its targets. And the compactor's: the manifest
+/// generation moved, which means it published a merged superfile and our next
+/// re-resolve will route to coordinates that are not sealed.
+///
+/// The second is what keeps a delete alive against a compaction pass running
+/// several merges at once. Such a pass seals every one of its inputs together,
+/// so a batch whose targets all sit in that set lands nothing at all until the
+/// pass commits — with only the first rule, it would spend its whole allowance
+/// waiting on a compactor that is making perfectly good progress.
+fn refunds_sealed_budget(landed_any: bool, manifest_before: u64, manifest_now: u64) -> bool {
+    landed_any || manifest_before != manifest_now
+}
+
 /// Backoff floor between sealed-sidecar retries. Doubles per
 /// attempt, capped at [`SEALED_RETRY_CAP_MS`].
 const SEALED_RETRY_BASE_MS: u64 = 100;
@@ -1086,6 +1102,10 @@ async fn do_tombstone_apply(
     );
 
     let mut sealed_attempts = 0u32;
+    // Generation the last sealed attempt saw, so an advance can refund the
+    // budget below. Seeded with the current one: a compactor that committed
+    // before this loop even started is not evidence of progress during it.
+    let mut manifest_at_last_attempt = inner.manifest.load().manifest_id;
     while !pending.is_empty() {
         let pending_ids: Vec<RowId> = pending.iter().map(|(_, target_id)| *target_id).collect();
 
@@ -1146,9 +1166,20 @@ async fn do_tombstone_apply(
         // Forward progress refunds the budget: a batch spanning several
         // concurrently-compacting superfiles would otherwise burn one
         // shared allowance on seals it is steadily working through.
-        if landed_any {
+        //
+        // OUR progress is not the only kind that counts. A compaction pass
+        // that runs several merges at once seals all of their inputs at the
+        // same time, so a batch whose targets all sit inside that set lands
+        // nothing at all until the pass commits — and would spend its whole
+        // allowance waiting on a compactor that is working perfectly well.
+        // An advancing manifest generation is exactly the evidence this loop
+        // is waiting for: the compactor published, and the next re-resolve
+        // routes to superfiles that are no longer sealed.
+        let manifest_now = inner.manifest.load().manifest_id;
+        if refunds_sealed_budget(landed_any, manifest_at_last_attempt, manifest_now) {
             sealed_attempts = 0;
         }
+        manifest_at_last_attempt = manifest_now;
         sealed_attempts += 1;
         if sealed_attempts > MAX_SEALED_RETRIES {
             return Err(TombstonePhaseError::SealedSidecarRetryExhausted {
@@ -1590,6 +1621,32 @@ mod tests {
         },
         test_helpers::{build_title_batch, default_supertable_options},
     };
+
+    /// A manifest generation, for the refund tests below.
+    const GEN: u64 = 7;
+
+    /// Landing a bit is progress, whatever the compactor is doing.
+    #[test]
+    fn landing_a_tombstone_refunds_the_sealed_budget() {
+        assert!(refunds_sealed_budget(true, GEN, GEN));
+    }
+
+    /// The case a concurrent compaction pass creates: the batch lands nothing,
+    /// because every superfile holding its targets is sealed by merges running
+    /// together. The manifest moving is the compactor publishing, so the next
+    /// re-resolve has somewhere new to go and the wait was not wasted.
+    #[test]
+    fn a_compactor_publishing_refunds_the_sealed_budget() {
+        assert!(refunds_sealed_budget(false, GEN, GEN + 1));
+    }
+
+    /// Nothing landed and nothing moved: this attempt bought nothing, so it
+    /// must cost budget. Otherwise a genuinely stuck table would spin forever
+    /// instead of surfacing a typed error.
+    #[test]
+    fn a_wasted_attempt_spends_the_sealed_budget() {
+        assert!(!refunds_sealed_budget(false, GEN, GEN));
+    }
 
     /// Construct a Supertable + a fresh WAL state doc + the WAL's
     /// etag, all backed by the same LocalFs storage so an
