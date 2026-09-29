@@ -292,9 +292,9 @@ pub struct CompactionSettings {
     /// large superfiles, not a typical job's size.
     ///
     /// It is also NOT a bound on the merge's resident set, which runs several
-    /// times higher once rows are decoded and the output encoded. Nothing sizes
-    /// concurrency from this: a wave is admitted against the bytes its own jobs
-    /// actually hold.
+    /// times higher once rows are decoded and the output encoded, and it does
+    /// not govern how many merges run at once: a wave widens against the
+    /// host's free memory.
     pub max_memory_mb: u64,
     /// How many of a pass's merge jobs may be in flight at once.
     ///
@@ -2192,8 +2192,7 @@ vector:
     }
 
     /// An arbitrary per-merge input cap. The figure carries no meaning: the
-    /// test below asserts the derived width is INDEPENDENT of it, which is
-    /// exactly what was broken when the width was sized off this setting.
+    /// test below asserts the derived width is INDEPENDENT of it.
     const ANY_BUDGET_MB: u64 = 3072;
 
     /// The derived width is a CPU ceiling, not a memory one.

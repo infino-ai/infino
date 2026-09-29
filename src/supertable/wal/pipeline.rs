@@ -941,11 +941,10 @@ const MAX_SEALED_RETRIES: u32 = 16;
 /// generation moved, which means it published a merged superfile and our next
 /// re-resolve will route to coordinates that are not sealed.
 ///
-/// The second is what keeps a delete alive against a compaction pass running
-/// several merges at once. Such a pass seals every one of its inputs together,
-/// so a batch whose targets all sit in that set lands nothing at all until the
-/// pass commits — with only the first rule, it would spend its whole allowance
-/// waiting on a compactor that is making perfectly good progress.
+/// The second keeps a delete alive against a compaction pass running several
+/// merges at once: such a pass seals every one of its inputs together, so a
+/// batch whose targets all sit in that set has no progress of its own to show
+/// until the pass commits.
 fn refunds_sealed_budget(landed_any: bool, manifest_before: u64, manifest_now: u64) -> bool {
     landed_any || manifest_before != manifest_now
 }
@@ -1167,14 +1166,12 @@ async fn do_tombstone_apply(
         // concurrently-compacting superfiles would otherwise burn one
         // shared allowance on seals it is steadily working through.
         //
-        // OUR progress is not the only kind that counts. A compaction pass
-        // that runs several merges at once seals all of their inputs at the
-        // same time, so a batch whose targets all sit inside that set lands
-        // nothing at all until the pass commits — and would spend its whole
-        // allowance waiting on a compactor that is working perfectly well.
-        // An advancing manifest generation is exactly the evidence this loop
-        // is waiting for: the compactor published, and the next re-resolve
-        // routes to superfiles that are no longer sealed.
+        // The compactor's progress counts as well as ours. A pass running
+        // several merges at once holds all of their inputs sealed together, so
+        // a batch whose targets sit entirely inside that set lands nothing
+        // until the pass commits. An advancing manifest generation is what
+        // this loop waits for: the compactor published, and the next
+        // re-resolve routes to superfiles that are not sealed.
         let manifest_now = inner.manifest.load().manifest_id;
         if refunds_sealed_budget(landed_any, manifest_at_last_attempt, manifest_now) {
             sealed_attempts = 0;

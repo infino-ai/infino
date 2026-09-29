@@ -1030,19 +1030,14 @@ impl Supertable {
 /// Share of the host's memory the runner keeps free: it stops widening a wave
 /// once less than this is available.
 ///
-/// This is feedback, not prediction. Estimating a merge's cost from its input
-/// bytes was tried twice and fitted twice — first as a flat multiple, then as
-/// an intercept plus a slope — and both were calibrations of one corpus at one
-/// schema through one index type. The flat multiple was wrong by 2.4x across a
-/// 32x change in job size, which silently made the derived width serial on
-/// large tables. A merge's footprint depends on term cardinality, posting
-/// density, document length and which indexes a table carries; none of that is
-/// knowable from `input_bytes`, and all of it shows up in `MemAvailable`.
-///
-/// So the runner does not predict. It admits one merge, lets the allocation
-/// land, looks at what the host has left, and admits another only if there is
-/// still room. A corpus that is twice as expensive per byte simply gets a
-/// narrower wave, with nothing to re-tune.
+/// The width comes from feedback rather than an estimate of what a merge
+/// costs. A merge's footprint depends on term cardinality, posting density,
+/// document length and which indexes a table carries — none of which is
+/// visible in its input byte count, and all of which shows up in
+/// `MemAvailable`. So the runner admits one merge, lets the allocation land,
+/// looks at what the host has left, and admits another only if there is still
+/// room. A corpus twice as expensive per byte gets a narrower wave, with
+/// nothing to re-tune.
 const WAVE_MEMORY_RESERVE_PERCENT: u64 = 40;
 
 /// How long to let an admitted merge's allocation materialize before reading
@@ -1065,11 +1060,11 @@ fn host_has_room_for_another_merge() -> bool {
 
 /// Take the next wave off `jobs`, widening it only while the host has room.
 ///
-/// One merge is admitted unconditionally — a table whose single job does not
-/// fit still has to compact, and it did so serially before waves existed.
-/// Each further merge is admitted only after the previous one's allocation has
-/// had time to land and the host still reports headroom, so the width follows
-/// what this corpus actually costs rather than a guess about what it should.
+/// One merge is admitted unconditionally: a table whose single job does not
+/// fit the host still has to compact, and stalling it would strand exactly the
+/// tables that most need compacting. Each further merge is admitted only once
+/// the previous one's allocation has had time to land and the host still
+/// reports headroom, so the width follows what this corpus costs.
 async fn admit_wave(
     jobs: &[CompactionJob],
     concurrency: usize,
@@ -3998,10 +3993,8 @@ mod tests {
         }
     }
 
-    /// One merge is admitted unconditionally, however big it is. A table
-    /// whose single job does not fit still has to compact — it did so serially
-    /// before waves existed, and refusing it would stall exactly the tables
-    /// that need compacting most.
+    /// One merge is admitted unconditionally, however big it is: refusing it
+    /// would stall exactly the tables that most need compacting.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_wave_always_admits_at_least_one_job() {
         let jobs = vec![wave_job(), wave_job()];
@@ -4214,12 +4207,11 @@ mod tests {
 
     /// A delete must not be starved by a wave that seals the whole table.
     ///
-    /// The writer's sealed-retry budget is refunded on forward progress, and
-    /// serially that was enough: one job's inputs were sealed at a time, so a
-    /// delete could almost always land something. A wave seals every one of
-    /// its inputs at once, and a delete whose targets all sit inside it lands
-    /// nothing at all until the wave commits — so it has to survive on the
-    /// compactor's progress instead of its own.
+    /// A wave seals every one of its inputs for as long as it runs, so a
+    /// delete whose targets all sit inside that set lands nothing at all until
+    /// the wave commits. Its sealed-retry budget is refunded on forward
+    /// progress, and it has none of its own to show — it survives on the
+    /// compactor's progress instead.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_delete_lands_while_a_wave_has_every_superfile_sealed() {
         // A wave seals ALL of its inputs from prepare until commit. Widen it
