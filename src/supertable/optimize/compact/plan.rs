@@ -87,13 +87,6 @@ pub struct CompactionJob {
     pub inputs: Vec<Uuid>,
     /// Estimated size of the merged superfile.
     pub estimated_output_bytes: u64,
-    /// Raw bytes of the inputs this job will materialize, tombstoned rows
-    /// included. This is the number a merge's memory cost scales with, and
-    /// it is usually far below `max_memory_mb`: that setting is the cap the
-    /// packer stops at, while a job is normally closed out by the output
-    /// target first. Sizing concurrency off the cap therefore overestimates
-    /// what a wave costs, sometimes several-fold.
-    pub input_bytes: u64,
 }
 
 /// Plan compaction: pack each partition's small superfiles into
@@ -214,7 +207,6 @@ impl PendingJob {
                 partition_key: key.to_vec(),
                 inputs: mem::take(&mut self.inputs),
                 estimated_output_bytes: self.live_bytes,
-                input_bytes: self.raw_bytes,
             });
         }
         *self = PendingJob::default();

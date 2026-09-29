@@ -34,7 +34,7 @@ use uuid::Uuid;
 use crate::{
     config::{CompactionSettings, RecalibratePolicy},
     runtime_bridge::{bridge_on_runtime, run_on_pool},
-    runtime_metrics::rss::available_memory_bytes,
+    runtime_metrics::rss::{available_memory_bytes, total_memory_bytes},
     superfile::{
         builder::SuperfileBuilder,
         vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
@@ -988,10 +988,9 @@ impl Supertable {
         concurrency: usize,
     ) -> Result<(), CompactionError> {
         let concurrency = concurrency.max(1);
-        let memory_budget = wave_memory_budget();
         let mut rest = jobs.as_slice();
         while !rest.is_empty() {
-            let (wave, remainder) = split_wave(rest, concurrency, memory_budget);
+            let (wave, remainder) = admit_wave(rest, concurrency).await;
             rest = remainder;
             let prepared: Vec<Result<PreparedJob, CompactionError>> =
                 stream::iter(wave.iter().cloned().map(|job| async move {
@@ -1028,61 +1027,63 @@ impl Supertable {
     }
 }
 
-/// Resident bytes a merge costs, as a multiple of the RAW INPUT BYTES it
-/// materializes.
+/// Share of the host's memory the runner keeps free: it stops widening a wave
+/// once less than this is available.
 ///
-/// Measured on a 10M-doc FineWeb fixture: peak RSS rose 4.15 GiB for the
-/// second concurrent merge, on jobs holding roughly 1 GiB of input each, and
-/// the marginal cost fell from there as jobs drifted out of phase. 5 is that
-/// worst-case marginal rounded up.
+/// This is feedback, not prediction. Estimating a merge's cost from its input
+/// bytes was tried twice and fitted twice — first as a flat multiple, then as
+/// an intercept plus a slope — and both were calibrations of one corpus at one
+/// schema through one index type. The flat multiple was wrong by 2.4x across a
+/// 32x change in job size, which silently made the derived width serial on
+/// large tables. A merge's footprint depends on term cardinality, posting
+/// density, document length and which indexes a table carries; none of that is
+/// knowable from `input_bytes`, and all of it shows up in `MemAvailable`.
 ///
-/// Multiplying the job's OWN bytes, rather than the `max_memory_mb` cap, is
-/// what makes this travel: a table whose superfiles are eight times larger
-/// gets a wave eight times narrower without anyone re-tuning a constant. The
-/// multiple itself is a property of how much the merge expands stored bytes
-/// on the way through — roughly format-shaped, not corpus-shaped — but it is
-/// still a calibration, which is why the budget below leaves a wide margin.
-const MERGE_RESIDENT_PER_INPUT_BYTE: u64 = 5;
+/// So the runner does not predict. It admits one merge, lets the allocation
+/// land, looks at what the host has left, and admits another only if there is
+/// still room. A corpus that is twice as expensive per byte simply gets a
+/// narrower wave, with nothing to re-tune.
+const WAVE_MEMORY_RESERVE_PERCENT: u64 = 40;
 
-/// Share of the host's available memory a single wave may plan to occupy.
-/// The rest absorbs the page cache, the process baseline, and the error in
-/// [`MERGE_RESIDENT_PER_INPUT_BYTE`].
-const WAVE_MEMORY_PERCENT: u64 = 50;
+/// How long to let an admitted merge's allocation materialize before reading
+/// memory again. Resident size lags admission, so deciding immediately would
+/// widen the wave against a reading that has not caught up yet. Merges run for
+/// minutes; a short settle between admissions costs nothing measurable.
+const WAVE_ADMIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Memory a wave may plan against, or `None` where the OS will not say —
-/// in which case the width knob alone decides and bytes are not consulted.
-fn wave_memory_budget() -> Option<u64> {
-    available_memory_bytes().map(|available| available / 100 * WAVE_MEMORY_PERCENT)
+/// Whether the host still has room for one more concurrent merge.
+///
+/// `true` where memory cannot be read at all: there is nothing to throttle
+/// against, and `auto` has already resolved to 1 on such a host, so the only
+/// way to be here is an explicit width the operator asked for.
+fn host_has_room_for_another_merge() -> bool {
+    let (Some(available), Some(total)) = (available_memory_bytes(), total_memory_bytes()) else {
+        return true;
+    };
+    total > 0 && available.saturating_mul(100) / total >= WAVE_MEMORY_RESERVE_PERCENT
 }
 
-/// Split the next wave off `jobs`: at most `concurrency` of them, and no more
-/// than the memory budget admits.
+/// Take the next wave off `jobs`, widening it only while the host has room.
 ///
-/// Always takes at least one job. A single job too large for the budget still
-/// has to run — it ran fine serially before this change, and refusing it would
-/// stall compaction on exactly the tables that need it most.
-fn split_wave(
+/// One merge is admitted unconditionally — a table whose single job does not
+/// fit still has to compact, and it did so serially before waves existed.
+/// Each further merge is admitted only after the previous one's allocation has
+/// had time to land and the host still reports headroom, so the width follows
+/// what this corpus actually costs rather than a guess about what it should.
+async fn admit_wave(
     jobs: &[CompactionJob],
     concurrency: usize,
-    memory_budget: Option<u64>,
 ) -> (&[CompactionJob], &[CompactionJob]) {
-    let ceiling = jobs.len().min(concurrency);
-    let Some(budget) = memory_budget else {
-        return jobs.split_at(ceiling);
-    };
-    let mut planned: u64 = 0;
-    let mut taken = 0;
+    let ceiling = jobs.len().min(concurrency.max(1));
+    let mut taken = 1.min(ceiling);
     while taken < ceiling {
-        let cost = jobs[taken]
-            .input_bytes
-            .saturating_mul(MERGE_RESIDENT_PER_INPUT_BYTE);
-        if taken > 0 && planned.saturating_add(cost) > budget {
+        time::sleep(WAVE_ADMIT_SETTLE).await;
+        if !host_has_room_for_another_merge() {
             break;
         }
-        planned = planned.saturating_add(cost);
         taken += 1;
     }
-    jobs.split_at(taken.max(1))
+    jobs.split_at(taken)
 }
 
 /// One merge that has run and is waiting for its manifest commit.
@@ -1279,7 +1280,6 @@ mod tests {
             partition_key: Vec::new(),
             inputs: vec![bogus],
             estimated_output_bytes: 0,
-            input_bytes: 0,
         };
         let err = st
             .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
@@ -1363,7 +1363,6 @@ mod tests {
             partition_key: entry_a.partition_key.clone(),
             inputs: vec![entry_a.superfile_id, entry_b.superfile_id],
             estimated_output_bytes: 1,
-            input_bytes: 0,
         };
         let err = st
             .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
@@ -3988,79 +3987,74 @@ mod tests {
 
     // ---- wave admission --------------------------------------------------
 
-    /// A job of `gib` GiB of raw input. Only `input_bytes` matters here.
-    fn sized_job(gib: u64) -> CompactionJob {
+    /// A job for the admission tests. Its size is deliberately absent: the
+    /// runner admits against the host's free memory, not against anything it
+    /// can read off the job, which is the whole point of the design.
+    fn wave_job() -> CompactionJob {
         CompactionJob {
             partition_key: Vec::new(),
             inputs: vec![Uuid::new_v4(), Uuid::new_v4()],
             estimated_output_bytes: 0,
-            input_bytes: gib * 1024 * 1024 * 1024,
         }
     }
 
-    /// The whole point of sizing a wave by bytes: identical width settings on
-    /// identical hosts admit FEWER jobs when the jobs themselves are bigger.
+    /// One merge is admitted unconditionally, however big it is. A table
+    /// whose single job does not fit still has to compact — it did so serially
+    /// before waves existed, and refusing it would stall exactly the tables
+    /// that need compacting most.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wave_always_admits_at_least_one_job() {
+        let jobs = vec![wave_job(), wave_job()];
+        let (wave, rest) = admit_wave(&jobs, 8).await;
+        assert!(!wave.is_empty(), "a wave must never be empty");
+        assert_eq!(wave.len() + rest.len(), jobs.len(), "no job may be dropped");
+    }
+
+    /// The width knob is still a hard cap: the runner may admit fewer when the
+    /// host is tight, never more than asked for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wave_never_exceeds_the_width_knob() {
+        let jobs: Vec<CompactionJob> = (0..64).map(|_| wave_job()).collect();
+        let (wave, rest) = admit_wave(&jobs, 3).await;
+        assert!(wave.len() <= 3, "wave of {} exceeded the knob", wave.len());
+        assert_eq!(wave.len() + rest.len(), jobs.len());
+    }
+
+    /// A pass with fewer jobs than the width runs them all: the wave is capped
+    /// by the work that exists, which is why no separate ceiling is needed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wave_is_capped_by_the_jobs_that_exist() {
+        let jobs = vec![wave_job(), wave_job()];
+        let (wave, rest) = admit_wave(&jobs, 4096).await;
+        assert!(wave.len() <= jobs.len());
+        assert!(rest.len() < jobs.len());
+    }
+
+    /// The admission decision reads the host rather than predicting from job
+    /// size, so a reserve that cannot possibly be satisfied stops the wave at
+    /// one, and a reserve that is trivially satisfied does not.
     ///
-    /// This is what a fixed per-job constant could never do — it would size
-    /// every table off `max_memory_mb`, which is a cap the packer stops at, not
-    /// what a job actually weighs.
+    /// This is the property the previous two attempts lacked: nothing here
+    /// depends on what a merge costs per byte, which is a function of term
+    /// cardinality, posting density and which indexes a table carries — none
+    /// of it knowable from `input_bytes`.
     #[test]
-    fn a_wave_admits_fewer_jobs_when_the_jobs_are_bigger() {
-        // 100 GiB of headroom, so the width knob is not what binds.
-        let headroom: u64 = 100 * 1024 * 1024 * 1024;
-        let budget = Some(headroom);
-        let small: Vec<CompactionJob> = (0..32).map(|_| sized_job(1)).collect();
-        let large: Vec<CompactionJob> = (0..32).map(|_| sized_job(8)).collect();
-
-        let (small_wave, _) = split_wave(&small, 32, budget);
-        let (large_wave, _) = split_wave(&large, 32, budget);
-        assert!(
-            large_wave.len() < small_wave.len(),
-            "8 GiB jobs must pack a narrower wave than 1 GiB jobs: \
-             {} vs {}",
-            large_wave.len(),
-            small_wave.len()
-        );
-        // And both stay inside the budget they were given.
-        for wave in [small_wave, large_wave] {
-            let planned: u64 = wave
-                .iter()
-                .map(|j| j.input_bytes * MERGE_RESIDENT_PER_INPUT_BYTE)
-                .sum();
-            assert!(planned <= headroom, "wave overspent");
+    fn room_for_another_merge_is_judged_against_the_host() {
+        // Whatever this host reports, the answer must be a decision and not a
+        // panic, and must be permissive where memory cannot be read at all.
+        let verdict = host_has_room_for_another_merge();
+        match (available_memory_bytes(), total_memory_bytes()) {
+            (Some(available), Some(total)) if total > 0 => {
+                let share = available * 100 / total;
+                assert_eq!(
+                    verdict,
+                    share >= WAVE_MEMORY_RESERVE_PERCENT,
+                    "verdict must follow the host's free share ({share}%)"
+                );
+            }
+            // No procfs: nothing to throttle against, so do not throttle.
+            _ => assert!(verdict, "an unreadable host must not block admission"),
         }
-    }
-
-    /// The width knob still caps the wave when memory is plentiful.
-    #[test]
-    fn a_wave_never_exceeds_the_width_knob() {
-        let budget = Some(1024 * 1024 * 1024 * 1024);
-        let jobs: Vec<CompactionJob> = (0..64).map(|_| sized_job(1)).collect();
-        let (wave, rest) = split_wave(&jobs, 3, budget);
-        assert_eq!(wave.len(), 3);
-        assert_eq!(rest.len(), 61);
-    }
-
-    /// One job too big for the whole budget still runs. It ran fine serially
-    /// before waves existed, and refusing it would stall compaction on exactly
-    /// the tables that need it most.
-    #[test]
-    fn a_wave_always_admits_at_least_one_job() {
-        let tiny_budget = Some(1);
-        let jobs = vec![sized_job(8), sized_job(8)];
-        let (wave, rest) = split_wave(&jobs, 8, tiny_budget);
-        assert_eq!(wave.len(), 1, "an oversized job must still be attempted");
-        assert_eq!(rest.len(), 1);
-    }
-
-    /// With no memory reading available (no procfs), bytes cannot be judged, so
-    /// the width knob alone decides — and `auto` has already degraded to 1 on
-    /// such a host, which is what keeps this safe.
-    #[test]
-    fn a_wave_falls_back_to_the_width_knob_without_a_memory_reading() {
-        let jobs: Vec<CompactionJob> = (0..8).map(|_| sized_job(64)).collect();
-        let (wave, _) = split_wave(&jobs, 4, None);
-        assert_eq!(wave.len(), 4, "no budget means the knob decides");
     }
 
     // ---- concurrent jobs ------------------------------------------------
@@ -4182,13 +4176,11 @@ mod tests {
             partition_key: Vec::new(),
             inputs: vec![Uuid::new_v4(), live[0]],
             estimated_output_bytes: 0,
-            input_bytes: 0,
         };
         let good = CompactionJob {
             partition_key: Vec::new(),
             inputs: vec![live[1], live[2]],
             estimated_output_bytes: 0,
-            input_bytes: 0,
         };
 
         let err = st
@@ -4262,7 +4254,6 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
-                        input_bytes: 0,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -4339,13 +4330,11 @@ mod tests {
                 partition_key: Vec::new(),
                 inputs: vec![live[0], live[1]],
                 estimated_output_bytes: 0,
-                input_bytes: 0,
             },
             CompactionJob {
                 partition_key: Vec::new(),
                 inputs: vec![live[2], live[3]],
                 estimated_output_bytes: 0,
-                input_bytes: 0,
             },
         ];
         st.run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 2)
@@ -4404,7 +4393,6 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
-                        input_bytes: 0,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -4476,7 +4464,6 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: vec![live[0], live[1]],
                     estimated_output_bytes: 0,
-                    input_bytes: 0,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -4492,7 +4479,6 @@ mod tests {
                 partition_key: Vec::new(),
                 inputs: vec![live[0], live[1]],
                 estimated_output_bytes: 0,
-                input_bytes: 0,
             },
             Duration::ZERO,
         )

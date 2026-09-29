@@ -74,9 +74,21 @@ pub fn current_rss_bytes() -> Option<u64> {
 /// platforms without procfs, so every caller needs a conservative fallback
 /// rather than a guess at the machine's size.
 pub fn available_memory_bytes() -> Option<u64> {
+    meminfo_field("MemAvailable:")
+}
+
+/// The host's total memory in bytes (Linux `MemTotal`), for expressing a
+/// reserve as a share of the machine rather than an absolute figure that
+/// would be wrong on the next host. `None` without procfs.
+pub fn total_memory_bytes() -> Option<u64> {
+    meminfo_field("MemTotal:")
+}
+
+/// One `/proc/meminfo` field, in bytes.
+fn meminfo_field(prefix: &str) -> Option<u64> {
     let s = fs::read_to_string(PROC_MEMINFO).ok()?;
     for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+        if let Some(rest) = line.strip_prefix(prefix) {
             let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
             return Some(kb * KIB_TO_BYTES);
         }
