@@ -274,16 +274,6 @@ const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFIL
 /// merging.
 const DEFAULT_COMPACTION_MAX_CONCURRENT_JOBS: ThreadCount = ThreadCount::Auto;
 
-/// Hard ceiling on the resolved concurrent-job width, whatever the setting or
-/// the derivation asks for. A compaction pass keeping this many merges in
-/// flight already saturates any realistic object-store connection pool, so an
-/// absurd explicit value or a mis-derived `auto` must not run past it.
-///
-/// Not a default — [`DEFAULT_COMPACTION_MAX_CONCURRENT_JOBS`] is what the
-/// `max_concurrent_jobs` setting starts at; this is the clamp applied after
-/// it resolves.
-const COMPACTION_CONCURRENCY_CEILING: usize = 64;
-
 /// How old a tombstone sidecar seal has to be before compaction treats
 /// its owner as dead and takes over, instead of backing off.
 /// Scale this up if target_superfile_size_mb is raised well past the default
@@ -1320,10 +1310,12 @@ impl Config {
             // rather than invent a width.
             None => 1,
         };
-        compaction
-            .max_concurrent_jobs
-            .resolve_or_default(resolved)
-            .clamp(1, COMPACTION_CONCURRENCY_CEILING)
+        // No upper clamp. An explicit setting is honored as written, and the
+        // real bounds are structural: a wave never exceeds the number of jobs
+        // the pass actually planned, memory narrows it further wherever the
+        // host reports any, and compaction's input opens ride a process-wide
+        // semaphore that bounds object-store fan-out on its own.
+        compaction.max_concurrent_jobs.resolve_or_default(resolved)
     }
 
     /// Load from the standard hierarchy. See module docs for the
@@ -2216,10 +2208,8 @@ vector:
             max_memory_mb: MEASURED_BUDGET_MB,
             ..CompactionSettings::default()
         });
-        // Whatever the host, the derived width never exceeds the ceiling, and
-        // is never zero — a zero would stall the wave loop outright.
+        // Never zero, whatever the host — a zero would stall the wave loop.
         assert!(derived >= 1, "width must be at least one");
-        assert!(derived <= COMPACTION_CONCURRENCY_CEILING);
         // Crucially it does NOT scale with the memory budget: a four-fold
         // budget is the same width, because bytes are judged downstream.
         let wide_budget = cfg.compaction_concurrency(&CompactionSettings {
@@ -2232,24 +2222,27 @@ vector:
         );
     }
 
-    /// An explicit setting wins over the derived width, in both directions,
-    /// and 1 still means strictly serial.
+    /// An explicit setting is honored as written, in both directions.
+    ///
+    /// Deliberately unclamped: a wave never exceeds the number of jobs the
+    /// pass planned, memory narrows it wherever the host reports any, and
+    /// input opens ride a process-wide semaphore. A ceiling here would only
+    /// second-guess an operator who asked for something specific.
     #[test]
-    fn an_explicit_width_overrides_the_derived_one() {
+    fn an_explicit_width_is_honored_as_written() {
         let cfg = Config::default();
         let serial = cfg.compaction_concurrency(&CompactionSettings {
             max_concurrent_jobs: ThreadCount::Fixed(1),
             ..CompactionSettings::default()
         });
         assert_eq!(serial, 1, "an explicit 1 must stay serial");
-        let capped = cfg.compaction_concurrency(&CompactionSettings {
-            max_concurrent_jobs: ThreadCount::Fixed(COMPACTION_CONCURRENCY_CEILING * 4),
+        /// Wider than any pool this would run on, to prove nothing trims it.
+        const VERY_WIDE: usize = 4096;
+        let wide = cfg.compaction_concurrency(&CompactionSettings {
+            max_concurrent_jobs: ThreadCount::Fixed(VERY_WIDE),
             ..CompactionSettings::default()
         });
-        assert_eq!(
-            capped, COMPACTION_CONCURRENCY_CEILING,
-            "an absurd explicit width is clamped, not honored"
-        );
+        assert_eq!(wide, VERY_WIDE, "an explicit width must not be trimmed");
     }
 
     /// The shipped default is the derived width, not serial: a serial pass was
