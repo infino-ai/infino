@@ -274,11 +274,15 @@ const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFIL
 /// merging.
 const DEFAULT_COMPACTION_MAX_CONCURRENT_JOBS: ThreadCount = ThreadCount::Auto;
 
-/// Upper bound on the resolved concurrent-job width. A compaction pass that
-/// keeps this many merges in flight already saturates any realistic
-/// object-store connection pool; a mis-derived `auto` must not run away past
-/// it.
-const MAX_COMPACTION_CONCURRENT_JOBS: usize = 64;
+/// Hard ceiling on the resolved concurrent-job width, whatever the setting or
+/// the derivation asks for. A compaction pass keeping this many merges in
+/// flight already saturates any realistic object-store connection pool, so an
+/// absurd explicit value or a mis-derived `auto` must not run past it.
+///
+/// Not a default — [`DEFAULT_COMPACTION_MAX_CONCURRENT_JOBS`] is what the
+/// `max_concurrent_jobs` setting starts at; this is the clamp applied after
+/// it resolves.
+const COMPACTION_CONCURRENCY_CEILING: usize = 64;
 
 /// How old a tombstone sidecar seal has to be before compaction treats
 /// its owner as dead and takes over, instead of backing off.
@@ -1319,7 +1323,7 @@ impl Config {
         compaction
             .max_concurrent_jobs
             .resolve_or_default(resolved)
-            .clamp(1, MAX_COMPACTION_CONCURRENT_JOBS)
+            .clamp(1, COMPACTION_CONCURRENCY_CEILING)
     }
 
     /// Load from the standard hierarchy. See module docs for the
@@ -2215,7 +2219,7 @@ vector:
         // Whatever the host, the derived width never exceeds the ceiling, and
         // is never zero — a zero would stall the wave loop outright.
         assert!(derived >= 1, "width must be at least one");
-        assert!(derived <= MAX_COMPACTION_CONCURRENT_JOBS);
+        assert!(derived <= COMPACTION_CONCURRENCY_CEILING);
         // Crucially it does NOT scale with the memory budget: a four-fold
         // budget is the same width, because bytes are judged downstream.
         let wide_budget = cfg.compaction_concurrency(&CompactionSettings {
@@ -2239,11 +2243,11 @@ vector:
         });
         assert_eq!(serial, 1, "an explicit 1 must stay serial");
         let capped = cfg.compaction_concurrency(&CompactionSettings {
-            max_concurrent_jobs: ThreadCount::Fixed(MAX_COMPACTION_CONCURRENT_JOBS * 4),
+            max_concurrent_jobs: ThreadCount::Fixed(COMPACTION_CONCURRENCY_CEILING * 4),
             ..CompactionSettings::default()
         });
         assert_eq!(
-            capped, MAX_COMPACTION_CONCURRENT_JOBS,
+            capped, COMPACTION_CONCURRENCY_CEILING,
             "an absurd explicit width is clamped, not honored"
         );
     }
