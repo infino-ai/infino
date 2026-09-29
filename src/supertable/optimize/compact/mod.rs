@@ -4559,26 +4559,26 @@ mod tests {
             .expect("second compact");
 
         // The selector packs the 30 small superfiles into several target-sized
-        // jobs (one manifest commit + one output superfile each), rather than
-        // one oversized merge. The exact job count tracks per-superfile byte
-        // size, which is format-dependent, so assert the invariant — more than
-        // one job — not a pinned number.
-        let jobs = st.manifest_id() - manifest_id_before_first_compact;
-        assert!(
-            jobs >= 2,
-            "compact must split into multiple size-bounded jobs, got {jobs}"
-        );
+        // jobs rather than one oversized merge, and each job writes one output
+        // superfile. Count the OUTPUTS, not manifest generations: a pass runs
+        // several merges at once and commits each wave in a single CAS, so
+        // generations count waves, not jobs. The exact job count tracks
+        // per-superfile byte size, which is format-dependent, so assert the
+        // invariant — more than one — not a pinned number.
+        let commits = st.manifest_id() - manifest_id_before_first_compact;
+        assert!(commits >= 1, "compaction must have committed something");
 
         // All 245760 docs must be visible after compaction.
         let r = st.reader().expect("reader");
         assert_eq!(r.n_docs_total(), 245760, "all docs must be preserved");
-        // One output superfile per job, and fewer than the original 30 — the
-        // 30 inputs consolidated into a handful of target-sized superfiles.
-        let n_superfiles = r.n_superfiles() as u64;
+        // Fewer than the original 30, and more than one: the inputs
+        // consolidated into a handful of target-sized superfiles rather than
+        // collapsing into a single oversized one.
+        let n_superfiles = r.n_superfiles();
         assert!(
-            n_superfiles == jobs && n_superfiles < 30,
-            "30 inputs must consolidate into `jobs` (< 30) superfiles, \
-             got {n_superfiles} superfiles for {jobs} jobs"
+            (2..30).contains(&n_superfiles),
+            "30 inputs must consolidate into several (< 30) superfiles, \
+             got {n_superfiles}"
         );
 
         // ManifestSnapshot consistency: per-entry doc counts sum to 245760.
