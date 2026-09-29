@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
+//! Optimizing an index: the phases a caller asks for with `optimize()`.
+//!
+//! Compaction is the one phase this module owns outright; it lives in
+//! [`compact`]. Every other phase (the hidden-cell drain, the
+//! centroid-router refresh, the term-stats rebuild, gc) is a maintenance
+//! operation with callers of its own, sequenced here rather than
+//! implemented here.
+
+pub(crate) mod compact;
+
 use std::time::Instant;
 
 #[cfg(feature = "detailed-tracing")]

@@ -34,6 +34,10 @@
 //! Nothing here reads or writes a blob. It takes term sets and returns
 //! an order, so it can be tested against the cost it claims to lower.
 
+use std::sync::{Mutex, PoisonError};
+
+use rayon::{join, prelude::*};
+
 /// Documents below this per-partition size are left in the order they
 /// already have. Splitting further costs more than the grouping is
 /// worth, and the gaps inside a group this small are already short.
@@ -48,6 +52,19 @@ const MAX_ROUNDS: usize = 20;
 /// splitting arbitrarily deep. At this depth a partition is `2^-24` of
 /// the corpus, far below [`MIN_PARTITION`] for any real one.
 const MAX_DEPTH: u32 = 24;
+
+/// Degrees below this read their cost from a table filled once per
+/// split instead of calling [`term_cost`]. Nearly every degree is
+/// below it, and at 256 KiB per side the tables stay in cache. Larger
+/// degrees call [`term_cost`] directly, so the values are the same.
+const COST_TABLE_LEN: usize = 1 << 16;
+
+/// Partitions below this size are split on one thread, with one scratch
+/// state for their whole subtree. Above it the two halves recurse in
+/// parallel, and a split's gains and sorts run in parallel too. Every
+/// partition is split the same way on any thread, so the order does not
+/// depend on how the work is spread.
+const PARALLEL_MIN_PARTITION: usize = 1 << 14;
 
 /// A document's terms, as ids into a shared vocabulary, laid out one
 /// document after another with an index of where each begins.
@@ -117,14 +134,57 @@ pub(crate) fn bisect_order(fwd: &ForwardIndex) -> Vec<u32> {
     if n <= MIN_PARTITION {
         return order;
     }
-    let mut state = BisectState {
-        deg_left: vec![0u32; fwd.n_terms],
-        deg_right: vec![0u32; fwd.n_terms],
-        gains: Vec::new(),
-        touched: Vec::new(),
+    let pool = StatePool {
+        n_terms: fwd.n_terms,
+        free: Mutex::new(Vec::new()),
     };
-    state.split(fwd, &mut order, 0);
+    split_parallel(fwd, &mut order, 0, &pool);
     order
+}
+
+/// Split `order` as [`BisectState::split`] does, running the two halves
+/// of a large partition in parallel.
+fn split_parallel(fwd: &ForwardIndex, order: &mut [u32], depth: u32, pool: &StatePool) {
+    if order.len() < PARALLEL_MIN_PARTITION {
+        pool.with_state(|state| state.split(fwd, order, depth));
+        return;
+    }
+    if depth >= MAX_DEPTH {
+        return;
+    }
+    let mid = order.len() / 2;
+    pool.with_state(|state| state.refine(fwd, order, mid, true));
+    let (left, right) = order.split_at_mut(mid);
+    join(
+        || split_parallel(fwd, left, depth + 1, pool),
+        || split_parallel(fwd, right, depth + 1, pool),
+    );
+}
+
+/// Scratch states shared by the parallel splits. A split takes one and
+/// puts it back clean, so only as many exist as ever ran at once.
+struct StatePool {
+    n_terms: usize,
+    free: Mutex<Vec<BisectState>>,
+}
+
+impl StatePool {
+    fn with_state<R>(&self, f: impl FnOnce(&mut BisectState) -> R) -> R {
+        // A split never panics while holding the lock, so a poisoned
+        // list is still a valid one.
+        let taken = self
+            .free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let mut state = taken.unwrap_or_else(|| BisectState::new(self.n_terms));
+        let out = f(&mut state);
+        self.free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(state);
+        out
+    }
 }
 
 /// Scratch reused down the whole recursion, so a split allocates
@@ -132,6 +192,16 @@ pub(crate) fn bisect_order(fwd: &ForwardIndex) -> Vec<u32> {
 struct BisectState {
     deg_left: Vec<u32>,
     deg_right: Vec<u32>,
+    /// What moving any one left document lowers a term's cost by. It
+    /// depends only on the term's degrees, so it is computed once per
+    /// term per round rather than once per document carrying it.
+    move_gain_left: Vec<f32>,
+    /// The same for a document moving from the right.
+    move_gain_right: Vec<f32>,
+    /// `term_cost(d, left size)` for the current split, by `d`.
+    cost_left: Vec<f32>,
+    /// `term_cost(d, right size)` for the current split, by `d`.
+    cost_right: Vec<f32>,
     /// `(gain, document)` for one side, rebuilt each round.
     gains: Vec<(f32, u32)>,
     /// Term ids whose degree entries a split touched, so the tables can
@@ -141,34 +211,51 @@ struct BisectState {
 }
 
 impl BisectState {
+    fn new(n_terms: usize) -> Self {
+        Self {
+            deg_left: vec![0u32; n_terms],
+            deg_right: vec![0u32; n_terms],
+            move_gain_left: vec![0f32; n_terms],
+            move_gain_right: vec![0f32; n_terms],
+            cost_left: Vec::new(),
+            cost_right: Vec::new(),
+            gains: Vec::new(),
+            touched: Vec::new(),
+        }
+    }
+
     fn split(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32) {
         if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
             return;
         }
         let mid = order.len() / 2;
-        self.refine(fwd, order, mid);
+        self.refine(fwd, order, mid, false);
         let (left, right) = order.split_at_mut(mid);
         self.split(fwd, left, depth + 1);
         self.split(fwd, right, depth + 1);
     }
 
     /// Move documents across the split while it lowers the cost, then
-    /// leave the two halves in `order`.
-    fn refine(&mut self, fwd: &ForwardIndex, order: &mut [u32], mid: usize) {
+    /// leave the two halves in `order`. `parallel` spreads each round's
+    /// gains and sorts across threads.
+    fn refine(&mut self, fwd: &ForwardIndex, order: &mut [u32], mid: usize, parallel: bool) {
         self.count_degrees(fwd, order, mid);
         let n_left = mid as f32;
         let n_right = (order.len() - mid) as f32;
+        fill_cost_table(&mut self.cost_left, n_left);
+        fill_cost_table(&mut self.cost_right, n_right);
 
         for _ in 0..MAX_ROUNDS {
             // A document's gain is what the cost drops by if it moves:
             // its terms get one rarer on this side and one commoner on
             // the other. Positive means the move is worth making.
             let moved = {
+                self.compute_move_gains(n_left, n_right);
                 let (left, right) = order.split_at_mut(mid);
-                let mut left_gains = self.rank_by_gain(fwd, left, n_left, n_right, true);
-                let mut right_gains = self.rank_by_gain(fwd, right, n_right, n_left, false);
-                left_gains.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-                right_gains.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                let mut left_gains = rank_by_gain(fwd, left, &self.move_gain_left, parallel);
+                let mut right_gains = rank_by_gain(fwd, right, &self.move_gain_right, parallel);
+                sort_by_gain(&mut left_gains, parallel);
+                sort_by_gain(&mut right_gains, parallel);
 
                 // Swap in pairs so the halves keep their sizes. Both
                 // lists are sorted by gain, so once a pair does not pay
@@ -202,43 +289,44 @@ impl BisectState {
         self.clear_degrees();
     }
 
-    /// `(gain, position within the half)` for every document in `half`.
-    fn rank_by_gain(
-        &mut self,
-        fwd: &ForwardIndex,
-        half: &[u32],
-        here: f32,
-        there: f32,
-        from_left: bool,
-    ) -> Vec<(f32, u32)> {
-        let mut out = Vec::with_capacity(half.len());
-        for (i, &d) in half.iter().enumerate() {
-            let mut gain = 0.0f32;
-            for &t in fwd.doc(d) {
-                let (deg_here, deg_there) = match from_left {
-                    true => (self.deg_left[t as usize], self.deg_right[t as usize]),
-                    false => (self.deg_right[t as usize], self.deg_left[t as usize]),
-                };
-                gain += term_cost(deg_here, here) - term_cost(deg_here.saturating_sub(1), here)
-                    + term_cost(deg_there, there)
-                    - term_cost(deg_there + 1, there);
+    /// Fill the move gains of every term in the partition from its
+    /// current degrees. A side's gain is only read by documents on that
+    /// side carrying the term, so a side with no such document is skipped.
+    fn compute_move_gains(&mut self, n_left: f32, n_right: f32) {
+        for &t in &self.touched {
+            let t = t as usize;
+            let (dl, dr) = (self.deg_left[t], self.deg_right[t]);
+            let left = Side {
+                deg: dl,
+                size: n_left,
+                costs: &self.cost_left,
+            };
+            let right = Side {
+                deg: dr,
+                size: n_right,
+                costs: &self.cost_right,
+            };
+            if dl > 0 {
+                self.move_gain_left[t] = move_gain(&left, &right);
             }
-            out.push((gain, i as u32));
+            if dr > 0 {
+                self.move_gain_right[t] = move_gain(&right, &left);
+            }
         }
-        out
     }
 
     fn count_degrees(&mut self, fwd: &ForwardIndex, order: &[u32], mid: usize) {
         for (i, &d) in order.iter().enumerate() {
             let side_left = i < mid;
             for &t in fwd.doc(d) {
+                // Seen on neither side yet: first sight in this partition.
+                if self.deg_left[t as usize] == 0 && self.deg_right[t as usize] == 0 {
+                    self.touched.push(t);
+                }
                 let slot = match side_left {
                     true => &mut self.deg_left[t as usize],
                     false => &mut self.deg_right[t as usize],
                 };
-                if *slot == 0 {
-                    self.touched.push(t);
-                }
                 *slot += 1;
             }
         }
@@ -252,6 +340,75 @@ impl BisectState {
         self.touched.clear();
         self.gains.clear();
     }
+}
+
+/// `(gain, position within the half)` for every document in `half`:
+/// the sum of its terms' move gains for that side.
+fn rank_by_gain(
+    fwd: &ForwardIndex,
+    half: &[u32],
+    move_gain: &[f32],
+    parallel: bool,
+) -> Vec<(f32, u32)> {
+    let gain_of = |(i, &d): (usize, &u32)| {
+        let mut gain = 0.0f32;
+        for &t in fwd.doc(d) {
+            gain += move_gain[t as usize];
+        }
+        (gain, i as u32)
+    };
+    match parallel {
+        true => half.par_iter().enumerate().map(gain_of).collect(),
+        false => half.iter().enumerate().map(gain_of).collect(),
+    }
+}
+
+/// Sort by gain, highest first, ties by position. Positions are unique,
+/// so the result is the same whichever sort runs.
+fn sort_by_gain(gains: &mut [(f32, u32)], parallel: bool) {
+    let by_gain = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+    match parallel {
+        true => gains.par_sort_by(by_gain),
+        false => gains.sort_by(by_gain),
+    }
+}
+
+/// One half of a split, as a term's move gain sees it.
+struct Side<'a> {
+    /// Documents in this half carrying the term.
+    deg: u32,
+    /// Documents in this half.
+    size: f32,
+    /// This half's cost table.
+    costs: &'a [f32],
+}
+
+impl Side<'_> {
+    #[inline]
+    fn cost(&self, deg: u32) -> f32 {
+        match self.costs.get(deg as usize) {
+            Some(&c) => c,
+            None => term_cost(deg, self.size),
+        }
+    }
+}
+
+/// What the cost drops by when one document carrying a term moves from
+/// `here` to `there`.
+#[inline]
+fn move_gain(here: &Side, there: &Side) -> f32 {
+    here.cost(here.deg) - here.cost(here.deg.saturating_sub(1)) + there.cost(there.deg)
+        - there.cost(there.deg + 1)
+}
+
+/// Fill `table` with `term_cost(d, size)` for every degree a half of
+/// `size` documents can reach, up to [`COST_TABLE_LEN`].
+fn fill_cost_table(table: &mut Vec<f32>, size: f32) {
+    // A degree reaches at most `size + 1`: the term's documents on this
+    // side plus the one moving in.
+    let len = (size as usize + 2).min(COST_TABLE_LEN);
+    table.clear();
+    table.extend((0..len as u32).map(|d| term_cost(d, size)));
 }
 
 /// What a term carried by `deg` of a half's `size` documents
@@ -398,5 +555,34 @@ mod tests {
     fn the_order_is_deterministic() {
         let (fwd, _) = clustered(1_000, 3, 5);
         assert_eq!(bisect_order(&fwd), bisect_order(&fwd));
+    }
+
+    #[test]
+    fn a_cost_matches_term_cost_on_both_sides_of_the_table() {
+        const SIZE: f32 = 200_000.0;
+        let mut costs = Vec::new();
+        fill_cost_table(&mut costs, SIZE);
+        assert_eq!(costs.len(), COST_TABLE_LEN);
+        let side = Side {
+            deg: 0,
+            size: SIZE,
+            costs: &costs,
+        };
+        let cap = COST_TABLE_LEN as u32;
+        for d in [0, 1, 2, cap - 1, cap, cap + 1, SIZE as u32 + 1] {
+            assert_eq!(
+                side.cost(d).to_bits(),
+                term_cost(d, SIZE).to_bits(),
+                "d={d}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_parallel_order_matches_the_serial_one() {
+        let (fwd, _) = clustered(3 * PARALLEL_MIN_PARTITION, 20, 13);
+        let mut serial: Vec<u32> = (0..fwd.len() as u32).collect();
+        BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0);
+        assert_eq!(bisect_order(&fwd), serial);
     }
 }

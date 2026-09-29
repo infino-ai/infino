@@ -1163,13 +1163,13 @@ impl FtsReader {
         if col.norms_loaded() {
             return Ok(());
         }
-        let n = col.n_docs as usize;
-        let array_len = n * col.doc_length_bytes;
-        let start = col.doc_lengths_range.start;
-        // The array plus its CRC, checked when verification is on.
+        // The array plus its CRC, checked when verification is on. The
+        // range is the open path's, bounded against the blob there; a source
+        // that answers short errors (`ShortRead`) rather than handing up a
+        // truncated buffer, so the slice below is within what came back.
         let array = self
             .source
-            .range_async(start..start + array_len + 4)
+            .range_async(col.array_with_crc_range())
             .await
             .map_err(|e| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
@@ -1177,7 +1177,7 @@ impl FtsReader {
                 )))
             })?;
         col.check_array_crc(&array)?;
-        let norms = col.norms_from_array(&array[..array_len]);
+        let norms = col.norms_from_array(&array[..col.array_len()]);
         // A concurrent prewarm may have won; either set is the same table.
         let _ = col.base_norms.set(norms);
         Ok(())
@@ -2226,10 +2226,20 @@ mod tests {
             );
         }
     }
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
 
     use async_trait::async_trait;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use tokio::{
+        spawn,
+        sync::Notify,
+        task::spawn_blocking,
+        time::{sleep, timeout},
+    };
 
     use super::{super::test_util::*, *};
     use crate::superfile::{
@@ -3993,6 +4003,233 @@ mod tests {
             .search("body", &["rust"], 10, BoolMode::Or)
             .await
             .expect("search over lazy reader");
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
+        assert!(ids.contains(&0) && ids.contains(&1));
+    }
+
+    /// How long the second of two racing searches may take while the first
+    /// is held on its read: far above a search over three documents.
+    const RACING_SEARCH_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Poll cadence while waiting for a paused read to be reached.
+    const PAUSE_POLL: Duration = Duration::from_millis(5);
+
+    /// A whole-blob source that serves bytes only asynchronously, the way
+    /// an object store does, and parks the first read touching `region`
+    /// until told to go on.
+    struct PausingSource {
+        inner: BytesLazyByteSource,
+        region: Range<usize>,
+        armed: AtomicBool,
+        paused: AtomicBool,
+        resume: Notify,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for PausingSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let touches =
+                (start as usize) < self.region.end && (start + len) as usize > self.region.start;
+            if touches && self.armed.swap(false, Ordering::SeqCst) {
+                self.paused.store(true, Ordering::SeqCst);
+                self.resume.notified().await;
+            }
+            self.inner.range(start, len).await
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// A lazy reader over a [`PausingSource`] parked on the column's length
+    /// array, armed after the open so only a query's read of the array
+    /// pauses; the source is returned so a test can watch and release it.
+    async fn reader_pausing_on_the_length_array() -> (Arc<PausingSource>, Arc<FtsReader>) {
+        let (blob, json) = build_blob();
+        let eager = FtsReader::open(blob.clone(), &json).expect("eager open");
+        let lengths = eager.columns[0].doc_lengths_range.clone();
+        let source = Arc::new(PausingSource {
+            inner: BytesLazyByteSource::new(blob),
+            region: lengths,
+            armed: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            resume: Notify::new(),
+        });
+        let src: Arc<dyn LazyByteSource> = source.clone();
+        let reader = Arc::new(
+            FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+                .await
+                .expect("open_lazy"),
+        );
+        source.armed.store(true, Ordering::SeqCst);
+        (source, reader)
+    }
+
+    /// Two scored single-term searches racing on a cold column: the second
+    /// completes while the first is still waiting for the length array.
+    ///
+    /// The single-term path used to reach the norms through the synchronous
+    /// fallback, whose initializer held the norms cell's lock across the
+    /// read, so the second search parked on that lock — a thread, and on an
+    /// `infino-io` worker the core the read needed — for as long as the
+    /// read took. Two workers, so a parked one is visible. This pins the
+    /// prewarm on the single-term path; the fallback's own lock behaviour
+    /// is pinned below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cold_scored_search_does_not_hold_a_racing_one_on_the_norms() {
+        let (source, reader) = reader_pausing_on_the_length_array().await;
+
+        let first = {
+            let reader = Arc::clone(&reader);
+            spawn(async move { reader.search("body", &["rust"], 10, BoolMode::Or).await })
+        };
+        // Bounded: a reader that stopped reading the array on a scored
+        // search would otherwise wait here forever instead of failing.
+        timeout(RACING_SEARCH_DEADLINE, async {
+            while !source.paused.load(Ordering::SeqCst) {
+                sleep(PAUSE_POLL).await;
+            }
+        })
+        .await
+        .expect("the first scored search must read the length array");
+        let second = {
+            let reader = Arc::clone(&reader);
+            spawn(async move { reader.search("body", &["rust"], 10, BoolMode::Or).await })
+        };
+        let second_done = timeout(RACING_SEARCH_DEADLINE, second).await;
+        // Release the first read before asserting, so a failure leaves no
+        // thread parked behind it.
+        source.resume.notify_one();
+        let first_hits = first
+            .await
+            .expect("first search task")
+            .expect("first search");
+        let second_hits = second_done
+            .expect("the second search must not wait on the first search's read")
+            .expect("second search task")
+            .expect("second search");
+        let first_ids: HashSet<u32> = first_hits.iter().map(|(d, _)| d.get()).collect();
+        let second_ids: HashSet<u32> = second_hits.iter().map(|(d, _)| d.get()).collect();
+        assert_eq!(first_ids, second_ids);
+        assert!(first_ids.contains(&0) && first_ids.contains(&1));
+    }
+
+    /// Two threads reaching a cold column's norms through the synchronous
+    /// fallback itself, the first parked on its read: the second returns
+    /// while the first is still parked, because the read runs outside the
+    /// cell. This is the assertion that fails if the read ever moves back
+    /// inside `get_or_init`, where the initializer's lock would hold the
+    /// second thread for as long as the first's read takes; the racing
+    /// search above no longer reaches the fallback, so it cannot tell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_fallback_read_does_not_hold_a_racing_one() {
+        let (source, reader) = reader_pausing_on_the_length_array().await;
+        let fallback = |reader: Arc<FtsReader>| {
+            spawn_blocking(move || {
+                reader.columns[0].norms();
+            })
+        };
+
+        let first = fallback(Arc::clone(&reader));
+        timeout(RACING_SEARCH_DEADLINE, async {
+            while !source.paused.load(Ordering::SeqCst) {
+                sleep(PAUSE_POLL).await;
+            }
+        })
+        .await
+        .expect("the first fallback must read the length array");
+        let second = timeout(RACING_SEARCH_DEADLINE, fallback(Arc::clone(&reader))).await;
+        let first_still_parked = !first.is_finished();
+        // Release the first read before asserting, so a failure leaves no
+        // thread parked behind it.
+        source.resume.notify_one();
+        first.await.expect("first fallback task");
+        second
+            .expect("the second fallback must not wait on the first's read")
+            .expect("second fallback task");
+        assert!(
+            first_still_parked,
+            "the first read was still parked when the second returned"
+        );
+        assert!(
+            reader.columns[0].norms_loaded(),
+            "either read fills the cell; both are the same table"
+        );
+    }
+
+    /// A whole-blob source whose first read touching `region` fails the
+    /// way a truncated object does, and serves every read after it.
+    struct FailingOnceSource {
+        inner: BytesLazyByteSource,
+        region: Range<usize>,
+        armed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for FailingOnceSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let touches =
+                (start as usize) < self.region.end && (start + len) as usize > self.region.start;
+            if touches && self.armed.swap(false, Ordering::SeqCst) {
+                return Err(LazyByteSourceError::ShortRead {
+                    start,
+                    requested: len,
+                    got: 0,
+                });
+            }
+            self.inner.range(start, len).await
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// A length-array read that fails in the synchronous fallback scores
+    /// that call against the empty table and leaves the column's cell
+    /// empty, so the next read fills it: the failure is not what every
+    /// later query on the reader scores against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_fallback_read_of_the_norms_is_not_cached() {
+        let (blob, json) = build_blob();
+        let eager = FtsReader::open(blob.clone(), &json).expect("eager open");
+        let lengths = eager.columns[0].doc_lengths_range.clone();
+        let source = Arc::new(FailingOnceSource {
+            inner: BytesLazyByteSource::new(blob),
+            region: lengths,
+            armed: AtomicBool::new(false),
+        });
+        let src: Arc<dyn LazyByteSource> = source.clone();
+        let reader = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        // Armed after the open, so the first read of the array is the
+        // fallback's.
+        source.armed.store(true, Ordering::SeqCst);
+        let column = &reader.columns[0];
+
+        // The fallback survives the failure without publishing it.
+        let _empty = column.norms();
+        assert!(
+            !column.norms_loaded(),
+            "a failed read must not fill the norms cell"
+        );
+
+        // The next scoring entry point reads the array again, and scores.
+        let hits = reader
+            .search("body", &["rust"], 10, BoolMode::Or)
+            .await
+            .expect("search after the failed read");
+        assert!(column.norms_loaded(), "the retry must fill the norms cell");
         let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0) && ids.contains(&1));
     }

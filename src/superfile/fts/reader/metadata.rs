@@ -16,7 +16,7 @@ use serde::Deserialize;
 use crate::superfile::{
     ReadError,
     error::FtsError,
-    format::checksum::crc32c,
+    format::{CRC_BYTES, checksum::crc32c},
     fts::{
         analysis::{Base, Stemmer, Stopwords},
         bm25,
@@ -354,7 +354,17 @@ impl ColumnNorms {
             bound_scale: 1.0,
         }
     }
+}
 
+/// The one empty table a failed read scores against, shared by every
+/// column in the process: it belongs to no column, so it is never put in a
+/// column's cell, which stays empty for the next read to fill.
+fn empty_norms() -> &'static ColumnNorms {
+    static EMPTY: OnceLock<ColumnNorms> = OnceLock::new();
+    EMPTY.get_or_init(ColumnNorms::empty)
+}
+
+impl ColumnNorms {
     /// These norms re-derived at `params`, for a view that scores with
     /// parameters other than `declared` — the ones the stored bounds were
     /// baked at. The per-doc length buckets are shared, not copied; the
@@ -434,29 +444,61 @@ impl ColumnMeta {
     /// fallback exists so a kernel can never find the norms absent — on an
     /// in-memory source it costs nothing, on a lazy one it is the read the
     /// prewarm would have made. A read that fails here logs and scores
-    /// against an empty table rather than aborting mid-kernel.
+    /// against an empty table rather than aborting mid-kernel — and leaves
+    /// the cell empty, so the next scoring entry point's prewarm reads
+    /// again rather than every later query scoring against the failure.
+    ///
+    /// The read runs outside the cell rather than inside `get_or_init`. An
+    /// initializer that fetches holds the cell's lock across the fetch, and
+    /// every other thread reaching the same cold column then parks on that
+    /// lock with no way to yield — on an `infino-io` worker that is the
+    /// runtime's own core, and the fetch that would release it is driven by
+    /// that runtime. Two threads racing here may both read the array; the
+    /// first to set wins and either is the same table, the trade the async
+    /// prewarm already makes.
     fn base_norms(&self) -> &ColumnNorms {
-        self.base_norms.get_or_init(|| {
-            let n = self.n_docs as usize;
-            let array_len = n * self.doc_length_bytes;
-            let start = self.doc_lengths_range.start;
-            let fetched = self
-                .source
-                .get_range(start..start + array_len + 4)
-                .map_err(|e| e.to_string())
-                .and_then(|array| {
-                    self.check_array_crc(&array)
-                        .map(|()| array)
-                        .map_err(|e| e.to_string())
-                });
-            match fetched {
-                Ok(array) => self.norms_from_array(&array[..array_len]),
-                Err(error) => {
-                    tracing::error!(column = %self.name, %error, "doc-length array unreadable; scoring against empty norms");
-                    ColumnNorms::empty()
+        if let Some(norms) = self.base_norms.get() {
+            return norms;
+        }
+        let fetched = self
+            .source
+            .get_range(self.array_with_crc_range())
+            .map_err(|e| e.to_string())
+            .and_then(|array| {
+                self.check_array_crc(&array)
+                    .map(|()| array)
+                    .map_err(|e| e.to_string())
+            });
+        match fetched {
+            Ok(array) => {
+                let norms = self.norms_from_array(&array[..self.array_len()]);
+                self.base_norms.get_or_init(|| norms)
+            }
+            Err(error) => {
+                tracing::error!(column = %self.name, %error, "doc-length array unreadable; scoring against empty norms");
+                // A racing reader may have set the cell meanwhile; its
+                // table is the real one.
+                match self.base_norms.get() {
+                    Some(norms) => norms,
+                    None => empty_norms(),
                 }
             }
-        })
+        }
+    }
+
+    /// The length array's byte length, `n_docs × doc_length_bytes`: the
+    /// span of [`Self::doc_lengths_range`], which the open path computed and
+    /// bounded against the blob. Read off the range rather than recomputed,
+    /// so no reader of the array carries arithmetic of its own.
+    pub(super) fn array_len(&self) -> usize {
+        self.doc_lengths_range.len()
+    }
+
+    /// The length array with the CRC that trails it: what a reader fetches.
+    /// The open path refused a column whose array plus CRC ran past the
+    /// source, so this end is within the blob, and the sum cannot overflow.
+    pub(super) fn array_with_crc_range(&self) -> Range<usize> {
+        self.doc_lengths_range.start..self.doc_lengths_range.end + CRC_BYTES
     }
 
     /// Check the CRC that trails the length array in `array_with_crc`, when
@@ -466,8 +508,8 @@ impl ColumnMeta {
         if !self.verify_crc {
             return Ok(());
         }
-        let len = self.n_docs as usize * self.doc_length_bytes;
-        let Some(crc_bytes) = array_with_crc.get(len..len + 4) else {
+        let len = self.array_len();
+        let Some(crc_bytes) = array_with_crc.get(len..len + CRC_BYTES) else {
             return Err(FtsError::Read(ReadError::MalformedVersion(
                 "doc-lengths array shorter than its CRC".into(),
             )));
@@ -495,15 +537,22 @@ impl ColumnMeta {
     }
 
     /// The norms this column scores with: the declared ones, or the
-    /// override view's, derived from them on first use.
+    /// override view's, derived from them on first use. A view is derived
+    /// only from the base in the cell, never from what [`Self::base_norms`]
+    /// returned: that may be the empty fallback of a read that failed, and
+    /// a racing reader may fill the cell between the fallback and here — a
+    /// view cached from the fallback would outlive the failure it stood in
+    /// for, and its empty table is one `get` must never see.
     pub(super) fn norms(&self) -> &ColumnNorms {
+        let base = self.base_norms();
         if self.params == self.declared_params {
-            return self.base_norms();
+            return base;
         }
-        self.view_norms.get_or_init(|| {
-            self.base_norms()
-                .rescored(self.declared_params, self.params)
-        })
+        let Some(base) = self.base_norms.get() else {
+            return base;
+        };
+        self.view_norms
+            .get_or_init(|| base.rescored(self.declared_params, self.params))
     }
 
     /// Whether the declared-parameter norms have been built.

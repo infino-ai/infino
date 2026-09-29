@@ -34,8 +34,8 @@ use crate::{
     },
     supertable::{
         Supertable,
-        compaction::{CompactionJob, JobOutcome, SuperfileMerge},
         error::{CompactionError, ReindexError},
+        optimize::compact::{CompactionJob, JobOutcome, SuperfileMerge},
         query::dispatch::open_compaction_input,
     },
 };

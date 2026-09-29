@@ -28,8 +28,8 @@ use crate::{
     },
     supertable::{
         BuildError,
-        compaction::{CompactionMerge, MergeInputs, SuperfileMerge},
         manifest::SuperfileEntry,
+        optimize::compact::{CompactionMerge, MergeInputs, SuperfileMerge},
     },
 };
 

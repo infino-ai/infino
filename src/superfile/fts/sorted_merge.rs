@@ -3,13 +3,13 @@
 
 //! Merge the FTS indexes of already-built superfiles term by term.
 //!
-//! Every input's dictionary is in term order, and every input's rows land
-//! in the output in input order through a remap that never goes down. So
-//! the merged postings of a term are each input's postings for it, joined
-//! in input order — already sorted by output doc id. A k-way merge over the
-//! inputs' dictionaries yields the output in final order, with no
-//! corpus-sized accumulator and no sort; peak memory is one term's
-//! postings across all inputs.
+//! Every input's dictionary is in term order, so a k-way merge over the
+//! inputs' dictionaries yields the output terms in final order, with no
+//! corpus-sized accumulator; peak memory is one term's postings across all
+//! inputs. When every remap rises, a term's postings joined in input order
+//! are already sorted by output doc id. When one does not (the merge chose
+//! its own doc order, or an input stores its docs under one), that one
+//! term's postings are sorted before they are emitted.
 
 use std::{
     cmp::Reverse, collections::BinaryHeap, io::Error, iter::once, str::from_utf8, sync::Arc, vec,
@@ -23,7 +23,7 @@ use crate::{
         fts::{positions::encode_run, reader::FtsReader},
         id_space::FtsDocId,
     },
-    utils::terms::FstValue,
+    utils::{terms::FstValue, varint::read_varint},
 };
 
 /// Terms each input cursor reads from its dictionary at a time.
@@ -33,11 +33,7 @@ pub(crate) const TERMS_PER_CHUNK: usize = 4096;
 pub(crate) struct SortedInput {
     pub(crate) reader: Arc<SuperfileReader>,
     /// The output blob doc id each of this input's own doc ids becomes;
-    /// `None` drops the row. Must never go down, and must sit above every
-    /// earlier input's ids — this merge joins each input's postings for a
-    /// term in input order and never sorts, so a remap that falls would
-    /// emit a posting list out of order. A caller whose remap cannot rise
-    /// takes the accumulator instead.
+    /// `None` drops the row. Output ids must be unique across all inputs.
     pub(crate) remap: Vec<Option<FtsDocId>>,
 }
 
@@ -76,6 +72,7 @@ pub(crate) fn merge_column(
     let mut postings: Vec<(u32, u32)> = Vec::new();
     let mut runs: Vec<u8> = Vec::new();
     let mut positions_buf: Vec<u32> = Vec::new();
+    let mut sort_scratch = SortScratch::default();
     while let Some(Reverse((term, first))) = heap.pop() {
         contributors.clear();
         contributors.push(first);
@@ -87,6 +84,7 @@ pub(crate) fn merge_column(
 
         postings.clear();
         runs.clear();
+        let mut ascending = true;
         for &i in &contributors {
             let value = values[i].ok_or(BuildError::BatchReadError)?;
             let remap = &inputs[i].remap;
@@ -97,13 +95,13 @@ pub(crate) fn merge_column(
                     &mut positions_buf,
                     |_, doc, tf, pos| {
                         if let Some(out_doc) = remap[doc as usize] {
-                            // Nothing sorts these postings, so a remap that
-                            // goes down would write a wrong posting list.
                             debug_assert!(
-                                postings.last().is_none_or(|&(d, _)| d < out_doc.get()),
-                                "sorted merge: output doc ids must ascend"
+                                pos.is_empty() || pos.len() == tf as usize,
+                                "sorted merge: a position run must hold tf positions"
                             );
-                            postings.push((out_doc.get(), tf));
+                            let out_doc = out_doc.get();
+                            ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
+                            postings.push((out_doc, tf));
                             encode_run(&mut runs, pos);
                         }
                         Ok(())
@@ -123,7 +121,66 @@ pub(crate) fn merge_column(
         if postings.is_empty() {
             continue;
         }
-        emit(term, &postings, &runs)?;
+        if ascending {
+            emit(term, &postings, &runs)?;
+            continue;
+        }
+        let runs = sort_scratch.sort(&mut postings, &runs)?;
+        debug_assert!(
+            postings.is_sorted_by(|a, b| a.0 < b.0),
+            "sorted merge: output doc ids must be unique"
+        );
+        emit(term, &postings, runs)?;
+    }
+    Ok(())
+}
+
+/// Reused buffers for sorting one term's postings by output doc id.
+#[derive(Default)]
+struct SortScratch {
+    /// `(output_doc_id, tf, run_start)` per posting.
+    entries: Vec<(u32, u32, usize)>,
+    /// The runs in sorted order.
+    runs: Vec<u8>,
+}
+
+impl SortScratch {
+    /// Sort `postings` in place by doc id and return `runs` in the same
+    /// order. A column without positions has no runs to move.
+    fn sort(&mut self, postings: &mut [(u32, u32)], runs: &[u8]) -> Result<&[u8], BuildError> {
+        self.runs.clear();
+        if runs.is_empty() {
+            postings.sort_unstable_by_key(|p| p.0);
+            return Ok(&self.runs);
+        }
+        // Runs carry no length; a run is exactly `tf` varints.
+        self.entries.clear();
+        let mut at = 0;
+        for &(doc, tf) in postings.iter() {
+            self.entries.push((doc, tf, at));
+            skip_run(runs, &mut at, tf)?;
+        }
+        debug_assert_eq!(
+            at,
+            runs.len(),
+            "sorted merge: runs must end with the last posting"
+        );
+        self.entries.sort_unstable_by_key(|e| e.0);
+        for (slot, &(doc, tf, start)) in postings.iter_mut().zip(&self.entries) {
+            *slot = (doc, tf);
+            let mut end = start;
+            skip_run(runs, &mut end, tf)?;
+            self.runs.extend_from_slice(&runs[start..end]);
+        }
+        Ok(&self.runs)
+    }
+}
+
+/// Move `*at` past one run of `tf` positions.
+fn skip_run(runs: &[u8], at: &mut usize, tf: u32) -> Result<(), BuildError> {
+    for _ in 0..tf {
+        read_varint(runs, at)
+            .ok_or_else(|| BuildError::Io(Error::other("fts sorted merge: bad position run")))?;
     }
     Ok(())
 }

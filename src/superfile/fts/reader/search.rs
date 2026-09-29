@@ -1178,6 +1178,23 @@ impl FtsReader {
                 },
             }
         };
+        if matches!(source, SingleSource::Absent) {
+            // No norms are read for a term this superfile does not hold:
+            // the fan-out reaches every superfile, and one without the term
+            // costs no length-array bytes.
+            return Ok((Vec::new(), MatchWork::default(), 0));
+        }
+        // Every scoring branch below reads the column's norms. Load them
+        // here, on the caller's runtime — the prewarm every other scoring
+        // shape makes in its cursor build — so no kernel reaches the
+        // synchronous fallback in `ColumnMeta::norms`: on a lazy source that
+        // fallback fetches the length array through the sync bridge from
+        // whatever thread the kernel is on, and on an `infino-io` worker
+        // that parks the runtime's own core on a storage read. This path had
+        // no prewarm of its own, and two cold scored queries racing on one
+        // column could park every core with nothing left to drive the read
+        // that would release them.
+        self.ensure_norms(column_id).await?;
         let (term_bytes, header_probed) = match source {
             SingleSource::Absent => return Ok((Vec::new(), MatchWork::default(), 0)),
             SingleSource::Inline { doc_id, tf } => {
