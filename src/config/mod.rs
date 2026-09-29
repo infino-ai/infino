@@ -271,9 +271,31 @@ const DEFAULT_COMPACTION_MAX_CONCURRENT_JOBS: ThreadCount = ThreadCount::Fixed(1
 
 /// Upper bound on the resolved concurrent-job width. A compaction pass that
 /// keeps this many merges in flight already saturates any realistic
-/// object-store connection pool, and each one holds `max_memory_mb`; a
-/// mis-derived `auto` must not run away past it.
+/// object-store connection pool; a mis-derived `auto` must not run away past
+/// it.
 const MAX_COMPACTION_CONCURRENT_JOBS: usize = 64;
+
+/// What a merge actually costs resident, as a percentage of the
+/// `max_memory_mb` it is configured with.
+///
+/// `max_memory_mb` bounds the RAW INPUT bytes a merge materializes. The
+/// decoded rows, the merge buffers and the encoded output sit on top of that,
+/// so resident cost runs well above the setting, and sizing concurrency off
+/// the setting alone overcommits the host.
+///
+/// Measured on a 10M-doc, 183-superfile fixture compacted to 1 GiB outputs
+/// (so `max_memory_mb` was 3072): peak RSS was 6.78 GB with one merge in
+/// flight and 13.63 GB with two, i.e. 2.26x the configured budget per job,
+/// tracking width linearly. Rounded up to 2.5x, since the measurement is one
+/// corpus and undershooting here is an OOM.
+const COMPACTION_RESIDENT_PERCENT_OF_BUDGET: u64 = 250;
+
+/// Share of available memory `auto` refuses to plan into, so a pass sized for
+/// a machine it owns still leaves the kernel page cache and any co-tenant
+/// room to breathe. Undershooting the width costs some wall time; overshooting
+/// it costs the whole pass to the OOM killer, so the margin is deliberately
+/// generous.
+const COMPACTION_MEMORY_MARGIN_PERCENT: u64 = 25;
 
 /// Bytes per mebibyte — the unit the memory budgets are expressed in.
 const MIB_BYTES: u64 = 1024 * 1024;
@@ -1282,15 +1304,32 @@ impl Serialize for ThreadCount {
     }
 }
 
+/// How many merges `available_bytes` can hold, given the per-merge budget.
+///
+/// Sized so a pass that owns its machine does not OOM: the budget is scaled to
+/// what a merge really costs resident, and a margin of the host's memory is
+/// left unplanned. Floors at 1 -- a host too small for one merge still has to
+/// run one, since refusing to compact is worse than swapping.
+fn concurrency_for_memory(available_bytes: u64, max_memory_mb: u64) -> usize {
+    let per_job_bytes = max_memory_mb
+        .saturating_mul(MIB_BYTES)
+        .saturating_mul(COMPACTION_RESIDENT_PERCENT_OF_BUDGET)
+        / 100;
+    if per_job_bytes == 0 {
+        return 1;
+    }
+    let usable = available_bytes / 100 * (100 - COMPACTION_MEMORY_MARGIN_PERCENT);
+    (usable / per_job_bytes).max(1) as usize
+}
+
 impl Config {
     /// How many compaction merge jobs a pass may run at once.
     ///
     /// An explicit setting is honored (clamped to the sane band); `auto`
     /// derives the width from the two things that actually bound it:
     ///
-    /// - **Memory.** Each in-flight job materializes up to
-    ///   `compaction.max_memory_mb` of raw input, so available memory divided
-    ///   by that budget is the number the host can hold. Where the OS won't
+    /// - **Memory.** See [`concurrency_for_memory`]: available memory, less a
+    ///   margin, over what a merge actually costs resident. Where the OS won't
     ///   say (no procfs), this falls back to 1 rather than guessing.
     /// - **CPU.** Merges run on the maintenance pool, so more concurrent jobs
     ///   than that pool is width without throughput.
@@ -1302,11 +1341,10 @@ impl Config {
             .vector
             .maintenance_threads
             .resolve_or_default(available_parallelism().map(NonZeroUsize::get).unwrap_or(1));
-        let budget_bytes = compaction.max_memory_mb.saturating_mul(MIB_BYTES);
-        let by_memory = match (available_memory_bytes(), budget_bytes) {
-            (Some(available), budget) if budget > 0 => (available / budget) as usize,
-            // No procfs, or a zero budget: stay serial rather than invent a width.
-            _ => 1,
+        let by_memory = match available_memory_bytes() {
+            Some(available) => concurrency_for_memory(available, compaction.max_memory_mb),
+            // No procfs: stay serial rather than invent a width.
+            None => 1,
         };
         compaction
             .max_concurrent_jobs
@@ -2186,5 +2224,59 @@ vector:
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Fixed(12));
         // Untouched keys fall through to the embedded default.
         assert_eq!(cfg.vector.drain_batch_superfiles, 64);
+    }
+    /// Bytes in a gibibyte, for readable fixture sizes.
+    const GIB: u64 = 1024 * 1024 * 1024;
+    /// The `max_memory_mb` the measured sweep ran with (1 GiB target + 2 GiB).
+    const MEASURED_BUDGET_MB: u64 = 3072;
+
+    /// `auto` is sized off what a merge COSTS, not what it is budgeted.
+    ///
+    /// The sweep this is calibrated from peaked at 6.78 GB resident for one
+    /// merge configured with a 3 GiB budget, and 38.58 GB at width 8. On the
+    /// 85 GB box it ran on (84 GB available) the derived width must therefore
+    /// be one whose measured footprint fits with room to spare -- the old
+    /// formula, dividing by the budget alone, produced 28 and would have
+    /// planned roughly 190 GB onto that host.
+    #[test]
+    fn auto_concurrency_fits_the_measured_cost_of_a_merge() {
+        let width = concurrency_for_memory(84 * GIB, MEASURED_BUDGET_MB);
+        // 84 GiB less a 25% margin, over 3072 MiB scaled to 2.5x.
+        assert_eq!(width, 8, "derived width on the measured host");
+        // The measured peak at width 8 was 38.58 GB; that must sit inside the
+        // memory the formula planned for, or the margin is fiction.
+        let planned = width as u64 * MEASURED_BUDGET_MB * 1024 * 1024 * 250 / 100;
+        assert!(
+            planned >= 38_580_000_000,
+            "planned {planned} B must cover the measured 38.58 GB peak"
+        );
+        assert!(planned <= 84 * GIB, "planned {planned} B must fit the host");
+        // The pre-measurement formula (available / budget) would have been 28.
+        assert!(
+            84 * GIB / (MEASURED_BUDGET_MB * 1024 * 1024) > 3 * width as u64,
+            "guard: the naive divisor really is several times too generous"
+        );
+    }
+
+    /// A host too small for even one merge still runs one: refusing to compact
+    /// is worse than swapping, and the floor keeps a zero out of the wave loop.
+    #[test]
+    fn auto_concurrency_floors_at_one() {
+        assert_eq!(concurrency_for_memory(0, MEASURED_BUDGET_MB), 1);
+        assert_eq!(concurrency_for_memory(GIB, MEASURED_BUDGET_MB), 1);
+        // A zero budget would divide by zero; it must not.
+        assert_eq!(concurrency_for_memory(84 * GIB, 0), 1);
+    }
+
+    /// Raising the per-merge budget makes each merge more expensive, so the
+    /// derived width must fall rather than stay put.
+    #[test]
+    fn auto_concurrency_shrinks_as_the_budget_grows() {
+        let narrow = concurrency_for_memory(84 * GIB, MEASURED_BUDGET_MB);
+        let wide = concurrency_for_memory(84 * GIB, MEASURED_BUDGET_MB * 4);
+        assert!(
+            wide < narrow,
+            "a 4x budget must not keep the same width: {wide} vs {narrow}"
+        );
     }
 }
