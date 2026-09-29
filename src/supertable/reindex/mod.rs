@@ -26,7 +26,7 @@ use uuid::Uuid;
 mod build;
 
 use crate::{
-    config::{ReindexMode, ReindexOptions},
+    config::{ReindexMode, ReindexOptions, ReindexTarget},
     runtime_bridge::bridge_on_runtime,
     superfile::{
         fts::reader::{FtsStaleness, StaleColumn},
@@ -214,15 +214,19 @@ pub struct ReindexReport {
 /// an interrupted migration resume by simply re-planning: the superfiles
 /// already rewritten are no longer stale and drop out.
 ///
-/// Selects on [`FtsStaleness::needs_rewrite`] rather than on staleness in
-/// general, and the difference is what makes a migration terminate. A
-/// rewrite carries postings across, so it moves a file's container to the
-/// current one and leaves its analysis revision exactly where it was —
-/// planning a rewrite for a file that is only analysis-stale would emit
-/// the same job on every run, each producing a file as stale as the last.
-/// Those files need re-analysis, which is a different operation, and they
-/// are reported rather than rewritten.
-pub(crate) fn plan_jobs(stale: &[StaleSuperfile], mode: ReindexMode) -> Vec<CompactionJob> {
+/// Under [`ReindexMode::Rewrite`] this selects on
+/// [`FtsStaleness::needs_rewrite`] rather than on staleness in general,
+/// and the difference is what makes a migration terminate. A rewrite
+/// carries postings across, so it moves a file's container to the current
+/// one and leaves its analysis revision exactly where it was — planning a
+/// rewrite for a file that is only analysis-stale would emit the same job
+/// on every run, each producing a file as stale as the last. Those files
+/// need re-analysis, and under that mode they are reported rather than
+/// rewritten.
+pub(crate) fn plan_jobs(
+    stale: &[StaleSuperfile],
+    mode: ReindexMode,
+) -> Vec<(CompactionJob, Repair)> {
     let mut stale: Vec<&StaleSuperfile> = stale
         .iter()
         .filter(|s| match mode {
@@ -232,18 +236,44 @@ pub(crate) fn plan_jobs(stale: &[StaleSuperfile], mode: ReindexMode) -> Vec<Comp
             ReindexMode::Rewrite => s.fts.needs_rewrite(),
             // Re-analysis produces new terms and a current container, so
             // it repairs either axis.
-            ReindexMode::Reanalyze => s.fts.needs_rewrite() || s.fts.needs_reanalysis(),
+            ReindexMode::Auto | ReindexMode::Reanalyze => {
+                s.fts.needs_rewrite() || s.fts.needs_reanalysis()
+            }
         })
         .collect();
     stale.sort_by_key(|s| s.superfile_id);
     stale
         .into_iter()
-        .map(|s| CompactionJob {
-            partition_key: s.partition_key.clone(),
-            inputs: vec![s.superfile_id],
-            estimated_output_bytes: s.live_bytes,
+        .map(|s| {
+            let repair = match mode {
+                ReindexMode::Rewrite => Repair::Layout,
+                ReindexMode::Reanalyze => Repair::Terms,
+                // The cheapest repair that makes *this* file current:
+                // copying postings cannot clear a stale revision, so only
+                // a file whose terms are current can take the cheap one.
+                ReindexMode::Auto => match s.fts.needs_reanalysis() {
+                    true => Repair::Terms,
+                    false => Repair::Layout,
+                },
+            };
+            let job = CompactionJob {
+                partition_key: s.partition_key.clone(),
+                inputs: vec![s.superfile_id],
+                estimated_output_bytes: s.live_bytes,
+            };
+            (job, repair)
         })
         .collect()
+}
+
+/// The repair one superfile gets, after [`ReindexMode::Auto`] has been
+/// resolved against what that file is actually behind on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Repair {
+    /// Copy the postings into the current layout.
+    Layout,
+    /// Re-analyze the stored text, which brings the layout current too.
+    Terms,
 }
 
 impl Supertable {
@@ -387,11 +417,46 @@ impl Supertable {
         Ok(report)
     }
 
+    /// Repair the index named by [`ReindexOptions::target`] in every
+    /// superfile this table holds that is behind what this engine writes.
+    ///
+    /// Scope, because a table is more than its superfiles:
+    ///
+    /// - **Rebuilt** — the full-text index inside each stale superfile.
+    /// - **Copied byte for byte** — the Parquet body and the vector blob,
+    ///   so a repair never re-encodes a row or decodes a vector.
+    /// - **Never opened** — the hidden vector index.
+    /// - **Written to publish the result, not migrated** — one manifest
+    ///   commit per superfile, each output's tombstone sidecar, and the
+    ///   table's term-statistics sidecar. These follow from replacing a
+    ///   file; their own formats are untouched.
+    ///
+    /// Superfiles are brought to the index layout this engine writes. One
+    /// already at or above it is left alone, because a newer release may
+    /// write a layout this one does not produce.
+    ///
+    /// Rows, their order and their `_id`s are identical across a repair,
+    /// deleted rows included — dropping them would renumber the
+    /// survivors.
+    ///
+    /// # Errors
+    ///
+    /// [`ReindexError::NoStorage`] when the table has none,
+    /// [`ReindexError::AlreadyRunning`] when a compaction or another
+    /// reindex holds the slot, and [`ReindexError::Rewrite`] when a
+    /// superfile fails to rewrite. Superfiles another run has sealed are
+    /// counted in [`ReindexReport::held_by_another_run`] rather than
+    /// failing the run.
     pub fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
         bridge_on_runtime(self.reindex_async(opts), &self.inner().query_runtime())
     }
 
     async fn reindex_async(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
+        // Everything below assesses and repairs the full-text index. The
+        // match is what makes a second target a decision here rather than
+        // a field this function quietly ignores.
+        let ReindexTarget::Fts = opts.target;
+
         let manifest = self.inner().manifest.load_full();
         if manifest.options.storage.is_none() {
             return Err(ReindexError::NoStorage);
@@ -420,8 +485,10 @@ impl Supertable {
             awaiting_reanalysis: match opts.mode {
                 // Re-analysis is what clears this axis, so a run that
                 // performs it leaves nothing waiting — except the columns
-                // it could not repair, which are named separately.
-                ReindexMode::Reanalyze => 0,
+                // it could not repair, which are named separately. `Auto`
+                // re-analyzes exactly the files on this axis, so it clears
+                // it too.
+                ReindexMode::Auto | ReindexMode::Reanalyze => 0,
                 ReindexMode::Rewrite => all.iter().filter(|s| s.fts.needs_reanalysis()).count(),
             },
             ..Default::default()
@@ -442,16 +509,19 @@ impl Supertable {
             );
         }
 
-        // `Rewrite` is compaction's build with deletions off; `Reanalyze`
-        // is this tool's own. Both carry the row set.
-        let merge: Arc<dyn SuperfileMerge> = match opts.mode {
-            ReindexMode::Rewrite => Arc::new(build::RewriteMerge),
-            ReindexMode::Reanalyze => Arc::new(build::ReanalyzeMerge),
-        };
-        for (done, job) in plan_jobs(&all, opts.mode).into_iter().enumerate() {
+        // `Layout` is compaction's build with deletions off; `Terms` is
+        // this tool's own. Both carry the row set. Built once and shared,
+        // because the plan picks between them per superfile.
+        let layout: Arc<dyn SuperfileMerge> = Arc::new(build::RewriteMerge);
+        let terms: Arc<dyn SuperfileMerge> = Arc::new(build::ReanalyzeMerge);
+        for (done, (job, repair)) in plan_jobs(&all, opts.mode).into_iter().enumerate() {
+            let merge = match repair {
+                Repair::Layout => &layout,
+                Repair::Terms => &terms,
+            };
             let superfile_id = job.inputs[0];
             let outcome = match self
-                .run_compaction_job_with(job, stale_seal_timeout, Arc::clone(&merge))
+                .run_compaction_job_with(job, stale_seal_timeout, Arc::clone(merge))
                 .await
             {
                 Ok(outcome) => outcome,
@@ -550,7 +620,7 @@ mod tests {
             ReindexMode::Rewrite,
         );
         assert_eq!(jobs.len(), 1, "{jobs:?}");
-        assert_eq!(jobs[0].inputs, vec![Uuid::from_u128(1)]);
+        assert_eq!(jobs[0].0.inputs, vec![Uuid::from_u128(1)]);
     }
 
     /// A file that is *only* analysis-stale earns no rewrite, and this is
@@ -582,6 +652,55 @@ mod tests {
         assert_eq!(plan_jobs(&[entry(5, both)], ReindexMode::Rewrite).len(), 1);
     }
 
+    /// `Auto` gives each superfile the cheapest repair that makes *it*
+    /// current, rather than charging the whole run the most expensive one
+    /// any file needs.
+    ///
+    /// This is the distinction the mode exists for: under `Reanalyze` a
+    /// file that is only behind on its container is tokenized again for
+    /// nothing, which costs far more than copying its postings.
+    #[test]
+    fn auto_repairs_each_superfile_by_what_that_file_is_behind_on() {
+        let both = FtsStaleness {
+            container: Some(4),
+            analysis: behind_analysis().analysis,
+        };
+        let plan = plan_jobs(
+            &[
+                entry(1, behind_container()),
+                entry(2, behind_analysis()),
+                entry(3, both),
+            ],
+            ReindexMode::Auto,
+        );
+        let repairs: Vec<Repair> = plan.iter().map(|(_, r)| *r).collect();
+        assert_eq!(
+            repairs,
+            vec![Repair::Layout, Repair::Terms, Repair::Terms],
+            "only the container-stale file may take the cheap repair"
+        );
+    }
+
+    /// `Reanalyze` re-analyzes even a file whose terms are current, which
+    /// is the only thing it offers over `Auto`.
+    #[test]
+    fn reanalyze_rebuilds_terms_even_where_only_the_container_is_behind() {
+        let plan = plan_jobs(&[entry(1, behind_container())], ReindexMode::Reanalyze);
+        assert_eq!(
+            plan.iter().map(|(_, r)| *r).collect::<Vec<_>>(),
+            vec![Repair::Terms]
+        );
+    }
+
+    /// `Auto` leaves nothing stale: it plans both axes, where `Rewrite`
+    /// plans only one.
+    #[test]
+    fn auto_plans_every_stale_superfile() {
+        let stale = [entry(1, behind_container()), entry(2, behind_analysis())];
+        assert_eq!(plan_jobs(&stale, ReindexMode::Auto).len(), 2);
+        assert_eq!(plan_jobs(&stale, ReindexMode::Rewrite).len(), 1);
+    }
+
     /// Every job takes exactly one input, so a rewrite never merges rows
     /// that were not already together.
     #[test]
@@ -590,8 +709,8 @@ mod tests {
             &[entry(9, behind_container()), entry(4, behind_analysis())],
             ReindexMode::Rewrite,
         );
-        assert!(jobs.iter().all(|j| j.inputs.len() == 1), "{jobs:?}");
-        assert_eq!(jobs[0].partition_key, vec![7], "partition is carried");
+        assert!(jobs.iter().all(|(j, _)| j.inputs.len() == 1), "{jobs:?}");
+        assert_eq!(jobs[0].0.partition_key, vec![7], "partition is carried");
     }
 
     /// A plan is stable across runs, which is what makes an interrupted

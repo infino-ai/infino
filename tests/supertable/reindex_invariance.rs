@@ -191,7 +191,7 @@ pub(crate) fn rows_by_id(db: &Connection) -> Vec<(i128, String, String, Option<S
 /// what remains on disk is what the table now reads.
 fn rewrite(table: &Supertable) {
     let report = table
-        .reindex(&ReindexOptions::default())
+        .reindex(&ReindexOptions::rewriting())
         .expect("a container rewrite is available to a hybrid table");
     assert!(
         report.rewritten > 0,
@@ -533,7 +533,7 @@ fn a_second_run_over_a_table_with_deletions_has_nothing_to_do() {
     );
 
     let second = table
-        .reindex(&ReindexOptions::default())
+        .reindex(&ReindexOptions::rewriting())
         .expect("a second run is allowed");
     assert_eq!(
         second.rewritten, 0,

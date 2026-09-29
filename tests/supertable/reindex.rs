@@ -37,7 +37,7 @@ fn assert_reindex_migrates(shape: &str, from_version: u32) {
     assert!(!ranking_before.is_empty());
 
     let report = table
-        .reindex(&ReindexOptions::default())
+        .reindex(&ReindexOptions::rewriting())
         .expect("reindex a table written by an older engine");
     assert_eq!(
         report.rewritten,
@@ -84,7 +84,7 @@ fn assert_reindex_migrates(shape: &str, from_version: u32) {
     // the whole corpus on every run and never converge. The report says so
     // instead.
     let again = table
-        .reindex(&ReindexOptions::default())
+        .reindex(&ReindexOptions::rewriting())
         .expect("a second reindex is a no-op");
     assert_eq!(again.rewritten, 0, "{shape}: reindex is not idempotent");
     assert_eq!(
@@ -213,7 +213,7 @@ fn assert_mixed_table_reads_cleanly(shape: &str, from_version: u32) {
     // state rather than from a uniform one. The appended file is already
     // current, so the planner must skip it rather than rewrite it.
     let report = table
-        .reindex(&ReindexOptions::default())
+        .reindex(&ReindexOptions::rewriting())
         .expect("reindex a mixed table");
     assert_eq!(
         report.already_current, 1,
@@ -368,7 +368,7 @@ fn assert_staleness_predicts_the_run(shape: &str) {
     );
 
     let report = table
-        .reindex(&ReindexOptions::default())
+        .reindex(&ReindexOptions::rewriting())
         .expect("rewrite what the assessment described");
     assert_eq!(
         report.rewritten, before.needing_rewrite,
@@ -570,4 +570,65 @@ fn reanalysis_of_the_newest_shape_converges_without_changing_terms() {
         .reindex(&ReindexOptions::reanalyzing())
         .expect("second re-analysis");
     assert_eq!(again.rewritten, 0, "re-analysis is not idempotent");
+}
+
+/// The default mode leaves nothing stale, where the cheap one cannot.
+///
+/// This is the difference between the two that matters to a caller: a
+/// layout-only repair brings the container current and reports the terms
+/// it could not fix, so the table is still behind when it finishes.
+/// `Auto` repairs both axes, and repairs them in one run.
+#[test]
+fn the_default_mode_leaves_the_table_current_where_a_rewrite_cannot() {
+    const SHAPE: &str = "v5_positional";
+    let Some(_) = corpus_dir(SHAPE) else {
+        return;
+    };
+
+    // The cheap mode, for contrast: containers current, terms still old.
+    let (_tmp, rewritten, _root) = open_corpus(SHAPE).expect("corpus present");
+    rewritten
+        .reindex(&ReindexOptions::rewriting())
+        .expect("rewrite");
+    let after_rewrite = rewritten.index_staleness().expect("assess");
+    assert_eq!(after_rewrite.needing_rewrite, 0);
+    assert!(
+        after_rewrite.awaiting_reanalysis > 0 && !after_rewrite.is_current(),
+        "a layout-only repair has to leave the analysis axis behind, or \
+         this test is not comparing two different things: {after_rewrite:?}"
+    );
+
+    let (_tmp2, table, _root2) = open_corpus(SHAPE).expect("corpus present");
+    let report = table
+        .reindex(&ReindexOptions::default())
+        .expect("the default repairs a table written by an older engine");
+    assert!(report.rewritten > 0, "{report:?}");
+    assert_eq!(
+        report.awaiting_reanalysis, 0,
+        "the default left files waiting on a repair it performs: {report:?}"
+    );
+
+    let after = table.index_staleness().expect("assess");
+    assert!(
+        after.is_current(),
+        "the default mode finished with the table still stale: {after:?}"
+    );
+
+    // The terms the older analysis could not produce are reachable, which
+    // is what a re-analysis buys over a rewrite.
+    assert_eq!(
+        hits(&table, "body", "common"),
+        N_DOCS,
+        "the corpus-wide term stopped matching every document"
+    );
+
+    // And it converges: a second run has nothing left to do.
+    let again = table
+        .reindex(&ReindexOptions::default())
+        .expect("second run");
+    assert_eq!(
+        (again.rewritten, again.awaiting_reanalysis),
+        (0, 0),
+        "{again:?}"
+    );
 }

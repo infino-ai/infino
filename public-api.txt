@@ -228,6 +228,7 @@ impl core::marker::UnsafeUnpin for infino::ReindexError
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ReindexError
 impl core::panic::unwind_safe::UnwindSafe for infino::ReindexError
 pub enum infino::ReindexMode
+pub infino::ReindexMode::Auto
 pub infino::ReindexMode::Reanalyze
 pub infino::ReindexMode::Rewrite
 impl core::clone::Clone for infino::ReindexMode
@@ -248,6 +249,26 @@ impl core::marker::Unpin for infino::ReindexMode
 impl core::marker::UnsafeUnpin for infino::ReindexMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ReindexMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ReindexMode
+#[non_exhaustive] pub enum infino::ReindexTarget
+pub infino::ReindexTarget::Fts
+impl core::clone::Clone for infino::ReindexTarget
+pub fn infino::ReindexTarget::clone(&self) -> Self
+impl core::cmp::Eq for infino::ReindexTarget
+impl core::cmp::PartialEq for infino::ReindexTarget
+pub fn infino::ReindexTarget::eq(&self, &Self) -> bool
+impl core::default::Default for infino::ReindexTarget
+pub fn infino::ReindexTarget::default() -> Self
+impl core::fmt::Debug for infino::ReindexTarget
+pub fn infino::ReindexTarget::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::ReindexTarget
+impl core::marker::StructuralPartialEq for infino::ReindexTarget
+impl core::marker::Freeze for infino::ReindexTarget
+impl core::marker::Send for infino::ReindexTarget
+impl core::marker::Sync for infino::ReindexTarget
+impl core::marker::Unpin for infino::ReindexTarget
+impl core::marker::UnsafeUnpin for infino::ReindexTarget
+impl core::panic::unwind_safe::RefUnwindSafe for infino::ReindexTarget
+impl core::panic::unwind_safe::UnwindSafe for infino::ReindexTarget
 #[non_exhaustive] pub enum infino::Stemmer
 pub infino::Stemmer::English
 pub infino::Stemmer::None
@@ -535,8 +556,10 @@ impl core::panic::unwind_safe::UnwindSafe for infino::OptimizeOptions
 pub struct infino::ReindexOptions
 pub infino::ReindexOptions::mode: infino::ReindexMode
 pub infino::ReindexOptions::stale_seal_timeout_ms: u64
+pub infino::ReindexOptions::target: infino::ReindexTarget
 impl infino::ReindexOptions
 pub fn infino::ReindexOptions::reanalyzing() -> Self
+pub fn infino::ReindexOptions::rewriting() -> Self
 impl core::clone::Clone for infino::ReindexOptions
 pub fn infino::ReindexOptions::clone(&self) -> Self
 impl core::cmp::Eq for infino::ReindexOptions

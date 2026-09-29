@@ -127,7 +127,7 @@ fn run_reindex_crash_child(dir: PathBuf) -> ! {
 
     let db = connect(dir.to_str().expect("utf-8 path")).expect("child connects");
     let table = db.open_table(TABLE).expect("child opens the corpus table");
-    let _ = table.reindex(&ReindexOptions::default());
+    let _ = table.reindex(&ReindexOptions::rewriting());
 
     // Reaching here means the whole run landed before the watcher fired.
     // Exiting zero makes the parent fail loudly rather than pass on a
@@ -245,7 +245,7 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
     // live owner and a dead one look identical from here. So the resume
     // honours it, migrates everything else, and says what it had to leave.
     let report = table
-        .reindex(&ReindexOptions::default())
+        .reindex(&ReindexOptions::rewriting())
         .expect("a resume makes progress rather than failing on the dead run's seal");
     // The rewrites the dead run finished are not redone. `already_current`
     // stays zero throughout and is not the check: it counts files current
@@ -274,7 +274,7 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
     // file over and finishes the table.
     let takeover = ReindexOptions {
         stale_seal_timeout_ms: 0,
-        ..ReindexOptions::default()
+        ..ReindexOptions::rewriting()
     };
     table
         .reindex(&takeover)
@@ -379,7 +379,7 @@ fn an_interrupted_reindex_never_resurrects_a_deleted_row() {
 
     let takeover = ReindexOptions {
         stale_seal_timeout_ms: 0,
-        ..ReindexOptions::default()
+        ..ReindexOptions::rewriting()
     };
     table
         .reindex(&takeover)

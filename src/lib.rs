@@ -172,7 +172,8 @@ pub use catalog::{
     ColdFetchMode, ConnectOptions, Connection, FtsField, IndexSpec, connect, connect_with,
 };
 pub use config::{
-    CompactionSettings, GcSettings, OptimizeOptions, RecalibratePolicy, ReindexMode, ReindexOptions,
+    CompactionSettings, GcSettings, OptimizeOptions, RecalibratePolicy, ReindexMode,
+    ReindexOptions, ReindexTarget,
 };
 /// The single public error type for the curated API.
 pub use error::InfinoError;

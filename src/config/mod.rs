@@ -1021,21 +1021,31 @@ pub enum RecalibratePolicy {
     Skip,
 }
 
-/// What a reindex repairs.
+/// What a reindex repairs, per superfile.
 ///
-/// Two repairs, because two independent things go out of date and they
-/// cost very different amounts. Naming them separately keeps the
-/// expensive one an explicit choice rather than something a caller pays
-/// for by default.
+/// Two things go out of date independently — the on-disk layout and the
+/// terms — and repairing the terms costs far more. The mode chooses how
+/// much to repair; [`ReindexMode::Auto`] decides per superfile, so a file
+/// that is only behind on layout never pays for a re-analysis it does not
+/// need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReindexMode {
+    /// Give each superfile the cheapest repair that makes it current:
+    /// [`ReindexMode::Rewrite`] where only its layout is behind,
+    /// [`ReindexMode::Reanalyze`] where its terms are.
+    ///
+    /// The default, because it is the only mode that leaves no stale
+    /// superfile behind and charges the expensive repair only where it is
+    /// the one that works.
+    #[default]
+    Auto,
     /// Bring each superfile's index into the current on-disk layout,
     /// keeping its terms.
     ///
     /// Cheap: postings are copied, not rebuilt. Recovers the pruning the
     /// newer layout allows. Does not fix terms produced by an older
-    /// analyzer — nothing that copies postings can.
-    #[default]
+    /// analyzer — nothing that copies postings can — so superfiles whose
+    /// terms are stale are left alone and reported.
     Rewrite,
     /// Rebuild terms by re-analyzing the text each superfile stored, and
     /// bring the layout current as a side effect.
@@ -1045,21 +1055,44 @@ pub enum ReindexMode {
     /// in how text is analyzed — a query analyzed one way cannot find
     /// terms written another. Columns whose text was never stored cannot
     /// be repaired and are reported.
+    ///
+    /// Applies to every stale superfile, including ones whose recorded
+    /// revision says their terms are already current — which is the only
+    /// thing this offers over [`ReindexMode::Auto`], and the reason to
+    /// reach for it is not trusting that record.
     Reanalyze,
+}
+
+/// Which index a reindex repairs.
+///
+/// A table's indexes go out of date on their own schedules, so a reindex
+/// names the one it is for rather than implying it covers them all. Only
+/// the full-text index has a repair today; the enum is the extension
+/// point, so adding one does not rename the operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ReindexTarget {
+    /// The full-text index inside each superfile. Vectors, the Parquet
+    /// body and the hidden vector index are copied or left untouched.
+    #[default]
+    Fts,
 }
 
 /// Knobs for [`crate::Supertable::reindex`].
 ///
-/// Only the seal timeout, because a reindex has nothing else to decide: it
+/// No sizing knobs, because a reindex has nothing to decide there: it
 /// rewrites every stale superfile, one in and one out, so there is no
 /// target size to pack toward and no fill threshold to clear. Taking
 /// [`CompactionSettings`] instead would hand a caller three knobs the
 /// operation ignores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReindexOptions {
-    /// What to repair. Defaults to [`ReindexMode::Rewrite`], the cheap
-    /// one — re-analyzing a corpus is not something a caller should get
-    /// without asking.
+    /// Which index to repair. Defaults to [`ReindexTarget::Fts`], the
+    /// only one with a repair today; a default naming one index can never
+    /// silently widen to cover another.
+    pub target: ReindexTarget,
+    /// How much to repair. Defaults to [`ReindexMode::Auto`], which gives
+    /// each superfile the cheapest repair that makes it current.
     pub mode: ReindexMode,
     /// How old a sealed tombstone sidecar has to be, in milliseconds,
     /// before a rewrite treats it as abandoned and takes it over. Shared
@@ -1070,15 +1103,28 @@ pub struct ReindexOptions {
 
 impl Default for ReindexOptions {
     fn default() -> Self {
+        // Deferred to each enum's own default rather than named again
+        // here, so the two cannot drift.
         Self {
-            mode: ReindexMode::Rewrite,
+            target: ReindexTarget::default(),
+            mode: ReindexMode::default(),
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
         }
     }
 }
 
 impl ReindexOptions {
-    /// Re-analyze stored text rather than only rewriting the layout.
+    /// Repair layouts only, leaving superfiles whose terms are stale
+    /// untouched and reported.
+    pub fn rewriting() -> Self {
+        Self {
+            mode: ReindexMode::Rewrite,
+            ..Self::default()
+        }
+    }
+
+    /// Re-analyze every stale superfile, including ones whose recorded
+    /// revision says their terms are current.
     pub fn reanalyzing() -> Self {
         Self {
             mode: ReindexMode::Reanalyze,
