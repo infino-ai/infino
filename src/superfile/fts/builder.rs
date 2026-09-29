@@ -102,7 +102,7 @@ use crate::{
         fts::{
             analysis::ChainTokenizer,
             bm25,
-            positions::{encode_group, encode_run, skip_run},
+            positions::{TermRuns, encode_group, encode_run, skip_run},
             posting::{
                 BLOCK_LEN, Block, ENCODING_BITSET, EncodedBlock, block_encoding, encode_block,
             },
@@ -119,7 +119,6 @@ use crate::{
             validate_column_name,
         },
         trace::{detail_span, record},
-        varint::read_varint,
     },
 };
 
@@ -2846,7 +2845,7 @@ impl FtsBuilder {
                     false => Vec::new(),
                 };
                 let term_positions = match col_positions {
-                    true => Some((&mut positions_sink, term_runs.as_slice())),
+                    true => Some((&mut positions_sink, TermRuns::Encoded(&term_runs))),
                     false => None,
                 };
                 encode_and_emit_term(
@@ -3102,7 +3101,7 @@ impl FtsBuilder {
                                 false => Vec::new(),
                             };
                             let term_positions = match col_positions {
-                                true => Some((&mut positions_sink, term_runs.as_slice())),
+                                true => Some((&mut positions_sink, TermRuns::Encoded(&term_runs))),
                                 false => None,
                             };
                             encode_and_emit_term(
@@ -4038,7 +4037,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
                     skip_run(blob, &mut at, tf).expect("builder-encoded blob runs are well-formed");
                     term_run.extend_from_slice(&blob[start..at]);
                 }
-                Some((&mut *positions_sink, term_run.as_slice()))
+                Some((&mut *positions_sink, TermRuns::Encoded(term_run.as_slice())))
             }
             false => None,
         };
@@ -4099,12 +4098,25 @@ fn encode_and_emit_term<W: Write>(
     postings_len: &mut u64,
     fst_entries_inram: Option<&mut TermDictBuilder>,
     mut fst_streaming: Option<&mut StreamingTermDictBuilder<BufWriter<File>>>,
-    mut term_positions: Option<(&mut PositionsSink, &[u8])>,
+    term_positions: Option<(&mut PositionsSink, TermRuns<'_>)>,
     profile: &mut FinishProfile,
     scratch: &mut TermScratch,
     era: BlobEra,
 ) -> Result<(), BuildError> {
     let encode_start = profile.enabled.then(Instant::now);
+    // The layouts before grouped positions store the LEB128 runs as they
+    // are, so decoded runs are encoded once here and the rest of this
+    // function sees bytes on those layouts.
+    let legacy_runs: Vec<u8>;
+    let mut term_positions = match term_positions {
+        Some((sink, runs @ TermRuns::Values { .. })) if !era.layout().grouped_positions => {
+            let mut bytes = Vec::new();
+            runs.encode_into(pairs.iter().map(|&(_, tf)| tf), &mut bytes);
+            legacy_runs = bytes;
+            Some((sink, TermRuns::Encoded(&legacy_runs)))
+        }
+        other => other,
+    };
     profile.encode_calls += 1;
     // Build the FST key once; reused regardless of in-RAM vs spilled
     // emit policy.
@@ -4132,8 +4144,7 @@ fn encode_and_emit_term<W: Write>(
         match &term_positions {
             None => Some(FstValue::Inline { doc_id, tf }),
             Some((_, runs)) if tf == 1 => {
-                let mut at = 0;
-                let pos = read_varint(runs, &mut at).expect("builder-encoded run is well-formed");
+                let pos = runs.first_value();
                 (pos <= INLINE_TF_MAX).then_some(FstValue::Inline { doc_id, tf: pos })
             }
             Some(_) => None,
@@ -4161,12 +4172,13 @@ fn encode_and_emit_term<W: Write>(
                 vals.clear();
                 out.clear();
                 let mut at = 0usize;
-                for &(_, tf) in pairs {
-                    for _ in 0..tf {
-                        vals.push(read_varint(runs, &mut at).expect("builder-encoded run"));
-                    }
+                for (i, &(_, tf)) in pairs.iter().enumerate() {
+                    runs.push_run(i, tf, &mut at, vals);
                 }
-                debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
+                debug_assert!(
+                    runs.encoded().is_none_or(|bytes| at == bytes.len()),
+                    "runs must cover exactly the pairs"
+                );
                 let tfs = &mut scratch.tfs;
                 tfs.clear();
                 tfs.extend(pairs.iter().map(|&(_, tf)| tf));
@@ -4327,23 +4339,17 @@ fn encode_and_emit_term<W: Write>(
         let pos_out = &mut scratch.pos_out;
         pos_out.clear();
         if let Some((_, runs)) = &term_positions {
-            debug_assert!(
-                runs.len() <= u32::MAX as usize,
-                "single-term positions > 4 GiB"
-            );
             let mut at: usize = 0;
             if era.layout().grouped_positions {
                 // Regroup block by block: every long-form group is packed,
                 // so the phrase decode reads it whole and indexes it by the
                 // block's tf prefix sums — no run offsets to record.
                 let vals = &mut scratch.pos_vals;
-                for chunk in pairs.chunks(BLOCK_LEN) {
+                for (c, chunk) in pairs.chunks(BLOCK_LEN).enumerate() {
                     pos_block_offsets.push(pos_out.len() as u32);
                     vals.clear();
-                    for &(_, tf) in chunk {
-                        for _ in 0..tf {
-                            vals.push(read_varint(runs, &mut at).expect("builder-encoded run"));
-                        }
+                    for (k, &(_, tf)) in chunk.iter().enumerate() {
+                        runs.push_run(c * BLOCK_LEN + k, tf, &mut at, vals);
                     }
                     let tfs = &mut scratch.tfs;
                     tfs.clear();
@@ -4351,6 +4357,13 @@ fn encode_and_emit_term<W: Write>(
                     encode_group(pos_out, tfs, vals, false, &mut scratch.pack);
                 }
             } else {
+                let bytes = runs
+                    .encoded()
+                    .expect("ungrouped layouts are given encoded runs");
+                debug_assert!(
+                    bytes.len() <= u32::MAX as usize,
+                    "single-term positions > 4 GiB"
+                );
                 for (i, &(_, tf)) in pairs.iter().enumerate() {
                     let in_block = i % BLOCK_LEN;
                     if in_block == 0 {
@@ -4359,10 +4372,13 @@ fn encode_and_emit_term<W: Write>(
                     if in_block.is_multiple_of(format::fts::POSITION_SUBINDEX_STRIDE) {
                         pos_subindex_offsets.push(at as u32);
                     }
-                    skip_run(runs, &mut at, tf).expect("builder-encoded runs are well-formed");
+                    skip_run(bytes, &mut at, tf).expect("builder-encoded runs are well-formed");
                 }
             }
-            debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
+            debug_assert!(
+                runs.encoded().is_none_or(|bytes| at == bytes.len()),
+                "runs must cover exactly the pairs"
+            );
             // Pad the final (partial) block's sub-index up to a whole
             // `entries_per_block`, so entry `(block, slot)` is a flat
             // `block * entries_per_block + slot`. The pad offsets point at
@@ -4407,9 +4423,9 @@ fn encode_and_emit_term<W: Write>(
         term_buf.extend_from_slice(&(postings_length as u32).to_le_bytes());
         term_buf.extend_from_slice(&num_blocks.to_le_bytes());
         if let Some((sink, runs)) = &term_positions {
-            let region_len = match era.layout().grouped_positions {
-                true => pos_out.len(),
-                false => runs.len(),
+            let region_len = match runs.encoded() {
+                Some(bytes) if !era.layout().grouped_positions => bytes.len(),
+                _ => pos_out.len(),
             };
             term_buf.extend_from_slice(&sink.len.to_le_bytes());
             term_buf.extend_from_slice(&(region_len as u32).to_le_bytes());
@@ -4508,9 +4524,9 @@ fn encode_and_emit_term<W: Write>(
         }
 
         if let Some((sink, runs)) = term_positions.as_mut() {
-            match era.layout().grouped_positions {
-                true => sink.write(pos_out)?,
-                false => sink.write(runs)?,
+            match runs.encoded() {
+                Some(bytes) if !era.layout().grouped_positions => sink.write(bytes)?,
+                _ => sink.write(pos_out)?,
             }
         }
 

@@ -20,10 +20,10 @@ use bytes::Bytes;
 use crate::{
     superfile::{
         BuildError, FtsError, SuperfileReader,
-        fts::{positions::encode_run, reader::FtsReader},
+        fts::{positions::TermRuns, reader::FtsReader},
         id_space::FtsDocId,
     },
-    utils::{terms::FstValue, varint::read_varint},
+    utils::terms::FstValue,
 };
 
 /// Terms each input cursor reads from its dictionary at a time.
@@ -40,12 +40,12 @@ pub(crate) struct SortedInput {
 /// Merge `column_id` across `inputs` and call `emit(term, postings, runs)`
 /// once per term that still has a surviving posting, in term order.
 /// `postings` are `(output_doc_id, tf)`, doc ids ascending; `runs` holds
-/// each posting's encoded positions back to back (empty for a
-/// non-positional column).
+/// each posting's position run, decoded (empty for a non-positional
+/// column).
 pub(crate) fn merge_column(
     inputs: &[SortedInput],
     column_id: u32,
-    mut emit: impl FnMut(&str, &[(u32, u32)], &[u8]) -> Result<(), BuildError>,
+    mut emit: impl FnMut(&str, &[(u32, u32)], TermRuns<'_>) -> Result<(), BuildError>,
 ) -> Result<(), BuildError> {
     let readers = inputs
         .iter()
@@ -70,7 +70,9 @@ pub(crate) fn merge_column(
 
     let mut contributors: Vec<usize> = Vec::new();
     let mut postings: Vec<(u32, u32)> = Vec::new();
-    let mut runs: Vec<u8> = Vec::new();
+    let mut runs: Vec<u32> = Vec::new();
+    // Where each posting's run starts in `runs`.
+    let mut run_starts: Vec<usize> = Vec::new();
     let mut positions_buf: Vec<u32> = Vec::new();
     let mut sort_scratch = SortScratch::default();
     while let Some(Reverse((term, first))) = heap.pop() {
@@ -84,6 +86,7 @@ pub(crate) fn merge_column(
 
         postings.clear();
         runs.clear();
+        run_starts.clear();
         let mut ascending = true;
         for &i in &contributors {
             let value = values[i].ok_or(BuildError::BatchReadError)?;
@@ -102,7 +105,8 @@ pub(crate) fn merge_column(
                             let out_doc = out_doc.get();
                             ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
                             postings.push((out_doc, tf));
-                            encode_run(&mut runs, pos);
+                            run_starts.push(runs.len());
+                            push_run_values(&mut runs, pos);
                         }
                         Ok(())
                     },
@@ -122,15 +126,23 @@ pub(crate) fn merge_column(
             continue;
         }
         if ascending {
-            emit(term, &postings, &runs)?;
+            let term_runs = TermRuns::Values {
+                values: &runs,
+                starts: &run_starts,
+            };
+            emit(term, &postings, term_runs)?;
             continue;
         }
-        let runs = sort_scratch.sort(&mut postings, &runs)?;
+        let starts = sort_scratch.sort(&mut postings, &run_starts);
         debug_assert!(
             postings.is_sorted_by(|a, b| a.0 < b.0),
             "sorted merge: output doc ids must be unique"
         );
-        emit(term, &postings, runs)?;
+        let term_runs = TermRuns::Values {
+            values: &runs,
+            starts,
+        };
+        emit(term, &postings, term_runs)?;
     }
     Ok(())
 }
@@ -140,49 +152,41 @@ pub(crate) fn merge_column(
 struct SortScratch {
     /// `(output_doc_id, tf, run_start)` per posting.
     entries: Vec<(u32, u32, usize)>,
-    /// The runs in sorted order.
-    runs: Vec<u8>,
+    /// The run starts in sorted order.
+    starts: Vec<usize>,
 }
 
 impl SortScratch {
-    /// Sort `postings` in place by doc id and return `runs` in the same
-    /// order. A column without positions has no runs to move.
-    fn sort(&mut self, postings: &mut [(u32, u32)], runs: &[u8]) -> Result<&[u8], BuildError> {
-        self.runs.clear();
-        if runs.is_empty() {
-            postings.sort_unstable_by_key(|p| p.0);
-            return Ok(&self.runs);
-        }
-        // Runs carry no length; a run is exactly `tf` varints.
+    /// Sort `postings` in place by doc id and return `run_starts` in the
+    /// same order. Only the starts move; the run values stay where they are.
+    fn sort(&mut self, postings: &mut [(u32, u32)], run_starts: &[usize]) -> &[usize] {
         self.entries.clear();
-        let mut at = 0;
-        for &(doc, tf) in postings.iter() {
-            self.entries.push((doc, tf, at));
-            skip_run(runs, &mut at, tf)?;
-        }
-        debug_assert_eq!(
-            at,
-            runs.len(),
-            "sorted merge: runs must end with the last posting"
+        self.entries.extend(
+            postings
+                .iter()
+                .zip(run_starts)
+                .map(|(&(doc, tf), &start)| (doc, tf, start)),
         );
         self.entries.sort_unstable_by_key(|e| e.0);
+        self.starts.clear();
         for (slot, &(doc, tf, start)) in postings.iter_mut().zip(&self.entries) {
             *slot = (doc, tf);
-            let mut end = start;
-            skip_run(runs, &mut end, tf)?;
-            self.runs.extend_from_slice(&runs[start..end]);
+            self.starts.push(start);
         }
-        Ok(&self.runs)
+        &self.starts
     }
 }
 
-/// Move `*at` past one run of `tf` positions.
-fn skip_run(runs: &[u8], at: &mut usize, tf: u32) -> Result<(), BuildError> {
-    for _ in 0..tf {
-        read_varint(runs, at)
-            .ok_or_else(|| BuildError::Io(Error::other("fts sorted merge: bad position run")))?;
+/// Append one document's positions to `out` as run values: the first
+/// position, then the gap to each next one. The same values a LEB128 run
+/// holds, without the encoding.
+fn push_run_values(out: &mut Vec<u32>, positions: &[u32]) {
+    let mut prev = 0u32;
+    for (i, &p) in positions.iter().enumerate() {
+        debug_assert!(i == 0 || p > prev, "positions must be strictly increasing");
+        out.push(p - prev);
+        prev = p;
     }
-    Ok(())
 }
 
 /// Walks one input column's dictionary in term order, a chunk at a time.
