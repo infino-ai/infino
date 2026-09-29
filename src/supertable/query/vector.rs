@@ -4342,9 +4342,7 @@ impl SupertableReader {
             // fanout law (routed fanout x cluster size) — recall is the side we protect
             // here, and latency is bounded by the fanout knob upstream, not by capping this
             // shortlist.
-            let shortlist_limit = k
-                .saturating_mul(rerank_mult)
-                .max(pooled.len().saturating_mul(GLOBAL_FINE_SHORTLIST_POOL_PCT) / 100);
+            let shortlist_limit = global_fine_shortlist_limit(k, rerank_mult, pooled.len());
             let winners = select_global_shortlist(pooled, shortlist_limit, 0);
             let mut by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
             for (si, c) in winners {
@@ -7160,6 +7158,15 @@ fn deferred_shortlist_limit(
     }
 }
 
+/// Global-fine exact-rerank shortlist size: at least `k * rerank_mult`, at
+/// least [`GLOBAL_FINE_SHORTLIST_POOL_PCT`] of the pool. One helper so the
+/// warm rerank path and its test size the cut the same way. Call site has the
+/// why-uncapped reasoning (#821).
+fn global_fine_shortlist_limit(k: usize, rerank_mult: usize, pool_len: usize) -> usize {
+    k.saturating_mul(rerank_mult)
+        .max(pool_len.saturating_mul(GLOBAL_FINE_SHORTLIST_POOL_PCT) / 100)
+}
+
 /// Deterministic global shortlist selection for deferred-rerank width
 /// sweeps: keep the `limit` best 1-bit estimates pooled across every
 /// scanned unit, plus each scanned (unit, cell)'s `cell_floor` best.
@@ -7432,16 +7439,15 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        CentroidRouterGraph, GLOBAL_FINE_SHORTLIST_POOL_PCT, IndexUnavailable,
-        RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
-        VectorSearchOptions, admit_extension_round, admit_shortlist_window, apply_width_pin,
-        assemble_flat_sections, assemble_hnsw_sections, build_centroid_router,
-        calibrated_query_for, cells_ranked_by_fine_score, decode_centroid_router_section,
-        encode_centroid_router_section, free_column_slot, free_columns_unambiguous,
-        gate_fine_candidates_by_fragment, gfc_prepare_for_metric, gfc_unit_normalize,
-        hidden_hits_user_ids, id_score_projection_indices, is_hidden_vector_manifest,
-        law_floor_serve_selection, postings_by_cell_from_summaries, rerank_mult_from_law,
-        score_fine_candidates, select_global_shortlist, union_cell_selection,
+        CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN,
+        ScanCandidate, VectorFilter, VectorSearchOptions, admit_extension_round,
+        admit_shortlist_window, apply_width_pin, assemble_flat_sections, assemble_hnsw_sections,
+        build_centroid_router, calibrated_query_for, cells_ranked_by_fine_score,
+        decode_centroid_router_section, encode_centroid_router_section, free_column_slot,
+        free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_prepare_for_metric,
+        gfc_unit_normalize, hidden_hits_user_ids, id_score_projection_indices,
+        is_hidden_vector_manifest, law_floor_serve_selection, postings_by_cell_from_summaries,
+        rerank_mult_from_law, score_fine_candidates, select_global_shortlist, union_cell_selection,
         vector_read_query_error,
     };
     use crate::{
@@ -7465,6 +7471,7 @@ mod tests {
                 ClusterCentroids, ManifestSnapshot,
                 list::{CellRoutingParams, PartitionStrategy},
             },
+            query::vector::global_fine_shortlist_limit,
             slow_vector_state::{ResidentIndexKind, write_resident_index_blob},
             writer::{recalibrate_probe_laws, split_overflow_cell},
         },
@@ -10216,8 +10223,9 @@ mod tests {
             .collect();
 
         let fixed_limit = K.saturating_mul(RERANK_MULT);
-        let proportional_limit =
-            fixed_limit.max(pooled.len().saturating_mul(GLOBAL_FINE_SHORTLIST_POOL_PCT) / 100);
+        // Use the production helper, not a recomputed copy, so a regression
+        // in the phase-C cut fails here.
+        let proportional_limit = global_fine_shortlist_limit(K, RERANK_MULT, POOL);
         assert_eq!(fixed_limit, 10, "old fixed cut is the top k*rerank_mult");
         assert_eq!(proportional_limit, 60, "proportional cut is 3% of the pool");
 
