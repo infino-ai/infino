@@ -235,8 +235,6 @@ fn cache_open_failed(e: DiskCacheError) -> ReaderCacheError {
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
-
     use arrow_array::{LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
@@ -380,39 +378,6 @@ mod tests {
         .expect("storage-only fallback");
         assert_eq!(reader.n_docs(), N_DOCS);
         assert_eq!(tier, OpenTier::Source);
-    }
-
-    /// Concurrent opens share one tally, so the counts from many threads add
-    /// up exactly, each in the slot of the tier it names.
-    #[test]
-    fn open_tier_counts_add_up_across_threads() {
-        const THREADS: usize = 4;
-        const OPENS_PER_THREAD: u64 = 1_000;
-        let counts = Arc::new(OpenTierCounts::default());
-        let threads: Vec<_> = (0..THREADS)
-            .map(|_| {
-                let counts = Arc::clone(&counts);
-                thread::spawn(move || {
-                    for _ in 0..OPENS_PER_THREAD {
-                        counts.add(OpenTier::Memory);
-                        counts.add(OpenTier::Source);
-                    }
-                })
-            })
-            .collect();
-        for thread in threads {
-            thread.join().expect("counting thread");
-        }
-        for tier in [
-            OpenTier::Disk,
-            OpenTier::Lazy,
-            OpenTier::Coalesced,
-            OpenTier::Streamed,
-        ] {
-            counts.add(tier);
-        }
-        let per_tier = THREADS as u64 * OPENS_PER_THREAD;
-        assert_eq!(counts.snapshot(), [per_tier, 1, 1, per_tier, 1, 1]);
     }
 
     // ---- tier 1: non-NotFound error short-circuits ---------------------

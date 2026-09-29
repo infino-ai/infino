@@ -241,11 +241,9 @@ impl SupertableReader {
         // The fusion math is a real (small) kernel section; bracket it so
         // hybrid's kernel CPU covers all three of its compute legs.
         let fused = fuse_span.in_scope(|| {
-            let fused =
-                op_stats::timed_kernel(&self.op_stats, || rrf_fuse(&bm25_hits, &vector_hits, k));
-            trace::record("rows_out", fused.len());
-            fused
+            op_stats::timed_kernel(&self.op_stats, || rrf_fuse(&bm25_hits, &vector_hits, k))
         });
+        fuse_span.record("rows_out", fused.len());
         Ok(fused)
     }
 
