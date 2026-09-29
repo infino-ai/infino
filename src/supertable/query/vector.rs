@@ -84,17 +84,9 @@ use datafusion::logical_expr::Expr;
 use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use roaring::RoaringBitmap;
 use tokio::{join, sync::OnceCell};
+use tracing::Instrument;
 use uuid::Uuid;
 
-use super::{
-    SuperfileHit,
-    candidate::{CandidatePlan, CandidateScope},
-    dispatch,
-    exec::common::{SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source},
-    fts::{memo_from_locations, memos_from_plan_locations},
-    provider::prune_leaves_for_filters,
-    prune::{PruneLeaf, select_superfiles},
-};
 pub use crate::superfile::reader::VectorSearchOptions;
 #[cfg(feature = "test-helpers")]
 use crate::test_helpers::{admit_trace, served_shortlist_probe};
@@ -136,6 +128,18 @@ use crate::{
         },
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
+        query::{
+            SuperfileHit,
+            candidate::{CandidatePlan, CandidateScope},
+            dispatch,
+            exec::common::{
+                SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source,
+            },
+            fts::{memo_from_locations, memos_from_plan_locations},
+            provider::prune_leaves_for_filters,
+            prune::{PruneLeaf, select_superfiles},
+            superfile_reader::OpenTierCounts,
+        },
         reader_cache::ReadIntent,
         slow_vector_state::{
             CentroidSection, ResidentIndexKind, ResidentVectorIndex, WalkPlaneRequest,
@@ -143,6 +147,7 @@ use crate::{
         },
         tombstones::SidecarCache,
     },
+    utils::trace::{self, detail_span, tiered_span},
 };
 
 /// A calibrated law width at or below this resolves to `None`: one cell
@@ -4705,6 +4710,19 @@ impl SupertableReader {
         // gate. Phase timers (INFINO_TRACE_VECTOR_WARM_PHASES): admit covers
         // that work; fanout_wall is probe+rerank+remap wall.
         let admit_t0 = io_counters::phase_start();
+        // The admit stage: which cells and superfiles the query will probe.
+        // Made here and ended once `units` is known, so it times the whole
+        // stage. The stage awaits in between, and a guard held across an
+        // await would mis-parent other tasks' spans, so rather than being
+        // entered it instruments those awaits; their spans nest under it.
+        let phases = self.phase_spans();
+        let route_span = trace::phase(phases, || {
+            detail_span!(
+                "vector.route",
+                superfiles = superfiles.len(),
+                units = tracing::field::Empty,
+            )
+        });
         // The grid/centroid ranking is the admit stage's kernel section —
         // pure CPU over manifest summaries on this thread.
         let ranked_cells_scored: Option<Vec<(u32, f32)>> =
@@ -5015,6 +5033,7 @@ impl SupertableReader {
                     &mut candidates,
                     deferred,
                 )
+                .instrument(route_span.clone())
                 .await?;
             }
             // #515 self-measured admit loop, law-served default path only
@@ -5094,6 +5113,7 @@ impl SupertableReader {
                             &mut delta_candidates,
                             delta_deferred,
                         )
+                        .instrument(route_span.clone())
                         .await?;
                     }
                     candidates.extend(delta_candidates);
@@ -5277,6 +5297,7 @@ impl SupertableReader {
                     &mut candidates,
                     deferred,
                 )
+                .instrument(route_span.clone())
                 .await?;
             }
             candidate_counts = candidates
@@ -5398,6 +5419,8 @@ impl SupertableReader {
         if let Some(t0) = admit_t0 {
             io_counters::phase_record("vec.admit", t0.elapsed().as_micros() as u64);
         }
+        route_span.record("units", units.len());
+        trace::end(route_span);
 
         // Fan out through the shared [`query::dispatch::fanout`] (also
         // used by FTS), but in waves capped by the configured reader
@@ -5614,26 +5637,36 @@ impl SupertableReader {
         // carries no bitmaps and fans out all units at once (matching
         // main's concurrency — every superfile GET overlaps on tokio).
         let fanout_t0 = io_counters::phase_start();
+        let scan_span = trace::phase(phases, || tiered_span!("vector.scan", units = units.len()));
         let mut per_superfile = if allow.is_some() {
             let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
+            // One tally across the waves, recorded once on the phase.
+            let tiers = OpenTierCounts::for_span(&scan_span);
             let mut collected = Vec::new();
             while !units.is_empty() {
                 let n = fanout_width.min(units.len());
                 let wave: Vec<_> = units.drain(..n).collect();
                 collected.extend(
-                    dispatch::fanout_with(
+                    dispatch::fanout_with_counted(
                         self,
                         wave,
                         !hidden_vector_index,
                         ReadIntent::Stream,
                         body.clone(),
+                        tiers.clone(),
                     )
+                    .instrument(scan_span.clone())
                     .await?,
                 );
             }
+            if let Some(tiers) = &tiers {
+                tiers.record_on(&scan_span);
+            }
+            trace::end(scan_span);
             collected
         } else {
             dispatch::fanout_with(self, units, !hidden_vector_index, ReadIntent::Stream, body)
+                .instrument(scan_span)
                 .await?
         };
 
@@ -5825,8 +5858,12 @@ impl SupertableReader {
                         Ok::<Vec<SuperfileHit>, QueryError>(tagged)
                     }
                 };
+                let rerank_span = trace::phase(phases, || {
+                    tiered_span!("vector.rerank", units = rerank_units.len())
+                });
                 per_superfile.extend(
                     dispatch::fanout_with(self, rerank_units, false, ReadIntent::Stream, body_c)
+                        .instrument(rerank_span)
                         .await?,
                 );
             }
@@ -5890,17 +5927,30 @@ impl SupertableReader {
             terms: tokens.clone(),
             mode: filter.mode,
         }];
+        let select_span = trace::phase(self.phase_spans(), || {
+            detail_span!(
+                "vector.select_superfiles",
+                manifest_superfiles = manifest.superfiles.len(),
+                survivors = tracing::field::Empty,
+            )
+        });
         let surviving: HashSet<u128> = select_superfiles(manifest, &prune_leaves)
+            .instrument(select_span.clone())
             .await?
             .iter()
             .map(|e| e.superfile_id.as_u128())
             .collect();
         if surviving.is_empty() {
+            select_span.record("survivors", 0);
+            trace::end(select_span);
             return Ok(Vec::new());
         }
         let superfiles = self
             .vector_pruned_superfiles_intersect(manifest, &surviving)
+            .instrument(select_span.clone())
             .await?;
+        select_span.record("survivors", superfiles.len());
+        trace::end(select_span);
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
@@ -6785,6 +6835,16 @@ impl SupertableReader {
                 .map_err(|error| QueryError::Execute(error.to_string()))
         };
         let user_parts = self.manifest().get_undrained_superfiles_loaded(&drained);
+        // Three concurrent legs, one span each: which one the query waited on
+        // is the question a slow vector search asks first.
+        let phases = self.phase_spans();
+        let hidden_search = hidden_search.instrument(trace::phase(phases, || {
+            detail_span!("vector.hidden", superfiles = hidden_entries.len())
+        }));
+        let fast_state =
+            fast_state.instrument(trace::phase(phases, || detail_span!("vector.delete_state")));
+        let user_parts =
+            user_parts.instrument(trace::phase(phases, || detail_span!("vector.user_parts")));
         let (hidden_hits, deleted, user_entries) = join!(hidden_search, fast_state, user_parts);
         let mut hidden_hits = hidden_hits?;
         let deleted = deleted?;
@@ -6796,6 +6856,9 @@ impl SupertableReader {
             Vec::new()
         } else {
             self.fanout_vector_clusters(&user_entries, column, query, k, options)
+                .instrument(trace::phase(phases, || {
+                    detail_span!("vector.user_delta", superfiles = user_entries.len())
+                }))
                 .await?
         };
         let refill_cap = k.saturating_add(deleted.len()).max(k);
@@ -6862,7 +6925,11 @@ impl SupertableReader {
                         .await
                 }
             };
-            let (next_hidden, next_user) = join!(hidden_retry, user_retry);
+            let (next_hidden, next_user) = async { join!(hidden_retry, user_retry) }
+                .instrument(trace::phase(phases, || {
+                    detail_span!("vector.refill", requested = requested)
+                }))
+                .await;
             hidden_hits = next_hidden?;
             user_hits = next_user?;
         }
@@ -6965,8 +7032,13 @@ impl SupertableReader {
                     .map_err(|e| QueryError::Execute(e.to_string()))?;
                 return Ok(vec![batch]);
             }
-            let hits = user_placement_for_scalar_resolve(self, &hits).await?;
-            let batch = resolve_hits_named(self, &hits, projection).await?;
+            let resolve = async {
+                let hits = user_placement_for_scalar_resolve(self, &hits).await?;
+                resolve_hits_named(self, &hits, projection).await
+            };
+            let batch = resolve
+                .instrument(detail_span!("search.resolve", hits = hits.len()))
+                .await?;
             Ok(vec![batch])
         })
     }
@@ -7359,7 +7431,27 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len(), role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
+        // The empty fields are the read's outcome, filled once it has run;
+        // see `CloseOut`.
+        tracing::instrument(skip_all, fields(
+            column = column,
+            k = k,
+            dim = query.len(),
+            role = self.role().as_str(),
+            origin = OpOrigin::Query.as_str(),
+            rows_out = tracing::field::Empty,
+            kernel_cpu_ns = tracing::field::Empty,
+            planned_read_ranges = tracing::field::Empty,
+            vector_cells_scanned = tracing::field::Empty,
+            vector_candidates_scanned = tracing::field::Empty,
+            vector_rows_reranked = tracing::field::Empty,
+            rows_materialized = tracing::field::Empty,
+            store_heads = tracing::field::Empty,
+            store_gets = tracing::field::Empty,
+            store_get_bytes = tracing::field::Empty,
+            store_bg_gets = tracing::field::Empty,
+            store_bg_get_bytes = tracing::field::Empty,
+        ))
     )]
     pub fn vector_search(
         &self,
@@ -7370,10 +7462,14 @@ impl Supertable {
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
-        self.reader()?
+        let close_out = self.close_out();
+        let batches = self
+            .reader()?
             .vector_search(column, query, k, options, filter, projection)
             .map_err(crate::InfinoError::from)
-            .map_err(|e| e.with_context("vector_search", None))
+            .map_err(|e| e.with_context("vector_search", None))?;
+        close_out.finish_batches(&batches);
+        Ok(batches)
     }
 }
 

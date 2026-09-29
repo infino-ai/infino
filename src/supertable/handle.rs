@@ -73,7 +73,7 @@ use crate::{
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
         },
     },
-    utils::trace::{TableRole, record},
+    utils::trace::{CloseOut, TableRole, record},
 };
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::{
@@ -747,6 +747,16 @@ impl Supertable {
     #[cfg_attr(not(feature = "detailed-tracing"), allow(dead_code))]
     pub(crate) fn role(&self) -> TableRole {
         self.inner.role
+    }
+
+    /// Begin the [`CloseOut`] a search's root span records when it is done:
+    /// the caller's op-stats collector and the storage's request ledger.
+    /// Taken before the reader is minted, so the manifest check that minting
+    /// may do is in the store numbers.
+    pub(crate) fn close_out(&self) -> CloseOut {
+        CloseOut::begin(op_stats::current, || {
+            self.inner.options.storage.as_ref().map(|s| s.usage_meter())
+        })
     }
 
     test_visible! {
@@ -2296,6 +2306,18 @@ impl SupertableReader {
     /// Per-supertable configuration for this reader's snapshot.
     pub(crate) fn options(&self) -> &Arc<SupertableOptions> {
         &self.inner.options
+    }
+
+    /// Whether a search on this reader splits its root span into phase spans
+    /// (superfile selection, term lookup, the fan-out, the vector legs).
+    ///
+    /// Only on a table of more than one superfile. Each exported span costs
+    /// the query a few microseconds, and on a single superfile the phases
+    /// are one file each, so the root's totals already say where the time
+    /// went; with more files the phase spans replace a span per file and
+    /// cost less than before.
+    pub(crate) fn phase_spans(&self) -> bool {
+        cfg!(feature = "detailed-tracing") && self.manifest.superfiles.len() > 1
     }
 
     /// Cached per-table SQL schemas (scan view + scalar schema).

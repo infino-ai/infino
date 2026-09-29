@@ -34,7 +34,15 @@
 //! bridge, no throwaway `current_thread` runtime, and
 //! object-store retries fire correctly.
 
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use tracing::Span;
 
 use crate::{
     storage::StorageProvider,
@@ -141,6 +149,84 @@ pub async fn superfile_reader_tiered(
     Err(ReaderCacheError::NotFound { uri: *uri })
 }
 
+/// How many of a read's opens each cache tier served. One line of counts on the
+/// span that opened them instead of a span per file: enough for a trace to say
+/// whether a slow read was a cold one, at a cost that does not grow with the
+/// table. Counted with relaxed atomics, so the concurrent opens of a fan-out
+/// can share one tally.
+///
+/// A fan-out counts one open per work unit, and a ranged search can split one
+/// superfile into several units, so the counts add up to the phase's `units`,
+/// not its superfiles. The repeats show as `memory` or `coalesced`.
+#[derive(Debug, Default)]
+pub(crate) struct OpenTierCounts {
+    memory: AtomicU64,
+    disk: AtomicU64,
+    lazy: AtomicU64,
+    source: AtomicU64,
+    coalesced: AtomicU64,
+    streamed: AtomicU64,
+}
+
+impl OpenTierCounts {
+    /// A tally for the opens `span` will report, or `None` when there is
+    /// nowhere to put them: tracing is off, the span is disabled, or it does
+    /// not declare the tier fields (made by `tiered_span!`).
+    pub(crate) fn for_span(span: &Span) -> Option<Arc<Self>> {
+        if !cfg!(feature = "detailed-tracing") {
+            return None;
+        }
+        span.metadata()
+            .is_some_and(|meta| meta.fields().field("memory").is_some())
+            .then(Arc::default)
+    }
+
+    /// [`Self::for_span`] on the current span, looked up only with
+    /// `detailed-tracing`.
+    pub(crate) fn for_current_span() -> Option<Arc<Self>> {
+        if !cfg!(feature = "detailed-tracing") {
+            return None;
+        }
+        Self::for_span(&Span::current())
+    }
+
+    pub(crate) fn add(&self, tier: OpenTier) {
+        let slot = match tier {
+            OpenTier::Memory => &self.memory,
+            OpenTier::Disk => &self.disk,
+            OpenTier::Lazy => &self.lazy,
+            OpenTier::Source => &self.source,
+            OpenTier::Coalesced => &self.coalesced,
+            OpenTier::Streamed => &self.streamed,
+        };
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The counts in `[memory, disk, lazy, source, coalesced, streamed]` order.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> [u64; 6] {
+        [
+            self.memory.load(Ordering::Relaxed),
+            self.disk.load(Ordering::Relaxed),
+            self.lazy.load(Ordering::Relaxed),
+            self.source.load(Ordering::Relaxed),
+            self.coalesced.load(Ordering::Relaxed),
+            self.streamed.load(Ordering::Relaxed),
+        ]
+    }
+
+    /// Record the counts on `span`, into the `memory`, `disk`, `lazy`,
+    /// `source`, `coalesced` and `streamed` fields it declares.
+    pub(crate) fn record_on(&self, span: &Span) {
+        span.record("memory", self.memory.load(Ordering::Relaxed));
+        span.record("disk", self.disk.load(Ordering::Relaxed));
+        span.record("lazy", self.lazy.load(Ordering::Relaxed));
+        span.record("source", self.source.load(Ordering::Relaxed));
+        span.record("coalesced", self.coalesced.load(Ordering::Relaxed));
+        span.record("streamed", self.streamed.load(Ordering::Relaxed));
+    }
+}
+
 fn cache_open_failed(e: DiskCacheError) -> ReaderCacheError {
     ReaderCacheError::OpenFailed {
         source: ReadError::Io(io::Error::other(format!("disk cache fetch: {e}"))),
@@ -149,6 +235,8 @@ fn cache_open_failed(e: DiskCacheError) -> ReaderCacheError {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use arrow_array::{LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
@@ -292,6 +380,39 @@ mod tests {
         .expect("storage-only fallback");
         assert_eq!(reader.n_docs(), N_DOCS);
         assert_eq!(tier, OpenTier::Source);
+    }
+
+    /// Concurrent opens share one tally, so the counts from many threads add
+    /// up exactly, each in the slot of the tier it names.
+    #[test]
+    fn open_tier_counts_add_up_across_threads() {
+        const THREADS: usize = 4;
+        const OPENS_PER_THREAD: u64 = 1_000;
+        let counts = Arc::new(OpenTierCounts::default());
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let counts = Arc::clone(&counts);
+                thread::spawn(move || {
+                    for _ in 0..OPENS_PER_THREAD {
+                        counts.add(OpenTier::Memory);
+                        counts.add(OpenTier::Source);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("counting thread");
+        }
+        for tier in [
+            OpenTier::Disk,
+            OpenTier::Lazy,
+            OpenTier::Coalesced,
+            OpenTier::Streamed,
+        ] {
+            counts.add(tier);
+        }
+        let per_tier = THREADS as u64 * OPENS_PER_THREAD;
+        assert_eq!(counts.snapshot(), [per_tier, 1, 1, per_tier, 1, 1]);
     }
 
     // ---- tier 1: non-NotFound error short-circuits ---------------------

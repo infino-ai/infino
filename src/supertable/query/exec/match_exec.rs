@@ -53,10 +53,12 @@ use crate::{
         query::exec::{
             common::{
                 arg_to_string, output_schema_with_score, resolve_hits, search_query_df_error,
+                traced_tvf,
             },
             fts_exec::arg_to_bool_mode,
         },
     },
+    utils::trace::detail_span,
 };
 
 /// SQL name for the unranked token-match TVF.
@@ -368,6 +370,15 @@ impl ExecutionPlan for MatchExec {
             .await
         };
 
+        let span = match &self.query {
+            MatchQuery::Token { .. } => {
+                detail_span!("tvf.token_match", rows_out = tracing::field::Empty)
+            }
+            MatchQuery::Exact { .. } => {
+                detail_span!("tvf.exact_match", rows_out = tracing::field::Empty)
+            }
+        };
+        let fut = traced_tvf(span, fut);
         let stream = stream::once(fut);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,

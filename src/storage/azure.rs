@@ -290,7 +290,10 @@ impl StorageProvider for AzureStorageProvider {
 
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(uri = uri, len = range.end - range.start))
+        // `debug`: a read issues thousands of range GETs, too many to export
+        // as spans. A read's root span carries their totals (`store_gets`,
+        // `store_get_bytes`).
+        tracing::instrument(level = "debug", skip_all, fields(uri = uri, len = range.end - range.start))
     )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;

@@ -47,10 +47,9 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use roaring::RoaringBitmap;
-use tracing::{Instrument, trace};
+use tracing::{Instrument, Span, trace};
 use uuid::Uuid;
 
-use super::SuperfileHit;
 use crate::{
     runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::StorageProvider,
@@ -60,11 +59,12 @@ use crate::{
         handle::SupertableReader,
         manifest::SuperfileEntry,
         query::{
+            SuperfileHit,
             exec::common::{stamp_stable_ids, take_rows_byte_source, take_rows_object_store},
-            superfile_reader::superfile_reader,
+            superfile_reader::{OpenTierCounts, superfile_reader_tiered},
             vector::row_id_from_manifest_entry,
         },
-        reader_cache::{DiskCacheStore, ReadIntent, SuperfileReaderCache},
+        reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
         tombstones::SidecarCache,
     },
 };
@@ -73,10 +73,6 @@ use crate::{
 /// Warm opens are in-memory cache hits (microseconds); cold opens
 /// fetch the superfile header/footer from object storage. Always
 /// `await`ed so the open I/O overlaps across the fan-out.
-#[cfg_attr(
-    feature = "detailed-tracing",
-    tracing::instrument(skip_all, fields(uri = ?entry.uri))
-)]
 pub(crate) async fn open_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
@@ -84,7 +80,27 @@ pub(crate) async fn open_reader(
     entry: &SuperfileEntry,
     intent: ReadIntent,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
-    superfile_reader(
+    open_reader_tiered(store, disk_cache, storage, entry, intent)
+        .await
+        .map(|(reader, _)| reader)
+}
+
+/// [`open_reader`], also saying which cache tier served the file, for a
+/// fan-out that counts its opens. The span is `debug`: one per superfile is
+/// too many to export with every query, so the fan-out's phase span carries
+/// the counts instead.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(level = "debug", skip_all, fields(uri = ?entry.uri))
+)]
+async fn open_reader_tiered(
+    store: &Arc<dyn SuperfileReaderCache>,
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+    storage: Option<&Arc<dyn StorageProvider>>,
+    entry: &SuperfileEntry,
+    intent: ReadIntent,
+) -> Result<(Arc<SuperfileReader>, OpenTier), QueryError> {
+    superfile_reader_tiered(
         store,
         disk_cache,
         storage,
@@ -508,6 +524,9 @@ struct FanoutContext {
     op_stats: Option<Arc<OpStatsCollector>>,
     now: Instant,
     intent: ReadIntent,
+    /// This fan-out's opens by cache tier, for the phase span that awaits
+    /// it. `None` unless that span declares the tier fields.
+    tiers: Option<Arc<OpenTierCounts>>,
 }
 
 impl FanoutContext {
@@ -516,6 +535,7 @@ impl FanoutContext {
         units: &[(Arc<SuperfileEntry>, P)],
         prefetch_tombstones: bool,
         intent: ReadIntent,
+        tiers: Option<Arc<OpenTierCounts>>,
     ) -> Self {
         let manifest = reader.manifest();
         let tombstone_cache = reader.tombstone_cache.clone();
@@ -541,6 +561,7 @@ impl FanoutContext {
             op_stats: reader.op_stats.clone(),
             now,
             intent,
+            tiers,
         }
     }
 
@@ -561,7 +582,7 @@ impl FanoutContext {
         ) -> Fut,
         Fut: Future<Output = Result<R, QueryError>>,
     {
-        let r = open_reader(
+        let (r, tier) = open_reader_tiered(
             &self.store,
             self.disk_cache.as_ref(),
             self.storage.as_ref(),
@@ -569,6 +590,9 @@ impl FanoutContext {
             self.intent,
         )
         .await?;
+        if let Some(tiers) = &self.tiers {
+            tiers.add(tier);
+        }
         verify_superfile_vector_codecs(&r, &self.vector_columns)?;
         note_superfile_opened(self.op_stats.as_ref());
         body(r, entry, self.tombstone_cache.clone(), self.now, params).await
@@ -629,6 +653,10 @@ impl FanoutContext {
 /// tags + retains hits, while the count path either takes the O(1)
 /// `term_df` fast path (no tombstones) or counts the matching ids minus
 /// tombstones.
+///
+/// Awaited under a `tiered_span!`, it records on that span how many of
+/// its opens each cache tier served. Under any other span it counts
+/// nothing.
 pub(crate) async fn fanout_with<P, R, B, Fut>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
@@ -645,11 +673,46 @@ where
         + 'static,
     Fut: Future<Output = Result<R, QueryError>> + Send + 'static,
 {
+    let tiers = OpenTierCounts::for_current_span();
+    let out = fanout_with_counted(
+        reader,
+        units,
+        prefetch_tombstones,
+        intent,
+        body,
+        tiers.clone(),
+    )
+    .await?;
+    if let Some(tiers) = &tiers {
+        tiers.record_on(&Span::current());
+    }
+    Ok(out)
+}
+
+/// [`fanout_with`], counting its opens into `tiers` without recording them,
+/// for a phase that fans out in waves and records the total once.
+pub(crate) async fn fanout_with_counted<P, R, B, Fut>(
+    reader: &SupertableReader,
+    units: Vec<(Arc<SuperfileEntry>, P)>,
+    prefetch_tombstones: bool,
+    intent: ReadIntent,
+    body: B,
+    tiers: Option<Arc<OpenTierCounts>>,
+) -> Result<Vec<R>, QueryError>
+where
+    P: Send + 'static,
+    R: Send + 'static,
+    B: Fn(Arc<SuperfileReader>, Arc<SuperfileEntry>, Option<Arc<SidecarCache>>, Instant, P) -> Fut
+        + Clone
+        + Send
+        + 'static,
+    Fut: Future<Output = Result<R, QueryError>> + Send + 'static,
+{
     if units.is_empty() {
         return Ok(Vec::new());
     }
     trace!(units = units.len(), "fanning query out across superfiles");
-    let ctx = FanoutContext::new(reader, &units, prefetch_tombstones, intent).await;
+    let ctx = FanoutContext::new(reader, &units, prefetch_tombstones, intent, tiers).await;
 
     // Single unit (the common case for a compacted, single-superfile
     // table): run the body inline on the current task. `tokio::spawn`
@@ -680,6 +743,9 @@ where
 /// The window is the trade: strictly sequential opens maximise skips but
 /// serialise I/O; a wider window keeps the CPU busy while the first results
 /// raise the floor for the rest.
+///
+/// Records its opens by tier as [`fanout_with`] does. A skipped unit is
+/// never opened, so it is not counted.
 pub(crate) async fn fanout_with_ordered<P, R, B, Fut, S>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
@@ -704,14 +770,19 @@ where
         units = units.len(),
         window, "fanning query out across superfiles in ceiling order"
     );
-    let ctx = FanoutContext::new(reader, &units, true, ReadIntent::Warm).await;
+    let tiers = OpenTierCounts::for_current_span();
+    let ctx = FanoutContext::new(reader, &units, true, ReadIntent::Warm, tiers.clone()).await;
     // One unit: inline, as in [`fanout_with`]; nothing to overlap against.
     if units.len() == 1 {
         let (entry, params) = units.into_iter().next().expect("len == 1");
-        return match skip_before_open(&params) {
-            true => Ok(Vec::new()),
-            false => Ok(vec![ctx.run(body, entry, params).await?]),
+        let out = match skip_before_open(&params) {
+            true => Vec::new(),
+            false => vec![ctx.run(body, entry, params).await?],
         };
+        if let Some(tiers) = &tiers {
+            tiers.record_on(&Span::current());
+        }
+        return Ok(out);
     }
     let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
     let mut out = Vec::with_capacity(units.len());
@@ -731,6 +802,9 @@ where
             Some(result) => out.push(result?),
             None => break,
         }
+    }
+    if let Some(tiers) = &tiers {
+        tiers.record_on(&Span::current());
     }
     Ok(out)
 }
@@ -880,5 +954,69 @@ mod codec_verify_tests {
             verify_superfile_vector_codecs(&reader, &expected).is_err(),
             "a cosine-only Sq16 codec must not be accepted for an L2Sq table"
         );
+    }
+}
+
+#[cfg(test)]
+mod fanout_tier_tests {
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        storage::LocalFsStorageProvider,
+        supertable::Supertable,
+        test_helpers::{build_title_batch, default_supertable_options},
+    };
+
+    /// Commits in the fixture, one superfile each.
+    const COMMITS: u64 = 3;
+
+    /// Fan out over every superfile `table` lists with a body that does
+    /// nothing, and return the opens by tier.
+    async fn fanout_tiers(table: &Supertable) -> [u64; 6] {
+        let reader = table.reader().expect("reader");
+        let units: Vec<(Arc<SuperfileEntry>, ())> = reader
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|entry| (Arc::clone(entry), ()))
+            .collect();
+        let tiers = Arc::new(OpenTierCounts::default());
+        let out = fanout_with_counted(
+            &reader,
+            units,
+            false,
+            ReadIntent::Warm,
+            |_, _, _, _, ()| async { Ok::<(), QueryError>(()) },
+            Some(Arc::clone(&tiers)),
+        )
+        .await
+        .expect("fan-out");
+        assert_eq!(out.len() as u64, COMMITS, "every unit ran");
+        tiers.snapshot()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fanout_counts_each_open_in_the_tier_that_served_it() {
+        // Three superfiles, one unit each, so each is counted once, in the
+        // tier that served it:
+        //  - the writer leaves what it commits in the in-memory reader
+        //    cache, so the table that wrote them opens all three from memory.
+        //  - a table reopened on the same storage has nothing cached and no
+        //    disk cache, so all three come from the source.
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = || default_supertable_options().with_storage(Arc::clone(&storage));
+        let table = Supertable::create(options()).expect("create");
+        for title in ["alpha", "bravo", "charlie"] {
+            let mut writer = table.writer().expect("writer");
+            writer.append(&build_title_batch(&[title])).expect("append");
+            writer.commit().expect("commit");
+        }
+        assert_eq!(fanout_tiers(&table).await, [COMMITS, 0, 0, 0, 0, 0]);
+
+        let reopened = Supertable::open(options()).expect("reopen");
+        assert_eq!(fanout_tiers(&reopened).await, [0, 0, 0, COMMITS, 0, 0]);
     }
 }
