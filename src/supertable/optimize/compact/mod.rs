@@ -77,10 +77,10 @@ pub(crate) mod plan;
 use plan::split_stats_at_drain_watermark;
 pub(crate) use plan::{CompactionJob, SuperfileStats, select};
 
-/// Cap on compaction input opens in flight, across the whole process.
-/// Process-wide rather than per job: concurrent jobs would otherwise each
-/// claim this many, and the combined fanout saturates the object-store
-/// connection pool until requests start timing out.
+/// Cap on compaction input opens in flight, counted across the whole process
+/// rather than per merge. Several merges run at once, and it is their combined
+/// fan-out that saturates the object-store connection pool and pushes requests
+/// into timeouts, so the budget they share is the one worth bounding.
 const MAX_CONCURRENT_INPUT_OPENS: usize = 64;
 
 /// The shared permit pool behind [`MAX_CONCURRENT_INPUT_OPENS`].
