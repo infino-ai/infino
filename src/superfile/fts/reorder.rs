@@ -49,6 +49,12 @@ const MAX_ROUNDS: usize = 20;
 /// the corpus, far below [`MIN_PARTITION`] for any real one.
 const MAX_DEPTH: u32 = 24;
 
+/// Degrees below this read their cost from a table filled once per
+/// split instead of calling [`term_cost`]. Nearly every degree is
+/// below it, and at 256 KiB per side the tables stay in cache. Larger
+/// degrees call [`term_cost`] directly, so the values are the same.
+const COST_TABLE_LEN: usize = 1 << 16;
+
 /// A document's terms, as ids into a shared vocabulary, laid out one
 /// document after another with an index of where each begins.
 ///
@@ -122,6 +128,8 @@ pub(crate) fn bisect_order(fwd: &ForwardIndex) -> Vec<u32> {
         deg_right: vec![0u32; fwd.n_terms],
         move_gain_left: vec![0f32; fwd.n_terms],
         move_gain_right: vec![0f32; fwd.n_terms],
+        cost_left: Vec::new(),
+        cost_right: Vec::new(),
         gains: Vec::new(),
         touched: Vec::new(),
     };
@@ -140,6 +148,10 @@ struct BisectState {
     move_gain_left: Vec<f32>,
     /// The same for a document moving from the right.
     move_gain_right: Vec<f32>,
+    /// `term_cost(d, left size)` for the current split, by `d`.
+    cost_left: Vec<f32>,
+    /// `term_cost(d, right size)` for the current split, by `d`.
+    cost_right: Vec<f32>,
     /// `(gain, document)` for one side, rebuilt each round.
     gains: Vec<(f32, u32)>,
     /// Term ids whose degree entries a split touched, so the tables can
@@ -166,6 +178,8 @@ impl BisectState {
         self.count_degrees(fwd, order, mid);
         let n_left = mid as f32;
         let n_right = (order.len() - mid) as f32;
+        fill_cost_table(&mut self.cost_left, n_left);
+        fill_cost_table(&mut self.cost_right, n_right);
 
         for _ in 0..MAX_ROUNDS {
             // A document's gain is what the cost drops by if it moves:
@@ -218,11 +232,21 @@ impl BisectState {
         for &t in &self.touched {
             let t = t as usize;
             let (dl, dr) = (self.deg_left[t], self.deg_right[t]);
+            let left = Side {
+                deg: dl,
+                size: n_left,
+                costs: &self.cost_left,
+            };
+            let right = Side {
+                deg: dr,
+                size: n_right,
+                costs: &self.cost_right,
+            };
             if dl > 0 {
-                self.move_gain_left[t] = move_gain(dl, n_left, dr, n_right);
+                self.move_gain_left[t] = move_gain(&left, &right);
             }
             if dr > 0 {
-                self.move_gain_right[t] = move_gain(dr, n_right, dl, n_left);
+                self.move_gain_right[t] = move_gain(&right, &left);
             }
         }
     }
@@ -268,14 +292,42 @@ fn rank_by_gain(fwd: &ForwardIndex, half: &[u32], move_gain: &[f32]) -> Vec<(f32
     out
 }
 
+/// One half of a split, as a term's move gain sees it.
+struct Side<'a> {
+    /// Documents in this half carrying the term.
+    deg: u32,
+    /// Documents in this half.
+    size: f32,
+    /// This half's cost table.
+    costs: &'a [f32],
+}
+
+impl Side<'_> {
+    #[inline]
+    fn cost(&self, deg: u32) -> f32 {
+        match self.costs.get(deg as usize) {
+            Some(&c) => c,
+            None => term_cost(deg, self.size),
+        }
+    }
+}
+
 /// What the cost drops by when one document carrying a term moves from
-/// a half where `deg_here` of `here` documents carry it to one where
-/// `deg_there` of `there` do.
+/// `here` to `there`.
 #[inline]
-fn move_gain(deg_here: u32, here: f32, deg_there: u32, there: f32) -> f32 {
-    term_cost(deg_here, here) - term_cost(deg_here.saturating_sub(1), here)
-        + term_cost(deg_there, there)
-        - term_cost(deg_there + 1, there)
+fn move_gain(here: &Side, there: &Side) -> f32 {
+    here.cost(here.deg) - here.cost(here.deg.saturating_sub(1)) + there.cost(there.deg)
+        - there.cost(there.deg + 1)
+}
+
+/// Fill `table` with `term_cost(d, size)` for every degree a half of
+/// `size` documents can reach, up to [`COST_TABLE_LEN`].
+fn fill_cost_table(table: &mut Vec<f32>, size: f32) {
+    // A degree reaches at most `size + 1`: the term's documents on this
+    // side plus the one moving in.
+    let len = (size as usize + 2).min(COST_TABLE_LEN);
+    table.clear();
+    table.extend((0..len as u32).map(|d| term_cost(d, size)));
 }
 
 /// What a term carried by `deg` of a half's `size` documents
@@ -422,5 +474,26 @@ mod tests {
     fn the_order_is_deterministic() {
         let (fwd, _) = clustered(1_000, 3, 5);
         assert_eq!(bisect_order(&fwd), bisect_order(&fwd));
+    }
+
+    #[test]
+    fn a_cost_matches_term_cost_on_both_sides_of_the_table() {
+        const SIZE: f32 = 200_000.0;
+        let mut costs = Vec::new();
+        fill_cost_table(&mut costs, SIZE);
+        assert_eq!(costs.len(), COST_TABLE_LEN);
+        let side = Side {
+            deg: 0,
+            size: SIZE,
+            costs: &costs,
+        };
+        let cap = COST_TABLE_LEN as u32;
+        for d in [0, 1, 2, cap - 1, cap, cap + 1, SIZE as u32 + 1] {
+            assert_eq!(
+                side.cost(d).to_bits(),
+                term_cost(d, SIZE).to_bits(),
+                "d={d}"
+            );
+        }
     }
 }

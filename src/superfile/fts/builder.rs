@@ -3037,8 +3037,7 @@ impl FtsBuilder {
             let n_scored = n_scored_per_col[orig_col_idx];
 
             // The compaction merge: the accumulator is empty (checked in
-            // `finish_to`) and the inputs are merged term by term, already in
-            // output order.
+            // `finish_to`) and the inputs are merged term by term.
             if !sorted_inputs.is_empty() {
                 let merge_span = detail_span!(
                     "fts_sorted_merge",
