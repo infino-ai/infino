@@ -38,6 +38,72 @@ pub(crate) fn encode_run(out: &mut Vec<u8>, positions: &[u32]) {
     }
 }
 
+/// A term's position runs in posting order, as the encoder takes them.
+/// A run is a posting's first position, then the gaps between the rest.
+#[derive(Clone, Copy)]
+pub(crate) enum TermRuns<'a> {
+    /// LEB128 runs back to back, as the build accumulator holds them.
+    Encoded(&'a [u8]),
+    /// Run values, as the compaction merge decodes them: posting `i`'s
+    /// `tf` values start at `starts[i]`. Keeping them decoded saves the
+    /// merge a LEB128 round trip per position.
+    Values {
+        values: &'a [u32],
+        starts: &'a [usize],
+    },
+}
+
+impl TermRuns<'_> {
+    /// Append posting `i`'s run of `tf` values to `out`. `at` walks the
+    /// encoded form and must start at 0 for posting 0; the decoded form
+    /// ignores it.
+    #[inline]
+    pub(crate) fn push_run(&self, i: usize, tf: u32, at: &mut usize, out: &mut Vec<u32>) {
+        match *self {
+            Self::Encoded(bytes) => {
+                for _ in 0..tf {
+                    out.push(read_varint(bytes, at).expect("builder-encoded run"));
+                }
+            }
+            Self::Values { values, starts } => {
+                let start = starts[i];
+                out.extend_from_slice(&values[start..start + tf as usize]);
+            }
+        }
+    }
+
+    /// The runs' LEB128 bytes, when that is the form they are in.
+    pub(crate) fn encoded(&self) -> Option<&[u8]> {
+        match *self {
+            Self::Encoded(bytes) => Some(bytes),
+            Self::Values { .. } => None,
+        }
+    }
+
+    /// The first posting's first value.
+    pub(crate) fn first_value(&self) -> u32 {
+        match *self {
+            Self::Encoded(bytes) => read_varint(bytes, &mut 0).expect("builder-encoded run"),
+            Self::Values { values, starts } => values[starts[0]],
+        }
+    }
+
+    /// The runs as LEB128 bytes, which the layouts before grouped
+    /// positions store verbatim. `tfs` gives each posting's run length.
+    pub(crate) fn encode_into(&self, tfs: impl Iterator<Item = u32>, out: &mut Vec<u8>) {
+        match *self {
+            Self::Encoded(bytes) => out.extend_from_slice(bytes),
+            Self::Values { values, starts } => {
+                for (i, tf) in tfs.enumerate() {
+                    for &v in &values[starts[i]..starts[i] + tf as usize] {
+                        push_varint(out, v);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Decode one run of exactly `tf` positions from `bytes` at `*at`,
 /// appending the absolute positions to `out` and advancing `*at`.
 /// `None` on corrupt (truncated / overflowing) bytes.
@@ -442,6 +508,52 @@ pub(crate) fn positions_from_run_values(values: &[u32], out: &mut Vec<u32>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decoded form of a term's runs reads, and re-encodes, exactly as
+    /// the LEB128 form does, whatever order the postings' runs sit in.
+    #[test]
+    fn decoded_runs_agree_with_encoded_runs() {
+        // Three postings' positions, and the order they are emitted in.
+        let docs: [&[u32]; 3] = [&[4, 9, 300], &[0], &[7, 200_000]];
+        let emitted = [2usize, 0, 1];
+        let mut values = Vec::new();
+        let mut starts = vec![0; docs.len()];
+        for (i, positions) in docs.iter().enumerate() {
+            starts[i] = values.len();
+            let mut prev = 0;
+            for &p in *positions {
+                values.push(p - prev);
+                prev = p;
+            }
+        }
+        let mut bytes = Vec::new();
+        for &i in &emitted {
+            encode_run(&mut bytes, docs[i]);
+        }
+        let emitted_starts: Vec<usize> = emitted.iter().map(|&i| starts[i]).collect();
+        let decoded = TermRuns::Values {
+            values: &values,
+            starts: &emitted_starts,
+        };
+        let encoded = TermRuns::Encoded(&bytes);
+        let tfs: Vec<u32> = emitted.iter().map(|&i| docs[i].len() as u32).collect();
+
+        let (mut from_decoded, mut from_encoded) = (Vec::new(), Vec::new());
+        let (mut at_decoded, mut at_encoded) = (0, 0);
+        for (i, &tf) in tfs.iter().enumerate() {
+            decoded.push_run(i, tf, &mut at_decoded, &mut from_decoded);
+            encoded.push_run(i, tf, &mut at_encoded, &mut from_encoded);
+        }
+        assert_eq!(from_decoded, from_encoded, "run values");
+        assert_eq!(at_encoded, bytes.len(), "the encoded walk covers every run");
+        assert_eq!(decoded.first_value(), encoded.first_value(), "first value");
+
+        let mut reencoded = Vec::new();
+        decoded.encode_into(tfs.iter().copied(), &mut reencoded);
+        assert_eq!(reencoded, bytes, "re-encoded runs");
+        assert_eq!(decoded.encoded(), None);
+        assert_eq!(encoded.encoded(), Some(bytes.as_slice()));
+    }
 
     /// Encode a group with fresh scratch.
     fn group(out: &mut Vec<u8>, tfs: &[u32], values: &[u32], allow_leb128: bool) {

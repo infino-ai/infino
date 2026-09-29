@@ -5861,10 +5861,18 @@ mod tests {
     }
 
     fn assert_sorted_merge_matches_accumulator(positions: bool, deletes: &[&[u32]]) {
+        assert_merge_of_sizes_matches_accumulator(&SORTED_MERGE_INPUT_DOCS, positions, deletes);
+    }
+
+    fn assert_merge_of_sizes_matches_accumulator(
+        sizes: &[u32],
+        positions: bool,
+        deletes: &[&[u32]],
+    ) {
         let opts = sorted_merge_opts(positions);
         let mut first_id = 0;
         let mut inputs = Vec::new();
-        for (i, &docs) in SORTED_MERGE_INPUT_DOCS.iter().enumerate() {
+        for (i, &docs) in sizes.iter().enumerate() {
             let docs_text = sorted_merge_docs(i as u32, first_id, docs);
             inputs.push((
                 merge_input(&opts, first_id, &docs_text, BlobEra::V7),
@@ -5956,6 +5964,23 @@ mod tests {
                 positions,
                 &[&[5, 7, 100], &all_of_input_1, &[], &every_third],
             );
+        }
+    }
+
+    /// A merge large enough to choose its own doc order, so nearly every
+    /// term's postings arrive out of order and are sorted before they are
+    /// written, positions included.
+    #[test]
+    fn a_reordered_sorted_merge_matches_accumulator() {
+        const SIZES: [u32; 3] = [2_500, 1_000, 1_700];
+        assert!(
+            SIZES.iter().sum::<u32>() as usize > REORDER_MIN_DOCS,
+            "premise: the merge reorders"
+        );
+        let every_fifth: Vec<u32> = (0..SIZES[1]).step_by(5).collect();
+        for positions in [false, true] {
+            assert_merge_of_sizes_matches_accumulator(&SIZES, positions, &[]);
+            assert_merge_of_sizes_matches_accumulator(&SIZES, positions, &[&[3, 9], &every_fifth]);
         }
     }
 
