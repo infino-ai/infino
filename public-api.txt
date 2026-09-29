@@ -254,33 +254,6 @@ impl core::marker::Unpin for infino::Stopwords
 impl core::marker::UnsafeUnpin for infino::Stopwords
 impl core::panic::unwind_safe::RefUnwindSafe for infino::Stopwords
 impl core::panic::unwind_safe::UnwindSafe for infino::Stopwords
-pub enum infino::ThreadCount
-pub infino::ThreadCount::Auto
-pub infino::ThreadCount::Fixed(usize)
-impl infino::ThreadCount
-pub fn infino::ThreadCount::resolve_or_default(self, usize) -> usize
-impl core::clone::Clone for infino::ThreadCount
-pub fn infino::ThreadCount::clone(&self) -> Self
-impl core::cmp::Eq for infino::ThreadCount
-impl core::cmp::PartialEq for infino::ThreadCount
-pub fn infino::ThreadCount::eq(&self, &Self) -> bool
-impl core::default::Default for infino::ThreadCount
-pub fn infino::ThreadCount::default() -> Self
-impl core::fmt::Debug for infino::ThreadCount
-pub fn infino::ThreadCount::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Copy for infino::ThreadCount
-impl core::marker::StructuralPartialEq for infino::ThreadCount
-impl serde_core::ser::Serialize for infino::ThreadCount
-pub fn infino::ThreadCount::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
-impl<'de> serde_core::de::Deserialize<'de> for infino::ThreadCount
-pub fn infino::ThreadCount::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
-impl core::marker::Freeze for infino::ThreadCount
-impl core::marker::Send for infino::ThreadCount
-impl core::marker::Sync for infino::ThreadCount
-impl core::marker::Unpin for infino::ThreadCount
-impl core::marker::UnsafeUnpin for infino::ThreadCount
-impl core::panic::unwind_safe::RefUnwindSafe for infino::ThreadCount
-impl core::panic::unwind_safe::UnwindSafe for infino::ThreadCount
 #[non_exhaustive] pub struct infino::Bm25Params
 pub infino::Bm25Params::b: f32
 pub infino::Bm25Params::k1: f32
@@ -331,7 +304,7 @@ impl core::marker::UnsafeUnpin for infino::Bm25SearchOptions
 impl core::panic::unwind_safe::RefUnwindSafe for infino::Bm25SearchOptions
 impl core::panic::unwind_safe::UnwindSafe for infino::Bm25SearchOptions
 pub struct infino::CompactionSettings
-pub infino::CompactionSettings::max_concurrent_jobs: infino::ThreadCount
+pub infino::CompactionSettings::max_concurrent_jobs: core::option::Option<usize>
 pub infino::CompactionSettings::max_memory_mb: u64
 pub infino::CompactionSettings::min_fill_percent: u8
 pub infino::CompactionSettings::min_superfiles_for_merge: u64

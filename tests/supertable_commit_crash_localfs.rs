@@ -79,7 +79,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use infino::{
-    CompactionSettings, GcSettings, ThreadCount, VectorSearchOptions,
+    CompactionSettings, GcSettings, VectorSearchOptions,
     config::{DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
     superfile::{
         builder::{FtsConfig, VectorConfig},
@@ -496,7 +496,7 @@ fn compact_crash_settings(stale_seal_timeout_ms: u64) -> CompactionSettings {
     CompactionSettings {
         target_superfile_size_mb: 1,
         min_fill_percent: 1,
-        max_concurrent_jobs: ThreadCount::Fixed(COMPACT_CRASH_CONCURRENCY),
+        max_concurrent_jobs: Some(COMPACT_CRASH_CONCURRENCY),
         stale_seal_timeout_ms,
         ..CompactionSettings::default()
     }

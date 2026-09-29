@@ -1243,7 +1243,7 @@ mod tests {
     };
     use crate::{
         Bm25Stats, BoolMode, VectorSearchOptions,
-        config::{DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions, ThreadCount},
+        config::{DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
         memory::ConnectionMemoryBudget,
         superfile::{
             builder::{FtsConfig, VectorConfig},
@@ -4096,7 +4096,7 @@ mod tests {
         }
 
         let cfg = CompactionSettings {
-            max_concurrent_jobs: ThreadCount::Fixed(concurrency),
+            max_concurrent_jobs: Some(concurrency),
             ..small_compact_cfg()
         };
         let before = st.manifest_id();

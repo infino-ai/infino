@@ -262,18 +262,6 @@ const DEFAULT_COMPACTION_MIN_FILL_PERCENT: u8 = 80;
 const DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE: u64 = 50;
 const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB + 2048;
 
-/// How many compaction merges run at once by default.
-///
-/// `auto`, which caps the width at the maintenance pool. The memory bound is
-/// not applied here: each wave is admitted against the bytes ITS OWN jobs will
-/// materialize, which the compaction runner knows and this layer does not.
-///
-/// A serial pass leaves a wide box idle — measured at a load average of 1.16
-/// across a 33-minute optimize on 44 cores — so the default is the derived
-/// width, not 1. Set `compaction.max_concurrent_jobs: 1` for strictly serial
-/// merging.
-const DEFAULT_COMPACTION_MAX_CONCURRENT_JOBS: ThreadCount = ThreadCount::Auto;
-
 /// How old a tombstone sidecar seal has to be before compaction treats
 /// its owner as dead and takes over, instead of backing off.
 /// Scale this up if target_superfile_size_mb is raised well past the default
@@ -308,12 +296,16 @@ pub struct CompactionSettings {
     /// concurrency from this: a wave is admitted against the bytes its own jobs
     /// actually hold.
     pub max_memory_mb: u64,
-    /// How many of a pass's merge jobs run at once. The jobs a pass plans
-    /// never share an input, so they are safe to run concurrently; the limit
-    /// is memory, since each in-flight job holds up to `max_memory_mb` of raw
-    /// input. `auto` (the default) resolves from available memory and the
-    /// maintenance pool width; set it to 1 for strictly serial merging.
-    pub max_concurrent_jobs: ThreadCount,
+    /// How many of a pass's merge jobs may be in flight at once.
+    ///
+    /// `None` (the default) derives the ceiling from the maintenance pool and
+    /// lets the runner widen each wave only while the host reports free
+    /// memory; `Some(n)` forces exactly `n`, and `Some(1)` is strictly serial.
+    ///
+    /// Not a thread count: a job is an async task whose CPU work runs on the
+    /// shared maintenance pool, so this is how many merges may overlap, not
+    /// how many threads they get.
+    pub max_concurrent_jobs: Option<usize>,
     /// How old a sealed tombstone sidecar has to be, in milliseconds,
     /// before it's treated as abandoned
     pub stale_seal_timeout_ms: u64,
@@ -326,7 +318,7 @@ impl Default for CompactionSettings {
             min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
             min_superfiles_for_merge: DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE,
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
-            max_concurrent_jobs: DEFAULT_COMPACTION_MAX_CONCURRENT_JOBS,
+            max_concurrent_jobs: None,
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
         }
     }
@@ -1289,16 +1281,15 @@ impl Serialize for ThreadCount {
 impl Config {
     /// How many compaction merge jobs a pass may run at once.
     ///
-    /// An explicit setting is honored (clamped to the sane band); `auto`
-    /// resolves to the maintenance pool width, because merges run on that pool
-    /// and more concurrent jobs than it has threads is width without
-    /// throughput.
+    /// An explicit setting is honored as written. Unset, the width derives
+    /// from the maintenance pool, because merges run on that pool and more
+    /// concurrent jobs than it has threads is width without throughput.
     ///
     /// This is a CPU ceiling only. The memory bound lives in the compaction
-    /// runner, which admits each wave against the bytes its own jobs will
-    /// materialize — a real quantity, where this layer would only have the
-    /// `max_memory_mb` cap to guess from. The one exception is a host with no
-    /// procfs: nothing downstream can bound a wave there, so `auto` stays at 1.
+    /// runner, which widens each wave only while the host reports free memory
+    /// — an observation, where this layer could only guess from the
+    /// `max_memory_mb` cap. The one exception is a host with no procfs:
+    /// nothing downstream can bound a wave there, so the derived width is 1.
     /// `compaction` is the settings the pass actually runs with, not
     /// necessarily `self.compaction`: the hidden vector index compacts under
     /// its own derived settings and resolves its own width from them.
@@ -1311,8 +1302,8 @@ impl Config {
             // Memory is observable, so the wave runner bounds each wave by the
             // bytes its own jobs will materialize — a far better estimate than
             // anything derivable here, where only the `max_memory_mb` CAP is
-            // known and real jobs are routinely a fraction of it. `auto` is
-            // then just the CPU ceiling.
+            // known and real jobs are routinely a fraction of it. The derived
+            // value is then just the CPU ceiling.
             Some(_) => maintenance,
             // No procfs: nothing downstream can bound a wave, so stay serial
             // rather than invent a width.
@@ -1323,7 +1314,7 @@ impl Config {
         // the pass actually planned, memory narrows it further wherever the
         // host reports any, and compaction's input opens ride a process-wide
         // semaphore that bounds object-store fan-out on its own.
-        compaction.max_concurrent_jobs.resolve_or_default(resolved)
+        compaction.max_concurrent_jobs.unwrap_or(resolved).max(1)
     }
 
     /// Load from the standard hierarchy. See module docs for the
@@ -2240,26 +2231,23 @@ vector:
     fn an_explicit_width_is_honored_as_written() {
         let cfg = Config::default();
         let serial = cfg.compaction_concurrency(&CompactionSettings {
-            max_concurrent_jobs: ThreadCount::Fixed(1),
+            max_concurrent_jobs: Some(1),
             ..CompactionSettings::default()
         });
         assert_eq!(serial, 1, "an explicit 1 must stay serial");
         /// Wider than any pool this would run on, to prove nothing trims it.
         const VERY_WIDE: usize = 4096;
         let wide = cfg.compaction_concurrency(&CompactionSettings {
-            max_concurrent_jobs: ThreadCount::Fixed(VERY_WIDE),
+            max_concurrent_jobs: Some(VERY_WIDE),
             ..CompactionSettings::default()
         });
         assert_eq!(wide, VERY_WIDE, "an explicit width must not be trimmed");
     }
 
-    /// The shipped default is the derived width, not serial: a serial pass was
-    /// measured holding a 44-core box at a load average of 1.16.
+    /// The shipped default derives the width rather than forcing one: a serial
+    /// pass was measured holding a 44-core box at a load average of 1.16.
     #[test]
-    fn the_default_width_is_auto() {
-        assert_eq!(
-            CompactionSettings::default().max_concurrent_jobs,
-            ThreadCount::Auto
-        );
+    fn the_default_width_is_derived() {
+        assert_eq!(CompactionSettings::default().max_concurrent_jobs, None);
     }
 }

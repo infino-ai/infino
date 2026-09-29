@@ -44,7 +44,6 @@ use super::{
 use crate::utils::trace::OpOrigin;
 use crate::{
     config,
-    config::ThreadCount,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::{PrefixedStorageProvider, StorageError},
@@ -1615,13 +1614,13 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
         min_fill_percent: cfg.compaction.min_fill_percent,
         min_superfiles_for_merge: vector.compaction_min_superfiles_for_merge,
         max_memory_mb: vector.compaction_max_memory_mb,
-        // Concurrency is derived here too. Safe for the same reason as the
-        // user table's: a pass's jobs never share
+        // Concurrency is derived here too (None). Safe for the same reason as
+        // the user table's: a pass's jobs never share
         // an input. The hidden table partitions by vector cell, so its jobs are
         // per-cell and disjoint by construction, and the over-cap cell split is a
         // separate phase that completes before merge selection begins — no merge
         // can race a split that would remove a superfile it planned to use.
-        max_concurrent_jobs: ThreadCount::Auto,
+        max_concurrent_jobs: None,
         ..Default::default()
     }
 }
@@ -4289,7 +4288,7 @@ mod tests {
             min_fill_percent: 1,
             min_superfiles_for_merge: 2,
             max_memory_mb: 64,
-            max_concurrent_jobs: crate::config::ThreadCount::Fixed(1),
+            max_concurrent_jobs: Some(1),
             stale_seal_timeout_ms: crate::config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         };
 
