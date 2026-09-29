@@ -127,7 +127,7 @@ const KP_HIDDEN_SPLIT_SECOND_LIST: &str = "hidden-split-second-list";
 /// merge finished, and the manifest pointer not yet moved. This is the
 /// window concurrent jobs widen -- one dead compactor now holds several
 /// sealed input sets and leaves several staged outputs behind.
-const KP_COMPACT_BATCH_SEG: &str = "compact-batch-seg";
+const KP_COMPACT_BATCH_SUPERFILE: &str = "compact-batch-superfile";
 /// Superfiles the compaction-crash fixture commits. Enough that the packer
 /// fills more than one job from them, so the crash really lands mid-batch.
 const COMPACT_CRASH_SUPERFILES: usize = 32;
@@ -511,7 +511,7 @@ fn run_compact_batch_crash_child(dir: PathBuf) -> ! {
         local,
         "data/",
         1,
-        KP_COMPACT_BATCH_SEG,
+        KP_COMPACT_BATCH_SUPERFILE,
     ));
     let storage: Arc<dyn StorageProvider> = Arc::<CrashStorage>::clone(&wrapped);
     let st =
@@ -536,7 +536,7 @@ fn run_compact_batch_crash_child(dir: PathBuf) -> ! {
     )));
 
     eprintln!(
-        "CRASH-CHILD: compaction returned without aborting (kill_point={KP_COMPACT_BATCH_SEG}) — \
+        "CRASH-CHILD: compaction returned without aborting (kill_point={KP_COMPACT_BATCH_SUPERFILE}) — \
          test configuration is wrong"
     );
     std::process::exit(MISCONFIGURED_KILL_POINT_EXIT_CODE);
@@ -642,7 +642,7 @@ fn dispatch_child_if_set() -> Option<()> {
         if kp == KP_VECTOR_COMMIT_SEG {
             run_vector_commit_crash_child(PathBuf::from(dir));
         }
-        if kp == KP_COMPACT_BATCH_SEG {
+        if kp == KP_COMPACT_BATCH_SUPERFILE {
             run_compact_batch_crash_child(PathBuf::from(dir));
         }
         run_crash_child(PathBuf::from(dir), &kp);
@@ -1118,7 +1118,7 @@ fn crash_mid_compaction_batch_recovers_and_reclaims_the_orphans() {
     }
     let dir = spawn_crash_child(
         "crash_mid_compaction_batch_recovers_and_reclaims_the_orphans",
-        KP_COMPACT_BATCH_SEG,
+        KP_COMPACT_BATCH_SUPERFILE,
     );
 
     let storage: Arc<dyn StorageProvider> =
