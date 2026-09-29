@@ -1615,11 +1615,8 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
         min_fill_percent: cfg.compaction.min_fill_percent,
         min_superfiles_for_merge: vector.compaction_min_superfiles_for_merge,
         max_memory_mb: vector.compaction_max_memory_mb,
-        // Concurrency is derived here too, and from THIS budget rather than the
-        // user table's: a hidden merge materializes `vector.compaction_max_memory_mb`,
-        // so a width sized off the user table's smaller budget would overcommit.
-        //
-        // Safe for the same reason as the user table's: a pass's jobs never share
+        // Concurrency is derived here too. Safe for the same reason as the
+        // user table's: a pass's jobs never share
         // an input. The hidden table partitions by vector cell, so its jobs are
         // per-cell and disjoint by construction, and the over-cap cell split is a
         // separate phase that completes before merge selection begins — no merge

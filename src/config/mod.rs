@@ -295,10 +295,18 @@ pub struct CompactionSettings {
     /// tables. Values below 2 are raised to 2 — merging fewer than two inputs
     /// is a no-op rewrite.
     pub min_superfiles_for_merge: u64,
-    /// Maximum memory budget for materializing inputs during a single merge, in MiB.
+    /// Ceiling on the raw input bytes one merge may accumulate, in MiB. The
+    /// packer stops adding superfiles to a job once it would cross this.
+    ///
     /// Independent of `target_superfile_size_mb`: raising the target does not
-    /// raise this. Bounds the raw input bytes a merge materializes, not the
-    /// merge's peak resident set.
+    /// raise this. Most jobs never approach it, because the output target
+    /// closes them out first — it is the backstop for a partition of unusually
+    /// large superfiles, not a typical job's size.
+    ///
+    /// It is also NOT a bound on the merge's resident set, which runs several
+    /// times higher once rows are decoded and the output encoded. Nothing sizes
+    /// concurrency from this: a wave is admitted against the bytes its own jobs
+    /// actually hold.
     pub max_memory_mb: u64,
     /// How many of a pass's merge jobs run at once. The jobs a pass plans
     /// never share an input, so they are safe to run concurrently; the limit
