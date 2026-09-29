@@ -202,8 +202,6 @@ struct BisectState {
     cost_left: Vec<f32>,
     /// `term_cost(d, right size)` for the current split, by `d`.
     cost_right: Vec<f32>,
-    /// `(gain, document)` for one side, rebuilt each round.
-    gains: Vec<(f32, u32)>,
     /// Term ids whose degree entries a split touched, so the tables can
     /// be cleared in proportion to the partition rather than to the
     /// vocabulary.
@@ -219,7 +217,6 @@ impl BisectState {
             move_gain_right: vec![0f32; n_terms],
             cost_left: Vec::new(),
             cost_right: Vec::new(),
-            gains: Vec::new(),
             touched: Vec::new(),
         }
     }
@@ -338,7 +335,6 @@ impl BisectState {
             self.deg_right[t as usize] = 0;
         }
         self.touched.clear();
-        self.gains.clear();
     }
 }
 
