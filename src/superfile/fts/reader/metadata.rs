@@ -668,6 +668,16 @@ pub struct FtsColumnConfig {
     pub stemmer: Option<String>,
     /// Revision of the analysis that produced this column's terms.
     ///
+    /// Per column rather than per file, for two reasons. It is derived
+    /// from [`Self::tokenizer`], [`Self::stopwords`] and
+    /// [`Self::stemmer`], which a caller sets per field — two columns of
+    /// one table can be analyzed by different chains and so sit at
+    /// different revisions. And a re-analysis can only rebuild columns
+    /// whose text was stored, carrying the rest across untouched, so it
+    /// leaves a file holding both the new revision and the old one. A
+    /// file-level field would have to claim one of them for columns it
+    /// did not repair.
+    ///
     /// Absent on every file written before revisions were recorded,
     /// which is precisely what `0` means — terms from an analysis whose
     /// version this engine cannot name, and which a reindex must

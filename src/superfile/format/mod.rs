@@ -226,6 +226,11 @@ pub mod fts {
     /// A new version therefore means: add the constant, add the era that
     /// writes it, then raise this. `current_version_matches_the_written_era`
     /// fails if the last step happens without the middle one.
+    ///
+    /// Not the newest version — the one the default era stamps. [`VERSION_V8`]
+    /// sits above it and is written only where a compaction chooses an order,
+    /// so deriving this from the highest known version would mark every plain
+    /// file stale and have a reindex re-emit the same version forever.
     pub const VERSION_CURRENT: u32 = VERSION_V7;
 
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
