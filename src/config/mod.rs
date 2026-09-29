@@ -2190,29 +2190,31 @@ vector:
         // Untouched keys fall through to the embedded default.
         assert_eq!(cfg.vector.drain_batch_superfiles, 64);
     }
-    /// The `max_memory_mb` the measured sweep ran with (1 GiB target + 2 GiB).
-    const MEASURED_BUDGET_MB: u64 = 3072;
 
-    /// `auto` is a CPU ceiling, not a memory one.
+    /// An arbitrary per-merge input cap. The figure carries no meaning: the
+    /// test below asserts the derived width is INDEPENDENT of it, which is
+    /// exactly what was broken when the width was sized off this setting.
+    const ANY_BUDGET_MB: u64 = 3072;
+
+    /// The derived width is a CPU ceiling, not a memory one.
     ///
-    /// The memory bound moved to the compaction runner, which knows what each
-    /// wave's own jobs weigh. Resolving it here could only divide by
-    /// `max_memory_mb` — the cap the packer stops at, which real jobs rarely
-    /// approach — and on the measured host that estimate was several times too
-    /// small. So `auto` caps width at the pool and nothing else.
+    /// The memory bound belongs to the compaction runner, which widens a wave
+    /// only while the host reports free memory. Deriving it here could only
+    /// divide by `max_memory_mb` — the cap the packer stops at, which real jobs
+    /// rarely approach — so the width caps at the pool and nothing else.
     #[test]
-    fn auto_concurrency_is_the_pool_width_not_a_memory_estimate() {
+    fn the_derived_width_is_the_pool_width_not_a_memory_estimate() {
         let cfg = Config::default();
         let derived = cfg.compaction_concurrency(&CompactionSettings {
-            max_memory_mb: MEASURED_BUDGET_MB,
+            max_memory_mb: ANY_BUDGET_MB,
             ..CompactionSettings::default()
         });
         // Never zero, whatever the host — a zero would stall the wave loop.
         assert!(derived >= 1, "width must be at least one");
         // Crucially it does NOT scale with the memory budget: a four-fold
-        // budget is the same width, because bytes are judged downstream.
+        // budget is the same width, because memory is judged downstream.
         let wide_budget = cfg.compaction_concurrency(&CompactionSettings {
-            max_memory_mb: MEASURED_BUDGET_MB * 4,
+            max_memory_mb: ANY_BUDGET_MB * 4,
             ..CompactionSettings::default()
         });
         assert_eq!(
