@@ -564,11 +564,12 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
 mod tests {
     use std::{collections::HashSet, sync::Arc};
 
+    use arrow::util::display::array_value_to_string;
     use arrow_array::{
         Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
         LargeStringArray, RecordBatch, StringArray, StringViewArray,
     };
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use datafusion::{datasource::MemTable, prelude::SessionContext};
     use tokio::runtime::Runtime;
 
@@ -577,7 +578,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER},
+            fts::tokenize::{ASCII_LOWER_TOKENIZER, MAX_TOKEN_CHARS, STANDARD_TOKENIZER},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -1860,6 +1861,53 @@ mod tests {
         }
     }
 
+    /// Every row of `batches` with each cell rendered as text, sorted: a
+    /// comparison that ignores row order and which string width a plan
+    /// chose for a column, but not a repeated or missing row.
+    fn rendered_rows(batches: &[RecordBatch]) -> Vec<String> {
+        let mut rows: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(move |i| {
+                    b.columns()
+                        .iter()
+                        .map(|c| array_value_to_string(c, i).expect("render cell"))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// DataFusion over `batches` in a plain in-memory table named like the
+    /// supertable: the oracle the index-bounded plans are judged against.
+    fn memtable_oracle(schema: SchemaRef, batches: Vec<RecordBatch>) -> SessionContext {
+        let ctx = SessionContext::new();
+        let mem = MemTable::try_new(schema, vec![batches]).expect("mem");
+        ctx.register_table("supertable", Arc::new(mem))
+            .expect("register");
+        ctx
+    }
+
+    /// Assert `sql` returns exactly the oracle's rows from `st`; `context`
+    /// names the fixture in the failure message.
+    fn assert_same_rows(
+        rt: &Runtime,
+        oracle: &SessionContext,
+        st: &Supertable,
+        sql: &str,
+        context: &str,
+    ) {
+        let expected = rendered_rows(
+            &rt.block_on(async { oracle.sql(sql).await?.collect().await })
+                .expect("datafusion oracle"),
+        );
+        let got = rendered_rows(&st.reader().expect("reader").query_sql(sql).expect("query"));
+        assert_eq!(got, expected, "{sql} ({context})");
+    }
+
     #[test]
     fn query_sql_like_and_ilike_match_datafusion_on_a_memtable() {
         // The oracle here is DataFusion itself over the same rows in a
@@ -1890,21 +1938,64 @@ mod tests {
             w.commit().expect("commit apart");
             assert_eq!(st.reader().expect("reader").n_superfiles(), 2);
 
-            let ctx = SessionContext::new();
-            let mem = MemTable::try_new(schema_id_cat_title(), vec![vec![batch, apart_batch]])
-                .expect("mem");
-            ctx.register_table("supertable", Arc::new(mem))
-                .expect("register");
-
+            let oracle = memtable_oracle(schema_id_cat_title(), vec![batch, apart_batch]);
             for (op, pattern) in FOLD_PATTERNS {
                 let quoted = pattern.replace('\'', "''");
                 let sql = format!("SELECT title FROM supertable WHERE title {op} '{quoted}'");
-                let expected = title_set(
-                    &rt.block_on(async { ctx.sql(&sql).await?.collect().await })
-                        .expect("datafusion oracle"),
-                );
-                let got = title_set(&st.reader().expect("reader").query_sql(&sql).expect("query"));
-                assert_eq!(got, expected, "{op} {pattern:?} under {name}");
+                assert_same_rows(&rt, &oracle, &st, &sql, name);
+            }
+        }
+    }
+
+    /// Characters planted ahead of a word in the cut rows: one short of
+    /// the tokenizer's cut, so the word's first character ends the first
+    /// piece and the rest of it starts the second.
+    const CUT_HEAD_RUN: usize = MAX_TOKEN_CHARS - 1;
+
+    /// A pattern word past the tokenizer's cut, so the query side cuts it
+    /// into a piece of the cut length and a remainder.
+    const LONG_PATTERN_WORD: usize = MAX_TOKEN_CHARS + 45;
+
+    #[test]
+    fn query_sql_like_finds_matches_across_a_tokenizer_cut() {
+        // A word past the cut is indexed as pieces, so a match running
+        // across a cut sits in no single term: `x…xBBC` (254 x's) is
+        // `x…xb` and `bc`, neither holding `bbc`. And a pattern word past
+        // the cut is cut on the query side too, where the edge between two
+        // pieces is no word boundary for the row. Both used to drop
+        // matching rows; the oracle is DataFusion over the same rows.
+        let rt = Runtime::new().expect("runtime");
+        let head = "x".repeat(CUT_HEAD_RUN);
+        let long_word = "a".repeat(LONG_PATTERN_WORD);
+        let planted = [
+            format!("{head}BBC"),
+            format!("{head}bbc"),
+            format!("{}bb cz", "x".repeat(CUT_HEAD_RUN - 1)),
+            format!("y{long_word}"),
+            "the bbc news".to_owned(),
+        ];
+        let planted_refs: Vec<&str> = planted.iter().map(String::as_str).collect();
+        let titles = with_walk_filler(&planted_refs);
+        let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let cats: Vec<&str> = title_refs.iter().map(|_| "x").collect();
+        let batch = build_cat_batch(0, &cats, &title_refs);
+        let oracle = memtable_oracle(schema_id_cat_title(), vec![batch.clone()]);
+        let cases = [
+            ("LIKE", "%bbc%".to_owned()),
+            ("ILIKE", "%BBC%".to_owned()),
+            ("LIKE", "%bbc".to_owned()),
+            ("LIKE", format!("%{long_word}%")),
+            ("ILIKE", format!("%{long_word}%")),
+            ("LIKE", format!("%{long_word}")),
+        ];
+        for name in [ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER] {
+            let st = Supertable::create(options_id_cat_title_with(name)).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            for (op, pattern) in &cases {
+                let sql = format!("SELECT title FROM supertable WHERE title {op} '{pattern}'");
+                assert_same_rows(&rt, &oracle, &st, &sql, name);
             }
         }
     }

@@ -14,7 +14,7 @@ use rayon::ThreadPool;
 use super::{core::*, work::MatchWork};
 use crate::{
     runtime_bridge::run_on_pool,
-    superfile::{error::FtsError, format::fts::DictLayout},
+    superfile::{error::FtsError, format::fts::DictLayout, fts::tokenize::MAX_TOKEN_CHARS},
     utils::terms::make_key,
 };
 
@@ -110,6 +110,45 @@ impl TermPattern<'_> {
             TermPattern::Contains(text) => term.contains(text),
         }
     }
+
+    /// Whether a match of this pattern may begin in `term` and run on
+    /// past a tokenizer cut (see [`straddles_cut`]); `view` is `term` as
+    /// [`Self::covers`] compares it. Only a token whose start may sit
+    /// mid-term can: a token closed on the left starts a word, a word's
+    /// first piece is the full cut length, and a pattern token is shorter
+    /// than that, so it ends before the first cut.
+    fn crosses_cut(&self, term: &str, view: &str) -> bool {
+        match self {
+            TermPattern::Suffix(text) | TermPattern::Contains(text) => {
+                straddles_cut(term, view, text)
+            }
+            TermPattern::Exact(_) | TermPattern::Prefix(_) => false,
+        }
+    }
+}
+
+/// Whether `term` may be the piece before a tokenizer cut that an
+/// occurrence of `text` runs across.
+///
+/// The tokenizer indexes a word longer than [`MAX_TOKEN_CHARS`] as
+/// consecutive pieces, each of exactly that many characters but the last,
+/// so a match crossing a cut is split between two terms and neither holds
+/// it. The piece before the cut is the one that shows it: it is exactly the
+/// cut length and its folded `view` ends with a proper, non-empty head of
+/// `text`. A match of text no longer than the cut length crosses at most
+/// one cut, so testing that piece finds every such match. A genuine word
+/// of exactly the cut length passes too; that only admits a row the
+/// caller then checks, never loses one.
+///
+/// The byte length is tested first: a term under the cut length in bytes
+/// is under it in characters, so the common term costs one compare.
+fn straddles_cut(term: &str, view: &str, text: &str) -> bool {
+    term.len() >= MAX_TOKEN_CHARS
+        && term.chars().count() == MAX_TOKEN_CHARS
+        && text
+            .char_indices()
+            .skip(1)
+            .any(|(at, _)| view.ends_with(&text[..at]))
 }
 
 /// A [`TermPattern`] with its text owned, so a leaf's patterns can move
@@ -340,8 +379,13 @@ fn walk_dictionary(
                 } else {
                     Cow::Borrowed(term)
                 };
+                // A term holding only the head of a match that crosses a
+                // tokenizer cut is admitted too: its row may match, and the
+                // caller verifies every row it keeps.
                 full.retain(|&i| {
-                    !patterns[i].borrow().covers(&view) || collected[i].admit(term, max_terms)
+                    let pattern = patterns[i].borrow();
+                    let admitted = pattern.covers(&view) || pattern.crosses_cut(term, &view);
+                    !admitted || collected[i].admit(term, max_terms)
                 });
             }
             // Stop once every full-walk pattern has hit its cap.
@@ -356,7 +400,7 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::{
-        super::test_util::{build_blob, build_standard_fold_blob},
+        super::test_util::{build_blob, build_standard_blob, build_standard_fold_blob},
         *,
     };
 
@@ -534,6 +578,66 @@ mod tests {
             owned(&["k"]),
             "the indexed term is already `k`"
         );
+    }
+
+    /// Characters planted ahead of the word in the cut fixtures: one short
+    /// of the tokenizer's cut, so the word's first character ends the
+    /// first piece.
+    const HEAD_RUN: usize = MAX_TOKEN_CHARS - 1;
+
+    #[test]
+    fn a_match_crossing_a_tokenizer_cut_is_found_through_the_piece_before_it() {
+        // `x…xBBC` (254 x's) is indexed as `x…xb` (the cut length) and
+        // `bc`, so no term holds `bbc`. The piece before the cut ends with
+        // `b`, a head of `bbc`, which is how an open-left token still
+        // finds the row. `x…xbb cz` (253 x's) is a near miss the dictionary
+        // cannot tell apart — its 255-character word ends with `bb` — and
+        // is admitted too; a caller verifies what it keeps.
+        let cut = format!("{}BBC", "x".repeat(HEAD_RUN));
+        let near = format!("{}bb cz", "x".repeat(HEAD_RUN - 1));
+        let (blob, json) = build_standard_blob(&[&cut, &near, "abbcd", "zzz"]);
+        let r = FtsReader::open(blob, &json).expect("open");
+        let head = format!("{}b", "x".repeat(HEAD_RUN));
+        let near_head = format!("{}bb", "x".repeat(HEAD_RUN - 1));
+        // Lex order: `abbcd`, then the 253-x head (`b` sorts before `x`).
+        assert_eq!(
+            expand(&r, TermPattern::Contains("bbc"), MAX_TERMS),
+            Some(vec!["abbcd".to_owned(), near_head.clone(), head.clone()])
+        );
+        assert_eq!(
+            expand(&r, TermPattern::Suffix("bbc"), MAX_TERMS),
+            Some(vec![near_head.clone(), head.clone()])
+        );
+        assert_eq!(
+            expand_fold(&r, TermPattern::Contains("bbc")),
+            Some(vec!["abbcd".to_owned(), near_head, head])
+        );
+        // A token closed on the left starts a word, which the first cut
+        // never splits: no piece is admitted for it.
+        assert_eq!(
+            expand(&r, TermPattern::Prefix("bbc"), MAX_TERMS),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn straddles_cut_needs_the_cut_length_and_a_proper_head_of_the_text() {
+        let head = format!("{}b", "x".repeat(HEAD_RUN));
+        assert!(straddles_cut(&head, &head, "bbc"));
+        // The whole text at the end is a plain match, not a crossing one.
+        let whole = format!("{}bbc", "x".repeat(MAX_TOKEN_CHARS - "bbc".len()));
+        assert!(!straddles_cut(&whole, &whole, "bbc"));
+        // Too short to be a cut piece.
+        assert!(!straddles_cut("xb", "xb", "bbc"));
+        // One character past the cut length is not a piece either (a
+        // superfile built before the cut existed can hold such a term).
+        let long = format!("{}b", "x".repeat(MAX_TOKEN_CHARS));
+        assert!(!straddles_cut(&long, &long, "bbc"));
+        // Counted in characters: 254 two-byte letters and a `b`.
+        let wide = format!("{}b", "é".repeat(HEAD_RUN));
+        assert!(straddles_cut(&wide, &wide, "bbc"));
+        // A one-character text has no proper head.
+        assert!(!straddles_cut(&head, &head, "b"));
     }
 
     #[test]

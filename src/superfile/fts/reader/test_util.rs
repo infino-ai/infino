@@ -13,21 +13,26 @@ use crate::superfile::fts::{
     tokenize::{AsciiLowerTokenizer, StandardTokenizer},
 };
 
+/// A one-column (`body`) `standard`-analyzer blob holding `docs`, doc `i`
+/// being `docs[i]`.
+pub(super) fn build_standard_blob(docs: &[&str]) -> (Bytes, String) {
+    let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+    b.register_column("body".into(), false)
+        .expect("register column");
+    for (i, doc) in docs.iter().enumerate() {
+        b.add_doc(0, i as u32, doc).expect("add doc");
+    }
+    let bytes = b.finish().expect("finish");
+    let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+    (Bytes::from(bytes), json.to_string())
+}
+
 /// A `standard`-analyzer corpus whose vocabulary carries the two letters
 /// Unicode case folding widens past lowercasing: `ſ` (long s, kept by
 /// `to_lowercase`) and the Kelvin sign U+212A (lowercased to `k` at index).
 /// Terms: k, kelvin, riſe, rise, set, sun, sunset, ſun.
 pub(super) fn build_standard_fold_blob() -> (Bytes, String) {
-    let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
-    b.register_column("body".into(), false)
-        .expect("register column");
-    b.add_doc(0, 0, "ſun riſe").expect("add doc");
-    b.add_doc(0, 1, "SUN set").expect("add doc");
-    b.add_doc(0, 2, "sunset rise").expect("add doc");
-    b.add_doc(0, 3, "Kelvin \u{212A}").expect("add doc");
-    let bytes = b.finish().expect("finish");
-    let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
-    (Bytes::from(bytes), json.to_string())
+    build_standard_blob(&["ſun riſe", "SUN set", "sunset rise", "Kelvin \u{212A}"])
 }
 
 pub(super) fn build_blob() -> (Bytes, String) {

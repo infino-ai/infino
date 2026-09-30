@@ -78,7 +78,7 @@ use crate::{
             reader::{
                 BoolMode, FetchedTermMemo, LONG_S_ASCII, MatchWork, TermPattern, has_fold_partner,
             },
-            tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER, Tokenizer},
+            tokenize::{ASCII_LOWER_TOKENIZER, MAX_TOKEN_CHARS, STANDARD_TOKENIZER, Tokenizer},
         },
         id_space::RowId,
     },
@@ -892,9 +892,22 @@ impl Fragment {
     /// wildcard stands for. Tokens the analyzer cannot bound soundly are
     /// dropped — a dropped constraint keeps a superset. `fold` is the
     /// `ILIKE` flag.
+    ///
+    /// A fragment word longer than [`MAX_TOKEN_CHARS`] comes back cut into
+    /// pieces, and the edges between two pieces are not word boundaries: a
+    /// matching row's copy of the word may start anywhere relative to the
+    /// fragment, so its own cuts fall elsewhere. A token of exactly the cut
+    /// length, and the token after it, are therefore dropped (a genuine
+    /// word of that length goes too, which only loosens the bound).
     fn tokens(&self, tok: &dyn Tokenizer, analyzer: Analyzer, fold: bool) -> Vec<LikeToken> {
         let texts: Vec<String> = tok.tokenize(&self.text).collect();
         let n = texts.len();
+        let cut_piece: Vec<bool> = texts
+            .iter()
+            .map(|t| t.chars().count() == MAX_TOKEN_CHARS)
+            .collect();
+        // A cut piece, or the piece its cut edge runs into.
+        let beside_cut = |i: usize| cut_piece[i] || (i > 0 && cut_piece[i - 1]);
         let left_closed = self.at_start
             || self
                 .text
@@ -910,6 +923,7 @@ impl Fragment {
         texts
             .into_iter()
             .enumerate()
+            .filter(|&(i, _)| !beside_cut(i))
             .filter_map(|(i, text)| {
                 analyzer.admits(
                     LikeToken {
@@ -1661,6 +1675,39 @@ mod tests {
         assert_eq!(
             standard_plan(col("title").like(lit("%ΟΔΟΣ"))),
             terms_like(vec![like_token("οδος", true, false)])
+        );
+    }
+
+    /// A fragment word past the tokenizer's cut, so the query side cuts
+    /// it into a piece of the cut length and a remainder.
+    const LONG_FRAGMENT_WORD: usize = MAX_TOKEN_CHARS + 45;
+
+    #[test]
+    fn like_drops_the_pieces_a_long_fragment_word_is_cut_into() {
+        // The pieces' shared edge is no word boundary: a matching row's
+        // copy of the word starts wherever it starts, so its own cuts fall
+        // elsewhere. `%a…a%` (300 a's) against `y` + 300 a's, indexed as
+        // `ya…a` (the cut length) and 46 a's, must not require a term
+        // ending in 255 a's.
+        let word = "a".repeat(LONG_FRAGMENT_WORD);
+        assert_eq!(
+            standard_plan(col("title").like(lit(format!("%{word}%")))),
+            CandidatePlan::Unbounded
+        );
+        assert_eq!(
+            standard_plan(col("title").ilike(lit(format!("%{word}")))),
+            CandidatePlan::Unbounded
+        );
+        // A separate word beside the long one keeps its own bound.
+        assert_eq!(
+            standard_plan(col("title").like(lit(format!("%{word} fox%")))),
+            terms_like(vec![like_token("fox", false, true)])
+        );
+        // A word of exactly the cut length cannot be told from a piece.
+        let exact_cut = "a".repeat(MAX_TOKEN_CHARS);
+        assert_eq!(
+            standard_plan(col("title").like(lit(format!("% {exact_cut} fox %")))),
+            CandidatePlan::Unbounded
         );
     }
 
