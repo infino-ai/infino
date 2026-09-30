@@ -1480,7 +1480,9 @@ mod tests {
         time::Duration,
     };
 
-    use arrow_array::{Array, Int64Array, LargeStringArray, StringViewArray};
+    use arrow_array::{
+        Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, StringViewArray,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
         logical_expr::LogicalPlan,
@@ -1490,7 +1492,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bm25SearchOptions, BoolMode, Consistency, Stemmer, Stopwords,
+        Bm25SearchOptions, BoolMode, Consistency, Metric, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
         supertable::manifest::commit::POINTER_PATH,
         test_helpers::{build_title_batch, schema_id_title},
@@ -3973,6 +3975,166 @@ mod tests {
         assert_eq!(rows, 1, "one doc equals the raw string exactly");
     }
 
+    /// Embedding dimension of the [`conn_with_vector_table`] fixture.
+    const VEC_DIM: usize = 16;
+    /// Titles of the [`conn_with_vector_table`] fixture, one row each.
+    const VEC_TITLES: [&str; 4] = ["rust async", "python data", "rust systems", "go rust"];
+
+    /// A `memory://` connection holding table `vecs`: one row per
+    /// [`VEC_TITLES`] entry, row `i` one-hot at dim `i` (so a one-hot query
+    /// at dim 0 is the exact nearest neighbour of row 0), with a full-text
+    /// index on `title` and an L2 vector index on `emb`.
+    fn conn_with_vector_table() -> Connection {
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(Arc::clone(&item), VEC_DIM as i32),
+                false,
+            ),
+        ]));
+        let mut flat = Vec::<f32>::with_capacity(VEC_TITLES.len() * VEC_DIM);
+        for i in 0..VEC_TITLES.len() {
+            for d in 0..VEC_DIM {
+                flat.push(if d == i { 1.0 } else { 0.0 });
+            }
+        }
+        let list = FixedSizeListArray::new(
+            item,
+            VEC_DIM as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeStringArray::from(VEC_TITLES.to_vec())),
+                Arc::new(list),
+            ],
+        )
+        .expect("vector batch");
+
+        let conn = connect("memory://").expect("connect");
+        conn.create_table(
+            "vecs",
+            schema,
+            IndexSpec::new()
+                .fts("title")
+                .vector("emb", VEC_DIM, Metric::L2Sq),
+        )
+        .expect("create table")
+        .append(&batch)
+        .expect("append");
+        conn
+    }
+
+    /// The [`VEC_DIM`]-wide one-hot vector at `dim`, as the comma-separated
+    /// literal the vector TVFs take.
+    fn one_hot_csv(dim: usize) -> String {
+        (0..VEC_DIM)
+            .map(|d| if d == dim { "1" } else { "0" })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Two calls of one search table function in a statement are two
+    /// searches. DataFusion names every table-function scan after the
+    /// function alone and compares scans without their provider, where
+    /// the arguments live, so the optimizer used to merge calls that
+    /// differed only in arguments: each pair below answered the first
+    /// call's count in both columns — across tables as well as terms,
+    /// and for every search function.
+    #[test]
+    fn search_tvf_calls_differing_in_arguments_stay_distinct() {
+        let conn = conn_with_vector_table();
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs")
+            .append(&build_title_batch(&["rust", "zig"]))
+            .expect("append");
+        let v = one_hot_csv(0);
+        // (what, first call, second call, first count, second count)
+        let cases: Vec<(&str, String, String, i64, i64)> = vec![
+            (
+                "token_match, different terms",
+                "token_match('vecs', 'title', 'rust')".into(),
+                "token_match('vecs', 'title', 'python')".into(),
+                3,
+                1,
+            ),
+            (
+                "token_match, different tables",
+                "token_match('vecs', 'title', 'rust')".into(),
+                "token_match('docs', 'title', 'rust')".into(),
+                3,
+                1,
+            ),
+            (
+                "exact_match",
+                "exact_match('vecs', 'title', 'rust async')".into(),
+                "exact_match('vecs', 'title', 'no such title')".into(),
+                1,
+                0,
+            ),
+            (
+                "bm25_search, different terms",
+                "bm25_search('vecs', 'title', 'rust', 10)".into(),
+                "bm25_search('vecs', 'title', 'python', 10)".into(),
+                3,
+                1,
+            ),
+            (
+                "bm25_search, different k",
+                "bm25_search('vecs', 'title', 'rust', 1)".into(),
+                "bm25_search('vecs', 'title', 'rust', 10)".into(),
+                1,
+                3,
+            ),
+            (
+                "bm25_search_prefix",
+                "bm25_search_prefix('vecs', 'title', 'rus', 10)".into(),
+                "bm25_search_prefix('vecs', 'title', 'pyt', 10)".into(),
+                3,
+                1,
+            ),
+            (
+                "vector_search, different k",
+                format!("vector_search('vecs', 'emb', '{v}', 1)"),
+                format!("vector_search('vecs', 'emb', '{v}', 3)"),
+                1,
+                3,
+            ),
+            (
+                "hybrid_search, different k",
+                format!("hybrid_search('vecs', 'title', 'rust', 'emb', '{v}', 1)"),
+                format!("hybrid_search('vecs', 'title', 'rust', 'emb', '{v}', 3)"),
+                1,
+                3,
+            ),
+        ];
+        for (what, first, second, want_first, want_second) in cases {
+            let batches = conn
+                .query_sql(&format!(
+                    "SELECT (SELECT count(*) FROM {first}) AS a, \
+                            (SELECT count(*) FROM {second}) AS b"
+                ))
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let count = |i: usize| {
+                batches[0]
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("count(*) is Int64")
+                    .value(0)
+            };
+            assert_eq!(
+                (count(0), count(1)),
+                (want_first, want_second),
+                "{what}: each call answers its own count"
+            );
+        }
+    }
+
     /// The remaining catalog-level search TVFs — `bm25_search_prefix`,
     /// `vector_search`, and `hybrid_search` — resolve their leading
     /// table-name argument and forward the rest to the table's search
@@ -3980,71 +4142,11 @@ mod tests {
     /// carries both an FTS index and a vector index.
     #[test]
     fn query_sql_prefix_vector_and_hybrid_tvfs_resolve_table() {
-        use crate::Metric;
-
-        /// Embedding dimension for the fixture's vector column.
-        const DIM: usize = 16;
-        /// Rows in the fixture (one-hot vectors at dims 0..ROWS).
-        const ROWS: usize = 4;
         /// Top-k requested by the vector / hybrid queries.
         const TOP_K: usize = 4;
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("title", DataType::LargeUtf8, false),
-            Field::new(
-                "emb",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    DIM as i32,
-                ),
-                false,
-            ),
-        ]));
-
-        // Four docs; doc `i` is one-hot at dim `i`, so a one-hot query
-        // at dim 0 is the exact nearest neighbour of doc 0.
-        let batch = {
-            use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray};
-            let titles = ["rust async", "python data", "rust systems", "go rust"];
-            let mut flat = Vec::<f32>::with_capacity(ROWS * DIM);
-            for i in 0..ROWS {
-                for d in 0..DIM {
-                    flat.push(if d == i { 1.0 } else { 0.0 });
-                }
-            }
-            let field = Arc::new(Field::new("item", DataType::Float32, true));
-            let list = FixedSizeListArray::new(
-                field,
-                DIM as i32,
-                Arc::new(Float32Array::from(flat)),
-                None,
-            );
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(LargeStringArray::from(titles.to_vec())),
-                    Arc::new(list),
-                ],
-            )
-            .expect("vector batch")
-        };
-
-        let conn = connect("memory://").expect("connect");
-        let table = conn
-            .create_table(
-                "vecs",
-                schema,
-                IndexSpec::new()
-                    .fts("title")
-                    .vector("emb", DIM, Metric::L2Sq),
-            )
-            .expect("create table");
-        table.append(&batch).expect("append");
-
-        let one_hot_0 = (0..DIM)
-            .map(|d| if d == 0 { "1" } else { "0" })
-            .collect::<Vec<_>>()
-            .join(",");
+        let conn = conn_with_vector_table();
+        let one_hot_0 = one_hot_csv(0);
 
         // bm25_search_prefix: 'rus' expands to 'rust'.
         let prefix_rows: usize = conn

@@ -65,7 +65,7 @@ use crate::{
             exec::common::{
                 PushedPredicate, SCORE_COLUMN, arg_to_string, arg_to_usize,
                 candidate_plan_for_filters, fill_top_k, output_schema_with_score, resolve_hits,
-                search_query_df_error,
+                scope_to_call, search_query_df_error,
             },
             vector::{free_column_slot, hits_id_score_batch, user_placement_for_scalar_resolve},
         },
@@ -131,15 +131,18 @@ impl TableFunctionImpl for VectorSearchFunc {
                 "vector_search: supertable consumer dropped before execution".into(),
             )
         })?;
-        Ok(Arc::new(VectorSearchTable {
-            reader,
-            column,
-            query,
-            k,
-            options: VectorSearchOptions::new(),
-            scalar_schema: Arc::clone(&self.scalar_schema),
-            output_schema: Arc::clone(&self.output_schema),
-        }))
+        scope_to_call(
+            VECTOR_SEARCH_UDTF,
+            Arc::new(VectorSearchTable {
+                reader,
+                column,
+                query,
+                k,
+                options: VectorSearchOptions::new(),
+                scalar_schema: Arc::clone(&self.scalar_schema),
+                output_schema: Arc::clone(&self.output_schema),
+            }),
+        )
     }
 }
 
@@ -1340,7 +1343,7 @@ mod tests {
         let st = supertable_one_superfile(dim, 8);
         let reader = Arc::new(st.reader().expect("reader"));
         let scalar_schema = reader.options().scalar_schema();
-        use crate::supertable::query::exec::common::test_support::call_tvf;
+        use crate::supertable::query::exec::common::test_support::{call_tvf, scoped_inner};
         let func = VectorSearchFunc::new(reader, scalar_schema);
         let table = call_tvf(&func, &[lit("emb"), lit(csv_one_hot(dim, 0)), lit(5_i64)])
             .expect("vector table");
@@ -1348,7 +1351,9 @@ mod tests {
         let dbg = format!("{table:?}");
         assert!(dbg.contains("VectorSearchTable"), "Debug missing: {dbg}");
         assert!(
-            table.downcast_ref::<VectorSearchTable>().is_some(),
+            scoped_inner(&table)
+                .downcast_ref::<VectorSearchTable>()
+                .is_some(),
             "as_any downcasts to VectorSearchTable"
         );
         assert_eq!(table.table_type(), TableType::Base);

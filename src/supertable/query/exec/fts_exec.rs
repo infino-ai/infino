@@ -64,7 +64,7 @@ use crate::{
         handle::{SupertableReader, WeakReader},
         query::exec::common::{
             PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters, fill_top_k,
-            output_schema_with_score, search_query_df_error,
+            output_schema_with_score, scope_to_call, search_query_df_error,
         },
     },
 };
@@ -154,14 +154,17 @@ impl TableFunctionImpl for Bm25SearchFunc {
                 "bm25_search: supertable consumer dropped before execution".into(),
             )
         })?;
-        Ok(Arc::new(Bm25Table {
-            reader,
-            column,
-            query: Bm25Query::Terms { query, mode },
-            k,
-            scalar_schema: Arc::clone(&self.scalar_schema),
-            output_schema: Arc::clone(&self.output_schema),
-        }))
+        scope_to_call(
+            BM25_SEARCH_UDTF,
+            Arc::new(Bm25Table {
+                reader,
+                column,
+                query: Bm25Query::Terms { query, mode },
+                k,
+                scalar_schema: Arc::clone(&self.scalar_schema),
+                output_schema: Arc::clone(&self.output_schema),
+            }),
+        )
     }
 }
 
@@ -205,14 +208,17 @@ impl TableFunctionImpl for Bm25PrefixFunc {
             )
         })?;
 
-        Ok(Arc::new(Bm25Table {
-            reader,
-            column,
-            query: Bm25Query::Prefix { prefix },
-            k,
-            scalar_schema: Arc::clone(&self.scalar_schema),
-            output_schema: Arc::clone(&self.output_schema),
-        }))
+        scope_to_call(
+            BM25_PREFIX_UDTF,
+            Arc::new(Bm25Table {
+                reader,
+                column,
+                query: Bm25Query::Prefix { prefix },
+                k,
+                scalar_schema: Arc::clone(&self.scalar_schema),
+                output_schema: Arc::clone(&self.output_schema),
+            }),
+        )
     }
 }
 
@@ -1167,7 +1173,7 @@ mod tests {
     /// `Debug` — none of which normal query execution touches.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bm25_table_and_exec_trait_methods() {
-        use crate::supertable::query::exec::common::test_support::call_tvf;
+        use crate::supertable::query::exec::common::test_support::{call_tvf, scoped_inner};
         let st = demo_corpus();
         let reader = Arc::new(st.reader().expect("reader"));
         let scalar_schema = reader.options().scalar_schema();
@@ -1178,7 +1184,7 @@ mod tests {
         let dbg = format!("{table:?}");
         assert!(dbg.contains("Bm25Table"), "Debug missing: {dbg}");
         assert!(
-            table.downcast_ref::<Bm25Table>().is_some(),
+            scoped_inner(&table).downcast_ref::<Bm25Table>().is_some(),
             "as_any downcasts to Bm25Table"
         );
         assert_eq!(table.table_type(), TableType::Base);
