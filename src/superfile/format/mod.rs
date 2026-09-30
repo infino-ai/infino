@@ -789,6 +789,11 @@ pub mod vec {
 
 /// Parquet KV metadata keys, all prefixed `inf.` to match the project magic.
 pub mod kv {
+    /// Namespace every key in this module shares. A carried footer's
+    /// keys are dropped by this prefix, so a key added here is covered
+    /// without touching that path.
+    pub const PREFIX: &str = "inf.";
+
     /// Required: marker that this Parquet file is an infino superfile.
     /// Always `"infino-superfile"`.
     pub const FORMAT: &str = "inf.format";
