@@ -485,8 +485,6 @@ fn run_vector_commit_crash_child(dir: PathBuf) -> ! {
     std::process::exit(MISCONFIGURED_KILL_POINT_EXIT_CODE);
 }
 
-/// Child path: build a Supertable on `CrashStorage` and run
-/// up to `n_commits` commits. The wrapper triggers
 /// Compaction settings for the batch-crash fixture: a 1 MiB target and a
 /// 1% fill floor so the tiny-ish superfiles are candidates, and more than one
 /// merge in flight so the crash interrupts a batch rather than a single job.
@@ -560,6 +558,8 @@ fn data_objects(dir: &Path) -> usize {
     count(&data)
 }
 
+/// Child path: build a Supertable on `CrashStorage` and run
+/// up to `n_commits` commits. The wrapper triggers
 /// `std::process::abort()` mid-flight in the last commit
 /// once the Nth matching PUT lands. The function never
 /// returns normally — either it aborts (expected) or, if
