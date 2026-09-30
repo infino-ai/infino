@@ -4,18 +4,33 @@
 //! Term-dictionary expansion on [`FtsReader`]: widen the tokens of one
 //! `LIKE` leaf to the indexed terms they cover, so the table layer's SQL
 //! `WHERE` pushdown can answer a substring predicate from posting lists
-//! instead of a column scan. Its own `impl FtsReader` block, split from
-//! the reader `core`.
+//! instead of a column scan, and answer an `ILIKE '%needle%'` exactly
+//! ([`FtsReader::contains_rows`]). Its own `impl FtsReader` block, split
+//! from the reader `core`.
 
 use std::{borrow::Cow, str};
 
 use rayon::ThreadPool;
+use roaring::RoaringBitmap;
 
-use super::{core::*, work::MatchWork};
+use super::{core::*, cursor::TermCursor, metadata::ColumnMeta, work::MatchWork};
 use crate::{
     runtime_bridge::run_on_pool,
-    superfile::{error::FtsError, format::fts::DictLayout, fts::tokenize::MAX_TOKEN_CHARS},
-    utils::terms::make_key,
+    runtime_metrics::op_stats::timed_section,
+    superfile::{
+        ReadError,
+        error::FtsError,
+        format::fts::DictLayout,
+        fts::{
+            posting::BLOCK_LEN,
+            tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER},
+        },
+        id_space::{DocMap, FtsDocId},
+    },
+    utils::terms::{
+        make_key,
+        value::{FstValue, PFOR_LENGTH_UNKNOWN},
+    },
 };
 
 /// Long s (U+017F). Simple case folding puts it in `s`'s class;
@@ -46,6 +61,28 @@ pub(crate) const LONG_S_ASCII: char = FOLD_PAIRS[0].1;
 pub(crate) fn has_fold_partner(c: char) -> bool {
     FOLD_PAIRS.iter().any(|&(_, ascii)| ascii == c)
 }
+
+/// Combining dot above (U+0307). `to_lowercase` turns `İ` (U+0130) into an
+/// `i` followed by this mark, so a term can hold an `i` its row spelled
+/// `İ` — a letter Arrow's `ILIKE` does not match against `i`. Written as
+/// an escape: the mark is invisible on its own.
+const COMBINING_DOT_ABOVE: char = '\u{307}';
+
+/// The letter `İ` lowercases onto, ahead of [`COMBINING_DOT_ABOVE`].
+const DOTTED_I_BASE: char = 'i';
+
+/// Postings bytes one fetch wave of [`FtsReader::contains_rows`] may pull
+/// before its terms are unioned and the bytes released. The exact path
+/// has no term cap, so a needle covering much of a large vocabulary would
+/// otherwise hold every covered term's postings at once. 8 MiB keeps a
+/// cold superfile's wave small next to a query's memory budget with every
+/// survivor of a scan fetching together, and still carries thousands of
+/// typical terms per round trip.
+const CONTAINS_FETCH_BATCH_BYTES: usize = 8 << 20;
+
+/// The query-term weight a match-only cursor is built with: nothing is
+/// scored, so nothing is weighted.
+const UNWEIGHTED: u32 = 1;
 
 /// How one `LIKE` fragment token constrains an indexed term. The text is
 /// already the column tokenizer's output (lowercased, split), so it
@@ -125,6 +162,29 @@ impl TermPattern<'_> {
             TermPattern::Exact(_) | TermPattern::Prefix(_) => false,
         }
     }
+
+    /// Whether a term this pattern covers under `ILIKE` may still come
+    /// from a row the `ILIKE` does not match. The one way is a dotted
+    /// capital I: its row spells `İ`, which Arrow does not fold to `i`, and
+    /// the term holds `i` + [`COMBINING_DOT_ABOVE`] — or only the `i`,
+    /// when a tokenizer cut fell between the two and the term is a piece
+    /// of the cut length. Only an `i` ending the text can meet the mark
+    /// (inside the text the mark would split the match), so this asks for
+    /// that first. It flags a term holding the mark anywhere, and every
+    /// piece of the cut length: a caller checks those rows' text, which
+    /// costs work, never a row.
+    fn doubtful_cover(&self, term: &str) -> bool {
+        self.text().ends_with(DOTTED_I_BASE)
+            && (term.contains(COMBINING_DOT_ABOVE) || is_cut_length(term))
+    }
+}
+
+/// Whether `term` is exactly the tokenizer's cut length, as every piece of
+/// a cut word but the last is. The byte length is tested first: a term
+/// under the cut length in bytes is under it in characters, so the common
+/// term costs one compare.
+fn is_cut_length(term: &str) -> bool {
+    term.len() >= MAX_TOKEN_CHARS && term.chars().count() == MAX_TOKEN_CHARS
 }
 
 /// Whether `term` may be the piece before a tokenizer cut that an
@@ -139,12 +199,8 @@ impl TermPattern<'_> {
 /// one cut, so testing that piece finds every such match. A genuine word
 /// of exactly the cut length passes too; that only admits a row the
 /// caller then checks, never loses one.
-///
-/// The byte length is tested first: a term under the cut length in bytes
-/// is under it in characters, so the common term costs one compare.
 fn straddles_cut(term: &str, view: &str, text: &str) -> bool {
-    term.len() >= MAX_TOKEN_CHARS
-        && term.chars().count() == MAX_TOKEN_CHARS
+    is_cut_length(term)
         && text
             .char_indices()
             .skip(1)
@@ -200,11 +256,29 @@ fn fold_term(term: &str) -> Cow<'_, str> {
     }
 }
 
+/// What a dictionary walk keeps of each term it admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// The term's text, for a match to resolve again: the verified path,
+    /// where every admitted term is only a candidate.
+    Terms,
+    /// The term's dictionary value, sorted into terms whose rows are
+    /// proven to match and terms whose rows need their text checked: the
+    /// exact path, which reads the postings straight from the values.
+    Values,
+}
+
 /// One pattern's terms as a walk collects them, with the cap it may not
 /// exceed. Past the cap the pattern is too broad for a posting-list
 /// answer and its collection stops.
 struct Collected {
+    /// Admitted terms' text, in lex order ([`Keep::Terms`]).
     terms: Vec<String>,
+    /// Values of admitted terms whose rows match ([`Keep::Values`]).
+    proven: Vec<FstValue>,
+    /// Values of admitted terms whose rows may not match
+    /// ([`Keep::Values`]).
+    doubtful: Vec<FstValue>,
     too_many: bool,
 }
 
@@ -212,24 +286,92 @@ impl Collected {
     fn new() -> Self {
         Self {
             terms: Vec::new(),
+            proven: Vec::new(),
+            doubtful: Vec::new(),
             too_many: false,
         }
     }
 
-    /// Record `term`; `false` once the cap is hit (the caller stops
-    /// feeding this pattern).
-    fn admit(&mut self, term: &str, max_terms: usize) -> bool {
-        if self.terms.len() == max_terms {
+    /// Record `term` (`doubtful` when its rows may not match); `false`
+    /// once the cap is hit (the caller stops feeding this pattern).
+    fn admit(
+        &mut self,
+        term: &str,
+        value: FstValue,
+        doubtful: bool,
+        keep: Keep,
+        max_terms: usize,
+    ) -> bool {
+        if self.terms.len() + self.proven.len() + self.doubtful.len() == max_terms {
             self.too_many = true;
             return false;
         }
-        self.terms.push(term.to_owned());
+        match keep {
+            Keep::Terms => self.terms.push(term.to_owned()),
+            Keep::Values if doubtful => self.doubtful.push(value),
+            Keep::Values => self.proven.push(value),
+        }
         true
     }
 
     fn finish(self) -> Option<Vec<String>> {
         (!self.too_many).then_some(self.terms)
     }
+}
+
+/// A dictionary key that is not UTF-8. Keys are the tokenizer's UTF-8
+/// output, so one that fails is a damaged dictionary; skipping it could
+/// drop the rows it indexes, so a walk fails instead.
+fn non_utf8_key() -> FtsError {
+    FtsError::Read(ReadError::MalformedVersion(
+        "fts dictionary key is not UTF-8".into(),
+    ))
+}
+
+/// One `Pfor` term's postings reference, as the exact path's fetch waves
+/// read it.
+#[derive(Debug, Clone, Copy)]
+struct TermBody {
+    metadata_offset: usize,
+    /// The body's length in bytes, when the dictionary slot could hold it.
+    length: Option<usize>,
+    short: bool,
+}
+
+impl TermBody {
+    /// What the body counts against [`CONTAINS_FETCH_BATCH_BYTES`]: its
+    /// length, or — when the slot could not hold it — the slot's limit,
+    /// which such a body is at least.
+    fn budget_bytes(&self) -> usize {
+        self.length.unwrap_or(PFOR_LENGTH_UNKNOWN as usize)
+    }
+}
+
+/// How many of `bodies`, from the front, one fetch wave takes: bodies
+/// until their bytes would pass [`CONTAINS_FETCH_BATCH_BYTES`], and
+/// always at least one.
+fn wave_len(bodies: &[TermBody]) -> usize {
+    let mut bytes = 0usize;
+    bodies
+        .iter()
+        .position(|body| {
+            bytes += body.budget_bytes();
+            bytes > CONTAINS_FETCH_BATCH_BYTES
+        })
+        .map_or(bodies.len(), |past| past.max(1))
+}
+
+/// Rows of one column an `ILIKE '%needle%'` matches, as the dictionary
+/// decides them ([`FtsReader::contains_rows`]).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct ContainsRows {
+    /// Parquet rows the dictionary proves match.
+    pub(crate) proven: RoaringBitmap,
+    /// Parquet rows that may match, which only their text can decide: a
+    /// word cut by the tokenizer, or a dotted capital I (see
+    /// [`TermPattern::doubtful_cover`]). Disjoint from `proven`; every row
+    /// outside both provably does not match.
+    pub(crate) doubtful: RoaringBitmap,
 }
 
 impl FtsReader {
@@ -290,6 +432,7 @@ impl FtsReader {
                     fold,
                     max_terms,
                     allow_full_walk,
+                    Keep::Terms,
                 )
             })
             .await
@@ -334,11 +477,215 @@ impl FtsReader {
         .await
         .map_err(|_| FtsError::TaskDropped("prefix expansion"))?
     }
+
+    /// The Parquet rows of `column` an `ILIKE '%needle%'` matches, from
+    /// the dictionary and the postings alone, but for the few rows
+    /// [`ContainsRows::doubtful`] leaves to the caller. The caller has
+    /// established that `needle` is lowercase ASCII and the whole of one
+    /// token under the `standard` analyzer (see the table layer's
+    /// `exact_contains`); under that rule an indexed term's containing
+    /// the needle decides its rows, cut words and the dotted capital I
+    /// aside.
+    ///
+    /// Every key of the column is visited, with no term cap: an exact
+    /// answer needs every covered term, and there is no scan to fall back
+    /// to. The dictionary fetch and the posting fetches are I/O on this
+    /// runtime; the walk and the unions are CPU on `pool`, like
+    /// [`Self::expand_terms`].
+    ///
+    /// Errors with `FtsError::UnknownColumn` when `column` is not
+    /// FTS-indexed here, and with `FtsError::ExactNeedsStandard` when this
+    /// superfile indexed it with another analyzer — the rule the answer
+    /// rests on is the standard analyzer's, and a plan that promised an
+    /// exact answer has no fallback.
+    pub(crate) async fn contains_rows(
+        &self,
+        column: &str,
+        needle: &str,
+        pool: Option<&ThreadPool>,
+    ) -> Result<(ContainsRows, MatchWork), FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let col = &self.columns[column_id as usize];
+        let analyzer = col.tokenizer.name();
+        if analyzer != STANDARD_TOKENIZER {
+            return Err(FtsError::ExactNeedsStandard {
+                column: column.to_owned(),
+                analyzer: analyzer.to_owned(),
+            });
+        }
+        let mut work = MatchWork::default();
+        let fst_bytes = self.dict_bytes_async().await?;
+        work.planned_ranges += 1;
+        let layout = self.dict_layout;
+        let owned_column = column.to_owned();
+        let patterns = [OwnedPattern::Contains(needle.to_owned())];
+        let (walked, walk_ns) = run_on_pool(pool, "contains walk", move || {
+            timed_section(|| {
+                walk_dictionary(
+                    &fst_bytes,
+                    layout,
+                    &owned_column,
+                    &patterns,
+                    &[Walk::Full],
+                    true,
+                    // No cap: an exact answer needs every covered term.
+                    usize::MAX,
+                    true,
+                    Keep::Values,
+                )
+            })
+        })
+        .await
+        .map_err(|_| FtsError::TaskDropped("contains walk"))?;
+        work.kernel_cpu_ns += walk_ns;
+        let walked = walked?.pop().expect("one collector per pattern");
+        let proven = self.union_rows(col, walked.proven, pool, &mut work).await?;
+        let mut doubtful = self
+            .union_rows(col, walked.doubtful, pool, &mut work)
+            .await?;
+        doubtful -= &proven;
+        Ok((ContainsRows { proven, doubtful }, work))
+    }
+
+    /// The Parquet rows the postings behind `values` hold, unioned. Inline
+    /// (df=1) values carry their document; the rest are fetched in waves
+    /// of at most [`CONTAINS_FETCH_BATCH_BYTES`] on this runtime and ORed
+    /// into one document bitset on `pool`, each wave's bytes released
+    /// before the next is fetched. The bitset becomes rows through the
+    /// blob's doc map last: a merged superfile numbers its documents in an
+    /// order of its own.
+    async fn union_rows(
+        &self,
+        col: &ColumnMeta,
+        values: Vec<FstValue>,
+        pool: Option<&ThreadPool>,
+        work: &mut MatchWork,
+    ) -> Result<RoaringBitmap, FtsError> {
+        if values.is_empty() {
+            return Ok(RoaringBitmap::new());
+        }
+        let n_docs = self.n_docs;
+        let mut inline: Vec<u32> = Vec::new();
+        let mut bodies: Vec<TermBody> = Vec::new();
+        for value in values {
+            match value {
+                FstValue::Inline { doc_id, .. } => inline.push(doc_id),
+                FstValue::Pfor {
+                    metadata_offset,
+                    postings_length_hint,
+                    short,
+                } => bodies.push(TermBody {
+                    metadata_offset: metadata_offset as usize,
+                    length: postings_length_hint.map(|len| len as usize),
+                    short,
+                }),
+            }
+        }
+        let mut bits = vec![0u64; n_docs as usize / u64::BITS as usize + 1];
+        let mut rest = bodies.as_slice();
+        while !rest.is_empty() {
+            let (wave, tail) = rest.split_at(wave_len(rest));
+            rest = tail;
+            let refs: Vec<(usize, Option<usize>)> = wave
+                .iter()
+                .map(|body| (body.metadata_offset, body.length))
+                .collect();
+            let fetched = self.fetch_term_postings(&refs).await?;
+            work.postings_bytes += fetched.iter().map(|b| b.len() as u64).sum::<u64>();
+            // One range per body, and one more for a header probed for a
+            // length the slot could not hold — as a match's build counts.
+            work.planned_ranges += wave
+                .iter()
+                .map(|body| 1 + u64::from(body.length.is_none()))
+                .sum::<u64>();
+            let forms: Vec<(bool, bool)> = wave
+                .iter()
+                .map(|body| (body.short, body.length.is_none()))
+                .collect();
+            let col = col.clone();
+            let stored = self.bounds;
+            let (ored, ns) = run_on_pool(pool, "contains union", move || {
+                timed_section(|| {
+                    let mut scratch = [0u32; BLOCK_LEN];
+                    for (bytes, (short, header_probed)) in fetched.into_iter().zip(forms) {
+                        let cursor = TermCursor::for_body(
+                            bytes,
+                            short,
+                            &col,
+                            stored,
+                            None,
+                            UNWEIGHTED,
+                            header_probed,
+                            true,
+                        )?;
+                        // The bitset spans this blob's documents; a list
+                        // reaching past them is a damaged blob, refused
+                        // before it can index out of the bitset.
+                        if cursor
+                            .blocks
+                            .last()
+                            .is_some_and(|b| b.last_doc_id >= n_docs)
+                        {
+                            return Err(posting_past_documents());
+                        }
+                        or_cursor_into_bitset(&mut bits, &cursor, &mut scratch);
+                    }
+                    Ok(bits)
+                })
+            })
+            .await
+            .map_err(|_| FtsError::TaskDropped("contains union"))?;
+            work.kernel_cpu_ns += ns;
+            bits = ored?;
+        }
+        let doc_map = self.doc_map.clone();
+        let (rows, ns) = run_on_pool(pool, "contains rows", move || {
+            timed_section(|| rows_of(bits, &inline, n_docs, &doc_map))
+        })
+        .await
+        .map_err(|_| FtsError::TaskDropped("contains rows"))?;
+        work.kernel_cpu_ns += ns;
+        rows
+    }
 }
 
-/// The CPU half of [`FtsReader::expand_terms`]: one pass over the fetched
-/// dictionary that fills every pattern's collector. Runs on the reader
-/// pool, so it takes owned inputs.
+/// A posting that names a document past the end of its blob.
+fn posting_past_documents() -> FtsError {
+    FtsError::Read(ReadError::MalformedVersion(
+        "fts posting names a document past the blob's end".into(),
+    ))
+}
+
+/// The Parquet rows of the documents set in `bits` or listed in `inline`,
+/// through `doc_map`.
+fn rows_of(
+    mut bits: Vec<u64>,
+    inline: &[u32],
+    n_docs: u32,
+    doc_map: &DocMap,
+) -> Result<RoaringBitmap, FtsError> {
+    for &doc in inline {
+        if doc >= n_docs {
+            return Err(posting_past_documents());
+        }
+        bits[(doc / u64::BITS) as usize] |= 1u64 << (doc % u64::BITS);
+    }
+    let mut rows = RoaringBitmap::new();
+    for (index, &word) in bits.iter().enumerate() {
+        let mut rest = word;
+        while rest != 0 {
+            let doc = index as u32 * u64::BITS + rest.trailing_zeros();
+            rest &= rest - 1;
+            rows.insert(doc_map.row_of(FtsDocId::new(doc)).get());
+        }
+    }
+    Ok(rows)
+}
+
+/// The CPU half of [`FtsReader::expand_terms`] and
+/// [`FtsReader::contains_rows`]: one pass over the fetched dictionary that
+/// fills every pattern's collector, keeping what `keep` names. Runs on the
+/// reader pool, so it takes owned inputs.
 fn walk_dictionary(
     fst_bytes: &[u8],
     layout: DictLayout,
@@ -348,22 +695,26 @@ fn walk_dictionary(
     fold: bool,
     max_terms: usize,
     allow_full_walk: bool,
+    keep: Keep,
 ) -> Result<Vec<Collected>, FtsError> {
     let dict = FtsReader::open_dict_with(fst_bytes, layout)?;
     let mut collected: Vec<Collected> = patterns.iter().map(|_| Collected::new()).collect();
     // Every key in the column's range starts with `<column>\x1F`; the
     // term is what follows. `for_each_prefix` only visits keys carrying
     // the prefix it was given, and every prefix below begins with that
-    // column key, so the slice never runs past a key. Keys are the
-    // tokenizer's UTF-8 output, so the conversion holds by construction; a
-    // key that fails it is skipped rather than trusted.
+    // column key, so the slice never runs past a key. A key that is not
+    // UTF-8 ends the walk with an error (see `non_utf8_key`).
     let term_start = make_key(column, "").len();
+    let mut bad_key = false;
     for ((slot, pattern), walk) in collected.iter_mut().zip(patterns).zip(walks) {
         if *walk == Walk::Subtree {
-            dict.for_each_prefix(&make_key(column, pattern.borrow().text()), |key, _| {
+            dict.for_each_prefix(&make_key(column, pattern.borrow().text()), |key, value| {
                 match str::from_utf8(&key[term_start..]) {
-                    Ok(term) => slot.admit(term, max_terms),
-                    Err(_) => true,
+                    Ok(term) => slot.admit(term, value, false, keep, max_terms),
+                    Err(_) => {
+                        bad_key = true;
+                        false
+                    }
                 }
             });
         }
@@ -371,38 +722,57 @@ fn walk_dictionary(
     let mut full: Vec<usize> = (0..patterns.len())
         .filter(|&i| walks[i] == Walk::Full && allow_full_walk)
         .collect();
-    if !full.is_empty() {
-        dict.for_each_prefix(&make_key(column, ""), |key, _| {
-            if let Ok(term) = str::from_utf8(&key[term_start..]) {
-                let view = if fold {
-                    fold_term(term)
+    if !full.is_empty() && !bad_key {
+        dict.for_each_prefix(&make_key(column, ""), |key, value| {
+            let Ok(term) = str::from_utf8(&key[term_start..]) else {
+                bad_key = true;
+                return false;
+            };
+            let view = if fold {
+                fold_term(term)
+            } else {
+                Cow::Borrowed(term)
+            };
+            // A covered term proves its rows unless `ILIKE`'s dotted-I
+            // exception applies. A term holding only the head of a match
+            // that crosses a tokenizer cut is admitted too, as doubtful:
+            // its row may match, and the caller checks the text.
+            full.retain(|&i| {
+                let pattern = patterns[i].borrow();
+                let doubtful = if pattern.covers(&view) {
+                    fold && pattern.doubtful_cover(term)
+                } else if pattern.crosses_cut(term, &view) {
+                    true
                 } else {
-                    Cow::Borrowed(term)
+                    return true;
                 };
-                // A term holding only the head of a match that crosses a
-                // tokenizer cut is admitted too: its row may match, and the
-                // caller verifies every row it keeps.
-                full.retain(|&i| {
-                    let pattern = patterns[i].borrow();
-                    let admitted = pattern.covers(&view) || pattern.crosses_cut(term, &view);
-                    !admitted || collected[i].admit(term, max_terms)
-                });
-            }
+                collected[i].admit(term, value, doubtful, keep, max_terms)
+            });
             // Stop once every full-walk pattern has hit its cap.
             !full.is_empty()
         });
+    }
+    if bad_key {
+        return Err(non_utf8_key());
     }
     Ok(collected)
 }
 
 #[cfg(test)]
 mod tests {
+    use arrow::{
+        array::{BooleanArray, Scalar, StringArray},
+        compute::kernels::comparison::ilike,
+    };
     use tokio::runtime::Runtime;
 
     use super::{
-        super::test_util::{build_blob, build_standard_blob, build_standard_fold_blob},
+        super::test_util::{
+            build_blob, build_standard_blob, build_standard_blob_with, build_standard_fold_blob,
+        },
         *,
     };
+    use crate::superfile::fts::builder::BlobEra;
 
     /// Generous cap so a test never trips the too-many fallback by accident.
     const MAX_TERMS: usize = 64;
@@ -671,6 +1041,203 @@ mod tests {
         assert_eq!(walked.planned_ranges, 1, "one FST fetch per walk");
         let (_, exact) = expand_all(&r, &[TermPattern::Exact("rust")], false, MAX_TERMS);
         assert_eq!(exact.planned_ranges, 0, "no dictionary needed");
+    }
+
+    /// Every blob era the builder writes: the kernel reads dictionary
+    /// values and posting bodies straight, so each layout must agree.
+    const ERAS: [BlobEra; 4] = [BlobEra::V7, BlobEra::V6, BlobEra::V5, BlobEra::V2ToV4];
+
+    /// Rows of the contains fixture carrying the dense term, enough for
+    /// several long-form posting blocks.
+    const DENSE_ROWS: usize = 3 * BLOCK_LEN + 7;
+
+    /// Every third fixture row carries `BBC`, so its postings are long
+    /// form too.
+    const BBC_EVERY: usize = 3;
+
+    /// The contains fixture: many rows of a dense term, `BBC` in a
+    /// multi-block term and in df=1 terms, and the planted spellings the
+    /// exact rule turns on — a match across a tokenizer cut and a near
+    /// miss beside one, a dotted capital I whole and at a cut, the long s
+    /// and the Kelvin sign.
+    fn contains_docs() -> Vec<String> {
+        let head = "x".repeat(HEAD_RUN);
+        let mut docs: Vec<String> = (0..DENSE_ROWS)
+            .map(|i| match i % BBC_EVERY {
+                0 => format!("common BBC News {i}"),
+                _ => format!("common filler {i}"),
+            })
+            .collect();
+        docs.extend(
+            [
+                format!("{head}BBC"),
+                format!("{}bb cz", "x".repeat(HEAD_RUN - 1)),
+                format!("{head}\u{130}"),
+                "TAX\u{130} rank".to_owned(),
+                "TAXI rank".to_owned(),
+                "the bbc's abbcd".to_owned(),
+                "\u{17F}un \u{212A}elvin".to_owned(),
+                String::new(),
+            ]
+            .iter()
+            .cloned(),
+        );
+        docs
+    }
+
+    /// Needles the fixture is asked for.
+    const NEEDLES: &[&str] = &[
+        "bbc", "xi", "taxi", "sun", "kelvin", "common", "news", "zzq", "b",
+    ];
+
+    /// The rows Arrow's own `ILIKE '%needle%'` matches in `docs`.
+    fn arrow_ilike(docs: &[String], needle: &str) -> RoaringBitmap {
+        let haystack = StringArray::from_iter_values(docs.iter());
+        let pattern = Scalar::new(StringArray::from(vec![format!("%{needle}%")]));
+        let matched: BooleanArray = ilike(&haystack, &pattern).expect("ilike");
+        (0..docs.len() as u32)
+            .filter(|&row| matched.value(row as usize))
+            .collect()
+    }
+
+    fn contains(r: &FtsReader, needle: &str) -> (ContainsRows, MatchWork) {
+        let rt = Runtime::new().expect("runtime");
+        rt.block_on(r.contains_rows("body", needle, None))
+            .expect("contains_rows")
+    }
+
+    /// The kernel's contract, held to Arrow: a proven row matches, a
+    /// matching row is proven or doubtful, and the two never overlap.
+    fn assert_bracketed(rows: &ContainsRows, oracle: &RoaringBitmap, context: &str) {
+        assert!(
+            rows.proven.is_subset(oracle),
+            "{context}: proven rows {:?} that do not match",
+            &rows.proven - oracle
+        );
+        let admitted = &rows.proven | &rows.doubtful;
+        assert!(
+            oracle.is_subset(&admitted),
+            "{context}: matching rows {:?} neither proven nor doubtful",
+            oracle - &admitted
+        );
+        assert!(rows.proven.is_disjoint(&rows.doubtful), "{context}");
+    }
+
+    #[test]
+    fn contains_rows_brackets_arrows_ilike_on_every_era() {
+        let docs = contains_docs();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let planted = DENSE_ROWS as u32;
+        let (cut_row, near_row, dotted_cut_row, taxi_dotted, taxi, _, fold_row) = (
+            planted,
+            planted + 1,
+            planted + 2,
+            planted + 3,
+            planted + 4,
+            planted + 5,
+            planted + 6,
+        );
+        for era in ERAS {
+            let (blob, json) = build_standard_blob_with(&refs, era, None);
+            let r = FtsReader::open(blob, &json).expect("open");
+            for needle in NEEDLES {
+                let (rows, work) = contains(&r, needle);
+                let oracle = arrow_ilike(&docs, needle);
+                assert_bracketed(&rows, &oracle, &format!("{needle} in {era:?}"));
+                assert!(work.planned_ranges >= 1, "the dictionary fetch is counted");
+            }
+            // The planted spellings land where the rule says.
+            let (bbc, _) = contains(&r, "bbc");
+            assert_eq!(
+                bbc.doubtful,
+                RoaringBitmap::from_iter([near_row, cut_row]),
+                "{era:?}: the cut match and the near miss beside a cut, nothing else"
+            );
+            assert!(arrow_ilike(&docs, "bbc").contains(cut_row));
+            assert!(!arrow_ilike(&docs, "bbc").contains(near_row));
+            let (xi, _) = contains(&r, "xi");
+            assert!(
+                xi.doubtful.contains(dotted_cut_row),
+                "{era:?}: `İ` at a cut"
+            );
+            assert!(!arrow_ilike(&docs, "xi").contains(dotted_cut_row));
+            let (taxi_rows, _) = contains(&r, "taxi");
+            assert!(taxi_rows.proven.contains(taxi), "{era:?}");
+            assert!(
+                taxi_rows.doubtful.contains(taxi_dotted),
+                "{era:?}: `İ` whole"
+            );
+            assert!(!arrow_ilike(&docs, "taxi").contains(taxi_dotted));
+            for needle in ["sun", "kelvin"] {
+                let (folded, _) = contains(&r, needle);
+                assert!(folded.proven.contains(fold_row), "{needle} in {era:?}");
+            }
+            // A needle no cut or dotted I can touch is decided outright.
+            for needle in ["common", "news", "zzq"] {
+                let (clean, _) = contains(&r, needle);
+                assert!(clean.doubtful.is_empty(), "{needle} in {era:?}");
+                assert_eq!(clean.proven, arrow_ilike(&docs, needle), "{needle}");
+            }
+        }
+    }
+
+    #[test]
+    fn contains_rows_names_parquet_rows_on_a_blob_that_reorders_its_documents() {
+        // Blob position `i` holds row `order[i]`, as a reordering merge
+        // writes it. The postings are in blob positions; the answer must
+        // be in rows.
+        let docs = contains_docs();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let n = docs.len() as u32;
+        let order: Vec<u32> = (0..n).rev().collect();
+        let (blob, json) = build_standard_blob_with(&refs, BlobEra::V7, Some(&order));
+        let r = FtsReader::open(blob, &json).expect("open");
+        assert!(r.has_doc_map(), "the fixture must reorder to mean anything");
+        for needle in NEEDLES {
+            let (rows, _) = contains(&r, needle);
+            let oracle = arrow_ilike(&docs, needle);
+            assert_bracketed(&rows, &oracle, needle);
+        }
+        let (common, _) = contains(&r, "common");
+        assert_eq!(common.proven, arrow_ilike(&docs, "common"));
+    }
+
+    #[test]
+    fn contains_rows_refuses_a_column_indexed_by_another_analyzer() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let rt = Runtime::new().expect("runtime");
+        let err = rt
+            .block_on(r.contains_rows("body", "rust", None))
+            .expect_err("ascii_lower column");
+        assert!(matches!(err, FtsError::ExactNeedsStandard { .. }), "{err}");
+        let err = rt
+            .block_on(r.contains_rows("nope", "rust", None))
+            .expect_err("unknown column");
+        assert!(matches!(err, FtsError::UnknownColumn(_)));
+    }
+
+    #[test]
+    fn a_fetch_wave_stops_at_the_byte_budget_and_always_takes_one_body() {
+        let body = |length: Option<usize>| TermBody {
+            metadata_offset: 0,
+            length,
+            short: false,
+        };
+        let half = CONTAINS_FETCH_BATCH_BYTES / 2;
+        let bodies = [body(Some(half)), body(Some(half)), body(Some(1))];
+        assert_eq!(wave_len(&bodies), 2, "exactly the budget fits");
+        assert_eq!(wave_len(&bodies[2..]), 1);
+        let oversized = [body(Some(CONTAINS_FETCH_BATCH_BYTES + 1)), body(Some(1))];
+        assert_eq!(
+            wave_len(&oversized),
+            1,
+            "one body over the budget goes alone"
+        );
+        // A body too long for its slot counts as at least the slot's limit.
+        let unknown = [body(None); 8];
+        let per_wave = CONTAINS_FETCH_BATCH_BYTES / PFOR_LENGTH_UNKNOWN as usize;
+        assert_eq!(wave_len(&unknown), per_wave.clamp(1, unknown.len()));
     }
 
     #[test]

@@ -220,6 +220,17 @@ pub enum FtsError {
     #[error("dictionary walk dropped its result during {0}")]
     TaskDropped(&'static str),
 
+    /// An exact substring answer was asked of a column this superfile
+    /// indexed with an analyzer other than `standard`. The answer rests on
+    /// the standard analyzer's token rules, and the plan that asked for it
+    /// promised an exact answer, so the query fails rather than answer
+    /// from terms that could miss a row.
+    #[error(
+        "column {column:?} is indexed with the {analyzer:?} analyzer in this superfile; \
+         an exact substring answer needs the standard analyzer"
+    )]
+    ExactNeedsStandard { column: String, analyzer: String },
+
     #[error("read error: {0}")]
     Read(#[from] ReadError),
 }

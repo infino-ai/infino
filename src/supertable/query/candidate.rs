@@ -53,6 +53,14 @@
 //! compares dictionary terms with those folded back (`fold_term`). Tokens
 //! with non-ASCII characters are not bounded under `ILIKE`. `NOT LIKE`
 //! stays `Unbounded`.
+//!
+//! ## The exact shape
+//!
+//! One `LIKE` shape skips pass 2 entirely: `col ILIKE '%word%'` on a
+//! `standard` column, where `word` is one whole ASCII token. The
+//! dictionary decides its rows (see [`exact_contains`]), the provider
+//! reports it `Exact`, and its scan selects exactly those rows — every
+//! other shape above stays a verified superset.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -165,7 +173,8 @@ impl CandidateScope {
 /// posting walk, and a token this broad matches enough rows that the
 /// scan wins anyway — the provider's selectivity gate would send it there
 /// after paying for the probes. Sibling of the provider's `PUSHDOWN_*`
-/// gates.
+/// gates. Bounds the verified path only: the exact shape
+/// ([`exact_contains`]) has no scan to fall back to and takes every term.
 pub(crate) const LIKE_MAX_TERMS: usize = 1024;
 
 /// `LIKE` wildcard matching any run of characters, including none.
@@ -817,38 +826,18 @@ fn like_leaf(
     fts_cols: &HashSet<&str>,
     resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
-    // `NOT LIKE` excludes rows — no term set bounds an exclusion.
-    if like.negated {
-        return CandidatePlan::Unbounded;
-    }
-    // `ILIKE`: Arrow compares under Unicode simple case folding (ASCII
-    // fast paths aside), so the analyzers' lowercasing does not reproduce
-    // every match — `fold` carries that to the token rules and the
-    // expansion.
-    let fold = like.case_insensitive;
-    // Arrow's kernel reads `\` as the escape; the executor rejects others.
-    if like.escape_char.is_some_and(|c| c != LIKE_ESCAPE) {
-        return CandidatePlan::Unbounded;
-    }
-    let (Expr::Column(c), Expr::Literal(v, _)) = (like.expr.as_ref(), like.pattern.as_ref()) else {
+    let Some(parts) = like_parts(like, fts_cols, resolve) else {
         return CandidatePlan::Unbounded;
     };
-    if !fts_cols.contains(c.name.as_str()) {
-        return CandidatePlan::Unbounded;
-    }
-    let Some(pattern) = scalar_str(v) else {
-        return CandidatePlan::Unbounded;
-    };
-    let Some(tok) = resolve(&c.name) else {
-        return CandidatePlan::Unbounded;
-    };
-    let Some(analyzer) = Analyzer::of(tok.as_ref()) else {
-        return CandidatePlan::Unbounded;
-    };
-    let Some(fragments) = like_fragments(pattern) else {
-        return CandidatePlan::Unbounded;
-    };
-    let tokens: Vec<LikeToken> = fragments
+    let LikeParts {
+        column,
+        tok,
+        analyzer,
+        pattern,
+        fold,
+    } = parts;
+    let tokens: Vec<LikeToken> = pattern
+        .fragments
         .iter()
         .flat_map(|fragment| fragment.tokens(tok.as_ref(), analyzer, fold))
         .collect();
@@ -861,15 +850,128 @@ fn like_leaf(
         && !(fold && tokens.iter().any(|t| t.text.contains(LONG_S_ASCII)));
     if exact_terms {
         return CandidatePlan::TermsAll {
-            column: c.name.clone(),
+            column: column.to_owned(),
             tokens: tokens.into_iter().map(|t| t.text).collect(),
         };
     }
     CandidatePlan::TermsLike {
-        column: c.name.clone(),
+        column: column.to_owned(),
         tokens,
         fold,
     }
+}
+
+/// A `LIKE` / `ILIKE` leaf the index can reason about, parsed once for
+/// both lowerings: the bounding one ([`like_leaf`]) and the exact one
+/// ([`exact_contains`]).
+struct LikeParts<'a> {
+    /// The FTS column the pattern is matched against.
+    column: &'a str,
+    /// The analyzer the table indexes that column with.
+    tok: Arc<dyn Tokenizer>,
+    analyzer: Analyzer,
+    pattern: LikePattern,
+    /// `ILIKE`: Arrow compares under Unicode simple case folding (ASCII
+    /// fast paths aside), so the analyzers' lowercasing does not reproduce
+    /// every match — this carries that to the token rules and the
+    /// expansion.
+    fold: bool,
+}
+
+/// Parse `like` for the index, or `None` for a leaf it cannot bound:
+/// `NOT LIKE` (no term set bounds an exclusion), a non-column or
+/// non-literal operand, a non-FTS column, an escape other than `\`, an
+/// analyzer the lowering does not know, or a pattern the executor rejects.
+fn like_parts<'a>(
+    like: &'a Like,
+    fts_cols: &HashSet<&str>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
+) -> Option<LikeParts<'a>> {
+    // Arrow's kernel reads `\` as the escape; the executor rejects others.
+    if like.negated || like.escape_char.is_some_and(|c| c != LIKE_ESCAPE) {
+        return None;
+    }
+    let (Expr::Column(c), Expr::Literal(v, _)) = (like.expr.as_ref(), like.pattern.as_ref()) else {
+        return None;
+    };
+    if !fts_cols.contains(c.name.as_str()) {
+        return None;
+    }
+    let pattern = like_fragments(scalar_str(v)?)?;
+    let tok = resolve(&c.name)?;
+    let analyzer = Analyzer::of(tok.as_ref())?;
+    Some(LikeParts {
+        column: &c.name,
+        tok,
+        analyzer,
+        pattern,
+        fold: like.case_insensitive,
+    })
+}
+
+/// A `WHERE` conjunct the term dictionary answers exactly: `column ILIKE
+/// '%needle%'`, with the rows it matches read from the postings rather
+/// than the text (see [`exact_contains`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactContains {
+    /// The FTS column.
+    pub(crate) column: String,
+    /// The pattern's literal, lowercased: one whole `standard` token.
+    pub(crate) needle: String,
+}
+
+/// `filter` as an [`ExactContains`], or `None` when the dictionary cannot
+/// answer it exactly and it stays a bounded, verified filter.
+///
+/// The rule: an `ILIKE` (not `NOT ILIKE`, not case-sensitive `LIKE`) of a
+/// bare FTS column the `standard` analyzer indexes, against a pattern of
+/// wildcards `%`, one literal `f`, and wildcards `%` again — no `_`, no
+/// second literal — where `f` is ASCII and tokenizes to exactly one token,
+/// `f` lowercased.
+///
+/// Why that is exact. Arrow matches `%f%` case-insensitively under simple
+/// case folding. The one-token condition means every character of `f` is
+/// a word character or a joiner the word rules keep inside a word (`.`
+/// between letters, `'`, `_`, …), so an occurrence of `f` in any text
+/// lies inside one word, and that word, lowercased, contains `f`
+/// lowercased; conversely a word containing the lowercased `f` spells it
+/// out in its row. Case folding and lowercasing agree on ASCII but for
+/// the characters the dictionary walk folds back (`ſ`, the Kelvin sign)
+/// and the dotted capital I, which the walk marks doubtful. A word longer
+/// than the tokenizer's cut is indexed in pieces, and a match across a
+/// cut is marked doubtful too. Doubtful rows are checked against their
+/// text; every other row is decided by the dictionary.
+///
+/// What is left out needs the text: an anchored `f%` or `%f` (the
+/// dictionary does not know which word starts or ends a value, nor the
+/// punctuation beside it), case-sensitive `LIKE` (terms are lowercased),
+/// `_` and several literals (order and gaps), a literal with a separator
+/// in it (a phrase), a non-ASCII literal, and other analyzers.
+pub(crate) fn exact_contains(
+    filter: &Expr,
+    fts_cols: &HashSet<&str>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
+) -> Option<ExactContains> {
+    let Expr::Like(like) = filter else {
+        return None;
+    };
+    let parts = like_parts(like, fts_cols, resolve)?;
+    if !parts.fold || parts.analyzer != Analyzer::Standard || parts.pattern.any_one {
+        return None;
+    }
+    let [fragment] = parts.pattern.fragments.as_slice() else {
+        return None;
+    };
+    if fragment.at_start || fragment.at_end || !fragment.text.is_ascii() {
+        return None;
+    }
+    let needle = fragment.text.to_ascii_lowercase();
+    let mut tokens = parts.tok.tokenize(&fragment.text);
+    let one_token = tokens.next().is_some_and(|token| token == needle) && tokens.next().is_none();
+    one_token.then(|| ExactContains {
+        column: parts.column.to_owned(),
+        needle,
+    })
 }
 
 /// One maximal run of literal (non-wildcard) pattern characters, and
@@ -938,12 +1040,24 @@ impl Fragment {
     }
 }
 
+/// A `LIKE` pattern split at its wildcards.
+#[derive(Debug, PartialEq, Eq)]
+struct LikePattern {
+    /// The literal runs between the wildcards, in order.
+    fragments: Vec<Fragment>,
+    /// The pattern holds an unescaped `_`: a gap of exactly one character
+    /// somewhere, which a fragment list alone does not show.
+    any_one: bool,
+}
+
 /// Split a `LIKE` pattern at its wildcards into literal fragments,
-/// unescaping `\x` to a literal `x`. `None` for a trailing `\`, which the
-/// executor rejects — nothing to plan.
-fn like_fragments(pattern: &str) -> Option<Vec<Fragment>> {
+/// unescaping `\x` to a literal `x` for any `x`, as Arrow's kernel reads
+/// it. `None` for a trailing `\`, which the executor rejects — nothing to
+/// plan.
+fn like_fragments(pattern: &str) -> Option<LikePattern> {
     let mut fragments = Vec::new();
     let mut text = String::new();
+    let mut any_one = false;
     // No wildcard seen yet: the next fragment starts where the pattern does.
     let mut at_start = true;
     let mut chars = pattern.chars();
@@ -951,6 +1065,7 @@ fn like_fragments(pattern: &str) -> Option<Vec<Fragment>> {
         match c {
             LIKE_ESCAPE => text.push(chars.next()?),
             LIKE_ANY | LIKE_ONE => {
+                any_one |= c == LIKE_ONE;
                 if !text.is_empty() {
                     fragments.push(Fragment {
                         text: mem::take(&mut text),
@@ -970,7 +1085,7 @@ fn like_fragments(pattern: &str) -> Option<Vec<Fragment>> {
             at_end: true,
         });
     }
-    Some(fragments)
+    Some(LikePattern { fragments, any_one })
 }
 
 /// Which shipped analyzer indexed a column. It decides which fragment
@@ -1170,9 +1285,10 @@ fn collect_like_leaves(
 
 #[cfg(test)]
 mod tests {
+    use arrow_schema::DataType;
     use datafusion::{
         logical_expr::expr::InList,
-        prelude::{col, lit},
+        prelude::{cast, col, lit},
     };
     use uuid::Uuid;
 
@@ -2027,5 +2143,93 @@ mod tests {
             &ascii_resolver,
         );
         assert_eq!(unbounded, CandidatePlan::Unbounded);
+    }
+
+    /// `exact_contains` of `expr` over `title` under the standard analyzer.
+    fn exact(expr: Expr) -> Option<ExactContains> {
+        exact_contains(&expr, &fts_cols(), &standard_resolver)
+    }
+
+    fn needle(text: &str) -> Option<ExactContains> {
+        Some(ExactContains {
+            column: "title".into(),
+            needle: text.into(),
+        })
+    }
+
+    #[test]
+    fn exact_contains_accepts_one_whole_standard_token_between_wildcards() {
+        let accepted = [
+            ("%bbc%", "bbc"),
+            ("%BBC%", "bbc"),
+            ("%%bbc%%", "bbc"),
+            // Escapes read as Arrow reads them: `\x` is `x` for any `x`.
+            (r"%b\_c%", "b_c"),
+            (r"%\b\b\c%", "bbc"),
+            // Joiners the word rules keep inside a word.
+            ("%don't%", "don't"),
+            ("%3.5%", "3.5"),
+            ("%u.s%", "u.s"),
+        ];
+        for (pattern, want) in accepted {
+            assert_eq!(
+                exact(col("title").ilike(lit(pattern))),
+                needle(want),
+                "{pattern}"
+            );
+        }
+        // The longest word the tokenizer keeps whole.
+        let longest = "a".repeat(MAX_TOKEN_CHARS);
+        assert_eq!(
+            exact(col("title").ilike(lit(format!("%{longest}%")))),
+            needle(&longest)
+        );
+        // A qualified column is the same column.
+        assert_eq!(exact(col("t.title").ilike(lit("%bbc%"))), needle("bbc"));
+    }
+
+    #[test]
+    fn exact_contains_leaves_everything_the_text_must_decide_to_the_verified_path() {
+        let too_long = "a".repeat(MAX_TOKEN_CHARS + 1);
+        let rejected = [
+            // Case-sensitive, negated.
+            col("title").like(lit("%bbc%")),
+            col("title").not_ilike(lit("%bbc%")),
+            // Anchored at either end, or both.
+            col("title").ilike(lit("bbc%")),
+            col("title").ilike(lit("%bbc")),
+            col("title").ilike(lit("bbc")),
+            // A one-character gap, and several literals.
+            col("title").ilike(lit("%_bbc%")),
+            col("title").ilike(lit("%b_c%")),
+            col("title").ilike(lit("%bbc%news%")),
+            // A literal that is not one whole token.
+            col("title").ilike(lit("%bbc.%")),
+            col("title").ilike(lit("%.net%")),
+            col("title").ilike(lit("%a.1%")),
+            col("title").ilike(lit("%bbc news%")),
+            col("title").ilike(lit(format!("%{too_long}%"))),
+            // Escaped wildcards and backslashes are literal text.
+            col("title").ilike(lit(r"%\\bbc%")),
+            col("title").ilike(lit(r"%bbc\%")),
+            col("title").ilike(lit(r"%\%bbc%")),
+            col("title").ilike(lit(r"%bbc\")),
+            // No literal at all.
+            col("title").ilike(lit("%%")),
+            // A non-ASCII literal.
+            col("title").ilike(lit("%riſe%")),
+            // Not a bare FTS column against a literal.
+            col("body").ilike(lit("%bbc%")),
+            cast(col("title"), DataType::Utf8).ilike(lit("%bbc%")),
+            col("title").ilike(col("title")),
+        ];
+        for expr in rejected {
+            assert_eq!(exact(expr.clone()), None, "{expr}");
+        }
+        // Other analyzers: the rule is the standard analyzer's.
+        let expr = col("title").ilike(lit("%bbc%"));
+        for resolve in [ascii_resolver, stemming_resolver, stopping_resolver] {
+            assert_eq!(exact_contains(&expr, &fts_cols(), &resolve), None);
+        }
     }
 }

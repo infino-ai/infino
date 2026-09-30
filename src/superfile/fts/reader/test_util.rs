@@ -9,18 +9,38 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::superfile::fts::{
-    builder::FtsBuilder,
+    builder::{BlobEra, FtsBuilder},
     tokenize::{AsciiLowerTokenizer, StandardTokenizer},
 };
 
 /// A one-column (`body`) `standard`-analyzer blob holding `docs`, doc `i`
 /// being `docs[i]`.
 pub(super) fn build_standard_blob(docs: &[&str]) -> (Bytes, String) {
+    build_standard_blob_with(docs, BlobEra::V7, None)
+}
+
+/// [`build_standard_blob`] written in `era`'s format, and, when `order` is
+/// given, storing its documents in that order: blob position `i` holds
+/// `docs[order[i]]`, the way a merge that reorders writes a blob.
+pub(super) fn build_standard_blob_with(
+    docs: &[&str],
+    era: BlobEra,
+    order: Option<&[u32]>,
+) -> (Bytes, String) {
     let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+    b.era = era;
     b.register_column("body".into(), false)
         .expect("register column");
-    for (i, doc) in docs.iter().enumerate() {
-        b.add_doc(0, i as u32, doc).expect("add doc");
+    let rows: Vec<u32> = match order {
+        Some(order) => order.to_vec(),
+        None => (0..docs.len() as u32).collect(),
+    };
+    for (position, &row) in rows.iter().enumerate() {
+        b.add_doc(0, position as u32, docs[row as usize])
+            .expect("add doc");
+    }
+    if order.is_some() {
+        b.doc_map = Some(rows);
     }
     let bytes = b.finish().expect("finish");
     let json = r#"[{"name":"body","tokenizer":"standard"}]"#;

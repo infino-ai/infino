@@ -2000,6 +2000,205 @@ mod tests {
         }
     }
 
+    /// Superfiles the exact-`ILIKE` fixture is committed as, so every
+    /// answer is a union across files.
+    const EXACT_FIXTURE_COMMITS: usize = 4;
+
+    /// Rows the exact-`ILIKE` path decides from the dictionary alone, the
+    /// rows it must check against their text (a cut word, a dotted capital
+    /// I), and near misses of both.
+    fn exact_ilike_titles() -> Vec<String> {
+        let head = "x".repeat(CUT_HEAD_RUN);
+        let planted = [
+            "BBC News at six".to_owned(),
+            "the bbc's report".to_owned(),
+            "abbcd".to_owned(),
+            "BBC-funded (BBC) www.bbc.co.uk".to_owned(),
+            format!("{head}BBC"),
+            format!("{}bb cz", "x".repeat(CUT_HEAD_RUN - 1)),
+            format!("{head}\u{130}"),
+            "TAX\u{130} rank".to_owned(),
+            "TAXI rank".to_owned(),
+            "\u{17F}un and \u{212A}elvin".to_owned(),
+            "don't stop".to_owned(),
+            "version 3.5 of the u.s rules".to_owned(),
+            "b_c joined".to_owned(),
+        ];
+        let refs: Vec<&str> = planted.iter().map(String::as_str).collect();
+        with_walk_filler(&refs)
+    }
+
+    /// `ILIKE` patterns over the fixture: the ones the dictionary answers
+    /// exactly under `standard`, then controls that stay verified.
+    const EXACT_ILIKE_PATTERNS: &[&str] = &[
+        "%bbc%",
+        "%BBC%",
+        "%%bbc%%",
+        "%taxi%",
+        "%xi%",
+        "%sun%",
+        "%kelvin%",
+        "%zzq%",
+        "%don''t%",
+        "%3.5%",
+        "%u.s%",
+        r"%b\_c%",
+        "%lorem%",
+        "bbc%",
+        "%bbc",
+        "%_bbc%",
+        "%bbc news%",
+        "%bbc%news%",
+    ];
+
+    /// The fixture committed as [`EXACT_FIXTURE_COMMITS`] superfiles under
+    /// analyzer `name`, categories alternating `x` / `y`, and a DataFusion
+    /// oracle over the same rows.
+    fn exact_ilike_table(name: &str) -> (Supertable, SessionContext) {
+        let titles = exact_ilike_titles();
+        let st = Supertable::create(options_id_cat_title_with(name)).expect("create");
+        let mut batches = Vec::new();
+        let mut offset = 0;
+        for chunk in titles.chunks(titles.len().div_ceil(EXACT_FIXTURE_COMMITS)) {
+            let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            let cats: Vec<&str> = (0..refs.len())
+                .map(|i| if (offset + i) % 2 == 0 { "x" } else { "y" })
+                .collect();
+            let batch = build_cat_batch(offset as u64, &cats, &refs);
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            offset += refs.len();
+            batches.push(batch);
+        }
+        assert_eq!(
+            st.reader().expect("reader").n_superfiles(),
+            EXACT_FIXTURE_COMMITS
+        );
+        (st, memtable_oracle(schema_id_cat_title(), batches))
+    }
+
+    #[test]
+    fn query_sql_exact_ilike_matches_datafusion_on_a_memtable() {
+        // `col ILIKE '%word%'` on a `standard` column is answered from the
+        // dictionary and reported exact, so nothing re-checks it: every
+        // shape of query over it must still return exactly DataFusion's
+        // rows, as must every control that stays verified, under both
+        // analyzers.
+        let rt = Runtime::new().expect("runtime");
+        for name in [STANDARD_TOKENIZER, ASCII_LOWER_TOKENIZER] {
+            let (st, oracle) = exact_ilike_table(name);
+            for pattern in EXACT_ILIKE_PATTERNS {
+                let like = format!("title ILIKE '{pattern}'");
+                for sql in [
+                    format!("SELECT title FROM supertable WHERE {like}"),
+                    format!("SELECT COUNT(*) FROM supertable WHERE {like}"),
+                    format!(
+                        "SELECT category, COUNT(*) FROM supertable WHERE {like} GROUP BY category"
+                    ),
+                    format!("SELECT MIN(title), MAX(title) FROM supertable WHERE {like}"),
+                    format!("SELECT title FROM supertable WHERE {like} AND category = 'y'"),
+                    format!(
+                        "SELECT COUNT(*) FROM supertable WHERE {like} AND title ILIKE '%news%'"
+                    ),
+                    format!("SELECT title FROM supertable WHERE {like} OR category = 'y'"),
+                    format!(
+                        "SELECT COUNT(*) FROM \
+                         (SELECT title FROM supertable WHERE {like} LIMIT 3)"
+                    ),
+                ] {
+                    assert_same_rows(&rt, &oracle, &st, &sql, name);
+                }
+            }
+            // A regex match DataFusion rewrites to the same `ILIKE`.
+            assert_same_rows(
+                &rt,
+                &oracle,
+                &st,
+                "SELECT title FROM supertable WHERE title ~* 'bbc'",
+                name,
+            );
+        }
+    }
+
+    #[test]
+    fn an_exact_ilike_is_checked_nowhere_and_a_count_reads_no_text() {
+        // An exact filter leaves nothing in the plan that evaluates it: no
+        // `FilterExec`, no Parquet row filter, no pruning predicate. A
+        // verified one shows up in one of those, as `ILIKE`.
+        let (st, oracle) = exact_ilike_table(STANDARD_TOKENIZER);
+        for sql in [
+            "SELECT title FROM supertable WHERE title ILIKE '%bbc%'",
+            "SELECT COUNT(*) FROM supertable WHERE title ILIKE '%bbc%'",
+            // Through a qualifier, a CTE or a join it is the same filter.
+            "SELECT t.title FROM supertable t WHERE t.title ILIKE '%%bbc%%'",
+            "WITH c AS (SELECT title FROM supertable) SELECT title FROM c \
+             WHERE title ILIKE '%bbc%'",
+            "SELECT a.title FROM supertable a JOIN supertable b ON a.title = b.title \
+             WHERE a.title ILIKE '%bbc%'",
+        ] {
+            let plan = explain_physical(&st, sql);
+            assert!(!plan.contains("ILIKE"), "{sql}: {plan}");
+        }
+        // A count projects no column, so the text is never decoded.
+        let count = explain_physical(
+            &st,
+            "SELECT COUNT(*) FROM supertable WHERE title ILIKE '%bbc%'",
+        );
+        let scan = count
+            .lines()
+            .find(|l| l.contains("DataSourceExec"))
+            .expect("a DataSourceExec in the physical plan");
+        assert!(!scan.contains("title"), "{scan}");
+        // Beside a verified conjunct, only that conjunct is checked.
+        let mixed = explain_physical(
+            &st,
+            "SELECT title FROM supertable WHERE title ILIKE '%bbc%' AND category = 'y'",
+        );
+        assert!(
+            !mixed.contains("ILIKE") && mixed.contains("category@"),
+            "{mixed}"
+        );
+        // Every control keeps its check, and so does a cast column; under
+        // another analyzer nothing is exact.
+        let (ascii, _) = exact_ilike_table(ASCII_LOWER_TOKENIZER);
+        for (table, sql) in [
+            (&st, "SELECT title FROM supertable WHERE title ILIKE 'bbc%'"),
+            (&st, "SELECT title FROM supertable WHERE title ILIKE '%bbc'"),
+            (
+                &st,
+                "SELECT title FROM supertable WHERE title ILIKE '%_bbc%'",
+            ),
+            (
+                &st,
+                "SELECT title FROM supertable WHERE title ILIKE '%bbc news%'",
+            ),
+            (
+                &st,
+                "SELECT title FROM supertable WHERE CAST(title AS VARCHAR) ILIKE '%bbc%'",
+            ),
+            (
+                &ascii,
+                "SELECT title FROM supertable WHERE title ILIKE '%bbc%'",
+            ),
+        ] {
+            let plan = explain_physical(table, sql);
+            assert!(plan.contains("ILIKE"), "{sql}: {plan}");
+        }
+        // And each rewrite still returns DataFusion's rows.
+        let rt = Runtime::new().expect("runtime");
+        for sql in [
+            "SELECT t.title FROM supertable t WHERE t.title ILIKE '%%bbc%%'",
+            "WITH c AS (SELECT title FROM supertable) SELECT title FROM c \
+             WHERE title ILIKE '%bbc%'",
+            "SELECT a.title FROM supertable a JOIN supertable b ON a.title = b.title \
+             WHERE a.title ILIKE '%bbc%'",
+            "SELECT title FROM supertable WHERE CAST(title AS VARCHAR) ILIKE '%bbc%'",
+        ] {
+            assert_same_rows(&rt, &oracle, &st, sql, "a rewritten filter");
+        }
+    }
+
     /// Rows of the wide superfile in [`mixed_like_table`]: more distinct
     /// terms containing `zz` than a LIKE token may widen to.
     const OVER_CAP_ROWS: usize = LIKE_MAX_TERMS + 76;

@@ -49,7 +49,7 @@ use parquet::{
     errors::{ParquetError, Result as ParquetResult},
     file::metadata::ParquetMetaData,
 };
-use rayon::prelude::*;
+use rayon::{ThreadPool, prelude::*};
 use tracing::{Instrument, Span};
 
 use crate::{
@@ -379,11 +379,38 @@ impl PushedPredicate {
         })
     }
 
+    /// Indices into the output schema of the columns the predicate reads,
+    /// in first-seen order.
+    pub(crate) fn columns(&self) -> &[usize] {
+        &self.columns
+    }
+
     /// Bind the predicate to `schema`, a projection of the output schema
     /// that carries every column in `self.columns`.
-    fn bind(&self, schema: &SchemaRef) -> DfResult<Arc<dyn PhysicalExpr>> {
+    pub(crate) fn bind(&self, schema: &SchemaRef) -> DfResult<BoundPredicate> {
         let df_schema = DFSchema::try_from(Arc::clone(schema))?;
         create_physical_expr(&self.conjunction, &df_schema, &ExecutionProps::new())
+            .map(BoundPredicate)
+    }
+}
+
+/// A [`PushedPredicate`] bound to the schema of the batches it checks.
+pub(crate) struct BoundPredicate(Arc<dyn PhysicalExpr>);
+
+impl BoundPredicate {
+    /// One boolean per row of `batch`: whether the predicate holds there.
+    /// A null result is kept as null; like SQL's `WHERE`, every caller
+    /// keeps only the rows that are `true`.
+    pub(crate) fn mask(&self, batch: &RecordBatch) -> DfResult<BooleanArray> {
+        let mask = self.0.evaluate(batch)?.into_array(batch.num_rows())?;
+        mask.as_any()
+            .downcast_ref::<BooleanArray>()
+            .cloned()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "a pushed-down predicate did not evaluate to a boolean".into(),
+                )
+            })
     }
 }
 
@@ -490,16 +517,8 @@ where
         let hits = search(want).await.map_err(search_query_df_error)?;
         let batch =
             resolve_hits(reader, &hits, scalar_schema, output_schema, Some(&decoded)).await?;
-        let mask = bound.evaluate(&batch)?.into_array(batch.num_rows())?;
-        let mask = mask
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                DataFusionError::Internal(
-                    "a pushed-down search predicate did not evaluate to a boolean".into(),
-                )
-            })?;
-        let kept = filter_record_batch(&batch, mask)
+        let mask = bound.mask(&batch)?;
+        let kept = filter_record_batch(&batch, &mask)
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         // The ceiling is the only stopping condition other than finding `k`.
         // Nothing observable here distinguishes a kernel that is out of
@@ -1028,6 +1047,35 @@ impl AsyncFileReader for ByteSourceAsyncReader {
     }
 }
 
+/// The `names` columns at `local_doc_ids` of one superfile, in that order:
+/// decoded on `pool` when its Parquet bytes are resident, streamed through
+/// its byte source otherwise. The split [`resolve_hits`] makes across many
+/// superfiles at once, for a caller holding one.
+pub(crate) async fn take_rows(
+    reader: &Arc<SuperfileReader>,
+    local_doc_ids: &[u32],
+    names: &[&str],
+    pool: &ThreadPool,
+) -> DfResult<RecordBatch> {
+    if !reader.can_take_by_local_doc_ids() {
+        return take_rows_byte_source(reader, local_doc_ids, names).await;
+    }
+    let owned_reader = Arc::clone(reader);
+    let ids = local_doc_ids.to_vec();
+    let owned_names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    run_on_pool(
+        Some(pool),
+        "take rows: reader pool dropped result",
+        move || {
+            let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
+            owned_reader.take_by_local_doc_ids(&ids, &name_refs)
+        },
+    )
+    .await
+    .map_err(|e| DataFusionError::Execution(e.to_string()))?
+    .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
 /// Stream projected rows through a reader's cache-aware byte source.
 ///
 /// Deliberately reports NO planned ranges: whether a take streams page
@@ -1406,15 +1454,7 @@ mod tests {
             ],
         )
         .expect("batch");
-        let mask = bound
-            .evaluate(&batch)
-            .expect("evaluate")
-            .into_array(3)
-            .expect("array");
-        let mask = mask
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .expect("boolean");
+        let mask = bound.mask(&batch).expect("mask");
         assert_eq!(
             (0..3).map(|i| mask.value(i)).collect::<Vec<_>>(),
             vec![true, false, false]

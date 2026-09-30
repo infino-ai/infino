@@ -941,8 +941,10 @@ async fn seal_with_bounded_retry(
 mod tests {
     use std::{collections::HashSet, mem, str, sync::Arc};
 
+    use arrow::util::pretty::pretty_format_batches;
     use arrow_array::{
-        ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+        ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
+        RecordBatch,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::{col, lit};
@@ -960,7 +962,7 @@ mod tests {
         memory::ConnectionMemoryBudget,
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::reader::Bm25SearchOptions,
+            fts::{reader::Bm25SearchOptions, tokenize::STANDARD_TOKENIZER},
             reader::SuperfileReader,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
@@ -973,6 +975,7 @@ mod tests {
         test_helpers::{
             build_title_batch, default_supertable_options, default_vector_config,
             fault_storage::{FaultKind, FaultOp, FaultStorage},
+            schema_id_title,
         },
     };
 
@@ -2899,6 +2902,119 @@ mod tests {
             );
             let got = st.reader().expect("reader").query_sql(&sql).expect("sql");
             assert_eq!(titles_of(&got), vec![expected[n].clone()], "doc {n}");
+        }
+    }
+
+    /// An `ILIKE '%word%'` answered from the dictionary reads postings in
+    /// the blob's own document order, so on a compacted superfile that
+    /// reorders its documents every id has to become its Parquet row, and
+    /// a deleted row has to stay out, with nothing re-checking the text.
+    /// The deletes include one through the exact filter itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exact_ilike_on_a_reordered_compacted_table_names_the_right_rows() {
+        const BATCHES: usize = 60;
+        const PER_BATCH: usize = 80;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let opts = SupertableOptions::new(
+            schema_id_title(),
+            vec![FtsConfig::new("title").analyzer(STANDARD_TOKENIZER)],
+            vec![],
+        )
+        .expect("options")
+        .with_writer_pool(pool)
+        .with_storage(Arc::clone(&storage));
+        let st = Supertable::create(opts).expect("create");
+        let mut titles: Vec<String> = Vec::with_capacity(BATCHES * PER_BATCH);
+        for b in 0..BATCHES {
+            let batch: Vec<String> = (0..PER_BATCH)
+                .map(|i| {
+                    let n = b * PER_BATCH + i;
+                    format!("uq{n} Shared t{} t{}", n % 37, n % 53)
+                })
+                .collect();
+            titles.extend(batch.iter().cloned());
+            let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
+            commit_titles(&st, &refs);
+        }
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+        let mut reordered = false;
+        for entry in st.reader().expect("reader").manifest().get_all_superfiles() {
+            let (bytes, _) = storage.get(&entry.storage_path()).await.expect("get");
+            let reader = SuperfileReader::open(bytes).expect("open");
+            reordered |= reader.fts().expect("fts").has_doc_map();
+        }
+        assert!(
+            reordered,
+            "the compaction must reorder for this test to mean anything"
+        );
+
+        let deleted = [3usize, 1000, 2222, 4000];
+        for n in deleted {
+            st.delete(col("title").eq(lit(titles[n].clone())))
+                .expect("delete");
+        }
+        let through_ilike = BATCHES * PER_BATCH - 1;
+        let stats = st
+            .delete(col("title").ilike(lit(format!("%uq{through_ilike}%"))))
+            .expect("delete through the exact filter");
+        assert_eq!(stats.matched(), 1);
+
+        for needle in ["uq12", "UQ4", "t36", "shared", "uq479", "uq3"] {
+            let lower = needle.to_ascii_lowercase();
+            let mut want: Vec<String> = titles
+                .iter()
+                .enumerate()
+                .filter(|&(n, title)| {
+                    !deleted.contains(&n)
+                        && n != through_ilike
+                        && title.to_ascii_lowercase().contains(&lower)
+                })
+                .map(|(_, title)| title.clone())
+                .collect();
+            want.sort();
+            let sql = format!("SELECT title FROM supertable WHERE title ILIKE '%{needle}%'");
+            let reader = st.reader().expect("reader");
+            let plan = pretty_format_batches(
+                &reader
+                    .query_sql(&format!("EXPLAIN {sql}"))
+                    .expect("explain"),
+            )
+            .expect("render the plan")
+            .to_string();
+            // The logical scan lists the filter as one it answers in full;
+            // nothing in the physical plan evaluates it.
+            let (logical, physical) = plan.split_once("physical_plan").expect("a physical plan");
+            assert!(
+                logical.contains("full_filters") && !physical.contains("ILIKE"),
+                "{needle} must be answered exactly: {plan}"
+            );
+            let mut got = titles_of(&reader.query_sql(&sql).expect("sql"));
+            got.sort();
+            assert_eq!(got, want, "{needle}");
+            // A count over the same selection, which spans the merged
+            // file's row groups, decodes no column at all.
+            let counted = reader
+                .query_sql(&format!(
+                    "SELECT COUNT(*) FROM supertable WHERE title ILIKE '%{needle}%'"
+                ))
+                .expect("count");
+            let n = counted[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count is Int64")
+                .value(0);
+            assert_eq!(n as usize, want.len(), "COUNT for {needle}");
         }
     }
 
