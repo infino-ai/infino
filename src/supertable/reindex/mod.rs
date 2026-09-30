@@ -587,13 +587,84 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::prelude::{col, lit};
     use tempfile::TempDir;
 
     use super::*;
     use crate::{
+        Bm25SearchOptions,
         superfile::fts::reader::StaleColumn,
+        supertable::Supertable,
         test_helpers::{copy_dir_recursive, old_format_fts_fixture, open_old_format_fts_fixture},
     };
+
+    /// Count the hits a term has, across the whole fixture.
+    fn hits(table: &Supertable, term: &str) -> usize {
+        table
+            .bm25_search("title", term, 100, Bm25SearchOptions::default(), None)
+            .expect("search")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum()
+    }
+
+    /// A re-analysis that repairs a table with a delete already on it.
+    ///
+    /// Runs on the committed fixture rather than the generated corpus, so
+    /// it exercises the reindex path — the carried body, the re-analysis
+    /// and the tombstone carry — wherever the corpus is absent. The
+    /// corpus-backed tests cover the older formats this one cannot.
+    #[test]
+    fn a_reanalysis_repairs_a_stale_table_and_keeps_its_deletes() {
+        const DELETED: &str = "alpha shared s0d00";
+        const SURVIVOR: &str = "s1d01";
+
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+        let (_storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+
+        let before = table
+            .index_staleness(&ReindexOptions::default())
+            .expect("assess");
+        assert!(
+            before.awaiting_reanalysis > 0,
+            "the fixture must be analysis-stale for this to prove anything: {before:?}"
+        );
+
+        table
+            .delete(col("title").eq(lit(DELETED)))
+            .expect("delete one row");
+        assert_eq!(hits(&table, "s0d00"), 0, "the row is gone before the run");
+        let survivors = hits(&table, "shared");
+
+        let report = table
+            .reindex(&ReindexOptions::default())
+            .expect("reindex the fixture");
+        assert!(
+            report.rewritten > 0,
+            "nothing was rewritten, so nothing was tested: {report:?}"
+        );
+
+        let after = table
+            .index_staleness(&ReindexOptions::default())
+            .expect("assess again");
+        assert!(
+            after.is_current(),
+            "a default reindex must leave the table current: {after:?}"
+        );
+
+        assert_eq!(
+            hits(&table, "s0d00"),
+            0,
+            "the deleted row came back, so its tombstone was not carried"
+        );
+        assert_eq!(
+            hits(&table, "shared"),
+            survivors,
+            "the rewrite changed how many rows a corpus-wide term matches"
+        );
+        assert_eq!(hits(&table, SURVIVOR), 1, "a survivor is still findable");
+    }
 
     /// The committed fixture was written by `infino/0.8.6`, which records
     /// no analysis revision. That is an unknown, so by default its columns
