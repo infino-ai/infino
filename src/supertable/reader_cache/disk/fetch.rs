@@ -106,14 +106,39 @@ impl DiskCacheStore {
             None,
         );
 
-        let reader = open_with_vector_hole(bytes, hole, &vector_source).await?;
+        self.holed_mmap_entry(mmap, bytes, hole, vector_source, size)
+            .await
+    }
 
-        Ok(self.build_mmap_entry(
-            Arc::new(reader),
-            mmap,
-            size.saturating_sub(hole.1),
-            Some(vector_source),
-        ))
+    /// A [`Residency::Mapped`] entry for a local copy missing its vector blob: reads inside `hole`
+    /// go to `vector_source`, the rest to `bytes`. Parquet is installed resident, so sync decodes
+    /// (take, id scans) run off the local bytes; there is no CRC check, since the vector bytes are
+    /// not local to check. The hole is not on disk, so when `vector_source` charges its own blocks
+    /// the entry is charged `size` minus the hole; otherwise the hole's blocks ride on `size`.
+    async fn holed_mmap_entry(
+        &self,
+        mmap: Arc<Mmap>,
+        bytes: Bytes,
+        (hole_start, hole_len): (u64, u64),
+        vector_source: Arc<BlockCachedSource>,
+        size: u64,
+    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+        let source: Arc<dyn LazyByteSource> = Arc::new(HoleFallbackSource {
+            local: Arc::new(BytesLazyByteSource::new(bytes.clone())),
+            hole_start,
+            hole_len,
+            fallback: Arc::clone(&vector_source),
+        });
+        let mut reader =
+            SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false }).await?;
+        reader.install_resident_parquet(bytes)?;
+
+        let charge = if vector_source.owns_accounting() {
+            size.saturating_sub(hole_len)
+        } else {
+            size
+        };
+        Ok(self.build_mmap_entry(Arc::new(reader), mmap, charge, Some(vector_source)))
     }
 
     /// Build a [`Residency::Mapped`] entry, always `Eager`. `charge` is the file size, or less when
@@ -1350,7 +1375,7 @@ async fn lazy_background_fill(
         // Mmap the tempfile itself; the install renames it into the cache only if it wins the slot.
         let (mmap_arc, bytes) = mmap_readonly_with_handle(&tmp)?;
 
-        let (promoted_reader, vector_source) = match skip_vec {
+        let entry = match skip_vec {
             Some(hole) => {
                 // Keep the live block cache, so the vector ranges the cold query read stay local.
                 // None only if an eviction raced the check above: start a fresh one for the hole.
@@ -1375,8 +1400,9 @@ async fn lazy_background_fill(
                         )
                     });
 
-                let reader = open_with_vector_hole(bytes, hole, &block_source).await?;
-                (reader, Some(block_source))
+                store
+                    .holed_mmap_entry(mmap_arc, bytes, hole, block_source, size)
+                    .await?
             }
             None => {
                 let reader = SuperfileReader::open_with(
@@ -1385,30 +1411,18 @@ async fn lazy_background_fill(
                         verify_crc: store.config.verify_crc_on_open,
                     },
                 )?;
-                (reader, None)
+                store.build_mmap_entry(Arc::new(reader), mmap_arc, size, None)
             }
         };
 
-        let block_source_retained = vector_source.is_some();
-
         // A copy missing its vector blob goes under its own name, so that nothing, a restart
         // included, can take it for a complete file.
-        let final_path = if block_source_retained {
+        let holed = skip_vec.is_some();
+        let final_path = if holed {
             store.hole_path(&uri)
         } else {
             store.cache_path(&uri)
         };
-
-        // The hole is not on disk. When its block source charges its own blocks, the mmap is
-        // charged only for what the file holds; otherwise the hole's blocks ride on this charge.
-        let charge = match (&vector_source, skip_vec) {
-            (Some(source), Some((_, vec_len))) if source.owns_accounting() => {
-                size.saturating_sub(vec_len)
-            }
-            _ => size,
-        };
-        let entry =
-            store.build_mmap_entry(Arc::new(promoted_reader), mmap_arc, charge, vector_source);
         // Installed with no vector hole, the mmap serves every range and the block file is dead
         // weight. Not installed, the block file stays with whoever holds the slot.
         let installed =
@@ -1416,7 +1430,7 @@ async fn lazy_background_fill(
         // The install settled the fill's reservation either way: it backs the new entry, or it
         // was released.
         own_reservation = None;
-        if installed.is_some() && !block_source_retained {
+        if installed.is_some() && !holed {
             store.drop_block_file(&uri);
         }
         Ok(())
@@ -1439,29 +1453,6 @@ fn vector_blob_range_in(kv_map: &footer::KvMap) -> Option<(u64, u64)> {
     let off: u64 = kv_map.get(kv::VEC_OFFSET)?.parse().ok()?;
     let len: u64 = kv_map.get(kv::VEC_LENGTH)?.parse().ok()?;
     (len > 0).then_some((off, len))
-}
-
-/// Open a local copy that holds everything but its vector blob: reads inside `hole` go to
-/// `vector_source`, the rest to `bytes`. Parquet is installed resident, so sync decodes (take, id
-/// scans) run off the local bytes. No CRC check, since the vector bytes are not local to check.
-async fn open_with_vector_hole(
-    bytes: Bytes,
-    (hole_start, hole_len): (u64, u64),
-    vector_source: &Arc<BlockCachedSource>,
-) -> Result<SuperfileReader, DiskCacheError> {
-    let source: Arc<dyn LazyByteSource> = Arc::new(HoleFallbackSource {
-        local: Arc::new(BytesLazyByteSource::new(bytes.clone())),
-        hole_start,
-        hole_len,
-        fallback: Arc::clone(vector_source),
-    });
-
-    let mut reader =
-        SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false }).await?;
-
-    reader.install_resident_parquet(bytes)?;
-
-    Ok(reader)
 }
 
 /// Sub-ranges of `[start, end)` that are outside an optional skip hole.
