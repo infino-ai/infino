@@ -104,6 +104,18 @@ where
     .instrument(span)
 }
 
+/// Catalog the per-call scans of [`scope_to_call`] are named under. No
+/// user table lives in it, so a call's scan can never share a name — and
+/// with it plan equality — with a scan of a real table.
+const CALL_SCOPE_CATALOG: &str = "__infino_internal";
+
+/// Schema, inside [`CALL_SCOPE_CATALOG`], of the per-call scans.
+const CALL_SCOPE_SCHEMA: &str = "search_tvf_call";
+
+/// Numbers the search table-function calls, so each call's scan gets a
+/// name no other call shares (see [`scope_to_call`]).
+static SEARCH_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Multiply a search's `k` by this each time the exact predicate leaves
 /// fewer than `k` rows standing (see [`fill_top_k`]). Doubling bounds the
 /// total work at about twice the final round's, whatever the predicate's
@@ -140,10 +152,6 @@ fn over_fetch_ceiling(k: usize, total: usize) -> usize {
         .min(total)
 }
 
-/// Numbers the search table-function calls, so each call's scan gets a
-/// name no other call shares (see [`scope_to_call`]).
-static SEARCH_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// Give one search table-function call a logical scan of its own.
 ///
 /// DataFusion names every table-function scan after the function alone
@@ -157,7 +165,8 @@ static SEARCH_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 /// tables as well as terms.
 ///
 /// The returned provider hands DataFusion a logical plan in place of
-/// itself: a scan of `provider` under a name unique to this call. The SQL
+/// itself: a scan of `provider` under a name unique to this call, inside a
+/// reserved catalog so it cannot match a real table's scan either. The SQL
 /// planner inlines that plan beneath the function's own alias, so column
 /// references are unchanged and no two calls compare equal. Two calls with
 /// identical arguments are no longer merged either; they run twice, which
@@ -168,7 +177,11 @@ pub(crate) fn scope_to_call(
 ) -> DfResult<Arc<dyn TableProvider>> {
     let seq = SEARCH_CALL_SEQ.fetch_add(1, Ordering::Relaxed);
     let plan = LogicalPlanBuilder::scan(
-        TableReference::bare(format!("{function}#{seq}")),
+        TableReference::full(
+            CALL_SCOPE_CATALOG,
+            CALL_SCOPE_SCHEMA,
+            format!("{function}#{seq}"),
+        ),
         provider_as_source(Arc::clone(&provider)),
         None,
     )?
