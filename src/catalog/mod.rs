@@ -98,7 +98,7 @@ use crate::{
         query::exec::common::collect_plan_metered,
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
-    utils::trace::{detail_span, record},
+    utils::trace::{self, CloseOut, detail_span},
 };
 
 /// Subdirectory under a tables cache root holding the manifest-part cache.
@@ -986,17 +986,17 @@ impl Connection {
         // the catalog at call time (so a table named only inside a TVF —
         // not as a `FROM` relation — still resolves).
         search_tvf::register_search_tvfs(&ctx, self.clone());
+        trace::follow_spans_into_datafusion_tasks();
 
         let sql = sql.to_owned();
         // Caller-thread pickup, same as reader mint: the drive future may
         // poll on runtime threads where the scope's slot is invisible.
         let op_stats = op_stats::current();
-        // What the span records when the query is done: the meter's counters
-        // for this query, and the connection's object-store ledger before it
-        // ran, so the delta is what this query fetched. Both are a few atomic
-        // loads, skipped along with the fields they feed.
-        let close_out = cfg!(feature = "detailed-tracing")
-            .then(|| (op_stats.clone(), self.inner.usage_meter.snapshot()));
+        // What the span records when the query is done; see `CloseOut`.
+        let close_out = CloseOut::begin(
+            || op_stats.clone(),
+            || Some(Arc::clone(&self.inner.usage_meter)),
+        );
         let drive = async move {
             // Plan on this runtime's 16 MiB workers, not the calling thread `block_on` polls on:
             // planner recursion depth must not hang on a stack the engine does not own. A panic
@@ -1082,26 +1082,8 @@ impl Connection {
                 .map_err(|e: InfinoError| e.with_context("query_sql", None)),
         };
 
-        if let (Some((op_stats, usage_before)), Ok(batches)) = (close_out, &result) {
-            record(
-                "rows_out",
-                batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(),
-            );
-            if let Some(stats) = op_stats {
-                let stats = stats.snapshot();
-                record("sql_page_bytes", stats.sql_page_bytes);
-                record("planned_read_ranges", stats.planned_read_ranges);
-                record("rows_materialized", stats.rows_materialized);
-                record("kernel_cpu_ns", stats.kernel_cpu_ns);
-            }
-            // The ledger is the connection's, not the query's: a second query
-            // on the same connection at the same time lands in this delta too.
-            let used = self.inner.usage_meter.snapshot().since(&usage_before);
-            record("store_heads", used.head_count);
-            record("store_gets", used.get_count);
-            record("store_get_bytes", used.get_bytes);
-            record("store_bg_gets", used.bg_get_count);
-            record("store_bg_get_bytes", used.bg_get_bytes);
+        if let Ok(batches) = &result {
+            close_out.finish_batches(batches);
         }
 
         result

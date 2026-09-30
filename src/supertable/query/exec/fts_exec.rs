@@ -64,9 +64,10 @@ use crate::{
         handle::{SupertableReader, WeakReader},
         query::exec::common::{
             PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters, fill_top_k,
-            output_schema_with_score, scope_to_call, search_query_df_error,
+            output_schema_with_score, scope_to_call, search_query_df_error, traced_tvf,
         },
     },
+    utils::trace::detail_span,
 };
 
 /// SQL name for the term-based BM25 TVF.
@@ -468,6 +469,23 @@ impl ExecutionPlan for Bm25Exec {
             .await
         };
 
+        let span = match &self.query {
+            Bm25Query::Terms { .. } => {
+                detail_span!(
+                    "tvf.bm25_search",
+                    k = self.k,
+                    rows_out = tracing::field::Empty
+                )
+            }
+            Bm25Query::Prefix { .. } => {
+                detail_span!(
+                    "tvf.bm25_search_prefix",
+                    k = self.k,
+                    rows_out = tracing::field::Empty
+                )
+            }
+        };
+        let fut = traced_tvf(span, fut);
         let stream = futures::stream::once(fut);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,

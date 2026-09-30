@@ -65,11 +65,12 @@ use crate::{
             exec::common::{
                 PushedPredicate, SCORE_COLUMN, arg_to_string, arg_to_usize,
                 candidate_plan_for_filters, fill_top_k, output_schema_with_score, resolve_hits,
-                scope_to_call, search_query_df_error,
+                scope_to_call, search_query_df_error, traced_tvf,
             },
             vector::{free_column_slot, hits_id_score_batch, user_placement_for_scalar_resolve},
         },
     },
+    utils::trace::detail_span,
 };
 
 /// SQL name the TVF is registered under.
@@ -481,6 +482,12 @@ impl ExecutionPlan for VectorSearchExec {
             .await
         };
 
+        let span = detail_span!(
+            "tvf.vector_search",
+            k = self.k,
+            rows_out = tracing::field::Empty
+        );
+        let fut = traced_tvf(span, fut);
         let stream = stream::once(fut);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,

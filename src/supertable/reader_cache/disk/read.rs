@@ -257,9 +257,8 @@ impl DiskCacheStore {
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<(Arc<CachedEntry>, OpenTier), DiskCacheError> {
-        // A fill may have installed the whole file since the memory check. Use its entry, not the
-        // file on disk: a fill that left the vector blob on the block cache wrote a file with a
-        // hole, and only the live entry can serve it.
+        // A fill may have installed the whole file since the memory check. Use its entry rather
+        // than open the file it wrote a second time.
         if let Some(entry) = self.whole_file_in_memory(uri) {
             return Ok((entry, OpenTier::Memory));
         }
@@ -267,7 +266,7 @@ impl DiskCacheStore {
         // Tier 2, disk: the whole file is on local disk (a prior run, or a finished fill). Mmap
         // it, no GETs.
         if let Some(entry) = self
-            .fetch_from_disk_cache(uri, offsets.map(|o| o.total_size))
+            .fetch_from_disk_cache(uri, storage_key, offsets.map(|o| o.total_size), storage)
             .await?
         {
             return Ok((entry, OpenTier::Disk));

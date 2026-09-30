@@ -63,6 +63,7 @@ use parquet::{
     file::metadata::ParquetMetaData,
 };
 use rayon::prelude::*;
+use tracing::{Instrument, Span};
 
 use crate::{
     runtime_bridge::run_on_pool,
@@ -83,7 +84,25 @@ use crate::{
         },
         reader_cache::ReadIntent,
     },
+    utils::trace::record,
 };
+
+/// A table function's search, run under `span` with the batch's row count
+/// recorded as its `rows_out`. `execute` makes the span under `sql.execute`,
+/// so the search kernel's phase spans nest beneath it.
+pub(crate) fn traced_tvf<F>(span: Span, search: F) -> impl Future<Output = F::Output>
+where
+    F: Future<Output = DfResult<RecordBatch>>,
+{
+    async move {
+        let out = search.await;
+        if let Ok(batch) = &out {
+            record("rows_out", batch.num_rows());
+        }
+        out
+    }
+    .instrument(span)
+}
 
 /// Multiply a search's `k` by this each time the exact predicate leaves
 /// fewer than `k` rows standing (see [`fill_top_k`]). Doubling bounds the
