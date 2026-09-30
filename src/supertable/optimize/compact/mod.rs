@@ -1019,14 +1019,33 @@ async fn carry_tombstones_to_output(
         )));
     };
 
+    // The bitmap this job holds was read when it sealed the input. The
+    // mutation path takes a seal over once it is older than its own
+    // timeout, clears it and writes its bit — so on a job that outlived
+    // that, the sealed bitmap is missing rows the input now has. The etag
+    // is what says so, and it is checked before the empty-bitmap exit
+    // below: sealing an empty sidecar and taking over are what a job that
+    // silently drops the first delete against its input looks like.
+    let held = sealed.iter().find(|s| s.superfile_id == input.superfile_id);
+    let current_etag = wal_store
+        .get_tombstones(input.superfile_id)
+        .await
+        .map_err(|e| {
+            CompactionError::Build(format!(
+                "re-reading the sidecar of {}: {e}",
+                input.superfile_id
+            ))
+        })?
+        .map(|(_, etag)| etag);
+    if current_etag.as_ref() != held.map(|s| &s.etag) {
+        return Err(CompactionError::SidecarChangedUnderSeal {
+            superfile_id: input.superfile_id,
+        });
+    }
+
     // An absent sidecar *is* the empty state, so writing one would leave an
     // object for GC to collect and every reader to fetch for nothing.
-    let Some(bitmap) = sealed
-        .iter()
-        .find(|s| s.superfile_id == input.superfile_id)
-        .map(|s| &s.bitmap)
-        .filter(|b| !b.is_empty())
-    else {
+    let Some(bitmap) = held.map(|s| &s.bitmap).filter(|b| !b.is_empty()) else {
         return Ok(None);
     };
 
@@ -1197,6 +1216,199 @@ mod tests {
 
     const DEFAULT_STALE_SEAL_TIMEOUT: std::time::Duration =
         std::time::Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
+
+    /// A build that carries every row, so the runner must carry the
+    /// input's tombstones onto its output.
+    struct AlwaysCarriesRows;
+
+    impl SuperfileMerge for AlwaysCarriesRows {
+        fn build(
+            &self,
+            _inputs: MergeInputs<'_>,
+            _output: &mut dyn Write,
+        ) -> Result<BuiltSuperfileStats, BuildError> {
+            unreachable!("the tombstone carry never builds")
+        }
+
+        fn preserves_tombstones(&self) -> bool {
+            true
+        }
+    }
+
+    /// A delete that lands while a job is building must not be dropped by
+    /// that job's commit.
+    ///
+    /// The runner seals the input's sidecar and holds the bitmap it read
+    /// at seal time. The delete path takes a seal over once it is older
+    /// than its own fixed timeout — reachable here because a reindex
+    /// targets the largest superfiles — clears it, and writes its bit.
+    /// Publishing the seal-time bitmap onto the output then loses that
+    /// row, and nothing downstream can tell: the output is live and its
+    /// sidecar looks authoritative.
+    ///
+    /// The input's etag is what says the sidecar moved, so the carry must
+    /// check it rather than trust the seal it took.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_that_lands_mid_job_is_not_dropped_by_the_carry() {
+        const SEALED_ROW: u32 = 0;
+        const ROW_DELETED_MID_JOB: u32 = 1;
+
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_titles(&st, &["alpha first", "alpha second"]);
+
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let wal_store = WalStore::new(storage);
+
+        let manifest = st.inner().manifest.load_full();
+        let input = manifest
+            .get_all_superfiles()
+            .first()
+            .expect("one superfile")
+            .clone();
+        let output = Arc::new(SuperfileEntry {
+            superfile_id: Uuid::from_u128(0xFEED),
+            ..(*input).clone()
+        });
+
+        // What the runner sees when it seals.
+        let at_seal: RoaringBitmap = [SEALED_ROW].into_iter().collect();
+        let sealed_etag = wal_store
+            .put_tombstones(
+                input.superfile_id,
+                None,
+                &TombstonesSidecar {
+                    seal: Some(SealRecord {
+                        compaction_id: Uuid::from_u128(1),
+                        sealed_at: Utc::now(),
+                    }),
+                    bitmap: at_seal.clone(),
+                },
+            )
+            .await
+            .expect("seal the input");
+        let sealed = vec![SealedInput {
+            superfile_id: input.superfile_id,
+            bitmap: at_seal,
+            etag: sealed_etag.clone(),
+        }];
+
+        // The delete path finds the seal stale, clears it, adds its bit.
+        let taken_over: RoaringBitmap = [SEALED_ROW, ROW_DELETED_MID_JOB].into_iter().collect();
+        wal_store
+            .put_tombstones(
+                input.superfile_id,
+                Some(&sealed_etag),
+                &TombstonesSidecar {
+                    seal: None,
+                    bitmap: taken_over,
+                },
+            )
+            .await
+            .expect("take the stale seal over");
+
+        let carried = carry_tombstones_to_output(
+            &AlwaysCarriesRows,
+            &wal_store,
+            &[Arc::clone(&input)],
+            &[Arc::clone(&output)],
+            &sealed,
+        )
+        .await;
+
+        assert!(
+            carried.is_err(),
+            "the sidecar moved under the seal, so the carry must refuse rather \
+             than publish the bitmap it read at seal time"
+        );
+        assert!(
+            wal_store
+                .get_tombstones(output.superfile_id)
+                .await
+                .expect("read output sidecar")
+                .is_none(),
+            "and it must not have written a sidecar onto the output"
+        );
+    }
+
+    /// The same loss, on a superfile that had no tombstones when the job
+    /// sealed it — the first delete against it.
+    ///
+    /// An empty sealed bitmap means "write no sidecar", which looks like a
+    /// no-op and is why this case hides: the job publishes an output with
+    /// no tombstones at all, so the delete leaves no trace anywhere. The
+    /// etag check has to come before that exit, not after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_delete_mid_job_is_not_dropped_by_the_empty_carry() {
+        const ROW_DELETED_MID_JOB: u32 = 1;
+
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_titles(&st, &["alpha first", "alpha second"]);
+
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let wal_store = WalStore::new(storage);
+
+        let manifest = st.inner().manifest.load_full();
+        let input = manifest
+            .get_all_superfiles()
+            .first()
+            .expect("one superfile")
+            .clone();
+        let output = Arc::new(SuperfileEntry {
+            superfile_id: Uuid::from_u128(0xFEED),
+            ..(*input).clone()
+        });
+
+        let sealed_etag = wal_store
+            .put_tombstones(
+                input.superfile_id,
+                None,
+                &TombstonesSidecar {
+                    seal: Some(SealRecord {
+                        compaction_id: Uuid::from_u128(1),
+                        sealed_at: Utc::now(),
+                    }),
+                    bitmap: RoaringBitmap::new(),
+                },
+            )
+            .await
+            .expect("seal the input");
+        let sealed = vec![SealedInput {
+            superfile_id: input.superfile_id,
+            bitmap: RoaringBitmap::new(),
+            etag: sealed_etag.clone(),
+        }];
+
+        wal_store
+            .put_tombstones(
+                input.superfile_id,
+                Some(&sealed_etag),
+                &TombstonesSidecar {
+                    seal: None,
+                    bitmap: [ROW_DELETED_MID_JOB].into_iter().collect(),
+                },
+            )
+            .await
+            .expect("take the stale seal over");
+
+        let carried = carry_tombstones_to_output(
+            &AlwaysCarriesRows,
+            &wal_store,
+            &[Arc::clone(&input)],
+            &[Arc::clone(&output)],
+            &sealed,
+        )
+        .await;
+
+        assert!(
+            carried.is_err(),
+            "an empty sealed bitmap is not permission to publish an output \
+             with no tombstones when the input has since gained one"
+        );
+    }
 
     // ---- run_compaction_job error arms ------------------------------
 

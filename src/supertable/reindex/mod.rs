@@ -553,7 +553,14 @@ impl Supertable {
                 // way this file is untouchable right now and every other
                 // stale file is not, so the run continues and says what it
                 // had to leave.
-                Err(CompactionError::SidecarConflict { .. }) => {
+                // Both mean another actor owns this superfile's sidecar:
+                // one held the seal, the other took ours. Either way the
+                // work is still there for a later run, and one contended
+                // file must not end a migration.
+                Err(
+                    CompactionError::SidecarConflict { .. }
+                    | CompactionError::SidecarChangedUnderSeal { .. },
+                ) => {
                     report.held_by_another_run += 1;
                     continue;
                 }
