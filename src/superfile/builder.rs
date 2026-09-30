@@ -99,7 +99,10 @@ use crate::{
             kv,
         },
         fts::{
-            analysis::{Base, Stemmer, Stopwords, chain_name, chain_revision, chain_tokenizer},
+            analysis::{
+                Base, Stemmer, Stopwords, UNKNOWN_ANALYSIS_REVISION, chain_name, chain_revision,
+                chain_tokenizer,
+            },
             bm25,
             builder::FtsBuilder,
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
@@ -664,7 +667,13 @@ impl BuilderOptions {
             else {
                 continue;
             };
-            let carried = own.analysis_revision().min(remote.analysis_revision);
+            // An input recording no revision is an unknown, and a merge is
+            // only as re-analyzed as its oldest input, so it floors the
+            // output.
+            let remote_revision = remote
+                .analysis_revision
+                .unwrap_or(UNKNOWN_ANALYSIS_REVISION);
+            let carried = own.analysis_revision().min(remote_revision);
             own.carried_analysis_revision = Some(carried);
         }
     }
@@ -743,7 +752,9 @@ impl BuilderOptions {
                         .positions(c.positions)
                         .stored(c.stored)
                         .bm25(c.params.k1, c.params.b)
-                        .carried_analysis_revision(c.analysis_revision)
+                        .carried_analysis_revision(
+                            c.analysis_revision.unwrap_or(UNKNOWN_ANALYSIS_REVISION),
+                        )
                 })
                 .collect()
         } else {
@@ -3323,15 +3334,13 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         if !c.stored {
             s.push_str(r#","stored":false"#);
         }
-        // Emitted only when non-zero, so an entry whose postings come
-        // from a file written before revisions existed stays
-        // byte-identical to what that file carried. A reader defaults a
-        // missing field to 0, which is what such a file means.
-        let analysis_revision = c.analysis_revision();
-        if analysis_revision != 0 {
-            s.push_str(r#","analysis_revision":"#);
-            s.push_str(&analysis_revision.to_string());
-        }
+        // Always emitted, zero included: a missing field is reserved for
+        // files written before revisions existed, whose analysis this
+        // engine can only infer from the writer's version. Omitting a
+        // known zero would put a carried-stale column in that same
+        // bucket and let it be credited with terms it does not hold.
+        s.push_str(r#","analysis_revision":"#);
+        s.push_str(&c.analysis_revision().to_string());
         s.push('}');
     }
     s.push(']');
@@ -3713,12 +3722,15 @@ mod tests {
         assert!(!kv.contains_key("inf.fts.offset"));
     }
 
-    /// A build that analyzes its own text records the revision this
-    /// engine's chain emits, and a file whose postings predate the field
-    /// keeps recording nothing — the JSON stays byte-identical to what
-    /// such a file carried.
+    /// Every column records a revision, zero included.
+    ///
+    /// Omitting a zero would make a carried-from-pre-revision column
+    /// indistinguishable from one written before the field existed, and
+    /// those mean different things: the first is known-stale, the second
+    /// is unknown. Only a reader that can tell them apart may credit an
+    /// unrecorded column with the revision its writer would have emitted.
     #[test]
-    fn analysis_revision_emitted_only_when_non_zero() {
+    fn every_column_records_its_analysis_revision() {
         let fresh = fts_columns_json(&[FtsConfig::new("title")]);
         assert!(
             fresh.contains(r#""analysis_revision":1"#),
@@ -3727,8 +3739,8 @@ mod tests {
 
         let carried = fts_columns_json(&[FtsConfig::new("title").carried_analysis_revision(0)]);
         assert!(
-            !carried.contains("analysis_revision"),
-            "postings carried from a pre-revision file record no revision at all: {carried}"
+            carried.contains(r#""analysis_revision":0"#),
+            "a known-stale column records the zero rather than omitting it: {carried}"
         );
     }
 
@@ -3763,6 +3775,7 @@ mod tests {
             .next()
             .expect("one column")
             .analysis_revision
+            .expect("every build records a revision")
     }
 
     /// Rewriting a file's container does not re-analyze its terms, so the

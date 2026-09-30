@@ -88,21 +88,26 @@ pub mod served_shortlist_probe {
     }
 }
 
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{
+    collections::HashSet,
+    fs::{copy as copy_file, create_dir_all, read_dir},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use rayon::ThreadPoolBuilder;
 
 use crate::{
-    storage::StorageProvider,
+    storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{FtsConfig, VectorConfig},
         fts::tokenize::{StandardTokenizer, Tokenizer},
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
     supertable::{
-        SupertableOptions,
+        Supertable, SupertableOptions,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
     },
 };
@@ -287,6 +292,49 @@ pub fn distinct_unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
 /// / `.with_*(...)` for whatever the specific test needs.
 /// Returning the un-storage-d shape lets each test decide
 /// explicitly whether to attach storage.
+/// Copy a directory tree, so a test can work on a writable copy of a
+/// committed fixture rather than the checkout.
+pub fn copy_dir_recursive(from: &Path, to: &Path) {
+    create_dir_all(to).expect("create fixture copy dir");
+    for entry in read_dir(from).expect("read fixture dir") {
+        let entry = entry.expect("fixture dir entry");
+        let dest = to.join(entry.file_name());
+        match entry.file_type().expect("fixture entry type").is_dir() {
+            true => copy_dir_recursive(&entry.path(), &dest),
+            false => {
+                copy_file(entry.path(), dest).expect("copy fixture file");
+            }
+        }
+    }
+}
+
+/// The committed three-superfile FTS table, written by `infino/0.8.6` —
+/// an engine that recorded no analysis revision. See the fixture's
+/// `README.md`.
+pub fn old_format_fts_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/old_format_fts_table")
+}
+
+/// Open a copy of [`old_format_fts_fixture`] sitting at `dir`, with its
+/// options adjusted by `customize`.
+///
+/// The fixture's shape is one `LargeUtf8` FTS column named `title`, no
+/// positions. Copying is the caller's ([`copy_dir_recursive`]) so one
+/// copy can be opened more than once — which is how a test reaches the
+/// lazy manifest path on a table another handle just wrote.
+pub fn open_old_format_fts_fixture(
+    dir: &Path,
+    customize: impl FnOnce(SupertableOptions) -> SupertableOptions,
+) -> (Arc<dyn StorageProvider>, Supertable) {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir).expect("local fs over the fixture copy"));
+    let options = customize(default_supertable_options().with_storage(Arc::clone(&storage)));
+    (
+        storage,
+        Supertable::open(options).expect("open fixture table"),
+    )
+}
+
 pub fn default_supertable_options() -> SupertableOptions {
     let pool = Arc::new(
         ThreadPoolBuilder::new()

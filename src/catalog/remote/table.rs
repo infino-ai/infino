@@ -312,7 +312,7 @@ impl Table for RemoteTable {
         Err(ReindexError::NoStorage)
     }
 
-    fn index_staleness(&self) -> Result<StalenessReport, ReindexError> {
+    fn index_staleness(&self, _opts: &ReindexOptions) -> Result<StalenessReport, ReindexError> {
         // Reads every superfile's index metadata off the storage backend a
         // client does not hold. Server-side for the same reason the
         // reindex it describes is.

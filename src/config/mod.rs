@@ -1099,6 +1099,25 @@ pub struct ReindexOptions {
     /// meaning with [`CompactionSettings::stale_seal_timeout_ms`] — the
     /// seal is the same guard, and a reindex job takes it the same way.
     pub stale_seal_timeout_ms: u64,
+    /// Credit a superfile that records no analysis revision with the one
+    /// the engine that wrote it emitted, instead of treating it as
+    /// unknown. Defaults to `false`.
+    ///
+    /// Revisions were not recorded before this field existed, so every
+    /// older superfile reads as stale and `Auto` re-analyzes it — correct,
+    /// but it re-tokenizes corpora whose terms are already current.
+    /// Setting this reads the writer's version out of `inf.builder` and
+    /// credits what that version's chains emitted, skipping those files.
+    ///
+    /// **Only sound when the table never held superfiles older than the
+    /// writer's version.** A merge carries postings rather than
+    /// re-analyzing them, and engines that did not record revisions did
+    /// not lower the output to its oldest input either — so a compaction
+    /// run by one of them could have folded much older terms into a file
+    /// stamped with its own version, and nothing in that file says so.
+    /// Crediting it leaves those terms in place and reports the table
+    /// migrated. Leave this off unless the table's whole history is known.
+    pub trust_writer_analysis: bool,
 }
 
 impl Default for ReindexOptions {
@@ -1109,6 +1128,7 @@ impl Default for ReindexOptions {
             target: ReindexTarget::default(),
             mode: ReindexMode::default(),
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
+            trust_writer_analysis: false,
         }
     }
 }

@@ -525,7 +525,9 @@ fn a_second_run_over_a_table_with_deletions_has_nothing_to_do() {
 
     rewrite(&table);
 
-    let after = table.index_staleness().expect("assess the rewritten table");
+    let after = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess the rewritten table");
     assert_eq!(
         after.needing_rewrite, 0,
         "a rewritten table still reports containers to rewrite, so the \

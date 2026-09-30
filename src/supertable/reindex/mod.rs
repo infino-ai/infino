@@ -29,8 +29,11 @@ use crate::{
     config::{ReindexMode, ReindexOptions, ReindexTarget},
     runtime_bridge::bridge_on_runtime,
     superfile::{
-        fts::reader::{FtsStaleness, StaleColumn},
-        reader::SuperfileReader,
+        fts::{
+            analysis::{UNKNOWN_ANALYSIS_REVISION, analysis_revision_written_by},
+            reader::{FtsStaleness, StaleColumn},
+        },
+        reader::{SuperfileReader, writer_builder_of},
     },
     supertable::{
         Supertable,
@@ -83,8 +86,19 @@ impl StaleSuperfile {
         partition_key: Vec<u8>,
         live_bytes: u64,
         reader: &SuperfileReader,
+        trust_writer_analysis: bool,
     ) -> Self {
-        let fts = reader.fts().map(|f| f.staleness()).unwrap_or_default();
+        // A file recording no revision is an unknown unless the caller has
+        // taken responsibility for reading it as its writer's.
+        let assumed = match trust_writer_analysis {
+            true => writer_builder_of(reader.parquet_metadata())
+                .map_or(UNKNOWN_ANALYSIS_REVISION, analysis_revision_written_by),
+            false => UNKNOWN_ANALYSIS_REVISION,
+        };
+        let fts = reader
+            .fts()
+            .map(|f| f.staleness(assumed))
+            .unwrap_or_default();
         Self {
             superfile_id,
             partition_key,
@@ -294,6 +308,7 @@ impl Supertable {
     /// caller can report both against one point in time.
     pub(crate) async fn stale_superfiles(
         &self,
+        trust_writer_analysis: bool,
     ) -> Result<(Vec<StaleSuperfile>, usize), CompactionError> {
         let manifest = self.inner().manifest.load_full();
         let store = manifest.options.store.clone();
@@ -329,6 +344,7 @@ impl Supertable {
                     entry.partition_key.clone(),
                     live_bytes,
                     &reader,
+                    trust_writer_analysis,
                 );
                 if !assessed.fts.is_current() {
                     stale.push(assessed);
@@ -378,11 +394,17 @@ impl Supertable {
     ///
     /// [`ReindexError::NoStorage`] without a durable backend, and
     /// [`ReindexError::Assess`] if a superfile cannot be opened.
-    pub fn index_staleness(&self) -> Result<StalenessReport, ReindexError> {
-        bridge_on_runtime(self.index_staleness_async(), &self.inner().query_runtime())
+    pub fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError> {
+        bridge_on_runtime(
+            self.index_staleness_async(opts),
+            &self.inner().query_runtime(),
+        )
     }
 
-    async fn index_staleness_async(&self) -> Result<StalenessReport, ReindexError> {
+    async fn index_staleness_async(
+        &self,
+        opts: &ReindexOptions,
+    ) -> Result<StalenessReport, ReindexError> {
         if self.inner().manifest.load_full().options.storage.is_none() {
             return Err(ReindexError::NoStorage);
         }
@@ -390,7 +412,7 @@ impl Supertable {
         // assessment fail while a migration it is meant to describe is
         // running, which is precisely when someone asks.
         let (stale, superfiles) = self
-            .stale_superfiles()
+            .stale_superfiles(opts.trust_writer_analysis)
             .await
             .map_err(|e| ReindexError::Assess(e.to_string()))?;
 
@@ -476,7 +498,7 @@ impl Supertable {
         // would mix two points in time, so a commit landing between them
         // would skew the report by however many superfiles it added.
         let (all, total) = self
-            .stale_superfiles()
+            .stale_superfiles(opts.trust_writer_analysis)
             .await
             .map_err(|e| ReindexError::Assess(e.to_string()))?;
 
@@ -577,8 +599,50 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
-    use crate::superfile::fts::reader::StaleColumn;
+    use crate::{
+        superfile::fts::reader::StaleColumn,
+        test_helpers::{copy_dir_recursive, old_format_fts_fixture, open_old_format_fts_fixture},
+    };
+
+    /// The committed fixture was written by `infino/0.8.6`, which records
+    /// no analysis revision. That is an unknown, so by default its columns
+    /// read as stale and a reindex re-analyzes them.
+    ///
+    /// Told to trust the writer, the same files read as current: 0.8.6
+    /// shipped the chains this engine still has. The two answers are the
+    /// trade the option exists for, so both are pinned here.
+    #[test]
+    fn an_unrecorded_revision_is_stale_until_the_writer_is_trusted() {
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+        let (_storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+
+        let conservative = table
+            .index_staleness(&ReindexOptions::default())
+            .expect("staleness");
+        assert_eq!(
+            conservative.awaiting_reanalysis, conservative.superfiles,
+            "recording no revision, every superfile is an unknown: {conservative:?}"
+        );
+
+        let trusting = table
+            .index_staleness(&ReindexOptions {
+                trust_writer_analysis: true,
+                ..ReindexOptions::default()
+            })
+            .expect("staleness");
+        assert_eq!(
+            trusting.awaiting_reanalysis, 0,
+            "0.8.6 shipped the current chains, so nothing needs re-analysis: {trusting:?}"
+        );
+        assert!(
+            trusting.unrepairable_columns.is_empty(),
+            "and no column is reported unrepairable: {trusting:?}"
+        );
+    }
 
     fn entry(id: u128, fts: FtsStaleness) -> StaleSuperfile {
         StaleSuperfile {

@@ -257,7 +257,9 @@ fn a_vector_bearing_table_can_be_rewritten_and_reanalyzed() {
         return;
     };
 
-    let before = table.index_staleness().expect("assess a hybrid table");
+    let before = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess a hybrid table");
     assert!(before.superfiles > 0, "the fixture has no superfiles");
     assert_eq!(
         before.awaiting_reanalysis, before.superfiles,
@@ -292,7 +294,9 @@ fn a_vector_bearing_table_can_be_rewritten_and_reanalyzed() {
 
     // Both axes clear: the container is current and the terms were rebuilt
     // from stored text, which is what a rewrite alone could never do.
-    let after = table.index_staleness().expect("assess the repaired table");
+    let after = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess the repaired table");
     assert_eq!(after.needing_rewrite, 0, "containers are still behind");
     assert_eq!(
         after.awaiting_reanalysis, 0,
@@ -343,7 +347,9 @@ fn assert_staleness_predicts_the_run(shape: &str) {
     let Some((_tmp, table, _root)) = open_corpus(shape) else {
         return;
     };
-    let before = table.index_staleness().expect("assess a stale table");
+    let before = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess a stale table");
 
     assert!(!before.is_current(), "{shape}: a corpus table is behind");
     assert_eq!(
@@ -362,7 +368,9 @@ fn assert_staleness_predicts_the_run(shape: &str) {
     // Assessing changes nothing: run it twice and the second answer is the
     // first. A read-only claim is cheap to make and cheap to break.
     assert_eq!(
-        table.index_staleness().expect("assess again"),
+        table
+            .index_staleness(&ReindexOptions::default())
+            .expect("assess again"),
         before,
         "{shape}: assessing the table changed it"
     );
@@ -385,7 +393,9 @@ fn assert_staleness_predicts_the_run(shape: &str) {
 
     // After the rewrite the container axis is clear and the analysis axis
     // is not — the two-axis split, visible without running anything.
-    let after = table.index_staleness().expect("assess a rewritten table");
+    let after = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess a rewritten table");
     assert_eq!(
         after.needing_rewrite, 0,
         "{shape}: containers are still behind after a rewrite"
@@ -407,7 +417,9 @@ fn assert_staleness_predicts_the_run(shape: &str) {
     table
         .reindex(&ReindexOptions::reanalyzing())
         .expect("re-analyze");
-    let finished = table.index_staleness().expect("assess a migrated table");
+    let finished = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess a migrated table");
     assert!(
         finished.is_current(),
         "{shape}: a fully migrated table still reports work: {finished:?}"
@@ -439,7 +451,9 @@ fn a_current_table_reports_nothing_to_do() {
     table
         .reindex(&ReindexOptions::reanalyzing())
         .expect("bring the newest published shape fully current");
-    let report = table.index_staleness().expect("assess");
+    let report = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess");
     assert!(
         report.is_current(),
         "a migrated table reports work: {report:?}"
@@ -590,7 +604,9 @@ fn the_default_mode_leaves_the_table_current_where_a_rewrite_cannot() {
     rewritten
         .reindex(&ReindexOptions::rewriting())
         .expect("rewrite");
-    let after_rewrite = rewritten.index_staleness().expect("assess");
+    let after_rewrite = rewritten
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess");
     assert_eq!(after_rewrite.needing_rewrite, 0);
     assert!(
         after_rewrite.awaiting_reanalysis > 0 && !after_rewrite.is_current(),
@@ -608,7 +624,9 @@ fn the_default_mode_leaves_the_table_current_where_a_rewrite_cannot() {
         "the default left files waiting on a repair it performs: {report:?}"
     );
 
-    let after = table.index_staleness().expect("assess");
+    let after = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess");
     assert!(
         after.is_current(),
         "the default mode finished with the table still stale: {after:?}"

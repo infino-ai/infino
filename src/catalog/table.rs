@@ -85,7 +85,7 @@ pub(crate) trait Table: Send + Sync {
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError>;
     fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError>;
-    fn index_staleness(&self) -> Result<StalenessReport, ReindexError>;
+    fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError>;
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError>;
 
     /// Test-only: expose the concrete handle behind the trait object so tests
@@ -188,8 +188,8 @@ impl Table for SupertableHandle {
     fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
         SupertableHandle::reindex(self, opts)
     }
-    fn index_staleness(&self) -> Result<StalenessReport, ReindexError> {
-        SupertableHandle::index_staleness(self)
+    fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError> {
+        SupertableHandle::index_staleness(self, opts)
     }
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         SupertableHandle::gc(self, safety_gap)
@@ -498,8 +498,8 @@ impl Supertable {
     /// Takes no writer slot, so it is safe against a live table and safe
     /// while a reindex or compaction is running — the numbers are then a
     /// snapshot of something already in motion.
-    pub fn index_staleness(&self) -> Result<StalenessReport, ReindexError> {
-        self.inner.index_staleness()
+    pub fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError> {
+        self.inner.index_staleness(opts)
     }
 
     /// Garbage-collect orphaned superfiles older than `safety_gap`.
