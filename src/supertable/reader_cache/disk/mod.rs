@@ -605,6 +605,12 @@ impl DiskCacheStore {
         self.config.cache_root.join(uri.cache_filename())
     }
 
+    /// Where a promoted copy of `uri` lives when its vector blob was left out; see
+    /// [`SuperfileUri::cache_hole_filename`].
+    pub(crate) fn hole_path(&self, uri: &SuperfileUri) -> PathBuf {
+        self.config.cache_root.join(uri.cache_hole_filename())
+    }
+
     /// Build a per-URI sparse block-cache path under `cache_root`.
     pub(crate) fn blocks_path(&self, uri: &SuperfileUri) -> PathBuf {
         self.config

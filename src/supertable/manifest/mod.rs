@@ -121,6 +121,10 @@ pub(crate) const SUPERFILE_KEY_SUFFIX: &str = ".sf.parquet";
 /// the file is atomically renamed to the bare name once complete.
 pub(crate) const CACHE_TMP_EXTENSION: &str = ".tmp";
 
+/// Extra extension a disk-cache copy carries when its vector blob was left out, so the bare name
+/// always means a complete file.
+pub(crate) const CACHE_HOLE_EXTENSION: &str = ".hole";
+
 /// Characters a hyphenated uuid renders to (`8-4-4-4-12`). The fixed width
 /// is what makes the `<stem>-<uuid>` key grammar unambiguous whatever the
 /// stem contains: the uuid is always the last this many bytes of the body.
@@ -3081,6 +3085,17 @@ impl SuperfileUri {
     /// and two writers on one tempfile corrupt it.
     pub fn cache_tmp_filename(self, seq: u64) -> String {
         format!("{}.{seq}{CACHE_TMP_EXTENSION}", self.cache_filename())
+    }
+
+    /// Disk-cache filename for a copy of this superfile that holds everything but its vector blob,
+    /// which is read through the block cache instead.
+    pub(crate) fn cache_hole_filename(self) -> String {
+        format!("{}{CACHE_HOLE_EXTENSION}", self.cache_filename())
+    }
+
+    /// Inverse of [`Self::cache_hole_filename`].
+    pub(crate) fn from_cache_hole_filename(name: &str) -> Option<Self> {
+        Self::from_cache_filename(name.strip_suffix(CACHE_HOLE_EXTENSION)?)
     }
 
     /// Inverse of [`Self::cache_filename`]: recover the URI from an on-disk

@@ -15,9 +15,12 @@ use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use tokio::io::AsyncWriteExt;
 
-use crate::supertable::{
-    manifest::SuperfileUri,
-    reader_cache::{block_source::indexed_filled_bytes, disk::*},
+use crate::{
+    storage::StorageProvider,
+    supertable::{
+        manifest::SuperfileUri,
+        reader_cache::{block_source::indexed_filled_bytes, disk::*},
+    },
 };
 
 impl DiskCacheStore {
@@ -138,8 +141,9 @@ impl DiskCacheStore {
     /// ([`Self::fetch_from_disk_cache`]).
     ///
     /// Deletes leftovers that can never be used: orphaned `.blocks` sidecars, zero-length files,
-    /// and `.tmp` files older than [`TMP_RECLAIM_AGE`] (a fresh one belongs to a sibling process's
-    /// in-flight fetch). On a scan error the map stays empty and reads just cold-fetch.
+    /// `.tmp` files older than [`TMP_RECLAIM_AGE`] (a fresh one belongs to a sibling process's
+    /// in-flight fetch), and a holed copy ([`Self::hole_path`]) that a complete copy of the same
+    /// superfile makes redundant. On a scan error the map stays empty and reads just cold-fetch.
     pub(crate) fn scan_cache_root(&self) {
         let dir = match fs::read_dir(&self.config.cache_root) {
             Ok(d) => d,
@@ -194,9 +198,18 @@ impl DiskCacheStore {
                 continue;
             }
 
-            let Some(uri) = SuperfileUri::from_cache_filename(name) else {
+            let Some((uri, holed)) = SuperfileUri::from_cache_filename(name)
+                .map(|uri| (uri, false))
+                .or_else(|| SuperfileUri::from_cache_hole_filename(name).map(|uri| (uri, true)))
+            else {
                 continue; // Foreign file: leave it alone.
             };
+
+            // A complete copy wins over one missing its vector blob.
+            if holed && self.cache_path(&uri).exists() {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
 
             let Ok(meta) = entry.metadata() else { continue };
             let size = meta.len();
@@ -247,6 +260,9 @@ impl DiskCacheStore {
     /// cold fetch and checks the filesystem directly, so it also finds files written after this
     /// store opened.
     ///
+    /// A copy under [`Self::hole_path`] is reused too: it is opened the way its fill left it, with
+    /// the vector blob read through the block cache, and charged for what it holds.
+    ///
     /// Returns `Ok(None)` when there is no usable file: missing, wrong size, or it fails to open.
     /// Unusable files are deleted so the cold fetch writes a fresh one. A file can also vanish
     /// between the stat and the open (GC deletes cache copies); that too is just `Ok(None)`.
@@ -255,13 +271,17 @@ impl DiskCacheStore {
     /// it from the manifest), never fetch one. A truncated file fails to open anyway, since the
     /// footer sits at the end.
     pub(crate) async fn fetch_from_disk_cache(
-        &self,
+        self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         expected_size: Option<u64>,
+        storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<Option<Arc<CachedEntry>>, DiskCacheError> {
-        let path = self.cache_path(uri);
+        let found = [(self.cache_path(uri), false), (self.hole_path(uri), true)]
+            .into_iter()
+            .find_map(|(path, holed)| fs::metadata(&path).ok().map(|meta| (path, meta, holed)));
 
-        let Ok(meta) = fs::metadata(&path) else {
+        let Some((path, meta, holed)) = found else {
             // No whole-file copy; decrement a vanished counted one but leave any block cache intact.
             if let Some((_, file)) = self.unindexed.remove(uri) {
                 self.current_bytes
@@ -292,14 +312,27 @@ impl DiskCacheStore {
             Some(self.reserve(size).await?)
         };
 
-        match self.open_cached_entry(&path, size, self.config.verify_crc_on_open) {
+        let opened = if holed {
+            self.open_holed_entry(uri, size, storage_key, self.resolve_storage(storage))
+                .await
+        } else {
+            self.open_cached_entry(&path, size, self.config.verify_crc_on_open)
+        };
+
+        match opened {
             Ok(entry) => {
+                // Counted or reserved at the file's length; a holed copy is charged less, since
+                // its hole is not on disk.
+                let uncharged = size - entry.size_bytes.load(Ordering::Acquire);
+
                 // Two racing reuses of one URI can both admit; admission frees the loser's bytes.
                 let entry = self.admit_entry(*uri, entry);
 
                 if let Some(r) = reservation {
                     r.commit();
                 }
+
+                self.current_bytes.fetch_sub(uncharged, Ordering::Release);
 
                 self.n_disk_reuses.fetch_add(1, Ordering::AcqRel);
 
@@ -310,9 +343,13 @@ impl DiskCacheStore {
                 if counted {
                     self.current_bytes.fetch_sub(size, Ordering::Release);
                 }
-                tracing::error!(target: "infino::cache", uri = %uri.0, err = %e, "evict: cache file failed to open, discarding + re-fetching");
+
+                tracing::warn!(target: "infino::cache", uri = %uri.0, err = ?e, "evict: cache file failed to open, discarding + re-fetching");
+
                 let _ = fs::remove_file(&path);
+
                 self.drop_block_file(uri);
+
                 Ok(None)
             }
         }
@@ -328,8 +365,14 @@ impl DiskCacheStore {
         }
 
         tracing::info!(target: "infino::cache", uri = %uri.0, "evict: discard whole .sf.parquet (unusable/size-mismatch)");
-        let _ = fs::remove_file(self.cache_path(uri));
+        self.remove_local_copy(uri);
         self.drop_block_file(uri);
+    }
+
+    /// Delete the local copy of `uri`, under whichever name it has.
+    pub(crate) fn remove_local_copy(&self, uri: &SuperfileUri) {
+        let _ = fs::remove_file(self.cache_path(uri));
+        let _ = fs::remove_file(self.hole_path(uri));
     }
 
     pub(crate) fn drop_block_file(&self, uri: &SuperfileUri) {
@@ -382,7 +425,7 @@ impl DiskCacheStore {
 
         self.coordinators.remove(uri);
         tracing::info!(target: "infino::cache", uri = %uri.0, present, "evict: erased local copy (object-store GC drop)");
-        let _ = fs::remove_file(self.cache_path(uri));
+        self.remove_local_copy(uri);
         self.drop_block_file(uri);
         if present {
             self.n_gc_drops.fetch_add(1, Ordering::AcqRel);
@@ -616,17 +659,48 @@ mod tests {
     async fn erase_superfile_local_copy_unlinks_file_left_without_an_entry() {
         // A cache file can exist with no map entry (crash between rename and
         // insert); erase_superfile_local_copy still unlinks it so the orphan cannot outlive its
-        // storage object.
+        // storage object. Under either name: a complete copy or a holed one.
         let (_dir, store) = test_store();
         let uri = SuperfileUri::new_v4();
         fs::write(store.cache_path(&uri), b"stale bytes").expect("write orphan");
+        fs::write(store.hole_path(&uri), b"stale bytes").expect("write holed orphan");
 
         assert!(!store.erase_superfile_local_copy(&uri), "no entry to drop");
         assert!(
-            !store.cache_path(&uri).exists(),
-            "orphan file still unlinked"
+            !store.cache_path(&uri).exists() && !store.hole_path(&uri).exists(),
+            "orphan files still unlinked"
         );
         assert_eq!(store.stats().n_gc_drops, 0);
+    }
+
+    /// The open-time scan counts a holed copy like any cache file, and drops it when a complete
+    /// copy of the same superfile is there too.
+    #[tokio::test]
+    async fn restart_scan_keeps_one_local_copy_per_superfile() {
+        let (_dir, store) = test_store();
+        let bytes = tiny_superfile_bytes();
+        let (both, holed) = (SuperfileUri::new_v4(), SuperfileUri::new_v4());
+        let complete = seed_cache_file(&store, &both, &bytes);
+        fs::write(store.hole_path(&both), &bytes).expect("stale holed copy");
+        fs::write(store.hole_path(&holed), &bytes).expect("holed copy");
+
+        let opened = reopen_store(&store, |_| {});
+
+        assert!(opened.cache_path(&both).exists(), "the complete copy stays");
+        assert!(
+            !opened.hole_path(&both).exists(),
+            "and wins over the holed one"
+        );
+        assert!(
+            opened.hole_path(&holed).exists(),
+            "a lone holed copy is kept"
+        );
+        assert_eq!(
+            opened.stats().current_bytes,
+            complete + bytes.len() as u64,
+            "both kept copies are counted"
+        );
+        opened.assert_budget_consistent();
     }
 
     #[tokio::test]
@@ -874,24 +948,40 @@ mod tests {
     #[tokio::test]
     async fn unusable_cache_files_fall_through_to_source() {
         // Every rejection path lands in the same place: unlink the bad file and let the read
-        // cold-fetch a clean copy. Nothing is ever served from a file that failed to open.
+        // cold-fetch a clean copy. Nothing is ever served from a file that failed to open, under
+        // either name.
         let bytes = tiny_superfile_bytes();
-        for (label, seeded) in [
-            ("zero length", Bytes::new()),
-            ("not a superfile", Bytes::from_static(b"garbage bytes")),
-        ] {
-            let (_dir, store) = test_store();
-            let uri = SuperfileUri::new_v4();
-            put_superfile(&store, &uri, bytes.clone()).await;
-            seed_cache_file(&store, &uri, &seeded);
+        for holed in [false, true] {
+            for (label, seeded) in [
+                ("zero length", Bytes::new()),
+                ("not a superfile", Bytes::from_static(b"garbage bytes")),
+            ] {
+                let (_dir, store) = test_store();
+                let uri = SuperfileUri::new_v4();
+                put_superfile(&store, &uri, bytes.clone()).await;
+                let bad = if holed {
+                    store.hole_path(&uri)
+                } else {
+                    store.cache_path(&uri)
+                };
+                fs::create_dir_all(&store.config.cache_root).expect("cache root");
+                fs::write(&bad, &seeded).expect("seed bad copy");
 
-            let reader = store.reader(&uri).await;
-            assert!(reader.is_ok(), "{label}: falls through and serves");
-            assert_eq!(
-                store.stats().n_cold_fetches,
-                1,
-                "{label}: came from storage, not the bad local file"
-            );
+                let reader = store.reader(&uri).await;
+                assert!(
+                    reader.is_ok(),
+                    "{label}, holed {holed}: falls through and serves"
+                );
+                assert_eq!(
+                    store.stats().n_cold_fetches,
+                    1,
+                    "{label}, holed {holed}: came from storage, not the bad local file"
+                );
+                assert!(
+                    !bad.exists(),
+                    "{label}, holed {holed}: the bad copy is deleted"
+                );
+            }
         }
     }
 
@@ -1017,7 +1107,7 @@ mod tests {
 
         let wrong = bytes.len() as u64 + 1;
         let reused = store
-            .fetch_from_disk_cache(&uri, Some(wrong))
+            .fetch_from_disk_cache(&uri, &uri.storage_path(), Some(wrong), None)
             .await
             .expect("reuse probe");
         assert!(reused.is_none(), "size mismatch is a miss, not a serve");
