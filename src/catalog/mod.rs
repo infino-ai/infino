@@ -179,10 +179,11 @@ pub fn connect_with(
     // Budget comes from `ConnectOptions`; unset falls back to the engine
     // default (measure-only today). The `config.yaml` default takes a separate
     // path (`apply_config`), so `connect` never reads config.
-    let connection_memory_budget = ConnectionMemoryBudget::from_budget_bytes(
+    let connection_memory_budget = ConnectionMemoryBudget::for_connection(
         options
             .connection_memory_budget_bytes
             .unwrap_or(DEFAULT_CONNECTION_BUDGET_BYTES),
+        options.process_memory_limit_bytes,
     );
 
     debug!(backend = ?backend, validate = options.validate, "catalog connected");
@@ -212,10 +213,11 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
     };
     let remote =
         remote::RemoteCatalog::new(base_url, database, options.api_key().map(str::to_owned))?;
-    let connection_memory_budget = ConnectionMemoryBudget::from_budget_bytes(
+    let connection_memory_budget = ConnectionMemoryBudget::for_connection(
         options
             .connection_memory_budget_bytes
             .unwrap_or(DEFAULT_CONNECTION_BUDGET_BYTES),
+        options.process_memory_limit_bytes,
     );
     debug!(backend = ?backend, "catalog connected (remote)");
     Ok(Connection {
@@ -1223,10 +1225,15 @@ fn build_options(
 
 /// Map a SQL execution error to the public error: a budget exhaustion becomes
 /// [`InfinoError::OverBudget`], anything else a generic query error.
+///
+/// Classified by the error's root, not its outer variant: an operator may wrap
+/// a refusal in context of its own (an external sort reports "Not enough memory
+/// to continue external sort" around the pool's refusal), and a wrapped
+/// refusal is still a budget refusal.
 fn sql_exec_error(e: DataFusionError) -> InfinoError {
-    match e {
-        DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg),
-        other => InfinoError::Query(other.to_string()),
+    match e.find_root() {
+        DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg.clone()),
+        _ => InfinoError::Query(e.to_string()),
     }
 }
 
@@ -3553,6 +3560,10 @@ mod tests {
 
     const HEAVY_GROUP_BY: &str = "SELECT title, COUNT(*) AS n FROM docs GROUP BY title";
 
+    /// A process ceiling the plumbing test only reads back; its size is
+    /// irrelevant.
+    const PROCESS_LIMIT_BYTES: u64 = 1 << 30;
+
     #[test]
     fn query_sql_under_measure_only_default_is_never_refused() {
         // Default budget only measures, so even a heavy aggregate runs.
@@ -3599,6 +3610,90 @@ mod tests {
         let out = conn
             .query_sql("SELECT title FROM docs")
             .expect("a streaming scan is not gated");
+        assert_eq!(n_rows(&out), n);
+    }
+
+    #[test]
+    fn query_sql_sort_over_a_tiny_budget_is_refused_as_over_budget() {
+        // The sort wraps the pool's refusal in context of its own ("Not enough
+        // memory to continue external sort"); the wrapped refusal is still a
+        // budget refusal, not a generic query error.
+        let (_dir, conn, _n) = tiny_budget_conn_after_ingest();
+        let err = conn
+            .query_sql("SELECT title FROM docs ORDER BY title")
+            .expect_err("a 0-byte gate refuses the sort");
+        assert!(
+            matches!(err, InfinoError::OverBudget(_)),
+            "expected OverBudget, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sql_exec_error_classifies_a_wrapped_refusal_by_its_root() {
+        let wrapped = DataFusionError::ResourcesExhausted("over".into()).context("sorting");
+        assert!(matches!(
+            sql_exec_error(wrapped),
+            InfinoError::OverBudget(msg) if msg == "over"
+        ));
+        assert!(matches!(
+            sql_exec_error(DataFusionError::Execution("boom".into())),
+            InfinoError::Query(_)
+        ));
+    }
+
+    #[test]
+    fn the_process_memory_limit_reaches_the_connection_budget() {
+        let limited = connect_with(
+            "memory://",
+            ConnectOptions::new().with_process_memory_limit_bytes(PROCESS_LIMIT_BYTES),
+        )
+        .expect("connect");
+        assert_eq!(
+            limited.inner.connection_memory_budget.process_limit(),
+            Some(PROCESS_LIMIT_BYTES)
+        );
+        // Unset and 0 both set none.
+        for options in [
+            ConnectOptions::new(),
+            ConnectOptions::new().with_process_memory_limit_bytes(0),
+        ] {
+            let conn = connect_with("memory://", options).expect("connect");
+            assert_eq!(conn.inner.connection_memory_budget.process_limit(), None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn query_sql_over_the_process_memory_limit_is_refused_as_over_budget() {
+        // Any live process holds more than one byte of anonymous memory, so a
+        // 1-byte ceiling refuses the statement at its start, whatever the
+        // connection budget (measure-only here) would allow.
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_process_memory_limit_bytes(1),
+        )
+        .expect("connect");
+        append_titles(&conn);
+        let err = conn
+            .query_sql("SELECT title FROM docs")
+            .expect_err("the process is over a 1-byte ceiling");
+        assert!(
+            matches!(&err, InfinoError::OverBudget(msg) if msg.contains("process memory limit")),
+            "expected the process-limit OverBudget, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn query_sql_under_a_process_memory_limit_the_process_is_below_succeeds() {
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_process_memory_limit_bytes(u64::MAX),
+        )
+        .expect("connect");
+        let n = append_titles(&conn);
+        let out = conn
+            .query_sql(HEAVY_GROUP_BY)
+            .expect("no process is over u64::MAX");
         assert_eq!(n_rows(&out), n);
     }
 

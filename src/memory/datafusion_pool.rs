@@ -18,12 +18,15 @@
 //!   memory by writing its buffered run to disk, then continues. The query still
 //!   succeeds, just slower.
 //! - Otherwise it surfaces as [`InfinoError::OverBudget`], when:
-//!     - the operator can't spill at all:
-//!        - non-spillable (hash-join build side, nested-loop join, window aggregate), or
-//!        - a streaming operator (scan / filter / projection) that buffers nothing, so a single
-//!          allocation already exceeds the budget and there is nothing to write out; or
+//!     - the operator can't spill at all (hash-join build side, nested-loop join), or
 //!     - it is spillable but can't reserve even the minimum it needs to run the
 //!       spill / merge (e.g. the sort's merge reservation).
+//!
+//! Some operators never ask this pool: the streaming ones — scan, filter,
+//! projection, `unnest` — and window functions, which buffer without
+//! reserving. Nothing they allocate is gated, however large. A connection's
+//! process ceiling (see `resident`) is what bounds them; this module hands it
+//! to the plan as a session extension.
 //!
 //! Spilling needs a disk manager; we use DataFusion's default (OS temp dir).
 //!
@@ -39,7 +42,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 
-use crate::memory::ConnectionMemoryBudget;
+use crate::memory::{ConnectionMemoryBudget, ProcessMemoryLimit};
 
 /// A DataFusion memory pool over a [`ConnectionMemoryBudget`]: measured never
 /// refuses, bounded refuses at the 90% gate (DataFusion then spills, or errors
@@ -114,11 +117,16 @@ fn budgeted_runtime(budget: &Arc<ConnectionMemoryBudget>) -> DfResult<Arc<Runtim
     RuntimeEnvBuilder::new().with_memory_pool(pool).build_arc()
 }
 
-/// A `SessionContext` whose SQL allocations are gated by `budget`.
+/// A `SessionContext` whose SQL allocations are gated by `budget`, carrying
+/// the budget's process ceiling (if any) as a [`ProcessMemoryLimit`] extension
+/// for the collect step to watch.
 pub(crate) fn budgeted_session_context(
     budget: &Arc<ConnectionMemoryBudget>,
 ) -> DfResult<SessionContext> {
     let mut config = SessionConfig::new();
+    if let Some(limit) = budget.process_limit() {
+        config = config.with_extension(Arc::new(ProcessMemoryLimit(limit)));
+    }
     // We scan string columns as `Utf8View` for fast comparisons, but a SQL
     // result should be `LargeUtf8`. This flag makes DataFusion convert every
     // `Utf8View` back to `LargeUtf8` at the query output, so the view stays
