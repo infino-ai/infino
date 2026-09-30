@@ -4388,13 +4388,17 @@ mod tests {
         );
     }
 
-    /// A delete must not be starved by a wave that seals the whole table.
+    /// A delete must not be lost by a wave that seals the whole table.
     ///
     /// A wave seals every one of its inputs for as long as it runs, so a
     /// delete whose targets all sit inside that set lands nothing at all until
-    /// the wave commits. Its sealed-retry budget is refunded on forward
-    /// progress, and it has none of its own to show — it survives on the
-    /// compactor's progress instead.
+    /// the wave commits. What this pins is that the delete then lands on the
+    /// merged output rather than reporting success having tombstoned nothing.
+    ///
+    /// It does NOT gate the retry budget: one short wave costs a couple of
+    /// attempts out of a budget of 16, so it passes with the refund removed.
+    /// [`a_delete_survives_a_pass_whose_waves_commit_one_by_one`] is the test
+    /// that gates the refund.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_delete_lands_while_a_wave_has_every_superfile_sealed() {
         // A wave seals ALL of its inputs from prepare until commit. Widen it
@@ -4692,6 +4696,101 @@ mod tests {
             again.matched(),
             0,
             "the deleted row must not come back through a stale-view merge"
+        );
+    }
+
+    /// The refund is what keeps a delete alive across a pass of several waves.
+    ///
+    /// The delete's targets sit in the LAST wave's inputs, so nothing it does
+    /// lands until that wave commits. Each earlier commit removes superfiles
+    /// from the manifest, which is the compactor's progress, and that is what
+    /// refunds the budget. Lowered to three retries, an unrefunded delete
+    /// exhausts after roughly 700 ms of backoff, well before the last wave
+    /// publishes at ~1.2 s.
+    ///
+    /// This gates that the refund exists. That it counts a removal rather than
+    /// any commit at all is gated separately, by the pipeline's
+    /// `an_append_does_not_refund_the_sealed_budget`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_survives_a_pass_whose_waves_commit_one_by_one() {
+        /// Small enough that an unrefunded delete exhausts inside the test.
+        const SEALED_RETRY_BUDGET: u32 = 3;
+        /// Gap between wave commits, comfortably under the ~700 ms an
+        /// unrefunded delete survives and over nothing else.
+        const WAVE_GAP: Duration = Duration::from_millis(300);
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            default_supertable_options()
+                .with_storage(storage)
+                .with_max_sealed_retries(SEALED_RETRY_BUDGET),
+        )
+        .expect("create supertable");
+
+        let doomed = "hotel first";
+        for term in [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let live: Vec<Uuid> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert_eq!(live.len(), 8, "fixture");
+
+        // Four jobs prepared up front: every superfile in the table is sealed
+        // and nothing has committed, so the delete has nowhere unsealed to go.
+        let mut waves = Vec::new();
+        for pair in [
+            [live[0], live[1]],
+            [live[2], live[3]],
+            [live[4], live[5]],
+            [live[6], live[7]],
+        ] {
+            waves.push(
+                st.prepare_compaction_job(
+                    CompactionJob {
+                        partition_key: Vec::new(),
+                        inputs: pair.to_vec(),
+                        estimated_output_bytes: 0,
+                    },
+                    DEFAULT_STALE_SEAL_TIMEOUT,
+                )
+                .await
+                .expect("prepare"),
+            );
+        }
+
+        let deleting = st.clone();
+        let title = doomed.to_string();
+        let delete = task::spawn_blocking(move || {
+            deleting
+                .delete(col("title").eq(lit(title)))
+                .map(|s| s.n_tombstoned())
+        });
+
+        // Publish the waves one at a time. Only the last frees the target.
+        for prepared in waves {
+            tokio::time::sleep(WAVE_GAP).await;
+            st.commit_compaction_batch(vec![prepared])
+                .await
+                .expect("the wave commits");
+        }
+
+        let tombstoned = delete
+            .await
+            .expect("delete task")
+            .expect("earlier waves committing must refund the budget");
+        assert_eq!(
+            tombstoned, 1,
+            "the tombstone must land once the last wave publishes"
         );
     }
 

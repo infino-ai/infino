@@ -54,7 +54,12 @@
 //! step-4 PUT is overwrite-safe and the step-5 manifest swap can
 //! short-circuit via the idempotency probe in step 1.
 
-use std::{collections::HashMap, io::Cursor, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Cursor,
+    sync::Arc,
+    time::Duration,
+};
 
 use arrow::ipc::reader::StreamReader;
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
@@ -925,28 +930,48 @@ const MAX_CAS_RETRIES: u32 = 10;
 /// for why the pre-backoff write is exempt.
 const LEASE_RENEW_FRACTION: i32 = 3;
 
-/// Bounded sealed-sidecar retry budget. Architecturally this
+/// Default bounded sealed-sidecar retry budget, overridable per table with
+/// [`SupertableOptions::with_max_sealed_retries`]. Architecturally this
 /// loop should be unbounded — the writer blocks until
 /// compaction's forward progress publishes a merged target and
 /// our re-resolve routes there. We bound it so a stuck
 /// supertable surfaces a typed error rather than hanging the
 /// test process. The budget is high enough that a healthy
 /// compactor never exhausts it under realistic loads.
-const MAX_SEALED_RETRIES: u32 = 16;
+pub(crate) const DEFAULT_MAX_SEALED_RETRIES: u32 = 16;
 
 /// Whether a sealed-retry attempt earns its budget back.
 ///
 /// Two kinds of progress count. Ours: we landed a bit somewhere, so the batch
-/// is working through its targets. And the compactor's: the manifest
-/// generation moved, which means it published a merged superfile and our next
-/// re-resolve will route to coordinates that are not sealed.
+/// is working through its targets. And the compactor's: the manifest lost a
+/// superfile it listed at our last attempt, which only a compaction commit
+/// does. That keeps a delete alive against a pass running several merges at
+/// once, since such a pass seals every input together and a batch whose
+/// targets all sit in that set has nothing of its own to show until the pass
+/// commits.
 ///
-/// The second keeps a delete alive against a compaction pass running several
-/// merges at once: such a pass seals every one of its inputs together, so a
-/// batch whose targets all sit in that set has no progress of its own to show
-/// until the pass commits.
-fn refunds_sealed_budget(landed_any: bool, manifest_before: u64, manifest_now: u64) -> bool {
-    landed_any || manifest_before != manifest_now
+/// A removal, not a generation bump: an append commits too, and moves the
+/// generation while removing nothing. Crediting that would refund a delete
+/// parked behind an abandoned seal on every unrelated write, so a table that
+/// really is stuck would spin instead of surfacing its typed error — which is
+/// the only reason the budget is bounded at all.
+fn refunds_sealed_budget(
+    landed_any: bool,
+    listed_before: &HashSet<Uuid>,
+    listed_now: &HashSet<Uuid>,
+) -> bool {
+    landed_any || listed_before.iter().any(|id| !listed_now.contains(id))
+}
+
+/// The superfile ids a manifest lists, for the refund comparison above.
+fn listed_superfile_ids(inner: &SupertableInner) -> HashSet<Uuid> {
+    inner
+        .manifest
+        .load()
+        .get_all_superfiles()
+        .iter()
+        .map(|e| e.superfile_id)
+        .collect()
 }
 
 /// Backoff floor between sealed-sidecar retries. Doubles per
@@ -1086,7 +1111,7 @@ async fn do_tombstone_apply(
     // superfile, and the target's `(superfile_id, doc_id)` moves with
     // it — so those targets must be re-resolved against a fresh
     // manifest rather than retried at the old coordinates. Bounded by
-    // `MAX_SEALED_RETRIES` with exponential backoff.
+    // the sealed-retry budget with exponential backoff.
     let mut pending: Vec<(usize, RowId)> = wal_cur
         .tombstone_progress
         .iter()
@@ -1101,10 +1126,12 @@ async fn do_tombstone_apply(
     );
 
     let mut sealed_attempts = 0u32;
-    // Generation the last sealed attempt saw, so an advance can refund the
-    // budget below. Seeded with the current one: a compactor that committed
-    // before this loop even started is not evidence of progress during it.
-    let mut manifest_at_last_attempt = inner.manifest.load().manifest_id;
+    let max_sealed_retries = inner.options.max_sealed_retries.max(1);
+    // What the manifest listed at the last sealed attempt, so a superfile
+    // disappearing can refund the budget below. Seeded with the current
+    // listing: a compaction that committed before this loop even started is
+    // not evidence of progress during it.
+    let mut listed_at_last_attempt = listed_superfile_ids(inner);
     while !pending.is_empty() {
         let pending_ids: Vec<RowId> = pending.iter().map(|(_, target_id)| *target_id).collect();
 
@@ -1169,16 +1196,15 @@ async fn do_tombstone_apply(
         // The compactor's progress counts as well as ours. A pass running
         // several merges at once holds all of their inputs sealed together, so
         // a batch whose targets sit entirely inside that set lands nothing
-        // until the pass commits. An advancing manifest generation is what
-        // this loop waits for: the compactor published, and the next
-        // re-resolve routes to superfiles that are not sealed.
-        let manifest_now = inner.manifest.load().manifest_id;
-        if refunds_sealed_budget(landed_any, manifest_at_last_attempt, manifest_now) {
+        // until the pass commits. A superfile leaving the manifest is that
+        // pass publishing: it is working through its waves and will reach ours.
+        let listed_now = listed_superfile_ids(inner);
+        if refunds_sealed_budget(landed_any, &listed_at_last_attempt, &listed_now) {
             sealed_attempts = 0;
         }
-        manifest_at_last_attempt = manifest_now;
+        listed_at_last_attempt = listed_now;
         sealed_attempts += 1;
-        if sealed_attempts > MAX_SEALED_RETRIES {
+        if sealed_attempts > max_sealed_retries {
             return Err(TombstonePhaseError::SealedSidecarRetryExhausted {
                 targets: pending_batch_label(&sealed),
             });
@@ -1619,30 +1645,57 @@ mod tests {
         test_helpers::{build_title_batch, default_supertable_options},
     };
 
-    /// A manifest generation, for the refund tests below.
-    const GEN: u64 = 7;
+    /// A manifest listing, for the refund tests below.
+    fn listing(ids: &[u128]) -> HashSet<Uuid> {
+        ids.iter().copied().map(Uuid::from_u128).collect()
+    }
 
     /// Landing a bit is progress, whatever the compactor is doing.
     #[test]
     fn landing_a_tombstone_refunds_the_sealed_budget() {
-        assert!(refunds_sealed_budget(true, GEN, GEN));
+        assert!(refunds_sealed_budget(
+            true,
+            &listing(&[1, 2]),
+            &listing(&[1, 2])
+        ));
     }
 
     /// The case a concurrent compaction pass creates: the batch lands nothing,
     /// because every superfile holding its targets is sealed by merges running
-    /// together. The manifest moving is the compactor publishing, so the next
-    /// re-resolve has somewhere new to go and the wait was not wasted.
+    /// together. A superfile leaving the listing is that pass publishing, so
+    /// it is working through its waves and the wait was not wasted.
     #[test]
     fn a_compactor_publishing_refunds_the_sealed_budget() {
-        assert!(refunds_sealed_budget(false, GEN, GEN + 1));
+        assert!(refunds_sealed_budget(
+            false,
+            &listing(&[1, 2, 3]),
+            &listing(&[3, 4])
+        ));
     }
 
-    /// Nothing landed and nothing moved: this attempt bought nothing, so it
-    /// must cost budget. Otherwise a genuinely stuck table would spin forever
-    /// instead of surfacing a typed error.
+    /// An append adds a superfile and removes none. It commits, so it moves
+    /// the manifest generation, but it frees nothing this batch is waiting on
+    /// — crediting it would refund a delete parked behind an abandoned seal on
+    /// every unrelated write, and the typed error would never surface.
+    #[test]
+    fn an_append_does_not_refund_the_sealed_budget() {
+        assert!(!refunds_sealed_budget(
+            false,
+            &listing(&[1, 2]),
+            &listing(&[1, 2, 3])
+        ));
+    }
+
+    /// Nothing landed and nothing left the listing: this attempt bought
+    /// nothing, so it must cost budget. Otherwise a genuinely stuck table
+    /// would spin forever instead of surfacing a typed error.
     #[test]
     fn a_wasted_attempt_spends_the_sealed_budget() {
-        assert!(!refunds_sealed_budget(false, GEN, GEN));
+        assert!(!refunds_sealed_budget(
+            false,
+            &listing(&[1, 2]),
+            &listing(&[1, 2])
+        ));
     }
 
     /// Construct a Supertable + a fresh WAL state doc + the WAL's
