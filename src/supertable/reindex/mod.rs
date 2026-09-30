@@ -128,8 +128,8 @@ impl StaleSuperfile {
 /// It exists because the migration is deliberately on demand, and an
 /// operation nobody is told to run is one nobody runs. Every input to the
 /// decision — whether anything is behind, which axis, how many bytes move,
-/// whether re-analysis would refuse the table outright — was already being
-/// computed and then discarded inside `reindex`.
+/// which columns nothing can repair — was already being computed and then
+/// discarded inside `reindex`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StalenessReport {
@@ -358,30 +358,6 @@ impl Supertable {
 }
 
 impl Supertable {
-    /// Rewrite every superfile whose FTS index is behind what this engine
-    /// writes today, leaving the table's rows, ids and layout unchanged.
-    ///
-    /// Each superfile is rewritten on its own and committed on its own, so
-    /// a query sees either the old file or its replacement and never a
-    /// half-migrated table. A run that is interrupted leaves the rewrites
-    /// it finished in place; running again picks up exactly what is left,
-    /// because "what is left" is read from the files rather than tracked
-    /// in a journal.
-    ///
-    /// Idempotent: a second run over a migrated table plans nothing.
-    ///
-    /// This rewrites containers — the layout and the bounds. It does not
-    /// re-analyze text, so a column whose terms came from an older
-    /// analysis stays stale and is named in
-    /// [`ReindexReport::unrepairable_columns`] only when nothing *could*
-    /// repair it.
-    ///
-    /// # Errors
-    ///
-    /// [`ReindexError::NoStorage`] without a durable backend,
-    /// [`ReindexError::AlreadyRunning`] while a compaction or another
-    /// reindex holds the slot, and [`ReindexError::Rewrite`] naming the
-    /// superfile whose rewrite failed.
     /// What a reindex would do, without doing it.
     ///
     /// Reads every superfile's index metadata and reports what is behind

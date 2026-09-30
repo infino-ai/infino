@@ -267,7 +267,6 @@ enum PostingMerge {
     Accumulator,
 }
 
-/// Per-column FTS configuration. The `column` must exist in
 /// Which of a source superfile's FTS columns a rebuild copies postings
 /// for, rather than producing terms of its own.
 ///
@@ -296,6 +295,7 @@ impl CarryScope {
     }
 }
 
+/// Per-column FTS configuration. The `column` must exist in
 /// `BuilderOptions.schema` and be `LargeUtf8` (an unstored column may
 /// be absent — the merge-source shape).
 ///
@@ -366,7 +366,7 @@ pub struct FtsConfig {
     /// touched it. Stamping this build's revision onto carried postings
     /// would certify terms nothing re-analyzed, which is exactly the
     /// silent mismatch the revision exists to detect.
-    pub carried_analysis_revision: Option<u32>,
+    pub(crate) carried_analysis_revision: Option<u32>,
 }
 
 impl FtsConfig {
