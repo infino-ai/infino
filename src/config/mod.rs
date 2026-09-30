@@ -1101,10 +1101,12 @@ pub enum SuperfileIndex {
 /// target size to pack toward and no fill threshold to clear. Taking
 /// [`CompactionSettings`] instead would hand a caller three knobs the
 /// operation ignores.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Every field's default is its type's, so the derive cannot drift from
+// the enums it defers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct ReindexOptions {
-    /// Which index to repair. Defaults to [`ReindexTarget::Fts`], the
+    /// What to repair. Defaults to the superfile full-text index, the
     /// only one with a repair today; a default naming one index can never
     /// silently widen to cover another.
     pub target: ReindexTarget,
@@ -1139,19 +1141,6 @@ pub struct ReindexOptions {
     /// Crediting it leaves those terms in place and reports the table
     /// migrated. Leave this off unless the table's whole history is known.
     pub trust_writer_analysis: bool,
-}
-
-impl Default for ReindexOptions {
-    fn default() -> Self {
-        // Deferred to each enum's own default rather than named again
-        // here, so the two cannot drift.
-        Self {
-            target: ReindexTarget::default(),
-            mode: ReindexMode::default(),
-            stale_seal_timeout_ms: None,
-            trust_writer_analysis: false,
-        }
-    }
 }
 
 impl ReindexOptions {
