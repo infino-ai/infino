@@ -763,9 +763,9 @@ fn every_readable_version_declares_its_coverage() {
 /// An absence is justified by a fact, not by a label.
 ///
 /// The V3 row's whole force is that it cites the release where
-/// `FtsField::positions` first appears — a reason with no release in it is
-/// a shrug, and this plan has already carried one wrong claim about
-/// reachability that read perfectly well.
+/// `FtsField::positions` first appears. A reason with no release in it is
+/// a shrug: a wrong claim about which versions are reachable reads just as
+/// convincingly as a right one, so the citation is what separates them.
 #[test]
 fn every_unreachable_version_cites_a_release() {
     for (version, coverage) in CORPUS_COVERAGE {
