@@ -1156,7 +1156,7 @@ async fn seal_with_bounded_retry(
                 time::sleep(backoff_delay(attempt)).await;
             }
             Err(TombstonesAdminError::CasLost { .. }) => {
-                return Err(CompactionError::Seal("seal retries exhausted".to_string()));
+                return Err(CompactionError::SealRetriesExhausted { superfile_id });
             }
             Err(TombstonesAdminError::AlreadySealed {
                 superfile_id,
@@ -1172,7 +1172,7 @@ async fn seal_with_bounded_retry(
             }
         }
     }
-    Err(CompactionError::Seal("seal retries exhausted".to_string()))
+    Err(CompactionError::SealRetriesExhausted { superfile_id })
 }
 
 #[cfg(test)]

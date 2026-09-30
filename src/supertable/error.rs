@@ -523,6 +523,9 @@ impl From<CompactionError> for OptimizeError {
             CompactionError::SidecarChangedUnderSeal { superfile_id } => OptimizeError::Seal(
                 format!("tombstone sidecar for {superfile_id} changed under this job's seal"),
             ),
+            CompactionError::SealRetriesExhausted { superfile_id } => {
+                OptimizeError::Seal(format!("seal retries exhausted for {superfile_id}"))
+            }
             CompactionError::Seal(s) => OptimizeError::Seal(s),
             CompactionError::Build(s) => OptimizeError::Build(s),
             CompactionError::Commit(s) => OptimizeError::Commit(s),
@@ -567,6 +570,14 @@ pub(crate) enum CompactionError {
     /// and a later run repeats it against the current sidecar.
     #[error("tombstone sidecar for {superfile_id} changed under this job's seal")]
     SidecarChangedUnderSeal { superfile_id: uuid::Uuid },
+
+    /// Sealing lost its CAS race to a writer on every attempt.
+    ///
+    /// Contention, not failure: a writer kept landing tombstone bits while
+    /// this job tried to freeze the sidecar. Distinct from [`Self::Seal`],
+    /// which is a storage error and means something is actually wrong.
+    #[error("seal retries exhausted for {superfile_id}")]
+    SealRetriesExhausted { superfile_id: uuid::Uuid },
 
     /// A WAL-store I/O error occurred while sealing a sidecar.
     #[error("seal failed: {0}")]

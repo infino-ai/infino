@@ -172,6 +172,14 @@ impl StalenessReport {
 }
 
 /// What a reindex did.
+///
+/// Counted against the snapshot the run planned from, which is one moment
+/// and not a lock. A concurrent compaction can merge a superfile this run
+/// planned to repair; the job then finds it gone and does nothing, while
+/// the merged output — no newer than its oldest input, so stale in the
+/// same way — was not in the plan and is not repaired here. A run that
+/// reports nothing left can therefore be followed by one that finds work,
+/// which is the price of not holding the table still for a migration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReindexReport {
@@ -188,7 +196,7 @@ pub struct ReindexReport {
     /// here rather than rewritten pointlessly on every run.
     pub awaiting_reanalysis: usize,
     /// Stale superfiles this run could not take, because another run holds
-    /// their tombstone sidecar.
+    /// their tombstone sidecar, took it over, or kept it moving.
     ///
     /// The sidecar seal is the cross-process guard that keeps two writers
     /// off one superfile, and it is held by superfile rather than by
@@ -534,17 +542,22 @@ impl Supertable {
                 // way this file is untouchable right now and every other
                 // stale file is not, so the run continues and says what it
                 // had to leave.
-                // Both mean another actor owns this superfile's sidecar:
-                // one held the seal, the other took ours. Either way the
-                // work is still there for a later run, and one contended
-                // file must not end a migration.
+                // Contention on one superfile's sidecar: another run holds
+                // the seal, took ours, or is landing tombstones faster than
+                // we can freeze them. The work is still there for a later
+                // run, and one contended file must not end a migration.
                 Err(
                     CompactionError::SidecarConflict { .. }
-                    | CompactionError::SidecarChangedUnderSeal { .. },
+                    | CompactionError::SidecarChangedUnderSeal { .. }
+                    | CompactionError::SealRetriesExhausted { .. },
                 ) => {
                     report.held_by_another_run += 1;
                     continue;
                 }
+                // Another writer replaced this superfile between the plan
+                // and the job. Its staleness went with it, so there is
+                // nothing here to repair and nothing to report.
+                Err(CompactionError::SuperfileNotFound(_)) => continue,
                 Err(e) => {
                     return Err(ReindexError::Rewrite {
                         superfile_id,
