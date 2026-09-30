@@ -173,7 +173,7 @@ pub use catalog::{
 };
 pub use config::{
     CompactionSettings, GcSettings, OptimizeOptions, RecalibratePolicy, ReindexMode,
-    ReindexOptions, ReindexTarget,
+    ReindexOptions, ReindexTarget, SuperfileIndex,
 };
 /// The single public error type for the curated API.
 pub use error::InfinoError;

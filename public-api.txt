@@ -227,7 +227,7 @@ impl core::marker::Unpin for infino::ReindexError
 impl core::marker::UnsafeUnpin for infino::ReindexError
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ReindexError
 impl core::panic::unwind_safe::UnwindSafe for infino::ReindexError
-pub enum infino::ReindexMode
+#[non_exhaustive] pub enum infino::ReindexMode
 pub infino::ReindexMode::Auto
 pub infino::ReindexMode::Reanalyze
 pub infino::ReindexMode::Rewrite
@@ -250,7 +250,7 @@ impl core::marker::UnsafeUnpin for infino::ReindexMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ReindexMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ReindexMode
 #[non_exhaustive] pub enum infino::ReindexTarget
-pub infino::ReindexTarget::Fts
+pub infino::ReindexTarget::Superfile(infino::SuperfileIndex)
 impl core::clone::Clone for infino::ReindexTarget
 pub fn infino::ReindexTarget::clone(&self) -> Self
 impl core::cmp::Eq for infino::ReindexTarget
@@ -315,6 +315,26 @@ impl core::marker::Unpin for infino::Stopwords
 impl core::marker::UnsafeUnpin for infino::Stopwords
 impl core::panic::unwind_safe::RefUnwindSafe for infino::Stopwords
 impl core::panic::unwind_safe::UnwindSafe for infino::Stopwords
+#[non_exhaustive] pub enum infino::SuperfileIndex
+pub infino::SuperfileIndex::Fts
+impl core::clone::Clone for infino::SuperfileIndex
+pub fn infino::SuperfileIndex::clone(&self) -> Self
+impl core::cmp::Eq for infino::SuperfileIndex
+impl core::cmp::PartialEq for infino::SuperfileIndex
+pub fn infino::SuperfileIndex::eq(&self, &Self) -> bool
+impl core::default::Default for infino::SuperfileIndex
+pub fn infino::SuperfileIndex::default() -> Self
+impl core::fmt::Debug for infino::SuperfileIndex
+pub fn infino::SuperfileIndex::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::SuperfileIndex
+impl core::marker::StructuralPartialEq for infino::SuperfileIndex
+impl core::marker::Freeze for infino::SuperfileIndex
+impl core::marker::Send for infino::SuperfileIndex
+impl core::marker::Sync for infino::SuperfileIndex
+impl core::marker::Unpin for infino::SuperfileIndex
+impl core::marker::UnsafeUnpin for infino::SuperfileIndex
+impl core::panic::unwind_safe::RefUnwindSafe for infino::SuperfileIndex
+impl core::panic::unwind_safe::UnwindSafe for infino::SuperfileIndex
 #[non_exhaustive] pub struct infino::Bm25Params
 pub infino::Bm25Params::b: f32
 pub infino::Bm25Params::k1: f32
@@ -553,14 +573,18 @@ impl core::marker::Unpin for infino::OptimizeOptions
 impl core::marker::UnsafeUnpin for infino::OptimizeOptions
 impl core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeOptions
 impl core::panic::unwind_safe::UnwindSafe for infino::OptimizeOptions
-pub struct infino::ReindexOptions
+#[non_exhaustive] pub struct infino::ReindexOptions
 pub infino::ReindexOptions::mode: infino::ReindexMode
-pub infino::ReindexOptions::stale_seal_timeout_ms: u64
+pub infino::ReindexOptions::stale_seal_timeout_ms: core::option::Option<u64>
 pub infino::ReindexOptions::target: infino::ReindexTarget
 pub infino::ReindexOptions::trust_writer_analysis: bool
 impl infino::ReindexOptions
 pub fn infino::ReindexOptions::reanalyzing() -> Self
 pub fn infino::ReindexOptions::rewriting() -> Self
+pub fn infino::ReindexOptions::trusting_writer_analysis(self) -> Self
+pub fn infino::ReindexOptions::with_mode(self, infino::ReindexMode) -> Self
+pub fn infino::ReindexOptions::with_stale_seal_timeout_ms(self, u64) -> Self
+pub fn infino::ReindexOptions::with_target(self, infino::ReindexTarget) -> Self
 impl core::clone::Clone for infino::ReindexOptions
 pub fn infino::ReindexOptions::clone(&self) -> Self
 impl core::cmp::Eq for infino::ReindexOptions

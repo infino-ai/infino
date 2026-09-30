@@ -272,10 +272,7 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
     // what an operator does when the crash is known rather than suspected;
     // zero is that knob taken to its limit, and the run then takes the
     // file over and finishes the table.
-    let takeover = ReindexOptions {
-        stale_seal_timeout_ms: 0,
-        ..ReindexOptions::rewriting()
-    };
+    let takeover = ReindexOptions::rewriting().with_stale_seal_timeout_ms(0);
     table
         .reindex(&takeover)
         .expect("an abandoned seal is taken over once it is stale");
@@ -377,10 +374,7 @@ fn an_interrupted_reindex_never_resurrects_a_deleted_row() {
          window this test is about was never open: {after_crash_versions:?}"
     );
 
-    let takeover = ReindexOptions {
-        stale_seal_timeout_ms: 0,
-        ..ReindexOptions::rewriting()
-    };
+    let takeover = ReindexOptions::rewriting().with_stale_seal_timeout_ms(0);
     table
         .reindex(&takeover)
         .expect("a resume finishes a table with deletions");

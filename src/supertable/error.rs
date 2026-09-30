@@ -484,18 +484,6 @@ pub enum OptimizeError {
         /// The compaction that had already sealed the sidecar.
         existing_compaction_id: uuid::Uuid,
     },
-    /// An input's tombstone sidecar changed after this job sealed it, so
-    /// the bitmap the job holds no longer describes that superfile.
-    ///
-    /// Reachable because the mutation path takes over a seal it considers
-    /// abandoned. Carrying the seal-time bitmap onto the output would drop
-    /// whatever landed in between, so the job gives up its input instead
-    /// and a later run repeats it against the current sidecar.
-    #[error("tombstone sidecar for {superfile_id} changed under this job's seal")]
-    SidecarChangedUnderSeal {
-        /// The superfile whose sidecar moved.
-        superfile_id: uuid::Uuid,
-    },
     /// Sealing the compaction output failed.
     #[error("seal failed: {0}")]
     Seal(String),

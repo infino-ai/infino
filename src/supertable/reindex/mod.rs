@@ -26,7 +26,7 @@ use uuid::Uuid;
 mod build;
 
 use crate::{
-    config::{ReindexMode, ReindexOptions, ReindexTarget},
+    config::{self, ReindexMode, ReindexOptions, ReindexTarget, SuperfileIndex},
     runtime_bridge::bridge_on_runtime,
     superfile::{
         fts::{
@@ -453,13 +453,18 @@ impl Supertable {
         // Everything below assesses and repairs the full-text index. The
         // match is what makes a second target a decision here rather than
         // a field this function quietly ignores.
-        let ReindexTarget::Fts = opts.target;
+        let ReindexTarget::Superfile(SuperfileIndex::Fts) = opts.target;
 
         let manifest = self.inner().manifest.load_full();
         if manifest.options.storage.is_none() {
             return Err(ReindexError::NoStorage);
         }
-        let stale_seal_timeout = Duration::from_millis(opts.stale_seal_timeout_ms);
+        // Unset means the table's own compaction setting: the seal is the
+        // same guard, so a table that tuned it meant it for this too.
+        let stale_seal_timeout = Duration::from_millis(
+            opts.stale_seal_timeout_ms
+                .unwrap_or_else(|| config::global().compaction.stale_seal_timeout_ms),
+        );
 
         // Share compaction's slot rather than adding a second one: both
         // rewrite superfiles and commit manifest swaps, so letting them

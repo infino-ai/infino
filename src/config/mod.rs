@@ -1029,6 +1029,7 @@ pub enum RecalibratePolicy {
 /// that is only behind on layout never pays for a re-analysis it does not
 /// need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ReindexMode {
     /// Give each superfile the cheapest repair that makes it current:
     /// [`ReindexMode::Rewrite`] where only its layout is behind,
@@ -1063,17 +1064,32 @@ pub enum ReindexMode {
     Reanalyze,
 }
 
-/// Which index a reindex repairs.
+/// What a reindex repairs.
 ///
-/// A table's indexes go out of date on their own schedules, so a reindex
-/// names the one it is for rather than implying it covers them all. Only
-/// the full-text index has a repair today; the enum is the extension
-/// point, so adding one does not rename the operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Tiered by where the thing lives, so the two ways this grows are two
+/// different edits: a new *kind* of target — the manifest, the tombstone
+/// sidecars — is a variant here, while a new index inside a superfile is
+/// a variant of [`SuperfileIndex`]. Only superfile indexes have a repair
+/// today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReindexTarget {
-    /// The full-text index inside each superfile. Vectors, the Parquet
-    /// body and the hidden vector index are copied or left untouched.
+    /// An index held inside each superfile.
+    Superfile(SuperfileIndex),
+}
+
+impl Default for ReindexTarget {
+    fn default() -> Self {
+        Self::Superfile(SuperfileIndex::default())
+    }
+}
+
+/// Which of a superfile's indexes a reindex repairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SuperfileIndex {
+    /// The full-text index. Vectors, the Parquet body and the hidden
+    /// vector index are copied or left untouched.
     #[default]
     Fts,
 }
@@ -1086,6 +1102,7 @@ pub enum ReindexTarget {
 /// [`CompactionSettings`] instead would hand a caller three knobs the
 /// operation ignores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReindexOptions {
     /// Which index to repair. Defaults to [`ReindexTarget::Fts`], the
     /// only one with a repair today; a default naming one index can never
@@ -1095,10 +1112,14 @@ pub struct ReindexOptions {
     /// each superfile the cheapest repair that makes it current.
     pub mode: ReindexMode,
     /// How old a sealed tombstone sidecar has to be, in milliseconds,
-    /// before a rewrite treats it as abandoned and takes it over. Shared
-    /// meaning with [`CompactionSettings::stale_seal_timeout_ms`] — the
-    /// seal is the same guard, and a reindex job takes it the same way.
-    pub stale_seal_timeout_ms: u64,
+    /// before a rewrite treats it as abandoned and takes it over.
+    ///
+    /// `None`, the default, uses the table's
+    /// [`CompactionSettings::stale_seal_timeout_ms`]: the seal is the same
+    /// guard and a reindex job takes it the same way, so a table that
+    /// tuned it for compaction meant it for this too. A value here
+    /// overrides that for one run.
+    pub stale_seal_timeout_ms: Option<u64>,
     /// Credit a superfile that records no analysis revision with the one
     /// the engine that wrote it emitted, instead of treating it as
     /// unknown. Defaults to `false`.
@@ -1127,7 +1148,7 @@ impl Default for ReindexOptions {
         Self {
             target: ReindexTarget::default(),
             mode: ReindexMode::default(),
-            stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
+            stale_seal_timeout_ms: None,
             trust_writer_analysis: false,
         }
     }
@@ -1150,6 +1171,33 @@ impl ReindexOptions {
             mode: ReindexMode::Reanalyze,
             ..Self::default()
         }
+    }
+
+    /// Repair `target` instead of the default.
+    pub fn with_target(mut self, target: ReindexTarget) -> Self {
+        self.target = target;
+        self
+    }
+
+    /// Repair to `mode` instead of the default.
+    pub fn with_mode(mut self, mode: ReindexMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Override the table's seal-takeover age for this run.
+    pub fn with_stale_seal_timeout_ms(mut self, ms: u64) -> Self {
+        self.stale_seal_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Credit a superfile recording no analysis revision with the one its
+    /// writer emitted. Read
+    /// [`ReindexOptions::trust_writer_analysis`] before setting this: it
+    /// is unsound on a table whose history is not known.
+    pub fn trusting_writer_analysis(mut self) -> Self {
+        self.trust_writer_analysis = true;
+        self
     }
 }
 
