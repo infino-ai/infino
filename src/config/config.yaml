@@ -222,9 +222,12 @@ vector:
   # For ivf_router = centroid_graph: the NUMBER of fine clusters the
   # query fans out to (globally scored), clamped to the table's cluster
   # total. Higher reads more clusters — more cold bytes, higher recall.
-  # 1024 is the ~0.99 point at 10M; it over-serves smaller tables and
-  # under-serves larger ones (the fanout for a recall target grows ~sqrt(N)),
-  # pending a per-table calibrated stamp. Ignored under ivf_router = stamped.
+  # The default (1024) defers to the per-table stamped fanout_for_k
+  # (auto-calibrated at drain, grows ~sqrt(N) with scale), using 1024 only when
+  # the table carries no stamp. An explicit non-default value overrides that
+  # stamp for the whole table (manual tuning / fanout sweeps), capped at
+  # centroid_graph_max_fanout; an explicit 0 also defers to the stamp so it
+  # never disables an engaged graph. Ignored under ivf_router = stamped.
   global_fine_fanout: 1024
 
   # For ivf_router = centroid_graph: exact-rerank over-fetch multiplier
@@ -249,7 +252,8 @@ vector:
 
   # For ivf_router = auto: the scale floor (hidden-table doc count) below which
   # auto picks stamped. The selected clusters coalesce into a cold-read win only
-  # at large N (measured win at 10M+, loss at 1M). Documented starting point.
+  # at large N (measured win at 10M+, loss at 1M). Documented starting point; a 0
+  # value is rejected at load and reverts to this default.
   centroid_graph_scale_floor_docs: 10000000
 
   # Ceiling on the fanout the router's recall calibration considers: the widest
@@ -438,6 +442,14 @@ vector:
   #           faster as the grid grows; small grids fall back to exact.
   #   false — kill-switch back to the 1-bit shortlist + exact rescore path.
   drain_graph_assign: true
+  # Place each drained row in the cell of its nearest FINE centroid (walking the
+  # centroid-router graph, read from the hidden slow-state section) instead of the
+  # nearest coarse cell centroid, so placement matches how the centroid_graph
+  # router routes. Only takes effect when the router resolves to centroid_graph and
+  # the drain graph-assign path is active.
+  #   true  — fine-centroid placement (default).
+  #   false — coarse cell-centroid placement (the isolation switch for a placement A/B).
+  global_fine_drain_placement: true
 
   # Read fan-out for the drain's superfile opens. `auto` resolves to
   # one in-flight read per hardware thread, floored at the

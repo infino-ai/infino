@@ -2076,10 +2076,15 @@ impl SupertableWriter {
         // this path. No slow CAS.
         if !self.inner.options.vector_columns.is_empty() {
             let commit_t0 = time::Instant::now();
+            // ONE pinned pre-commit snapshot drives both the pack grid and the
+            // fine-placement router, so a split landing mid-commit cannot give
+            // them divergent cell numbering (the per-row bounds check in
+            // `assign_row_to_cells` is the backstop; this removes the window).
+            let pinned_manifest = self.inner.manifest.load_full();
             let pack_grid = pending_gvi
                 .as_ref()
                 .cloned()
-                .or_else(|| self.inner.manifest.load().get_global_vector_index())
+                .or_else(|| pinned_manifest.get_global_vector_index())
                 .ok_or_else(|| {
                     BuildError::Store(
                         "vector columns present but global cell grid missing after Phase A".into(),
@@ -2093,6 +2098,15 @@ impl SupertableWriter {
                 .first()
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
+            // The user/commit append path places on the coarse cell grid. Rows
+            // land in the user table's own cell grid here; fine-centroid
+            // placement (matching how the centroid_graph router routes) is
+            // applied where hidden-cell membership is decided — the bulk drain
+            // `drain_user_superfiles_to_hidden_cells`. The user manifest carries
+            // the cell grid but not the fine centroid section (that lives on the
+            // hidden vector-index manifest), so there is nothing to place against
+            // here.
+            let fine_assign: Option<crate::supertable::query::vector::FineAssignRouter> = None;
             // Pipelined publish on storage-backed tables: shards stream
             // to the uploader as each finishes packing, so the commit
             // pays ~max(pack, PUT) instead of pack + PUT. The manifest
@@ -2120,6 +2134,7 @@ impl SupertableWriter {
                     buffer,
                     &self.inner,
                     &pack_grid,
+                    fine_assign.as_ref(),
                     metric,
                     packed_cell_shard_count(&self.inner.options),
                     &self.op_stats,
@@ -2180,6 +2195,7 @@ impl SupertableWriter {
                     buffer,
                     &self.inner,
                     &pack_grid,
+                    fine_assign.as_ref(),
                     metric,
                     packed_cell_shard_count(&self.inner.options),
                     &self.op_stats,
@@ -4421,6 +4437,82 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let drain_graph_assign = config::global().vector.drain_graph_assign;
     let drain_timers = config::global().diagnostics.drain_build_timers;
     let mut coarse_router: Option<(opann::Fp32Scorer, opann::Hnsw, Vec<u32>)> = None;
+    // Fine-centroid drain placement: when the table routes through the
+    // centroid_graph router, place each row in the cell of its nearest FINE
+    // centroid (walking the same graph queries use) instead of the coarse cell
+    // grid, so placement matches routing. The router is read from the hidden
+    // table's slow-state centroid section (loading the persisted graph topology
+    // when present), never re-materializing the older superfiles, and built once
+    // for the whole drain. `None` — placement toggled off, router not
+    // centroid_graph, first drain / no section, or a load failure — leaves the
+    // coarse cell-grid path in place, so it never fails the drain.
+    let fine_router: Option<crate::supertable::query::vector::FineAssignRouter> = {
+        let vcfg = &config::global().vector;
+        let router_is_centroid_graph = drain_graph_assign
+            && vcfg.global_fine_drain_placement
+            && (running_clusters.n_cent as usize) >= opann::GRAPH_ASSIGN_MIN_N_CENT
+            && vcfg.search_mode == config::VectorSearchMode::Ivf
+            && match vcfg.ivf_router {
+                config::IvfRouter::CentroidGraph => true,
+                config::IvfRouter::Auto => {
+                    crate::supertable::query::vector::auto_prefers_centroid_graph(
+                        &hidden_manifest,
+                        &column,
+                        vcfg,
+                    )
+                }
+                _ => false,
+            };
+        // Charge the router build against the compaction memory budget. The
+        // build materializes the full fine-centroid set as fp32 plus decode /
+        // copy amplification, which reaches GBs at billion scale; left
+        // unbudgeted it is the drain-OOM class. Estimate the footprint from the
+        // fine-cluster count and skip fine placement (drain coarse) when it
+        // would exceed the budget, rather than risk the OOM. A `0` budget means
+        // unlimited (the estimate is advisory only).
+        let n_fine =
+            crate::supertable::query::vector::total_fine_clusters(&hidden_manifest, &column);
+        // fp32 centroid set (n_fine * dim * 4) times a factor for the graph
+        // nodes and the decode-time copy that briefly coexists with the section.
+        const ROUTER_BUILD_BYTES_PER_CENTROID_FACTOR: u64 = 3;
+        let est_router_bytes = (n_fine as u64)
+            .saturating_mul(running_clusters.dim as u64)
+            .saturating_mul(4)
+            .saturating_mul(ROUTER_BUILD_BYTES_PER_CENTROID_FACTOR);
+        let budget_bytes = vcfg.compaction_max_memory_mb.saturating_mul(1024 * 1024);
+        let within_budget = budget_bytes == 0 || est_router_bytes <= budget_bytes;
+        if router_is_centroid_graph && within_budget {
+            let reader = crate::supertable::handle::SupertableReader::from_inner_pinned(
+                Arc::clone(&hidden_inner),
+                Arc::clone(&hidden_manifest),
+                hidden_inner.tombstone_cache.clone(),
+                None,
+            );
+            reader.build_global_fine_assign_router(&column).await
+        } else {
+            if router_is_centroid_graph && !within_budget {
+                debug!(
+                    target: "infino::gfc",
+                    est_router_bytes,
+                    budget_bytes,
+                    "drain placement: coarse cell grid (fine router estimate exceeds the compaction memory budget)"
+                );
+            }
+            None
+        }
+    };
+    if fine_router.is_some() {
+        debug!(
+            target: "infino::gfc",
+            "drain placement: fine-centroid router engaged (rows placed by nearest fine centroid, read from slow-state)"
+        );
+    }
+    if drain_timers {
+        eprintln!(
+            "[gfc-drain] fine placement router engaged={} (read from slow-state centroid section)",
+            fine_router.is_some()
+        );
+    }
     let mut drain_assign_total_ms = 0.0f64;
     // Drain batch-loop sub-phase accumulators (ms), summed across batches:
     // `materialize` (open + read + row-materialize) and `assign_spill` (assign +
@@ -4703,15 +4795,74 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     let assignments: Vec<opann::BoundaryAssignment> = if distinct_rows.is_empty() {
                         // No rows to assign: never build the router (skip-empty).
                         Vec::new()
+                    } else if let Some(fr) = fine_router.as_ref() {
+                        // Fine-centroid placement (any metric the router
+                        // resolves for): place each row in the cell of its
+                        // nearest FINE centroid (walking the router the
+                        // hidden table serves queries with), so placement
+                        // matches routing. Dequantize the encoded row to fp32
+                        // for the graph walk — the same reconstruction the
+                        // coarse graph path applies. A row the fine router
+                        // cannot place (no in-range, live cell survives its
+                        // bounds/superseded checks) falls back to the exact
+                        // shortlist assign for that row. The result type is
+                        // identical, so the spill/replica code below is
+                        // untouched.
+                        let dim = clusters_ref.dim as usize;
+                        let admit_ctx = RabitqAdmitContext::new(dim, drain_rot_seed);
+                        let window =
+                            opann::assignment_shortlist_window(clusters_ref.n_cent as usize);
+                        // Count rows actually placed by the fine router vs. the
+                        // per-row coarse fallback, so a run can VERIFY placement
+                        // engaged (surfaced below, not via `tracing`, which the
+                        // Python binding drops) rather than inferring it from a
+                        // noisy recall delta.
+                        let fine_hits = std::sync::atomic::AtomicUsize::new(0);
+                        let out: Vec<opann::BoundaryAssignment> =
+                            hidden_inner.options.writer_pool.install(|| {
+                                distinct_rows
+                                    .par_iter()
+                                    .map(|row| {
+                                        let row_fp = opann::dequantize_row(&row.encoded, dim);
+                                        match fr.assign_row_to_cells(clusters_ref, metric, &row_fp)
+                                        {
+                                            Some(a) => {
+                                                fine_hits.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                a
+                                            }
+                                            None => opann::boundary_assignment_encoded(
+                                                clusters_ref,
+                                                metric,
+                                                &row.encoded,
+                                                &admit_ctx,
+                                                window,
+                                            ),
+                                        }
+                                    })
+                                    .collect()
+                            });
+                        if drain_timers {
+                            eprintln!(
+                                "[gfc-drain] batch {} fine placement engaged: {}/{} rows placed by nearest fine centroid (rest coarse fallback)",
+                                batch_idx + 1,
+                                fine_hits.load(std::sync::atomic::Ordering::Relaxed),
+                                distinct_rows.len()
+                            );
+                        }
+                        out
                     } else if use_graph_assign {
-                        // Graph-routed assign. Build the coarse centroid router
-                        // ONCE for the drain, lazily on the first batch with
-                        // rows. The build is serial + deterministic (see
-                        // `Hnsw::build_serial`) so cell placement is reproducible
-                        // run to run; the writer-pool install below is for the
-                        // per-row assignment fan-out. The result type is
-                        // identical to the shortlist path, so the spill/replica
-                        // code below is untouched.
+                        // Graph-routed assign over the COARSE cell centroids.
+                        // Build the coarse centroid router ONCE for the drain,
+                        // lazily on the first batch with rows. The build is
+                        // serial + deterministic (see `Hnsw::build_serial`) so
+                        // cell placement is reproducible run to run; the
+                        // writer-pool install below is for the per-row
+                        // assignment fan-out. The result type is identical to
+                        // the shortlist path, so the spill/replica code below
+                        // is untouched.
                         // Cosine-only path (gated above), so ef is the cosine
                         // beam: max(16, round(sqrt(n_cent)/4)).
                         let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize, metric);
@@ -4720,7 +4871,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 opann::build_coarse_router(clusters_ref, metric)
                             });
                             // Shared reborrows so the parallel closure captures
-                            // `&` (Sync), not the `&mut` from `get_or_insert_with`.
+                            // `&` (Sync), not the `&mut` from
+                            // `get_or_insert_with`.
                             let (scorer, graph, node_to_cell) =
                                 (&router.0, &router.1, &router.2[..]);
                             distinct_rows
@@ -4763,6 +4915,21 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     };
                     let assign_ms = assign_t0.elapsed().as_secs_f64() * 1e3;
                     drain_assign_total_ms += assign_ms;
+                    // Tripwire: every assigned cell (primary and replicas) must
+                    // index the live grid. The fine-placement path bounds-checks
+                    // and drops out-of-range cells before this point; this catches
+                    // any future path that forgets to, before a bad cell reaches
+                    // the spill and corrupts the drained layout.
+                    debug_assert!(
+                        assignments.iter().all(|a| {
+                            (a.primary as usize) < clusters_ref.n_cent as usize
+                                && a.replicas.iter().flatten().all(|&(cell, _)| {
+                                    (cell as usize) < clusters_ref.n_cent as usize
+                                })
+                        }),
+                        "drain assignment emitted a cell id >= n_cent ({})",
+                        clusters_ref.n_cent
+                    );
                     if drain_timers {
                         debug!(
                             batch = batch_idx + 1,
@@ -6074,9 +6241,17 @@ fn pack_row_stable_id(row: PackRow<'_>) -> i128 {
 /// budget applied once, cell buckets out. Does **not** build IVF subsections —
 /// that runs in the shard-stage pack (parallel). Boundary replicas are vector
 /// postings only; callers decide which primaries become Parquet rows.
+///
+/// `fine` selects placement: `Some` walks the centroid-router HNSW to place each
+/// row in the cell of its nearest fine centroid (matching how queries route),
+/// falling back per row to the coarse `clusters` cell grid when the graph cannot
+/// place it; `None` places every row on the coarse cell grid. `assignment.primary`
+/// and `assignment.replicas` are cell ids in both modes, so the bucketing below
+/// is identical.
 fn assign_cells<'a>(
     rows: &[PackRow<'a>],
     clusters: &ClusterCentroids,
+    fine: Option<&crate::supertable::query::vector::FineAssignRouter>,
     metric: Metric,
     rot_seed: u64,
     replica_target_factor: f32,
@@ -6085,43 +6260,53 @@ fn assign_cells<'a>(
         return Ok(Vec::new());
     }
     let replica_extra_budget = drain_replica_extra_budget(rows.len(), replica_target_factor);
-    // Per-row nearest-cell scoring is the commit CPU wave: run it on the
-    // ambient rayon pool (callers wrap this in `writer_pool.install`).
-    // One shared admit context per batch (rotation / quantizer / cosine
-    // table); each row is 1-bit shortlisted over the grid and exact-scored
-    // only inside the 20% window, so assignment compute scales with the
-    // window instead of the full cell count.
+    // Per-row placement is the commit CPU wave: run it on the ambient rayon pool
+    // (callers wrap this in `writer_pool.install`). Fine placement walks the
+    // shared centroid-router HNSW (log-N, scale-invariant); the coarse fallback
+    // 1-bit shortlists the row over the cell grid and exact-scores only inside
+    // the window. One shared admit context per batch (rotation / quantizer /
+    // cosine table) serves the coarse path (and the fine path's per-row
+    // fallback).
     let admit_ctx = RabitqAdmitContext::new(clusters.dim as usize, rot_seed);
     let window = opann::assignment_shortlist_window(clusters.n_cent as usize);
     let assignments: Vec<opann::BoundaryAssignment> = rows
         .par_iter()
         .map(|row| match *row {
-            PackRow::Fp32 { vector, .. } => {
-                opann::boundary_assignment_fp32(clusters, metric, vector, &admit_ctx, window)
-            }
+            PackRow::Fp32 { vector, .. } => fine
+                .and_then(|fr| fr.assign_row_to_cells(clusters, metric, vector))
+                .unwrap_or_else(|| {
+                    opann::boundary_assignment_fp32(clusters, metric, vector, &admit_ctx, window)
+                }),
         })
         .collect();
-
-    let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
-        .iter()
-        .enumerate()
-        .flat_map(|(row_idx, assignment)| {
-            assignment
-                .replicas
-                .iter()
-                .flatten()
-                .map(move |&(cell, margin)| (row_idx, cell, margin))
-        })
-        .collect();
-    replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
 
     let mut buckets: HashMap<u32, Vec<(i128, bool, PackRow<'a>)>> = HashMap::new();
-    for (row_idx, cell, _) in replica_candidates.into_iter().take(replica_extra_budget) {
-        let row = rows[row_idx];
-        buckets
-            .entry(cell)
-            .or_default()
-            .push((pack_row_stable_id(row), false, row));
+    // Boundary-replica materialization. The default replica budget is 0
+    // (`drain_replica_target_factor <= 1.0`), so the common path materializes NO
+    // replicas and skips the candidate vector entirely — building and sorting a
+    // ~3×rows candidate list only to `.take(0)` it charged the drain hundreds of
+    // MB per shard for nothing. Only when a budget is set do we collect the
+    // candidates and keep the `replica_extra_budget` thinnest-margin ones.
+    if replica_extra_budget > 0 {
+        let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
+            .iter()
+            .enumerate()
+            .flat_map(|(row_idx, assignment)| {
+                assignment
+                    .replicas
+                    .iter()
+                    .flatten()
+                    .map(move |&(cell, margin)| (row_idx, cell, margin))
+            })
+            .collect();
+        replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+        for (row_idx, cell, _) in replica_candidates.into_iter().take(replica_extra_budget) {
+            let row = rows[row_idx];
+            buckets
+                .entry(cell)
+                .or_default()
+                .push((pack_row_stable_id(row), false, row));
+        }
     }
     for (row, assignment) in rows.iter().zip(&assignments) {
         buckets
@@ -6501,6 +6686,7 @@ fn commit_shards_via_drain(
     buffer: &[BufferedBatch],
     inner: &SupertableInner,
     clusters: &ClusterCentroids,
+    fine: Option<&crate::supertable::query::vector::FineAssignRouter>,
     metric: Metric,
     n_packed_shards: usize,
     op_stats: &Option<Arc<OpStatsCollector>>,
@@ -6589,7 +6775,7 @@ fn commit_shards_via_drain(
     let assigned = inner
         .options
         .writer_pool
-        .install(|| assign_cells(&rows, clusters, metric, vc.rot_seed, replica_target))?;
+        .install(|| assign_cells(&rows, clusters, fine, metric, vc.rot_seed, replica_target))?;
     let assign_elapsed = stage_t0.elapsed().saturating_sub(flatten_elapsed);
     let assigned_cells: Vec<(u32, AssignedCellGroup<'_>)> = assigned
         .into_iter()
@@ -6714,6 +6900,13 @@ pub(in crate::supertable) fn build_packed_update_superfile(
         &buffer,
         inner,
         &pack_grid,
+        // Update replacement rows deliberately place on the coarse cell grid.
+        // They are a small, latency-sensitive WAL-append batch, and a later
+        // drain/merge re-clusters them into the hidden index anyway; building a
+        // fine-placement router here (opening superfiles + walking the graph)
+        // would not pay off. Fine-centroid placement engages on the commit-append
+        // path, gated on the router resolving to centroid_graph.
+        None,
         metric,
         UPDATE_PACKED_SHARDS,
         op_stats,
@@ -8789,7 +8982,6 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     let router_column = crate::supertable::query::vector::select_eager_router_column(
         vcfg.search_mode,
         vcfg.ivf_router,
-        vcfg.global_fine_fanout,
         &inner.options.vector_columns,
     );
     let router_eligible = router_column.as_deref() == Some(column.as_str())
@@ -9307,7 +9499,6 @@ async fn build_and_publish_centroid_router_section(
     let column = crate::supertable::query::vector::select_eager_router_column(
         vcfg.search_mode,
         vcfg.ivf_router,
-        vcfg.global_fine_fanout,
         &inner.options.vector_columns,
     )?;
     let dim = inner
@@ -13545,6 +13736,7 @@ mod tests {
         let assigned = assign_cells(
             &rows,
             &clusters,
+            None,
             Metric::L2Sq,
             COMMIT_AS_DRAIN_TEST_ROT_SEED,
             BOUNDARY_STUB_TARGET_FACTOR,

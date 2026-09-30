@@ -1909,6 +1909,18 @@ impl VectorReader {
         Some((lo, flat - bases[lo]))
     }
 
+    /// Global cell id owning a per-superfile `flat` fine-cluster id. Composes
+    /// [`Self::resolve_flat_cluster`] (flat -> cell ordinal) with this reader's
+    /// `cell_ids` (ordinal -> global cell id). The drain-side fine-centroid
+    /// placement and the query-side fine->cell resolution share this mapping,
+    /// so a row placed against a fine centroid lands in the same cell the
+    /// router will rank shallow for a nearby query. `None` on a v1 single-IVF
+    /// reader (no cell ids) or an out-of-range flat.
+    pub(crate) fn global_cell_of_flat(&self, flat: u32) -> Option<u32> {
+        let (cell_ord, _local) = self.resolve_flat_cluster(flat)?;
+        self.cell_ids.get(cell_ord).copied()
+    }
+
     /// Emit the fp32 centroid VECTORS of every fine cluster in this superfile,
     /// tagged with their per-superfile `flat` cluster ids, from the resident
     /// centroid `section` (zero superfile opens). Feeds the in-memory centroid
