@@ -68,8 +68,10 @@ const REQUIRED_ENV: &str = "INFINO_CORPUS_REQUIRED";
 /// Table name every generator writes, so a test needs no per-shape name.
 pub(crate) const TABLE: &str = "corpus";
 
-/// Documents per generated table; mirrors the generators' shared corpus.
-pub(crate) const N_DOCS: usize = 12_000;
+// The documents the generators wrote, included rather than restated: a
+// test that keeps its own copy of the corpus's shape can drift from the
+// corpus and still pass.
+include!("../corpus/generators/shared/corpus_data.rs");
 
 /// A superfile holding at least this many documents gives a term present
 /// in every document more than `BLOCK_LEN * COARSE_BLOCK_MAX_SPAN` (128 *
@@ -82,10 +84,6 @@ const DOCS_FOR_MULTI_ENTRY_COARSE: u32 = 4096;
 /// immediately after it.
 const FTS_MAGIC: &[u8; 8] = b"INFFTS01";
 
-/// Dimension of the corpus generators' planted embeddings.
-const EMBEDDING_DIM: usize = 16;
-/// Off-axis weight in the probe vector, mirroring `embedding(0)`.
-const PROBE_OFF_AXIS: f32 = 0.05;
 /// Neighbours retrieved by the probe.
 const PROBE_NEIGHBOURS: usize = 16;
 
@@ -148,12 +146,11 @@ pub(crate) fn superfile_paths(root: &Path) -> Vec<PathBuf> {
     files_with_extension(root, "parquet")
 }
 
-/// The probe used against the corpus's planted embeddings; mirrors the
-/// generators' `embedding(0)`.
+/// The probe used against the corpus's planted embeddings: document 0's
+/// own vector, taken from the generators' definition rather than
+/// reconstructed from it.
 pub(crate) fn probe_embedding() -> Vec<f32> {
-    (0..EMBEDDING_DIM)
-        .map(|d| if d == 0 { 1.0 } else { PROBE_OFF_AXIS })
-        .collect()
+    embedding(0)
 }
 
 /// Ids and distances a vector search returns, in rank order.
@@ -380,7 +377,7 @@ pub(crate) fn assert_scores_equivalent(
 /// smaller than the match count silently truncates and reads as a recall
 /// loss.
 pub(crate) fn hits(table: &Supertable, column: &str, query: &str) -> usize {
-    hits_k(table, column, query, N_DOCS)
+    hits_k(table, column, query, N_DOCS as usize)
 }
 
 /// Rows a `bm25_search` returns for `query` on `column`, taking `k`.
@@ -420,7 +417,7 @@ fn assert_shape(shape: &str, expected_version: u32, coarse: CoarseTable) {
     let headers = blob_headers(&root);
     assert!(!headers.is_empty(), "{shape}: no superfiles");
     let total: usize = headers.iter().map(|h| h.n_docs as usize).sum();
-    assert_eq!(total, N_DOCS, "{shape}: document count drifted");
+    assert_eq!(total, N_DOCS as usize, "{shape}: document count drifted");
 
     for (i, h) in headers.iter().enumerate() {
         assert_eq!(
@@ -472,7 +469,7 @@ fn assert_opens_and_ranks(shape: &str) {
     };
     assert_eq!(
         hits(&table, "body", "common"),
-        N_DOCS,
+        N_DOCS as usize,
         "{shape}: the corpus-wide term did not match every document"
     );
 }

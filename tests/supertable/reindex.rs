@@ -13,11 +13,11 @@
 use std::{sync::Arc, time::Duration};
 
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
-use infino::{ReindexOptions, Supertable, superfile::format::fts::VERSION_CURRENT};
+use infino::{ReindexOptions, superfile::format::fts::VERSION_CURRENT};
 
 use crate::corpus_shapes::{
     N_DOCS, assert_scores_equivalent, blob_versions, corpus_dir, hits, hits_k, open_corpus,
-    scores_by_id,
+    probe_embedding, scores_by_id, vector_hits,
 };
 
 /// Rewriting a table written by an older engine brings every superfile to
@@ -33,7 +33,7 @@ fn assert_reindex_migrates(shape: &str, from_version: u32) {
         before.iter().all(|v| *v == from_version),
         "{shape}: expected every superfile at version {from_version}, got {before:?}"
     );
-    let ranking_before = scores_by_id(&table, "body", "common shared", N_DOCS);
+    let ranking_before = scores_by_id(&table, "body", "common shared", N_DOCS as usize);
     assert!(!ranking_before.is_empty());
 
     let report = table
@@ -64,14 +64,14 @@ fn assert_reindex_migrates(shape: &str, from_version: u32) {
     // each with the same score. Compared by id rather than by rank, since
     // the migration reshapes the files that decide tie order.
     assert_scores_equivalent(
-        &scores_by_id(&table, "body", "common shared", N_DOCS),
+        &scores_by_id(&table, "body", "common shared", N_DOCS as usize),
         &ranking_before,
         shape,
     );
 
     assert_eq!(
         hits(&table, "body", "common"),
-        N_DOCS,
+        N_DOCS as usize,
         "{shape}: the corpus-wide term stopped matching every document"
     );
 
@@ -197,7 +197,7 @@ fn assert_mixed_table_reads_cleanly(shape: &str, from_version: u32) {
     // Every document still carries the corpus-wide term, inherited and
     // appended alike — so the fold over two tokenizations did not lose a
     // posting list or double-count one.
-    let with_appended = N_DOCS + appended.len();
+    let with_appended = N_DOCS as usize + appended.len();
     assert_eq!(
         hits_k(&table, "body", "common", with_appended),
         with_appended,
@@ -266,7 +266,7 @@ fn a_vector_bearing_table_can_be_rewritten_and_reanalyzed() {
         "every corpus file predates the analysis revision"
     );
 
-    let probe: Vec<f32> = infino_probe_embedding();
+    let probe: Vec<f32> = probe_embedding();
     let hits_before = vector_hits(&table, &probe);
     assert!(
         !hits_before.is_empty(),
@@ -306,33 +306,6 @@ fn a_vector_bearing_table_can_be_rewritten_and_reanalyzed() {
         after.is_current(),
         "a fully repaired table must report itself finished: {after:?}"
     );
-}
-
-/// The probe used against the corpus's planted embeddings; mirrors the
-/// generators' `embedding(0)`.
-fn infino_probe_embedding() -> Vec<f32> {
-    const DIM: usize = 16;
-    (0..DIM).map(|d| if d == 0 { 1.0 } else { 0.05 }).collect()
-}
-
-/// Ids a vector search returns, in rank order.
-fn vector_hits(table: &Supertable, probe: &[f32]) -> Vec<i128> {
-    let batches = table
-        .vector_search("emb", probe, 16, None, None)
-        .expect("vector search");
-    let mut out = Vec::new();
-    for batch in &batches {
-        let ids = batch
-            .column_by_name("_id")
-            .expect("_id column")
-            .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
-            .expect("_id is Decimal128");
-        for i in 0..batch.num_rows() {
-            out.push(ids.value(i));
-        }
-    }
-    out
 }
 
 /// The assessment reports what the run then does — the same numbers, not
@@ -575,7 +548,7 @@ fn reanalysis_of_the_newest_shape_converges_without_changing_terms() {
     let Some((_tmp, table, _root)) = open_corpus(SHAPE) else {
         return;
     };
-    let before = scores_by_id(&table, "body", "common shared", N_DOCS);
+    let before = scores_by_id(&table, "body", "common shared", N_DOCS as usize);
 
     let report = table
         .reindex(&ReindexOptions::reanalyzing())
@@ -586,7 +559,7 @@ fn reanalysis_of_the_newest_shape_converges_without_changing_terms() {
         "re-analysis is what clears this axis"
     );
     assert_scores_equivalent(
-        &scores_by_id(&table, "body", "common shared", N_DOCS),
+        &scores_by_id(&table, "body", "common shared", N_DOCS as usize),
         &before,
         "re-analysing the newest shape",
     );
@@ -647,7 +620,7 @@ fn the_default_mode_leaves_the_table_current_where_a_rewrite_cannot() {
     // is what a re-analysis buys over a rewrite.
     assert_eq!(
         hits(&table, "body", "common"),
-        N_DOCS,
+        N_DOCS as usize,
         "the corpus-wide term stopped matching every document"
     );
 

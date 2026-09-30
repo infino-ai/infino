@@ -19,7 +19,8 @@ use std::{
 use arrow_array::{Array, Decimal128Array, LargeStringArray};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
-    Connection, ReindexOptions, Supertable, superfile::format::footer::read_kv_metadata,
+    Connection, ReindexOptions, Supertable,
+    superfile::format::{footer::read_kv_metadata, kv as footer_kv},
     supertable::wal::tombstones_codec::decode_sidecar,
 };
 
@@ -32,8 +33,8 @@ use super::corpus_shapes::{
 /// and a vector index, so "nothing but FTS moves" has something to move.
 const SHAPE: &str = "v6_with_vectors";
 
-/// Prefix on every key a superfile uses to declare a spliced region.
-const REGION_KEY_PREFIX: &str = "inf.";
+// Footer keys come from `format::kv`, not from copies: a test that spells
+// them itself keeps passing after the writer renames one.
 /// Key suffix holding a region's absolute start offset.
 const REGION_OFFSET_SUFFIX: &str = ".offset";
 /// Key suffix holding a region's byte length.
@@ -42,21 +43,8 @@ const REGION_LENGTH_SUFFIX: &str = ".length";
 const FTS_REGION: &str = "fts";
 /// The stable-id sidecar, which a rewrite re-encodes as a side effect.
 const IDS_REGION: &str = "ids";
-/// Footer key naming the id sidecar's layout; absent means the raw
-/// `i128` array that predates the packed one.
-const IDS_LAYOUT_KEY: &str = "inf.ids.layout";
-/// The [`IDS_LAYOUT_KEY`] value for the packed sidecar.
-const IDS_LAYOUT_PACKED: &str = "packed";
-/// Footer key naming the vector blob's layout.
-const VEC_LAYOUT_KEY: &str = "inf.vec.layout";
-/// The [`VEC_LAYOUT_KEY`] value for cell-directory subsections.
+/// The [`footer_kv::VEC_LAYOUT`] value for cell-directory subsections.
 const VEC_LAYOUT_MULTI_CELL: &str = "multi_cell_ivf";
-/// Footer key holding the FTS blob's start, which is where the Parquet
-/// body ends.
-const FTS_OFFSET_KEY: &str = "inf.fts.offset";
-/// Footer key holding a superfile's document count, tombstoned rows
-/// included.
-const N_DOCS_KEY: &str = "inf.n_docs";
 
 /// Regions a rewrite may change; everything else is held to byte equality.
 ///
@@ -75,12 +63,12 @@ fn spliced_regions(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
     let mut regions = BTreeMap::new();
     for (key, offset) in &kv {
         let Some(name) = key
-            .strip_prefix(REGION_KEY_PREFIX)
+            .strip_prefix(footer_kv::PREFIX)
             .and_then(|k| k.strip_suffix(REGION_OFFSET_SUFFIX))
         else {
             continue;
         };
-        let length_key = format!("{REGION_KEY_PREFIX}{name}{REGION_LENGTH_SUFFIX}");
+        let length_key = format!("{}{name}{REGION_LENGTH_SUFFIX}", footer_kv::PREFIX);
         let length: usize = kv
             .get(&length_key)
             .unwrap_or_else(|| panic!("{key} has no matching {length_key}"))
@@ -347,7 +335,7 @@ fn a_rewrite_upgrades_the_id_sidecar_to_the_packed_layout() {
         return;
     };
 
-    let before_layouts = footer_values(&root, IDS_LAYOUT_KEY);
+    let before_layouts = footer_values(&root, footer_kv::IDS_LAYOUT);
     assert!(
         before_layouts.iter().all(Option::is_none),
         "the fixture already names an id-sidecar layout, so it cannot show \
@@ -357,11 +345,11 @@ fn a_rewrite_upgrades_the_id_sidecar_to_the_packed_layout() {
 
     rewrite(&table);
 
-    let after_layouts = footer_values(&root, IDS_LAYOUT_KEY);
+    let after_layouts = footer_values(&root, footer_kv::IDS_LAYOUT);
     assert!(
         after_layouts
             .iter()
-            .all(|l| l.as_deref() == Some(IDS_LAYOUT_PACKED)),
+            .all(|l| l.as_deref() == Some(footer_kv::IDS_LAYOUT_PACKED)),
         "a rewrite left an id sidecar in a layout other than the packed \
          one: {after_layouts:?}"
     );
@@ -390,7 +378,7 @@ fn the_hybrid_fixture_carries_multi_cell_vector_subsections() {
         return;
     };
 
-    let layouts = footer_values(&dir, VEC_LAYOUT_KEY);
+    let layouts = footer_values(&dir, footer_kv::VEC_LAYOUT);
 
     assert!(!layouts.is_empty(), "the hybrid fixture has no superfiles");
     assert!(
@@ -488,7 +476,7 @@ fn a_rewrite_carries_the_tombstone_sidecar_to_the_new_superfile() {
 
 /// Documents every superfile under `root` holds, tombstoned included.
 fn total_docs(root: &Path) -> u64 {
-    footer_values(root, N_DOCS_KEY)
+    footer_values(root, footer_kv::N_DOCS)
         .iter()
         .map(|v| {
             v.as_ref()
@@ -577,7 +565,7 @@ fn table_bodies(root: &Path) -> Vec<Vec<u8>> {
             let bytes = fs::read(path).expect("read superfile");
             let kv = read_kv_metadata(&bytes).expect("read superfile key-value metadata");
             let fts_at: usize = kv
-                .get(FTS_OFFSET_KEY)
+                .get(footer_kv::FTS_OFFSET)
                 .expect("a superfile under test has an FTS blob")
                 .parse()
                 .expect("offset is a number");

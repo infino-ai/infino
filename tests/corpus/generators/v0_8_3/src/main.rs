@@ -32,11 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let table = args.next().ok_or("usage: <output-dir> <table-name>")?;
     let with_vectors = args.next().as_deref() == Some("vectors");
 
-    let mut fields = vec![
-        Field::new("body", DataType::LargeUtf8, false),
-        Field::new("title", DataType::LargeUtf8, false),
-        Field::new("notes", DataType::LargeUtf8, true),
-    ];
+    let mut fields = text_fields();
     let mut spec = IndexSpec::new()
         .fts(FtsField::new("body"))
         .fts(FtsField::new("title").positions(true))
@@ -59,15 +55,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = connect(&out_dir)?;
     let handle = db.create_table(&table, Arc::clone(&schema), spec)?;
 
-    let bodies: Vec<String> = (0..N_DOCS).map(body).collect();
-    let titles: Vec<String> = (0..N_DOCS).map(title).collect();
-    let notes: Vec<Option<String>> = (0..N_DOCS).map(notes).collect();
-
-    let mut columns: Vec<ArrayRef> = vec![
-        Arc::new(LargeStringArray::from(bodies)),
-        Arc::new(LargeStringArray::from(titles)),
-        Arc::new(LargeStringArray::from(notes)),
-    ];
+    let mut columns: Vec<ArrayRef> = text_columns()
+        .into_iter()
+        .map(|c| Arc::new(c) as ArrayRef)
+        .collect();
     if with_vectors {
         let flat: Vec<f32> = (0..N_DOCS).flat_map(embedding).collect();
         columns.push(Arc::new(FixedSizeListArray::try_new(

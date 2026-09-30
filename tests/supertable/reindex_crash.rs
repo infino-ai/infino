@@ -33,7 +33,7 @@
 //! window allows is coherent, and the test says which ones it saw.
 
 use std::{
-    env, fs,
+    env,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -46,7 +46,7 @@ use tempfile::TempDir;
 use crate::{
     corpus_shapes::{
         N_DOCS, TABLE, assert_scores_equivalent, blob_versions, copy_tree, corpus_dir, hits,
-        scores_by_id,
+        scores_by_id, superfile_paths,
     },
     reindex_invariance::{DELETED_DOCS, delete_leading_rows, rows_by_id},
 };
@@ -82,26 +82,6 @@ const WATCH_POLL: Duration = Duration::from_millis(5);
 /// zero and the parent fails on the clean exit rather than reporting a
 /// pass.
 const WATCH_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Every superfile under `root`, by path.
-fn superfile_paths(root: &Path) -> Vec<PathBuf> {
-    let mut stack = vec![root.to_path_buf()];
-    let mut found = Vec::new();
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            match path.is_dir() {
-                true => stack.push(path),
-                false if path.extension().is_some_and(|e| e == "parquet") => found.push(path),
-                false => {}
-            }
-        }
-    }
-    found
-}
 
 /// The child: reindex, and abort once the run is demonstrably underway.
 ///
@@ -162,7 +142,7 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
         &db.open_table(TABLE).expect("open pristine"),
         "body",
         "common shared",
-        N_DOCS,
+        N_DOCS as usize,
     );
     assert!(!baseline.is_empty(), "the baseline ranking is empty");
 
@@ -199,11 +179,11 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
     // catch a half-committed rewrite being read as live.
     assert_eq!(
         hits(&table, "body", "common"),
-        N_DOCS,
+        N_DOCS as usize,
         "documents went missing across the crash"
     );
     assert_scores_equivalent(
-        &scores_by_id(&table, "body", "common shared", N_DOCS),
+        &scores_by_id(&table, "body", "common shared", N_DOCS as usize),
         &baseline,
         "the killed table against the same bytes untouched",
     );
@@ -285,11 +265,11 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
     );
     assert_eq!(
         hits(&table, "body", "common"),
-        N_DOCS,
+        N_DOCS as usize,
         "documents went missing across the resume"
     );
     assert_scores_equivalent(
-        &scores_by_id(&table, "body", "common shared", N_DOCS),
+        &scores_by_id(&table, "body", "common shared", N_DOCS as usize),
         &baseline,
         "the resumed migration",
     );
@@ -322,7 +302,7 @@ fn an_interrupted_reindex_never_resurrects_a_deleted_row() {
     let live_before = live_ids(&victim);
     assert_eq!(
         live_before.len(),
-        N_DOCS - DELETED_DOCS,
+        N_DOCS as usize - DELETED_DOCS,
         "the delete did not take before the crash run started"
     );
 
