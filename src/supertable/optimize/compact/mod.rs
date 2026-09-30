@@ -4112,7 +4112,7 @@ mod tests {
     ///
     /// Nothing here depends on what a merge costs per byte, which is a
     /// function of term cardinality, posting density and which indexes a table
-    /// carries — none of it knowable from `input_bytes`.
+    /// carries — none of it knowable from a job's byte count.
     #[test]
     fn room_for_another_merge_is_judged_against_the_host() {
         assert_eq!(

@@ -1299,11 +1299,12 @@ impl Config {
             .maintenance_threads
             .resolve_or_default(available_parallelism().map(NonZeroUsize::get).unwrap_or(1));
         let resolved = match available_memory_bytes() {
-            // Memory is observable, so the wave runner bounds each wave by the
-            // bytes its own jobs will materialize — a far better estimate than
-            // anything derivable here, where only the `max_memory_mb` CAP is
-            // known and real jobs are routinely a fraction of it. The derived
-            // value is then just the CPU ceiling.
+            // Memory is observable, so the wave runner reads `MemAvailable`
+            // between admissions and stops widening once less than its reserve
+            // share is free — a measurement of what merges cost on this
+            // corpus, where this layer could only guess from the
+            // `max_memory_mb` CAP, which real jobs are routinely a fraction
+            // of. The derived value is then just the CPU ceiling.
             Some(_) => maintenance,
             // No procfs: nothing downstream can bound a wave, so stay serial
             // rather than invent a width.
