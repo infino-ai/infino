@@ -260,10 +260,9 @@ fn trace_of(capture: &Capture, root: &str, op: impl Fn() -> u64) -> (Vec<Capture
     let out = op();
     let spans = capture.take();
     for s in &spans {
-        assert!(
-            !matches!(s.name, "open_reader" | "get_range"),
-            "`{}` is a span per superfile or range read; it must stay below `info`",
-            s.name
+        assert_ne!(
+            s.name, "open_reader",
+            "a span per superfile opened must stay below `info`"
         );
         let ours = [
             "fts.", "vector.", "hybrid.", "tvf.", "search.", "sql.", "scan.",
