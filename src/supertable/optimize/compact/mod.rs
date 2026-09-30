@@ -305,16 +305,9 @@ impl Supertable {
     ) -> Result<(), CompactionError> {
         let inner = table.inner();
 
-        match inner.compaction_outstanding.compare_exchange(
-            false,
-            true,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {}
-            Err(_) => return Err(CompactionError::AlreadyCompacting),
-        }
-        let _slot = CompactionSlot(&inner.compaction_outstanding);
+        let _slot = table
+            .try_hold_compaction_slot()
+            .ok_or(CompactionError::AlreadyCompacting)?;
         // #512 invariant tripwire, mirroring the drain's: merges and splits
         // transcode Sq8 rows between per-cluster quantizers, and a
         // destination grid that fails to cover its inputs saturates

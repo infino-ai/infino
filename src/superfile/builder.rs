@@ -2789,10 +2789,13 @@ impl SuperfileBuilder {
             .whole_file_bytes()
             .ok_or_else(|| BuildError::Io(Error::other("carried body needs a resident source")))?;
         let src_kv = read_kv_metadata(bytes).map_err(BuildError::Footer)?;
+        // Bounds-checked: these come off a file's footer, so a truncated or
+        // hand-edited one must be refused rather than panic the slice below.
         let region = |offset: &str, length: &str| -> Option<Range<usize>> {
             let at: usize = src_kv.get(offset)?.parse().ok()?;
             let len: usize = src_kv.get(length)?.parse().ok()?;
-            (len > 0).then_some(at..at + len)
+            let end = at.checked_add(len)?;
+            (len > 0 && end <= bytes.len()).then_some(at..end)
         };
         // Splice order is body, FTS, vector, ids — so the FTS blob starts
         // where the body ends.

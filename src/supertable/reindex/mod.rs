@@ -288,6 +288,22 @@ pub(crate) fn plan_jobs(
         .collect()
 }
 
+/// The distinct columns no repair can fix, in first-seen order.
+///
+/// Both reports name these, and the docs promise the two agree — so they
+/// read it from here rather than each folding the same list themselves.
+fn unrepairable_column_names(stale: &[StaleSuperfile]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for file in stale {
+        for column in file.unrepairable_columns() {
+            if !names.contains(&column.name) {
+                names.push(column.name.clone());
+            }
+        }
+    }
+    names
+}
+
 /// The repair one superfile gets, after [`ReindexMode::Auto`] has been
 /// resolved against what that file is actually behind on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,12 +430,8 @@ impl Supertable {
             if file.fts.needs_reanalysis() {
                 report.awaiting_reanalysis += 1;
             }
-            for column in file.unrepairable_columns() {
-                if !report.unrepairable_columns.contains(&column.name) {
-                    report.unrepairable_columns.push(column.name.clone());
-                }
-            }
         }
+        report.unrepairable_columns = unrepairable_column_names(&stale);
         Ok(report)
     }
 
@@ -504,13 +516,7 @@ impl Supertable {
             },
             ..Default::default()
         };
-        for stale in &all {
-            for column in stale.unrepairable_columns() {
-                if !report.unrepairable_columns.contains(&column.name) {
-                    report.unrepairable_columns.push(column.name.clone());
-                }
-            }
-        }
+        report.unrepairable_columns = unrepairable_column_names(&all);
         if !report.unrepairable_columns.is_empty() {
             warn!(
                 "[supertable reindex] {} column(s) hold terms from an older \
