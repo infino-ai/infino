@@ -573,6 +573,26 @@ impl core::marker::Unpin for infino::OptimizeOptions
 impl core::marker::UnsafeUnpin for infino::OptimizeOptions
 impl core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeOptions
 impl core::panic::unwind_safe::UnwindSafe for infino::OptimizeOptions
+#[non_exhaustive] pub struct infino::PlannedRepair
+pub infino::PlannedRepair::live_bytes: u64
+pub infino::PlannedRepair::mode: infino::ReindexMode
+pub infino::PlannedRepair::superfile_id: uuid::Uuid
+impl core::clone::Clone for infino::PlannedRepair
+pub fn infino::PlannedRepair::clone(&self) -> Self
+impl core::cmp::Eq for infino::PlannedRepair
+impl core::cmp::PartialEq for infino::PlannedRepair
+pub fn infino::PlannedRepair::eq(&self, &Self) -> bool
+impl core::fmt::Debug for infino::PlannedRepair
+pub fn infino::PlannedRepair::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::PlannedRepair
+impl core::marker::StructuralPartialEq for infino::PlannedRepair
+impl core::marker::Freeze for infino::PlannedRepair
+impl core::marker::Send for infino::PlannedRepair
+impl core::marker::Sync for infino::PlannedRepair
+impl core::marker::Unpin for infino::PlannedRepair
+impl core::marker::UnsafeUnpin for infino::PlannedRepair
+impl core::panic::unwind_safe::RefUnwindSafe for infino::PlannedRepair
+impl core::panic::unwind_safe::UnwindSafe for infino::PlannedRepair
 #[non_exhaustive] pub struct infino::ReindexOptions
 pub infino::ReindexOptions::mode: infino::ReindexMode
 pub infino::ReindexOptions::stale_seal_timeout_ms: core::option::Option<u64>
@@ -664,6 +684,7 @@ pub fn infino::Supertable::hybrid_search(&self, &str, &str, infino::BoolMode, &s
 pub fn infino::Supertable::index_staleness(&self, &infino::ReindexOptions) -> core::result::Result<infino::StalenessReport, infino::ReindexError>
 pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
 pub fn infino::Supertable::reindex(&self, &infino::ReindexOptions) -> core::result::Result<infino::ReindexReport, infino::ReindexError>
+pub fn infino::Supertable::reindex_plan(&self, &infino::ReindexOptions) -> core::result::Result<alloc::vec::Vec<infino::PlannedRepair>, infino::ReindexError>
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
 pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::tokenize(&self, &str, &str) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>

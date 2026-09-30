@@ -25,7 +25,7 @@ use crate::{
     superfile::VectorSearchOptions,
     supertable::{
         Supertable as SupertableHandle,
-        reindex::{ReindexReport, StalenessReport},
+        reindex::{PlannedRepair, ReindexReport, StalenessReport},
     },
 };
 
@@ -86,6 +86,7 @@ pub(crate) trait Table: Send + Sync {
     fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError>;
     fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError>;
     fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError>;
+    fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError>;
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError>;
 
     /// Test-only: expose the concrete handle behind the trait object so tests
@@ -190,6 +191,9 @@ impl Table for SupertableHandle {
     }
     fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError> {
         SupertableHandle::index_staleness(self, opts)
+    }
+    fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError> {
+        SupertableHandle::reindex_plan(self, opts)
     }
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         SupertableHandle::gc(self, safety_gap)
@@ -500,6 +504,12 @@ impl Supertable {
     /// snapshot of something already in motion.
     pub fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError> {
         self.inner.index_staleness(opts)
+    }
+
+    /// The superfiles [`Self::reindex`] would repair under `opts`, and the
+    /// repair each gets, without repairing anything.
+    pub fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError> {
+        self.inner.reindex_plan(opts)
     }
 
     /// Garbage-collect orphaned superfiles older than `safety_gap`.

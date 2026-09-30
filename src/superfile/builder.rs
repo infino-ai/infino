@@ -94,7 +94,7 @@ use crate::{
             self,
             footer::{
                 EncodedBody, ParquetBodyEncoder, ParquetLayout, encode_parquet_body,
-                read_kv_metadata, splice_carried_body_to, splice_index_streams_to,
+                extract_kv_map, splice_carried_body_to, splice_index_streams_to,
             },
             kv,
         },
@@ -2788,7 +2788,9 @@ impl SuperfileBuilder {
         let bytes = source
             .whole_file_bytes()
             .ok_or_else(|| BuildError::Io(Error::other("carried body needs a resident source")))?;
-        let src_kv = read_kv_metadata(bytes).map_err(BuildError::Footer)?;
+        // The reader decoded this footer when it opened; decoding the bytes
+        // again would buy nothing.
+        let src_kv = extract_kv_map(source.parquet_metadata()).map_err(BuildError::Footer)?;
         // Bounds-checked: these come off a file's footer, so a truncated or
         // hand-edited one must be refused rather than panic the slice below.
         let region = |offset: &str, length: &str| -> Option<Range<usize>> {

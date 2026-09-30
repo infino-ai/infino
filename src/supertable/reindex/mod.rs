@@ -171,6 +171,23 @@ impl StalenessReport {
     }
 }
 
+/// One superfile a reindex would repair, and how.
+///
+/// What [`StalenessReport`] counts, this names. A caller reviewing a
+/// migration before running it needs the list rather than the totals —
+/// which files move, and which of them pay for a re-analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PlannedRepair {
+    /// The superfile this job reads and replaces.
+    pub superfile_id: Uuid,
+    /// The repair it gets. Never [`ReindexMode::Auto`]: that is the
+    /// question a plan answers, so it is already resolved here.
+    pub mode: ReindexMode,
+    /// Live bytes in the superfile, so a caller can size the run.
+    pub live_bytes: u64,
+}
+
 /// What a reindex did.
 ///
 /// Counted against the snapshot the run planned from, which is one moment
@@ -394,6 +411,47 @@ impl Supertable {
     ///
     /// [`ReindexError::NoStorage`] without a durable backend, and
     /// [`ReindexError::Assess`] if a superfile cannot be opened.
+    /// The superfiles [`Supertable::reindex`] would repair under `opts`,
+    /// and the repair each one gets — without repairing anything.
+    ///
+    /// Planned off one snapshot, so it predicts the run that starts now;
+    /// see [`ReindexReport`] for what a concurrent writer does to that.
+    /// Writes nothing and takes no writer slot.
+    ///
+    /// # Errors
+    ///
+    /// [`ReindexError::NoStorage`] without a durable backend, and
+    /// [`ReindexError::Assess`] if a superfile cannot be opened.
+    pub fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError> {
+        bridge_on_runtime(self.reindex_plan_async(opts), &self.inner().query_runtime())
+    }
+
+    async fn reindex_plan_async(
+        &self,
+        opts: &ReindexOptions,
+    ) -> Result<Vec<PlannedRepair>, ReindexError> {
+        let ReindexTarget::Superfile(SuperfileIndex::Fts) = opts.target;
+        if self.inner().manifest.load_full().options.storage.is_none() {
+            return Err(ReindexError::NoStorage);
+        }
+        let (stale, _) = self
+            .stale_superfiles(opts.trust_writer_analysis)
+            .await
+            .map_err(|e| ReindexError::Assess(e.to_string()))?;
+        // The same planner the run drives, so the two cannot disagree.
+        Ok(plan_jobs(&stale, opts.mode)
+            .into_iter()
+            .map(|(job, repair)| PlannedRepair {
+                superfile_id: job.inputs[0],
+                mode: match repair {
+                    Repair::Layout => ReindexMode::Rewrite,
+                    Repair::Terms => ReindexMode::Reanalyze,
+                },
+                live_bytes: job.estimated_output_bytes,
+            })
+            .collect())
+    }
+
     pub fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError> {
         bridge_on_runtime(
             self.index_staleness_async(opts),
@@ -725,6 +783,74 @@ mod tests {
                 .expect("assess")
                 .is_current(),
             "a forced re-analysis must leave the table current"
+        );
+    }
+
+    /// A dry run names exactly the superfiles a real run then repairs,
+    /// and how each one is repaired.
+    ///
+    /// The point of it is reviewability: counts say how much work there
+    /// is, this says what the work is. So it is held to matching the run
+    /// it predicts, not merely to being non-empty.
+    #[test]
+    fn a_planned_run_names_what_the_real_run_repairs() {
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+        let (_storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+
+        let planned = table
+            .reindex_plan(&ReindexOptions::default())
+            .expect("plan a default run");
+        assert!(
+            !planned.is_empty(),
+            "the fixture is stale, so there is a plan"
+        );
+        assert!(
+            planned.iter().all(|p| p.mode == ReindexMode::Reanalyze),
+            "the fixture's terms are behind, so Auto resolves to re-analysis: {planned:?}"
+        );
+
+        // Planning writes nothing, so planning twice must say the same.
+        assert_eq!(
+            table
+                .reindex_plan(&ReindexOptions::default())
+                .expect("plan again"),
+            planned,
+            "planning changed the table"
+        );
+
+        let report = table
+            .reindex(&ReindexOptions::default())
+            .expect("run what was planned");
+        assert_eq!(
+            report.rewritten,
+            planned.len(),
+            "the run repaired a different number of superfiles than it planned"
+        );
+        assert!(
+            table
+                .reindex_plan(&ReindexOptions::default())
+                .expect("plan a third time")
+                .is_empty(),
+            "a migrated table has nothing left to plan"
+        );
+    }
+
+    /// `rewriting()` cannot clear an analysis revision, so on a table
+    /// whose terms are behind it plans nothing rather than planning a
+    /// rewrite that would repeat forever.
+    #[test]
+    fn a_planned_rewrite_declines_a_table_only_its_terms_are_behind_on() {
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+        let (_storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+
+        let planned = table
+            .reindex_plan(&ReindexOptions::rewriting())
+            .expect("plan a rewrite");
+        assert!(
+            planned.iter().all(|p| p.mode == ReindexMode::Rewrite),
+            "a rewrite plans only rewrites: {planned:?}"
         );
     }
 

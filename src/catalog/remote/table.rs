@@ -23,7 +23,7 @@ use crate::{
     OptimizeError, OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
     catalog::table::Table,
     superfile::VectorSearchOptions,
-    supertable::reindex::{ReindexReport, StalenessReport},
+    supertable::reindex::{PlannedRepair, ReindexReport, StalenessReport},
 };
 
 /// A hosted table handle. Holds its `RemoteCatalog`, the table name, and the
@@ -309,6 +309,12 @@ impl Table for RemoteTable {
         // hosted side's job for the same reason compaction is: it needs the
         // storage backend and the writer slot, neither of which a client
         // holds. Deliberately not exposed over the remote transport.
+        Err(ReindexError::NoStorage)
+    }
+
+    fn reindex_plan(&self, _opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError> {
+        // Planning reads every superfile's index metadata, same as the
+        // staleness report below and for the same reason.
         Err(ReindexError::NoStorage)
     }
 
