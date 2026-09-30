@@ -1098,6 +1098,13 @@ fn has_room_for_another_merge(available: Option<u64>, total: Option<u64>) -> boo
     total > 0 && available.saturating_mul(100) / total >= WAVE_MEMORY_RESERVE_PERCENT
 }
 
+/// How many merges a wave may admit at most: the work that exists, capped by
+/// the width knob. A width of zero still admits one, so a misconfigured knob
+/// cannot stall compaction outright.
+fn wave_ceiling(jobs: usize, concurrency: usize) -> usize {
+    jobs.min(concurrency.max(1))
+}
+
 /// Take the next wave off `jobs`, widening it only while the host has room.
 ///
 /// One merge is admitted unconditionally: a table whose single job does not
@@ -1109,7 +1116,7 @@ async fn admit_wave(
     jobs: &[CompactionJob],
     concurrency: usize,
 ) -> (&[CompactionJob], &[CompactionJob]) {
-    let ceiling = jobs.len().min(concurrency.max(1));
+    let ceiling = wave_ceiling(jobs.len(), concurrency);
     let mut taken = 1.min(ceiling);
     while taken < ceiling {
         time::sleep(WAVE_ADMIT_SETTLE).await;
@@ -4051,14 +4058,27 @@ mod tests {
         assert_eq!(wave.len() + rest.len(), jobs.len());
     }
 
-    /// A pass with fewer jobs than the width runs them all: the wave is capped
-    /// by the work that exists, which is why no separate ceiling is needed.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_wave_is_capped_by_the_jobs_that_exist() {
-        let jobs = vec![wave_job(), wave_job()];
-        let (wave, rest) = admit_wave(&jobs, 4096).await;
-        assert!(wave.len() <= jobs.len());
-        assert!(rest.len() < jobs.len());
+    /// A width far above any plausible job count.
+    const ABSURD_WIDTH: usize = 4096;
+
+    /// The wave is capped by the work that exists, which is why no separate
+    /// ceiling is needed: a pass with fewer jobs than the width runs them all.
+    /// Stated against the ceiling itself rather than a split, because
+    /// `split_at` makes `wave.len() <= jobs.len()` true of any implementation.
+    #[test]
+    fn a_wave_is_capped_by_the_jobs_that_exist() {
+        assert_eq!(
+            wave_ceiling(2, ABSURD_WIDTH),
+            2,
+            "two jobs cap the wave at two"
+        );
+        assert_eq!(
+            wave_ceiling(64, 3),
+            3,
+            "the knob caps the wave when work is plentiful"
+        );
+        assert_eq!(wave_ceiling(5, 0), 1, "a zero width still admits one job");
+        assert_eq!(wave_ceiling(0, 8), 0, "no jobs, no wave");
     }
 
     /// The reserve the cases below encode, written out rather than read from
