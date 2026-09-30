@@ -666,6 +666,49 @@ mod tests {
         assert_eq!(hits(&table, SURVIVOR), 1, "a survivor is still findable");
     }
 
+    /// `Reanalyze` forces every stale superfile through a re-analysis,
+    /// including ones a delete has already touched.
+    ///
+    /// `Auto` picks the repair per file; this mode does not, so it is the
+    /// one that can pair the expensive rebuild with a carried tombstone on
+    /// the same superfile.
+    #[test]
+    fn a_forced_reanalysis_keeps_the_deletes_it_rebuilds_over() {
+        const DELETED: &str = "alpha shared s0d00";
+
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+        let (_storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+
+        table
+            .delete(col("title").eq(lit(DELETED)))
+            .expect("delete one row");
+        let survivors = hits(&table, "shared");
+
+        let report = table
+            .reindex(&ReindexOptions::reanalyzing())
+            .expect("force a re-analysis");
+        assert!(report.rewritten > 0, "nothing was re-analyzed: {report:?}");
+
+        assert_eq!(
+            hits(&table, "s0d00"),
+            0,
+            "the deleted row survived a forced re-analysis"
+        );
+        assert_eq!(
+            hits(&table, "shared"),
+            survivors,
+            "the re-analysis changed which rows a corpus-wide term matches"
+        );
+        assert!(
+            table
+                .index_staleness(&ReindexOptions::default())
+                .expect("assess")
+                .is_current(),
+            "a forced re-analysis must leave the table current"
+        );
+    }
+
     /// The committed fixture was written by `infino/0.8.6`, which records
     /// no analysis revision. That is an unknown, so by default its columns
     /// read as stale and a reindex re-analyzes them.

@@ -526,6 +526,17 @@ fn assert_reanalysis_repairs_terms(shape: &str, expect_emoji: bool) {
         "{shape}: re-analysis changed which documents carry the corpus-wide term"
     );
 
+    // The report is the run's own account of itself. Re-reading the files
+    // is what catches a run that reported a clean axis while skipping the
+    // superfiles that were on it.
+    assert!(
+        table
+            .index_staleness(&ReindexOptions::default())
+            .expect("assess after re-analysis")
+            .is_current(),
+        "{shape}: the files still say they are behind"
+    );
+
     // Idempotent for the same reason a rewrite is: the files now record
     // this engine's revision, so a second pass plans nothing.
     let again = table
