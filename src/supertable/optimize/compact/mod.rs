@@ -1073,13 +1073,26 @@ const WAVE_MEMORY_RESERVE_PERCENT: u64 = 40;
 /// minutes; a short settle between admissions costs nothing measurable.
 const WAVE_ADMIT_SETTLE: Duration = Duration::from_millis(250);
 
-/// Whether the host still has room for one more concurrent merge.
+/// Whether the host still has room for one more concurrent merge: reads the
+/// machine once and hands both figures to [`has_room_for_another_merge`].
+///
+/// Split so the decision itself is a pure function of two numbers. Reading
+/// inside the predicate would mean a test could only re-derive the same
+/// arithmetic from a second, later reading of the same host.
+fn host_has_room_for_another_merge() -> bool {
+    has_room_for_another_merge(available_memory_bytes(), total_memory_bytes())
+}
+
+/// Whether a host reporting `available` of `total` bytes has room for one more
+/// concurrent merge.
 ///
 /// `true` where memory cannot be read at all: there is nothing to throttle
-/// against, and `auto` has already resolved to 1 on such a host, so the only
-/// way to be here is an explicit width the operator asked for.
-fn host_has_room_for_another_merge() -> bool {
-    let (Some(available), Some(total)) = (available_memory_bytes(), total_memory_bytes()) else {
+/// against, and a derived width has already resolved to 1 on such a host, so
+/// the only way to be here is an explicit width the operator asked for. A
+/// `total` of zero is a nonsense reading rather than an absent one, and is the
+/// one case that denies.
+fn has_room_for_another_merge(available: Option<u64>, total: Option<u64>) -> bool {
+    let (Some(available), Some(total)) = (available, total) else {
         return true;
     };
     total > 0 && available.saturating_mul(100) / total >= WAVE_MEMORY_RESERVE_PERCENT
@@ -4048,31 +4061,76 @@ mod tests {
         assert!(rest.len() < jobs.len());
     }
 
-    /// The admission decision reads the host rather than predicting from job
-    /// size, so a reserve that cannot possibly be satisfied stops the wave at
-    /// one, and a reserve that is trivially satisfied does not.
+    /// The reserve the cases below encode, written out rather than read from
+    /// [`WAVE_MEMORY_RESERVE_PERCENT`]: a test that takes its inputs from the
+    /// value it is checking moves with a wrong edit instead of failing on it.
+    const SHIPPED_RESERVE_PERCENT: u64 = 40;
+    /// One point under the reserve — the widest share that must be denied.
+    const UNDER_RESERVE_PERCENT: u64 = 39;
+    /// A host with nothing else on it.
+    const IDLE_HOST_PERCENT: u64 = 100;
+    /// A host with nothing left.
+    const EXHAUSTED_HOST_PERCENT: u64 = 0;
+
+    /// Free share of a synthetic 100 GiB host, as the two readings the
+    /// decision takes. Fixed inputs: the running machine's own memory is not
+    /// an input here, so the test cannot flake when the host itself sits near
+    /// the reserve, and nothing re-derives the predicate's arithmetic.
+    fn host_at(free_percent: u64) -> (Option<u64>, Option<u64>) {
+        const SYNTHETIC_HOST_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+        (
+            Some(SYNTHETIC_HOST_BYTES / 100 * free_percent),
+            Some(SYNTHETIC_HOST_BYTES),
+        )
+    }
+
+    /// The admission decision follows the host's free share against the
+    /// reserve, and admits at exactly the reserve rather than only above it.
+    /// The 40/39 pair pins both the constant and the comparison: lower the
+    /// reserve and the first assertion fails, tighten `>=` to `>` and the
+    /// second does.
     ///
-    /// This is the property the previous two attempts lacked: nothing here
-    /// depends on what a merge costs per byte, which is a function of term
-    /// cardinality, posting density and which indexes a table carries — none
-    /// of it knowable from `input_bytes`.
+    /// Nothing here depends on what a merge costs per byte, which is a
+    /// function of term cardinality, posting density and which indexes a table
+    /// carries — none of it knowable from `input_bytes`.
     #[test]
     fn room_for_another_merge_is_judged_against_the_host() {
-        // Whatever this host reports, the answer must be a decision and not a
-        // panic, and must be permissive where memory cannot be read at all.
-        let verdict = host_has_room_for_another_merge();
-        match (available_memory_bytes(), total_memory_bytes()) {
-            (Some(available), Some(total)) if total > 0 => {
-                let share = available * 100 / total;
-                assert_eq!(
-                    verdict,
-                    share >= WAVE_MEMORY_RESERVE_PERCENT,
-                    "verdict must follow the host's free share ({share}%)"
-                );
-            }
-            // No procfs: nothing to throttle against, so do not throttle.
-            _ => assert!(verdict, "an unreadable host must not block admission"),
-        }
+        assert_eq!(
+            WAVE_MEMORY_RESERVE_PERCENT, SHIPPED_RESERVE_PERCENT,
+            "the shares below are written against a {SHIPPED_RESERVE_PERCENT}% reserve"
+        );
+
+        let (available, total) = host_at(SHIPPED_RESERVE_PERCENT);
+        assert!(
+            has_room_for_another_merge(available, total),
+            "a host exactly at the reserve still admits"
+        );
+        let (available, total) = host_at(UNDER_RESERVE_PERCENT);
+        assert!(
+            !has_room_for_another_merge(available, total),
+            "a host one point under the reserve does not"
+        );
+        let (available, total) = host_at(IDLE_HOST_PERCENT);
+        assert!(has_room_for_another_merge(available, total), "an idle host");
+        let (available, total) = host_at(EXHAUSTED_HOST_PERCENT);
+        assert!(
+            !has_room_for_another_merge(available, total),
+            "an exhausted host"
+        );
+    }
+
+    /// A host whose memory cannot be read does not throttle: there is nothing
+    /// to throttle against, and a derived width is already 1 there, so the
+    /// only way to reach this path is a width an operator set explicitly.
+    /// A zero total is a nonsense reading rather than an absent one, and is
+    /// the one case that denies.
+    #[test]
+    fn an_unreadable_host_does_not_throttle() {
+        const SOME_BYTES: u64 = 1024 * 1024 * 1024;
+        assert!(has_room_for_another_merge(None, None));
+        assert!(has_room_for_another_merge(None, Some(SOME_BYTES)));
+        assert!(has_room_for_another_merge(Some(SOME_BYTES), None));
+        assert!(!has_room_for_another_merge(Some(SOME_BYTES), Some(0)));
     }
 
     // ---- concurrent jobs ------------------------------------------------
