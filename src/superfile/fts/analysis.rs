@@ -455,12 +455,20 @@ pub(crate) fn chain_name(base: Base, stopwords: Stopwords, stemmer: Stemmer) -> 
 /// that cannot alter output (a faster path over identical tokens) leaves it
 /// alone.
 ///
-/// The chain's revision is the highest of its parts, so adding a filter
-/// never lowers it and each part moves independently.
+/// The chain's revision is the sum of its parts', so each part moves it
+/// independently — see [`combine_revisions`].
 pub(crate) fn chain_revision(base: Base, stopwords: Stopwords, stemmer: Stemmer) -> u32 {
-    base.revision()
-        .max(stopwords.revision())
-        .max(stemmer.revision())
+    combine_revisions(base.revision(), stopwords.revision(), stemmer.revision())
+}
+
+/// Fold a chain's part revisions into the one number the format stores.
+///
+/// Summing rather than taking the maximum is what makes a filter bump
+/// visible: under a maximum, a stemmer moving from 0 to 1 is swallowed by
+/// a base already at 1, so the chain keeps its old revision and every file
+/// analyzed by the old stemmer reads as current.
+fn combine_revisions(base: u32, stopwords: u32, stemmer: u32) -> u32 {
+    base + stopwords + stemmer
 }
 
 /// Build the tokenizer for a chain: the bare base tokenizer when no
@@ -735,6 +743,114 @@ mod tests {
             8,
             "two bases x two stopword sets x two stemmers"
         );
+    }
+
+    /// Every shipped chain emits exactly these tokens. A change here is a
+    /// format change: columns already built hold the old terms and would
+    /// be queried with the new ones. Bump the part that moved
+    /// ([`Base::revision`] and friends) so a reindex can repair them —
+    /// do not re-record the expectations.
+    ///
+    /// The text covers what separates the chains: case, a hyphen split, a
+    /// digit run, a stopword, an inflected word, and non-ASCII including
+    /// an emoji — which `standard` emits as a token and `ascii_lower`
+    /// drops.
+    #[test]
+    fn every_chain_emits_its_recorded_tokens() {
+        const TEXT: &str = "The Quick brown-foxes JUMPED over 42 lazy dogs! Café ☕ naïve";
+        let expected: [(&str, &[&str]); 8] = [
+            (
+                "ascii_lower",
+                &[
+                    "the", "quick", "brown", "foxes", "jumped", "over", "42", "lazy", "dogs",
+                ],
+            ),
+            (
+                "ascii_lower+stop=english",
+                &[
+                    "quick", "brown", "foxes", "jumped", "over", "42", "lazy", "dogs",
+                ],
+            ),
+            (
+                "ascii_lower+stem=english",
+                &[
+                    "the", "quick", "brown", "fox", "jump", "over", "42", "lazi", "dog",
+                ],
+            ),
+            (
+                "ascii_lower+stop=english+stem=english",
+                &["quick", "brown", "fox", "jump", "over", "42", "lazi", "dog"],
+            ),
+            (
+                "standard",
+                &[
+                    "the", "quick", "brown", "foxes", "jumped", "over", "42", "lazy", "dogs",
+                    "café", "☕", "naïve",
+                ],
+            ),
+            (
+                "standard+stop=english",
+                &[
+                    "quick", "brown", "foxes", "jumped", "over", "42", "lazy", "dogs", "café",
+                    "☕", "naïve",
+                ],
+            ),
+            (
+                "standard+stem=english",
+                &[
+                    "the", "quick", "brown", "fox", "jump", "over", "42", "lazi", "dog", "café",
+                    "☕", "naïv",
+                ],
+            ),
+            (
+                "standard+stop=english+stem=english",
+                &[
+                    "quick", "brown", "fox", "jump", "over", "42", "lazi", "dog", "café", "☕",
+                    "naïv",
+                ],
+            ),
+        ];
+        for (name, want) in expected {
+            assert_eq!(
+                tokens(name, TEXT),
+                want,
+                "{name:?} changed what it emits. This is a format change: \
+                 bump the part that moved rather than re-recording this."
+            );
+        }
+    }
+
+    /// Every chain is at revision 1 today, which is what makes summing the
+    /// parts a no-op for existing files: no column's recorded revision
+    /// changes meaning under the new rule.
+    #[test]
+    fn every_shipped_chain_is_at_revision_one() {
+        for base in [Base::AsciiLower, Base::Standard] {
+            for stop in [Stopwords::None, Stopwords::English] {
+                for stem in [Stemmer::None, Stemmer::English] {
+                    let name = chain_name(base, stop, stem);
+                    assert_eq!(
+                        chain_revision(base, stop, stem),
+                        1,
+                        "{name:?} moved off revision 1 — every file it wrote \
+                         reads as stale, so this needs to be deliberate"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A bump in any one part must move the chain's revision. Taking the
+    /// maximum instead hides a filter bump behind a higher base, so a
+    /// column whose stemmer moved keeps reporting the revision it had and
+    /// a reindex leaves its terms stale.
+    #[test]
+    fn a_chain_revision_moves_when_any_single_part_moves() {
+        let flat = combine_revisions(1, 0, 0);
+        assert_eq!(combine_revisions(2, 0, 0), flat + 1, "base moved");
+        assert_eq!(combine_revisions(1, 1, 0), flat + 1, "stopwords moved");
+        assert_eq!(combine_revisions(1, 0, 1), flat + 1, "stemmer moved");
+        assert_eq!(combine_revisions(2, 1, 1), flat + 3, "every part moved");
     }
 
     /// The persisted field values round-trip, and a value this engine
