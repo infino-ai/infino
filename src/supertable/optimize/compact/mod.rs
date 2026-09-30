@@ -15,7 +15,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -32,7 +32,7 @@ use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::{CompactionSettings, RecalibratePolicy},
+    config::{CompactionSettings, RecalibratePolicy, global},
     runtime_bridge::{bridge_on_runtime, run_on_pool},
     runtime_metrics::rss::{available_memory_bytes, total_memory_bytes},
     superfile::{
@@ -143,7 +143,7 @@ impl Supertable {
         cfg: &CompactionSettings,
         recalibrate: RecalibratePolicy,
     ) -> Result<(), CompactionError> {
-        let phase_timers = crate::config::global().diagnostics.optimize_phase_timers;
+        let phase_timers = global().diagnostics.optimize_phase_timers;
         Self::compact_one_table(self, cfg, recalibrate).await?;
         if matches!(
             self.inner().manifest.load().get_partition_strategy(),
@@ -250,10 +250,10 @@ impl Supertable {
             HashSet::new()
         };
         // Optimize phase timers ([optphase]); gated, off by default.
-        let phase_timers = crate::config::global().diagnostics.optimize_phase_timers;
+        let phase_timers = global().diagnostics.optimize_phase_timers;
         // How many merges this pass keeps in flight. Resolved once: the jobs
         // are planned from one snapshot, so the width must not drift mid-pass.
-        let concurrency = crate::config::global().compaction_concurrency(cfg);
+        let concurrency = global().compaction_concurrency(cfg);
         let mut __pt = Instant::now();
         if hidden_ivf {
             split_overflow_cells(Arc::clone(inner))
@@ -298,7 +298,7 @@ impl Supertable {
         // id. Deduped here, not in `select`: the drain-watermark split below
         // could otherwise put two copies of one superfile in different jobs.
         let now = Utc::now();
-        let stale_seal_timeout = std::time::Duration::from_millis(cfg.stale_seal_timeout_ms);
+        let stale_seal_timeout = Duration::from_millis(cfg.stale_seal_timeout_ms);
         let listed = manifest.get_all_superfiles();
         let stats: Vec<SuperfileStats> = listed_once(listed, |entry| entry.superfile_id)
             .map(|entry| {
@@ -637,7 +637,7 @@ impl Supertable {
     pub(crate) async fn prepare_compaction_job(
         &self,
         job: CompactionJob,
-        stale_seal_timeout: std::time::Duration,
+        stale_seal_timeout: Duration,
     ) -> Result<PreparedJob, CompactionError> {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
@@ -995,7 +995,7 @@ impl Supertable {
     pub(crate) async fn run_compaction_job(
         &self,
         job: CompactionJob,
-        stale_seal_timeout: std::time::Duration,
+        stale_seal_timeout: Duration,
     ) -> Result<(), CompactionError> {
         let prepared = self.prepare_compaction_job(job, stale_seal_timeout).await?;
         self.commit_compaction_batch(vec![prepared]).await
@@ -1011,7 +1011,7 @@ impl Supertable {
     async fn run_compaction_jobs(
         &self,
         jobs: Vec<CompactionJob>,
-        stale_seal_timeout: std::time::Duration,
+        stale_seal_timeout: Duration,
         concurrency: usize,
     ) -> Result<(), CompactionError> {
         let concurrency = concurrency.max(1);
@@ -1071,7 +1071,7 @@ const WAVE_MEMORY_RESERVE_PERCENT: u64 = 40;
 /// memory again. Resident size lags admission, so deciding immediately would
 /// widen the wave against a reading that has not caught up yet. Merges run for
 /// minutes; a short settle between admissions costs nothing measurable.
-const WAVE_ADMIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+const WAVE_ADMIT_SETTLE: Duration = Duration::from_millis(250);
 
 /// Whether the host still has room for one more concurrent merge.
 ///
@@ -1209,7 +1209,7 @@ async fn seal_with_bounded_retry(
     superfile_id: Uuid,
     compaction_id: Uuid,
     sealed_at: chrono::DateTime<Utc>,
-    stale_seal_timeout: std::time::Duration,
+    stale_seal_timeout: Duration,
     max_retries: u32,
 ) -> Result<(TombstonesSidecar, Etag), CompactionError> {
     for attempt in 0..max_retries {
@@ -1248,7 +1248,7 @@ async fn seal_with_bounded_retry(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, mem, str, sync::Arc, time::Duration};
+    use std::{collections::HashSet, env, mem, str, sync::Arc, time::Duration};
 
     use arrow_array::{
         ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
@@ -1265,7 +1265,7 @@ mod tests {
     };
     use crate::{
         Bm25Stats, BoolMode, VectorSearchOptions,
-        config::{DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
+        config::{DEFAULT_GC_SAFETY_GAP, DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
         memory::ConnectionMemoryBudget,
         superfile::{
             builder::{FtsConfig, VectorConfig},
@@ -1285,8 +1285,8 @@ mod tests {
         },
     };
 
-    const DEFAULT_STALE_SEAL_TIMEOUT: std::time::Duration =
-        std::time::Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
+    const DEFAULT_STALE_SEAL_TIMEOUT: Duration =
+        Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
 
     // ---- run_compaction_job error arms ------------------------------
 
@@ -3672,7 +3672,7 @@ mod tests {
     ];
 
     fn env_usize(key: &str, default: usize) -> usize {
-        std::env::var(key)
+        env::var(key)
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
@@ -3903,7 +3903,7 @@ mod tests {
         // Default 1-day safety gap: everything here is brand new, so
         // gc() deletes nothing yet.
         let default_gap_report = st
-            .gc(crate::config::DEFAULT_GC_SAFETY_GAP)
+            .gc(DEFAULT_GC_SAFETY_GAP)
             .expect("gc with default safety gap");
         assert_eq!(default_gap_report.objects_deleted, 0);
         let after_default_gc_objects = storage
@@ -3915,9 +3915,7 @@ mod tests {
 
         // A shrunk safety gap reclaims the orphaned inputs, and disk
         // count catches up with the manifest.
-        let zero_gap_report = st
-            .gc(std::time::Duration::ZERO)
-            .expect("gc with zero safety gap");
+        let zero_gap_report = st.gc(Duration::ZERO).expect("gc with zero safety gap");
         assert!(
             zero_gap_report.objects_deleted > 0,
             "a gc() past the safety gap must reclaim the orphaned pre-merge inputs"

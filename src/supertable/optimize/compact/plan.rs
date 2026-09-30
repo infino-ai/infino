@@ -215,7 +215,7 @@ impl PendingJob {
 
 #[cfg(test)]
 pub(in crate::supertable::optimize::compact) mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use proptest::prelude::*;
     use uuid::Uuid;
@@ -527,7 +527,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
 
             let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
             let candidates: HashSet<Uuid> = stats.iter().map(|s| s.superfile_id).collect();
-            let by_id: std::collections::HashMap<Uuid, &SuperfileStats> =
+            let by_id: HashMap<Uuid, &SuperfileStats> =
                 stats.iter().map(|s| (s.superfile_id, s)).collect();
 
             let mut claimed: HashSet<Uuid> = HashSet::new();
