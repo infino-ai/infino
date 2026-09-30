@@ -61,7 +61,7 @@ use crate::{
             try_commit_attempt,
         },
     },
-    utils::trace::detail_span,
+    utils::trace::{detail_span, record},
 };
 
 struct CompactionSlot<'a>(&'a AtomicBool);
@@ -786,6 +786,22 @@ impl Supertable {
     ///
     /// A single-job batch is exactly the historical per-job commit, which is
     /// what keeps a serial pass byte-for-byte what it was.
+    ///
+    /// `jobs` is what the wave handed in and `committed` what survived, so a
+    /// job whose inputs another compactor took shows as a gap between them.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "commit_compaction_batch",
+            skip_all,
+            fields(
+                role = self.role().as_str(),
+                jobs = batch.len(),
+                attempts = tracing::field::Empty,
+                committed = tracing::field::Empty,
+            )
+        )
+    )]
     pub(crate) async fn commit_compaction_batch(
         &self,
         mut batch: Vec<PreparedJob>,
@@ -869,7 +885,10 @@ impl Supertable {
                 .collect();
             let mut pending_storage_replaces: Vec<(String, Bytes)> = Vec::new();
 
-            match try_commit_attempt(
+            // The CAS on its own, separated from the cache warm and reclaim
+            // that follow it: one span over the whole retry loop could not
+            // tell a slow pointer write from several fast ones plus backoff.
+            let attempt_outcome = try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
                 current,
@@ -880,9 +899,17 @@ impl Supertable {
                 &mut pending_storage_replaces,
                 &term_contributions,
             )
-            .await
-            {
+            .instrument(detail_span!(
+                "compaction_commit_attempt",
+                attempt = attempt,
+                superfiles_added = new_entries.len(),
+                superfiles_removed = entries_to_remove.len(),
+            ))
+            .await;
+            match attempt_outcome {
                 Ok(new_manifest) => {
+                    record("attempts", attempt + 1);
+                    record("committed", batch.len());
                     inner.manifest.store(Arc::new(new_manifest));
                     // Warm each merged superfile into the in-memory reader
                     // cache, same as a normal writer commit does. Without
