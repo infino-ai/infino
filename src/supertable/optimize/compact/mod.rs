@@ -422,7 +422,20 @@ impl Supertable {
         Ok(())
     }
 
-    /// Merges the given superfiles into one
+    /// Merges the given superfiles into one, dropping the rows `tombstones`
+    /// marks dead.
+    ///
+    /// `tombstones` maps each input to the bitmap its sidecar held when the
+    /// caller sealed it. The caller has to supply them because only it knows
+    /// its reads are current: it GETs each sidecar under the seal, so no bit
+    /// can land behind that read. Reading them here instead, through the
+    /// sidecar cache, would be a read against whatever seq view this handle
+    /// last installed, and a handle that has not seen a delete's commit holds
+    /// a view that predates it — the merge would then carry a deleted row into
+    /// the output and the commit would remove the input that held its bit.
+    ///
+    /// An input absent from the map is treated as having no tombstones, which
+    /// is correct for a superfile with no sidecar and a caller bug otherwise.
     #[cfg_attr(
         feature = "detailed-tracing",
         tracing::instrument(name = "merge_superfiles", skip_all, fields(inputs = superfiles.len()))
@@ -430,12 +443,19 @@ impl Supertable {
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
+        tombstones: &HashMap<Uuid, Arc<RoaringBitmap>>,
     ) -> Result<PreparedSuperfile, BuildError> {
+        debug_assert!(
+            tombstones.is_empty()
+                || superfiles
+                    .iter()
+                    .all(|e| tombstones.contains_key(&e.superfile_id)),
+            "every input needs its sealed tombstone bitmap, or its rows come back"
+        );
         let manifest = { self.inner().manifest.load().clone() };
         let store = manifest.options.store.clone();
         let disk_cache = manifest.options.disk_cache.clone();
         let storage = manifest.options.storage.clone();
-        let tombstone_cache = self.inner().tombstone_cache.clone();
 
         // This reserves budget for the whole input size since merge still
         // loads it all at once. Real fix is streaming the merge and pooling
@@ -486,25 +506,11 @@ impl Supertable {
         let mut readers = superfile_readers_tasks.join_all().await;
         readers.sort_unstable_by_key(|(idx, ..)| *idx);
 
-        let now = Instant::now();
-        if let Some(tombstone_cache) = &tombstone_cache {
-            let superfile_ids = superfiles
-                .iter()
-                .map(|entry| entry.superfile_id)
-                .collect::<Vec<_>>();
-
-            tombstone_cache.prefetch(&superfile_ids, now).await;
-        }
-
         let superseded_map = manifest.get_superseded_cells();
         let mut readers_with_tombstones = Vec::with_capacity(readers.len());
         let mut superseded_per_reader = Vec::with_capacity(readers.len());
         for (_idx, superfile_id, reader) in readers {
-            let bitmap = tombstone_cache
-                .as_ref()
-                .map(|t| t.bitmap_for(superfile_id, now))
-                .transpose()
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+            let bitmap = tombstones.get(&superfile_id).map(Arc::clone);
 
             let reader = reader.map_err(|e| BuildError::Store(e.to_string()))?;
             let superseded = superseded_map
@@ -699,7 +705,13 @@ impl Supertable {
             });
         }
 
-        let merged_segment = match self.merge_superfiles(&inputs).await {
+        // The bitmaps `seal` GETs are the authoritative ones: read from
+        // storage, under the seal, so nothing can land behind them.
+        let sealed_tombstones: HashMap<Uuid, Arc<RoaringBitmap>> = sealed
+            .iter()
+            .map(|s| (s.superfile_id, Arc::new(s.bitmap.clone())))
+            .collect();
+        let merged_segment = match self.merge_superfiles(&inputs, &sealed_tombstones).await {
             Ok(seg) => Some(seg),
             // Every input was fully dead — all cells tombstoned, or all
             // superseded by an in-place cell split. There is nothing live to
@@ -766,6 +778,7 @@ impl Supertable {
 
         Ok(PreparedJob {
             input_ids: job.inputs,
+            compaction_id,
             sealed,
             new_entries,
             pending_storage_writes,
@@ -852,6 +865,64 @@ impl Supertable {
             // gone, so there is no sidecar left to clear.
             for i in vanished.into_iter().rev() {
                 batch.remove(i);
+            }
+            if batch.is_empty() {
+                return match deferred_error {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                };
+            }
+
+            // Re-stamp every seal this batch holds, conditioned on the etag
+            // `seal` returned. A seal expires after `stale_seal_timeout`, and
+            // a wave outlives that: once it does, a writer treats the seal as
+            // abandoned, lands a tombstone on an input and changes its etag.
+            // Committing that input away would drop the bit on the floor,
+            // because the merged superfile was built from the bitmap the merge
+            // read. A job whose re-stamp loses is therefore stale and leaves
+            // the batch; the next pass merges those inputs again, this time
+            // seeing the tombstone. A won re-stamp also refreshes `sealed_at`,
+            // so the seal cannot go stale between here and the manifest CAS.
+            // `resolved` was built by walking `batch` in order and skipping
+            // the vanished, and the removals below preserve order, so
+            // `resolved[k]` is `batch[k]`'s. Its stored index predates the
+            // vanished removal and must not be used to address either.
+            debug_assert_eq!(resolved.len(), batch.len());
+            let mut stale: Vec<usize> = Vec::new();
+            let resealed_at = Utc::now();
+            for (i, prepared) in batch.iter_mut().enumerate() {
+                let compaction_id = prepared.compaction_id;
+                for input in prepared.sealed.iter_mut() {
+                    match tombstones_admin::refresh_seal(
+                        &wal_store,
+                        input.superfile_id,
+                        compaction_id,
+                        input.bitmap.clone(),
+                        resealed_at,
+                        &input.etag,
+                    )
+                    .await
+                    {
+                        Ok(etag) => input.etag = etag,
+                        Err(e) => {
+                            warn!(
+                                superfile_id = %input.superfile_id,
+                                error = %e,
+                                "compact: input sidecar changed under our seal, dropping the job"
+                            );
+                            stale.push(i);
+                            break;
+                        }
+                    }
+                }
+            }
+            // Back-to-front so the surviving indices stay valid. A stale job's
+            // seals are already gone from under it, so there is nothing to
+            // clear; its merged bytes are orphans for gc, like a vanished
+            // job's.
+            for i in stale.into_iter().rev() {
+                batch.remove(i);
+                resolved.remove(i);
             }
             if batch.is_empty() {
                 return match deferred_error {
@@ -1132,6 +1203,8 @@ async fn admit_wave(
 pub(crate) struct PreparedJob {
     /// Inputs this job claimed, in plan order.
     input_ids: Vec<Uuid>,
+    /// Owns the seals on those inputs; the commit re-stamps them under it.
+    compaction_id: Uuid,
     /// Seals placed on those inputs, cleared if the job never commits.
     sealed: Vec<SealedInput>,
     /// The merged superfile's entry. Empty on a pure reclaim, where every
@@ -1707,7 +1780,7 @@ mod tests {
 
         // Merge the superfiles - should succeed
         let _merged_superfile = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, &no_tombstones())
             .await
             .expect("merge_superfiles should succeed");
     }
@@ -1761,7 +1834,7 @@ mod tests {
 
         // Merge should succeed and preserve scalar stats
         let merged_superfile = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, &no_tombstones())
             .await
             .expect("merge_superfiles should succeed");
 
@@ -1841,7 +1914,7 @@ mod tests {
 
         // Merging 3 superfiles should succeed
         let merged_superfile = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, &no_tombstones())
             .await
             .expect("merge_superfiles should succeed");
 
@@ -1927,7 +2000,7 @@ mod tests {
         assert_eq!(superfiles.len(), N_INPUTS);
 
         let merged = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, &no_tombstones())
             .await
             .expect("merge_superfiles should succeed");
         let merged_reader = merged
@@ -1998,7 +2071,7 @@ mod tests {
         let inputs = &superfiles[..2];
 
         let merged = st
-            .merge_superfiles(inputs)
+            .merge_superfiles(inputs, &no_tombstones())
             .await
             .expect("merge_superfiles should succeed");
         let merged_reader = merged
@@ -2068,7 +2141,7 @@ mod tests {
         superfiles.sort_by_key(|sf| sf.id_min);
 
         let merged = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, &no_tombstones())
             .await
             .expect("merge_superfiles should succeed");
         let merged_reader = merged
@@ -2196,7 +2269,7 @@ mod tests {
         superfiles.sort_by_key(|sf| sf.id_min);
 
         let merged = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, &no_tombstones())
             .await
             .expect("merge_superfiles should succeed");
         let merged_reader = merged
@@ -2270,7 +2343,7 @@ mod tests {
         let reader = st.reader().expect("reader");
         let superfiles: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
 
-        match st.merge_superfiles(&superfiles).await {
+        match st.merge_superfiles(&superfiles, &no_tombstones()).await {
             Err(BuildError::MemoryBudgetExceeded(_)) => {}
             Err(other) => panic!("expected MemoryBudgetExceeded, got {other:?}"),
             Ok(_) => panic!("merge must be refused over budget"),
@@ -2307,7 +2380,7 @@ mod tests {
 
         // Merging a single superfile should succeed
         let merged_superfile = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, &no_tombstones())
             .await
             .expect("merge_superfiles should succeed");
 
@@ -2388,6 +2461,13 @@ mod tests {
     }
 
     // ─── Helpers shared by the end-to-end compact() tests ─────────────────
+
+    /// Inputs with no tombstone sidecars at all, which is every merge fixture
+    /// that never deletes. Named rather than inlined so a merge test that
+    /// DOES tombstone cannot pass an empty map by accident.
+    fn no_tombstones() -> HashMap<Uuid, Arc<RoaringBitmap>> {
+        HashMap::new()
+    }
 
     fn make_st(dir: &TempDir) -> Supertable {
         let storage: Arc<dyn StorageProvider> =
@@ -4385,6 +4465,234 @@ mod tests {
             "the tombstone must have landed once the wave published"
         );
         assert_eq!(before_docs, st.reader().expect("reader").n_docs_total());
+    }
+
+    /// A tombstone that lands while a wave's seal has gone stale survives the
+    /// wave's commit.
+    ///
+    /// A seal expires after `DEFAULT_STALE_SEAL_TIMEOUT_MS`, and a writer that
+    /// finds one expired treats its owner as dead, steals it and lands its bit
+    /// anyway. A wave holds every input sealed from prepare until the batch
+    /// commit, which on a large table runs longer than that. Committing such
+    /// an input away would drop the bit, because the merged superfile was
+    /// built from the bitmap the merge read — so the commit re-stamps each
+    /// seal against the etag it holds, and a job that lost one leaves the
+    /// batch. The delete stands and the merge is redone later.
+    ///
+    /// The wave's other job is untouched and must still commit: one stolen
+    /// seal costs its own job, not the pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_that_steals_a_stale_seal_survives_the_waves_commit() {
+        /// How far past the stale threshold the wave's seals are aged.
+        const AGED_PAST_STALE_MS: i64 =
+            tombstones_admin::DEFAULT_STALE_SEAL_TIMEOUT_MS as i64 + 60_000;
+
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let doomed = "delta first";
+        for term in ["alpha", "bravo", "charlie", "delta"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let live: Vec<Uuid> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert_eq!(live.len(), 4, "fixture");
+
+        // Stage a wave: every input sealed, every merge done, nothing committed.
+        let mut wave = Vec::new();
+        for pair in [[live[0], live[1]], [live[2], live[3]]] {
+            wave.push(
+                st.prepare_compaction_job(
+                    CompactionJob {
+                        partition_key: Vec::new(),
+                        inputs: pair.to_vec(),
+                        estimated_output_bytes: 0,
+                    },
+                    DEFAULT_STALE_SEAL_TIMEOUT,
+                )
+                .await
+                .expect("prepare"),
+            );
+        }
+
+        // Age every seal past the stale threshold. The wave is still running —
+        // only its seals now look abandoned to a writer, which is what a wave
+        // longer than the timeout looks like from the delete path.
+        //
+        // Aging means rewriting the sidecar, which moves its etag, so the
+        // wave's held etags are re-synced below. Real elapsed time moves
+        // `sealed_at` past the threshold without touching the object, and it
+        // is that state — stale seal, etag still the compactor's — the test
+        // has to reproduce. Skipping the re-sync would make every input look
+        // stolen and prove nothing.
+        let storage = st
+            .inner()
+            .manifest
+            .load_full()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed table");
+        let wal_store = WalStore::new(storage);
+        let aged = Utc::now() - chrono::Duration::milliseconds(AGED_PAST_STALE_MS);
+        for id in &live {
+            let (mut sidecar, etag) = wal_store
+                .get_tombstones(*id)
+                .await
+                .expect("get sidecar")
+                .expect("prepare sealed every input");
+            sidecar.seal.as_mut().expect("sealed by prepare").sealed_at = aged;
+            wal_store
+                .put_tombstones(*id, Some(&etag), &sidecar)
+                .await
+                .expect("age the seal");
+        }
+
+        for prepared in wave.iter_mut() {
+            for input in prepared.sealed.iter_mut() {
+                let (_, etag) = wal_store
+                    .get_tombstones(input.superfile_id)
+                    .await
+                    .expect("get sidecar")
+                    .expect("still sealed");
+                input.etag = etag;
+            }
+        }
+
+        // The delete finds a stale seal, steals it, and lands its bit on an
+        // input the wave is about to remove.
+        let deleting = st.clone();
+        let title = doomed.to_string();
+        let stats = task::spawn_blocking(move || deleting.delete(col("title").eq(lit(title))))
+            .await
+            .expect("delete task")
+            .expect("delete");
+        assert_eq!(
+            stats.n_tombstoned(),
+            1,
+            "the delete must steal the stale seal and land its bit"
+        );
+
+        // The wave commits, removing the inputs it merged before that landed.
+        st.commit_compaction_batch(wave)
+            .await
+            .expect("the wave commits");
+
+        // The row must still be gone. A second delete resolves against live
+        // rows, so a match here means the deleted row came back.
+        let deleting = st.clone();
+        let title = doomed.to_string();
+        let again = task::spawn_blocking(move || deleting.delete(col("title").eq(lit(title))))
+            .await
+            .expect("delete task")
+            .expect("delete");
+        assert_eq!(
+            again.matched(),
+            0,
+            "the deleted row must not survive the wave's commit"
+        );
+
+        // The job holding the stolen seal left the batch, so its inputs are
+        // still listed; the wave's other job committed as normal.
+        let after: Vec<Uuid> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert!(
+            after.contains(&live[2]) && after.contains(&live[3]),
+            "the job whose seal was stolen must not have committed"
+        );
+        assert!(
+            !after.contains(&live[0]) && !after.contains(&live[1]),
+            "the untouched job must still have merged"
+        );
+    }
+
+    /// A compactor whose tombstone view predates a committed delete still
+    /// drops the deleted row.
+    ///
+    /// The sidecar cache refreshes an entry only when its seq differs from the
+    /// seq view installed from THIS handle's manifest, so a handle that has
+    /// not seen a delete's commit holds a view that predates it. A merge
+    /// reading tombstones through that cache would carry the deleted row into
+    /// the output and then remove the input holding its bit. The seal is no
+    /// help here: the bit landed before the seal, so nothing changes the
+    /// sidecar afterwards. What makes it correct is that the merge uses the
+    /// bitmaps `seal` read from storage rather than anything cached.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_tombstone_view_does_not_resurrect_a_deleted_row() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let compactor =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+
+        let doomed = "alpha first";
+        commit_titles(&compactor, &[doomed, "alpha second"]);
+        commit_titles(&compactor, &["bravo first", "bravo second"]);
+        let live: Vec<Uuid> = compactor
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert_eq!(live.len(), 2, "fixture");
+
+        // A second handle deletes the row and commits it. The compactor handle
+        // is never refreshed, so its manifest and seq view stay behind.
+        let writer_handle =
+            Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("open second handle");
+        let title = doomed.to_string();
+        let stats = task::spawn_blocking(move || writer_handle.delete(col("title").eq(lit(title))))
+            .await
+            .expect("delete task")
+            .expect("delete");
+        assert_eq!(stats.n_tombstoned(), 1, "the delete landed its bit");
+
+        // The compactor merges both superfiles off its stale view and commits.
+        let prepared = compactor
+            .prepare_compaction_job(
+                CompactionJob {
+                    partition_key: Vec::new(),
+                    inputs: live.clone(),
+                    estimated_output_bytes: 0,
+                },
+                DEFAULT_STALE_SEAL_TIMEOUT,
+            )
+            .await
+            .expect("prepare");
+        compactor
+            .commit_compaction_batch(vec![prepared])
+            .await
+            .expect("commit");
+
+        // Read through a handle that is definitely current.
+        let checker =
+            Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("open checker");
+        let title = doomed.to_string();
+        let again = task::spawn_blocking(move || checker.delete(col("title").eq(lit(title))))
+            .await
+            .expect("delete task")
+            .expect("delete");
+        assert_eq!(
+            again.matched(),
+            0,
+            "the deleted row must not come back through a stale-view merge"
+        );
     }
 
     /// A batch that loses the manifest CAS retries as a batch: the merges are
