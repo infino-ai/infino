@@ -15,7 +15,7 @@
 //!                                                    ▼
 //!                        sleep the grace (readers pinned to `base` finish their fetches)
 //!                                                    │
-//!                        re-read the pointer ── fails? ──► delete nothing
+//!                        re-read the pointer ── fails? ──► put the keys back for the next sweep
 //!                                                    ▼
 //!                        skip keys the latest manifest names ──► DELETE the rest
 //! ```
@@ -26,28 +26,21 @@
 //! [`Supertable::gc`](crate::Supertable::gc), whose listing sweep `optimize` runs with a one-day
 //! grace.
 
-use std::{collections::HashSet, iter, mem, sync::Arc};
+use std::{collections::HashSet, mem, sync::Arc};
 
-use futures::{StreamExt, stream};
-use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
 use crate::{
-    storage::StorageError,
+    storage::StorageProvider,
     supertable::{
         ManifestSnapshot,
         error::GcError,
-        gc::refresh_to_committed,
+        gc::{delete_objects, list_refs, refresh_to_committed, term_index_slices},
         handle::SupertableInner,
-        manifest::{SuperfileEntry, SuperfileUri, commit::manifest_uri},
+        manifest::{SuperfileEntry, commit::manifest_uri, list::RoutingRef},
         wal::persistence::WalStore,
     },
 };
-
-/// DELETEs one sweep keeps in flight. A compaction can drop thousands of superfiles in one commit;
-/// issued one at a time that is minutes of wall clock, and unbounded it would crowd the
-/// object-store client the table's queries share.
-const RECLAIM_CONCURRENCY: usize = 32;
 
 /// Most keys a handle holds for its next deferred sweep. Some commit paths never schedule one
 /// (tombstone and term-index stamps, deletes mirrored onto the vector index), so a handle that
@@ -56,12 +49,17 @@ const RECLAIM_CONCURRENCY: usize = 32;
 /// which is where they went before this sweep existed.
 const MAX_PENDING_SUPERSEDED: usize = 100_000;
 
-/// Keys committed manifests dropped, waiting for a deferred sweep: removed superfiles and their
-/// tombstone sidecars, superseded manifest lists and parts, and replaced blobs (vector state and
-/// its sections, graph and router blobs, term stats, the term-index root).
+/// What committed manifests dropped, waiting for a deferred sweep.
 #[derive(Debug, Default)]
 pub(in crate::supertable) struct Superseded {
+    /// Removed superfiles and their tombstone sidecars, superseded manifest lists and parts, and
+    /// replaced list-level blobs (vector state and its sections, graph and router blobs, term
+    /// stats, the term-index root).
     keys: Vec<String>,
+    /// Replaced term-index roots. A root names its slices, and rebuilding the index (which
+    /// `optimize` does after compaction) leaves every old slice unreferenced at once; the sweep
+    /// reads each replaced root to find them.
+    term_index_roots: Vec<RoutingRef>,
 }
 
 /// What a deferred sweep did, for its summary line and for tests.
@@ -99,90 +97,69 @@ impl Superseded {
                 .filter(|uri| !kept.contains(uri))
                 .map(str::to_owned),
         );
-        Self { keys }
+        let term_index_roots = base
+            .term_index_ref()
+            .filter(|root| !kept.contains(root.uri.as_str()))
+            .cloned()
+            .into_iter()
+            .collect();
+        Self {
+            keys,
+            term_index_roots,
+        }
     }
 
     pub(in crate::supertable) fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.len() == 0
     }
 
     pub(in crate::supertable) fn len(&self) -> usize {
-        self.keys.len()
+        self.keys.len() + self.term_index_roots.len()
     }
 
     pub(in crate::supertable) fn extend(&mut self, other: Self) {
         self.keys.extend(other.keys);
+        self.term_index_roots.extend(other.term_index_roots);
     }
 }
 
-/// Every object a manifest's list references besides the list itself (parts, their routing
-/// siblings, and the list-level blobs): the same set the listing sweep keeps from the list, read
-/// with no I/O.
-fn list_refs(manifest: &ManifestSnapshot) -> impl Iterator<Item = &str> {
-    let parts = manifest.get_all_list_entries().iter().flat_map(|entry| {
-        iter::once(entry.uri.as_str())
-            .chain(entry.routing.as_ref().map(|routing| routing.uri.as_str()))
-    });
-    let blobs = [
-        manifest.slow_vector_state_blob().map(|(uri, _)| uri),
-        manifest
-            .slow_vector_state_centroids_blob()
-            .map(|r| r.uri.as_str()),
-        manifest
-            .resident_vector_index_blob()
-            .map(|r| r.uri.as_str()),
-        manifest
-            .slow_vector_state_centroid_graph_blob()
-            .map(|r| r.uri.as_str()),
-        manifest.term_stats_blob().map(|r| r.uri.as_str()),
-        manifest.term_index_ref().map(|r| r.uri.as_str()),
-    ]
-    .into_iter()
-    .flatten();
-    parts.chain(blobs)
-}
-
 /// Delete `superseded` against the table's committed state now. The caller has already waited the
-/// grace. Aborts, deleting nothing, if the pointer cannot be re-read: a keep-set that cannot be
-/// verified is the input that deletes live data.
+/// grace. If the pointer cannot be re-read, nothing is deleted and the keys go back on the handle
+/// for its next sweep: a keep-set that cannot be verified is the input that deletes live data.
 pub(in crate::supertable) async fn reclaim(
     inner: &SupertableInner,
     superseded: Superseded,
 ) -> Result<ReclaimReport, GcError> {
     let storage = inner.options.storage.clone().ok_or(GcError::NoStorage)?;
-    refresh_to_committed(inner).await?;
+    if let Err(error) = refresh_to_committed(inner).await {
+        inner.hold_superseded(superseded);
+        return Err(error);
+    }
     let latest = inner.manifest.load_full();
     let latest_list = manifest_uri(latest.get_manifest_id());
     let referenced: HashSet<&str> = list_refs(&latest).chain([latest_list.as_str()]).collect();
 
+    let Superseded {
+        keys,
+        term_index_roots,
+    } = superseded;
     let mut report = ReclaimReport::default();
-    let (kept, targets): (Vec<String>, Vec<String>) = superseded
-        .keys
+    let (kept, mut targets): (Vec<String>, Vec<String>) = keys
         .into_iter()
         .partition(|key| referenced.contains(key.as_str()));
     report.still_referenced = kept.len();
+    targets.extend(
+        orphaned_slices(storage.as_ref(), &term_index_roots, latest.term_index_ref()).await,
+    );
 
-    erase_cached_copies(inner, &targets).await;
-    let results: Vec<(String, Result<(), StorageError>)> = stream::iter(targets)
-        .map(|key| {
-            let storage = Arc::clone(&storage);
-            async move {
-                let result = storage.delete(&key).await;
-                (key, result)
-            }
-        })
-        .buffer_unordered(RECLAIM_CONCURRENCY)
-        .collect()
-        .await;
-    for (key, result) in results {
-        match result {
-            Ok(()) => report.deleted += 1,
-            Err(error) => {
-                report.failed += 1;
-                warn!(object = %key, %error, "gc: failed to delete a superseded object; the next listing sweep reclaims it");
-            }
+    delete_objects(inner, &storage, targets, |key, result| match result {
+        Ok(()) => report.deleted += 1,
+        Err(error) => {
+            report.failed += 1;
+            warn!(object = %key, %error, "gc: failed to delete a superseded object; the next listing sweep reclaims it");
         }
-    }
+    })
+    .await;
 
     debug!(
         deleted = report.deleted,
@@ -194,28 +171,38 @@ pub(in crate::supertable) async fn reclaim(
     Ok(report)
 }
 
-/// Drop the disk-cache copy of each superfile about to be deleted. Unlinking thousands of files is
-/// blocking filesystem work, so it runs on the blocking pool, off the runtime queries share.
-async fn erase_cached_copies(inner: &SupertableInner, keys: &[String]) {
-    let Some(cache) = inner.options.disk_cache.clone() else {
-        return;
+/// The slices the replaced term-index `roots` name and the `latest` root does not. A rebuilt index
+/// can hold slices with the same content, and so the same name, as the one it replaced, so the
+/// latest root's slices are always subtracted. A root that cannot be read leaves its slices to the
+/// listing sweep.
+async fn orphaned_slices(
+    storage: &dyn StorageProvider,
+    roots: &[RoutingRef],
+    latest: Option<&RoutingRef>,
+) -> Vec<String> {
+    if roots.is_empty() {
+        return Vec::new();
+    }
+    let live: HashSet<String> = match latest {
+        Some(root) => match term_index_slices(storage, root).await {
+            Ok(slices) => slices.into_iter().collect(),
+            Err(error) => {
+                warn!(%error, "gc: could not read the latest term-index root; leaving replaced slices to the listing sweep");
+                return Vec::new();
+            }
+        },
+        None => HashSet::new(),
     };
-    let uris: Vec<SuperfileUri> = keys
-        .iter()
-        .filter_map(|key| SuperfileUri::from_storage_path(key))
-        .collect();
-    if uris.is_empty() {
-        return;
-    }
-    if let Err(error) = spawn_blocking(move || {
-        for uri in &uris {
-            cache.erase_superfile_local_copy(uri);
+    let mut orphaned = Vec::new();
+    for root in roots {
+        match term_index_slices(storage, root).await {
+            Ok(slices) => orphaned.extend(slices.into_iter().filter(|slice| !live.contains(slice))),
+            Err(error) => {
+                warn!(%error, "gc: could not read a replaced term-index root; leaving its slices to the listing sweep")
+            }
         }
-    })
-    .await
-    {
-        warn!(%error, "gc: disk-cache erase for superseded superfiles did not finish");
     }
+    orphaned
 }
 
 impl SupertableInner {
@@ -229,9 +216,13 @@ impl SupertableInner {
         removed: &[Arc<SuperfileEntry>],
     ) {
         let superseded = Superseded::between(base, new, removed);
-        if superseded.is_empty() {
-            return;
+        if !superseded.is_empty() {
+            self.hold_superseded(superseded);
         }
+    }
+
+    /// Add `superseded` to what the next deferred sweep on this handle takes, up to the cap.
+    fn hold_superseded(&self, superseded: Superseded) {
         let mut pending = self.superseded.lock().expect("superseded mutex poisoned");
         if pending.len() + superseded.len() > MAX_PENDING_SUPERSEDED {
             debug!(
@@ -272,10 +263,14 @@ mod tests {
     use super::*;
     use crate::{
         CompactionSettings, OptimizeOptions,
-        storage::{LocalFsStorageProvider, ObjectMeta, StorageProvider},
+        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         supertable::{
             Supertable,
-            manifest::{commit::POINTER_PATH, list::RoutingRef, part::ContentHash},
+            gc::term_index_slices,
+            manifest::{
+                commit::POINTER_PATH, list::RoutingRef, part::ContentHash,
+                term_index::STORAGE_PREFIX as TERM_INDEX_STORAGE_PREFIX,
+            },
             writer::{CommitListMetadata, persist_commit_async},
         },
         test_helpers::{build_title_batch, default_supertable_options},
@@ -288,8 +283,8 @@ mod tests {
     const COMPACTION_INPUTS: usize = 10;
 
     /// Local storage wrapped so a test can see and steer what the sweep does: it counts LISTs,
-    /// can hold the next pointer swap until released (a commit stuck before its swap, as in the
-    /// incident this sweep exists for), and can fail pointer reads.
+    /// can hold the next pointer swap until released (a commit stalled between its upload and its
+    /// pointer swap), and can fail pointer reads.
     struct Hooked {
         inner: Arc<dyn StorageProvider>,
         lists: AtomicUsize,
@@ -435,8 +430,8 @@ mod tests {
             .expect("backdate");
     }
 
-    /// The incident this sweep exists for. One commit is stuck between uploading its superfile
-    /// and swapping the pointer, long enough that its upload is older than any grace, while the
+    /// A commit stalled between its upload and its pointer swap. One commit is stuck between
+    /// uploading its superfile and swapping the pointer, long enough that its upload is older than any grace, while the
     /// previous commit's deferred sweep runs. A listing sweep takes the upload for garbage; this
     /// sweep deletes only what committed manifests dropped, so the upload survives and the stuck
     /// commit lands on a file that is still there.
@@ -556,6 +551,7 @@ mod tests {
             st.inner(),
             Superseded {
                 keys: vec![latest_blob.clone()],
+                ..Superseded::default()
             },
         ))
         .expect("reclaim");
@@ -567,9 +563,10 @@ mod tests {
         );
     }
 
-    /// A sweep that cannot re-read the pointer cannot verify anything, so it deletes nothing.
+    /// A sweep that cannot re-read the pointer cannot verify anything, so it deletes nothing and
+    /// puts the keys back for the next sweep instead of leaving them for the daily one.
     #[test]
-    fn a_sweep_that_cannot_read_the_pointer_deletes_nothing() {
+    fn a_sweep_that_cannot_read_the_pointer_deletes_nothing_and_keeps_the_keys() {
         let dir = tempdir().expect("tempdir");
         let storage = Hooked::over(dir.path());
         let st = table(&storage);
@@ -588,6 +585,11 @@ mod tests {
                 "{key} deleted without a verified pointer"
             );
         }
+        assert_eq!(
+            st.inner().take_superseded().keys,
+            previous_list,
+            "the keys wait for the next sweep"
+        );
     }
 
     /// A commit that loses the pointer race and retries records what its winning attempt
@@ -633,6 +635,7 @@ mod tests {
         let _ = st.inner().take_superseded();
         *st.inner().superseded.lock().expect("pending") = Superseded {
             keys: vec![String::new(); MAX_PENDING_SUPERSEDED],
+            ..Superseded::default()
         };
 
         commit_title(&st, "betatoken marker");
@@ -698,5 +701,49 @@ mod tests {
             !recorded.keys.contains(&second.uri),
             "the stamped graph: {recorded:?}"
         );
+    }
+
+    /// Rebuilding the term index (which `optimize` does after compaction) leaves every old slice
+    /// unreferenced at once. The sweep reads each replaced root, so after it the only term-index
+    /// objects left are the latest root and the slices it names.
+    #[test]
+    fn an_optimize_that_rebuilds_the_term_index_leaves_only_the_live_slices() {
+        let dir = tempdir().expect("tempdir");
+        let storage = Hooked::over(dir.path());
+        let st = table(&storage);
+        for i in 0..COMPACTION_INPUTS {
+            commit_title(&st, &format!("token{i} marker"));
+        }
+        st.optimize(&OptimizeOptions::compact(CompactionSettings {
+            target_superfile_size_mb: 1,
+            min_fill_percent: 1,
+            ..CompactionSettings::default()
+        }))
+        .expect("optimize");
+        let superseded = st.inner().take_superseded();
+        assert!(
+            !superseded.term_index_roots.is_empty(),
+            "the optimize replaced the term-index root"
+        );
+
+        block_on(reclaim(st.inner(), superseded)).expect("reclaim");
+
+        let latest = st.inner().manifest.load_full();
+        let root = latest
+            .term_index_ref()
+            .expect("the table has a term index")
+            .clone();
+        let mut live: HashSet<String> = block_on(term_index_slices(storage.as_ref(), &root))
+            .expect("slices")
+            .into_iter()
+            .collect();
+        live.insert(root.uri);
+        let left = block_on(storage.list_with_prefix(TERM_INDEX_STORAGE_PREFIX)).expect("list");
+        for key in left {
+            assert!(
+                live.contains(&key),
+                "{key} outlived the sweep but the latest root does not name it"
+            );
+        }
     }
 }

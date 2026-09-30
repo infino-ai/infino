@@ -2,11 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    future, iter,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
+use futures::{StreamExt, stream};
+use tokio::task::spawn_blocking;
 use tracing::{debug, error, info, warn};
 
 pub(in crate::supertable) mod superseded;
@@ -21,6 +24,7 @@ use crate::{
         manifest::{
             SUPERFILE_DATA_DIR, SUPERFILE_KEY_SUFFIX, SuperfileUri,
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
+            list::RoutingRef,
             term_index::{self, STORAGE_PREFIX as TERM_INDEX_STORAGE_PREFIX},
             term_stats::STORAGE_PREFIX as TERM_STATS_STORAGE_PREFIX,
         },
@@ -34,6 +38,11 @@ use crate::{
 /// superseded superfiles after a manifest swap.
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) const DEFAULT_SUPERFILE_RECLAIM_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// DELETEs one sweep keeps in flight. A compaction can drop thousands of superfiles in one commit;
+/// issued one at a time that is minutes of wall clock, and unbounded it would crowd the
+/// object-store client the table's queries share.
+const RECLAIM_CONCURRENCY: usize = 32;
 
 /// Most referenced-but-unlisted superfiles one sweep confirms with a HEAD. A table that has lost
 /// more than this is already reported loudly, and a HEAD each for thousands would stall the sweep.
@@ -74,13 +83,8 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     live.insert(POINTER_PATH.to_string());
     live.insert(manifest_uri(manifest.manifest_id));
 
-    // The part fan this list is built from, plus each part's routing sibling where it has one.
-    for entry in manifest.get_all_list_entries() {
-        live.insert(entry.uri.clone());
-        if let Some(routing) = &entry.routing {
-            live.insert(routing.uri.clone());
-        }
-    }
+    // The parts, their routing siblings and the list-level blobs, all read off the list.
+    live.extend(list_refs(manifest).map(str::to_owned));
 
     // Every superfile, but only when the parts are all loaded. A partial view names some of the
     // superfiles and no more, so the caller must skip `data/` entirely rather than treat the ones
@@ -94,26 +98,6 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
         false
     };
 
-    // The slow-CAS state blob and its centroid section, read straight off the list refs with no
-    // fetch. Older drains are absent from the current list and age out past the safety gap.
-    if let Some((uri, _)) = manifest.slow_vector_state_blob() {
-        live.insert(uri.to_owned());
-    }
-    if let Some(centroids) = manifest.slow_vector_state_centroids_blob() {
-        live.insert(centroids.uri.clone());
-    }
-    if let Some(graphs) = manifest.resident_vector_index_blob() {
-        live.insert(graphs.uri.clone());
-    }
-    if let Some(centroid_graph) = manifest.slow_vector_state_centroid_graph_blob() {
-        live.insert(centroid_graph.uri.clone());
-    }
-    // The global term-stats sidecar, same list-ref discipline: the current
-    // artifact is live; superseded generations age out past the safety gap.
-    if let Some(stats) = manifest.term_stats_blob() {
-        live.insert(stats.uri.clone());
-    }
-
     // Each resident superfile's tombstone sidecar. `superfiles/` is swept whatever the flag says,
     // so these have to be named here or a sidecar past the gap is deleted and its deleted rows
     // come back. The superfile paths repeat what the complete view above already inserted.
@@ -123,6 +107,112 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     }
 
     (live, superfiles_complete)
+}
+
+/// Every object a manifest's list references besides the list itself: the parts and their routing
+/// siblings, and the list-level blobs (vector state and its sections, graph and router blobs, term
+/// stats, the term-index root). Read off the list with no I/O. The listing sweep keeps these and
+/// the deferred sweep diffs them, so a new kind of list reference is added here, once, for both.
+fn list_refs(manifest: &ManifestSnapshot) -> impl Iterator<Item = &str> {
+    let parts = manifest.get_all_list_entries().iter().flat_map(|entry| {
+        iter::once(entry.uri.as_str())
+            .chain(entry.routing.as_ref().map(|routing| routing.uri.as_str()))
+    });
+
+    let blobs = [
+        manifest.slow_vector_state_blob().map(|(uri, _)| uri),
+        manifest
+            .slow_vector_state_centroids_blob()
+            .map(|r| r.uri.as_str()),
+        manifest
+            .resident_vector_index_blob()
+            .map(|r| r.uri.as_str()),
+        manifest
+            .slow_vector_state_centroid_graph_blob()
+            .map(|r| r.uri.as_str()),
+        manifest.term_stats_blob().map(|r| r.uri.as_str()),
+        manifest.term_index_ref().map(|r| r.uri.as_str()),
+    ]
+    .into_iter()
+    .flatten();
+
+    parts.chain(blobs)
+}
+
+/// The slices a term-index root names, which takes reading the root, one small object. A root
+/// that cannot be read is a permanent failure on that URI: slices a sweep could not enumerate are
+/// slices it must not decide about.
+async fn term_index_slices(
+    storage: &dyn StorageProvider,
+    root: &RoutingRef,
+) -> Result<Vec<String>, GcError> {
+    let loaded = term_index::load_root(storage, root)
+        .await
+        .map_err(|error| {
+            GcError::Storage(StorageError::Permanent {
+                uri: root.uri.clone(),
+                source: Box::new(error),
+            })
+        })?;
+
+    Ok(loaded
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.slices)
+        .map(|slice| term_index::slice_uri(&slice.content_hash))
+        .collect())
+}
+
+/// Delete `keys`, each superfile's disk-cache copy first, at most [`RECLAIM_CONCURRENCY`] in
+/// flight. `on_result` sees every key's outcome as it arrives. Both sweeps delete through here.
+async fn delete_objects(
+    inner: &SupertableInner,
+    storage: &Arc<dyn StorageProvider>,
+    keys: Vec<String>,
+    mut on_result: impl FnMut(String, Result<(), StorageError>),
+) {
+    erase_cached_copies(inner, &keys).await;
+    stream::iter(keys)
+        .map(|key| {
+            let storage = Arc::clone(storage);
+            async move {
+                let result = storage.delete(&key).await;
+                (key, result)
+            }
+        })
+        .buffer_unordered(RECLAIM_CONCURRENCY)
+        .for_each(|(key, result)| {
+            on_result(key, result);
+            future::ready(())
+        })
+        .await;
+}
+
+/// Drop the disk-cache copy of each superfile about to be deleted. Unlinking thousands of files is
+/// blocking filesystem work, so it runs on the blocking pool, off the runtime queries share.
+async fn erase_cached_copies(inner: &SupertableInner, keys: &[String]) {
+    let Some(cache) = inner.options.disk_cache.clone() else {
+        return;
+    };
+
+    let uris: Vec<SuperfileUri> = keys
+        .iter()
+        .filter_map(|key| SuperfileUri::from_storage_path(key))
+        .collect();
+
+    if uris.is_empty() {
+        return;
+    }
+
+    if let Err(error) = spawn_blocking(move || {
+        for uri in &uris {
+            cache.erase_superfile_local_copy(uri);
+        }
+    })
+    .await
+    {
+        warn!(%error, "gc: disk-cache erase for deleted superfiles did not finish");
+    }
 }
 
 impl Supertable {
@@ -208,26 +298,9 @@ async fn live_set(
         }
     }
 
-    // The term index: the root the list references, and every slice that
-    // root names — which takes reading the root, one small object. A root
-    // that cannot be read is a permanent failure on that URI, surfaced the
-    // same way as an unreadable slow-state blob: deleting slices we could
-    // not enumerate would be exactly the loss this sweep exists to prevent.
+    // Every slice the term-index root names (the root itself is a list ref, already in).
     if let Some(reference) = manifest.term_index_ref() {
-        uris.insert(reference.uri.clone());
-        let root = term_index::load_root(storage.as_ref(), reference)
-            .await
-            .map_err(|error| {
-                GcError::Storage(StorageError::Permanent {
-                    uri: reference.uri.clone(),
-                    source: Box::new(error),
-                })
-            })?;
-        for segment in &root.segments {
-            for slice in &segment.slices {
-                uris.insert(term_index::slice_uri(&slice.content_hash));
-            }
-        }
+        uris.extend(term_index_slices(storage.as_ref(), reference).await?);
     }
     Ok(LiveSet {
         uris,
@@ -392,45 +465,40 @@ pub(super) async fn gc_storage_sweep_for_inner(
 
     let now = SystemTime::now();
     let mut young_superfiles_deleted = 0u64;
-    for (key, size, last_modified) in candidates {
-        // Drop the cache copy first.
-        if let (Some(cache), Some(uri)) = (
-            inner.options.disk_cache.as_ref(),
-            SuperfileUri::from_storage_path(&key),
-        ) {
-            cache.erase_superfile_local_copy(&uri);
-        }
-
-        match storage.delete(&key).await {
-            Ok(()) => {
-                report.objects_deleted += 1;
-                report.bytes_freed += size;
-                let age = now.duration_since(last_modified).unwrap_or_default();
-                if age < YOUNG_SUPERFILE_DELETE_AGE && key.ends_with(SUPERFILE_KEY_SUFFIX) {
-                    young_superfiles_deleted += 1;
-                    info!(
-                        object = %key,
-                        bytes = size,
-                        age_secs = age.as_secs(),
-                        manifest_id = checked_manifest_id,
-                        "gc: deleted a young superfile unreferenced by the committed manifest"
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
+    let mut listed: HashMap<String, (u64, SystemTime)> = HashMap::with_capacity(candidates.len());
+    let keys: Vec<String> = candidates
+        .into_iter()
+        .map(|(key, size, last_modified)| {
+            listed.insert(key.clone(), (size, last_modified));
+            key
+        })
+        .collect();
+    delete_objects(inner, &storage, keys, |key, result| match result {
+        Ok(()) => {
+            let (size, last_modified) = listed[&key];
+            report.objects_deleted += 1;
+            report.bytes_freed += size;
+            let age = now.duration_since(last_modified).unwrap_or_default();
+            if age < YOUNG_SUPERFILE_DELETE_AGE && key.ends_with(SUPERFILE_KEY_SUFFIX) {
+                young_superfiles_deleted += 1;
+                info!(
                     object = %key,
-                    error = %e,
-                    "gc: failed to delete orphan object"
+                    bytes = size,
+                    age_secs = age.as_secs(),
+                    manifest_id = checked_manifest_id,
+                    "gc: deleted a young superfile unreferenced by the committed manifest"
                 );
-                report.delete_errors += 1;
             }
         }
-    }
+        Err(e) => {
+            warn!(object = %key, error = %e, "gc: failed to delete orphan object");
+            report.delete_errors += 1;
+        }
+    })
+    .await;
 
-    // Every commit schedules a sweep, and under ingest most sweeps reclaim a few superseded manifest
-    // lists or parts, so a routine sweep stays at `debug`. One that deleted a young superfile or
-    // failed a delete is the one worth reading.
+    // A routine sweep stays at `debug`. One that deleted a young superfile (only possible with a
+    // gap shorter than a commit can take) or failed a delete is the one worth reading.
     if young_superfiles_deleted > 0 || report.delete_errors > 0 {
         info!(
             deleted = report.objects_deleted,
