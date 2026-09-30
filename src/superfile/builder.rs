@@ -1575,12 +1575,11 @@ impl SuperfileBuilder {
         fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts = merge_builder_opts(readers, first, fts_corpus);
+        let builder_opts = merge_builder_opts(readers, fts_corpus)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
+        let (first, _) = readers.first().ok_or(BuildError::BatchReadError)?;
         let vec_col = first
-            .0
             .vec()
             .and_then(|v| v.vector_columns_config().next())
             .ok_or_else(|| BuildError::VectorReadError)?;
@@ -1664,8 +1663,7 @@ impl SuperfileBuilder {
         fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts = merge_builder_opts(readers, first, fts_corpus);
+        let builder_opts = merge_builder_opts(readers, fts_corpus)?;
         if builder_opts.vector_layout != VectorLayout::MultiCellIvf {
             return Err(BuildError::VectorSchemaMismatch(
                 "build_from_multi_cell_sq8_ivf_readers requires multi-cell inputs".into(),
@@ -2160,9 +2158,7 @@ impl SuperfileBuilder {
         fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        let first = readers.first().ok_or(BuildError::BatchReadError)?;
-
-        let builder_opts = merge_builder_opts(readers, first, fts_corpus);
+        let builder_opts = merge_builder_opts(readers, fts_corpus)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         let mut stats_collector = Vec::with_capacity(readers.len());
@@ -2357,8 +2353,7 @@ impl SuperfileBuilder {
         output: W,
         merge: PostingMerge,
     ) -> Result<SuperfileStats, BuildError> {
-        let first = readers.first().ok_or(BuildError::BatchReadError)?;
-        let builder_opts = merge_builder_opts(readers, first, fts_corpus);
+        let builder_opts = merge_builder_opts(readers, fts_corpus)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         // Encode the Parquet body incrementally: each input's surviving rows are
@@ -3280,15 +3275,14 @@ fn fts_param_json(v: f32) -> String {
 /// [`BuilderOptions::lower_analysis_revision_to`].
 pub(crate) fn merge_builder_opts(
     readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-    first: &(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>),
     fts_corpus: &HashMap<String, ColumnLengthStats>,
-) -> BuilderOptions {
-    let mut opts =
-        BuilderOptions::new_from_reader(&first.0).with_fts_corpus_stats(fts_corpus.clone());
+) -> Result<BuilderOptions, BuildError> {
+    let (first, _) = readers.first().ok_or(BuildError::BatchReadError)?;
+    let mut opts = BuilderOptions::new_from_reader(first).with_fts_corpus_stats(fts_corpus.clone());
     for (reader, _) in readers.iter().skip(1) {
         opts.lower_analysis_revision_to(reader);
     }
-    opts
+    Ok(opts)
 }
 
 fn fts_columns_json(cols: &[FtsConfig]) -> String {

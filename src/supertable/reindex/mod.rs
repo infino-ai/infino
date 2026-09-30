@@ -523,8 +523,8 @@ impl Supertable {
         // `Layout` is compaction's build with deletions off; `Terms` is
         // this tool's own. Both carry the row set. Built once and shared,
         // because the plan picks between them per superfile.
-        let layout: Arc<dyn SuperfileMerge> = Arc::new(build::RewriteMerge);
-        let terms: Arc<dyn SuperfileMerge> = Arc::new(build::ReanalyzeMerge);
+        let layout: Arc<dyn SuperfileMerge> = Arc::new(build::RepairMerge(Repair::Layout));
+        let terms: Arc<dyn SuperfileMerge> = Arc::new(build::RepairMerge(Repair::Terms));
         for (done, (job, repair)) in plan_jobs(&all, opts.mode).into_iter().enumerate() {
             let merge = match repair {
                 Repair::Layout => &layout,

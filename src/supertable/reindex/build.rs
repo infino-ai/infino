@@ -30,33 +30,9 @@ use crate::{
         BuildError,
         manifest::SuperfileEntry,
         optimize::compact::{CompactionMerge, MergeInputs, SuperfileMerge},
+        reindex::Repair,
     },
 };
-
-/// Compaction's build, carrying the rows it would otherwise drop.
-///
-/// Restating the merge here would be a second copy that could drift from
-/// the one the table is actually compacted with.
-pub(crate) struct RewriteMerge;
-
-impl SuperfileMerge for RewriteMerge {
-    fn build(
-        &self,
-        inputs: MergeInputs<'_>,
-        output: &mut dyn Write,
-    ) -> Result<SuperfileStats, BuildError> {
-        match carry_body(&inputs) {
-            Some((reader, entry)) => {
-                rewrite_carrying_body_to(reader, entry, inputs.fts_corpus, output)
-            }
-            None => CompactionMerge.build(inputs, output),
-        }
-    }
-
-    fn preserves_tombstones(&self) -> bool {
-        true
-    }
-}
 
 /// The single resident input a carrying rewrite needs, or `None` when the
 /// merge path has to run instead.
@@ -105,41 +81,15 @@ fn carried_doc_count(
     Ok(())
 }
 
-/// Rebuild the FTS index, and copy every other byte of `source` across.
+/// A reindex's build, parameterised by the repair the plan chose.
 ///
-/// The output's stats are the input's: a carried body holds the same rows
-/// in the same order, so recomputing them from a decode this build does
-/// not perform would only be a chance to get them wrong.
-fn rewrite_carrying_body_to(
-    source: &Arc<SuperfileReader>,
-    entry: &Arc<SuperfileEntry>,
-    fts_corpus: &HashMap<String, ColumnLengthStats>,
-    output: &mut dyn Write,
-) -> Result<SuperfileStats, BuildError> {
-    let readers = [(Arc::clone(source), None)];
-    let first = &readers[0];
-    let builder_opts = merge_builder_opts(&readers, first, fts_corpus);
-    let mut builder = SuperfileBuilder::new(builder_opts)?;
-    builder.carry_fts_from_reader_scoped(source, None, CarryScope::AllColumns)?;
-    carried_doc_count(source, entry)?;
-    builder.set_carried_doc_count(entry.n_docs);
-    builder.finish_carrying_body_to(source, output)?;
-    Ok(SuperfileStats {
-        n_docs: entry.n_docs,
-        id_min: entry.id_min,
-        id_max: entry.id_max,
-        scalar_stats: entry.scalar_stats.clone(),
-    })
-}
+/// One type rather than two: the two repairs differ in which builder call
+/// produces the terms and whether the stored columns are re-analyzed, and
+/// nothing else. Spelling that as two structs and two carrying builds left
+/// four places for the parts they share to drift apart.
+pub(crate) struct RepairMerge(pub(crate) Repair);
 
-/// Rebuilds each input's FTS index from the text it stored.
-///
-/// The only build that changes a file's *terms*: every other rebuild
-/// copies postings, which is why a container rewrite leaves an older
-/// analyzer's output where it was.
-pub(crate) struct ReanalyzeMerge;
-
-impl SuperfileMerge for ReanalyzeMerge {
+impl SuperfileMerge for RepairMerge {
     fn build(
         &self,
         inputs: MergeInputs<'_>,
@@ -147,9 +97,14 @@ impl SuperfileMerge for ReanalyzeMerge {
     ) -> Result<SuperfileStats, BuildError> {
         match carry_body(&inputs) {
             Some((reader, entry)) => {
-                reanalyze_carrying_body_to(reader, entry, inputs.fts_corpus, output)
+                repair_carrying_body_to(self.0, reader, entry, inputs.fts_corpus, output)
             }
-            None => reanalyze_to(inputs.readers, inputs.fts_corpus, output),
+            // Restating compaction's merge here would be a second copy that
+            // could drift from the one the table is actually compacted with.
+            None => match self.0 {
+                Repair::Layout => CompactionMerge.build(inputs, output),
+                Repair::Terms => reanalyze_to(inputs.readers, inputs.fts_corpus, output),
+            },
         }
     }
 
@@ -158,22 +113,35 @@ impl SuperfileMerge for ReanalyzeMerge {
     }
 }
 
-/// Re-analyze `source`'s terms, and copy every other byte across.
+/// Apply `repair` to `source`'s FTS index, and copy every other byte
+/// across.
 ///
-/// Rows are unchanged by a re-analysis — only terms are — so the body and
-/// the vector subsection carry, and the vectors are never decoded. That is
-/// what the append path cannot do for a quantized codec.
-fn reanalyze_carrying_body_to(
+/// Rows are unchanged by either repair — only the index is — so the body
+/// and the vector subsection carry and the vectors are never decoded. That
+/// is what the append path cannot do for a quantized codec.
+///
+/// The output's stats are the input's: a carried body holds the same rows
+/// in the same order, so recomputing them from a decode this build does
+/// not perform would only be a chance to get them wrong.
+fn repair_carrying_body_to(
+    repair: Repair,
     source: &Arc<SuperfileReader>,
     entry: &Arc<SuperfileEntry>,
     fts_corpus: &HashMap<String, ColumnLengthStats>,
     output: &mut dyn Write,
 ) -> Result<SuperfileStats, BuildError> {
     let readers = [(Arc::clone(source), None)];
-    let first = &readers[0];
-    let builder_opts = merge_builder_opts(&readers, first, fts_corpus).reanalyze_stored_columns();
-    let mut builder = SuperfileBuilder::new(builder_opts)?;
-    builder.reanalyze_fts_from_reader(source)?;
+    let opts = merge_builder_opts(&readers, fts_corpus)?;
+    let mut builder = SuperfileBuilder::new(match repair {
+        Repair::Layout => opts,
+        Repair::Terms => opts.reanalyze_stored_columns(),
+    })?;
+    match repair {
+        Repair::Layout => {
+            builder.carry_fts_from_reader_scoped(source, None, CarryScope::AllColumns)?
+        }
+        Repair::Terms => builder.reanalyze_fts_from_reader(source)?,
+    }
     carried_doc_count(source, entry)?;
     builder.set_carried_doc_count(entry.n_docs);
     builder.finish_carrying_body_to(source, output)?;
@@ -199,8 +167,7 @@ fn reanalyze_to<W: Write>(
     fts_corpus: &HashMap<String, ColumnLengthStats>,
     output: W,
 ) -> Result<SuperfileStats, BuildError> {
-    let first = readers.first().ok_or(SuperfileBuildError::BatchReadError)?;
-    let builder_opts = merge_builder_opts(readers, first, fts_corpus).reanalyze_stored_columns();
+    let builder_opts = merge_builder_opts(readers, fts_corpus)?.reanalyze_stored_columns();
     let mut builder = SuperfileBuilder::new(builder_opts)?;
 
     let mut stats = Vec::with_capacity(readers.len());
