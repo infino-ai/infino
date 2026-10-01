@@ -91,8 +91,23 @@ pub(crate) fn set_process_limit(limit: Option<u64>) {
 }
 
 /// The limit from config, else from the cgroup, logged once so an operator can
-/// see what SQL is held to.
+/// see what SQL is held to. A limit the process cannot be measured against
+/// would look enforced and never be, so where `RssAnon` cannot be read there
+/// is none, and a warning says so.
 fn resolve_limit() -> Option<u64> {
+    let limit = configured_or_cgroup_limit();
+    if limit.is_some() && status_anon_rss_bytes().is_none() {
+        warn!(
+            ?limit,
+            "SQL process memory limit disabled: this platform does not report the process's \
+             anonymous resident memory"
+        );
+        return None;
+    }
+    limit
+}
+
+fn configured_or_cgroup_limit() -> Option<u64> {
     if let Some(bytes) = config::global().memory.process_limit_bytes {
         let limit = (bytes > 0).then_some(bytes);
         info!(?limit, "SQL process memory limit from config");
@@ -101,9 +116,16 @@ fn resolve_limit() -> Option<u64> {
     let cgroup = fs::read_to_string(PROC_SELF_CGROUP)
         .ok()
         .and_then(|membership| cgroup_memory_limit(Path::new(CGROUP_ROOT), &membership));
-    let limit = cgroup.map(|bytes| bytes / PERCENT * CGROUP_LIMIT_PERCENT);
+    let limit = cgroup.map(share_of_cgroup_limit);
     info!(?cgroup, ?limit, "SQL process memory limit from the cgroup");
     limit
+}
+
+/// The SQL limit for a cgroup limit of `bytes`: [`CGROUP_LIMIT_PERCENT`] of
+/// it, scaled before dividing so a small limit is not rounded away, and never
+/// 0, which would read as no limit.
+fn share_of_cgroup_limit(bytes: u64) -> u64 {
+    (bytes.saturating_mul(CGROUP_LIMIT_PERCENT) / PERCENT).max(1)
 }
 
 /// The lowest memory limit set on the cgroup v2 path `membership` names or on
@@ -288,6 +310,19 @@ mod tests {
         assert_eq!(cgroup_memory_limit(root.path(), WORKER_CGROUP), None);
         // cgroup v1 only: no `0::` entry to follow.
         assert_eq!(cgroup_memory_limit(root.path(), "4:memory:/worker\n"), None);
+    }
+
+    #[test]
+    fn the_sql_limit_is_ninety_percent_of_the_cgroups_and_never_rounds_to_none() {
+        let high: u64 = WORKER_HIGH.parse().expect("bytes");
+        assert_eq!(
+            share_of_cgroup_limit(high),
+            high * CGROUP_LIMIT_PERCENT / PERCENT
+        );
+        // Below 100 bytes, dividing first would give 0: no limit at all.
+        assert_eq!(share_of_cgroup_limit(1), 1);
+        // A limit near the top of the range saturates instead of overflowing.
+        assert!(share_of_cgroup_limit(u64::MAX) > 0);
     }
 
     #[cfg(target_os = "linux")]
