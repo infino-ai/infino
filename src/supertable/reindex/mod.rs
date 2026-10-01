@@ -675,7 +675,10 @@ mod tests {
     use crate::{
         Bm25SearchOptions,
         superfile::fts::reader::StaleColumn,
-        supertable::Supertable,
+        supertable::{
+            Supertable,
+            writer::{CommitListMetadata, persist_commit_async},
+        },
         test_helpers::{copy_dir_recursive, old_format_fts_fixture, open_old_format_fts_fixture},
     };
 
@@ -687,6 +690,59 @@ mod tests {
             .iter()
             .map(|b| b.num_rows())
             .sum()
+    }
+
+    /// A migration of a one-superfile table written before the term index
+    /// existed leaves an index that lists that superfile, and marks it so.
+    ///
+    /// The rewrite publishes the table's first index, from this commit's
+    /// postings alone, which is exactly what a full rebuild over the new
+    /// membership produces. Marked incomplete, part selection and global idf
+    /// would keep ignoring an index that is whole, and no later maintenance
+    /// pass would notice, since its rebuild finds the root it would write.
+    #[test]
+    fn a_migrated_single_superfile_table_marks_its_term_index_complete() {
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+        let (storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+        let manifest = table.reader().expect("reader").manifest().clone();
+        assert!(
+            manifest.term_index_ref().is_none(),
+            "the fixture must predate the term index for this to prove anything"
+        );
+
+        // Leave one stale superfile: drop the others from the membership.
+        let entries = table
+            .block_on_query(manifest.get_all_superfiles_loaded())
+            .expect("load entries");
+        table
+            .block_on_query(persist_commit_async(
+                table.inner(),
+                storage,
+                Vec::new(),
+                &entries[1..],
+                Vec::new(),
+                Vec::new(),
+                CommitListMetadata::empty(),
+                Vec::new(),
+            ))
+            .expect("drop all but one superfile");
+        table.block_on_query(table.refresh()).expect("refresh");
+
+        let report = table
+            .reindex(&ReindexOptions::default())
+            .expect("reindex the remaining superfile");
+        assert_eq!(report.rewritten, 1, "{report:?}");
+
+        let manifest = table.reader().expect("reader").manifest().clone();
+        assert!(
+            manifest.term_index_ref().is_some(),
+            "the rewrite publishes an index"
+        );
+        assert!(
+            manifest.term_index_complete(),
+            "the only live superfile is the one the index lists"
+        );
     }
 
     /// A re-analysis that repairs a table with a delete already on it.
