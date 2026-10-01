@@ -53,6 +53,14 @@ const PROC_SELF_STATUS: &str = "/proc/self/status";
 const PROC_MEMINFO: &str = "/proc/meminfo";
 /// Aggregated smaps rollup (Anonymous / Rss / Shmem).
 const PROC_SELF_SMAPS_ROLLUP: &str = "/proc/self/smaps_rollup";
+/// cgroup v2 memory ceiling for this process's cgroup, or the literal `max`.
+const CGROUP_MEMORY_MAX: &str = "/sys/fs/cgroup/memory.max";
+/// cgroup v2 current charge: anonymous, page cache and kernel memory.
+const CGROUP_MEMORY_CURRENT: &str = "/sys/fs/cgroup/memory.current";
+/// cgroup v2 breakdown of that charge, read for its reclaimable part.
+const CGROUP_MEMORY_STAT: &str = "/sys/fs/cgroup/memory.stat";
+/// `memory.max` for a cgroup with no ceiling of its own.
+const CGROUP_UNLIMITED: &str = "max";
 
 /// One-shot read of the calling process's current VmRSS in bytes.
 pub fn current_rss_bytes() -> Option<u64> {
@@ -66,22 +74,89 @@ pub fn current_rss_bytes() -> Option<u64> {
     None
 }
 
-/// One-shot read of the memory the kernel estimates is available for a new
-/// allocation without swapping (Linux `MemAvailable`), in bytes.
+/// One-shot read of the memory available for a new allocation without
+/// swapping, in bytes: this process's cgroup ceiling where it has one, the
+/// host's `MemAvailable` otherwise.
 ///
-/// Unlike total RAM this already discounts what other processes hold, which
-/// is what a sizing decision actually has to spend. Returns `None` on
-/// platforms without procfs, so every caller needs a conservative fallback
-/// rather than a guess at the machine's size.
+/// The cgroup comes first because `/proc/meminfo` reports the machine, not
+/// the limit the process actually lives under. In a 4 GiB container on a
+/// large host it reads back tens of gigabytes free, a sizing decision made
+/// on it admits work the cgroup cannot hold, and the OOM killer answers
+/// instead of the throttle.
+///
+/// Returns `None` on platforms with neither, so every caller needs a
+/// conservative fallback rather than a guess at the machine's size.
 pub fn available_memory_bytes() -> Option<u64> {
-    meminfo_field("MemAvailable:")
+    cgroup_available_bytes().or_else(|| meminfo_field("MemAvailable:"))
 }
 
-/// The host's total memory in bytes (Linux `MemTotal`), for expressing a
-/// reserve as a share of the machine rather than an absolute figure that
-/// would be wrong on the next host. `None` without procfs.
+/// Total memory a sizing decision may spend, in bytes: the cgroup's ceiling
+/// where it has one, the host's `MemTotal` otherwise. Paired with
+/// [`available_memory_bytes`] so a reserve can be a share of whichever of the
+/// two actually binds. `None` with neither.
 pub fn total_memory_bytes() -> Option<u64> {
-    meminfo_field("MemTotal:")
+    cgroup_memory_limit_bytes().or_else(|| meminfo_field("MemTotal:"))
+}
+
+/// This process's cgroup v2 memory ceiling, in bytes.
+///
+/// `None` without cgroup v2, and `None` for the literal `max`, which is a
+/// cgroup with no ceiling of its own: the host's figures are the right ones
+/// there. cgroup v1 is deliberately not read — it reports through a different
+/// hierarchy, and a v1 host falls back to the host figures, which is the
+/// behaviour it had before this existed.
+///
+/// Read from the cgroup root as this process sees it, which inside a
+/// container is the container's own cgroup.
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    parse_cgroup_limit(&fs::read_to_string(CGROUP_MEMORY_MAX).ok()?)
+}
+
+/// `memory.max`, as bytes. `None` for an absent ceiling.
+fn parse_cgroup_limit(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw == CGROUP_UNLIMITED {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+/// What this process's cgroup can still take, in bytes.
+///
+/// `max - current` alone would be far too pessimistic: most of a compaction's
+/// charge is page cache, which the kernel reclaims under pressure rather than
+/// OOM-killing for. So the reclaimable file pages are added back, which is
+/// the same accounting `MemAvailable` does for the host.
+fn cgroup_available_bytes() -> Option<u64> {
+    let limit = cgroup_memory_limit_bytes()?;
+    let current: u64 = fs::read_to_string(CGROUP_MEMORY_CURRENT)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let stat = fs::read_to_string(CGROUP_MEMORY_STAT).ok()?;
+    let reclaimable = memory_stat_field(&stat, "inactive_file").unwrap_or(0)
+        + memory_stat_field(&stat, "slab_reclaimable").unwrap_or(0);
+    Some(cgroup_headroom(limit, current, reclaimable))
+}
+
+/// Headroom left in a cgroup: what the ceiling has not charged, plus what is
+/// charged but reclaimable. Saturating, because `current` can exceed the
+/// ceiling momentarily and a sizing decision wants zero rather than a wrap.
+fn cgroup_headroom(limit: u64, current: u64, reclaimable: u64) -> u64 {
+    limit
+        .saturating_sub(current)
+        .saturating_add(reclaimable.min(current))
+        .min(limit)
+}
+
+/// One `memory.stat` field, in bytes. The file is `key value` per line, in
+/// bytes already, unlike `/proc/meminfo`'s kibibytes.
+fn memory_stat_field(raw: &str, key: &str) -> Option<u64> {
+    raw.lines()
+        .filter_map(|line| line.split_once(' '))
+        .find(|(name, _)| *name == key)
+        .and_then(|(_, value)| value.trim().parse().ok())
 }
 
 /// One `/proc/meminfo` field, in bytes.
@@ -361,5 +436,42 @@ mod tests {
         assert_eq!(stats.p90_rss_bytes, 50);
         assert_eq!(stats.peak_anon_rss_bytes, 30);
         assert_eq!(stats.peak_file_rss_bytes, 45);
+    }
+
+    /// A cgroup with no ceiling of its own reads back as absent, so the
+    /// caller falls through to the host's figures rather than treating the
+    /// literal `max` as a byte count.
+    #[test]
+    fn an_unlimited_cgroup_has_no_limit() {
+        assert_eq!(parse_cgroup_limit("max\n"), None);
+        assert_eq!(parse_cgroup_limit("4294967296\n"), Some(4_294_967_296));
+        assert_eq!(parse_cgroup_limit(""), None);
+    }
+
+    /// Headroom counts what the ceiling has not charged plus what is charged
+    /// but reclaimable, because most of a merge's charge is page cache the
+    /// kernel drops under pressure rather than OOM-killing for.
+    #[test]
+    fn cgroup_headroom_counts_reclaimable_charge() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // 4 GiB ceiling, 3 GiB charged, 2 GiB of it reclaimable file pages.
+        assert_eq!(cgroup_headroom(4 * GIB, 3 * GIB, 2 * GIB), 3 * GIB);
+        // Nothing reclaimable: only the uncharged remainder is available.
+        assert_eq!(cgroup_headroom(4 * GIB, 3 * GIB, 0), GIB);
+        // Over the ceiling, and a reclaimable figure larger than the charge:
+        // neither may wrap or exceed the ceiling.
+        assert_eq!(cgroup_headroom(4 * GIB, 5 * GIB, 0), 0);
+        assert_eq!(cgroup_headroom(4 * GIB, GIB, 9 * GIB), 4 * GIB);
+    }
+
+    /// `memory.stat` is `key value` in bytes, not `/proc/meminfo`'s kibibytes,
+    /// and a prefix must not match a longer key.
+    #[test]
+    fn memory_stat_fields_parse_in_bytes() {
+        let raw = "anon 1024\nfile 2048\ninactive_file 512\nslab_reclaimable 256\n";
+        assert_eq!(memory_stat_field(raw, "inactive_file"), Some(512));
+        assert_eq!(memory_stat_field(raw, "slab_reclaimable"), Some(256));
+        assert_eq!(memory_stat_field(raw, "file"), Some(2048));
+        assert_eq!(memory_stat_field(raw, "absent"), None);
     }
 }
