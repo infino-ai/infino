@@ -21,10 +21,15 @@ categories = ["database", "database-implementations"]
 # small JS script that regenerates it) at runtime; both are kept out of
 # the published crate — they would push the tarball past the registry
 # size limit and aren't needed to build the library or the example.
+# The corpus generators are standalone crates pinning old published
+# releases, built by `tests/corpus/generate.sh` and never by this package.
+# Their lockfiles alone are ~700 KB of vendored dependency graphs that no
+# crate consumer can use.
 exclude = [
     "infino-python/",
     "examples/locomo-recall/fixture.json",
     "examples/locomo-recall/embed.mjs",
+    "tests/corpus/generators/",
 ]
 # Disable cargo's auto-discovery of `benches/*.rs` as bench
 # binaries — every bench target is declared explicitly via

@@ -463,6 +463,10 @@ impl Supertable {
         &self,
         opts: &ReindexOptions,
     ) -> Result<StalenessReport, ReindexError> {
+        // Matched here as well as in the two entry points that act, so a
+        // second target cannot report against the full-text index while a
+        // run repairs something else.
+        let ReindexTarget::Superfile(SuperfileIndex::Fts) = opts.target;
         if self.inner().manifest.load_full().options.storage.is_none() {
             return Err(ReindexError::NoStorage);
         }
