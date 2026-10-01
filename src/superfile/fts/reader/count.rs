@@ -434,7 +434,15 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         // What a cursor built for an inline term would score it at: this
         // superfile's own idf for df = 1, unweighted.
-        let inline_idf = bm25::idf(col_meta.scored_doc_count(), 1);
+        //
+        // A column no row in this superfile filled has no scored documents
+        // and so no inline term to score — `df = 1` against `n_docs = 0` is
+        // not a ratio, so it is not computed. Reachable on a table where one
+        // indexed column is sparse enough to miss a whole superfile.
+        let inline_idf = match col_meta.scored_doc_count() {
+            0 => 0.0,
+            scored => bm25::idf(scored, 1),
+        };
 
         let mut out = Vec::with_capacity(entries.len());
         let mut with_postings: Vec<usize> = Vec::new();
@@ -1250,6 +1258,48 @@ mod tests {
         assert_eq!(batched, vec![2, 0, 1, 3, 0], "planted document frequencies");
         // Empty input short-circuits to empty output (no dict open, no fetch).
         assert!(r.term_dfs("body", &[]).await.expect("empty").0.is_empty());
+    }
+
+    /// A column no row in this superfile filled is walked without
+    /// computing an idf for it.
+    ///
+    /// Sparse columns miss whole superfiles — a compaction or a repair
+    /// that lands such a shard would otherwise ask for `df = 1` against
+    /// `n_docs = 0`, which is not a ratio and trips the scorer's
+    /// precondition.
+    #[tokio::test]
+    async fn a_column_with_no_scored_documents_walks_without_scoring() {
+        const N_DOCS: u32 = 8;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("filled".into(), false).expect("register");
+        b.register_column("empty".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            b.add_doc(0, i, &format!("common u{i}"))
+                .expect("add filled");
+            // Indexed for row alignment, but every cell is empty.
+            b.add_doc(1, i, "").expect("add empty");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"filled","tokenizer":"ascii_lower"},{"name":"empty","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let fst_bytes = r.dict_bytes_async().await.expect("dict");
+
+        let walked = r
+            .term_index_facts_after(&fst_bytes, "empty", None, 16)
+            .await
+            .expect("walking an empty column must not panic");
+        assert!(
+            walked.is_empty(),
+            "an empty column has no terms: {walked:?}"
+        );
+
+        // The filled column beside it still reports its terms.
+        let filled = r
+            .term_index_facts_after(&fst_bytes, "filled", None, 16)
+            .await
+            .expect("walk");
+        assert!(!filled.is_empty(), "the filled column still has terms");
     }
 
     /// The walk with values gives every term exactly the fact the lookup
