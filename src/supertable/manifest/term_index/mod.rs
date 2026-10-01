@@ -702,6 +702,7 @@ mod tests {
     use crate::{
         storage::LocalFsStorageProvider,
         supertable::query::prune::select_superfiles,
+        test_helpers::{copy_dir_recursive, old_format_fts_fixture, open_old_format_fts_fixture},
         utils::terms::{FstValue, make_key},
     };
 
@@ -2988,20 +2989,6 @@ mod tests {
     /// ignored); and a fresh table holding the same rows written entirely
     /// by the current writer.
     /// Recursive copy of a checked-in fixture into a scratch directory.
-    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
-        use std::fs;
-        fs::create_dir_all(to).expect("mkdir");
-        for entry in fs::read_dir(from).expect("read_dir") {
-            let entry = entry.expect("entry");
-            let dest = to.join(entry.file_name());
-            if entry.file_type().expect("type").is_dir() {
-                copy_dir(&entry.path(), &dest);
-            } else {
-                fs::copy(entry.path(), dest).expect("copy");
-            }
-        }
-    }
-
     /// Open a table written by the engine before the term index existed
     /// (the fixture's schema: one FTS column, no positions), with its options
     /// adjusted by `customize`.
@@ -3011,25 +2998,13 @@ mod tests {
             crate::supertable::SupertableOptions,
         ) -> crate::supertable::SupertableOptions,
     ) -> (Arc<dyn StorageProvider>, crate::supertable::Supertable) {
-        use crate::{
-            superfile::builder::FtsConfig,
-            supertable::{Supertable, SupertableOptions},
-        };
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir).expect("local fs"));
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(2)
                 .build()
                 .expect("pool"),
         );
-        let options = customize(
-            SupertableOptions::new(title_schema(), vec![FtsConfig::new("title")], Vec::new())
-                .expect("options")
-                .with_writer_pool(pool)
-                .with_storage(Arc::clone(&storage)),
-        );
-        (storage, Supertable::open(options).expect("open"))
+        open_old_format_fts_fixture(dir, |o| customize(o.with_writer_pool(pool)))
     }
 
     /// An upgraded table whose manifest is loaded lazily: the parts that
@@ -3039,14 +3014,11 @@ mod tests {
     /// live only in the new superfiles.
     #[test]
     fn upgraded_lazy_tables_find_terms_that_only_new_superfiles_hold() {
-        use std::path::Path;
-
         use crate::Bm25SearchOptions;
 
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/old_format_fts_table");
+        let fixture = old_format_fts_fixture();
         let dir = TempDir::new().expect("tempdir");
-        copy_dir(&fixture, dir.path());
+        copy_dir_recursive(&fixture, dir.path());
         let (_storage, st) = open_old_format(dir.path(), |o| o.with_eager_load_threshold(0));
         for segment in 3..6 {
             commit_segment(&st, segment);
@@ -3195,10 +3167,9 @@ mod tests {
                 .collect()
         };
 
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/old_format_fts_table");
+        let fixture = old_format_fts_fixture();
         let work = TempDir::new().expect("tempdir");
-        copy_dir(&fixture, work.path());
+        copy_dir_recursive(&fixture, work.path());
 
         // Cell 1: the old table as written. Blooms present, no index.
         let (_storage, st) = open(work.path());

@@ -424,6 +424,41 @@ impl OpenError {
     }
 }
 
+/// Failures from [`crate::Supertable::reindex`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReindexError {
+    /// No durable storage backend is configured (e.g. `memory://`);
+    /// a reindex rewrites committed files, so it needs one.
+    #[error("reindex requires a storage backend")]
+    NoStorage,
+    /// Another compaction or reindex is already running in this process.
+    ///
+    /// Both reshape the same superfiles through the same slot, so they are
+    /// serialized rather than allowed to race. This is a signal to retry
+    /// later, not a failure of the migration.
+    #[error("a compaction or reindex is already running")]
+    AlreadyRunning,
+    /// Reading a superfile to decide whether it is stale failed.
+    #[error("failed to assess superfiles: {0}")]
+    Assess(String),
+    /// Rewriting one superfile failed. The migration stops here; the
+    /// superfiles already rewritten stay rewritten, and re-running picks
+    /// up what is left.
+    ///
+    /// The cause is carried as text rather than as the underlying error:
+    /// that type is internal, and exposing it here would make every
+    /// compaction failure mode part of the public surface for the sake of
+    /// one message.
+    #[error("failed to rewrite superfile {superfile_id}: {cause}")]
+    Rewrite {
+        /// The superfile whose rewrite failed.
+        superfile_id: uuid::Uuid,
+        /// What went wrong underneath.
+        cause: String,
+    },
+}
+
 /// Errors raised by [`crate::Supertable::optimize`].
 #[derive(Debug, thiserror::Error)]
 pub enum OptimizeError {
@@ -485,6 +520,12 @@ impl From<CompactionError> for OptimizeError {
                 superfile_id,
                 existing_compaction_id,
             },
+            CompactionError::SidecarChangedUnderSeal { superfile_id } => OptimizeError::Seal(
+                format!("tombstone sidecar for {superfile_id} changed under this job's seal"),
+            ),
+            CompactionError::SealRetriesExhausted { superfile_id } => {
+                OptimizeError::Seal(format!("seal retries exhausted for {superfile_id}"))
+            }
             CompactionError::Seal(s) => OptimizeError::Seal(s),
             CompactionError::Build(s) => OptimizeError::Build(s),
             CompactionError::Commit(s) => OptimizeError::Commit(s),
@@ -519,6 +560,24 @@ pub(crate) enum CompactionError {
         superfile_id: uuid::Uuid,
         existing_compaction_id: uuid::Uuid,
     },
+
+    /// An input's tombstone sidecar changed after this job sealed it, so
+    /// the bitmap the job holds no longer describes that superfile.
+    ///
+    /// Reachable because the mutation path takes over a seal it considers
+    /// abandoned. Carrying the seal-time bitmap onto the output would drop
+    /// whatever landed in between, so the job gives up its input instead
+    /// and a later run repeats it against the current sidecar.
+    #[error("tombstone sidecar for {superfile_id} changed under this job's seal")]
+    SidecarChangedUnderSeal { superfile_id: uuid::Uuid },
+
+    /// Sealing lost its CAS race to a writer on every attempt.
+    ///
+    /// Contention, not failure: a writer kept landing tombstone bits while
+    /// this job tried to freeze the sidecar. Distinct from [`Self::Seal`],
+    /// which is a storage error and means something is actually wrong.
+    #[error("seal retries exhausted for {superfile_id}")]
+    SealRetriesExhausted { superfile_id: uuid::Uuid },
 
     /// A WAL-store I/O error occurred while sealing a sidecar.
     #[error("seal failed: {0}")]

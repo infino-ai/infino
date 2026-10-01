@@ -9168,6 +9168,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             &[],
             &no_removals,
             NewEntryBirthVersions::StampCommit,
+            None,
             &mut Vec::new(),
             &mut Vec::new(),
             &[],
@@ -10290,6 +10291,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 &new_entries,
                 entries_to_remove,
                 NewEntryBirthVersions::StampCommit,
+                None,
                 pending_writes,
                 pending_replaces,
                 contributions,
@@ -10642,6 +10644,9 @@ pub(crate) async fn try_commit_attempt(
     new_entries: &[Arc<SuperfileEntry>],
     entries_to_remove: &[Arc<SuperfileEntry>],
     birth_versions: NewEntryBirthVersions,
+    // A superfile in `new_entries` whose tombstone sidecar is already
+    // written and must be named by this successor.
+    sidecar_to_register: Option<Uuid>,
     pending_storage_writes: &mut Vec<(String, Bytes)>,
     pending_storage_replaces: &mut Vec<(String, Bytes)>,
     term_contributions: &[TermContribution],
@@ -10668,6 +10673,10 @@ pub(crate) async fn try_commit_attempt(
                 .await?
         }
     };
+
+    // 2a. Name any already-written sidecar in this same successor; a later
+    //     manifest would leave its tombstones unreadable in between.
+    new_manifest.register_tombstone_sidecar(sidecar_to_register);
 
     // 2b. Hidden VectorCell membership lives in the slow-state blob.
     //     `update` clears the ref; restamp it onto this same successor

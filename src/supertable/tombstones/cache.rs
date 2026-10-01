@@ -35,6 +35,22 @@
 //! Cross-process delete visibility is therefore bounded by manifest
 //! freshness (the read-consistency window), not by a cache TTL.
 //!
+//! ## Known gap: the view is per process, not per reader
+//!
+//! The seq view is held once per handle, while a reader pins its own
+//! [`ManifestSnapshot`](crate::supertable::manifest::ManifestSnapshot).
+//! The two disagree once a commit removes a superfile the reader still
+//! has pinned: the view advances past it, the lookup finds it absent, and
+//! the absent rule above reads that as "no sidecar" rather than "not in
+//! this reader's manifest". The reader then sees rows its own snapshot
+//! has tombstoned.
+//!
+//! Reaching it needs a reader that outlives a commit replacing one of its
+//! superfiles — compaction, a reindex, or a refresh that jumps the view
+//! forward. Closing it means resolving a lookup against the seq map of
+//! the manifest the caller pinned instead of the newest one, which is a
+//! change to every lookup's signature rather than to the rule here.
+//!
 //! ## Seal freshness
 //!
 //! Sealing (compaction stamping a [`SealRecord`] onto a sidecar)
@@ -262,6 +278,11 @@ impl SidecarCache {
         let Some(expected) = view.seqs.get(&superfile_id).copied() else {
             // The seq map is authoritative for existence: absent
             // means no sidecar, so there is nothing to fetch.
+            //
+            // This view is the newest the process has seen, not the one
+            // the caller pinned, so "absent" also covers a superfile a
+            // later commit removed while a reader still holds it — and
+            // that reader loses its tombstones here. See the module docs.
             return Ok((Arc::clone(&self.empty_bitmap), None));
         };
         if let Some(entry) = self.inner.get(&superfile_id) {

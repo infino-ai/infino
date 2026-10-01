@@ -327,14 +327,14 @@ pub fn splice_index_blobs(
 /// assembly both call here.
 pub(crate) fn splice_index_streams_to<W, F, V, I>(
     body: EncodedBody,
-    mut fts_blob: F,
+    fts_blob: F,
     fts_length: u64,
-    mut vec_blob: V,
+    vec_blob: V,
     vec_length: u64,
-    mut ids_blob: I,
+    ids_blob: I,
     ids_length: u64,
     extra_kv: &[(String, String)],
-    mut output: W,
+    output: W,
 ) -> Result<ParquetLayout, FooterError>
 where
     W: Write,
@@ -347,14 +347,52 @@ where
         body_len,
         metadata,
     } = body;
+    splice_carried_body_to(
+        BufReader::new(body_file.reopen()?),
+        body_len,
+        metadata,
+        fts_blob,
+        fts_length,
+        vec_blob,
+        vec_length,
+        ids_blob,
+        ids_length,
+        extra_kv,
+        output,
+    )
+}
+
+/// As [`splice_index_streams_to`], for a body that is already encoded —
+/// carried verbatim from the superfile being replaced rather than produced
+/// by this build.
+///
+/// The body lands at offset 0 in both files, so the row-group and column
+/// offsets in `metadata` stay valid without adjustment.
+pub(crate) fn splice_carried_body_to<W, B, F, V, I>(
+    mut body: B,
+    body_len: u64,
+    metadata: ParquetMetaData,
+    mut fts_blob: F,
+    fts_length: u64,
+    mut vec_blob: V,
+    vec_length: u64,
+    mut ids_blob: I,
+    ids_length: u64,
+    extra_kv: &[(String, String)],
+    mut output: W,
+) -> Result<ParquetLayout, FooterError>
+where
+    W: Write,
+    B: Read,
+    F: Read,
+    V: Read,
+    I: Read,
+{
     let mut output = CountingWriter {
         output: &mut output,
         written: 0,
     };
-    // Stream the footer-stripped body from its scratch file; `reopen()` reads
-    // from offset 0 independently of the write handle.
-    let mut body_reader = BufReader::new(body_file.reopen()?);
-    let body_copied = io::copy(&mut body_reader, &mut output)?;
+    let body_copied = io::copy(&mut body, &mut output)?;
     if body_copied != body_len {
         return Err(FooterError::Malformed("body stream length mismatch"));
     }
@@ -398,6 +436,12 @@ where
     // column / offset indexes through unchanged.
     let old_fm = metadata.file_metadata();
     let mut kvs = old_fm.key_value_metadata().cloned().unwrap_or_default();
+    // `metadata` is the carried file's footer, so it already describes
+    // that file's regions. The caller supplies a complete replacement set,
+    // and keeping both would store each key twice: our reader takes the
+    // last value, but a first-match reader resolves the stale offsets, and
+    // the footer grows by a key set on every rewrite.
+    kvs.retain(|entry| !entry.key.starts_with(kv::PREFIX));
     for (k, v) in extra_kv {
         kvs.push(KeyValue::new(k.clone(), Some(v.clone())));
     }
@@ -635,6 +679,110 @@ mod tests {
         // Sidecar exercised by builder/reader round-trip tests, not this
         // body+splice composition helper.
         splice_index_blobs(body, fts_blob, vec_blob, &[], extra_kv)
+    }
+
+    /// The footer's KV entries in the order they are stored, duplicates
+    /// included — unlike [`read_kv_metadata`], which folds a repeated key
+    /// onto its last value and so cannot see a duplicate at all.
+    fn raw_footer_kv(bytes: &[u8]) -> Vec<(String, Option<String>)> {
+        let n = bytes.len();
+        let len_bytes: [u8; PARQUET_FOOTER_LEN_FIELD_BYTES] = bytes
+            [n - PARQUET_FOOTER_SUFFIX_BYTES..n - PARQUET_MAGIC_LEN]
+            .try_into()
+            .expect("footer length field");
+        let footer_len = u32::from_le_bytes(len_bytes) as usize;
+        let start = n - PARQUET_FOOTER_SUFFIX_BYTES - footer_len;
+        let meta =
+            ParquetMetaDataReader::decode_metadata(&bytes[start..n - PARQUET_FOOTER_SUFFIX_BYTES])
+                .expect("decode footer");
+        meta.file_metadata()
+            .key_value_metadata()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|kv| (kv.key, kv.value))
+            .collect()
+    }
+
+    /// A carried rewrite must leave one `inf.*` set in the footer.
+    ///
+    /// The carried body brings the source's whole footer with it, so
+    /// appending this build's keys without dropping the old ones stores
+    /// each twice. Our reader takes the last value and is unaffected, but
+    /// a first-match reader — pyarrow, DuckDB — resolves the *old*
+    /// offsets and reads the previous file's regions, and the footer grows
+    /// by a full key set on every rewrite.
+    #[test]
+    fn a_carried_rewrite_leaves_one_inf_key_set_in_the_footer() {
+        const OLD_FTS: &[u8] = b"old fts blob";
+        const NEW_FTS: &[u8] = b"a longer new fts blob";
+
+        let schema = small_schema();
+        let batch = small_batch(&schema);
+        let original = write_with_blobs(
+            &schema,
+            &[batch],
+            OLD_FTS,
+            &[],
+            &[(kv::N_DOCS.to_string(), "3".to_string())],
+            Compression::SNAPPY,
+            1024,
+            &[],
+        )
+        .expect("write original");
+
+        // Everything before the FTS blob is the Parquet body, which the
+        // carried path reuses verbatim.
+        let body = &original.bytes[..original.fts_offset as usize];
+        let carried_meta = {
+            let n = original.bytes.len();
+            let len_bytes: [u8; PARQUET_FOOTER_LEN_FIELD_BYTES] = original.bytes
+                [n - PARQUET_FOOTER_SUFFIX_BYTES..n - PARQUET_MAGIC_LEN]
+                .try_into()
+                .expect("footer length field");
+            let footer_len = u32::from_le_bytes(len_bytes) as usize;
+            let start = n - PARQUET_FOOTER_SUFFIX_BYTES - footer_len;
+            ParquetMetaDataReader::decode_metadata(
+                &original.bytes[start..n - PARQUET_FOOTER_SUFFIX_BYTES],
+            )
+            .expect("decode original footer")
+        };
+
+        let mut out = Vec::new();
+        let layout = splice_carried_body_to(
+            Cursor::new(body),
+            body.len() as u64,
+            carried_meta,
+            Cursor::new(NEW_FTS),
+            NEW_FTS.len() as u64,
+            Cursor::new(&[][..]),
+            0,
+            Cursor::new(&[][..]),
+            0,
+            &[(kv::N_DOCS.to_string(), "3".to_string())],
+            &mut out,
+        )
+        .expect("carried splice");
+
+        let entries = raw_footer_kv(&out);
+        for key in kv::ALL {
+            let seen = entries.iter().filter(|(k, _)| k == key).count();
+            assert!(
+                seen <= 1,
+                "{key} appears {seen} times; a first-match reader would take \
+                 the carried file's value"
+            );
+        }
+        let first_offset = entries
+            .iter()
+            .find(|(k, _)| k == kv::FTS_OFFSET)
+            .and_then(|(_, v)| v.clone())
+            .expect("fts offset present");
+        assert_eq!(
+            first_offset,
+            layout.fts_offset.to_string(),
+            "the first `inf.fts.offset` must be this rewrite's"
+        );
     }
 
     #[test]

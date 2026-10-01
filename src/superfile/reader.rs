@@ -85,6 +85,23 @@ use crate::{
 /// one range GET, so the cold open usually costs a single round-trip.
 const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
 
+/// The `inf.builder` value this superfile records — the engine that
+/// wrote it — or `None` on a file that carries no such key.
+///
+/// Read from the footer's key-value list rather than a parsed map, and so
+/// dependent on a rewrite having stripped the carried file's keys before
+/// appending its own; otherwise the first match would be the previous
+/// writer's.
+pub(crate) fn writer_builder_of(metadata: &ParquetMetaData) -> Option<&str> {
+    metadata
+        .file_metadata()
+        .key_value_metadata()?
+        .iter()
+        .find(|entry| entry.key == kv::BUILDER)?
+        .value
+        .as_deref()
+}
+
 pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorLayout {
     kv_map
         .get(kv::VEC_LAYOUT)
@@ -787,6 +804,21 @@ impl SuperfileReader {
     /// [`install_resident_parquet`]: SuperfileReader::install_resident_parquet
     pub(crate) fn is_fully_resident(&self) -> bool {
         self.bytes.is_some() && self.source.is_none()
+    }
+
+    /// Whether the stable-id sidecar is in the packed layout.
+    pub(crate) fn id_sidecar_is_packed(&self) -> bool {
+        self.id_sidecar_packed
+    }
+
+    /// Whole-file bytes, but only when every region of them is valid.
+    ///
+    /// `bytes` alone is not enough: a hybrid-promoted reader carries a
+    /// fill-file mmap whose vector region is left sparse, so a caller
+    /// copying blob ranges out of it would copy zeros. Gated on
+    /// [`Self::is_fully_resident`], which that promotion never satisfies.
+    pub(crate) fn whole_file_bytes(&self) -> Option<&Bytes> {
+        self.is_fully_resident().then_some(self.bytes.as_ref())?
     }
 
     /// Install resident whole-file bytes on a lazily-opened reader so the
