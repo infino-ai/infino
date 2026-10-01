@@ -951,6 +951,11 @@ pub(crate) const DEFAULT_MAX_SEALED_RETRIES: u32 = 16;
 /// targets all sit in that set has nothing of its own to show until the pass
 /// commits.
 ///
+/// Read from this handle's in-memory manifest, so the compactor it can see is
+/// one sharing this process. A delete driven from another process waits out
+/// its budget and then takes the seal over once it goes stale, which is the
+/// same path a dead compactor's seals take.
+///
 /// A removal, not a generation bump: an append commits too, and moves the
 /// generation while removing nothing. Crediting that would refund a delete
 /// parked behind an abandoned seal on every unrelated write, so a table that

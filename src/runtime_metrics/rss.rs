@@ -109,42 +109,81 @@ pub fn total_memory_bytes() -> Option<u64> {
 /// over a host-sized denominator, or the reverse, is not a share of anything.
 /// The reverse is the dangerous one — host `MemAvailable` over a container's
 /// ceiling reads as far more than 100% free and would admit without limit —
-/// and it is reachable whenever the ceiling is readable but the charge is
-/// not. So a cgroup answer needs both halves to come back, or the host's pair
+/// and it is reachable whenever the ceiling is readable but the charge is not.
+/// So a cgroup answer needs every part of it to come back, or the host's pair
 /// is used whole.
-fn memory_budget() -> Option<(u64, u64)> {
-    if let Some(limit) = cgroup_memory_limit_bytes()
-        && let Some(available) = cgroup_available_bytes(limit)
-    {
-        return Some((available, limit));
+pub fn memory_budget() -> Option<(u64, u64)> {
+    if let Some(budget) = cgroup_budget() {
+        return Some(budget);
     }
     Some((meminfo_field("MemAvailable:")?, meminfo_field("MemTotal:")?))
 }
 
-/// This process's cgroup v2 memory ceiling, in bytes.
+/// What this process's cgroup can still take, and its ceiling. `None` without
+/// cgroup v2, or where no cgroup from here to the root sets one, in which case
+/// the host's figures are the right ones.
 ///
-/// `None` without cgroup v2, and `None` for the literal `max`, which is a
-/// cgroup with no ceiling of its own: the host's figures are the right ones
-/// there. cgroup v1 is deliberately not read — it reports through a different
-/// hierarchy, and a v1 host falls back to the host figures, which is the
-/// behaviour it had before this existed.
-///
-/// Read from the cgroup root as this process sees it, which inside a
-/// container is the container's own cgroup.
-fn cgroup_memory_limit_bytes() -> Option<u64> {
-    parse_cgroup_limit(&fs::read_to_string(cgroup_dir()?.join(CGROUP_MEMORY_MAX)).ok()?)
+/// Walks leaf to root and takes the tightest of the ceilings it finds, because
+/// a v2 limit binds every descendant: the ceiling that stops this process may
+/// be set an ancestor away, on a systemd slice rather than the unit, or on a
+/// Kubernetes pod rather than the container. Reading only the leaf sees `max`
+/// there and sizes against the whole machine, which is the failure this path
+/// exists to prevent.
+fn cgroup_budget() -> Option<(u64, u64)> {
+    let root = Path::new(CGROUP_MOUNT);
+    let mut dir = cgroup_dir()?;
+    let mut tightest: Option<(u64, u64)> = None;
+    loop {
+        if let Some(budget) = cgroup_level_budget(&dir) {
+            tightest = Some(match tightest {
+                // Headroom and ceiling are tracked together rather than
+                // minimised apart: a level's headroom is only meaningful
+                // against its own ceiling, and a share built from two levels
+                // would describe neither.
+                Some(current) if current.0 <= budget.0 => current,
+                _ => budget,
+            });
+        }
+        if dir == root {
+            return tightest;
+        }
+        match dir.parent() {
+            Some(parent) if parent.starts_with(root) => dir = parent.to_path_buf(),
+            _ => return tightest,
+        }
+    }
 }
 
-/// The directory holding this process's cgroup v2 memory files.
+/// Headroom and ceiling for one cgroup directory. `None` when it sets no
+/// ceiling of its own, or when any of the three files it needs is unreadable.
+fn cgroup_level_budget(dir: &Path) -> Option<(u64, u64)> {
+    let limit = parse_cgroup_limit(&fs::read_to_string(dir.join(CGROUP_MEMORY_MAX)).ok()?)?;
+    let current: u64 = fs::read_to_string(dir.join(CGROUP_MEMORY_CURRENT))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    // Most of a compaction's charge is page cache, which the kernel reclaims
+    // under pressure rather than OOM-killing for, so it counts as headroom —
+    // the same accounting `MemAvailable` does for the host. Ceiling minus
+    // charge alone would throttle a container nowhere near its limit.
+    let stat = fs::read_to_string(dir.join(CGROUP_MEMORY_STAT)).ok()?;
+    let reclaimable = memory_stat_field(&stat, "inactive_file").unwrap_or(0)
+        + memory_stat_field(&stat, "slab_reclaimable").unwrap_or(0);
+    Some((cgroup_headroom(limit, current, reclaimable), limit))
+}
+
+/// The directory holding this process's own cgroup v2 memory files, the leaf
+/// of the walk in [`cgroup_budget`].
 ///
 /// Not simply the mount root. That is the process's own cgroup only when it
 /// has a private cgroup namespace, which `docker run -m` gives it; a systemd
 /// unit with `MemoryMax=`, or a Kubernetes runtime sharing the host's cgroup
 /// namespace, leaves the process in a nested cgroup whose root carries no
 /// `memory.max` at all. Reading only the root there finds nothing and falls
-/// back to the host's figures, which is the case this whole path exists to
-/// avoid. So the relative path comes from `/proc/self/cgroup`, with the mount
-/// root as the fallback.
+/// back to the host's figures, which is the case this path exists to avoid.
+/// So the relative path comes from `/proc/self/cgroup`, with the mount root as
+/// the fallback.
 fn cgroup_dir() -> Option<PathBuf> {
     let root = Path::new(CGROUP_MOUNT);
     if let Some(relative) = fs::read_to_string(PROC_SELF_CGROUP)
@@ -166,39 +205,23 @@ fn cgroup_dir() -> Option<PathBuf> {
 ///
 /// `/proc/self/cgroup` lists one controller per line; v2's is `0::<path>`,
 /// with the path absolute-looking but relative to the mount. A process at the
-/// root reads `0::/`, which joins to the root itself.
+/// root reads `0::/`, which joins to the root itself. cgroup v1 lists numbered
+/// controllers and no `0::` line, so it reads as absent and the host's figures
+/// are used, which is what a v1 host did before any of this existed.
 fn parse_cgroup_path(raw: &str) -> Option<&str> {
     raw.lines()
         .find_map(|line| line.strip_prefix("0::"))
         .map(|path| path.trim().trim_start_matches('/'))
 }
 
-/// `memory.max`, as bytes. `None` for an absent ceiling.
+/// `memory.max`, as bytes. `None` for the literal `max`, a cgroup with no
+/// ceiling of its own.
 fn parse_cgroup_limit(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     if raw == CGROUP_UNLIMITED {
         return None;
     }
     raw.parse().ok()
-}
-
-/// What this process's cgroup can still take, in bytes.
-///
-/// `max - current` alone would be far too pessimistic: most of a compaction's
-/// charge is page cache, which the kernel reclaims under pressure rather than
-/// OOM-killing for. So the reclaimable file pages are added back, which is
-/// the same accounting `MemAvailable` does for the host.
-fn cgroup_available_bytes(limit: u64) -> Option<u64> {
-    let dir = cgroup_dir()?;
-    let current: u64 = fs::read_to_string(dir.join(CGROUP_MEMORY_CURRENT))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    let stat = fs::read_to_string(dir.join(CGROUP_MEMORY_STAT)).ok()?;
-    let reclaimable = memory_stat_field(&stat, "inactive_file").unwrap_or(0)
-        + memory_stat_field(&stat, "slab_reclaimable").unwrap_or(0);
-    Some(cgroup_headroom(limit, current, reclaimable))
 }
 
 /// Headroom left in a cgroup: what the ceiling has not charged, plus what is
