@@ -603,6 +603,16 @@ impl ColumnMeta {
         self.length_stats().n_scored_docs
     }
 
+    /// The tf a df=1 inline dictionary slot scores with. On a positional
+    /// column the slot carries the term's single position, tf implied 1:
+    /// the builder only inlines tf == 1 postings there.
+    pub(super) fn inline_tf(&self, slot: u32) -> u32 {
+        match self.positions {
+            true => 1,
+            false => slot,
+        }
+    }
+
     /// The average document length this column is scored at — the one
     /// its norm table decodes with.
     pub fn avgdl(&self) -> f32 {

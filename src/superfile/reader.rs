@@ -53,6 +53,8 @@ use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 
+#[cfg(test)]
+use crate::superfile::fts::reader::TermIndexFact;
 use crate::{
     memory::ConnectionMemoryBudget,
     superfile::{
@@ -63,7 +65,7 @@ use crate::{
             bm25::Bm25Params,
             reader::{
                 self as fts_reader, BoolMode, ClauseLists, FetchedTermMemo, FtsReader, MatchWork,
-                OrCursorSet, PreparedClauses, TermIndexFact, TermPattern,
+                OrCursorSet, PreparedClauses, TermPattern,
             },
             tokenize::{Phrase, Tokenizer},
         },
@@ -1504,6 +1506,7 @@ impl SuperfileReader {
     /// What a table-level term index records about each of `tokens` in
     /// `column`, in input order (`None` for an absent token). Delegates to
     /// [`FtsReader::term_index_facts`].
+    #[cfg(test)]
     pub(crate) async fn term_index_facts(
         &self,
         column: &str,

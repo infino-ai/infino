@@ -6,6 +6,8 @@
 //! entry points (no BM25 scoring, no top-k). Its own `impl FtsReader`
 //! block, split from the reader `core`.
 
+use std::str::from_utf8;
+
 #[cfg(any(test, feature = "test-helpers"))]
 use super::cursor::{SubindexKind, TermCursor, TermMeta};
 use super::{
@@ -24,7 +26,7 @@ use crate::{
         ReadError,
         error::FtsError,
         format::fts::U32_BYTES,
-        fts::{builder::TERM_META_SIZE, short::short_df, tokenize::Phrase},
+        fts::{bm25, builder::TERM_META_SIZE, short::short_df, tokenize::Phrase},
         id_space::{FtsDocId, RowId},
     },
     utils::terms::{FstValue, make_key},
@@ -400,6 +402,73 @@ impl FtsReader {
                 })
             })
             .collect())
+    }
+
+    /// Up to `limit` of `column`'s terms after `after` (from the first when
+    /// `None`), in term order, each with what [`Self::term_index_facts`]
+    /// records for it. Walks the dictionary with its values, avoiding a
+    /// separate term lookup for each entry.A df=1 inline term gets its fact
+    /// straight from its entry: its one posting's score is its bound, so no
+    /// cursor is built. `fst_bytes` is this reader's dictionary, fetched
+    /// once by the caller.
+    pub(crate) async fn term_index_facts_after(
+        &self,
+        fst_bytes: &[u8],
+        column: &str,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Option<TermIndexFact>)>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        // The walk starts at `after` itself, which the caller already has.
+        let mut entries =
+            self.column_terms_from(fst_bytes, column_id, after.unwrap_or(b""), limit + 1)?;
+        if let Some(after) = after
+            && entries
+                .first()
+                .is_some_and(|(term, _)| term.as_slice() == after)
+        {
+            entries.remove(0);
+        }
+        entries.truncate(limit);
+        self.ensure_norms(column_id).await?;
+        let col_meta = &self.columns[column_id as usize];
+        // What a cursor built for an inline term would score it at: this
+        // superfile's own idf for df = 1, unweighted.
+        let inline_idf = bm25::idf(col_meta.scored_doc_count(), 1);
+
+        let mut out = Vec::with_capacity(entries.len());
+        let mut with_postings: Vec<usize> = Vec::new();
+        for (term, entry) in entries {
+            let fact = match entry {
+                FstValue::Inline { doc_id, tf } => Some(TermIndexFact {
+                    df: 1,
+                    bound: bm25::score_with_dl_norm_k1(
+                        inline_idf,
+                        col_meta.inline_tf(tf),
+                        col_meta.dl_norm_k1().get(doc_id),
+                    ),
+                    entry,
+                }),
+                FstValue::Pfor { .. } => {
+                    with_postings.push(out.len());
+                    None
+                }
+            };
+            out.push((term, fact));
+        }
+        // The rest need their postings read: the lookup path serves them.
+        let facts = {
+            let terms = with_postings
+                .iter()
+                .map(|&i| from_utf8(&out[i].0))
+                .collect::<Result<Vec<&str>, _>>()
+                .map_err(|_| FtsError::Read(ReadError::MalformedVersion("non-utf8 term".into())))?;
+            self.term_index_facts(column, &terms).await?
+        };
+        for (i, fact) in with_postings.into_iter().zip(facts) {
+            out[i].1 = fact;
+        }
+        Ok(out)
     }
 
     /// Document frequency for each of `tokens` in `column` — the number
@@ -1181,5 +1250,71 @@ mod tests {
         assert_eq!(batched, vec![2, 0, 1, 3, 0], "planted document frequencies");
         // Empty input short-circuits to empty output (no dict open, no fetch).
         assert!(r.term_dfs("body", &[]).await.expect("empty").0.is_empty());
+    }
+
+    /// The walk with values gives every term exactly the fact the lookup
+    /// path gives it: inline (tf 1 and more), short and long terms, on a
+    /// positional and a plain column, across chunk edges.
+    #[tokio::test]
+    async fn facts_from_the_walk_match_facts_from_lookups() {
+        const N_DOCS: u32 = 600;
+        const CHUNK: usize = 5;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("pos".into(), true).expect("register");
+        b.register_column("flat".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            // `common` is long, `mid` short, `u{i}` inline with tf 1 and
+            // `twice{i}` a df=1 term with tf 2. `u{i}` sits past position
+            // 1, so its positional slot differs from its tf.
+            let mut text = format!("common twice{i} twice{i} u{i}");
+            if i.is_multiple_of(7) {
+                text.push_str(" mid");
+            }
+            b.add_doc(0, i, &text).expect("add pos");
+            b.add_doc(1, i, &text).expect("add flat");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"pos","tokenizer":"ascii_lower","positions":true},{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let fst_bytes = r.dict_bytes_async().await.expect("dict");
+        for column in ["pos", "flat"] {
+            let mut walked = Vec::new();
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let chunk = r
+                    .term_index_facts_after(&fst_bytes, column, after.as_deref(), CHUNK)
+                    .await
+                    .expect("walk");
+                let done = chunk.len() < CHUNK;
+                after = chunk.last().map(|(t, _)| t.clone());
+                walked.extend(chunk);
+                if done {
+                    break;
+                }
+            }
+            let all = r.iter_column_terms(column).expect("terms");
+            let names: Vec<&str> = all
+                .iter()
+                .map(|t| std::str::from_utf8(t).expect("utf8"))
+                .collect();
+            assert_eq!(
+                walked.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+                all,
+                "{column}: the walk visits every term once, in order"
+            );
+            let looked_up = r.term_index_facts(column, &names).await.expect("lookups");
+            for ((term, walk), lookup) in walked.iter().zip(looked_up) {
+                let (walk, lookup) = (walk.clone().expect("walk fact"), lookup.expect("fact"));
+                let name = String::from_utf8_lossy(term);
+                assert_eq!(walk.df, lookup.df, "{column}/{name}: df");
+                assert_eq!(
+                    walk.bound.to_bits(),
+                    lookup.bound.to_bits(),
+                    "{column}/{name}: bound"
+                );
+                assert_eq!(walk.entry, lookup.entry, "{column}/{name}: entry");
+            }
+        }
     }
 }

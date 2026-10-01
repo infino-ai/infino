@@ -24,6 +24,7 @@ mod work;
 
 pub use core::*;
 
+#[cfg(test)]
 pub(crate) use count::TermIndexFact;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use count::TermLayout;

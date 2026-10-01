@@ -71,7 +71,7 @@ use datafusion::{
     },
 };
 use futures::{future, stream};
-use tracing::debug;
+use tracing::{Instrument, debug};
 
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
@@ -93,7 +93,7 @@ use crate::{
                 common::{
                     PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
                     fill_top_k, output_schema_with_score, resolve_hits_named,
-                    search_query_df_error,
+                    search_query_df_error, traced_tvf,
                 },
                 vector_exec::arg_to_query_vector,
             },
@@ -103,6 +103,7 @@ use crate::{
             },
         },
     },
+    utils::trace::{self, detail_span},
 };
 
 /// SQL name the TVF is registered under.
@@ -213,24 +214,37 @@ impl SupertableReader {
             }
         };
         // Both retrievers run concurrently on the query runtime; each
-        // inherits its own manifest skip and returns hits best-first.
-        let (bm25_res, vector_res) = future::join(
-            self.bm25_search_scoped_async(
+        // inherits its own manifest skip and returns hits best-first. Each
+        // leg has its span, so a trace shows which one the query waited on.
+        let phases = self.phase_spans();
+        let bm25_leg = self
+            .bm25_search_scoped_async(
                 text_col,
                 q_text,
                 k,
                 Bm25SearchOptions::new().with_mode(mode),
                 scope,
-            ),
-            vector_leg,
-        )
-        .await;
+            )
+            .instrument(trace::phase(phases, || detail_span!("hybrid.bm25")));
+        let vector_leg =
+            vector_leg.instrument(trace::phase(phases, || detail_span!("hybrid.vector")));
+        let (bm25_res, vector_res) = future::join(bm25_leg, vector_leg).await;
         let (bm25_hits, vector_hits) = (bm25_res?, vector_res?);
+        let fuse_span = trace::phase(phases, || {
+            detail_span!(
+                "hybrid.fuse",
+                bm25_hits = bm25_hits.len(),
+                vector_hits = vector_hits.len(),
+                rows_out = tracing::field::Empty,
+            )
+        });
         // The fusion math is a real (small) kernel section; bracket it so
         // hybrid's kernel CPU covers all three of its compute legs.
-        Ok(op_stats::timed_kernel(&self.op_stats, || {
-            rrf_fuse(&bm25_hits, &vector_hits, k)
-        }))
+        let fused = fuse_span.in_scope(|| {
+            op_stats::timed_kernel(&self.op_stats, || rrf_fuse(&bm25_hits, &vector_hits, k))
+        });
+        fuse_span.record("rows_out", fused.len());
+        Ok(fused)
     }
 
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion
@@ -265,7 +279,29 @@ impl Supertable {
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
+        // The empty fields are the read's outcome, filled once it has run;
+        // see `CloseOut`.
+        tracing::instrument(skip_all, fields(
+            text_col = text_col,
+            vec_col = vec_col,
+            k = k,
+            mode = ?mode,
+            role = self.role().as_str(),
+            origin = OpOrigin::Query.as_str(),
+            rows_out = tracing::field::Empty,
+            kernel_cpu_ns = tracing::field::Empty,
+            planned_read_ranges = tracing::field::Empty,
+            fts_postings_bytes = tracing::field::Empty,
+            vector_cells_scanned = tracing::field::Empty,
+            vector_candidates_scanned = tracing::field::Empty,
+            vector_rows_reranked = tracing::field::Empty,
+            rows_materialized = tracing::field::Empty,
+            store_heads = tracing::field::Empty,
+            store_gets = tracing::field::Empty,
+            store_get_bytes = tracing::field::Empty,
+            store_bg_gets = tracing::field::Empty,
+            store_bg_get_bytes = tracing::field::Empty,
+        ))
     )]
     pub fn hybrid_search(
         &self,
@@ -279,6 +315,7 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(text_col, vec_col, k, "hybrid_search");
+        let close_out = self.close_out();
         let reader = self.reader()?;
         reader
             .check_projection(projection)
@@ -287,34 +324,38 @@ impl Supertable {
             .hybrid_search(text_col, q_text, mode, vec_col, q_vec, options, k)
             .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;
         let batch = self
-            .block_on_query(async {
-                // `_id` + `score` come free with the search wave, so a
-                // projection of just those needs no placement and no
-                // Parquet decode — the same fast path `vector_search`
-                // takes. GUARDED on every hit carrying a stable-id
-                // stamp: hybrid fuses FTS-matched rows that never went
-                // through the hidden vector index, and those reach here
-                // unstamped (`stable_id: None`), which
-                // `hits_id_score_batch` treats as an upstream bug. Any
-                // unstamped hit falls through to the general path,
-                // which resolves ids by placement.
-                let id_column = reader.options().id_column.as_str();
-                if free_columns_unambiguous(&reader.options().schema, id_column)
-                    && let Some(indices) = id_score_projection_indices(projection, id_column)
-                    && hits.iter().all(|h| h.stable_id.is_some())
-                {
-                    return hits_id_score_batch(&reader, &hits)?
-                        .project(&indices)
-                        .map_err(|e| QueryError::Execute(e.to_string()));
+            .block_on_query(
+                async {
+                    // `_id` + `score` come free with the search wave, so a
+                    // projection of just those needs no placement and no
+                    // Parquet decode: the same fast path `vector_search`
+                    // takes. GUARDED on every hit carrying a stable-id
+                    // stamp: hybrid fuses FTS-matched rows that never went
+                    // through the hidden vector index, and those reach here
+                    // unstamped (`stable_id: None`), which
+                    // `hits_id_score_batch` treats as an upstream bug. Any
+                    // unstamped hit falls through to the general path,
+                    // which resolves ids by placement.
+                    let id_column = reader.options().id_column.as_str();
+                    if free_columns_unambiguous(&reader.options().schema, id_column)
+                        && let Some(indices) = id_score_projection_indices(projection, id_column)
+                        && hits.iter().all(|h| h.stable_id.is_some())
+                    {
+                        return hits_id_score_batch(&reader, &hits)?
+                            .project(&indices)
+                            .map_err(|e| QueryError::Execute(e.to_string()));
+                    }
+                    // Boundary-replica stubs carry an IVF local that does not
+                    // address a Parquet row; remap to the owning placement by
+                    // stable id before the scalar decode, exactly as the
+                    // hybrid TVF and `vector_search` paths do.
+                    let hits = user_placement_for_scalar_resolve(&reader, &hits).await?;
+                    resolve_hits_named(&reader, &hits, projection).await
                 }
-                // Boundary-replica stubs carry an IVF local that does not
-                // address a Parquet row; remap to the owning placement by
-                // stable id before the scalar decode, exactly as the
-                // hybrid TVF and `vector_search` paths do.
-                let hits = user_placement_for_scalar_resolve(&reader, &hits).await?;
-                resolve_hits_named(&reader, &hits, projection).await
-            })
+                .instrument(detail_span!("search.resolve", hits = hits.len())),
+            )
             .map_err(|e| InfinoError::Query(e.to_string()).with_context("hybrid_search", None))?;
+        close_out.finish(batch.num_rows() as u64);
         Ok(vec![batch])
     }
 }
@@ -643,6 +684,12 @@ impl ExecutionPlan for HybridSearchExec {
             .await
         };
 
+        let span = detail_span!(
+            "tvf.hybrid_search",
+            k = self.k,
+            rows_out = tracing::field::Empty
+        );
+        let fut = traced_tvf(span, fut);
         let stream = stream::once(fut);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,
