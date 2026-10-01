@@ -54,7 +54,7 @@ use rayon::prelude::*;
 use tracing::{Instrument, Span};
 
 use crate::{
-    memory::{ProcessMemoryLimit, over_process_limit, process_limit_exceeded, process_over_limit},
+    memory::{over_process_limit, process_limit, process_limit_exceeded, process_over_limit},
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::{OpStatsCollector, timed_section},
     superfile::{
@@ -158,9 +158,9 @@ pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
 /// through here; error mapping stays with the caller, whose surface it
 /// belongs to.
 ///
-/// When the session carries a [`ProcessMemoryLimit`] (the connection set a
-/// process ceiling), the collect races it, and a process past the ceiling ends
-/// the statement with a `ResourcesExhausted` refusal.
+/// When the process has a memory limit (see `memory::resident`), the collect
+/// races it, and a process past the limit ends the statement with a
+/// `ResourcesExhausted` refusal.
 pub(crate) async fn collect_plan_metered(
     plan: &Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
@@ -168,32 +168,30 @@ pub(crate) async fn collect_plan_metered(
 ) -> DfResult<Vec<RecordBatch>> {
     let metered: Arc<dyn ExecutionPlan> =
         Arc::new(MeteredExec::new(Arc::clone(plan), op_stats.clone()));
-    let limit = task_ctx
-        .session_config()
-        .get_extension::<ProcessMemoryLimit>();
     let collected = collect(metered, task_ctx);
-    let batches = match limit {
+    let batches = match process_limit() {
         None => collected.await?,
-        // The batches streamed between operators are never reserved, so the
-        // process ceiling is the only bound on them. The collect runs as a
-        // task of its own: over resident data a plan can do all its work
-        // inside one poll, and a watch in the same task would not be looked
-        // at until that poll had finished — result in hand. Dropping the task
-        // when the limit wins aborts it, along with the partition streams and
-        // the tasks DataFusion spawned for them; a partition in the middle of
-        // a batch finishes that batch before its memory goes. A process
-        // already over the limit is refused before the plan is spawned at
-        // all; `biased`, with the limit first, makes a reading over it win
-        // over a result that lands in the same wakeup.
+        // With a process limit, run the collect as its own task and race it
+        // against the sampler. The streamed batches are never reserved, so
+        // this is the only bound on them.
+        //  - over the limit before we start: refuse without spawning anything.
+        //  - own task, because a plan over cached data can finish all its work
+        //    in one poll, so a check in the same task would only run once the
+        //    result is ready.
+        //  - limit wins: dropping the task stops DataFusion's partition tasks
+        //    and the search functions' fan-out. A batch already being
+        //    processed still finishes first.
+        //  - `biased` checks the limit first, so a reading over it wins even if
+        //    the result lands in the same wakeup.
         Some(limit) => {
-            if let Some(anon) = process_over_limit(limit.0) {
-                return Err(over_process_limit(anon, limit.0));
+            if let Some(anon) = process_over_limit(limit) {
+                return Err(over_process_limit(anon, limit));
             }
             let collecting = SpawnedTask::spawn(collected);
             tokio::select! {
                 biased;
-                anon = process_limit_exceeded(limit.0) => {
-                    return Err(over_process_limit(anon, limit.0));
+                anon = process_limit_exceeded(limit) => {
+                    return Err(over_process_limit(anon, limit));
                 }
                 joined = collecting => {
                     joined.map_err(|join| DataFusionError::ExecutionJoin(Box::new(join)))??

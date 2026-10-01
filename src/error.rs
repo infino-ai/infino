@@ -74,12 +74,11 @@ pub enum InfinoError {
     /// A query exceeded the connection's memory budget (see
     /// [`ConnectOptions::with_connection_memory_budget_bytes`]). For SQL the
     /// engine spills first and only raises this when it still can't fit. Also
-    /// raised when a SQL statement runs while the process is over the
-    /// connection's process memory limit (see
-    /// [`ConnectOptions::with_process_memory_limit_bytes`]).
+    /// raised when a SQL statement runs while the process is over its memory
+    /// limit: 90% of the process's cgroup memory limit, or
+    /// `memory.process_limit_bytes` in config.
     ///
     /// [`ConnectOptions::with_connection_memory_budget_bytes`]: crate::ConnectOptions::with_connection_memory_budget_bytes
-    /// [`ConnectOptions::with_process_memory_limit_bytes`]: crate::ConnectOptions::with_process_memory_limit_bytes
     #[error("over budget: {0}")]
     OverBudget(String),
 
