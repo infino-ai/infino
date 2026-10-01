@@ -1094,6 +1094,12 @@ impl Supertable {
         let mut merging: JoinSet<(usize, Result<PreparedJob, CompactionError>)> = JoinSet::new();
         let mut first_error: Option<CompactionError> = None;
         let mut fatal: Option<CompactionError> = None;
+        // When the next admission may be considered. A deadline rather than a
+        // fresh timer per iteration: a merge finishing is not a reason to make
+        // the next admission wait another full settle, and under merges
+        // shorter than the settle a restarting timer would never elapse at all
+        // and the width would collapse to one.
+        let mut next_admission = time::Instant::now() + MERGE_ADMIT_SETTLE;
 
         while !queued.is_empty() || !merging.is_empty() {
             // Nothing running: start one without consulting the host. A table
@@ -1102,6 +1108,7 @@ impl Supertable {
             if merging.is_empty() {
                 let (plan_index, job) = queued.pop_front().expect("loop condition");
                 self.spawn_merge(&mut merging, plan_index, job, stale_seal_timeout);
+                next_admission = time::Instant::now() + MERGE_ADMIT_SETTLE;
                 continue;
             }
 
@@ -1117,7 +1124,7 @@ impl Supertable {
                 // reading that follows it sees their allocations rather than
                 // an idle host. That is the whole feedback loop: admit, let it
                 // land, look at what is left, decide again.
-                _ = time::sleep(MERGE_ADMIT_SETTLE), if may_admit => {
+                _ = time::sleep_until(next_admission), if may_admit => {
                     if admits_another_merge(
                         merging.len(),
                         concurrency,
@@ -1127,6 +1134,10 @@ impl Supertable {
                         let (plan_index, job) = queued.pop_front().expect("guarded above");
                         self.spawn_merge(&mut merging, plan_index, job, stale_seal_timeout);
                     }
+                    // Advanced whether or not the host had room: a deadline
+                    // left in the past would re-fire immediately and spin on
+                    // `/proc` until a merge finished.
+                    next_admission = time::Instant::now() + MERGE_ADMIT_SETTLE;
                     continue;
                 }
             };
@@ -1151,9 +1162,13 @@ impl Supertable {
             let batch: Vec<PreparedJob> = ready.into_iter().map(|(_, prepared)| prepared).collect();
 
             let commit = self.commit_compaction_batch(batch).await;
-            self.refresh()
-                .await
-                .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+            // Both failures leave by the same door: merges are still running,
+            // and returning here would drop their tasks with their seals
+            // placed and nothing to clear them until they went stale.
+            if let Err(e) = self.refresh().await {
+                fatal = Some(CompactionError::Refresh(e.to_string()));
+                break;
+            }
             if let Err(e) = commit {
                 fatal = Some(e);
                 break;

@@ -87,7 +87,7 @@ pub fn current_rss_bytes() -> Option<u64> {
 /// Returns `None` on platforms with neither, so every caller needs a
 /// conservative fallback rather than a guess at the machine's size.
 pub fn available_memory_bytes() -> Option<u64> {
-    cgroup_available_bytes().or_else(|| meminfo_field("MemAvailable:"))
+    memory_budget().map(|(available, _)| available)
 }
 
 /// Total memory a sizing decision may spend, in bytes: the cgroup's ceiling
@@ -95,7 +95,25 @@ pub fn available_memory_bytes() -> Option<u64> {
 /// [`available_memory_bytes`] so a reserve can be a share of whichever of the
 /// two actually binds. `None` with neither.
 pub fn total_memory_bytes() -> Option<u64> {
-    cgroup_memory_limit_bytes().or_else(|| meminfo_field("MemTotal:"))
+    memory_budget().map(|(_, total)| total)
+}
+
+/// Available and total together, always from the same source.
+///
+/// Taken as a pair because callers compare them: a cgroup-limited numerator
+/// over a host-sized denominator, or the reverse, is not a share of anything.
+/// The reverse is the dangerous one — host `MemAvailable` over a container's
+/// ceiling reads as far more than 100% free and would admit without limit —
+/// and it is reachable whenever the ceiling is readable but the charge is
+/// not. So a cgroup answer needs both halves to come back, or the host's pair
+/// is used whole.
+fn memory_budget() -> Option<(u64, u64)> {
+    if let Some(limit) = cgroup_memory_limit_bytes()
+        && let Some(available) = cgroup_available_bytes(limit)
+    {
+        return Some((available, limit));
+    }
+    Some((meminfo_field("MemAvailable:")?, meminfo_field("MemTotal:")?))
 }
 
 /// This process's cgroup v2 memory ceiling, in bytes.
@@ -127,8 +145,7 @@ fn parse_cgroup_limit(raw: &str) -> Option<u64> {
 /// charge is page cache, which the kernel reclaims under pressure rather than
 /// OOM-killing for. So the reclaimable file pages are added back, which is
 /// the same accounting `MemAvailable` does for the host.
-fn cgroup_available_bytes() -> Option<u64> {
-    let limit = cgroup_memory_limit_bytes()?;
+fn cgroup_available_bytes(limit: u64) -> Option<u64> {
     let current: u64 = fs::read_to_string(CGROUP_MEMORY_CURRENT)
         .ok()?
         .trim()
