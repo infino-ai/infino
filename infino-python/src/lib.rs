@@ -34,7 +34,8 @@ use pyo3::types::{PyDict, PyList};
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
     GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
-    Stemmer, Stopwords, VectorFilter,
+    ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions, Stemmer, Stopwords,
+    VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
 // the engine's public API and reachable only under `infino/test-helpers`.
@@ -102,6 +103,43 @@ fn optimize_err(e: OptimizeError) -> PyErr {
 
 fn gc_err(e: GcError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
+}
+
+/// A table without its own storage backend — `memory://`, or a hosted table
+/// whose storage the service holds — has nothing a reindex could read or
+/// rewrite, so every reindex call refuses it as a bad target rather than
+/// reporting an empty, misleadingly current, result.
+fn reindex_err(e: ReindexError) -> PyErr {
+    match e {
+        ReindexError::NoStorage => PyValueError::new_err(
+            "reindex requires durable storage (not memory:// or a hosted table)",
+        ),
+        other => PyRuntimeError::new_err(other.to_string()),
+    }
+}
+
+/// Parse a reindex mode name (`"auto"` / `"rewrite"` / `"reanalyze"`).
+fn reindex_mode_from_str(s: &str) -> PyResult<ReindexMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => Ok(ReindexMode::Auto),
+        "rewrite" => Ok(ReindexMode::Rewrite),
+        "reanalyze" => Ok(ReindexMode::Reanalyze),
+        other => Err(PyValueError::new_err(format!(
+            "unknown reindex mode {other:?}; use 'auto', 'rewrite', or 'reanalyze'"
+        ))),
+    }
+}
+
+/// The name `reindex_mode_from_str` parses back to the same mode.
+fn reindex_mode_name(mode: ReindexMode) -> String {
+    match mode {
+        ReindexMode::Auto => "auto".into(),
+        ReindexMode::Rewrite => "rewrite".into(),
+        ReindexMode::Reanalyze => "reanalyze".into(),
+        // `ReindexMode` is `#[non_exhaustive]`: a newer mode keeps its own
+        // name rather than masquerading as one of the three above.
+        other => format!("{other:?}").to_ascii_lowercase(),
+    }
 }
 
 /// Parse a metric name (`"cosine"` / `"l2sq"` / `"negdot"`).
@@ -582,6 +620,179 @@ impl CompactOptions {
     }
 }
 
+/// Options for `reindex`, `reindex_plan` and `index_staleness`; omitted
+/// fields fall back to engine defaults. Repairs the full-text index, the only
+/// index with a repair today.
+#[pyclass(name = "ReindexOptions", skip_from_py_object)]
+#[derive(Clone, Default)]
+struct ReindexOptions {
+    mode: Option<String>,
+    stale_seal_timeout_ms: Option<u64>,
+    trust_writer_analysis: bool,
+}
+
+#[pymethods]
+impl ReindexOptions {
+    #[new]
+    #[pyo3(signature = (*, mode=None, stale_seal_timeout_ms=None, trust_writer_analysis=false))]
+    fn new(
+        mode: Option<String>,
+        stale_seal_timeout_ms: Option<u64>,
+        trust_writer_analysis: bool,
+    ) -> Self {
+        Self {
+            mode,
+            stale_seal_timeout_ms,
+            trust_writer_analysis,
+        }
+    }
+}
+
+impl ReindexOptions {
+    /// Lower onto the engine's options through its builder, so every field
+    /// left unset keeps the engine's default.
+    fn to_core(&self) -> PyResult<CoreReindexOptions> {
+        let mut out = CoreReindexOptions::default();
+        if let Some(mode) = self.mode.as_deref() {
+            out = out.with_mode(reindex_mode_from_str(mode)?);
+        }
+        if let Some(ms) = self.stale_seal_timeout_ms {
+            out = out.with_stale_seal_timeout_ms(ms);
+        }
+        if self.trust_writer_analysis {
+            out = out.trusting_writer_analysis();
+        }
+        Ok(out)
+    }
+}
+
+/// Lower an optional binding options object, defaulting when absent.
+fn core_reindex_options(options: Option<&ReindexOptions>) -> PyResult<CoreReindexOptions> {
+    options.map_or_else(
+        || Ok(CoreReindexOptions::default()),
+        ReindexOptions::to_core,
+    )
+}
+
+/// What a `reindex` did.
+#[pyclass(name = "ReindexReport", frozen)]
+struct ReindexReport {
+    #[pyo3(get)]
+    rewritten: usize,
+    #[pyo3(get)]
+    already_current: usize,
+    #[pyo3(get)]
+    awaiting_reanalysis: usize,
+    #[pyo3(get)]
+    held_by_another_run: usize,
+    #[pyo3(get)]
+    unrepairable_columns: Vec<String>,
+}
+
+impl ReindexReport {
+    fn from_core(r: infino::ReindexReport) -> Self {
+        Self {
+            rewritten: r.rewritten,
+            already_current: r.already_current,
+            awaiting_reanalysis: r.awaiting_reanalysis,
+            held_by_another_run: r.held_by_another_run,
+            unrepairable_columns: r.unrepairable_columns,
+        }
+    }
+}
+
+#[pymethods]
+impl ReindexReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "ReindexReport(rewritten={}, already_current={}, awaiting_reanalysis={}, \
+             held_by_another_run={}, unrepairable_columns={:?})",
+            self.rewritten,
+            self.already_current,
+            self.awaiting_reanalysis,
+            self.held_by_another_run,
+            self.unrepairable_columns,
+        )
+    }
+}
+
+/// What a `reindex` would do, and what it would cost.
+#[pyclass(name = "StalenessReport", frozen)]
+struct StalenessReport {
+    #[pyo3(get)]
+    superfiles: usize,
+    #[pyo3(get)]
+    needing_rewrite: usize,
+    #[pyo3(get)]
+    awaiting_reanalysis: usize,
+    #[pyo3(get)]
+    bytes_to_rewrite: u64,
+    #[pyo3(get)]
+    unrepairable_columns: Vec<String>,
+    #[pyo3(get)]
+    is_current: bool,
+}
+
+impl StalenessReport {
+    fn from_core(r: infino::StalenessReport) -> Self {
+        Self {
+            is_current: r.is_current(),
+            superfiles: r.superfiles,
+            needing_rewrite: r.needing_rewrite,
+            awaiting_reanalysis: r.awaiting_reanalysis,
+            bytes_to_rewrite: r.bytes_to_rewrite,
+            unrepairable_columns: r.unrepairable_columns,
+        }
+    }
+}
+
+#[pymethods]
+impl StalenessReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "StalenessReport(superfiles={}, needing_rewrite={}, awaiting_reanalysis={}, \
+             bytes_to_rewrite={}, unrepairable_columns={:?}, is_current={})",
+            self.superfiles,
+            self.needing_rewrite,
+            self.awaiting_reanalysis,
+            self.bytes_to_rewrite,
+            self.unrepairable_columns,
+            if self.is_current { "True" } else { "False" },
+        )
+    }
+}
+
+/// One superfile a `reindex` would repair, and how.
+#[pyclass(name = "PlannedRepair", frozen)]
+struct PlannedRepair {
+    #[pyo3(get)]
+    superfile_id: String,
+    #[pyo3(get)]
+    mode: String,
+    #[pyo3(get)]
+    live_bytes: u64,
+}
+
+impl PlannedRepair {
+    fn from_core(p: &infino::PlannedRepair) -> Self {
+        Self {
+            superfile_id: p.superfile_id.to_string(),
+            mode: reindex_mode_name(p.mode),
+            live_bytes: p.live_bytes,
+        }
+    }
+}
+
+#[pymethods]
+impl PlannedRepair {
+    fn __repr__(&self) -> String {
+        format!(
+            "PlannedRepair(superfile_id={:?}, mode={:?}, live_bytes={})",
+            self.superfile_id, self.mode, self.live_bytes,
+        )
+    }
+}
+
 /// A single-table handle.
 #[pyclass]
 struct Table {
@@ -1059,6 +1270,53 @@ impl Table {
         Ok(GcReport::from_core(&report))
     }
 
+    /// Repair every superfile whose full-text index is behind what this
+    /// engine writes. Rows, their order and their `_id`s are unchanged. Takes
+    /// the table's compaction slot, so it raises while an `optimize` or
+    /// another reindex is running.
+    ///
+    /// Local durable connections only: a `memory://` table has nothing to
+    /// repair and a hosted table's storage is the service's, so on either
+    /// this — and `reindex_plan` / `index_staleness` — raises `ValueError`.
+    #[pyo3(signature = (options=None))]
+    fn reindex(&self, py: Python<'_>, options: Option<&ReindexOptions>) -> PyResult<ReindexReport> {
+        let opts = core_reindex_options(options)?;
+        let report = py
+            .detach(|| self.inner.reindex(&opts))
+            .map_err(reindex_err)?;
+        Ok(ReindexReport::from_core(report))
+    }
+
+    /// The superfiles `reindex` would repair under `options`, and the repair
+    /// each gets — without repairing anything. Writes nothing.
+    #[pyo3(signature = (options=None))]
+    fn reindex_plan(
+        &self,
+        py: Python<'_>,
+        options: Option<&ReindexOptions>,
+    ) -> PyResult<Vec<PlannedRepair>> {
+        let opts = core_reindex_options(options)?;
+        let plan = py
+            .detach(|| self.inner.reindex_plan(&opts))
+            .map_err(reindex_err)?;
+        Ok(plan.iter().map(PlannedRepair::from_core).collect())
+    }
+
+    /// What is behind and what repairing it would cost. Writes nothing, so it
+    /// is safe against a live table.
+    #[pyo3(signature = (options=None))]
+    fn index_staleness(
+        &self,
+        py: Python<'_>,
+        options: Option<&ReindexOptions>,
+    ) -> PyResult<StalenessReport> {
+        let opts = core_reindex_options(options)?;
+        let report = py
+            .detach(|| self.inner.index_staleness(&opts))
+            .map_err(reindex_err)?;
+        Ok(StalenessReport::from_core(report))
+    }
+
     /// The user-facing Arrow schema, as a pyarrow `Schema`.
     fn schema<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.inner.schema().as_ref().to_pyarrow(py)
@@ -1240,6 +1498,10 @@ fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MutationStats>()?;
     m.add_class::<GcReport>()?;
     m.add_class::<CompactOptions>()?;
+    m.add_class::<ReindexOptions>()?;
+    m.add_class::<ReindexReport>()?;
+    m.add_class::<StalenessReport>()?;
+    m.add_class::<PlannedRepair>()?;
     m.add("InfinoError", m.py().get_type::<InfinoError>())?;
     m.add(
         "ConnectionMemoryBudgetError",

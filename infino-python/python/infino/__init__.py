@@ -17,6 +17,10 @@ from infino._infino import (
     InfinoError,
     MutationStats,
     OptimizeOptions,
+    PlannedRepair,
+    ReindexOptions,
+    ReindexReport,
+    StalenessReport,
     Table,
     connect,
 )
@@ -37,4 +41,8 @@ __all__ = [
     "MutationStats",
     "GcReport",
     "OptimizeOptions",
+    "ReindexOptions",
+    "ReindexReport",
+    "StalenessReport",
+    "PlannedRepair",
 ]

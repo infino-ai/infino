@@ -49,7 +49,8 @@ use datafusion::logical_expr::Expr;
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
     InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
-    RecalibratePolicy, Stemmer, Stopwords,
+    RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions, Stemmer,
+    Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,6 +120,64 @@ fn gc_err(e: GcError) -> Error {
         ),
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
+}
+
+/// A table without its own storage backend — `memory://`, or a hosted table
+/// whose storage the service holds — has nothing a reindex could read or
+/// rewrite, so every reindex call refuses it as a bad target rather than
+/// reporting an empty, misleadingly current, result.
+fn reindex_err(e: ReindexError) -> Error {
+    match e {
+        ReindexError::NoStorage => Error::new(
+            Status::InvalidArg,
+            "reindex requires durable storage (not memory:// or a hosted table)",
+        ),
+        other => Error::new(Status::GenericFailure, other.to_string()),
+    }
+}
+
+/// Parse a reindex mode name (`"auto"` / `"rewrite"` / `"reanalyze"`).
+fn reindex_mode_from_str(s: &str) -> Result<ReindexMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => Ok(ReindexMode::Auto),
+        "rewrite" => Ok(ReindexMode::Rewrite),
+        "reanalyze" => Ok(ReindexMode::Reanalyze),
+        other => Err(Error::new(
+            Status::InvalidArg,
+            format!("unknown reindex mode {other:?}; use 'auto', 'rewrite', or 'reanalyze'"),
+        )),
+    }
+}
+
+/// The name `reindex_mode_from_str` parses back to the same mode.
+fn reindex_mode_name(mode: ReindexMode) -> String {
+    match mode {
+        ReindexMode::Auto => "auto".into(),
+        ReindexMode::Rewrite => "rewrite".into(),
+        ReindexMode::Reanalyze => "reanalyze".into(),
+        // `ReindexMode` is `#[non_exhaustive]`: a newer mode keeps its own
+        // name rather than masquerading as one of the three above.
+        other => format!("{other:?}").to_ascii_lowercase(),
+    }
+}
+
+/// Lower the binding's reindex options onto the engine's, through its
+/// builder so every field left unset keeps the engine's default.
+fn reindex_options(opts: Option<ReindexOptions>) -> Result<InfinoReindexOptions> {
+    let mut out = InfinoReindexOptions::default();
+    let Some(o) = opts else {
+        return Ok(out);
+    };
+    if let Some(mode) = o.mode.as_deref() {
+        out = out.with_mode(reindex_mode_from_str(mode)?);
+    }
+    if let Some(ms) = o.stale_seal_timeout_ms {
+        out = out.with_stale_seal_timeout_ms(ms as u64);
+    }
+    if o.trust_writer_analysis == Some(true) {
+        out = out.trusting_writer_analysis();
+    }
+    Ok(out)
 }
 
 /// Parse a metric name (`"cosine"` / `"l2sq"` / `"negdot"`).
@@ -539,6 +598,109 @@ impl From<infino::GcReport> for GcReport {
             objects_skipped_live: r.objects_skipped_live as i64,
             objects_skipped_too_new: r.objects_skipped_too_new as i64,
             delete_errors: r.delete_errors as i64,
+        }
+    }
+}
+
+/// Options for `reindex`, `reindexPlan` and `indexStaleness`; all fields
+/// optional (omitted ⇒ engine default). Repairs the full-text index, the only
+/// index with a repair today.
+#[napi(object)]
+pub struct ReindexOptions {
+    /// How much to repair: `"auto"` (default — the cheapest repair that makes
+    /// each superfile current), `"rewrite"` (layout only; superfiles whose
+    /// terms are stale are left and reported), or `"reanalyze"` (re-tokenize
+    /// every stale superfile from its stored text).
+    pub mode: Option<String>,
+    /// How old a sealed tombstone sidecar has to be, in milliseconds, before a
+    /// rewrite takes it over. Omit to use the table's compaction setting.
+    pub stale_seal_timeout_ms: Option<u32>,
+    /// Credit a superfile that records no analysis revision with the one its
+    /// writer emitted (default `false`). **Only sound when the table never held
+    /// superfiles older than that writer**: an older compaction can have folded
+    /// stale terms into a newer-stamped file, and crediting it reports the
+    /// table migrated with those terms still in place. Leave unset unless the
+    /// table's whole history is known.
+    pub trust_writer_analysis: Option<bool>,
+}
+
+/// What a `reindex` did.
+#[napi(object)]
+pub struct ReindexReport {
+    /// Superfiles rewritten into the current format.
+    pub rewritten: i64,
+    /// Superfiles already current when the run planned.
+    pub already_current: i64,
+    /// Superfiles holding terms from an older analysis that this run's mode
+    /// cannot repair (non-zero only under `"rewrite"`).
+    pub awaiting_reanalysis: i64,
+    /// Stale superfiles another run held; run again to finish them.
+    pub held_by_another_run: i64,
+    /// Columns whose text was never stored, so no repair can fix their terms;
+    /// only re-ingesting them from source can.
+    pub unrepairable_columns: Vec<String>,
+}
+
+impl From<infino::ReindexReport> for ReindexReport {
+    fn from(r: infino::ReindexReport) -> Self {
+        Self {
+            rewritten: r.rewritten as i64,
+            already_current: r.already_current as i64,
+            awaiting_reanalysis: r.awaiting_reanalysis as i64,
+            held_by_another_run: r.held_by_another_run as i64,
+            unrepairable_columns: r.unrepairable_columns,
+        }
+    }
+}
+
+/// What a `reindex` would do, and what it would cost.
+#[napi(object)]
+pub struct StalenessReport {
+    /// Superfiles in the table, stale or not.
+    pub superfiles: i64,
+    /// Superfiles whose layout is behind — what `"rewrite"` would rewrite.
+    pub needing_rewrite: i64,
+    /// Superfiles holding terms from an older analysis, which only
+    /// re-analysis repairs.
+    pub awaiting_reanalysis: i64,
+    /// Live bytes a `"rewrite"` would read and write again.
+    pub bytes_to_rewrite: i64,
+    /// Columns no repair can fix, because their text was never stored.
+    pub unrepairable_columns: Vec<String>,
+    /// Whether a reindex would do nothing at all.
+    pub is_current: bool,
+}
+
+impl From<infino::StalenessReport> for StalenessReport {
+    fn from(r: infino::StalenessReport) -> Self {
+        Self {
+            is_current: r.is_current(),
+            superfiles: r.superfiles as i64,
+            needing_rewrite: r.needing_rewrite as i64,
+            awaiting_reanalysis: r.awaiting_reanalysis as i64,
+            bytes_to_rewrite: r.bytes_to_rewrite as i64,
+            unrepairable_columns: r.unrepairable_columns,
+        }
+    }
+}
+
+/// One superfile a `reindex` would repair, and how.
+#[napi(object)]
+pub struct PlannedRepair {
+    /// The superfile the run reads and replaces.
+    pub superfile_id: String,
+    /// The repair it gets: `"rewrite"` or `"reanalyze"`, never `"auto"`.
+    pub mode: String,
+    /// Live bytes in the superfile.
+    pub live_bytes: i64,
+}
+
+impl From<infino::PlannedRepair> for PlannedRepair {
+    fn from(p: infino::PlannedRepair) -> Self {
+        Self {
+            superfile_id: p.superfile_id.to_string(),
+            mode: reindex_mode_name(p.mode),
+            live_bytes: p.live_bytes as i64,
         }
     }
 }
@@ -1114,6 +1276,39 @@ impl Table {
     pub fn gc(&self, grace_secs: f64) -> Result<GcReport> {
         let grace = Duration::from_secs_f64(grace_secs.max(0.0));
         self.inner.gc(grace).map(GcReport::from).map_err(gc_err)
+    }
+
+    /// Repair every superfile whose full-text index is behind what this engine
+    /// writes. Rows, their order and their `_id`s are unchanged. Requires
+    /// durable storage and takes the table's compaction slot.
+    #[napi]
+    pub fn reindex(&self, options: Option<ReindexOptions>) -> Result<ReindexReport> {
+        let opts = reindex_options(options)?;
+        self.inner
+            .reindex(&opts)
+            .map(ReindexReport::from)
+            .map_err(reindex_err)
+    }
+
+    /// The superfiles `reindex` would repair under `options`, and the repair
+    /// each gets — without repairing anything. Writes nothing.
+    #[napi]
+    pub fn reindex_plan(&self, options: Option<ReindexOptions>) -> Result<Vec<PlannedRepair>> {
+        let opts = reindex_options(options)?;
+        self.inner
+            .reindex_plan(&opts)
+            .map(|plan| plan.into_iter().map(PlannedRepair::from).collect())
+            .map_err(reindex_err)
+    }
+
+    /// What is behind and what repairing it would cost. Writes nothing.
+    #[napi]
+    pub fn index_staleness(&self, options: Option<ReindexOptions>) -> Result<StalenessReport> {
+        let opts = reindex_options(options)?;
+        self.inner
+            .index_staleness(&opts)
+            .map(StalenessReport::from)
+            .map_err(reindex_err)
     }
 
     /// The user-facing Arrow schema, as an Arrow IPC `Buffer` (an empty

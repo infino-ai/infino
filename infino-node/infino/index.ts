@@ -118,6 +118,74 @@ export interface OptimizeOptions {
   recalibrate?: "auto" | "force" | "skip";
 }
 
+/** How much a reindex repairs. `"auto"` gives each superfile the cheapest
+ * repair that makes it current; `"rewrite"` brings layouts current and leaves
+ * superfiles whose terms are stale (reported); `"reanalyze"` re-tokenizes every
+ * stale superfile from its stored text. */
+export type ReindexMode = "auto" | "rewrite" | "reanalyze";
+
+/** Options for `reindex`, `reindexPlan` and `indexStaleness`; all fields
+ * optional (omitted ⇒ engine default). Repairs the full-text index. */
+export interface ReindexOptions {
+  /** How much to repair; omit for `"auto"`. */
+  mode?: ReindexMode;
+  /** How old a sealed tombstone sidecar has to be, in milliseconds, before a
+   * rewrite takes it over. Omit to use the table's compaction setting. */
+  staleSealTimeoutMs?: number;
+  /**
+   * Credit a superfile that records no analysis revision with the one its
+   * writer emitted (default `false`). **Only sound when the table never held
+   * superfiles older than that writer**: an older compaction can have folded
+   * stale terms into a newer-stamped file, and crediting it reports the table
+   * migrated with those terms still in place. Leave unset unless the table's
+   * whole history is known.
+   */
+  trustWriterAnalysis?: boolean;
+}
+
+/** What a `reindex` did. */
+export interface ReindexReport {
+  /** Superfiles rewritten into the current format. */
+  rewritten: number;
+  /** Superfiles already current when the run planned. */
+  alreadyCurrent: number;
+  /** Superfiles holding terms from an older analysis that this run's mode
+   * cannot repair (non-zero only under `"rewrite"`). */
+  awaitingReanalysis: number;
+  /** Stale superfiles another run held; run again to finish them. */
+  heldByAnotherRun: number;
+  /** Columns whose text was never stored, so no repair can fix their terms;
+   * only re-ingesting them from source can. */
+  unrepairableColumns: string[];
+}
+
+/** What a `reindex` would do, and what it would cost. */
+export interface StalenessReport {
+  /** Superfiles in the table, stale or not. */
+  superfiles: number;
+  /** Superfiles whose layout is behind — what `"rewrite"` would rewrite. */
+  needingRewrite: number;
+  /** Superfiles holding terms from an older analysis, which only
+   * re-analysis repairs. */
+  awaitingReanalysis: number;
+  /** Live bytes a `"rewrite"` would read and write again. */
+  bytesToRewrite: number;
+  /** Columns no repair can fix, because their text was never stored. */
+  unrepairableColumns: string[];
+  /** Whether a reindex would do nothing at all. */
+  isCurrent: boolean;
+}
+
+/** One superfile a `reindex` would repair, and how. */
+export interface PlannedRepair {
+  /** The superfile the run reads and replaces. */
+  superfileId: string;
+  /** The repair it gets — never `"auto"`, which the plan has resolved. */
+  mode: Exclude<ReindexMode, "auto">;
+  /** Live bytes in the superfile. */
+  liveBytes: number;
+}
+
 export interface Bm25SearchOptions {
   mode?: BoolMode;
   /** BM25 statistics scope: `"global"` (default) or `"per_superfile"`. */
@@ -489,6 +557,32 @@ export class Table {
    */
   gc(graceSecs: number): GcReport {
     return guard(this.remote, () => this.inner.gc(graceSecs));
+  }
+
+  /**
+   * Repair every superfile whose full-text index is behind what this engine
+   * writes. Rows, their order and their `_id`s are unchanged. Takes the
+   * table's compaction slot, so it throws while an `optimize` or another
+   * reindex is running.
+   *
+   * **Local durable connections only.** A `memory://` table has nothing to
+   * repair and a hosted table's storage is the service's, so on either this —
+   * and `reindexPlan` / `indexStaleness` — throws with `code` `"InvalidArg"`.
+   */
+  reindex(options?: ReindexOptions): ReindexReport {
+    return guard(this.remote, () => this.inner.reindex(options));
+  }
+
+  /** The superfiles {@link Table.reindex} would repair under `options`, and
+   * the repair each gets — without repairing anything. Writes nothing. */
+  reindexPlan(options?: ReindexOptions): PlannedRepair[] {
+    return guard(this.remote, () => this.inner.reindexPlan(options));
+  }
+
+  /** What is behind and what repairing it would cost. Writes nothing, so it is
+   * safe against a live table. */
+  indexStaleness(options?: ReindexOptions): StalenessReport {
+    return guard(this.remote, () => this.inner.indexStaleness(options));
   }
 }
 
