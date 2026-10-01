@@ -78,6 +78,11 @@ class ConflictError(InfinoError):
     retries were exhausted. Recoverable: nothing partial is visible, so catch it,
     back off, and reissue the append / update / delete."""
 
+class AlreadyRunningError(InfinoError):
+    """Raised by ``reindex`` when an ``optimize`` or another reindex already holds
+    the table. Recoverable: nothing was changed, so catch it and try again once
+    the other run has finished."""
+
 class Connection:
     def create_database(self) -> None: ...
     def create_table(self, name: str, schema: Schema, indexes: IndexSpec) -> Table: ...
@@ -194,7 +199,8 @@ class Table:
     # Repairs every superfile whose full-text index is behind what this engine
     # writes; rows, their order and their `_id`s are unchanged. All three
     # reindex calls raise `ValueError` on a `memory://` or hosted table, which
-    # has no storage of its own to repair.
+    # has no storage of its own to repair; `reindex` raises `AlreadyRunningError`
+    # while an `optimize` or another reindex holds the table.
     def reindex(self, options: ReindexOptions | None = ...) -> ReindexReport: ...
     def reindex_plan(self, options: ReindexOptions | None = ...) -> list[PlannedRepair]: ...
     def index_staleness(self, options: ReindexOptions | None = ...) -> StalenessReport: ...

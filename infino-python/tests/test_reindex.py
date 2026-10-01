@@ -18,6 +18,8 @@ OLD_FORMAT_SUPERFILES = 3
 SHARED_TERM = "shared"
 # Upper bound on hits for a fixture-wide search; above its row count.
 ALL_HITS = 1000
+# A seal-takeover age past what 32 bits of milliseconds can hold (~49 days).
+LONG_SEAL_TIMEOUT_MS = 2**40
 # Where the catalog keeps its own records, beside each table's subtree.
 CATALOG_DIR = "_catalog"
 
@@ -124,3 +126,29 @@ def test_a_rewrite_leaves_analysis_stale_superfiles_reported(tmp_path):
     assert report.rewritten == 0
     assert report.awaiting_reanalysis == OLD_FORMAT_SUPERFILES
     assert not table.index_staleness().is_current
+
+
+def test_trusting_writer_analysis_reaches_the_engine_and_is_off_by_default(tmp_path):
+    # The fixture's superfiles record no analysis revision, but the engine that
+    # wrote them emitted the current one — so trusting the writer reads the
+    # table as current, and the default must not.
+    table = _old_format_table(tmp_path)
+    trusting = infino.ReindexOptions(trust_writer_analysis=True)
+
+    assert table.index_staleness(trusting).is_current
+    assert table.reindex_plan(trusting) == []
+
+    assert not table.index_staleness().is_current
+    assert not table.index_staleness(infino.ReindexOptions()).is_current
+    assert len(table.reindex_plan(infino.ReindexOptions())) == OLD_FORMAT_SUPERFILES
+
+
+def test_a_long_seal_timeout_is_passed_through(tmp_path):
+    table = _old_format_table(tmp_path)
+    report = table.reindex(infino.ReindexOptions(stale_seal_timeout_ms=LONG_SEAL_TIMEOUT_MS))
+    assert report.rewritten == OLD_FORMAT_SUPERFILES
+
+
+def test_a_negative_seal_timeout_is_rejected():
+    with pytest.raises(OverflowError):
+        infino.ReindexOptions(stale_seal_timeout_ms=-1)

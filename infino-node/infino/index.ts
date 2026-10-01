@@ -561,9 +561,10 @@ export class Table {
 
   /**
    * Repair every superfile whose full-text index is behind what this engine
-   * writes. Rows, their order and their `_id`s are unchanged. Takes the
-   * table's compaction slot, so it throws while an `optimize` or another
-   * reindex is running.
+   * writes. Rows, their order and their `_id`s are unchanged.
+   *
+   * Throws an Error whose message starts with `AlreadyRunningError:` while an
+   * `optimize` or another reindex holds the table — retry later.
    *
    * **Local durable connections only.** A `memory://` table has nothing to
    * repair and a hosted table's storage is the service's, so on either this —

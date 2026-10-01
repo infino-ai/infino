@@ -132,6 +132,13 @@ fn reindex_err(e: ReindexError) -> Error {
             Status::InvalidArg,
             "reindex requires durable storage (not memory:// or a hosted table)",
         ),
+        // Another compaction or reindex holds the table's slot. Retryable, and
+        // prefixed with the same name Python raises (`AlreadyRunningError`) so
+        // a caller can tell it apart from a failed repair and try again later.
+        ReindexError::AlreadyRunning => Error::new(
+            Status::GenericFailure,
+            format!("AlreadyRunningError: {}", ReindexError::AlreadyRunning),
+        ),
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
 }
@@ -172,7 +179,13 @@ fn reindex_options(opts: Option<ReindexOptions>) -> Result<InfinoReindexOptions>
         out = out.with_mode(reindex_mode_from_str(mode)?);
     }
     if let Some(ms) = o.stale_seal_timeout_ms {
-        out = out.with_stale_seal_timeout_ms(ms as u64);
+        let ms = u64::try_from(ms).map_err(|_| {
+            Error::new(
+                Status::InvalidArg,
+                format!("staleSealTimeoutMs must not be negative, got {ms}"),
+            )
+        })?;
+        out = out.with_stale_seal_timeout_ms(ms);
     }
     if o.trust_writer_analysis == Some(true) {
         out = out.trusting_writer_analysis();
@@ -614,7 +627,9 @@ pub struct ReindexOptions {
     pub mode: Option<String>,
     /// How old a sealed tombstone sidecar has to be, in milliseconds, before a
     /// rewrite takes it over. Omit to use the table's compaction setting.
-    pub stale_seal_timeout_ms: Option<u32>,
+    // `i64`, not `u32`: a JS number carries any timeout up to 2^53 ms, and a
+    // `u32` would wrap the ones past ~49 days instead of passing them on.
+    pub stale_seal_timeout_ms: Option<i64>,
     /// Credit a superfile that records no analysis revision with the one its
     /// writer emitted (default `false`). **Only sound when the table never held
     /// superfiles older than that writer**: an older compaction can have folded

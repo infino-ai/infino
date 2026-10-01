@@ -76,6 +76,15 @@ create_exception!(
      back off, and reissue the append / update / delete."
 );
 
+create_exception!(
+    infino,
+    AlreadyRunningError,
+    InfinoError,
+    "Raised by `reindex` when an `optimize` or another reindex already holds \
+     the table. It is recoverable: nothing was changed, so catch it and try \
+     again once the other run has finished."
+);
+
 /// Map a core engine error to the Python exception the caller sees.
 fn py_err(e: CoreError) -> PyErr {
     match e {
@@ -114,6 +123,10 @@ fn reindex_err(e: ReindexError) -> PyErr {
         ReindexError::NoStorage => PyValueError::new_err(
             "reindex requires durable storage (not memory:// or a hosted table)",
         ),
+        // Another compaction or reindex holds the table's slot: retryable.
+        ReindexError::AlreadyRunning => {
+            AlreadyRunningError::new_err(ReindexError::AlreadyRunning.to_string())
+        }
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
@@ -1272,8 +1285,8 @@ impl Table {
 
     /// Repair every superfile whose full-text index is behind what this
     /// engine writes. Rows, their order and their `_id`s are unchanged. Takes
-    /// the table's compaction slot, so it raises while an `optimize` or
-    /// another reindex is running.
+    /// the table's compaction slot, so it raises `AlreadyRunningError` while
+    /// an `optimize` or another reindex is running.
     ///
     /// Local durable connections only: a `memory://` table has nothing to
     /// repair and a hosted table's storage is the service's, so on either
@@ -1508,5 +1521,9 @@ fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<ConnectionMemoryBudgetError>(),
     )?;
     m.add("ConflictError", m.py().get_type::<ConflictError>())?;
+    m.add(
+        "AlreadyRunningError",
+        m.py().get_type::<AlreadyRunningError>(),
+    )?;
     Ok(())
 }
