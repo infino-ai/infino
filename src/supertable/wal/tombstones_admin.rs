@@ -141,11 +141,25 @@ pub async fn seal(
         bitmap,
     };
 
+    let new_etag = put_sidecar(wal_store, superfile_id, etag_opt.as_ref(), &sealed).await?;
+    Ok((sealed, new_etag))
+}
+
+/// CAS-PUT one sidecar, reporting a lost race as [`TombstonesAdminError::CasLost`].
+///
+/// The three callers differ only in what they write and what they make of losing: `seal` and
+/// `refresh_seal` surface it, `unseal` treats it as already resolved.
+async fn put_sidecar(
+    wal_store: &WalStore,
+    superfile_id: Uuid,
+    expected_etag: Option<&Etag>,
+    sidecar: &TombstonesSidecar,
+) -> Result<Etag, TombstonesAdminError> {
     match wal_store
-        .put_tombstones(superfile_id, etag_opt.as_ref(), &sealed)
+        .put_tombstones(superfile_id, expected_etag, sidecar)
         .await
     {
-        Ok(new_etag) => Ok((sealed, new_etag)),
+        Ok(new_etag) => Ok(new_etag),
         Err(WalStoreError::CasFailed { .. }) => Err(TombstonesAdminError::CasLost { superfile_id }),
         Err(other) => Err(other.into()),
     }
@@ -164,13 +178,11 @@ pub async fn unseal(
     etag: &Etag,
 ) -> Result<(), TombstonesAdminError> {
     let unsealed = TombstonesSidecar { seal: None, bitmap };
-    match wal_store
-        .put_tombstones(superfile_id, Some(etag), &unsealed)
-        .await
-    {
+    match put_sidecar(wal_store, superfile_id, Some(etag), &unsealed).await {
         Ok(_) => Ok(()),
-        Err(WalStoreError::CasFailed { .. }) => Ok(()),
-        Err(other) => Err(other.into()),
+        // Whatever changed it already resolved the seal; there is nothing left to clear.
+        Err(TombstonesAdminError::CasLost { .. }) => Ok(()),
+        Err(other) => Err(other),
     }
 }
 
@@ -201,14 +213,7 @@ pub async fn refresh_seal(
         }),
         bitmap,
     };
-    match wal_store
-        .put_tombstones(superfile_id, Some(etag), &resealed)
-        .await
-    {
-        Ok(new_etag) => Ok(new_etag),
-        Err(WalStoreError::CasFailed { .. }) => Err(TombstonesAdminError::CasLost { superfile_id }),
-        Err(other) => Err(other.into()),
-    }
+    put_sidecar(wal_store, superfile_id, Some(etag), &resealed).await
 }
 
 /// Return the local doc-ids of `superfile_id` that are NOT in

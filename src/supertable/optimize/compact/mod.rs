@@ -20,7 +20,10 @@ use std::{
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::stream::{self, StreamExt};
+use futures::{
+    future::BoxFuture,
+    stream::{self, StreamExt},
+};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::{
@@ -62,7 +65,7 @@ use crate::{
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
+            CommitFence, NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
             finalize_compaction_commit, maint_pool, prepare_superfile_named,
             recalibrate_probe_laws, refresh_slow_vector_state, split_overflow_cells,
             try_commit_attempt,
@@ -1104,6 +1107,15 @@ impl Supertable {
             // The CAS on its own, separated from the cache warm and reclaim
             // that follow it: one span over the whole retry loop could not
             // tell a slow pointer write from several fast ones plus backoff.
+            // The seals have to still be ours when the swap lands, not merely
+            // when the uploads started: `try_commit_attempt` writes every
+            // merged superfile before its pointer PUT, and a seal that expired
+            // during that lets a delete land a tombstone on an input this
+            // commit then removes.
+            let mut fence = SealFence {
+                wal_store: &wal_store,
+                batch: &mut batch,
+            };
             let attempt_outcome = try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
@@ -1115,6 +1127,7 @@ impl Supertable {
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
                 &term_contributions,
+                Some(&mut fence),
             )
             .instrument(detail_span!(
                 "compaction_commit_attempt",
@@ -1564,6 +1577,42 @@ pub(crate) struct PreparedJob {
     bytes_for_cache: Option<(SuperfileUri, Bytes)>,
     merged_superfile_id: Uuid,
     term_contributions: Vec<TermContribution>,
+}
+
+/// Re-stamps a batch's seals with only the pointer PUT left to outlive them.
+///
+/// The early re-stamp before the uploads is a cheap way to drop a job whose sidecar has already
+/// moved, so a multi-gigabyte upload is not spent on work that cannot commit. It is not what makes
+/// the commit safe: the uploads take minutes at scale, and a seal can expire inside them. This
+/// runs after them, leaving one pointer PUT for a freshly stamped seal to outlive.
+///
+/// A lost CAS here fails the whole attempt rather than dropping one job: the outputs are already
+/// uploaded and the manifest is already built against this batch, so there is nothing left to drop
+/// a job from. The retry re-resolves, and its early re-stamp drops the job then.
+struct SealFence<'a> {
+    wal_store: &'a WalStore,
+    batch: &'a mut Vec<PreparedJob>,
+}
+
+impl CommitFence for SealFence<'_> {
+    fn check(&mut self) -> BoxFuture<'_, Result<(), CommitError>> {
+        Box::pin(async move {
+            let stale = restamp_seals(self.wal_store, self.batch, Utc::now())
+                .await
+                .map_err(|e| CommitError::Encode(e.to_string()))?;
+            let Some(&i) = stale.first() else {
+                return Ok(());
+            };
+            let superfile_id = self.batch[i]
+                .sealed
+                .first()
+                .map(|s| s.superfile_id)
+                .unwrap_or_default();
+            Err(CommitError::Encode(
+                CompactionError::SidecarChangedUnderSeal { superfile_id }.to_string(),
+            ))
+        })
+    }
 }
 
 /// Re-stamp every seal the batch still needs stamped, conditioned on the etag
@@ -5212,6 +5261,102 @@ mod tests {
         assert!(
             !after.contains(&live[0]) && !after.contains(&live[1]),
             "the untouched job must still have merged"
+        );
+    }
+
+    /// Prepare one job over the whole table, for the fence tests below.
+    async fn one_job_over(st: &Supertable, live: &[Uuid]) -> Vec<PreparedJob> {
+        vec![
+            st.prepare_compaction_job(
+                CompactionJob {
+                    partition_key: Vec::new(),
+                    inputs: live.to_vec(),
+                    estimated_output_bytes: 0,
+                },
+                DEFAULT_STALE_SEAL_TIMEOUT,
+            )
+            .await
+            .expect("prepare"),
+        ]
+    }
+
+    /// The fence passes a commit whose inputs nobody touched, re-stamping the
+    /// seals so they outlive the pointer PUT that follows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_commit_fence_passes_an_untouched_sidecar() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        for term in ["alpha", "bravo"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let live = listed_ids(&st);
+        let mut batch = one_job_over(&st, &live).await;
+        let wal_store = wal_store_for(&st);
+
+        // Old enough that the fence re-stamps rather than skipping, which is
+        // the state a long upload leaves the seals in.
+        age_seals_past_stale(&wal_store, &mut batch).await;
+        let mut fence = SealFence {
+            wal_store: &wal_store,
+            batch: &mut batch,
+        };
+        fence
+            .check()
+            .await
+            .expect("a sidecar nobody touched must pass the fence");
+    }
+
+    /// The fence refuses a commit whose input sidecar moved under its seal.
+    ///
+    /// `try_commit_attempt` writes every merged superfile before its pointer
+    /// PUT, so a re-stamp proved only before that work leaves a window as wide
+    /// as the upload is slow: the seal expires mid-upload, a delete takes it
+    /// over and marks its row, and the pointer PUT removes the input anyway.
+    /// The fence is checked with only the pointer PUT left to outlive a
+    /// freshly stamped seal.
+    ///
+    /// Driven directly rather than through a slowed upload: making the expiry
+    /// fall strictly between the early re-stamp and the pointer PUT needs a
+    /// fault-injection point inside `try_commit_attempt` that the harness does
+    /// not have. What this pins is the fence's own decision, which is what the
+    /// commit path calls at that moment.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_commit_fence_refuses_a_sidecar_that_moved_under_its_seal() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let doomed = "bravo first";
+        for term in ["alpha", "bravo"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let live = listed_ids(&st);
+        let mut batch = one_job_over(&st, &live).await;
+        let wal_store = wal_store_for(&st);
+
+        // The seals age out, as they would inside a long upload, and a delete
+        // arriving meanwhile takes one over and marks its row.
+        age_seals_past_stale(&wal_store, &mut batch).await;
+        let deleting = st.clone();
+        let title = doomed.to_string();
+        let stats = task::spawn_blocking(move || deleting.delete(col("title").eq(lit(title))))
+            .await
+            .expect("delete task")
+            .expect("delete");
+        assert_eq!(
+            stats.n_tombstoned(),
+            1,
+            "the delete must take the expired seal over and land its bit"
+        );
+
+        // The job still holds the etag from before that bit landed. Committing
+        // would remove the input carrying it, so the fence must refuse.
+        let mut fence = SealFence {
+            wal_store: &wal_store,
+            batch: &mut batch,
+        };
+        let refused = fence.check().await;
+        assert!(
+            refused.is_err(),
+            "a sidecar that moved under the seal must fail the attempt, got {refused:?}"
         );
     }
 

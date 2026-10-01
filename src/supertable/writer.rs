@@ -77,7 +77,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
 use futures::{
-    future::try_join_all,
+    future::{BoxFuture, try_join_all},
     stream::{self, FuturesUnordered, StreamExt},
 };
 use object_store::{MultipartUpload, PutPayload, UploadPart};
@@ -9172,6 +9172,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             &mut Vec::new(),
             &mut Vec::new(),
             &[],
+            None,
         )
         .await
         {
@@ -10298,6 +10299,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 pending_writes,
                 pending_replaces,
                 contributions,
+                None,
             )
             .await
             {
@@ -10639,6 +10641,22 @@ pub(crate) enum NewEntryBirthVersions {
     Preserve,
 }
 
+/// A condition that has to still hold at the instant a commit becomes visible.
+///
+/// Everything a commit does before its pointer PUT — uploading the new superfiles, writing the
+/// manifest parts — is invisible until that PUT lands, so a safety property proved *before* that
+/// work has a hole exactly as wide as the work is slow. A fence is checked with only the pointer
+/// PUT left to do, which is the closest to the swap a separate object can be checked.
+///
+/// Compaction uses it to re-stamp the seals on the inputs this commit is about to remove: a seal
+/// that expired during a long upload lets a delete land a tombstone on a superfile that is then
+/// removed, and the deletion is lost. Ordinary writer commits remove nothing and pass `None`.
+pub(crate) trait CommitFence: Send {
+    /// `Err` aborts the attempt before anything is visible, so the caller can retry or give up
+    /// with nothing published.
+    fn check(&mut self) -> BoxFuture<'_, Result<(), SupertableCommitError>>;
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_commit_attempt(
     storage: Arc<dyn StorageProvider>,
@@ -10653,6 +10671,8 @@ pub(crate) async fn try_commit_attempt(
     pending_storage_writes: &mut Vec<(String, Bytes)>,
     pending_storage_replaces: &mut Vec<(String, Bytes)>,
     term_contributions: &[TermContribution],
+    // Checked immediately before the pointer PUT; see [`CommitFence`].
+    fence: Option<&mut dyn CommitFence>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
@@ -10825,6 +10845,11 @@ pub(crate) async fn try_commit_attempt(
         .flat_map(|ep| [Some(ep.encoded.as_slice()), ep.routing_encoded.as_deref()])
         .flatten()
         .collect();
+    // The last thing before the swap: whatever this commit's safety rests on has to still hold
+    // here, with only the pointer PUT left to outlive it.
+    if let Some(fence) = fence {
+        fence.check().await?;
+    }
     new_manifest
         .write(storage.as_ref(), prev_etag.as_deref(), &encoded_refs)
         .await?;
