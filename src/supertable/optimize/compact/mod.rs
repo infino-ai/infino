@@ -4351,14 +4351,11 @@ mod tests {
     /// table. Same doc count, same superfile shape — the plan is identical, so
     /// only the order the merges run in changed.
     ///
-    /// It must also cost FEWER manifest generations, since a wave commits in
-    /// one CAS. That half is what proves the batching actually happened and
-    /// the pass did not quietly fall back to committing one job at a time.
+    /// Commit count is bounded rather than pinned. A merge commits as soon as
+    /// it is ready and takes along whatever else has finished, so how many
+    /// CASes a pass spends depends on how its merges interleave.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_jobs_land_the_same_table_as_a_serial_pass() {
-        // Shape equality is the gate here: a pass that merges several jobs at
-        // once and commits them as they finish must land exactly the table a
-        // serial pass does.
         let (serial_docs, serial_shape, serial_generations) = compact_a_fragmented_table(1).await;
         let (concurrent_docs, concurrent_shape, concurrent_generations) =
             compact_a_fragmented_table(TEST_CONCURRENT_JOBS).await;
