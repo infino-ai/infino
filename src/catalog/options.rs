@@ -68,6 +68,10 @@ pub struct ConnectOptions {
     /// can't exhaust process memory. Applies to the whole connection, shared
     /// across supertables.
     pub(crate) connection_memory_budget_bytes: Option<u64>,
+    /// Process-wide anonymous-memory ceiling for this connection's SQL
+    /// statements. `None` (default) sets none. See
+    /// [`with_process_memory_limit_bytes`](Self::with_process_memory_limit_bytes).
+    pub(crate) process_memory_limit_bytes: Option<u64>,
     /// Read-consistency policy for every table opened or created on this
     /// connection (see [`Consistency`]). Default:
     /// [`Consistency::BoundedStaleness`] with a 1s window — the engine default,
@@ -121,6 +125,31 @@ impl ConnectOptions {
     /// connection's tables.
     pub fn with_connection_memory_budget_bytes(mut self, bytes: u64) -> Self {
         self.connection_memory_budget_bytes = Some(bytes);
+        self
+    }
+
+    /// Refuse a running SQL statement on this connection — including the scan
+    /// an `update` or `delete` runs to find its rows — once the whole process's
+    /// anonymous resident memory passes `bytes`. `0` sets no limit.
+    ///
+    /// The connection memory budget counts what query operators reserve —
+    /// sorts, aggregates, joins. The batches passing between operators (a
+    /// scan's decoded pages, the rows an `unnest` repeats, a projection's
+    /// output) are never reserved, so a statement can grow far past the budget
+    /// while the budget reads near zero. This limit reads the process instead,
+    /// which is what a container or cgroup memory limit kills on: set it below
+    /// that limit, and a statement that would have grown into it fails with
+    /// [`InfinoError::OverBudget`](crate::InfinoError::OverBudget) instead.
+    ///
+    /// It is process-wide: memory held by anything else in the process counts
+    /// too, so a statement is refused whenever the process as a whole is over
+    /// the limit, including before it starts. It suits a process that serves
+    /// one connection inside a hard memory limit. Memory is sampled every
+    /// 100 ms, and a batch already being processed finishes before the
+    /// statement's memory is released. Linux only (it reads
+    /// `/proc/self/status`); elsewhere it never refuses.
+    pub fn with_process_memory_limit_bytes(mut self, bytes: u64) -> Self {
+        self.process_memory_limit_bytes = Some(bytes);
         self
     }
 

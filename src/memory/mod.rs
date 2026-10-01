@@ -17,7 +17,9 @@
 //! reserves the bytes *before* it allocates them — so the budget can say no in
 //! advance:
 //!   - the vector shortlist fetched for a search,
-//!   - SQL result / intermediate batches,
+//!   - the working state of the SQL operators that buffer — sorts, aggregates,
+//!     joins, repartitions — which DataFusion reserves through the pool in
+//!     `datafusion_pool`,
 //!   - ingest buffers.
 //!
 //! # What we don't
@@ -26,6 +28,22 @@
 //! rows, posting lists stream through, scratch is a fixed size. Reserving at
 //! each of these would be noise, so we skip them and cover them with a small
 //! headroom margin instead.
+//!
+//! Nor the batches a SQL plan streams between its operators — a scan's decoded
+//! pages, a filter's or projection's output, the rows an `unnest` repeats, the
+//! result as it is collected. DataFusion reserves none of them, and a streaming
+//! scan runs even at a zero gate. They are bounded per batch, not by the
+//! budget, and a batch is only as small as its rows: one that repeats a long
+//! text column many times over can be larger than the whole budget.
+//!
+//! # Process ceiling
+//!
+//! Where the process must not outgrow a hard memory limit, a connection can
+//! also carry a process-wide ceiling for its SQL statements
+//! ([`ConnectOptions::with_process_memory_limit_bytes`](crate::ConnectOptions::with_process_memory_limit_bytes)).
+//! It reads the process's anonymous resident memory rather than the
+//! reservations, so it sees the streamed batches too, and refuses a running
+//! statement once the process passes it (`resident`).
 //!
 //! That headroom is exactly why a bounded budget enforces against only **90%
 //! of the value given in config** — the spare 10% absorbs all of these
@@ -92,8 +110,12 @@ use std::{
 };
 
 mod datafusion_pool;
+mod resident;
 
 pub(crate) use datafusion_pool::budgeted_session_context;
+pub(crate) use resident::{
+    ProcessMemoryLimit, over_process_limit, process_limit_exceeded, process_over_limit,
+};
 
 /// The fraction of a configured budget we actually enforce: gate at 9/10 and
 /// leave the final 1/10 as headroom for allocations too small to track. Applied
@@ -128,17 +150,29 @@ pub struct ConnectionMemoryBudget {
     // Count of refused reservations (a count, not bytes); observability only,
     // never affects gating.
     denials: AtomicU64,
+    // Process-wide anonymous-memory ceiling for the connection's SQL
+    // statements (see `resident`). `None` sets none. Not part of the counter
+    // above: it reads the process, not the reservations.
+    process_limit: Option<u64>,
 }
 
 impl ConnectionMemoryBudget {
     /// A measure-only budget: counts usage but never refuses. The default when
     /// no limit is configured.
     pub fn measured() -> Arc<Self> {
+        Self::build(None, None)
+    }
+
+    /// The one constructor behind the public ones: `limit` is the already-gated
+    /// ceiling (or `None` for measure-only), `process_limit` the SQL process
+    /// ceiling.
+    fn build(limit: Option<usize>, process_limit: Option<u64>) -> Arc<Self> {
         Arc::new(Self {
-            limit: None,
+            limit,
             used: AtomicUsize::new(0),
             peak_used: AtomicUsize::new(0),
             denials: AtomicU64::new(0),
+            process_limit,
         })
     }
 
@@ -156,28 +190,36 @@ impl ConnectionMemoryBudget {
             "with_limit expects a positive budget; 0 / unset means measured() at the call site"
         );
 
-        let limit = (configured_bytes as u128 * ENFORCED_BUDGET_NUMERATOR
-            / ENFORCED_BUDGET_DENOMINATOR) as usize;
-
-        Arc::new(Self {
-            limit: Some(limit),
-            used: AtomicUsize::new(0),
-            peak_used: AtomicUsize::new(0),
-            denials: AtomicU64::new(0),
-        })
+        Self::build(Some(Self::gate(configured_bytes)), None)
     }
 
-    /// Map a configured byte value to a budget: `0` is measure-only
-    /// ([`measured`](Self::measured)), anything positive is bounded
-    /// ([`with_limit`](Self::with_limit)). Both config sources (`ConnectOptions`
-    /// and `config.yaml`) route through here, so "0 means measure-only" is
-    /// defined in exactly one place.
+    /// The enforced ceiling for `configured_bytes`: its 90% headroom gate.
+    fn gate(configured_bytes: u64) -> usize {
+        (configured_bytes as u128 * ENFORCED_BUDGET_NUMERATOR / ENFORCED_BUDGET_DENOMINATOR)
+            as usize
+    }
+
+    /// Map a configured byte value to a budget with no process ceiling: `0` is
+    /// measure-only ([`measured`](Self::measured)), anything positive is
+    /// bounded ([`with_limit`](Self::with_limit)). "0 means measure-only" is
+    /// defined once, in [`for_connection`](Self::for_connection), which both
+    /// config sources (`ConnectOptions` and `config.yaml`) reach.
     pub fn from_budget_bytes(bytes: u64) -> Arc<Self> {
-        if bytes > 0 {
-            Self::with_limit(bytes)
-        } else {
-            Self::measured()
-        }
+        Self::for_connection(bytes, None)
+    }
+
+    /// A connection's budget from its two settings: `budget_bytes` as in
+    /// [`from_budget_bytes`](Self::from_budget_bytes), and the process ceiling
+    /// its SQL statements are refused past (`None` or `Some(0)` sets none).
+    pub(crate) fn for_connection(budget_bytes: u64, process_limit_bytes: Option<u64>) -> Arc<Self> {
+        let limit = (budget_bytes > 0).then(|| Self::gate(budget_bytes));
+        Self::build(limit, process_limit_bytes.filter(|&bytes| bytes > 0))
+    }
+
+    /// The process-wide anonymous-memory ceiling for this connection's SQL
+    /// statements, if one is set.
+    pub(crate) fn process_limit(&self) -> Option<u64> {
+        self.process_limit
     }
 
     /// Reserve `n` bytes, returning a guard that frees them on drop. Fails with
@@ -415,6 +457,22 @@ mod tests {
         assert_eq!(
             ConnectionMemoryBudget::from_budget_bytes(1000).limit(),
             Some(900)
+        );
+    }
+
+    #[test]
+    fn for_connection_keeps_the_budget_rule_and_zero_sets_no_process_limit() {
+        // The budget half is from_budget_bytes's rule, unchanged.
+        let bounded = ConnectionMemoryBudget::for_connection(1000, Some(5000));
+        assert_eq!(bounded.limit(), Some(900));
+        assert_eq!(bounded.process_limit(), Some(5000));
+        let measured = ConnectionMemoryBudget::for_connection(0, None);
+        assert_eq!(measured.limit(), None);
+        assert_eq!(measured.process_limit(), None);
+        // A 0 process limit means none, as a 0 budget means measure-only.
+        assert_eq!(
+            ConnectionMemoryBudget::for_connection(0, Some(0)).process_limit(),
+            None
         );
     }
 

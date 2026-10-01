@@ -47,16 +47,30 @@ const RSS_MEDIAN_PERCENTILE: usize = 50;
 const RSS_P90_PERCENTILE: usize = 90;
 /// Divisor converting a percentile rank to a `[0, 1]` fraction.
 const PERCENT_SCALE: f64 = 100.0;
-/// Process status file carrying `VmRSS`.
+/// Process status file carrying `VmRSS` and `RssAnon`.
 const PROC_SELF_STATUS: &str = "/proc/self/status";
 /// Aggregated smaps rollup (Anonymous / Rss / Shmem).
 const PROC_SELF_SMAPS_ROLLUP: &str = "/proc/self/smaps_rollup";
 
 /// One-shot read of the calling process's current VmRSS in bytes.
 pub fn current_rss_bytes() -> Option<u64> {
+    status_field_bytes("VmRSS:")
+}
+
+/// The calling process's anonymous resident bytes (`RssAnon`), read from
+/// `/proc/self/status`: the kernel's counter, with no allocator purge and no
+/// walk of the mappings, so it is cheap enough to poll while a query runs.
+/// Unlike [`current_anon_rss_bytes`] it includes pages the allocator has freed
+/// but not yet returned, which is what a memory limit counts.
+pub(crate) fn status_anon_rss_bytes() -> Option<u64> {
+    status_field_bytes("RssAnon:")
+}
+
+/// A `/proc/self/status` field that the kernel reports in kB, in bytes.
+fn status_field_bytes(field: &str) -> Option<u64> {
     let s = fs::read_to_string(PROC_SELF_STATUS).ok()?;
     for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
+        if let Some(rest) = line.strip_prefix(field) {
             let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
             return Some(kb * KIB_TO_BYTES);
         }
