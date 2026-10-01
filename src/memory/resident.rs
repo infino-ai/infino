@@ -12,8 +12,9 @@
 //! The limit is resolved once per process: `memory.process_limit_bytes` from
 //! config when it is set (`0` sets none), otherwise [`CGROUP_LIMIT_PERCENT`]
 //! of the process's cgroup memory limit — the lowest `memory.high` or
-//! `memory.max` from its cgroup v2 directory up to the root. With neither,
-//! there is no limit.
+//! `memory.max` from its cgroup v2 directory up to the root
+//! (`runtime_metrics::rss::cgroup_memory_limit_bytes`). With neither, there
+//! is no limit.
 //!
 //! One sampler thread serves the whole process. While at least one statement is
 //! watching it reads `RssAnon` every [`SAMPLE_EVERY`] and publishes the reading
@@ -22,9 +23,7 @@
 //! worker for a whole batch, and a timer needs a free worker to fire.
 
 use std::{
-    fs,
     future::pending,
-    path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -37,7 +36,10 @@ use datafusion::error::DataFusionError;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::{config, runtime_metrics::rss::status_anon_rss_bytes};
+use crate::{
+    config,
+    runtime_metrics::rss::{cgroup_memory_limit_bytes, status_anon_rss_bytes},
+};
 
 /// How often the sampler reads the process's anonymous memory while a
 /// statement is watching. Growth that lasts longer than this is seen; a
@@ -54,19 +56,6 @@ const CGROUP_LIMIT_PERCENT: u64 = 90;
 
 /// Divisor turning a percent into a fraction.
 const PERCENT: u64 = 100;
-
-/// Where the cgroup v2 hierarchy is mounted.
-const CGROUP_ROOT: &str = "/sys/fs/cgroup";
-
-/// The process's cgroup membership. Its cgroup v2 entry reads `0::<path>`.
-const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
-
-/// The prefix of the cgroup v2 entry in [`PROC_SELF_CGROUP`].
-const CGROUP_V2_PREFIX: &str = "0::";
-
-/// The cgroup v2 files that hold a memory limit: the throttle and the kill.
-/// Either reads `max` when unset.
-const CGROUP_LIMIT_FILES: [&str; 2] = ["memory.high", "memory.max"];
 
 /// The stored limit meaning "none". No real limit is 0 bytes: config's `0`
 /// means none as well.
@@ -113,9 +102,7 @@ fn configured_or_cgroup_limit() -> Option<u64> {
         info!(?limit, "SQL process memory limit from config");
         return limit;
     }
-    let cgroup = fs::read_to_string(PROC_SELF_CGROUP)
-        .ok()
-        .and_then(|membership| cgroup_memory_limit(Path::new(CGROUP_ROOT), &membership));
+    let cgroup = cgroup_memory_limit_bytes();
     let limit = cgroup.map(share_of_cgroup_limit);
     info!(?cgroup, ?limit, "SQL process memory limit from the cgroup");
     limit
@@ -126,32 +113,6 @@ fn configured_or_cgroup_limit() -> Option<u64> {
 /// 0, which would read as no limit.
 fn share_of_cgroup_limit(bytes: u64) -> u64 {
     (bytes.saturating_mul(CGROUP_LIMIT_PERCENT) / PERCENT).max(1)
-}
-
-/// The lowest memory limit set on the cgroup v2 path `membership` names or on
-/// any of its ancestors, read under `root`. `None` when the membership has no
-/// cgroup v2 entry or no level sets a limit.
-fn cgroup_memory_limit(root: &Path, membership: &str) -> Option<u64> {
-    let path = membership
-        .lines()
-        .find_map(|line| line.strip_prefix(CGROUP_V2_PREFIX))?;
-    let mut dir = PathBuf::from(path.trim());
-    let mut lowest: Option<u64> = None;
-    loop {
-        let level = root.join(dir.strip_prefix("/").unwrap_or(dir.as_path()));
-        for file in CGROUP_LIMIT_FILES {
-            // `max` (no limit) does not parse, and a missing file sets nothing.
-            let bytes = fs::read_to_string(level.join(file))
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok());
-            if let Some(bytes) = bytes {
-                lowest = Some(lowest.map_or(bytes, |lower| lower.min(bytes)));
-            }
-        }
-        if !dir.pop() {
-            return lowest;
-        }
-    }
 }
 
 /// The shared sampler: the channel its readings go out on, and its thread, to
@@ -245,7 +206,6 @@ pub(crate) fn over_process_limit(anon: u64, limit: u64) -> DataFusionError {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::TempDir;
     use tokio::{runtime::Runtime, time::timeout};
 
     use super::*;
@@ -253,71 +213,14 @@ mod tests {
     /// Longer than several samples, so a limit that was going to trip would
     /// have.
     const SETTLE: Duration = Duration::from_millis(500);
-    /// A worker's cgroup path, as `/proc/self/cgroup` names it.
-    const WORKER_CGROUP: &str = "0::/system.slice/worker.service\n";
     /// The worker unit's throttle (`memory.high`).
-    const WORKER_HIGH: &str = "7516192768";
-    /// The worker unit's kill (`memory.max`).
-    const WORKER_MAX: &str = "8589934592";
-    /// A parent slice's limit, tighter than the worker's own.
-    const PARENT_MAX: &str = "1000";
-
-    /// A fake cgroup v2 hierarchy: `files` are (path under the root, content).
-    fn hierarchy(files: &[(&str, &str)]) -> TempDir {
-        let root = TempDir::new().expect("tempdir");
-        for (path, content) in files {
-            let file = root.path().join(path);
-            fs::create_dir_all(file.parent().expect("a file under the root"))
-                .expect("create cgroup dir");
-            fs::write(file, content).expect("write cgroup file");
-        }
-        root
-    }
-
-    #[test]
-    fn the_cgroup_limit_is_the_lowest_set_on_the_path() {
-        let root = hierarchy(&[
-            ("system.slice/memory.high", "max"),
-            ("system.slice/memory.max", "max"),
-            ("system.slice/worker.service/memory.high", WORKER_HIGH),
-            ("system.slice/worker.service/memory.max", WORKER_MAX),
-        ]);
-        assert_eq!(
-            cgroup_memory_limit(root.path(), WORKER_CGROUP),
-            Some(WORKER_HIGH.parse().expect("bytes"))
-        );
-    }
-
-    #[test]
-    fn a_parent_limit_tighter_than_the_cgroups_own_wins() {
-        let root = hierarchy(&[
-            ("system.slice/memory.max", PARENT_MAX),
-            ("system.slice/worker.service/memory.max", WORKER_MAX),
-        ]);
-        assert_eq!(
-            cgroup_memory_limit(root.path(), WORKER_CGROUP),
-            Some(PARENT_MAX.parse().expect("bytes"))
-        );
-    }
-
-    #[test]
-    fn no_limit_anywhere_or_no_cgroup_v2_entry_sets_none() {
-        let root = hierarchy(&[
-            ("system.slice/memory.max", "max"),
-            ("system.slice/worker.service/memory.high", "max"),
-            ("system.slice/worker.service/memory.max", "max"),
-        ]);
-        assert_eq!(cgroup_memory_limit(root.path(), WORKER_CGROUP), None);
-        // cgroup v1 only: no `0::` entry to follow.
-        assert_eq!(cgroup_memory_limit(root.path(), "4:memory:/worker\n"), None);
-    }
+    const WORKER_HIGH: u64 = 7_516_192_768;
 
     #[test]
     fn the_sql_limit_is_ninety_percent_of_the_cgroups_and_never_rounds_to_none() {
-        let high: u64 = WORKER_HIGH.parse().expect("bytes");
         assert_eq!(
-            share_of_cgroup_limit(high),
-            high * CGROUP_LIMIT_PERCENT / PERCENT
+            share_of_cgroup_limit(WORKER_HIGH),
+            WORKER_HIGH * CGROUP_LIMIT_PERCENT / PERCENT
         );
         // Below 100 bytes, dividing first would give 0: no limit at all.
         assert_eq!(share_of_cgroup_limit(1), 1);
