@@ -153,9 +153,6 @@ pub enum BuildError {
     #[error("write contention: a concurrent writer won the commit race")]
     WriteContention,
 
-    #[error("merge needs more memory than the connection budget allows: {0}")]
-    MemoryBudgetExceeded(String),
-
     #[error("rayon thread pool creation failed: {0}")]
     ThreadPoolCreation(String),
 

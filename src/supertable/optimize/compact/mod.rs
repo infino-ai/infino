@@ -293,7 +293,7 @@ impl Supertable {
         } else if let Some(hidden) = self.inner().vector_index_table.as_ref() {
             Self::compact_one_table(
                 hidden,
-                &hidden_vector_index_compaction_settings(),
+                &hidden_vector_index_compaction_settings(cfg.max_concurrent_jobs),
                 recalibrate,
             )
             .await?;
@@ -604,17 +604,14 @@ impl Supertable {
         // This reserves budget for the whole input size since merge still
         // loads it all at once. Real fix is streaming the merge and pooling
         // buffers instead of a flat reservation; picking that up later.
-        let input_bytes: u64 = superfiles
-            .iter()
-            .map(|e| e.subsection_offsets.as_ref().map_or(0, |o| o.total_size))
-            .sum();
-        // double the input bytes to account for the merge buffer and any overhead
-        let estimated_bytes = input_bytes.saturating_mul(2) as usize;
-        let _memory_reservation = manifest
-            .options
-            .connection_memory_budget
-            .try_reserve(estimated_bytes)
-            .map_err(|e| BuildError::MemoryBudgetExceeded(e.to_string()))?;
+        // Deliberately not reserved from `connection_memory_budget`: that budget
+        // bounds what search and ingest may hold on behalf of a connection, and
+        // a merge is neither. Charging it here made the optimizer's footprint a
+        // function of a knob set for queries — and with several merges running,
+        // a pass could be refused for a budget a serial pass fit inside, on a
+        // machine with the memory to spare. What bounds a merge is the host:
+        // the runner admits one at a time against free memory, and
+        // `max_memory_mb` caps the input bytes a single job may pack.
 
         let semaphore = input_open_permits();
         let mut superfile_readers_tasks = JoinSet::new();
@@ -3039,45 +3036,39 @@ mod tests {
         assert_eq!(fts_hits.len(), 4, "all four 'alpha' docs must match");
     }
 
+    /// A merge is not charged to the connection memory budget.
+    ///
+    /// That budget bounds what search and ingest may hold for a connection; an
+    /// optimize is neither, and sizing it from a knob set for queries meant a
+    /// pass could be refused on a machine with the memory to spare — the more
+    /// easily the more merges ran at once. The host is what bounds a merge.
     #[tokio::test(flavor = "multi_thread")]
-    async fn merge_superfiles_respects_connection_memory_budget() {
+    async fn a_merge_is_not_charged_to_the_connection_budget() {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
-        // Write the data with a normal budget first — ingest draws from the
-        // same connection budget, so a tight limit here would starve the
-        // setup appends too.
+        // Written under a normal budget: ingest draws from the same one, so a
+        // tight limit here would starve the setup appends too.
         let st =
             Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
                 .expect("create supertable");
-        {
+        for titles in [["first doc", "second doc"], ["third doc", "fourth doc"]] {
             let mut w = st.writer().expect("writer");
-            let batch = build_title_batch(&["first doc", "second doc"]);
-            w.append(&batch).expect("append");
-            w.commit().expect("commit");
-        }
-        {
-            let mut w = st.writer().expect("writer");
-            let batch = build_title_batch(&["third doc", "fourth doc"]);
-            w.append(&batch).expect("append");
+            w.append(&build_title_batch(&titles)).expect("append");
             w.commit().expect("commit");
         }
 
-        // Reopen the same committed data under a starved budget to exercise
-        // the merge-time reservation.
+        // Reopened with a budget that cannot admit a single byte.
         let mut opts = default_supertable_options().with_storage(Arc::clone(&storage));
         opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
         let st = Supertable::create(opts).expect("reopen supertable");
 
         let reader = st.reader().expect("reader");
         let superfiles: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
-
-        match st.merge_superfiles(&superfiles, &no_tombstones()).await {
-            Err(BuildError::MemoryBudgetExceeded(_)) => {}
-            Err(other) => panic!("expected MemoryBudgetExceeded, got {other:?}"),
-            Ok(_) => panic!("merge must be refused over budget"),
-        }
+        st.merge_superfiles(&superfiles, &no_tombstones())
+            .await
+            .expect("a merge must not be refused by a budget that is not about it");
     }
 
     #[tokio::test(flavor = "multi_thread")]
