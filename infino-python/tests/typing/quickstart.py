@@ -77,6 +77,18 @@ def mutations() -> None:
     _ = matched
 
 
+def repairs() -> None:
+    docs = infino.connect("./data").open_table("docs")
+    staleness: infino.StalenessReport = docs.index_staleness()
+    current: bool = staleness.is_current
+    plan: list[infino.PlannedRepair] = docs.reindex_plan(
+        infino.ReindexOptions(mode="rewrite", stale_seal_timeout_ms=60_000)
+    )
+    report: infino.ReindexReport = docs.reindex(infino.ReindexOptions(mode="reanalyze"))
+    unrepairable: list[str] = report.unrepairable_columns
+    _ = (current, [p.superfile_id for p in plan], unrepairable)
+
+
 def rejects_invalid_literals() -> None:
     db = infino.connect("memory://")
     schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), 16), nullable=False)])
@@ -99,3 +111,4 @@ def rejects_invalid_literals() -> None:
         filter_mode="nand",  # type: ignore[arg-type]
     )
     infino.connect("memory://", cold_fetch_mode="warp_speed")  # type: ignore[arg-type]
+    infino.ReindexOptions(mode="rebuild")  # type: ignore[arg-type]

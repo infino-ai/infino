@@ -128,11 +128,16 @@ live on the [`Connection`] and [`Supertable`] pages:
     [`update`](Supertable::update), [`delete`](Supertable::delete).
   - **Maintain** — [`optimize`](Supertable::optimize),
     [`gc`](Supertable::gc), and [`schema`](Supertable::schema).
+  - **Repair** — [`reindex`](Supertable::reindex) brings stale superfiles'
+    full-text indexes current; [`reindex_plan`](Supertable::reindex_plan)
+    and [`index_staleness`](Supertable::index_staleness) report what it
+    would do, without writing anything.
 
 Supporting types: [`IndexSpec`], [`Metric`], [`BoolMode`],
 [`VectorFilter`], [`ConnectOptions`], [`MutationStats`],
-[`GcReport`], and the [`InfinoError`], [`OptimizeError`], and [`GcError`] error
-enums.
+[`GcReport`], [`ReindexOptions`], [`ReindexReport`], [`StalenessReport`],
+[`PlannedRepair`], and the [`InfinoError`], [`OptimizeError`], [`GcError`], and
+[`ReindexError`] error enums.
 
 ## Cargo features
 

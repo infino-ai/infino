@@ -209,6 +209,30 @@ pub mod fts {
     /// older needs one, since for those blobs the identity is the map.
     pub const VERSION_V8: u32 = 8;
 
+    /// The blob version a file must carry to be current — what the
+    /// staleness check compares against and what a migration plans from.
+    ///
+    /// Deliberately *not* what the writer stamps. The writer maps a layout
+    /// era to the version that era defines, and the two are different
+    /// facts: raising this constant says "older files are now stale",
+    /// while stamping it would say "the bytes I just wrote are whatever
+    /// the newest version is" — which is false unless a new era was
+    /// written too. Getting that backwards would label a `V7` layout as
+    /// `V8`, and the reader's feature gates, which enumerate the versions
+    /// that carry a position sub-index, bitset blocks, a term-block
+    /// dictionary and short-form terms, would stop recognising it and
+    /// silently decode none of them.
+    ///
+    /// A new version therefore means: add the constant, add the era that
+    /// writes it, then raise this. `current_version_matches_the_written_era`
+    /// fails if the last step happens without the middle one.
+    ///
+    /// Not the newest version — the one the default era stamps. [`VERSION_V8`]
+    /// sits above it and is written only where a compaction chooses an order,
+    /// so deriving this from the highest known version would mark every plain
+    /// file stale and have a reindex re-emit the same version forever.
+    pub const VERSION_CURRENT: u32 = VERSION_V7;
+
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
     /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.
@@ -765,6 +789,11 @@ pub mod vec {
 
 /// Parquet KV metadata keys, all prefixed `inf.` to match the project magic.
 pub mod kv {
+    /// Namespace every key in this module shares. A carried footer's
+    /// keys are dropped by this prefix, so a key added here is covered
+    /// without touching that path.
+    pub const PREFIX: &str = "inf.";
+
     /// Required: marker that this Parquet file is an infino superfile.
     /// Always `"infino-superfile"`.
     pub const FORMAT: &str = "inf.format";

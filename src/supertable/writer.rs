@@ -3079,6 +3079,7 @@ pub(in crate::supertable) fn build_term_contribution(
 /// dictionary yields its terms sorted, so the contribution is in the
 /// ascending key order the merge requires. A superfile with no text index
 /// contributes no terms but is still listed by the index.
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 async fn write_superfile_terms(
     reader: &SuperfileReader,
     writer: &mut term_index::ContributionWriter,
@@ -3088,20 +3089,25 @@ async fn write_superfile_terms(
     };
     let mut columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
     columns.sort();
+    let fst_bytes = fts
+        .dict_bytes_async()
+        .await
+        .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
     for column in &columns {
-        let term_bytes = fts
-            .iter_column_terms(column)
-            .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
-        let terms: Vec<&str> = term_bytes
-            .iter()
-            .map(|t| from_utf8(t).map_err(|_| TermIndexError::Build("non-utf8 term".into())))
-            .collect::<Result<_, _>>()?;
-        for chunk in terms.chunks(TERM_INDEX_BATCH_TERMS) {
-            let facts = reader
-                .term_index_facts(column, chunk)
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let chunk = fts
+                .term_index_facts_after(
+                    &fst_bytes,
+                    column,
+                    after.as_deref(),
+                    TERM_INDEX_BATCH_TERMS,
+                )
                 .await
                 .map_err(|e| TermIndexError::Build(format!("term facts: {e}")))?;
-            for (term, fact) in chunk.iter().zip(facts) {
+            for (term, fact) in &chunk {
+                let term =
+                    from_utf8(term).map_err(|_| TermIndexError::Build("non-utf8 term".into()))?;
                 // A term the dictionary lists but no cursor could describe
                 // keeps its presence and is given the ceiling that prunes
                 // nothing rather than one that could be wrong.
@@ -3114,6 +3120,11 @@ async fn write_superfile_terms(
                     None => (0, f32::INFINITY, term_index::Location::None),
                 };
                 writer.push(&make_key(column, term), df, bound, location)?;
+            }
+            let done = chunk.len() < TERM_INDEX_BATCH_TERMS;
+            after = chunk.into_iter().last().map(|(term, _)| term);
+            if done {
+                break;
             }
         }
     }
@@ -9157,6 +9168,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             &[],
             &no_removals,
             NewEntryBirthVersions::StampCommit,
+            None,
             &mut Vec::new(),
             &mut Vec::new(),
             &[],
@@ -9857,7 +9869,10 @@ pub(in crate::supertable) async fn stamp_term_index(
             let reference = term_index::write_built(storage.as_ref(), built)
                 .await
                 .map_err(|e| BuildError::Store(e.to_string()))?;
-            if old.term_index_ref() == Some(&reference) {
+            // The root is content-addressed, so an unchanged reference can
+            // still sit beside a stale "incomplete" mark; this build covers
+            // the whole membership, so publish whenever that mark is wrong.
+            if old.term_index_ref() == Some(&reference) && old.term_index_complete() {
                 return Ok(None);
             }
             Ok(Some(old.with_term_index(reference)))
@@ -10279,6 +10294,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 &new_entries,
                 entries_to_remove,
                 NewEntryBirthVersions::StampCommit,
+                None,
                 pending_writes,
                 pending_replaces,
                 contributions,
@@ -10631,6 +10647,9 @@ pub(crate) async fn try_commit_attempt(
     new_entries: &[Arc<SuperfileEntry>],
     entries_to_remove: &[Arc<SuperfileEntry>],
     birth_versions: NewEntryBirthVersions,
+    // A superfile in `new_entries` whose tombstone sidecar is already
+    // written and must be named by this successor.
+    sidecar_to_register: Option<Uuid>,
     pending_storage_writes: &mut Vec<(String, Bytes)>,
     pending_storage_replaces: &mut Vec<(String, Bytes)>,
     term_contributions: &[TermContribution],
@@ -10657,6 +10676,10 @@ pub(crate) async fn try_commit_attempt(
                 .await?
         }
     };
+
+    // 2a. Name any already-written sidecar in this same successor; a later
+    //     manifest would leave its tombstones unreadable in between.
+    new_manifest.register_tombstone_sidecar(sidecar_to_register);
 
     // 2b. Hidden VectorCell membership lives in the slow-state blob.
     //     `update` clears the ref; restamp it onto this same successor

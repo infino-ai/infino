@@ -1792,10 +1792,7 @@ impl FtsReader {
                     slot: FetchedTermSlot::Inline { doc_id, tf },
                     gidf,
                 }) => {
-                    let tf = match col_meta.positions {
-                        true => 1,
-                        false => tf,
-                    };
+                    let tf = col_meta.inline_tf(tf);
                     // A match-only cursor never scores; a fixed idf keeps it
                     // from consulting the column's statistics or norms.
                     let (n_scored, dl_norm_k1, gidf) = match count_only {
@@ -1842,16 +1839,10 @@ impl FtsReader {
                     cursors.push(Some(cursor));
                 }
                 Some(Resolved::Inline { doc_id, tf, gidf }) => {
-                    // On a positional column the inline slot carries
-                    // the term's single position, tf implied 1 — the
-                    // builder only inlines tf == 1 postings there.
                     // Scoring must use the implied tf, never the slot.
                     // (Phrase members recover the position itself with
                     // their own FST lookup — see `build_atom_cursors`.)
-                    let tf = match col_meta.positions {
-                        true => 1,
-                        false => tf,
-                    };
+                    let tf = col_meta.inline_tf(tf);
                     // A match-only cursor never scores; a fixed idf keeps it
                     // from consulting the column's statistics or norms.
                     let (n_scored, dl_norm_k1, gidf) = match count_only {

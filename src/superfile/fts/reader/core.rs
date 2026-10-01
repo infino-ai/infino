@@ -507,6 +507,14 @@ pub struct FtsReader {
     /// How this blob lays out its term dictionary (front-coded blocks
     /// from `VERSION_V7`, an FST of packed values before).
     pub(super) dict_layout: DictLayout,
+    /// The blob version from the header, kept verbatim.
+    ///
+    /// The decode fields above carry everything the read path needs to
+    /// interpret the bytes, but each groups the versions that decode
+    /// alike — so together they still cannot say which version a file
+    /// actually is. A migration has to report and plan on that, hence
+    /// the raw number.
+    pub(super) version: u32,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
     /// The Parquet row each doc id in this blob stands for. The
@@ -969,6 +977,7 @@ impl FtsReader {
                 stopwords,
                 stemmer,
                 stored: col_cfg.stored,
+                analysis_revision: col_cfg.analysis_revision,
                 source: source.clone(),
                 n_docs,
                 doc_length_bytes,
@@ -1040,6 +1049,7 @@ impl FtsReader {
             positions_grouped,
             doc_length_bytes,
             has_bitset_blocks,
+            version,
             bounds,
             dict_layout,
             columns,
@@ -1195,7 +1205,7 @@ impl FtsReader {
     /// zero-copy for in-memory / warm sources; for a cold `Lazy`
     /// source it `await`s the object-store range on the caller's
     /// runtime (no sync bridge).
-    pub(super) async fn dict_bytes_async(&self) -> Result<Bytes, FtsError> {
+    pub(crate) async fn dict_bytes_async(&self) -> Result<Bytes, FtsError> {
         self.source
             .range_async(self.fst_range.clone())
             .await
