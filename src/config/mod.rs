@@ -36,8 +36,10 @@
 use std::{
     collections::HashMap,
     env, fmt,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::OnceLock,
+    thread::available_parallelism,
     time::Duration,
 };
 
@@ -51,7 +53,10 @@ use serde::{
     ser::Serializer,
 };
 
-use crate::supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT;
+use crate::{
+    runtime_metrics::rss::available_memory_bytes,
+    supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT,
+};
 
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
@@ -278,8 +283,29 @@ pub struct CompactionSettings {
     /// tables. Values below 2 are raised to 2 — merging fewer than two inputs
     /// is a no-op rewrite.
     pub min_superfiles_for_merge: u64,
-    /// Maximum memory budget for materializing inputs during a single merge, in MiB.
+    /// Ceiling on the raw input bytes one merge may accumulate, in MiB. The
+    /// packer stops adding superfiles to a job once it would cross this.
+    ///
+    /// Independent of `target_superfile_size_mb`: raising the target does not
+    /// raise this. Most jobs never approach it, because the output target
+    /// closes them out first — it is the backstop for a partition of unusually
+    /// large superfiles, not a typical job's size.
+    ///
+    /// It is also NOT a bound on the merge's resident set, which runs several
+    /// times higher once rows are decoded and the output encoded, and it does
+    /// not govern how many merges run at once: the runner admits them against
+    /// the host's free memory.
     pub max_memory_mb: u64,
+    /// How many of a pass's merge jobs may be in flight at once.
+    ///
+    /// `None` (the default) derives the ceiling from the maintenance pool and
+    /// lets the runner admit another merge only while the host reports free
+    /// memory; `Some(n)` forces exactly `n`, and `Some(1)` is strictly serial.
+    ///
+    /// Not a thread count: a job is an async task whose CPU work runs on the
+    /// shared maintenance pool, so this is how many merges may overlap, not
+    /// how many threads they get.
+    pub max_concurrent_jobs: Option<usize>,
     /// How old a sealed tombstone sidecar has to be, in milliseconds,
     /// before it's treated as abandoned
     pub stale_seal_timeout_ms: u64,
@@ -292,6 +318,7 @@ impl Default for CompactionSettings {
             min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
             min_superfiles_for_merge: DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE,
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
+            max_concurrent_jobs: None,
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
         }
     }
@@ -1421,6 +1448,45 @@ impl Serialize for ThreadCount {
 }
 
 impl Config {
+    /// How many compaction merge jobs a pass may run at once.
+    ///
+    /// An explicit setting is honored as written. Unset, the width derives
+    /// from the maintenance pool, because merges run on that pool and more
+    /// concurrent jobs than it has threads is width without throughput.
+    ///
+    /// This is a CPU ceiling only. The memory bound lives in the compaction
+    /// runner, which admits another merge only while the host reports free memory
+    /// — an observation, where this layer could only guess from the
+    /// `max_memory_mb` cap. The one exception is a host with no procfs:
+    /// nothing downstream can bound the merges there, so the derived width is 1.
+    /// `compaction` is the settings the pass actually runs with, not
+    /// necessarily `self.compaction`: the hidden vector index compacts under
+    /// its own derived settings and resolves its own width from them.
+    pub(crate) fn compaction_concurrency(&self, compaction: &CompactionSettings) -> usize {
+        let maintenance = self
+            .vector
+            .maintenance_threads
+            .resolve_or_default(available_parallelism().map(NonZeroUsize::get).unwrap_or(1));
+        let resolved = match available_memory_bytes() {
+            // Memory is observable, so the runner reads `MemAvailable`
+            // between admissions and stops widening once less than its reserve
+            // share is free — a measurement of what merges cost on this
+            // corpus, where this layer could only guess from the
+            // `max_memory_mb` CAP, which real jobs are routinely a fraction
+            // of. The derived value is then just the CPU ceiling.
+            Some(_) => maintenance,
+            // No procfs: nothing downstream can bound the merges, so stay serial
+            // rather than invent a width.
+            None => 1,
+        };
+        // No upper clamp. An explicit setting is honored as written, and the
+        // real bounds are structural: the merges in flight never exceed the jobs
+        // the pass actually planned, memory narrows it further wherever the
+        // host reports any, and compaction's input opens ride a process-wide
+        // semaphore that bounds object-store fan-out on its own.
+        compaction.max_concurrent_jobs.unwrap_or(resolved).max(1)
+    }
+
     /// Load from the standard hierarchy. See module docs for the
     /// precedence order.
     pub fn load() -> Result<Self, ConfigError> {
@@ -2293,5 +2359,66 @@ vector:
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Fixed(12));
         // Untouched keys fall through to the embedded default.
         assert_eq!(cfg.vector.drain_batch_superfiles, 64);
+    }
+
+    /// An arbitrary per-merge input cap. The figure carries no meaning: the
+    /// test below asserts the derived width is INDEPENDENT of it.
+    const ANY_BUDGET_MB: u64 = 3072;
+
+    /// The derived width is a CPU ceiling, not a memory one.
+    ///
+    /// The memory bound belongs to the compaction runner, which admits merges
+    /// only while the host reports free memory. Deriving it here could only
+    /// divide by `max_memory_mb` — the cap the packer stops at, which real jobs
+    /// rarely approach — so the width caps at the pool and nothing else.
+    #[test]
+    fn the_derived_width_is_the_pool_width_not_a_memory_estimate() {
+        let cfg = Config::default();
+        let derived = cfg.compaction_concurrency(&CompactionSettings {
+            max_memory_mb: ANY_BUDGET_MB,
+            ..CompactionSettings::default()
+        });
+        // Never zero, whatever the host — a zero would stall the merge loop.
+        assert!(derived >= 1, "width must be at least one");
+        // Crucially it does NOT scale with the memory budget: a four-fold
+        // budget is the same width, because memory is judged downstream.
+        let wide_budget = cfg.compaction_concurrency(&CompactionSettings {
+            max_memory_mb: ANY_BUDGET_MB * 4,
+            ..CompactionSettings::default()
+        });
+        assert_eq!(
+            derived, wide_budget,
+            "the config layer must not size width off the budget cap"
+        );
+    }
+
+    /// An explicit setting is honored as written, in both directions.
+    ///
+    /// Deliberately unclamped: the merges in flight never exceed the jobs the
+    /// pass planned, memory narrows it wherever the host reports any, and
+    /// input opens ride a process-wide semaphore. A ceiling here would only
+    /// second-guess an operator who asked for something specific.
+    #[test]
+    fn an_explicit_width_is_honored_as_written() {
+        let cfg = Config::default();
+        let serial = cfg.compaction_concurrency(&CompactionSettings {
+            max_concurrent_jobs: Some(1),
+            ..CompactionSettings::default()
+        });
+        assert_eq!(serial, 1, "an explicit 1 must stay serial");
+        /// Wider than any pool this would run on, to prove nothing trims it.
+        const VERY_WIDE: usize = 4096;
+        let wide = cfg.compaction_concurrency(&CompactionSettings {
+            max_concurrent_jobs: Some(VERY_WIDE),
+            ..CompactionSettings::default()
+        });
+        assert_eq!(wide, VERY_WIDE, "an explicit width must not be trimmed");
+    }
+
+    /// The shipped default derives the width rather than forcing one: a serial
+    /// pass was measured holding a 44-core box at a load average of 1.16.
+    #[test]
+    fn the_default_width_is_derived() {
+        assert_eq!(CompactionSettings::default().max_concurrent_jobs, None);
     }
 }

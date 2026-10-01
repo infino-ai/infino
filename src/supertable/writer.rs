@@ -9869,7 +9869,10 @@ pub(in crate::supertable) async fn stamp_term_index(
             let reference = term_index::write_built(storage.as_ref(), built)
                 .await
                 .map_err(|e| BuildError::Store(e.to_string()))?;
-            if old.term_index_ref() == Some(&reference) {
+            // The root is content-addressed, so an unchanged reference can
+            // still sit beside a stale "incomplete" mark; this build covers
+            // the whole membership, so publish whenever that mark is wrong.
+            if old.term_index_ref() == Some(&reference) && old.term_index_complete() {
                 return Ok(None);
             }
             Ok(Some(old.with_term_index(reference)))

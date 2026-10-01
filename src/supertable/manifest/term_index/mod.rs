@@ -1507,25 +1507,11 @@ mod tests {
         );
     }
 
-    /// A commit that publishes a superfile without postings — one whose
-    /// path built no contribution — leaves the index unable to route to
-    /// it, so the index must stop claiming to list every live superfile.
-    #[test]
-    fn a_superfile_published_without_postings_marks_the_index_incomplete() {
-        use crate::supertable::{
-            manifest::{SuperfileUri, VectorLayout},
-            writer::{CommitListMetadata, persist_commit_async},
-        };
+    /// A manifest entry for a superfile no commit built postings for.
+    fn unindexed_entry() -> Arc<SuperfileEntry> {
+        use crate::supertable::manifest::{SuperfileUri, VectorLayout};
 
-        let (_dir, storage, st) = fresh_table();
-        commit_segment(&st, 0);
-        assert!(
-            st.reader()
-                .expect("reader")
-                .manifest()
-                .term_index_complete()
-        );
-        let entry = Arc::new(SuperfileEntry {
+        Arc::new(SuperfileEntry {
             stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
@@ -1540,19 +1526,46 @@ mod tests {
             partition_hint: None,
             vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
-        });
-        let committed = st
-            .block_on_query(persist_commit_async(
-                st.inner(),
-                Arc::clone(&storage),
-                vec![entry],
-                &[],
-                Vec::new(),
-                Vec::new(),
-                CommitListMetadata::empty(),
-                Vec::new(),
-            ))
-            .expect("commit");
+        })
+    }
+
+    /// Commit a membership change that carries no postings: `add` joins
+    /// the table, `remove` leaves it.
+    fn commit_without_postings(
+        st: &crate::supertable::Supertable,
+        storage: &Arc<dyn StorageProvider>,
+        add: Vec<Arc<SuperfileEntry>>,
+        remove: &[Arc<SuperfileEntry>],
+    ) -> Arc<crate::supertable::manifest::ManifestSnapshot> {
+        use crate::supertable::writer::{CommitListMetadata, persist_commit_async};
+
+        st.block_on_query(persist_commit_async(
+            st.inner(),
+            Arc::clone(storage),
+            add,
+            remove,
+            Vec::new(),
+            Vec::new(),
+            CommitListMetadata::empty(),
+            Vec::new(),
+        ))
+        .expect("commit")
+    }
+
+    /// A commit that publishes a superfile without postings — one whose
+    /// path built no contribution — leaves the index unable to route to
+    /// it, so the index must stop claiming to list every live superfile.
+    #[test]
+    fn a_superfile_published_without_postings_marks_the_index_incomplete() {
+        let (_dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        let committed = commit_without_postings(&st, &storage, vec![unindexed_entry()], &[]);
         assert!(
             committed.term_index_ref().is_some(),
             "the prior root is carried forward"
@@ -1560,6 +1573,60 @@ mod tests {
         assert!(
             !committed.term_index_complete(),
             "an unindexed live superfile makes the index incomplete"
+        );
+    }
+
+    /// An index marked incomplete that already lists every live superfile
+    /// is marked complete by the next maintenance rebuild, even though the
+    /// rebuild produces the very root the manifest already references.
+    ///
+    /// The rebuild's root is content-addressed, so "nothing changed" and
+    /// "the flag is still wrong" look the same from the reference alone. A
+    /// rebuild that stopped there would leave the table routing by part
+    /// summaries, and gathering global idf by opening superfiles, for as
+    /// long as its membership stayed put.
+    #[test]
+    fn a_rebuild_matching_the_current_root_marks_the_index_complete() {
+        let (_dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        let reference = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned()
+            .expect("the first commit publishes a root");
+
+        // An unindexed superfile marks the index incomplete; removing it
+        // leaves the index listing every live superfile while still marked
+        // incomplete, with the root unchanged throughout.
+        let entry = unindexed_entry();
+        commit_without_postings(&st, &storage, vec![Arc::clone(&entry)], &[]);
+        let stuck = commit_without_postings(&st, &storage, Vec::new(), &[entry]);
+        // A direct commit does not advance the handle; adopt it, as a later
+        // open would.
+        st.block_on_query(st.refresh()).expect("refresh");
+        assert_eq!(stuck.term_index_ref(), Some(&reference));
+        assert!(!stuck.term_index_complete());
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        let covered: std::collections::HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        assert_eq!(
+            covered, live,
+            "the index already lists every live superfile"
+        );
+
+        stats_only_optimize(&st);
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        assert_eq!(
+            manifest.term_index_ref(),
+            Some(&reference),
+            "the rebuild reproduces the root it found"
+        );
+        assert!(
+            manifest.term_index_complete(),
+            "a rebuild over the whole membership marks the index complete"
         );
     }
 

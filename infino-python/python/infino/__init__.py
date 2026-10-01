@@ -9,6 +9,7 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError, version
 
 from infino._infino import (
+    AlreadyRunningError,
     ConflictError,
     Connection,
     ConnectionMemoryBudgetError,
@@ -17,6 +18,10 @@ from infino._infino import (
     InfinoError,
     MutationStats,
     OptimizeOptions,
+    PlannedRepair,
+    ReindexOptions,
+    ReindexReport,
+    StalenessReport,
     Table,
     connect,
 )
@@ -32,9 +37,14 @@ __all__ = [
     "InfinoError",
     "ConnectionMemoryBudgetError",
     "ConflictError",
+    "AlreadyRunningError",
     "Table",
     "IndexSpec",
     "MutationStats",
     "GcReport",
     "OptimizeOptions",
+    "ReindexOptions",
+    "ReindexReport",
+    "StalenessReport",
+    "PlannedRepair",
 ]

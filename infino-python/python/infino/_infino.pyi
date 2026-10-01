@@ -6,6 +6,11 @@ from pyarrow import RecordBatch, Schema, Table as ArrowTable
 Metric: TypeAlias = Literal["cosine", "l2sq", "l2", "negdot", "dot"]
 BoolMode: TypeAlias = Literal["or", "and"]
 Bm25Stats: TypeAlias = Literal["per_superfile", "global"]
+# How much a reindex repairs: "auto" gives each superfile the cheapest repair
+# that makes it current; "rewrite" brings layouts current and leaves superfiles
+# whose terms are stale (reported); "reanalyze" re-tokenizes every stale
+# superfile from its stored text.
+ReindexMode: TypeAlias = Literal["auto", "rewrite", "reanalyze"]
 ColdFetchMode: TypeAlias = Literal[
     "hybrid_with_prefetch",
     "range_only",
@@ -72,6 +77,11 @@ class ConflictError(InfinoError):
     """Raised when a concurrent writer won the commit race and the engine's own
     retries were exhausted. Recoverable: nothing partial is visible, so catch it,
     back off, and reissue the append / update / delete."""
+
+class AlreadyRunningError(InfinoError):
+    """Raised by ``reindex`` when an ``optimize`` or another reindex already holds
+    the table. Recoverable: nothing was changed, so catch it and try again once
+    the other run has finished."""
 
 class Connection:
     def create_database(self) -> None: ...
@@ -186,6 +196,14 @@ class Table:
     def update(self, predicate: str, new_rows: RowData) -> MutationStats: ...
     def optimize(self, settings: OptimizeOptions | None = ...) -> None: ...
     def gc(self, grace_secs: float) -> GcReport: ...
+    # Repairs every superfile whose full-text index is behind what this engine
+    # writes; rows, their order and their `_id`s are unchanged. All three
+    # reindex calls raise `ValueError` on a `memory://` or hosted table, which
+    # has no storage of its own to repair; `reindex` raises `AlreadyRunningError`
+    # while an `optimize` or another reindex holds the table.
+    def reindex(self, options: ReindexOptions | None = ...) -> ReindexReport: ...
+    def reindex_plan(self, options: ReindexOptions | None = ...) -> list[PlannedRepair]: ...
+    def index_staleness(self, options: ReindexOptions | None = ...) -> StalenessReport: ...
     def schema(self) -> Schema: ...
 
 class MutationStats:
@@ -220,3 +238,56 @@ class OptimizeOptions:
         stale_seal_timeout_ms: int | None = ...,
         recalibrate: Literal["auto", "force", "skip"] | None = ...,
     ) -> None: ...
+
+class ReindexOptions:
+    # `trust_writer_analysis=True` credits a superfile recording no analysis
+    # revision with the one its writer emitted. It is only sound when the table
+    # never held superfiles older than that writer: an older compaction can
+    # have folded stale terms into a newer-stamped file, and crediting it
+    # reports the table migrated with those terms still in place. Leave it off
+    # unless the table's whole history is known.
+    def __init__(
+        self,
+        *,
+        mode: ReindexMode | None = ...,
+        stale_seal_timeout_ms: int | None = ...,
+        trust_writer_analysis: bool = ...,
+    ) -> None: ...
+
+class ReindexReport:
+    @property
+    def rewritten(self) -> int: ...
+    @property
+    def already_current(self) -> int: ...
+    @property
+    def awaiting_reanalysis(self) -> int: ...
+    @property
+    def held_by_another_run(self) -> int: ...
+    @property
+    def unrepairable_columns(self) -> list[str]: ...
+    def __repr__(self) -> str: ...
+
+class StalenessReport:
+    @property
+    def superfiles(self) -> int: ...
+    @property
+    def needing_rewrite(self) -> int: ...
+    @property
+    def awaiting_reanalysis(self) -> int: ...
+    @property
+    def bytes_to_rewrite(self) -> int: ...
+    @property
+    def unrepairable_columns(self) -> list[str]: ...
+    @property
+    def is_current(self) -> bool: ...
+    def __repr__(self) -> str: ...
+
+class PlannedRepair:
+    @property
+    def superfile_id(self) -> str: ...
+    # Never "auto": the plan has already resolved it per superfile.
+    @property
+    def mode(self) -> Literal["rewrite", "reanalyze"]: ...
+    @property
+    def live_bytes(self) -> int: ...
+    def __repr__(self) -> str: ...
