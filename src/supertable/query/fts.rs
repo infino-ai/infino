@@ -89,7 +89,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
-use tracing::debug;
+use tracing::{Instrument, debug};
 use uuid::Uuid;
 
 /// Fewest should-terms for which a ranged kernel is shipped to the
@@ -146,7 +146,10 @@ use crate::{
         reader_cache::{ReadIntent, disk::ForegroundQueryGuard},
         tombstones::SidecarCache,
     },
-    utils::terms::FstValue,
+    utils::{
+        terms::FstValue,
+        trace::{self, detail_span, tiered_span},
+    },
 };
 
 /// Per-superfile open-wave fetches for one global-stats query, keyed by
@@ -703,7 +706,17 @@ impl SupertableReader {
             terms: prune_terms,
             mode: prune_mode,
         };
-        let mut kept = select_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf)).await?;
+        let phases = self.phase_spans();
+        let select_span = trace::phase(phases, || {
+            detail_span!(
+                "fts.select_superfiles",
+                manifest_superfiles = manifest.superfiles.len(),
+                survivors = tracing::field::Empty,
+            )
+        });
+        let mut kept = select_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf))
+            .instrument(select_span.clone())
+            .await?;
         // A pushed-down `WHERE` narrows the search to the superfiles its
         // scope admits — the statistics survivors that still hold a
         // candidate row. The global-idf gather below still probes every
@@ -716,6 +729,8 @@ impl SupertableReader {
                 .collect();
             kept.retain(|e| admitted.contains(&e.superfile_id));
         }
+        select_span.record("survivors", kept.len());
+        trace::end(select_span);
         if kept.is_empty() {
             return Ok(Vec::new());
         }
@@ -755,6 +770,9 @@ impl SupertableReader {
                     false => {
                         let (map, memos) = self
                             .global_idf_open_wave(manifest.as_ref(), column, &scored, &kept, corpus)
+                            .instrument(trace::phase(phases, || {
+                                tiered_span!("fts.global_idf", terms = scored.len())
+                            }))
                             .await?;
                         (Some(Arc::new(map)), memos)
                     }
@@ -775,7 +793,13 @@ impl SupertableReader {
         // changes the parameters the stored ceilings were baked at; until the
         // rescale from the manifest's length stats exists, such a query keeps
         // the unordered path — correct, just unpruned.
-        let term_index = manifest.term_index().await;
+        // One span over the three awaits that read the term index (its load,
+        // the score ceilings, the postings locations), with the synchronous
+        // work between them.
+        let term_span = trace::phase(phases, || {
+            detail_span!("fts.term_index", terms = tracing::field::Empty)
+        });
+        let term_index = manifest.term_index().instrument(term_span.clone()).await;
         // Every scored term, phrase members included, once: what the index
         // is asked for locations.
         let mut all_terms: Vec<&str> = musts
@@ -808,6 +832,7 @@ impl SupertableReader {
                 };
                 index
                     .query_ceilings(column, &terms, &phrases, &kept, &idf_used)
+                    .instrument(term_span.clone())
                     .await
                     .ok()
             }
@@ -821,7 +846,12 @@ impl SupertableReader {
         // The index also knows where each term's postings sit in every
         // indexed superfile, so a cursor set can be built from those
         // locations and the superfile's dictionary never read.
-        let index_locations = self.index_locations(column, &all_terms, &kept).await;
+        let index_locations = self
+            .index_locations(column, &all_terms, &kept)
+            .instrument(term_span.clone())
+            .await;
+        term_span.record("terms", all_terms.len());
+        trace::end(term_span);
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
         // Phrase-bearing queries stay per-superfile: the ranged
         // kernel is the pure term-union fast path. So does a search
@@ -1134,6 +1164,7 @@ impl SupertableReader {
                 Ok(rows_as_local_ids(hits))
             }
         };
+        let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
         let per_unit = match ceilings.is_some() {
             // Units are in descending ceiling order. A unit whose ceiling is
             // strictly below the running k-th score cannot place a document
@@ -1150,9 +1181,14 @@ impl SupertableReader {
                     },
                     kernel,
                 )
+                .instrument(fanout_span)
                 .await?
             }
-            false => dispatch::fanout_local_hits(self, units, kernel).await?,
+            false => {
+                dispatch::fanout_local_hits(self, units, kernel)
+                    .instrument(fanout_span)
+                    .await?
+            }
         };
         let hits = select_top_k_stable(self, per_unit, k).await?;
         Ok(hits)
@@ -1706,7 +1742,20 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        let (match_set, negatives, kept) = self.parse_and_prune(column, query, mode).await?;
+        let phases = self.phase_spans();
+        let select_span = trace::phase(phases, || {
+            detail_span!(
+                "fts.select_superfiles",
+                manifest_superfiles = self.manifest().superfiles.len(),
+                survivors = tracing::field::Empty,
+            )
+        });
+        let (match_set, negatives, kept) = self
+            .parse_and_prune(column, query, mode)
+            .instrument(select_span.clone())
+            .await?;
+        select_span.record("survivors", kept.len());
+        trace::end(select_span);
         if kept.is_empty() {
             return Ok(Vec::new());
         }
@@ -1721,7 +1770,12 @@ impl SupertableReader {
             .chain(negatives.terms.iter())
             .map(String::as_str)
             .collect();
-        let locations = self.index_locations(column, &all_terms, &kept).await;
+        let locations = self
+            .index_locations(column, &all_terms, &kept)
+            .instrument(trace::phase(phases, || {
+                detail_span!("fts.term_index", terms = all_terms.len())
+            }))
+            .await;
         let units: Vec<(Arc<SuperfileEntry>, Uuid)> = kept
             .into_iter()
             .map(|e| {
@@ -1800,7 +1854,10 @@ impl SupertableReader {
                     .collect::<Vec<_>>())
             }
         };
-        let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
+        let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
+        let per_unit = dispatch::fanout_local_hits(self, units, kernel)
+            .instrument(fanout_span)
+            .await?;
         // Exact pre-size: `Flatten`'s size_hint is opaque, and growth
         // reallocations copy the whole hit vec repeatedly at 1M hits.
         let total: usize = per_unit.iter().map(Vec::len).sum();
@@ -2039,12 +2096,29 @@ impl SupertableReader {
                 mode: BoolMode::And,
             }]
         };
-        let kept = select_superfiles(manifest.as_ref(), &leaves).await?;
+        let phases = self.phase_spans();
+        let select_span = trace::phase(phases, || {
+            detail_span!(
+                "fts.select_superfiles",
+                manifest_superfiles = manifest.superfiles.len(),
+                survivors = tracing::field::Empty,
+            )
+        });
+        let kept = select_superfiles(manifest.as_ref(), &leaves)
+            .instrument(select_span.clone())
+            .await?;
+        select_span.record("survivors", kept.len());
+        trace::end(select_span);
         if kept.is_empty() {
             return Ok(Vec::new());
         }
         let token_refs: Vec<&str> = term_strings.iter().map(String::as_str).collect();
-        let locations = self.index_locations(column, &token_refs, &kept).await;
+        let locations = self
+            .index_locations(column, &token_refs, &kept)
+            .instrument(trace::phase(phases, || {
+                detail_span!("fts.term_index", terms = token_refs.len())
+            }))
+            .await;
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_arc = Arc::new(column.to_owned());
         let value_arc = Arc::new(value.to_owned());
@@ -2152,7 +2226,10 @@ impl SupertableReader {
                 Ok(hits)
             }
         };
-        let per_unit = dispatch::fanout_with(self, units, true, ReadIntent::Warm, body).await?;
+        let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
+        let per_unit = dispatch::fanout_with(self, units, true, ReadIntent::Warm, body)
+            .instrument(fanout_span)
+            .await?;
         let mut hits: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
         dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
         Ok(hits)
@@ -2184,7 +2261,9 @@ impl SupertableReader {
             // visible scalar columns, or the trailing `score`); `None`
             // returns `_id` + `score` only. The shared resolver decodes
             // only the projected columns.
-            let batch = resolve_hits_named(self, &hits, projection).await?;
+            let batch = resolve_hits_named(self, &hits, projection)
+                .instrument(detail_span!("search.resolve", hits = hits.len()))
+                .await?;
             Ok(vec![batch])
         })
     }
@@ -2526,7 +2605,25 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?opts.mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
+        // The empty fields are the read's outcome, filled once it has run;
+        // see `CloseOut`.
+        tracing::instrument(skip_all, fields(
+            column = column,
+            k = k,
+            mode = ?opts.mode,
+            role = self.role().as_str(),
+            origin = OpOrigin::Query.as_str(),
+            rows_out = tracing::field::Empty,
+            kernel_cpu_ns = tracing::field::Empty,
+            planned_read_ranges = tracing::field::Empty,
+            fts_postings_bytes = tracing::field::Empty,
+            rows_materialized = tracing::field::Empty,
+            store_heads = tracing::field::Empty,
+            store_gets = tracing::field::Empty,
+            store_get_bytes = tracing::field::Empty,
+            store_bg_gets = tracing::field::Empty,
+            store_bg_get_bytes = tracing::field::Empty,
+        ))
     )]
     pub fn bm25_search(
         &self,
@@ -2537,10 +2634,14 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, k, mode = ?opts.mode, "bm25_search");
-        self.reader()?
+        let close_out = self.close_out();
+        let batches = self
+            .reader()?
             .bm25_search(column, query, k, opts, projection)
             .map_err(InfinoError::from)
-            .map_err(|e| e.with_context("bm25_search", None))
+            .map_err(|e| e.with_context("bm25_search", None))?;
+        close_out.finish_batches(&batches);
+        Ok(batches)
     }
 
     /// Unranked token match over one FTS column: every row whose
@@ -2557,7 +2658,24 @@ impl Supertable {
     /// `bm25_search`.
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, mode = ?mode, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
+        // The empty fields are the read's outcome, filled once it has run;
+        // see `CloseOut`.
+        tracing::instrument(skip_all, fields(
+            column = column,
+            mode = ?mode,
+            role = self.role().as_str(),
+            origin = OpOrigin::Query.as_str(),
+            rows_out = tracing::field::Empty,
+            kernel_cpu_ns = tracing::field::Empty,
+            planned_read_ranges = tracing::field::Empty,
+            fts_postings_bytes = tracing::field::Empty,
+            rows_materialized = tracing::field::Empty,
+            store_heads = tracing::field::Empty,
+            store_gets = tracing::field::Empty,
+            store_get_bytes = tracing::field::Empty,
+            store_bg_gets = tracing::field::Empty,
+            store_bg_get_bytes = tracing::field::Empty,
+        ))
     )]
     pub fn token_match(
         &self,
@@ -2567,6 +2685,7 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, mode = ?mode, "token_match");
+        let close_out = self.close_out();
         let reader = self.reader()?;
         reader
             .check_projection(projection)
@@ -2575,8 +2694,12 @@ impl Supertable {
             .token_match(column, query, mode)
             .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
         let batch = self
-            .block_on_query(resolve_hits_named(&reader, &hits, projection))
+            .block_on_query(
+                resolve_hits_named(&reader, &hits, projection)
+                    .instrument(detail_span!("search.resolve", hits = hits.len())),
+            )
             .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
+        close_out.finish(batch.num_rows() as u64);
         Ok(vec![batch])
     }
 
@@ -2587,7 +2710,23 @@ impl Supertable {
     /// `bm25_search`.
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
+        // The empty fields are the read's outcome, filled once it has run;
+        // see `CloseOut`.
+        tracing::instrument(skip_all, fields(
+            column = column,
+            role = self.role().as_str(),
+            origin = OpOrigin::Query.as_str(),
+            rows_out = tracing::field::Empty,
+            kernel_cpu_ns = tracing::field::Empty,
+            planned_read_ranges = tracing::field::Empty,
+            fts_postings_bytes = tracing::field::Empty,
+            rows_materialized = tracing::field::Empty,
+            store_heads = tracing::field::Empty,
+            store_gets = tracing::field::Empty,
+            store_get_bytes = tracing::field::Empty,
+            store_bg_gets = tracing::field::Empty,
+            store_bg_get_bytes = tracing::field::Empty,
+        ))
     )]
     pub fn exact_match(
         &self,
@@ -2596,6 +2735,7 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, "exact_match");
+        let close_out = self.close_out();
         let reader = self.reader()?;
         reader
             .check_projection(projection)
@@ -2604,8 +2744,12 @@ impl Supertable {
             .exact_match(column, value)
             .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
         let batch = self
-            .block_on_query(resolve_hits_named(&reader, &hits, projection))
+            .block_on_query(
+                resolve_hits_named(&reader, &hits, projection)
+                    .instrument(detail_span!("search.resolve", hits = hits.len())),
+            )
             .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
+        close_out.finish(batch.num_rows() as u64);
         Ok(vec![batch])
     }
 

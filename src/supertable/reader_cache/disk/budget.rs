@@ -258,7 +258,7 @@ impl DiskCacheStore {
             // cannot double-count.
             if self.unindexed.remove(&uri).is_some() {
                 tracing::info!(target: "infino::cache", uri = %uri.0, size, "evict: whole .sf.parquet (budget)");
-                let _ = fs::remove_file(self.cache_path(&uri));
+                self.remove_local_copy(&uri);
                 self.drop_block_file(&uri);
                 self.current_bytes.fetch_sub(size, Ordering::Release);
                 self.n_evictions.fetch_add(1, Ordering::AcqRel);
@@ -466,8 +466,7 @@ impl DiskCacheStore {
                 // A leftover coordinator would keep the evicted entry, and its budget, alive.
                 self.coordinators.remove(&uri);
 
-                let path = self.cache_path(&uri);
-                let _ = fs::remove_file(&path);
+                self.remove_local_copy(&uri);
                 let _ = fs::remove_file(self.blocks_path(&uri));
                 let _ = fs::remove_file(self.blocks_idx_path(&uri));
                 self.release_entry_accounting(&entry);

@@ -53,6 +53,7 @@ use crate::{
     },
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
+        gc::superseded::Superseded,
         manifest::commit::{PointerProbe, probe_pointer, read_pointer},
         options::Consistency,
         query::{
@@ -73,7 +74,7 @@ use crate::{
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
         },
     },
-    utils::trace::{TableRole, record},
+    utils::trace::{CloseOut, TableRole, record},
 };
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::{
@@ -235,6 +236,9 @@ pub(super) struct SupertableInner {
     /// (which rewrite the pointer without capturing its new etag) —
     /// the next probe then takes the full-read path and re-seeds it.
     pub(super) last_pointer_etag: Mutex<Option<String>>,
+    /// Keys this handle's commits dropped since its last deferred sweep was scheduled. Every
+    /// pointer-swapping commit adds to it (`note_superseded`); scheduling a sweep takes it all.
+    pub(super) superseded: Mutex<Superseded>,
     /// Set once this handle's pointer is seen deleted — its table was dropped
     /// and purged elsewhere. Latched: the handle can only be discarded, and
     /// `Connection::open_table` checks this before serving it from cache.
@@ -749,6 +753,16 @@ impl Supertable {
         self.inner.role
     }
 
+    /// Begin the [`CloseOut`] a search's root span records when it is done:
+    /// the caller's op-stats collector and the storage's request ledger.
+    /// Taken before the reader is minted, so the manifest check that minting
+    /// may do is in the store numbers.
+    pub(crate) fn close_out(&self) -> CloseOut {
+        CloseOut::begin(op_stats::current, || {
+            self.inner.options.storage.as_ref().map(|s| s.usage_meter())
+        })
+    }
+
     test_visible! {
     fn vector_index_table(&self) -> Option<&Arc<Supertable>> {
         self.inner.vector_index_table.as_ref()
@@ -925,15 +939,24 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
-    /// Build and publish the global term-stats sidecar over the current
-    /// membership (see `manifest::term_stats`). Not part of the public
-    /// API — [`Supertable::optimize`] calls this after compaction so the
-    /// artifact describes the post-merge superfile set.
+    /// Rebuild the table-level term index over the current membership
+    /// (see `manifest::term_index`), and the global term-stats sidecar only
+    /// if the index still does not cover every superfile. Not part of the
+    /// public API — [`Supertable::optimize`] calls this after compaction so
+    /// the artifacts describe the post-merge superfile set.
+    ///
+    /// A complete index already holds every term's df in every superfile,
+    /// and queries sum global df from it without opening the sidecar, so
+    /// building the sidecar then is a full pass over every dictionary for
+    /// nothing. It stays the fallback for an index that is incomplete.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn refresh_term_stats_sync(&self) -> Result<(), BuildError> {
         self.block_on_query(async {
-            super::writer::stamp_term_stats(&self.inner).await?;
-            super::writer::stamp_term_index(&self.inner).await
+            super::writer::stamp_term_index(&self.inner).await?;
+            if self.inner.manifest.load().term_index_complete() {
+                return Ok(());
+            }
+            super::writer::stamp_term_stats(&self.inner).await
         })
     }
 
@@ -1810,6 +1833,7 @@ async fn build_handle(
         hidden_index_open_error: std::sync::OnceLock::new(),
         last_pointer_check: Mutex::new(None),
         last_pointer_etag: Mutex::new(None),
+        superseded: Mutex::default(),
         pointer_vanished: OnceLock::new(),
         hidden_deleted_cache: Mutex::new(None),
         sql_schemas: OnceLock::new(),
@@ -2296,6 +2320,18 @@ impl SupertableReader {
     /// Per-supertable configuration for this reader's snapshot.
     pub(crate) fn options(&self) -> &Arc<SupertableOptions> {
         &self.inner.options
+    }
+
+    /// Whether a search on this reader splits its root span into phase spans
+    /// (superfile selection, term lookup, the fan-out, the vector legs).
+    ///
+    /// Only on a table of more than one superfile. Each exported span costs
+    /// the query a few microseconds, and on a single superfile the phases
+    /// are one file each, so the root's totals already say where the time
+    /// went; with more files the phase spans replace a span per file and
+    /// cost less than before.
+    pub(crate) fn phase_spans(&self) -> bool {
+        cfg!(feature = "detailed-tracing") && self.manifest.superfiles.len() > 1
     }
 
     /// Cached per-table SQL schemas (scan view + scalar schema).

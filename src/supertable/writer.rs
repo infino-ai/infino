@@ -11,7 +11,7 @@
 //! Each `commit` here internally spawns many superfile builders,
 //! one per piece of the split buffer.
 //!
-//! Acquired via [`Supertable::writer`](super::Supertable::writer);
+//! Acquired via [`Supertable::writer`](crate::supertable::Supertable::writer);
 //! at most one writer is outstanding per supertable at a time
 //! (enforced by the inner state's `writer_outstanding` flag, with
 //! release on `Drop`). Holds an in-memory buffer of
@@ -91,31 +91,8 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::{
-    build::{fanout_shards, fanout_shards_metered},
-    error::BuildError,
-    handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
-    manifest::{
-        CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, RoutingRef, ScalarStatsAgg,
-        SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary, bloom::BloomBuilder,
-        superfile_stem,
-    },
-    mutations::{
-        CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
-        PendingDelete, PendingUpdate,
-    },
-    opann,
-    options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
-    utils::vector_split::split_vectors,
-    wal::{
-        WalStore,
-        pipeline::{self, TombstonePhaseOutcome},
-        state_doc::{
-            IdSpan, OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry,
-            TombstoneOutcome, WalId, WalState, WalStateDoc,
-        },
-    },
-};
+#[cfg(not(test))]
+use crate::supertable::gc::{DEFAULT_SUPERFILE_RECLAIM_GRACE, superseded::reclaim};
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
@@ -167,10 +144,18 @@ use crate::{
     },
     supertable::{
         CommitError as SupertableCommitError, ManifestLoadError,
-        error::ManifestError,
+        build::{fanout_shards, fanout_shards_metered},
+        error::{BuildError, ManifestError},
+        handle::{
+            GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner,
+            hidden_vector_cell_count, user_vector_cell_count,
+        },
         hidden_deleted::{self, encode_deleted_ids},
         manifest::{
-            ClusterCentroids, RabitqAdmitContext,
+            CellVectorSummary, ClusterCentroids, FtsSummaryAgg, ManifestSnapshot,
+            RabitqAdmitContext, RoutingRef, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry,
+            SuperfileUri, VectorSummary,
+            bloom::BloomBuilder,
             commit::{get_current_manifest_etag, manifest_uri},
             list::{
                 CellRoutingParams, CellSplitCheck, DrainedVersionRanges, GlobalVectorIndex,
@@ -178,9 +163,16 @@ use crate::{
             },
             listed_once, options_hash,
             part::{self as part_mod, ContentHash, PartId},
+            superfile_stem,
             term_index::{self, Contribution as TermContribution, TermIndexError},
             term_stats,
         },
+        mutations::{
+            CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
+            PendingDelete, PendingUpdate,
+        },
+        opann,
+        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
         query::{
             dispatch::{open_compaction_input, open_reader},
             vector::{IndexOutcome, stable_ids_by_local_for_routing},
@@ -189,9 +181,15 @@ use crate::{
             DiskCacheStore, ReadIntent, SuperfileReaderCache, disk::mmap_readonly_bytes,
         },
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
+        utils::vector_split::split_vectors,
         wal::{
-            Lease,
+            Lease, WalStore,
             lease::{self, DEFAULT_LEASE_DURATION},
+            pipeline::{self, TombstonePhaseOutcome},
+            state_doc::{
+                IdSpan, OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry,
+                TombstoneOutcome, WalId, WalState, WalStateDoc,
+            },
         },
     },
     utils::terms::make_key,
@@ -684,29 +682,30 @@ fn split_buffer_into_superfile_inputs(
     pieces
 }
 
-/// After a manifest swap that drops superfile references, schedule a deferred
-/// GC sweep instead of inline `storage.delete`. Inline delete races snapshot-
-/// pinned readers that may still cold-fetch superseded bytes.
+/// Schedule the deferred sweep for everything this handle's commits dropped since the last one:
+/// after the grace, delete exactly those keys (see [`reclaim`]). Never a listing sweep, so a file
+/// whose commit is still in flight cannot be taken for garbage. Deleting inline instead would race
+/// readers still pinned to the manifest the commit replaced.
 fn schedule_background_storage_reclaim(inner: Arc<SupertableInner>) {
-    if inner.options.storage.is_none() {
-        return;
-    }
-    // Integration tests that need reclaim call `Supertable::gc()` explicitly
-    // (see `tests/supertable/compact_gc.rs`). Spawning here from a
+    // Unit tests take the recorded keys and call `reclaim` themselves; spawning here from a
     // `current_thread` tokio test runtime panics in `block_in_place`.
     #[cfg(not(test))]
     {
+        if inner.options.storage.is_none() {
+            return;
+        }
+
+        let superseded = inner.take_superseded();
+
+        if superseded.is_empty() {
+            return;
+        }
+
         let rt = inner.query_runtime();
         rt.spawn(async move {
-            sleep(super::gc::DEFAULT_SUPERFILE_RECLAIM_GRACE).await;
-            if let Err(e) = super::gc::gc_storage_sweep_for_inner(
-                &inner,
-                super::gc::DEFAULT_SUPERFILE_RECLAIM_GRACE,
-                super::gc::GcTrigger::DeferredReclaim,
-            )
-            .await
-            {
-                warn!(error = %e, "supertable: deferred storage reclaim failed");
+            sleep(DEFAULT_SUPERFILE_RECLAIM_GRACE).await;
+            if let Err(e) = reclaim(&inner, superseded).await {
+                warn!(error = %e, "supertable: deferred storage reclaim failed; the next listing sweep reclaims what it left");
             }
         });
     }
@@ -2026,10 +2025,10 @@ impl SupertableWriter {
             && let Some(grid) = bootstrap_centroids_from_batch(
                 buffer,
                 vc.dim,
-                super::handle::hidden_vector_cell_count(&self.inner.options),
+                hidden_vector_cell_count(&self.inner.options),
             ) {
-            let hidden_cells = super::handle::hidden_vector_cell_count(&self.inner.options);
-            let user_cells = super::handle::user_vector_cell_count(&self.inner.options);
+            let hidden_cells = hidden_vector_cell_count(&self.inner.options);
+            let user_cells = user_vector_cell_count(&self.inner.options);
             let user_grid = (user_cells != hidden_cells)
                 .then(|| bootstrap_centroids_from_batch(buffer, vc.dim, user_cells))
                 .flatten();
@@ -3080,6 +3079,7 @@ pub(in crate::supertable) fn build_term_contribution(
 /// dictionary yields its terms sorted, so the contribution is in the
 /// ascending key order the merge requires. A superfile with no text index
 /// contributes no terms but is still listed by the index.
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 async fn write_superfile_terms(
     reader: &SuperfileReader,
     writer: &mut term_index::ContributionWriter,
@@ -3089,20 +3089,25 @@ async fn write_superfile_terms(
     };
     let mut columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
     columns.sort();
+    let fst_bytes = fts
+        .dict_bytes_async()
+        .await
+        .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
     for column in &columns {
-        let term_bytes = fts
-            .iter_column_terms(column)
-            .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
-        let terms: Vec<&str> = term_bytes
-            .iter()
-            .map(|t| from_utf8(t).map_err(|_| TermIndexError::Build("non-utf8 term".into())))
-            .collect::<Result<_, _>>()?;
-        for chunk in terms.chunks(TERM_INDEX_BATCH_TERMS) {
-            let facts = reader
-                .term_index_facts(column, chunk)
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let chunk = fts
+                .term_index_facts_after(
+                    &fst_bytes,
+                    column,
+                    after.as_deref(),
+                    TERM_INDEX_BATCH_TERMS,
+                )
                 .await
                 .map_err(|e| TermIndexError::Build(format!("term facts: {e}")))?;
-            for (term, fact) in chunk.iter().zip(facts) {
+            for (term, fact) in &chunk {
+                let term =
+                    from_utf8(term).map_err(|_| TermIndexError::Build("non-utf8 term".into()))?;
                 // A term the dictionary lists but no cursor could describe
                 // keeps its presence and is given the ceiling that prunes
                 // nothing rather than one that could be wrong.
@@ -3115,6 +3120,11 @@ async fn write_superfile_terms(
                     None => (0, f32::INFINITY, term_index::Location::None),
                 };
                 writer.push(&make_key(column, term), df, bound, location)?;
+            }
+            let done = chunk.len() < TERM_INDEX_BATCH_TERMS;
+            after = chunk.into_iter().last().map(|(term, _)| term);
+            if done {
+                break;
             }
         }
     }
@@ -9166,6 +9176,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         .await
         {
             Ok(new_manifest) => {
+                inner.note_superseded(&manifest, &new_manifest, &no_removals);
                 inner.manifest.store(Arc::new(new_manifest));
                 info!(
                     "supertable optimize: probe laws recalibrated over {} cells at k={WIDTH_LAW_KS:?}: width {:?}, fine depth {:?}, rerank {:?}",
@@ -9705,7 +9716,7 @@ where
             return Ok(());
         };
         let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = get_current_manifest_etag(storage, old)
+        let prev_etag = get_current_manifest_etag(storage, Arc::clone(&old))
             .await
             .inspect_err(|e| inner.note_commit_error(e))
             .map_err(BuildError::from)?;
@@ -9714,6 +9725,7 @@ where
             .await
         {
             Ok(()) => {
+                inner.note_superseded(&old, &new_manifest, &[]);
                 inner.manifest.store(Arc::new(new_manifest));
                 return Ok(());
             }
@@ -10052,6 +10064,7 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             .await
         {
             Ok(()) => {
+                inner.note_superseded(&old, &new_manifest, &[]);
                 inner.manifest.store(Arc::new(new_manifest));
                 return Ok(());
             }
@@ -10139,6 +10152,7 @@ async fn record_hidden_deleted_ids(
             .await
         {
             Ok(()) => {
+                inner.note_superseded(&old, &new_manifest, &[]);
                 inner.manifest.store(Arc::new(new_manifest));
                 return Ok(());
             }
@@ -10255,6 +10269,10 @@ pub(in crate::supertable) async fn persist_commit_async(
             } else {
                 old
             };
+            // What this attempt supersedes is measured from the committed manifest, not from
+            // `base`: the stamps below may already carry this commit's own refs (a drain batch's
+            // new graph), which would hide the ones they replace.
+            let committed = Arc::clone(&old);
             // Re-apply call-site stamps on every attempt. A pre-store of these
             // fields is not OCC-safe: contention refresh reloads from storage
             // and would drop them before a successful CAS.
@@ -10280,7 +10298,10 @@ pub(in crate::supertable) async fn persist_commit_async(
             )
             .await
             {
-                Ok(new_manifest) => return Ok(Arc::new(new_manifest)),
+                Ok(new_manifest) => {
+                    inner.note_superseded(&committed, &new_manifest, entries_to_remove);
+                    return Ok(Arc::new(new_manifest));
+                }
                 Err(SupertableCommitError::WriteContentionExhausted) => {
                     let last_attempt = attempt + 1 == max_retries;
                     // After the last attempt, refresh only to learn whether it
@@ -10295,6 +10316,9 @@ pub(in crate::supertable) async fn persist_commit_async(
                     } else if !new_entries.is_empty() {
                         refresh_inner_state_async(inner, &storage_async).await?;
                     }
+                    // Nothing is recorded for the deferred sweep here: the attempt that landed was
+                    // an earlier one, whose base this loop no longer holds, and `published` may be
+                    // several commits past it. What that commit replaced is left to the listing sweep.
                     if let Some(published) = published_by_earlier_attempt(inner, &new_entries) {
                         return Ok(published);
                     }
@@ -10990,6 +11014,7 @@ pub(in crate::supertable) async fn stamp_tombstone_seqs(
             .await
         {
             Ok(()) => {
+                inner.note_superseded(&old, &new_manifest, &[]);
                 inner.manifest.store(Arc::new(new_manifest));
                 inner.reconcile_tombstone_seqs();
                 return Ok(());
@@ -11284,8 +11309,13 @@ mod tests {
         },
         supertable::{
             SupertableOptions,
+            gc::superseded::reclaim,
             handle::Supertable,
-            manifest::{CellVectorSummary, ClusterCentroids, VectorSummary, commit::POINTER_PATH},
+            manifest::{
+                CellVectorSummary, ClusterCentroids, VectorSummary,
+                commit::{MANIFEST_DIR, POINTER_PATH, manifest_uri},
+            },
+            slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
             storage::LocalFsStorageProvider,
             wal::{recovery::scan_and_recover, state_doc::SupertableHandleId},
         },
@@ -12349,6 +12379,69 @@ mod tests {
             !hits.is_empty(),
             "docs survive the cross-batch splice concatenate"
         );
+    }
+
+    /// A drain commits once per batch and again when it settles, replacing the vector-state blob
+    /// and the manifest list each time, then schedules one deferred sweep. Every commit records
+    /// what it replaced, so after that one sweep nothing of the vector index's state or manifest
+    /// history survives that its latest manifest does not name: no intermediate generation leaks
+    /// to the day-long listing sweep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_multi_batch_drain_leaves_only_what_its_latest_manifest_names() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let options = options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+            .with_storage(storage)
+            .with_drain_batch_superfiles(1);
+        let table = Supertable::create(options).expect("create");
+        for _ in 0..2 {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let (hidden, _epoch) = current_drain_epoch(&table).await;
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("two-batch drain");
+
+        let superseded = hidden.inner().take_superseded();
+        reclaim(hidden.inner(), superseded).await.expect("reclaim");
+
+        let latest = hidden.inner().manifest.load_full();
+        let named: HashSet<String> = [
+            latest
+                .slow_vector_state_blob()
+                .map(|(uri, _)| uri.to_owned()),
+            latest
+                .slow_vector_state_centroids_blob()
+                .map(|r| r.uri.clone()),
+            latest.resident_vector_index_blob().map(|r| r.uri.clone()),
+            latest
+                .slow_vector_state_centroid_graph_blob()
+                .map(|r| r.uri.clone()),
+            Some(manifest_uri(latest.get_manifest_id())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let hidden_storage = hidden.inner().options.storage.clone().expect("storage");
+        for prefix in [SLOW_VECTOR_STATE_STORAGE_PREFIX, MANIFEST_DIR] {
+            for key in hidden_storage.list_with_prefix(prefix).await.expect("list") {
+                assert!(
+                    named.contains(&key),
+                    "{key} outlived the drain's sweep but the latest manifest does not name it"
+                );
+            }
+        }
     }
 
     /// Row count for the open-footprint regression fixture: large enough

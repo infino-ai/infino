@@ -70,10 +70,11 @@ impl Supertable {
                 "[optphase] router_cache"
             );
         }
-        // Refresh the global term-stats sidecar over the post-merge
-        // membership (compaction's removals dropped any prior reference —
-        // see the manifest carry rule). Runs before gc so the sweep's live
-        // set names the fresh artifact.
+        // Refresh the term index, and the term-stats sidecar if the index
+        // is incomplete, over the post-merge membership (compaction's
+        // removals dropped any prior sidecar reference — see the manifest
+        // carry rule). Runs before gc so the sweep's live set names the
+        // fresh artifacts.
         self.refresh_term_stats_sync()
             .map_err(|e| OptimizeError::Build(e.to_string()))?;
         match self.gc(opts.gc.safety_gap) {

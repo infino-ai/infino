@@ -3414,11 +3414,12 @@ fn escape_json(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, iter::once, sync::Arc};
 
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, UInt64Array};
     use arrow_schema::Field;
     use bytes::Bytes;
+    use rayon::ThreadPoolBuilder;
     use roaring::RoaringBitmap;
 
     use super::*;
@@ -3429,11 +3430,13 @@ mod tests {
             fts::{
                 builder::{BlobEra, RADIX_SORT_MIN_TRIPLES},
                 reader::BoolMode,
+                short::SHORT_MAX_DF,
                 sorted_merge::TERMS_PER_CHUNK,
             },
             vector::rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
         },
         test_helpers::{decimal128_ids, default_vector_config},
+        utils::terms::FstValue,
     };
 
     fn schema_with_fts() -> Arc<Schema> {
@@ -5881,18 +5884,34 @@ mod tests {
         positions: bool,
         deletes: &[&[u32]],
     ) {
+        assert_merges_agree(&merge_inputs_of_sizes(
+            sizes,
+            positions,
+            deletes,
+            sorted_merge_docs,
+        ));
+    }
+
+    /// Inputs of `sizes` docs each, made by `make_docs(input, first_id,
+    /// docs)`, input `i` losing the docs in `deletes[i]`.
+    fn merge_inputs_of_sizes(
+        sizes: &[u32],
+        positions: bool,
+        deletes: &[&[u32]],
+        make_docs: impl Fn(u32, u32, u32) -> Vec<(String, String)>,
+    ) -> Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> {
         let opts = sorted_merge_opts(positions);
         let mut first_id = 0;
         let mut inputs = Vec::new();
         for (i, &docs) in sizes.iter().enumerate() {
-            let docs_text = sorted_merge_docs(i as u32, first_id, docs);
+            let docs_text = make_docs(i as u32, first_id, docs);
             inputs.push((
                 merge_input(&opts, first_id, &docs_text, BlobEra::V7),
                 tombstones(deletes.get(i).copied().unwrap_or(&[])),
             ));
             first_id += docs;
         }
-        assert_merges_agree(&inputs);
+        inputs
     }
 
     /// Docs giving input `input` a vocabulary of exactly `n_terms` in both
@@ -5993,6 +6012,115 @@ mod tests {
         for positions in [false, true] {
             assert_merge_of_sizes_matches_accumulator(&SIZES, positions, &[]);
             assert_merge_of_sizes_matches_accumulator(&SIZES, positions, &[&[3, 9], &every_fifth]);
+        }
+    }
+
+    /// Docs for the thread-count test: `a{k}` in many docs
+    /// (long lists), `a{k}x` in few (short lists), `u{id}` in one (inline).
+    /// The long and short terms interleave in term order and share batches;
+    /// the inline terms follow them.
+    fn mixed_df_docs(first_id: u32, docs: u32) -> Vec<(String, String)> {
+        const LONG_TERMS: u32 = 7;
+        const SHORT_TERMS: u32 = 60;
+        (first_id..first_id + docs)
+            .map(|id| {
+                let title = format!("a{} a{}x u{id}", id % LONG_TERMS, id % SHORT_TERMS);
+                (title, format!("b{}", id % LONG_TERMS))
+            })
+            .collect()
+    }
+
+    /// Terms are merged on however many threads the pool has, and the
+    /// bytes must not depend on how many that is.
+    #[test]
+    fn a_sorted_merge_writes_the_same_bytes_on_any_number_of_threads() {
+        const MANY_THREADS: usize = 4;
+        let inputs = merge_inputs_of_sizes(
+            &[2_500, 1_000, 1_700],
+            true,
+            &[&[3, 9]],
+            |_, first_id, docs| mixed_df_docs(first_id, docs),
+        );
+        let merge_on = |threads: usize| -> Vec<u8> {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            let mut out = Vec::new();
+            pool.install(|| {
+                SuperfileBuilder::fts_merge_to(
+                    &inputs,
+                    &HashMap::new(),
+                    &mut out,
+                    PostingMerge::TermByTerm,
+                )
+            })
+            .expect("sorted merge");
+            out
+        };
+        let one = merge_on(1);
+        assert!(!one.is_empty(), "merge wrote a superfile");
+        assert!(
+            one == merge_on(MANY_THREADS),
+            "bytes must not depend on the thread count"
+        );
+        assert_merges_agree(&inputs);
+    }
+
+    /// The batch cap trusts `term_postings_at_most`, and the merge output
+    /// does not show it being wrong, so check it against every term: exact
+    /// for a long term, the form's limit for a short one, one for inline.
+    #[test]
+    fn term_postings_at_most_matches_each_term() {
+        const DOCS: u32 = 300;
+        const MAX_TERMS: usize = 1 << 16;
+        let opts = sorted_merge_opts(true);
+        for era in [BlobEra::V7, BlobEra::V2ToV4] {
+            let reader = merge_input(&opts, 0, &sorted_merge_docs(0, 0, DOCS), era);
+            let fts = reader.fts().expect("fts");
+            let dict = fts.dict_bytes().expect("dict");
+            let (mut inline, mut short, mut long) = (0, 0, 0);
+            for column_id in 0..2 {
+                let terms = fts
+                    .column_terms_from(&dict, column_id, b"", MAX_TERMS)
+                    .expect("terms");
+                assert!(terms.len() < MAX_TERMS, "premise: every term listed");
+                for (term, value) in terms {
+                    let mut postings = 0u32;
+                    fts.for_each_posting_in(
+                        column_id,
+                        once((term.as_slice(), value)),
+                        &mut Vec::new(),
+                        |_, _, _, _| {
+                            postings += 1;
+                            Ok(())
+                        },
+                    )
+                    .expect("postings");
+                    let at_most = fts.term_postings_at_most(value).expect("postings bound");
+                    match value {
+                        FstValue::Inline { .. } => {
+                            inline += 1;
+                            assert_eq!((at_most, postings), (1, 1), "inline {term:?}");
+                        }
+                        FstValue::Pfor { short: true, .. } => {
+                            short += 1;
+                            assert_eq!(at_most, SHORT_MAX_DF as u32, "short {term:?}");
+                            assert!(postings <= at_most, "short {term:?} over its limit");
+                        }
+                        FstValue::Pfor { .. } => {
+                            long += 1;
+                            assert_eq!(at_most, postings, "long {term:?}");
+                        }
+                    }
+                }
+            }
+            assert!(
+                inline > 0 && long > 0,
+                "{era:?} holds inline and long terms"
+            );
+            // Only the current layout has the short form.
+            assert_eq!(short > 0, era == BlobEra::V7, "{era:?} short terms");
         }
     }
 

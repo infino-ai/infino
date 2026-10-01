@@ -137,7 +137,7 @@ pub enum DiskCacheError {
     /// parse. The source [`crate::superfile::ReadError`] chain is
     /// preserved so callers that want variant-level detail can
     /// match on it instead of a stringified message.
-    #[error("superfile reader failed to open bytes")]
+    #[error("superfile reader failed to open bytes: {0}")]
     SuperfileOpenRead(#[from] crate::superfile::ReadError),
     /// Eviction could not free enough space: every cached entry is pinned, or the incoming
     /// superfile alone exceeds the budget. [`DiskCacheStore::open_for_query`] degrades to an
@@ -603,6 +603,12 @@ impl DiskCacheStore {
     /// Build a per-URI cache file path under `cache_root`.
     pub(crate) fn cache_path(&self, uri: &SuperfileUri) -> PathBuf {
         self.config.cache_root.join(uri.cache_filename())
+    }
+
+    /// Where a promoted copy of `uri` lives when its vector blob was left out; see
+    /// [`SuperfileUri::cache_hole_filename`].
+    pub(crate) fn hole_path(&self, uri: &SuperfileUri) -> PathBuf {
+        self.config.cache_root.join(uri.cache_hole_filename())
     }
 
     /// Build a per-URI sparse block-cache path under `cache_root`.

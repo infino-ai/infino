@@ -897,7 +897,7 @@ impl Supertable {
             match try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
-                current,
+                Arc::clone(&current),
                 &new_entries,
                 &entries_to_remove,
                 NewEntryBirthVersions::Preserve,
@@ -909,6 +909,9 @@ impl Supertable {
             .await
             {
                 Ok(new_manifest) => {
+                    // This attempt's own removals, resolved against its own base above, so a
+                    // retry that found fewer inputs records only those.
+                    inner.note_superseded(&current, &new_manifest, &entries_to_remove);
                     inner.manifest.store(Arc::new(new_manifest));
                     // Point the sidecar cache at the manifest just published;
                     // until then a carried sidecar has no seq and reads as absent.

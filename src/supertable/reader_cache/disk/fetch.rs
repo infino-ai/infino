@@ -39,7 +39,7 @@ use crate::{
     runtime_metrics::io::scope_background,
     storage::{StorageError, StorageProvider},
     superfile::{
-        BytesLazyByteSource, LazyByteSource, LazyByteSourceError, PrefetchedSource,
+        BytesLazyByteSource, LazyByteSource, LazyByteSourceError, PrefetchedSource, ReadError,
         format::{footer, kv},
         reader::{OpenOptions, SuperfileReader},
     },
@@ -68,6 +68,77 @@ impl DiskCacheStore {
         let (mmap, bytes) = mmap_readonly_with_handle(path).map_err(DiskCacheError::Io)?;
         let reader = SuperfileReader::open_with(bytes, OpenOptions { verify_crc })?;
         Ok(self.build_mmap_entry(Arc::new(reader), mmap, size, None))
+    }
+
+    /// [`Self::open_cached_entry`] for a copy at [`Self::hole_path`]: opened the way its fill left
+    /// it, with the vector blob read through a block cache over the superfile's `.blocks` file, and
+    /// charged its size minus the hole. The hole's range comes from the copy's own footer.
+    pub(crate) async fn open_holed_entry(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        size: u64,
+        storage_key: &str,
+        fetch_storage: Arc<dyn StorageProvider>,
+    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+        let (mmap, bytes) =
+            mmap_readonly_with_handle(&self.hole_path(uri)).map_err(DiskCacheError::Io)?;
+
+        let kv_map = footer::read_kv_metadata(&bytes).map_err(ReadError::Footer)?;
+
+        let hole = vector_blob_range_in(&kv_map).ok_or_else(|| {
+            DiskCacheError::SuperfileOpen("holed cache copy has no vector blob".into())
+        })?;
+
+        let remote: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
+            fetch_storage,
+            storage_key.to_owned(),
+            size,
+        ));
+
+        // This source charges the vector blocks it holds, so the entry is charged only for the
+        // bytes the copy holds.
+        let vector_source = BlockCachedSource::new_with_accounting(
+            remote,
+            Arc::downgrade(self),
+            *uri,
+            self.blocks_path(uri),
+            true,
+            None,
+        );
+
+        self.holed_mmap_entry(mmap, bytes, hole, vector_source, size)
+            .await
+    }
+
+    /// A [`Residency::Mapped`] entry for a local copy missing its vector blob: reads inside `hole`
+    /// go to `vector_source`, the rest to `bytes`. Parquet is installed resident, so sync decodes
+    /// (take, id scans) run off the local bytes; there is no CRC check, since the vector bytes are
+    /// not local to check. The hole is not on disk, so when `vector_source` charges its own blocks
+    /// the entry is charged `size` minus the hole; otherwise the hole's blocks ride on `size`.
+    async fn holed_mmap_entry(
+        &self,
+        mmap: Arc<Mmap>,
+        bytes: Bytes,
+        (hole_start, hole_len): (u64, u64),
+        vector_source: Arc<BlockCachedSource>,
+        size: u64,
+    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+        let source: Arc<dyn LazyByteSource> = Arc::new(HoleFallbackSource {
+            local: Arc::new(BytesLazyByteSource::new(bytes.clone())),
+            hole_start,
+            hole_len,
+            fallback: Arc::clone(&vector_source),
+        });
+        let mut reader =
+            SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false }).await?;
+        reader.install_resident_parquet(bytes)?;
+
+        let charge = if vector_source.owns_accounting() {
+            size.saturating_sub(hole_len)
+        } else {
+            size
+        };
+        Ok(self.build_mmap_entry(Arc::new(reader), mmap, charge, Some(vector_source)))
     }
 
     /// Build a [`Residency::Mapped`] entry, always `Eager`. `charge` is the file size, or less when
@@ -1235,7 +1306,6 @@ async fn lazy_background_fill(
         return Ok(());
     };
     let tmp = store.tmp_path(&uri);
-    let final_path = store.cache_path(&uri);
 
     if background_store_abandoned(&store) {
         rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation);
@@ -1305,8 +1375,8 @@ async fn lazy_background_fill(
         // Mmap the tempfile itself; the install renames it into the cache only if it wins the slot.
         let (mmap_arc, bytes) = mmap_readonly_with_handle(&tmp)?;
 
-        let (promoted_reader, vector_source) = match skip_vec {
-            Some((hole_start, hole_len)) => {
+        let entry = match skip_vec {
+            Some(hole) => {
                 // Keep the live block cache, so the vector ranges the cold query read stay local.
                 // None only if an eviction raced the check above: start a fresh one for the hole.
                 let block_source = store
@@ -1329,18 +1399,10 @@ async fn lazy_background_fill(
                             None,
                         )
                     });
-                let source: Arc<dyn LazyByteSource> = Arc::new(HoleFallbackSource {
-                    local: Arc::new(BytesLazyByteSource::new(bytes.clone())),
-                    hole_start,
-                    hole_len,
-                    fallback: Arc::clone(&block_source),
-                });
-                let mut reader =
-                    SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
-                        .await?;
-                // Sync parquet decodes (take, id scans) run off the mmap.
-                reader.install_resident_parquet(bytes)?;
-                (reader, Some(block_source))
+
+                store
+                    .holed_mmap_entry(mmap_arc, bytes, hole, block_source, size)
+                    .await?
             }
             None => {
                 let reader = SuperfileReader::open_with(
@@ -1349,21 +1411,18 @@ async fn lazy_background_fill(
                         verify_crc: store.config.verify_crc_on_open,
                     },
                 )?;
-                (reader, None)
+                store.build_mmap_entry(Arc::new(reader), mmap_arc, size, None)
             }
         };
 
-        let block_source_retained = vector_source.is_some();
-        // The hole is not on disk. When its block source charges its own blocks, the mmap is
-        // charged only for what the file holds; otherwise the hole's blocks ride on this charge.
-        let charge = match (&vector_source, skip_vec) {
-            (Some(source), Some((_, vec_len))) if source.owns_accounting() => {
-                size.saturating_sub(vec_len)
-            }
-            _ => size,
+        // A copy missing its vector blob goes under its own name, so that nothing, a restart
+        // included, can take it for a complete file.
+        let holed = skip_vec.is_some();
+        let final_path = if holed {
+            store.hole_path(&uri)
+        } else {
+            store.cache_path(&uri)
         };
-        let entry =
-            store.build_mmap_entry(Arc::new(promoted_reader), mmap_arc, charge, vector_source);
         // Installed with no vector hole, the mmap serves every range and the block file is dead
         // weight. Not installed, the block file stays with whoever holds the slot.
         let installed =
@@ -1371,7 +1430,7 @@ async fn lazy_background_fill(
         // The install settled the fill's reservation either way: it backs the new entry, or it
         // was released.
         own_reservation = None;
-        if installed.is_some() && !block_source_retained {
+        if installed.is_some() && !holed {
             store.drop_block_file(&uri);
         }
         Ok(())
@@ -1387,7 +1446,10 @@ async fn lazy_background_fill(
 
 /// Absolute `(offset, length)` of the vector blob from Parquet KV metadata.
 fn vector_blob_range(reader: &SuperfileReader) -> Option<(u64, u64)> {
-    let kv_map = footer::extract_kv_map(reader.parquet_metadata()).ok()?;
+    vector_blob_range_in(&footer::extract_kv_map(reader.parquet_metadata()).ok()?)
+}
+
+fn vector_blob_range_in(kv_map: &footer::KvMap) -> Option<(u64, u64)> {
     let off: u64 = kv_map.get(kv::VEC_OFFSET)?.parse().ok()?;
     let len: u64 = kv_map.get(kv::VEC_LENGTH)?.parse().ok()?;
     (len > 0).then_some((off, len))
@@ -1734,7 +1796,7 @@ mod tests {
         let uri = SuperfileUri::new_v4();
         seed_cache_file(&store, &uri, &tiny_superfile_bytes());
         let stranger = store
-            .fetch_from_disk_cache(&uri, None)
+            .fetch_from_disk_cache(&uri, &uri.storage_path(), None, None)
             .await
             .expect("disk probe")
             .expect("whole file admitted");
@@ -1920,14 +1982,16 @@ mod tests {
         let size = bytes.len() as u64;
         seed_cache_file(&store, &uri, &bytes);
         let stranger = store
-            .fetch_from_disk_cache(&uri, None)
+            .fetch_from_disk_cache(&uri, &uri.storage_path(), None, None)
             .await
             .expect("disk probe")
             .expect("whole file admitted");
+
         store
             .reserve_manual(size)
             .await
             .expect("the fill's own reservation");
+
         let charged_before = store.stats().current_bytes;
 
         // Different bytes in the fill's download, so an overwrite would show.
@@ -2031,7 +2095,8 @@ mod tests {
     /// The whole race, end to end: a Warm fill runs while a query holds the reader, the entry is
     /// evicted, a query reopens the file lazily, and the fill finishes. The fill must win the slot,
     /// leave a complete setup (file under the cache name, no stray tempfiles), keep the ledger
-    /// honest, and the next read must not fetch or throw anything away.
+    /// honest, and the next read must not fetch or throw anything away. The fixture has vectors,
+    /// so the copy lands under the hole name.
     #[tokio::test]
     async fn fill_that_outlives_an_eviction_still_promotes() {
         for reopen in [ReadIntent::Stream, ReadIntent::Warm] {
@@ -2073,7 +2138,7 @@ mod tests {
                 .expect("fills settle");
 
             assert!(
-                store.cache_path(&uri).exists(),
+                store.hole_path(&uri).exists(),
                 "{reopen:?}: file in the cache"
             );
             assert_eq!(
@@ -2094,7 +2159,7 @@ mod tests {
                 "{reopen:?}: the next read is served locally"
             );
             assert!(
-                store.cache_path(&uri).exists() && store.blocks_path(&uri).exists(),
+                store.hole_path(&uri).exists() && store.blocks_path(&uri).exists(),
                 "{reopen:?}: nothing local was thrown away"
             );
         }
@@ -2669,6 +2734,149 @@ mod tests {
             entry.block_source().is_some(),
             "the vector blob stays on the block cache as the retained hole",
         );
+    }
+
+    /// A promotion that left the vector blob on the block cache must survive a restart. The next
+    /// process reuses the local copy and its `.blocks`, with no GET; before, it took the copy for a
+    /// complete file, failed to open it (the hole reads as zeros where the vector header should
+    /// be), deleted both and fetched the superfile again.
+    #[tokio::test]
+    async fn vector_hole_promotion_is_reused_after_a_restart() {
+        for intent in [ReadIntent::Stream, ReadIntent::Warm] {
+            let dir = TempDir::new().expect("tempdir");
+            let local: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+            let recording = RecordingStorage::over(local);
+            let store = DiskCacheStore::new_unpinned(
+                Arc::clone(&recording) as Arc<dyn StorageProvider>,
+                DiskCacheConfig {
+                    cache_root: dir.path().join("cache"),
+                    cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+                    mmap_cold_threshold_secs: 0,
+                    ..Default::default()
+                },
+            )
+            .expect("store");
+            let uri = SuperfileUri::new_v4();
+            put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+
+            // An FTS or SQL read warms the file; the fill leaves the vector blob out of it.
+            drop(
+                store
+                    .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Warm)
+                    .await
+                    .expect("warm open"),
+            );
+            store
+                .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+                .await
+                .expect("promote");
+            assert!(
+                store.hole_path(&uri).exists() && !store.cache_path(&uri).exists(),
+                "a copy missing its vector blob is kept under its own name"
+            );
+
+            // Restart: a fresh store over the same directory, and the old one gone.
+            let restarted = reopen_store(&store, |cfg| {
+                cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            });
+            drop(store);
+
+            let before = restarted.stats();
+            let gets_before = recording.n_ranges();
+            restarted
+                .open_for_query(&uri, &uri.storage_path(), None, None, intent)
+                .await
+                .expect("read after the restart");
+            let after = restarted.stats();
+            assert_eq!(
+                after.n_cold_fetches - before.n_cold_fetches,
+                0,
+                "{intent:?}: the restart must not fetch the superfile again"
+            );
+            assert_eq!(
+                after.n_disk_reuses - before.n_disk_reuses,
+                1,
+                "{intent:?}: the restart must reuse the local copy"
+            );
+            assert_eq!(
+                recording.n_ranges(),
+                gets_before,
+                "{intent:?}: the vector header comes from .blocks, not object storage"
+            );
+            assert!(
+                restarted.hole_path(&uri).exists() && restarted.blocks_path(&uri).exists(),
+                "{intent:?}: the copy and its .blocks are still on disk"
+            );
+            restarted.assert_budget_consistent();
+        }
+    }
+
+    /// A holed copy whose `.blocks` is gone (evicted under budget pressure, or dropped by the scan
+    /// for a broken index) is still reused after a restart: the vector header is fetched by range,
+    /// not the whole superfile again.
+    #[tokio::test]
+    async fn holed_copy_without_its_blocks_is_still_reused_after_a_restart() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+        drop(
+            store
+                .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Warm)
+                .await
+                .expect("warm open"),
+        );
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("promote");
+
+        let restarted = reopen_store(&store, |cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        drop(store);
+        restarted.drop_block_file(&uri);
+
+        let before = restarted.stats();
+        restarted
+            .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Stream)
+            .await
+            .expect("read after the restart");
+        let after = restarted.stats();
+        assert_eq!(after.n_cold_fetches, before.n_cold_fetches, "no refetch");
+        assert_eq!(after.n_disk_reuses - before.n_disk_reuses, 1, "copy reused");
+        assert!(restarted.hole_path(&uri).exists(), "copy still on disk");
+        restarted.assert_budget_consistent();
+    }
+
+    /// Evicting a promoted copy with a hole deletes it under its own name, together with the
+    /// `.blocks` that held its vector ranges.
+    #[tokio::test]
+    async fn evicting_a_holed_copy_deletes_it_and_its_blocks() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+        drop(
+            store
+                .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Warm)
+                .await
+                .expect("warm open"),
+        );
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("promote");
+        assert!(store.hole_path(&uri).exists(), "promoted with a hole");
+
+        store.evict_at_least(1).await.expect("evict");
+
+        assert!(!store.hole_path(&uri).exists(), "the holed copy is deleted");
+        assert!(!store.blocks_path(&uri).exists(), "and so is its .blocks");
+        store.assert_budget_consistent();
     }
 
     #[tokio::test]

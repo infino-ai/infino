@@ -78,6 +78,7 @@ use std::{
     hash::{BuildHasher, Hash},
     io::{self, BufReader, BufWriter, Error, ErrorKind, Read, Seek, SeekFrom, Write},
     mem,
+    ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -189,6 +190,8 @@ struct FinishProfile {
     encode_df1: u64,
     encode_short: u64,
     encode_pfor: u64,
+    /// Time spent encoding and writing terms. The merge encodes on many
+    /// threads and sums their times, so there it can exceed wall time.
     encode_total: Duration,
     encode_block_build: Duration,
     encode_meta_write: Duration,
@@ -210,6 +213,22 @@ struct FinishProfile {
 }
 
 impl FinishProfile {
+    /// Add a worker thread's encode counts and times. ORs
+    /// `saw_bitset_block`, which sets the blob's version, so a worker's
+    /// must never be dropped.
+    fn absorb(&mut self, other: &FinishProfile) {
+        self.saw_bitset_block |= other.saw_bitset_block;
+        self.encode_calls += other.encode_calls;
+        self.encode_df1 += other.encode_df1;
+        self.encode_short += other.encode_short;
+        self.encode_pfor += other.encode_pfor;
+        self.encode_total += other.encode_total;
+        self.encode_block_build += other.encode_block_build;
+        self.encode_meta_write += other.encode_meta_write;
+        self.encode_skip_write += other.encode_skip_write;
+        self.encode_block_write += other.encode_block_write;
+    }
+
     fn from_config() -> Self {
         Self {
             enabled: crate::config::global().diagnostics.fts_profile,
@@ -243,6 +262,16 @@ pub(crate) const TERM_META_SIZE: usize = 20;
 /// column's positions flag selects the stride — the two layouts never
 /// mix within one column.
 pub(crate) const TERM_META_POSITIONAL_SIZE: usize = 32;
+
+/// Where a long term's header holds its own offset in the postings
+/// region. Filled in when the term is written, since only the writer knows
+/// where it lands.
+const HEADER_POSTINGS_OFFSET: Range<usize> = 4..12;
+
+/// Where a positional long term's header holds its offset in the
+/// positions region; filled in when the term is written, like
+/// [`HEADER_POSTINGS_OFFSET`].
+const HEADER_POSITIONS_OFFSET: Range<usize> = 20..28;
 
 /// Largest document frequency at which a term's blocks may take the
 /// patched encoding. A patched block decodes about 15 ns slower than a
@@ -2828,6 +2857,13 @@ impl FtsBuilder {
             // The collection size idf is baked with: the documents that
             // carry tokens, matching what the reader divides by.
             let n_scored = n_scored_per_col[orig_col_idx];
+            let enc = TermEncoding {
+                doc_lengths: col_doc_lengths,
+                avgdl,
+                params,
+                n_scored_docs: n_scored,
+                era,
+            };
 
             // In-RAM path invariant: dispatcher checked
             // `!any_spilled`, so every column is `InRam`.
@@ -2870,10 +2906,7 @@ impl FtsBuilder {
                     &term,
                     &postings,
                     col_name_bytes,
-                    col_doc_lengths,
-                    avgdl,
-                    params,
-                    n_scored,
+                    &enc,
                     &mut key_buf,
                     &mut postings_writer,
                     &mut postings_crc_acc,
@@ -2883,7 +2916,6 @@ impl FtsBuilder {
                     term_positions,
                     &mut finish_profile,
                     &mut term_scratch,
-                    era,
                 )?;
                 n_terms_total_usize += 1;
             }
@@ -3052,6 +3084,13 @@ impl FtsBuilder {
             // The collection size idf is baked with: the documents that
             // carry tokens, matching what the reader divides by.
             let n_scored = n_scored_per_col[orig_col_idx];
+            let enc = TermEncoding {
+                doc_lengths: col_doc_lengths,
+                avgdl,
+                params,
+                n_scored_docs: n_scored,
+                era,
+            };
 
             // The compaction merge: the accumulator is empty (checked in
             // `finish_to`) and the inputs are merged term by term.
@@ -3063,29 +3102,68 @@ impl FtsBuilder {
                     terms = tracing::field::Empty,
                 )
                 .entered();
+                let profiling = finish_profile.enabled;
+                // Terms are encoded on many threads, each with its own
+                // scratch and profile, and written here in term order.
                 let mut n_emitted: usize = 0;
-                merge_column(&sorted_inputs, orig_col_idx as u32, |term, pairs, runs| {
-                    n_emitted += 1;
-                    encode_and_emit_term(
-                        term,
-                        pairs,
-                        col_name_bytes,
-                        col_doc_lengths,
-                        avgdl,
-                        params,
-                        n_scored,
-                        &mut key_buf,
-                        &mut postings_writer,
-                        &mut postings_crc_acc,
-                        &mut postings_len,
-                        None,
-                        Some(&mut fst_streaming),
-                        col_positions.then_some((&mut positions_sink, runs)),
-                        &mut finish_profile,
-                        &mut term_scratch,
-                        era,
-                    )
-                })?;
+                let workers = merge_column(
+                    &sorted_inputs,
+                    orig_col_idx as u32,
+                    || {
+                        let profile = FinishProfile {
+                            enabled: profiling,
+                            ..FinishProfile::default()
+                        };
+                        (TermScratch::default(), profile)
+                    },
+                    |(scratch, profile), pairs, runs| {
+                        let positions = col_positions.then_some(runs);
+                        let encoded = encode_term_timed(pairs, positions, &enc, profile, scratch)?;
+                        // A long term's buffers are moved out rather than
+                        // copied, so a worker does not keep their size. A
+                        // short body is small; copying it keeps the
+                        // scratch's capacity for the next term.
+                        let (body, positions) = match encoded {
+                            EncodedTerm::Inline(_) => (Vec::new(), Vec::new()),
+                            EncodedTerm::Short => (scratch.term_buf.clone(), Vec::new()),
+                            EncodedTerm::Long => {
+                                // Positions grow without a reserve; drop
+                                // the spare capacity while the term waits.
+                                let mut positions = mem::take(&mut scratch.pos_out);
+                                positions.shrink_to_fit();
+                                // Its blocks' bytes are in the body now.
+                                scratch.encoded_blocks.clear();
+                                (mem::take(&mut scratch.term_buf), positions)
+                            }
+                        };
+                        Ok(MergedTerm {
+                            encoded,
+                            body,
+                            positions,
+                        })
+                    },
+                    |term, mut merged| {
+                        n_emitted += 1;
+                        write_term(
+                            term,
+                            merged.encoded,
+                            &mut merged.body,
+                            &merged.positions,
+                            col_name_bytes,
+                            &mut key_buf,
+                            &mut postings_writer,
+                            &mut postings_crc_acc,
+                            &mut postings_len,
+                            None,
+                            Some(&mut fst_streaming),
+                            col_positions.then_some(&mut positions_sink),
+                            &mut finish_profile,
+                        )
+                    },
+                )?;
+                for (_, profile) in &workers {
+                    finish_profile.absorb(profile);
+                }
                 n_terms_total_usize += n_emitted;
                 record("terms", n_emitted as u64);
                 drop(merge_span);
@@ -3126,10 +3204,7 @@ impl FtsBuilder {
                                 &term,
                                 &postings,
                                 col_name_bytes,
-                                col_doc_lengths,
-                                avgdl,
-                                params,
-                                n_scored,
+                                &enc,
                                 &mut key_buf,
                                 &mut postings_writer,
                                 &mut postings_crc_acc,
@@ -3139,7 +3214,6 @@ impl FtsBuilder {
                                 term_positions,
                                 &mut finish_profile,
                                 &mut term_scratch,
-                                era,
                             )?;
                             n_terms_total_usize += 1;
                         }
@@ -3296,10 +3370,7 @@ impl FtsBuilder {
                                 &term_id_in_lex_order,
                                 &id_to_term,
                                 col_name_bytes,
-                                col_doc_lengths,
-                                avgdl,
-                                params,
-                                n_scored,
+                                &enc,
                                 &mut key_buf,
                                 &mut postings_writer,
                                 &mut postings_crc_acc,
@@ -3308,7 +3379,6 @@ impl FtsBuilder {
                                 &mut positions_sink,
                                 &mut finish_profile,
                                 &mut term_scratch,
-                                era,
                             )?,
                             SpillStore::Positional { blobs, .. } => {
                                 // mmap each partition's positions blob so
@@ -3335,10 +3405,7 @@ impl FtsBuilder {
                                     &term_id_in_lex_order,
                                     &id_to_term,
                                     col_name_bytes,
-                                    col_doc_lengths,
-                                    avgdl,
-                                    params,
-                                    n_scored,
+                                    &enc,
                                     &mut key_buf,
                                     &mut postings_writer,
                                     &mut postings_crc_acc,
@@ -3347,7 +3414,6 @@ impl FtsBuilder {
                                     &mut positions_sink,
                                     &mut finish_profile,
                                     &mut term_scratch,
-                                    era,
                                 )?
                             }
                         };
@@ -3884,12 +3950,13 @@ fn map_fst_err(e: fst::Error) -> BuildError {
     BuildError::Io(Error::new(ErrorKind::InvalidData, e))
 }
 
-/// Reusable per-term scratch buffers threaded through
-/// `encode_and_emit_term`. One instance is created at the top of
-/// `finish_to` and re-used across every term encoded in the column,
-/// turning ~3M+ per-term `Vec::new` allocations on the 1M-doc
-/// forced-spill bench into ~5 reused allocations (one per buffer,
-/// once per column). The Block's `doc_ids` / `tfs` Vecs are
+/// Reusable per-term scratch buffers threaded through `encode_term`.
+/// Each thread that encodes terms owns one and re-uses it across every
+/// term it encodes, turning ~3M+ per-term `Vec::new` allocations on the
+/// 1M-doc forced-spill bench into ~5 reused allocations (one per buffer,
+/// once per column). The compaction merge moves a long term's `term_buf`
+/// and `pos_out` out, so those two are allocated again per long term. The
+/// Block's `doc_ids` / `tfs` Vecs are
 /// `mem::take`'d into a Block, encoded, then swapped back via
 /// `mem::take` so the underlying buffer is reused for the next
 /// chunk (same allocation, just `Vec::clear` between iterations).
@@ -3927,8 +3994,9 @@ struct TermScratch {
     /// so entry `(block, slot)` sits at a flat `block * ENTRIES_PER_BLOCK
     /// + slot`. Reused like the other buffers.
     pos_subindex_offsets: Vec<u32>,
-    /// A term's position region as emitted under grouped positions:
-    /// every block's group back to back. Reused across terms.
+    /// A long term's positions region: every block's group back to back
+    /// under grouped positions, or on the earlier layouts, the runs when
+    /// they came decoded. Reused across terms.
     pos_out: Vec<u8>,
     /// The patched encoders' planning buffers.
     pack: PackScratch,
@@ -3952,10 +4020,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     term_id_in_lex_order: &[u32],
     id_to_term: &[&'static str],
     col_name_bytes: &[u8],
-    col_doc_lengths: &[u32],
-    avgdl: f32,
-    params: bm25::Bm25Params,
-    n_scored_docs: u32,
+    enc: &TermEncoding<'_>,
     key_buf: &mut Vec<u8>,
     postings_writer: &mut W,
     postings_crc_acc: &mut u32,
@@ -3964,7 +4029,6 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     positions_sink: &mut PositionsSink,
     finish_profile: &mut FinishProfile,
     term_scratch: &mut TermScratch,
-    era: BlobEra,
 ) -> Result<usize, BuildError> {
     let mmap_start = finish_profile.enabled.then(Instant::now);
     let mut mmaps: Vec<Mmap> = Vec::with_capacity(sorted_files.len());
@@ -4064,10 +4128,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             term_bytes,
             &group,
             col_name_bytes,
-            col_doc_lengths,
-            avgdl,
-            params,
-            n_scored_docs,
+            enc,
             key_buf,
             postings_writer,
             postings_crc_acc,
@@ -4077,7 +4138,6 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             term_positions,
             finish_profile,
             term_scratch,
-            era,
         )?;
         n_emitted += 1;
     }
@@ -4100,48 +4160,130 @@ fn merge_sorted_spill<const N: usize, W: Write>(
 /// dispatches accordingly.
 ///
 /// Owns the per-term encoding policy (df=1 inline value, df≥2 PFOR
-/// blocks via `encode_posting_group`).
+/// blocks via `encode_posting_group`): [`encode_term`] builds the term's
+/// bytes and [`write_term`] places them.
 #[allow(clippy::too_many_arguments)]
 fn encode_and_emit_term<W: Write>(
     term: &str,
     pairs: &[(u32, u32)],
     col_name_bytes: &[u8],
-    col_doc_lengths: &[u32],
-    avgdl: f32,
-    params: bm25::Bm25Params,
-    n_scored_docs: u32,
+    enc: &TermEncoding<'_>,
     key_buf: &mut Vec<u8>,
     postings_writer: &mut W,
     postings_crc_acc: &mut u32,
     postings_len: &mut u64,
     fst_entries_inram: Option<&mut TermDictBuilder>,
-    mut fst_streaming: Option<&mut StreamingTermDictBuilder<BufWriter<File>>>,
+    fst_streaming: Option<&mut StreamingTermDictBuilder<BufWriter<File>>>,
     term_positions: Option<(&mut PositionsSink, TermRuns<'_>)>,
     profile: &mut FinishProfile,
     scratch: &mut TermScratch,
-    era: BlobEra,
 ) -> Result<(), BuildError> {
+    let (sink, runs) = match term_positions {
+        Some((sink, runs)) => (Some(sink), Some(runs)),
+        None => (None, None),
+    };
+    let encoded = encode_term_timed(pairs, runs, enc, profile, scratch)?;
+    let positions = match runs {
+        Some(TermRuns::Encoded(bytes)) if !enc.era.layout().grouped_positions => bytes,
+        _ => &scratch.pos_out,
+    };
+    write_term(
+        term,
+        encoded,
+        &mut scratch.term_buf,
+        positions,
+        col_name_bytes,
+        key_buf,
+        postings_writer,
+        postings_crc_acc,
+        postings_len,
+        fst_entries_inram,
+        fst_streaming,
+        sink,
+        profile,
+    )
+}
+
+/// [`encode_term`], counted and timed in `profile`.
+fn encode_term_timed(
+    pairs: &[(u32, u32)],
+    term_positions: Option<TermRuns<'_>>,
+    enc: &TermEncoding<'_>,
+    profile: &mut FinishProfile,
+    scratch: &mut TermScratch,
+) -> Result<EncodedTerm, BuildError> {
     let encode_start = profile.enabled.then(Instant::now);
+    profile.encode_calls += 1;
+    let encoded = encode_term(pairs, term_positions, enc, profile, scratch)?;
+    if let Some(start) = encode_start {
+        profile.encode_total += start.elapsed();
+    }
+    Ok(encoded)
+}
+
+/// What a column's terms are encoded against, besides the terms.
+#[derive(Clone, Copy)]
+struct TermEncoding<'a> {
+    doc_lengths: &'a [u32],
+    avgdl: f32,
+    params: bm25::Bm25Params,
+    n_scored_docs: u32,
+    era: BlobEra,
+}
+
+/// A term encoded on a worker thread, its bytes taken out of that
+/// worker's scratch so the scratch can take the next term.
+struct MergedTerm {
+    encoded: EncodedTerm,
+    body: Vec<u8>,
+    positions: Vec<u8>,
+}
+
+/// What [`encode_term`] made of one term. A body sits in the scratch's
+/// `term_buf`. A long term's positions sit in its `pos_out`, except on the
+/// layouts before grouped positions when the runs came encoded: they are
+/// the positions as they are.
+#[derive(Clone, Copy)]
+enum EncodedTerm {
+    /// The whole posting fits the dictionary value; no bytes.
+    Inline(FstValue),
+    /// A short-form body, positions inside it.
+    Short,
+    /// A long-form body whose header still needs its two offsets.
+    Long,
+}
+
+/// Build one term's bytes. Depends on nothing outside the term, so terms
+/// can be encoded in any order; [`write_term`] then places them in term
+/// order. `term_positions` is `Some` exactly for a positional column.
+fn encode_term(
+    pairs: &[(u32, u32)],
+    term_positions: Option<TermRuns<'_>>,
+    enc: &TermEncoding<'_>,
+    profile: &mut FinishProfile,
+    scratch: &mut TermScratch,
+) -> Result<EncodedTerm, BuildError> {
+    let TermEncoding {
+        doc_lengths: col_doc_lengths,
+        avgdl,
+        params,
+        n_scored_docs,
+        era,
+    } = *enc;
     // The layouts before grouped positions store the LEB128 runs as they
     // are, so decoded runs are encoded once here and the rest of this
     // function sees bytes on those layouts.
-    let legacy_runs: Vec<u8>;
-    let mut term_positions = match term_positions {
-        Some((sink, runs @ TermRuns::Values { .. })) if !era.layout().grouped_positions => {
+    let mut legacy_runs: Option<Vec<u8>> = None;
+    let term_positions = match term_positions {
+        Some(runs @ TermRuns::Values { .. }) if !era.layout().grouped_positions => {
             let mut bytes = Vec::new();
             runs.encode_into(pairs.iter().map(|&(_, tf)| tf), &mut bytes);
-            legacy_runs = bytes;
-            Some((sink, TermRuns::Encoded(&legacy_runs)))
+            Some(TermRuns::Encoded(legacy_runs.insert(bytes).as_slice()))
         }
         other => other,
     };
-    profile.encode_calls += 1;
-    // Build the FST key once; reused regardless of in-RAM vs spilled
-    // emit policy.
-    key_buf.clear();
-    key_buf.extend_from_slice(col_name_bytes);
-    key_buf.push(FST_SEPARATOR);
-    key_buf.extend_from_slice(term.as_bytes());
+    scratch.term_buf.clear();
+    scratch.pos_out.clear();
 
     debug_assert!(
         pairs.windows(2).all(|w| w[0].0 < w[1].0),
@@ -4161,7 +4303,7 @@ fn encode_and_emit_term<W: Write>(
         let (doc_id, tf) = pairs[0];
         match &term_positions {
             None => Some(FstValue::Inline { doc_id, tf }),
-            Some((_, runs)) if tf == 1 => {
+            Some(runs) if tf == 1 => {
                 let pos = runs.first_value();
                 (pos <= INLINE_TF_MAX).then_some(FstValue::Inline { doc_id, tf: pos })
             }
@@ -4171,18 +4313,16 @@ fn encode_and_emit_term<W: Write>(
         None
     };
 
-    let fst_value: FstValue = if let Some(v) = inline_value {
+    let encoded = if let Some(v) = inline_value {
         profile.encode_df1 += 1;
-        v
+        EncodedTerm::Inline(v)
     } else if era.layout().short_form && pairs.len() <= SHORT_MAX_DF {
         // Single-block term: the short form (`fts::short`) — no header,
         // skip entry, sub-index row, coarse slot or block header, and no
-        // lane padding. Its position runs go to the positions region
-        // exactly as a long term's do; the body's trailer says where.
+        // lane padding. Its positions sit inline in the body.
         profile.encode_short += 1;
-        let metadata_offset = *postings_len;
         let positions = match term_positions.as_ref() {
-            Some((_, runs)) => {
+            Some(runs) => {
                 // The whole term is one position group, inline in the body:
                 // its run values, packed or LEB128, whichever is smaller.
                 let vals = &mut scratch.pos_vals;
@@ -4205,15 +4345,10 @@ fn encode_and_emit_term<W: Write>(
             }
             None => None,
         };
-        let term_buf = &mut scratch.term_buf;
-        term_buf.clear();
-        encode_short(term_buf, pairs, positions);
-        write_counted(postings_writer, postings_crc_acc, postings_len, term_buf)?;
-        FstValue::Pfor {
-            metadata_offset,
-            postings_length_hint: Some(term_buf.len() as u32),
-            short: true,
-        }
+        encode_short(&mut scratch.term_buf, pairs, positions);
+        // The body carries its positions; nothing goes to the region.
+        scratch.pos_out.clear();
+        EncodedTerm::Short
     } else {
         profile.encode_pfor += 1;
         let idf_t = bm25::idf(n_scored_docs as u64, df);
@@ -4304,7 +4439,6 @@ fn encode_and_emit_term<W: Write>(
             profile.saw_bitset_block = true;
         }
         let num_blocks = encoded_blocks.len() as u32;
-        let metadata_offset = *postings_len;
         let skip_layout = era.layout().skip;
         let skip_table_size =
             encoded_blocks.len() * skip_layout.entry_bytes(term_positions.is_some());
@@ -4355,8 +4489,7 @@ fn encode_and_emit_term<W: Write>(
         // accumulator's LEB128 runs verbatim, or — under grouped positions
         // — those runs regrouped per block into `scratch.pos_out`.
         let pos_out = &mut scratch.pos_out;
-        pos_out.clear();
-        if let Some((_, runs)) = &term_positions {
+        if let Some(runs) = &term_positions {
             let mut at: usize = 0;
             if era.layout().grouped_positions {
                 // Regroup block by block: every long-form group is packed,
@@ -4427,25 +4560,25 @@ fn encode_and_emit_term<W: Write>(
             )));
         }
 
-        // Reuse `scratch.term_buf` across every dense term. `clear`
-        // keeps the existing allocation; only a true grow (a term
-        // larger than any previously seen) reallocs.
+        // `term_buf` is empty here, so this reserves exactly the term. It
+        // reuses its allocation across terms, except where the compaction
+        // merge moves a long term's buffer out.
         let term_buf = &mut scratch.term_buf;
-        term_buf.clear();
-        if term_buf.capacity() < postings_length as usize {
-            term_buf.reserve(postings_length as usize - term_buf.capacity());
-        }
+        term_buf.reserve(postings_length as usize);
         let meta_write_start = profile.enabled.then(Instant::now);
         term_buf.extend_from_slice(&(df as u32).to_le_bytes());
-        term_buf.extend_from_slice(&metadata_offset.to_le_bytes());
+        // The two offsets are placeholders until `write_term` fills them.
+        debug_assert_eq!(term_buf.len(), HEADER_POSTINGS_OFFSET.start);
+        term_buf.extend_from_slice(&0u64.to_le_bytes());
         term_buf.extend_from_slice(&(postings_length as u32).to_le_bytes());
         term_buf.extend_from_slice(&num_blocks.to_le_bytes());
-        if let Some((sink, runs)) = &term_positions {
+        if let Some(runs) = &term_positions {
             let region_len = match runs.encoded() {
                 Some(bytes) if !era.layout().grouped_positions => bytes.len(),
                 _ => pos_out.len(),
             };
-            term_buf.extend_from_slice(&sink.len.to_le_bytes());
+            debug_assert_eq!(term_buf.len(), HEADER_POSITIONS_OFFSET.start);
+            term_buf.extend_from_slice(&0u64.to_le_bytes());
             term_buf.extend_from_slice(&(region_len as u32).to_le_bytes());
         }
         debug_assert_eq!(term_buf.len(), term_meta_size);
@@ -4536,22 +4669,67 @@ fn encode_and_emit_term<W: Write>(
         // Coarse block-max table: the term region's tail.
         term_buf.extend_from_slice(&coarse_slots);
         debug_assert_eq!(term_buf.len(), postings_length as usize);
-        write_counted(postings_writer, postings_crc_acc, postings_len, term_buf)?;
         if let Some(start) = block_write_start {
             profile.encode_block_write += start.elapsed();
         }
+        EncodedTerm::Long
+    };
+    // Runs this function encoded are the region on the earlier layouts.
+    if let Some(bytes) = legacy_runs {
+        scratch.pos_out = bytes;
+    }
+    Ok(encoded)
+}
 
-        if let Some((sink, runs)) = term_positions.as_mut() {
-            match runs.encoded() {
-                Some(bytes) if !era.layout().grouped_positions => sink.write(bytes)?,
-                _ => sink.write(pos_out)?,
+/// Place an encoded term: fill in its header's offsets, append its bytes
+/// to the postings and, for a long positional term, the positions region,
+/// and add its dictionary entry. Terms must arrive in term order.
+#[allow(clippy::too_many_arguments)]
+fn write_term<W: Write>(
+    term: &str,
+    encoded: EncodedTerm,
+    body: &mut [u8],
+    positions: &[u8],
+    col_name_bytes: &[u8],
+    key_buf: &mut Vec<u8>,
+    postings_writer: &mut W,
+    postings_crc_acc: &mut u32,
+    postings_len: &mut u64,
+    fst_entries_inram: Option<&mut TermDictBuilder>,
+    mut fst_streaming: Option<&mut StreamingTermDictBuilder<BufWriter<File>>>,
+    positions_sink: Option<&mut PositionsSink>,
+    profile: &mut FinishProfile,
+) -> Result<(), BuildError> {
+    let write_start = profile.enabled.then(Instant::now);
+    key_buf.clear();
+    key_buf.extend_from_slice(col_name_bytes);
+    key_buf.push(FST_SEPARATOR);
+    key_buf.extend_from_slice(term.as_bytes());
+
+    let fst_value = match encoded {
+        EncodedTerm::Inline(value) => value,
+        EncodedTerm::Short | EncodedTerm::Long => {
+            let metadata_offset = *postings_len;
+            let long = matches!(encoded, EncodedTerm::Long);
+            if long {
+                body[HEADER_POSTINGS_OFFSET].copy_from_slice(&metadata_offset.to_le_bytes());
+                if let Some(sink) = &positions_sink {
+                    body[HEADER_POSITIONS_OFFSET].copy_from_slice(&sink.len.to_le_bytes());
+                }
             }
-        }
-
-        FstValue::Pfor {
-            metadata_offset,
-            postings_length_hint: Some(postings_length as u32),
-            short: false,
+            let block_write_start = (profile.enabled && long).then(Instant::now);
+            write_counted(postings_writer, postings_crc_acc, postings_len, body)?;
+            if long && let Some(sink) = positions_sink {
+                sink.write(positions)?;
+            }
+            if let Some(start) = block_write_start {
+                profile.encode_block_write += start.elapsed();
+            }
+            FstValue::Pfor {
+                metadata_offset,
+                postings_length_hint: Some(body.len() as u32),
+                short: !long,
+            }
         }
     };
 
@@ -4564,11 +4742,9 @@ fn encode_and_emit_term<W: Write>(
     if let Some(start) = fst_insert_start {
         profile.fst_insert += start.elapsed();
     }
-
-    if let Some(start) = encode_start {
+    if let Some(start) = write_start {
         profile.encode_total += start.elapsed();
     }
-
     Ok(())
 }
 

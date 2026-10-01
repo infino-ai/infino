@@ -200,6 +200,11 @@ test-remote:
 	cargo test --features remote --lib catalog::remote::wire
 	cargo test --features remote --test remote
 
+# Tracing lane. `detailed-tracing` is off in the default gates, which only
+# compile it, so the spans a search exports are tested here.
+test-tracing:
+	cargo test --features test-helpers,metering,detailed-tracing --test search_spans
+
 # Build the API docs locally, exactly as docs.rs renders them: crate only
 # (`--no-deps`), default features, opened in a browser. The landing page is
 # the README (lib.rs pulls it in via `include_str!`); the rest is rustdoc
@@ -305,7 +310,7 @@ node-verify:
 	cd infino-node && ./scripts/verify-pack.sh
 
 # Local "pre-PR" check — same gates CI runs
-ci: check doctest coverage test-remote
+ci: check doctest coverage test-remote test-tracing
 	@echo "✓ ready to PR"
 
 clean:
