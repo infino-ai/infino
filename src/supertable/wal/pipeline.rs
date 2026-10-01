@@ -70,6 +70,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::{
+    config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
     runtime_bridge::{bridge_sync_to_async, run_on_pool},
     runtime_metrics::op_stats::{OpStatsCollector, timed_kernel},
     storage::StorageError,
@@ -988,6 +989,41 @@ const SEALED_RETRY_CAP_MS: u64 = 30_000;
 /// plateaus (before [`SEALED_RETRY_CAP_MS`] clamps the result)
 /// rather than overflowing on a high attempt count.
 const SEALED_RETRY_MAX_SHIFT: u32 = 8;
+
+/// Total backoff a mutation spends before `retries` sealed attempts are up.
+const fn sealed_retry_span_ms(retries: u32) -> u64 {
+    let mut total = 0;
+    let mut attempt = 0;
+    while attempt < retries {
+        let shift = if attempt < SEALED_RETRY_MAX_SHIFT {
+            attempt
+        } else {
+            SEALED_RETRY_MAX_SHIFT
+        };
+        let step = SEALED_RETRY_BASE_MS * (1u64 << shift);
+        total += if step < SEALED_RETRY_CAP_MS {
+            step
+        } else {
+            SEALED_RETRY_CAP_MS
+        };
+        attempt += 1;
+    }
+    total
+}
+
+// The two timeouts are ordered, and the order is what keeps a delete alive
+// through a compaction wave longer than a seal lives. A writer waits on a
+// fresh seal and steals a stale one, so it needs budget enough to reach the
+// staleness threshold: the moment the budget is the shorter of the two, every
+// delete landing on a sealed input during a long merge fails with
+// `SealedSidecarRetryExhausted` instead of taking the seal over. Raising the
+// staleness threshold — which its own doc-comment invites for large targets —
+// is the edit this catches.
+const _: () = assert!(
+    sealed_retry_span_ms(DEFAULT_MAX_SEALED_RETRIES) > DEFAULT_STALE_SEAL_TIMEOUT_MS,
+    "the sealed-retry budget must outlast the seal staleness threshold, or a \
+     delete exhausts its retries before it is allowed to steal an abandoned seal"
+);
 
 /// The lease span the current driver was granted, or `None` when the WAL
 /// carries no lease. Read once per phase, before any renewal moves

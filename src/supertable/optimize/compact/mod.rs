@@ -20,7 +20,10 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures::stream::{self, StreamExt};
+use futures::{
+    FutureExt,
+    stream::{self, Stream, StreamExt},
+};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::{sync::Semaphore, task::JoinSet, time};
@@ -1090,38 +1093,91 @@ impl Supertable {
         while !rest.is_empty() {
             let (wave, remainder) = admit_wave(rest, concurrency).await;
             rest = remainder;
-            let prepared: Vec<Result<PreparedJob, CompactionError>> =
-                stream::iter(wave.iter().cloned().map(|job| async move {
-                    self.prepare_compaction_job(job, stale_seal_timeout).await
-                }))
-                // Ordered, not `buffer_unordered`: the batch commits in plan
-                // order so a pass's manifest is reproducible from its plan.
-                .buffered(concurrency)
-                .collect()
-                .await;
+            // Unordered, so a finished merge can commit without waiting on a
+            // slower sibling. A job's inputs stay sealed from its prepare
+            // until its commit, and a writer treats a seal older than the
+            // staleness threshold as abandoned — so holding the whole wave's
+            // seals for the slowest merge would hand every delete that lands
+            // meanwhile a reason to steal one, and cost those jobs their
+            // merges at commit. Plan order is restored within each batch
+            // below, which is as much of it as committing early can preserve.
+            let mut merges = stream::iter(wave.iter().cloned().enumerate().map(
+                |(plan_index, job)| async move {
+                    (
+                        plan_index,
+                        self.prepare_compaction_job(job, stale_seal_timeout).await,
+                    )
+                },
+            ))
+            .buffer_unordered(concurrency);
 
-            let mut ready = Vec::with_capacity(prepared.len());
             let mut first_error: Option<CompactionError> = None;
-            for outcome in prepared {
-                match outcome {
-                    Ok(p) => ready.push(p),
-                    // A failed prepare already cleared its own seals.
-                    Err(e) => {
-                        first_error.get_or_insert(e);
+            let mut fatal: Option<CompactionError> = None;
+            while let Some(first) = merges.next().await {
+                let mut ready: Vec<(usize, PreparedJob)> = Vec::new();
+                let mut take = |(plan_index, outcome): (usize, Result<_, CompactionError>)| {
+                    match outcome {
+                        Ok(p) => ready.push((plan_index, p)),
+                        // A failed prepare already cleared its own seals.
+                        Err(e) => {
+                            first_error.get_or_insert(e);
+                        }
                     }
+                };
+                take(first);
+                // Whatever else has already finished rides along in the same
+                // CAS. Polling once never waits, so an early commit costs a
+                // sibling nothing and merges that land together still batch.
+                while let Some(Some(done)) = merges.next().now_or_never() {
+                    take(done);
+                }
+                if ready.is_empty() {
+                    continue;
+                }
+                ready.sort_by_key(|(plan_index, _)| *plan_index);
+                let batch: Vec<PreparedJob> =
+                    ready.into_iter().map(|(_, prepared)| prepared).collect();
+
+                let commit = self.commit_compaction_batch(batch).await;
+                self.refresh()
+                    .await
+                    .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+                if let Err(e) = commit {
+                    fatal = Some(e);
+                    break;
                 }
             }
 
-            let commit = self.commit_compaction_batch(ready).await;
-            self.refresh()
-                .await
-                .map_err(|e| CompactionError::Refresh(e.to_string()))?;
-            commit?;
+            if let Some(e) = fatal {
+                // Merges still in flight hold seals this pass will not commit.
+                // Let them finish and clear their own, rather than dropping
+                // the futures and leaving the seals to age out.
+                self.unseal_remaining(merges).await;
+                return Err(e);
+            }
             if let Some(e) = first_error {
                 return Err(e);
             }
         }
         Ok(())
+    }
+
+    /// Drain merges still running after a pass has given up, clearing the
+    /// seals they placed. Their staged outputs are orphans for gc, exactly as
+    /// a job dropped from a batch leaves behind.
+    async fn unseal_remaining(
+        &self,
+        mut merges: impl Stream<Item = (usize, Result<PreparedJob, CompactionError>)> + Unpin,
+    ) {
+        let Some(storage) = self.inner().manifest.load_full().options.storage.clone() else {
+            return;
+        };
+        let wal_store = WalStore::new(storage);
+        while let Some((_, outcome)) = merges.next().await {
+            if let Ok(prepared) = outcome {
+                unseal_batch(&wal_store, vec![prepared]).await;
+            }
+        }
     }
 }
 
@@ -4300,6 +4356,9 @@ mod tests {
     /// the pass did not quietly fall back to committing one job at a time.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_jobs_land_the_same_table_as_a_serial_pass() {
+        // Shape equality is the gate here: a pass that merges several jobs at
+        // once and commits them as they finish must land exactly the table a
+        // serial pass does.
         let (serial_docs, serial_shape, serial_generations) = compact_a_fragmented_table(1).await;
         let (concurrent_docs, concurrent_shape, concurrent_generations) =
             compact_a_fragmented_table(TEST_CONCURRENT_JOBS).await;
@@ -4317,10 +4376,21 @@ mod tests {
             serial_shape, concurrent_shape,
             "a concurrent pass must produce the same superfiles as a serial one"
         );
+        // Commit count is not asserted beyond this bound. A merge commits as
+        // soon as it is ready, taking along whatever else has finished, so how
+        // many CASes a pass spends depends on how its merges interleave. What
+        // must hold either way: every commit lands at least one job, so a pass
+        // never spends more CASes than it planned jobs, and each job produces
+        // one superfile.
         assert!(
-            concurrent_generations < serial_generations,
-            "a wave must commit in one CAS: {concurrent_generations} generations \
-             concurrently vs {serial_generations} serially"
+            concurrent_generations <= concurrent_shape.len() as u64,
+            "{concurrent_generations} commits for {} jobs",
+            concurrent_shape.len()
+        );
+        assert!(
+            concurrent_generations <= serial_generations,
+            "committing early must not cost more CASes than a serial pass: \
+             {concurrent_generations} vs {serial_generations}"
         );
     }
 
