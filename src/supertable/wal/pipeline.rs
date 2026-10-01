@@ -1012,7 +1012,7 @@ const fn sealed_retry_span_ms(retries: u32) -> u64 {
 }
 
 // The two timeouts are ordered, and the order is what keeps a delete alive
-// through a compaction wave longer than a seal lives. A writer waits on a
+// through a compaction merge longer than a seal lives. A writer waits on a
 // fresh seal and steals a stale one, so it needs budget enough to reach the
 // staleness threshold: the moment the budget is the shorter of the two, every
 // delete landing on a sealed input during a long merge fails with
@@ -1233,7 +1233,7 @@ async fn do_tombstone_apply(
         // several merges at once holds all of their inputs sealed together, so
         // a batch whose targets sit entirely inside that set lands nothing
         // until the pass commits. A superfile leaving the manifest is that
-        // pass publishing: it is working through its waves and will reach ours.
+        // pass publishing: it is working through its merges and will reach ours.
         let listed_now = listed_superfile_ids(inner);
         if refunds_sealed_budget(landed_any, &listed_at_last_attempt, &listed_now) {
             sealed_attempts = 0;
@@ -1699,7 +1699,7 @@ mod tests {
     /// The case a concurrent compaction pass creates: the batch lands nothing,
     /// because every superfile holding its targets is sealed by merges running
     /// together. A superfile leaving the listing is that pass publishing, so
-    /// it is working through its waves and the wait was not wasted.
+    /// it is working through its merges and the wait was not wasted.
     #[test]
     fn a_compactor_publishing_refunds_the_sealed_budget() {
         assert!(refunds_sealed_budget(

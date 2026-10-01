@@ -14,6 +14,7 @@
 
 use std::{
     fs,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -53,12 +54,16 @@ const PROC_SELF_STATUS: &str = "/proc/self/status";
 const PROC_MEMINFO: &str = "/proc/meminfo";
 /// Aggregated smaps rollup (Anonymous / Rss / Shmem).
 const PROC_SELF_SMAPS_ROLLUP: &str = "/proc/self/smaps_rollup";
-/// cgroup v2 memory ceiling for this process's cgroup, or the literal `max`.
-const CGROUP_MEMORY_MAX: &str = "/sys/fs/cgroup/memory.max";
+/// Where the cgroup v2 hierarchy is mounted.
+const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
+/// This process's place in that hierarchy, as `0::<relative path>`.
+const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
+/// cgroup v2 memory ceiling, or the literal `max`.
+const CGROUP_MEMORY_MAX: &str = "memory.max";
 /// cgroup v2 current charge: anonymous, page cache and kernel memory.
-const CGROUP_MEMORY_CURRENT: &str = "/sys/fs/cgroup/memory.current";
+const CGROUP_MEMORY_CURRENT: &str = "memory.current";
 /// cgroup v2 breakdown of that charge, read for its reclaimable part.
-const CGROUP_MEMORY_STAT: &str = "/sys/fs/cgroup/memory.stat";
+const CGROUP_MEMORY_STAT: &str = "memory.stat";
 /// `memory.max` for a cgroup with no ceiling of its own.
 const CGROUP_UNLIMITED: &str = "max";
 
@@ -127,7 +132,45 @@ fn memory_budget() -> Option<(u64, u64)> {
 /// Read from the cgroup root as this process sees it, which inside a
 /// container is the container's own cgroup.
 fn cgroup_memory_limit_bytes() -> Option<u64> {
-    parse_cgroup_limit(&fs::read_to_string(CGROUP_MEMORY_MAX).ok()?)
+    parse_cgroup_limit(&fs::read_to_string(cgroup_dir()?.join(CGROUP_MEMORY_MAX)).ok()?)
+}
+
+/// The directory holding this process's cgroup v2 memory files.
+///
+/// Not simply the mount root. That is the process's own cgroup only when it
+/// has a private cgroup namespace, which `docker run -m` gives it; a systemd
+/// unit with `MemoryMax=`, or a Kubernetes runtime sharing the host's cgroup
+/// namespace, leaves the process in a nested cgroup whose root carries no
+/// `memory.max` at all. Reading only the root there finds nothing and falls
+/// back to the host's figures, which is the case this whole path exists to
+/// avoid. So the relative path comes from `/proc/self/cgroup`, with the mount
+/// root as the fallback.
+fn cgroup_dir() -> Option<PathBuf> {
+    let root = Path::new(CGROUP_MOUNT);
+    if let Some(relative) = fs::read_to_string(PROC_SELF_CGROUP)
+        .ok()
+        .as_deref()
+        .and_then(parse_cgroup_path)
+    {
+        let nested = root.join(relative);
+        if nested.join(CGROUP_MEMORY_MAX).exists() {
+            return Some(nested);
+        }
+    }
+    root.join(CGROUP_MEMORY_MAX)
+        .exists()
+        .then(|| root.to_path_buf())
+}
+
+/// This process's cgroup v2 path, relative to the mount root.
+///
+/// `/proc/self/cgroup` lists one controller per line; v2's is `0::<path>`,
+/// with the path absolute-looking but relative to the mount. A process at the
+/// root reads `0::/`, which joins to the root itself.
+fn parse_cgroup_path(raw: &str) -> Option<&str> {
+    raw.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| path.trim().trim_start_matches('/'))
 }
 
 /// `memory.max`, as bytes. `None` for an absent ceiling.
@@ -146,12 +189,13 @@ fn parse_cgroup_limit(raw: &str) -> Option<u64> {
 /// OOM-killing for. So the reclaimable file pages are added back, which is
 /// the same accounting `MemAvailable` does for the host.
 fn cgroup_available_bytes(limit: u64) -> Option<u64> {
-    let current: u64 = fs::read_to_string(CGROUP_MEMORY_CURRENT)
+    let dir = cgroup_dir()?;
+    let current: u64 = fs::read_to_string(dir.join(CGROUP_MEMORY_CURRENT))
         .ok()?
         .trim()
         .parse()
         .ok()?;
-    let stat = fs::read_to_string(CGROUP_MEMORY_STAT).ok()?;
+    let stat = fs::read_to_string(dir.join(CGROUP_MEMORY_STAT)).ok()?;
     let reclaimable = memory_stat_field(&stat, "inactive_file").unwrap_or(0)
         + memory_stat_field(&stat, "slab_reclaimable").unwrap_or(0);
     Some(cgroup_headroom(limit, current, reclaimable))
@@ -479,6 +523,24 @@ mod tests {
         // neither may wrap or exceed the ceiling.
         assert_eq!(cgroup_headroom(4 * GIB, 5 * GIB, 0), 0);
         assert_eq!(cgroup_headroom(4 * GIB, GIB, 9 * GIB), 4 * GIB);
+    }
+
+    /// A nested cgroup's path is read relative to the mount, and the root
+    /// case joins to the mount itself. Without this a process in a nested
+    /// cgroup (a systemd unit, or a container sharing the host's cgroup
+    /// namespace) reads no ceiling at all and silently sizes against the host.
+    #[test]
+    fn a_nested_cgroup_path_is_read_relative_to_the_mount() {
+        assert_eq!(
+            parse_cgroup_path("0::/system.slice/infino.service\n"),
+            Some("system.slice/infino.service")
+        );
+        assert_eq!(parse_cgroup_path("0::/\n"), Some(""));
+        // v1 lists numbered controllers and no `0::` line.
+        assert_eq!(
+            parse_cgroup_path("11:memory:/docker/abc\n4:cpu:/docker/abc\n"),
+            None
+        );
     }
 
     /// `memory.stat` is `key value` in bytes, not `/proc/meminfo`'s kibibytes,

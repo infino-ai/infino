@@ -293,13 +293,13 @@ pub struct CompactionSettings {
     ///
     /// It is also NOT a bound on the merge's resident set, which runs several
     /// times higher once rows are decoded and the output encoded, and it does
-    /// not govern how many merges run at once: a wave widens against the
-    /// host's free memory.
+    /// not govern how many merges run at once: the runner admits them against
+    /// the host's free memory.
     pub max_memory_mb: u64,
     /// How many of a pass's merge jobs may be in flight at once.
     ///
     /// `None` (the default) derives the ceiling from the maintenance pool and
-    /// lets the runner widen each wave only while the host reports free
+    /// lets the runner admit another merge only while the host reports free
     /// memory; `Some(n)` forces exactly `n`, and `Some(1)` is strictly serial.
     ///
     /// Not a thread count: a job is an async task whose CPU work runs on the
@@ -1286,10 +1286,10 @@ impl Config {
     /// concurrent jobs than it has threads is width without throughput.
     ///
     /// This is a CPU ceiling only. The memory bound lives in the compaction
-    /// runner, which widens each wave only while the host reports free memory
+    /// runner, which admits another merge only while the host reports free memory
     /// — an observation, where this layer could only guess from the
     /// `max_memory_mb` cap. The one exception is a host with no procfs:
-    /// nothing downstream can bound a wave there, so the derived width is 1.
+    /// nothing downstream can bound the merges there, so the derived width is 1.
     /// `compaction` is the settings the pass actually runs with, not
     /// necessarily `self.compaction`: the hidden vector index compacts under
     /// its own derived settings and resolves its own width from them.
@@ -1299,19 +1299,19 @@ impl Config {
             .maintenance_threads
             .resolve_or_default(available_parallelism().map(NonZeroUsize::get).unwrap_or(1));
         let resolved = match available_memory_bytes() {
-            // Memory is observable, so the wave runner reads `MemAvailable`
+            // Memory is observable, so the runner reads `MemAvailable`
             // between admissions and stops widening once less than its reserve
             // share is free — a measurement of what merges cost on this
             // corpus, where this layer could only guess from the
             // `max_memory_mb` CAP, which real jobs are routinely a fraction
             // of. The derived value is then just the CPU ceiling.
             Some(_) => maintenance,
-            // No procfs: nothing downstream can bound a wave, so stay serial
+            // No procfs: nothing downstream can bound the merges, so stay serial
             // rather than invent a width.
             None => 1,
         };
         // No upper clamp. An explicit setting is honored as written, and the
-        // real bounds are structural: a wave never exceeds the number of jobs
+        // real bounds are structural: the merges in flight never exceed the jobs
         // the pass actually planned, memory narrows it further wherever the
         // host reports any, and compaction's input opens ride a process-wide
         // semaphore that bounds object-store fan-out on its own.
@@ -2198,7 +2198,7 @@ vector:
 
     /// The derived width is a CPU ceiling, not a memory one.
     ///
-    /// The memory bound belongs to the compaction runner, which widens a wave
+    /// The memory bound belongs to the compaction runner, which admits merges
     /// only while the host reports free memory. Deriving it here could only
     /// divide by `max_memory_mb` — the cap the packer stops at, which real jobs
     /// rarely approach — so the width caps at the pool and nothing else.
@@ -2209,7 +2209,7 @@ vector:
             max_memory_mb: ANY_BUDGET_MB,
             ..CompactionSettings::default()
         });
-        // Never zero, whatever the host — a zero would stall the wave loop.
+        // Never zero, whatever the host — a zero would stall the merge loop.
         assert!(derived >= 1, "width must be at least one");
         // Crucially it does NOT scale with the memory budget: a four-fold
         // budget is the same width, because memory is judged downstream.
@@ -2225,7 +2225,7 @@ vector:
 
     /// An explicit setting is honored as written, in both directions.
     ///
-    /// Deliberately unclamped: a wave never exceeds the number of jobs the
+    /// Deliberately unclamped: the merges in flight never exceed the jobs the
     /// pass planned, memory narrows it wherever the host reports any, and
     /// input opens ride a process-wide semaphore. A ceiling here would only
     /// second-guess an operator who asked for something specific.

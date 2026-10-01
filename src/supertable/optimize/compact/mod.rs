@@ -19,7 +19,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
@@ -783,6 +783,7 @@ impl Supertable {
         Ok(PreparedJob {
             input_ids: job.inputs,
             compaction_id,
+            sealed_at,
             sealed,
             new_entries,
             pending_storage_writes,
@@ -804,8 +805,8 @@ impl Supertable {
     /// A single-job batch is exactly the historical per-job commit, which is
     /// what keeps a serial pass byte-for-byte what it was.
     ///
-    /// `jobs` is what the wave handed in and `committed` what survived, so a
-    /// job whose inputs another compactor took shows as a gap between them.
+    /// `jobs` is what this commit was handed and `committed` what survived, so
+    /// a job whose inputs another compactor took shows as a gap between them.
     #[cfg_attr(
         feature = "detailed-tracing",
         tracing::instrument(
@@ -877,24 +878,35 @@ impl Supertable {
                 };
             }
 
-            // Re-stamp every seal this batch holds, conditioned on the etag
-            // `seal` returned. A seal expires after `stale_seal_timeout`, and
-            // a wave outlives that: once it does, a writer treats the seal as
-            // abandoned, lands a tombstone on an input and changes its etag.
-            // Committing that input away would drop the bit on the floor,
-            // because the merged superfile was built from the bitmap the merge
-            // read. A job whose re-stamp loses is therefore stale and leaves
-            // the batch; the next pass merges those inputs again, this time
-            // seeing the tombstone. A won re-stamp also refreshes `sealed_at`,
-            // so the seal cannot go stale between here and the manifest CAS.
+            // Re-stamp the seals this batch holds, conditioned on the etag
+            // `seal` returned. A seal expires after the staleness threshold,
+            // and a long merge outlives that: once it does, a writer treats
+            // the seal as abandoned, lands a tombstone on an input and changes
+            // its etag. Committing that input away would drop the bit on the
+            // floor, because the merged superfile was built from the bitmap
+            // the merge read. A job whose re-stamp loses is therefore stale
+            // and leaves the batch; the next pass merges those inputs again,
+            // this time seeing the tombstone. A won re-stamp also refreshes
+            // `sealed_at`, so the seal cannot go stale between here and the
+            // manifest CAS.
+            //
+            // Seals too young to have been stolen are left alone, which is
+            // every merge that finished well inside the window: the round
+            // trip could only confirm what the clock already proves, and this
+            // runs on the critical path of every commit, serial ones included.
+            //
             // `resolved` was built by walking `batch` in order and skipping
             // the vanished, and the removals below preserve order, so
             // `resolved[k]` is `batch[k]`'s. Its stored index predates the
             // vanished removal and must not be used to address either.
             debug_assert_eq!(resolved.len(), batch.len());
             let mut stale: Vec<usize> = Vec::new();
+            let mut restamp_failure: Option<CompactionError> = None;
             let resealed_at = Utc::now();
             for (i, prepared) in batch.iter_mut().enumerate() {
+                if !seal_may_have_been_stolen(prepared.sealed_at, resealed_at) {
+                    continue;
+                }
                 let compaction_id = prepared.compaction_id;
                 for input in prepared.sealed.iter_mut() {
                     match tombstones_admin::refresh_seal(
@@ -908,25 +920,48 @@ impl Supertable {
                     .await
                     {
                         Ok(etag) => input.etag = etag,
-                        Err(e) => {
+                        // Someone else holds this sidecar now, and may have
+                        // landed a tombstone on it. Only this job is stale.
+                        Err(TombstonesAdminError::CasLost { .. }) => {
                             warn!(
                                 superfile_id = %input.superfile_id,
-                                error = %e,
                                 "compact: input sidecar changed under our seal, dropping the job"
                             );
                             stale.push(i);
                             break;
                         }
+                        // Anything else is storage failing, not a writer
+                        // winning. It proves nothing about who holds the
+                        // sidecar, so the batch cannot be committed on the
+                        // strength of it.
+                        Err(e) => {
+                            restamp_failure.get_or_insert(CompactionError::Seal(e.to_string()));
+                            break;
+                        }
                     }
                 }
+                if restamp_failure.is_some() {
+                    break;
+                }
             }
-            // Back-to-front so the surviving indices stay valid. A stale job's
-            // seals are already gone from under it, so there is nothing to
-            // clear; its merged bytes are orphans for gc, like a vanished
-            // job's.
+            if let Some(e) = restamp_failure {
+                unseal_batch(&wal_store, batch).await;
+                return Err(e);
+            }
+            // Back-to-front so the surviving indices stay valid. A dropped
+            // job's seals must be cleared: only the input that lost the CAS
+            // has left our hands, while the ones re-stamped before it carry a
+            // FRESH window under a compaction that will never commit, and the
+            // ones after it still carry prepare's. Left behind, they block
+            // every delete resolving there and fail the next pass outright,
+            // since `seal` answers `AlreadySealed` without retrying.
+            let mut dropped: Vec<PreparedJob> = Vec::with_capacity(stale.len());
             for i in stale.into_iter().rev() {
-                batch.remove(i);
+                dropped.push(batch.remove(i));
                 resolved.remove(i);
+            }
+            if !dropped.is_empty() {
+                unseal_batch(&wal_store, dropped).await;
             }
             if batch.is_empty() {
                 return match deferred_error {
@@ -1077,12 +1112,13 @@ impl Supertable {
     }
 
     /// Run a pass's planned jobs, up to `concurrency` merges in flight, and
-    /// commit each wave in one manifest CAS.
+    /// commit each as it finishes.
     ///
-    /// The waves are chunks of the plan in order, so a serial pass (the
+    /// Merges are admitted one at a time against the host and committed when
+    /// ready, taking along whatever else has finished, so a serial pass (the
     /// default `concurrency` of 1) is prepare-commit-refresh per job, exactly
-    /// as before. A merge that fails does not cost its wave-mates their work:
-    /// the successful merges commit and the first error surfaces after.
+    /// as before. A merge that fails does not cost the others their work: the
+    /// successful merges commit and the first error surfaces after.
     async fn run_compaction_jobs(
         &self,
         jobs: Vec<CompactionJob>,
@@ -1237,8 +1273,8 @@ impl Supertable {
 /// visible in its input byte count, and all of which shows up in
 /// `MemAvailable`. So the runner admits one merge, lets the allocation land,
 /// looks at what the host has left, and admits another only if there is still
-/// room. A corpus twice as expensive per byte gets a narrower wave, with
-/// nothing to re-tune.
+/// room. A corpus twice as expensive per byte gets fewer merges in flight,
+/// with nothing to re-tune.
 const MERGE_MEMORY_RESERVE_PERCENT: u64 = 40;
 
 /// How long to let an admitted merge's allocation materialize before reading
@@ -1272,6 +1308,30 @@ fn has_room_for_another_merge(available: Option<u64>, total: Option<u64>) -> boo
         return true;
     };
     total > 0 && available.saturating_mul(100) / total >= MERGE_MEMORY_RESERVE_PERCENT
+}
+
+/// How much of the staleness window a commit keeps in hand. A seal younger
+/// than the window minus this cannot have been stolen yet and cannot expire
+/// before the CAS lands, so re-stamping it would be a round trip that only
+/// confirms what the clock already proves. It also absorbs modest clock skew
+/// between this process and whichever one might steal a seal, since the two
+/// judge staleness against their own clocks.
+const SEAL_RESTAMP_MARGIN: Duration = Duration::from_secs(30);
+
+/// Whether a seal placed at `sealed_at` could have been taken over by now.
+///
+/// Measured against the threshold a WRITER uses, which is the shipped default
+/// rather than this table's configured one: that is the clock deciding whether
+/// a delete was allowed to steal, and it is the steal this guards against.
+fn seal_may_have_been_stolen(sealed_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    let steal_after = Duration::from_millis(tombstones_admin::DEFAULT_STALE_SEAL_TIMEOUT_MS)
+        .saturating_sub(SEAL_RESTAMP_MARGIN);
+    match (now - sealed_at).to_std() {
+        Ok(age) => age >= steal_after,
+        // A seal stamped in the future is a clock that moved; re-stamp rather
+        // than trust the arithmetic.
+        Err(_) => true,
+    }
 }
 
 /// Whether another merge may start right now.
@@ -1321,6 +1381,9 @@ pub(crate) struct PreparedJob {
     input_ids: Vec<Uuid>,
     /// Owns the seals on those inputs; the commit re-stamps them under it.
     compaction_id: Uuid,
+    /// When those seals were placed, which decides whether the commit has to
+    /// re-stamp them at all.
+    sealed_at: DateTime<Utc>,
     /// Seals placed on those inputs, cleared if the job never commits.
     sealed: Vec<SealedInput>,
     /// The merged superfile's entry. Empty on a pure reclaim, where every
@@ -4337,8 +4400,8 @@ mod tests {
 
     // ---- concurrent jobs ------------------------------------------------
 
-    /// Jobs per wave when a test exercises the concurrent path. Four is enough
-    /// that a wave holds several merges without needing a large fixture.
+    /// Merges in flight when a test exercises the concurrent path. Four is
+    /// enough to hold several at once without needing a large fixture.
     const TEST_CONCURRENT_JOBS: usize = 4;
 
     /// Build a table whose superfiles the selector packs into several jobs,
@@ -4350,8 +4413,8 @@ mod tests {
         let st = make_st(&dir);
 
         // Each superfile must be big enough that a handful overflow the 1 MiB
-        // target, so the selector emits more than one job and the waves are
-        // exercised rather than degenerating to a single batch.
+        // target, so the selector emits more than one job and the concurrent
+        // path is exercised rather than degenerating to a single merge.
         let commit_bulk = |titles: &[&str]| {
             let mut w = st.writer().expect("writer");
             for _ in 0..4096 {
@@ -4360,7 +4423,7 @@ mod tests {
             w.commit().expect("commit");
         };
         // Thirty-two superfiles: the packer fills several 1 MiB jobs from them,
-        // which is what makes the waves meaningful.
+        // which is what makes running them concurrently meaningful.
         for round in 0..2 {
             for term in [
                 "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
@@ -4437,13 +4500,13 @@ mod tests {
         );
     }
 
-    /// One job failing must not cost its wave-mates their merges. The failure
+    /// One job failing must not cost the others their merges. The failure
     /// here is an input that vanished between planning and preparing, which
     /// `prepare_compaction_job` reports as `SuperfileNotFound`.
     ///
     /// The surviving job still commits, and the error still surfaces.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_failed_job_still_lets_its_wave_mates_commit() {
+    async fn a_failed_job_still_lets_the_others_commit() {
         let dir = TempDir::new().expect("tempdir");
         let st = make_st(&dir);
         for term in ["alpha", "bravo", "charlie", "delta"] {
@@ -4459,7 +4522,7 @@ mod tests {
             .collect();
         assert_eq!(live.len(), 4, "fixture");
 
-        // Two jobs in one wave: the first names a superfile that is not in the
+        // Two jobs in flight: the first names a superfile that is not in the
         // manifest, the second is real.
         let doomed = CompactionJob {
             partition_key: Vec::new(),
@@ -4501,23 +4564,22 @@ mod tests {
         );
     }
 
-    /// A tombstone that lands while a wave's seal has gone stale survives the
-    /// wave's commit.
+    /// A tombstone that lands while a merge's seal has gone stale survives the
+    /// commit that removes its superfile.
     ///
     /// A seal expires after `DEFAULT_STALE_SEAL_TIMEOUT_MS`, and a writer that
     /// finds one expired treats its owner as dead, steals it and lands its bit
-    /// anyway. A wave holds every input sealed from prepare until the batch
-    /// commit, which on a large table runs longer than that. Committing such
+    /// anyway. A merge holds its inputs sealed from prepare until its commit, which on a large table runs longer than that. Committing such
     /// an input away would drop the bit, because the merged superfile was
     /// built from the bitmap the merge read — so the commit re-stamps each
     /// seal against the etag it holds, and a job that lost one leaves the
     /// batch. The delete stands and the merge is redone later.
     ///
-    /// The wave's other job is untouched and must still commit: one stolen
-    /// seal costs its own job, not the pass.
+    /// The other job is untouched and must still commit: one stolen seal costs
+    /// its own job, not the pass.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_delete_that_steals_a_stale_seal_survives_the_waves_commit() {
-        /// How far past the stale threshold the wave's seals are aged.
+    async fn a_delete_that_steals_a_stale_seal_survives_the_commit() {
+        /// How far past the stale threshold the seals are aged.
         const AGED_PAST_STALE_MS: i64 =
             tombstones_admin::DEFAULT_STALE_SEAL_TIMEOUT_MS as i64 + 60_000;
 
@@ -4537,10 +4599,10 @@ mod tests {
             .collect();
         assert_eq!(live.len(), 4, "fixture");
 
-        // Stage a wave: every input sealed, every merge done, nothing committed.
-        let mut wave = Vec::new();
+        // Stage two jobs: every input sealed, every merge done, nothing committed.
+        let mut prepared_jobs = Vec::new();
         for pair in [[live[0], live[1]], [live[2], live[3]]] {
-            wave.push(
+            prepared_jobs.push(
                 st.prepare_compaction_job(
                     CompactionJob {
                         partition_key: Vec::new(),
@@ -4554,12 +4616,12 @@ mod tests {
             );
         }
 
-        // Age every seal past the stale threshold. The wave is still running —
-        // only its seals now look abandoned to a writer, which is what a wave
-        // longer than the timeout looks like from the delete path.
+        // Age every seal past the stale threshold. The merges are still running —
+        // only their seals now look abandoned to a writer, which is what a
+        // merge longer than the timeout looks like from the delete path.
         //
         // Aging means rewriting the sidecar, which moves its etag, so the
-        // wave's held etags are re-synced below. Real elapsed time moves
+        // held etags are re-synced below. Real elapsed time moves
         // `sealed_at` past the threshold without touching the object, and it
         // is that state — stale seal, etag still the compactor's — the test
         // has to reproduce. Skipping the re-sync would make every input look
@@ -4587,7 +4649,13 @@ mod tests {
                 .expect("age the seal");
         }
 
-        for prepared in wave.iter_mut() {
+        for prepared in prepared_jobs.iter_mut() {
+            // Both halves of the clock move together: `prepare` writes one
+            // instant into the sidecar and into the job it returns, so a merge
+            // old enough for a writer to steal from is one whose own record of
+            // when it sealed is equally old. Aging only the sidecar would
+            // describe a state the code cannot reach.
+            prepared.sealed_at = aged;
             for input in prepared.sealed.iter_mut() {
                 let (_, etag) = wal_store
                     .get_tombstones(input.superfile_id)
@@ -4599,7 +4667,7 @@ mod tests {
         }
 
         // The delete finds a stale seal, steals it, and lands its bit on an
-        // input the wave is about to remove.
+        // input the commit is about to remove.
         let deleting = st.clone();
         let title = doomed.to_string();
         let stats = task::spawn_blocking(move || deleting.delete(col("title").eq(lit(title))))
@@ -4612,10 +4680,10 @@ mod tests {
             "the delete must steal the stale seal and land its bit"
         );
 
-        // The wave commits, removing the inputs it merged before that landed.
-        st.commit_compaction_batch(wave)
+        // The batch commits, removing the inputs it merged before that landed.
+        st.commit_compaction_batch(prepared_jobs)
             .await
-            .expect("the wave commits");
+            .expect("the batch commits");
 
         // The row must still be gone. A second delete resolves against live
         // rows, so a match here means the deleted row came back.
@@ -4628,11 +4696,11 @@ mod tests {
         assert_eq!(
             again.matched(),
             0,
-            "the deleted row must not survive the wave's commit"
+            "the deleted row must not survive the commit"
         );
 
         // The job holding the stolen seal left the batch, so its inputs are
-        // still listed; the wave's other job committed as normal.
+        // still listed; the other job committed as normal.
         let after: Vec<Uuid> = st
             .reader()
             .expect("reader")
@@ -4649,6 +4717,110 @@ mod tests {
             !after.contains(&live[0]) && !after.contains(&live[1]),
             "the untouched job must still have merged"
         );
+    }
+
+    /// A job dropped for a stolen seal must leave none of its other inputs
+    /// sealed.
+    ///
+    /// Only the input that lost the CAS has left our hands. The ones
+    /// re-stamped before it carry a FRESH window under a compaction that will
+    /// never commit, and the ones after it still carry prepare's. Left
+    /// behind, they block every delete resolving there and fail the next pass
+    /// outright, because `seal` answers `AlreadySealed` without retrying.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_dropped_for_a_stolen_seal_leaves_nothing_sealed() {
+        const AGED_PAST_STALE_MS: i64 =
+            tombstones_admin::DEFAULT_STALE_SEAL_TIMEOUT_MS as i64 + 60_000;
+
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        // Four inputs in one job, so the stolen one sits in the middle: one
+        // input is re-stamped before it, two are never reached.
+        let doomed = "bravo first";
+        for term in ["alpha", "bravo", "charlie", "delta"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let live: Vec<Uuid> = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert_eq!(live.len(), 4, "fixture");
+
+        let mut prepared = st
+            .prepare_compaction_job(
+                CompactionJob {
+                    partition_key: Vec::new(),
+                    inputs: live.clone(),
+                    estimated_output_bytes: 0,
+                },
+                DEFAULT_STALE_SEAL_TIMEOUT,
+            )
+            .await
+            .expect("prepare");
+
+        let storage = st
+            .inner()
+            .manifest
+            .load_full()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed table");
+        let wal_store = WalStore::new(storage);
+        let aged = Utc::now() - chrono::Duration::milliseconds(AGED_PAST_STALE_MS);
+        for id in &live {
+            let (mut sidecar, etag) = wal_store
+                .get_tombstones(*id)
+                .await
+                .expect("get sidecar")
+                .expect("sealed by prepare");
+            sidecar.seal.as_mut().expect("sealed").sealed_at = aged;
+            wal_store
+                .put_tombstones(*id, Some(&etag), &sidecar)
+                .await
+                .expect("age the seal");
+        }
+        // The commit has to believe its seals are old enough to be at risk,
+        // and re-sync the etags the aging moved.
+        prepared.sealed_at = aged;
+        for input in prepared.sealed.iter_mut() {
+            let (_, etag) = wal_store
+                .get_tombstones(input.superfile_id)
+                .await
+                .expect("get sidecar")
+                .expect("still sealed");
+            input.etag = etag;
+        }
+
+        // A delete steals one input's seal, which costs the job its commit.
+        let deleting = st.clone();
+        let title = doomed.to_string();
+        task::spawn_blocking(move || deleting.delete(col("title").eq(lit(title))))
+            .await
+            .expect("delete task")
+            .expect("delete");
+
+        st.commit_compaction_batch(vec![prepared])
+            .await
+            .expect("a batch with nothing left to commit is not an error");
+
+        // Every input must now be unsealed: a seal left behind here is one no
+        // compaction will ever clear.
+        for id in &live {
+            let sealed = wal_store
+                .get_tombstones(*id)
+                .await
+                .expect("get sidecar")
+                .and_then(|(sidecar, _)| sidecar.seal);
+            assert!(
+                sealed.is_none(),
+                "superfile {id} is still sealed after its job was dropped"
+            );
+        }
     }
 
     /// A compactor whose tombstone view predates a committed delete still
@@ -4729,13 +4901,13 @@ mod tests {
         );
     }
 
-    /// The refund is what keeps a delete alive across a pass of several waves.
+    /// The refund is what keeps a delete alive across a pass of several merges.
     ///
-    /// The delete's targets sit in the LAST wave's inputs, so nothing it does
-    /// lands until that wave commits. Each earlier commit removes superfiles
+    /// The delete's targets sit in the LAST merge's inputs, so nothing it does
+    /// lands until that merge commits. Each earlier commit removes superfiles
     /// from the manifest, which is the compactor's progress, and that is what
     /// refunds the budget. Lowered to three retries, an unrefunded delete
-    /// exhausts after roughly 700 ms of backoff, well before the last wave
+    /// exhausts after roughly 700 ms of backoff, well before the last merge
     /// publishes at ~1.2 s.
     ///
     /// Every superfile in the table is sealed before the delete starts, so
@@ -4747,10 +4919,10 @@ mod tests {
     /// any commit at all is gated separately, by the pipeline's
     /// `an_append_does_not_refund_the_sealed_budget`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_delete_survives_a_pass_whose_waves_commit_one_by_one() {
+    async fn a_delete_survives_a_pass_whose_merges_commit_one_by_one() {
         /// Small enough that an unrefunded delete exhausts inside the test.
         const SEALED_RETRY_BUDGET: u32 = 3;
-        /// Gap between wave commits, comfortably under the ~700 ms an
+        /// Gap between commits, comfortably under the ~700 ms an
         /// unrefunded delete survives and over nothing else.
         const WAVE_GAP: Duration = Duration::from_millis(300);
 
@@ -4783,14 +4955,14 @@ mod tests {
 
         // Four jobs prepared up front: every superfile in the table is sealed
         // and nothing has committed, so the delete has nowhere unsealed to go.
-        let mut waves = Vec::new();
+        let mut prepared_jobs = Vec::new();
         for pair in [
             [live[0], live[1]],
             [live[2], live[3]],
             [live[4], live[5]],
             [live[6], live[7]],
         ] {
-            waves.push(
+            prepared_jobs.push(
                 st.prepare_compaction_job(
                     CompactionJob {
                         partition_key: Vec::new(),
@@ -4812,25 +4984,25 @@ mod tests {
                 .map(|s| (s.matched(), s.n_tombstoned()))
         });
 
-        // Publish the waves one at a time. Only the last frees the target.
-        for prepared in waves {
+        // Publish the merges one at a time. Only the last frees the target.
+        for prepared in prepared_jobs {
             tokio::time::sleep(WAVE_GAP).await;
             st.commit_compaction_batch(vec![prepared])
                 .await
-                .expect("the wave commits");
+                .expect("the batch commits");
         }
 
         let (matched, tombstoned) = delete
             .await
             .expect("delete task")
-            .expect("earlier waves committing must refund the budget");
+            .expect("earlier merges committing must refund the budget");
         assert_eq!(matched, 1, "the predicate must have resolved its row");
         // A delete that resolved its row and then failed to tombstone it
         // anywhere has silently lost the deletion, so the call returning
         // without an error is not enough.
         assert_eq!(
             tombstoned, 1,
-            "the tombstone must land once the last wave publishes"
+            "the tombstone must land once the last merge publishes"
         );
         assert_eq!(before_docs, st.reader().expect("reader").n_docs_total());
     }
@@ -4838,7 +5010,7 @@ mod tests {
     /// A batch that loses the manifest CAS retries as a batch: the merges are
     /// already done and their outputs already staged, so the second attempt
     /// re-resolves the inputs against the refreshed manifest and commits the
-    /// same wave. Nothing is re-merged and nothing is lost.
+    /// same batch. Nothing is re-merged and nothing is lost.
     ///
     /// The race is a real concurrent writer rather than an injected fault,
     /// because that is the contention the retry loop is built for: a writer
@@ -4861,7 +5033,7 @@ mod tests {
             .collect();
         assert_eq!(live.len(), 4, "fixture");
 
-        // Two jobs in one wave, racing a writer commit. The wave may lose its
+        // Two jobs in one batch, racing a writer commit. The batch may lose its
         // pointer CAS to the writer and retry, or win outright; either way
         // both the merge and the append must land.
         let racing = st.clone();
@@ -4982,7 +5154,7 @@ mod tests {
     }
 
     /// A job whose inputs another compactor merged away between planning and
-    /// commit is dropped from its wave, not treated as a failure: there is
+    /// commit is dropped from the batch, not treated as a failure: there is
     /// nothing left for it to remove, and its output is an orphan for gc.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_job_whose_inputs_vanished_before_commit_is_dropped_not_failed() {
@@ -5090,8 +5262,9 @@ mod tests {
         // The selector packs the 30 small superfiles into several target-sized
         // jobs rather than one oversized merge, and each job writes one output
         // superfile. Count the OUTPUTS, not manifest generations: a pass runs
-        // several merges at once and commits each wave in a single CAS, so
-        // generations count waves, not jobs. The exact job count tracks
+        // several merges at once and commits whichever have finished in a
+        // single CAS, so generations count commits, not jobs. The exact job
+        // count tracks
         // per-superfile byte size, which is format-dependent, so assert the
         // invariant — more than one — not a pinned number.
         let commits = st.manifest_id() - manifest_id_before_first_compact;
