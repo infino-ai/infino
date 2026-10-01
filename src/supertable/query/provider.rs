@@ -51,7 +51,7 @@
 
 use std::{
     cmp,
-    collections::HashSet,
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::Range,
     sync::{Arc, atomic},
@@ -107,7 +107,7 @@ use crate::{
     superfile::{
         SuperfileReader,
         fts::{
-            reader::{BoolMode, MatchWork},
+            reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
         },
     },
@@ -116,7 +116,7 @@ use crate::{
         manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
-            candidate::{CandidatePlan, ExactContains, exact_contains, like_prune_leaves},
+            candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
             df_object_store::SuperfileObjectStore,
             exec::{
                 common::{BoundPredicate, PushedPredicate, take_rows},
@@ -441,16 +441,16 @@ impl SupertableProvider {
     }
 
     /// `filter` as a conjunct this provider answers exactly from the term
-    /// dictionary (see [`exact_contains`]), or `None` for one the index
-    /// only bounds and DataFusion verifies. The one classification
+    /// dictionary (see [`ExactFilter`]), or `None` for one the index only
+    /// bounds and DataFusion verifies. The one classification
     /// [`supports_filters_pushdown`](TableProvider::supports_filters_pushdown),
     /// [`scan`](TableProvider::scan) and the covered-aggregate rewrite
     /// share, so what DataFusion is told is exact is what the scan answers
     /// exactly. It reads only the expression and the table options, so a
     /// cached plan stays valid.
-    fn exact_filter(&self, filter: &Expr, fts_cols: &HashSet<&str>) -> Option<ExactContains> {
+    fn exact_filter(&self, filter: &Expr, fts_cols: &HashSet<&str>) -> Option<ExactFilter> {
         let opts = &self.manifest.options;
-        exact_contains(filter, fts_cols, &|col| opts.try_fts_tokenizer_for(col))
+        exact_filter(filter, fts_cols, &|col| opts.try_fts_tokenizer_for(col))
     }
 
     /// Whether this provider answers any of `filters` exactly
@@ -466,10 +466,12 @@ impl SupertableProvider {
 
     /// The rows of one superfile its exact conjuncts hold for, within
     /// `bound` (the other conjuncts' candidate rows, when the index bounded
-    /// them). Each conjunct's rows come from the dictionary
-    /// ([`SuperfileReader::contains_rows`]); the rows some conjunct leaves
-    /// doubtful are checked against their stored text, tombstoned ones
-    /// left out first since the scan skips them anyway.
+    /// them). Every leaf's rows come from the dictionary
+    /// ([`SuperfileReader::contains_rows`]), each column walked once for
+    /// all its needles; the leaves combine through the conjuncts' `AND` /
+    /// `OR` tree ([`ExactFilter::rows`]), and the rows that leaves doubtful
+    /// are checked against their stored text, tombstoned ones left out
+    /// first since the scan skips them anyway.
     async fn exact_rows(
         &self,
         prepared: &PreparedScanFile,
@@ -480,38 +482,39 @@ impl SupertableProvider {
     ) -> DfResult<(RoaringBitmap, MatchWork)> {
         let pool: &ThreadPool = &self.manifest.options.reader_pool;
         let mut work = MatchWork::default();
-        // Rows every conjunct proves, and rows every conjunct admits (as
-        // proven or doubtful); the second less the first need the text.
-        let mut proven = bound.cloned();
-        let mut possible = bound.cloned();
-        for exact in &check.conjuncts {
-            let (rows, conjunct_work) = prepared
+        // Each column's distinct needles, in first-seen order.
+        let mut by_column: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for leaf in check.filter.leaves() {
+            let needles = by_column.entry(leaf.column.as_str()).or_default();
+            if !needles.contains(&leaf.needle.as_str()) {
+                needles.push(&leaf.needle);
+            }
+        }
+        let mut leaf_rows: HashMap<(&str, &str), ContainsRows> = HashMap::new();
+        for (column, needles) in by_column {
+            let (rows, column_work) = prepared
                 .reader
-                .contains_rows(&exact.column, &exact.needle, Some(pool))
+                .contains_rows(column, &needles, Some(pool))
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            work.merge(conjunct_work);
-            let admitted = &rows.proven | &rows.doubtful;
-            proven = Some(match proven {
-                Some(acc) => acc & rows.proven,
-                None => rows.proven,
-            });
-            possible = Some(match possible {
-                Some(acc) => acc & admitted,
-                None => admitted,
-            });
+            work.merge(column_work);
+            leaf_rows.extend(needles.into_iter().map(|needle| (column, needle)).zip(rows));
         }
-        let proven = proven.unwrap_or_default();
-        let mut doubtful = possible.unwrap_or_default();
-        doubtful -= &proven;
-        doubtful -= tombstones;
+        let mut rows = check
+            .filter
+            .rows(&|leaf| leaf_rows[&(leaf.column.as_str(), leaf.needle.as_str())].clone());
+        if let Some(bound) = bound {
+            rows.proven &= bound;
+            rows.doubtful &= bound;
+        }
+        rows.doubtful -= tombstones;
         let verified = check
-            .rows_holding(&prepared.reader, &doubtful, pool, batch_size)
+            .rows_holding(&prepared.reader, &rows.doubtful, pool, batch_size)
             .await?;
         if let Some(stats) = self.scan_store.op_stats() {
-            stats.add_rows_materialized(doubtful.len());
+            stats.add_rows_materialized(rows.doubtful.len());
         }
-        Ok((proven | verified, work))
+        Ok((rows.proven | verified, work))
     }
 
     /// Open and prepare one superfile once for this pinned manifest.
@@ -814,8 +817,9 @@ fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
 /// A scan's exact conjuncts ([`SupertableProvider::exact_filter`]),
 /// compiled once per scan together with the check their doubtful rows get.
 struct ExactCheck {
-    /// Each conjunct as the dictionary answers it.
-    conjuncts: Vec<ExactContains>,
+    /// The conjunction as the dictionary answers it: an `AND` of the
+    /// conjuncts.
+    filter: ExactFilter,
     /// The conjunction, bound to the columns it reads.
     predicate: BoundPredicate,
     /// Those columns' names, in the bound schema's order.
@@ -827,7 +831,7 @@ impl ExactCheck {
     /// pair up: each filter is the expression its conjunct came from.
     fn compile(
         filters: &[Expr],
-        conjuncts: Vec<ExactContains>,
+        conjuncts: Vec<ExactFilter>,
         schema: &SchemaRef,
     ) -> DfResult<Option<Self>> {
         if conjuncts.is_empty() {
@@ -847,7 +851,7 @@ impl ExactCheck {
             .map(|field| field.name().clone())
             .collect();
         Ok(Some(Self {
-            conjuncts,
+            filter: ExactFilter::And(conjuncts),
             predicate,
             columns,
         }))
@@ -1037,7 +1041,7 @@ impl TableProvider for SupertableProvider {
         // ones the index only bounds.
         let fts_cols = self.fts_cols_set();
         let mut exact_filters: Vec<Expr> = Vec::new();
-        let mut exact_conjuncts: Vec<ExactContains> = Vec::new();
+        let mut exact_conjuncts: Vec<ExactFilter> = Vec::new();
         let mut bounded_filters: Vec<Expr> = Vec::new();
         for filter in filters {
             match self.exact_filter(filter, &fts_cols) {

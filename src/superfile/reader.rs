@@ -1404,19 +1404,20 @@ impl SuperfileReader {
             .await?)
     }
 
-    /// The rows of `column` an `ILIKE '%needle%'` matches, decided from the
-    /// dictionary and postings but for the rows it marks doubtful; `needle`
-    /// meets the exact rule. Delegates to [`FtsReader::contains_rows`].
+    /// For each of `needles`, the rows of `column` an `ILIKE '%needle%'`
+    /// matches, decided from the dictionary and postings in one walk but
+    /// for the rows it marks doubtful; every needle meets the exact rule.
+    /// Delegates to [`FtsReader::contains_rows`].
     pub(crate) async fn contains_rows(
         &self,
         column: &str,
-        needle: &str,
+        needles: &[&str],
         pool: Option<&ThreadPool>,
-    ) -> Result<(ContainsRows, MatchWork), ReadError> {
+    ) -> Result<(Vec<ContainsRows>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.contains_rows(column, needle, pool).await?)
+        Ok(fts.contains_rows(column, needles, pool).await?)
     }
 
     /// Unranked token-match **count**: the number of `local_doc_id`s

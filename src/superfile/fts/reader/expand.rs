@@ -478,20 +478,20 @@ impl FtsReader {
         .map_err(|_| FtsError::TaskDropped("prefix expansion"))?
     }
 
-    /// The Parquet rows of `column` an `ILIKE '%needle%'` matches, from
-    /// the dictionary and the postings alone, but for the few rows
-    /// [`ContainsRows::doubtful`] leaves to the caller. The caller has
-    /// established that `needle` is lowercase ASCII and the whole of one
-    /// token under the `standard` analyzer (see the table layer's
-    /// `exact_contains`); under that rule an indexed term's containing
-    /// the needle decides its rows, cut words and the dotted capital I
-    /// aside.
+    /// For each of `needles`, the Parquet rows of `column` an `ILIKE
+    /// '%needle%'` matches, from the dictionary and the postings alone, but
+    /// for the few rows [`ContainsRows::doubtful`] leaves to the caller; one
+    /// result per needle, in order. The caller has established that every
+    /// needle is lowercase ASCII and the whole of one token under the
+    /// `standard` analyzer (see the table layer's `exact_contains`); under
+    /// that rule an indexed term's containing the needle decides its rows,
+    /// cut words and the dotted capital I aside.
     ///
-    /// Every key of the column is visited, with no term cap: an exact
-    /// answer needs every covered term, and there is no scan to fall back
-    /// to. The dictionary fetch and the posting fetches are I/O on this
-    /// runtime; the walk and the unions are CPU on `pool`, like
-    /// [`Self::expand_terms`].
+    /// Every key of the column is visited once for all the needles, with
+    /// no term cap: an exact answer needs every covered term, and there is
+    /// no scan to fall back to. The dictionary fetch and the posting
+    /// fetches are I/O on this runtime; the walk and the unions are CPU on
+    /// `pool`, like [`Self::expand_terms`].
     ///
     /// Errors with `FtsError::UnknownColumn` when `column` is not
     /// FTS-indexed here, and with `FtsError::ExactNeedsStandard` when this
@@ -501,9 +501,9 @@ impl FtsReader {
     pub(crate) async fn contains_rows(
         &self,
         column: &str,
-        needle: &str,
+        needles: &[&str],
         pool: Option<&ThreadPool>,
-    ) -> Result<(ContainsRows, MatchWork), FtsError> {
+    ) -> Result<(Vec<ContainsRows>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         let col = &self.columns[column_id as usize];
         let analyzer = col.tokenizer.name();
@@ -514,11 +514,18 @@ impl FtsReader {
             });
         }
         let mut work = MatchWork::default();
+        if needles.is_empty() {
+            return Ok((Vec::new(), work));
+        }
         let fst_bytes = self.dict_bytes_async().await?;
         work.planned_ranges += 1;
         let layout = self.dict_layout;
         let owned_column = column.to_owned();
-        let patterns = [OwnedPattern::Contains(needle.to_owned())];
+        let patterns: Vec<OwnedPattern> = needles
+            .iter()
+            .map(|needle| OwnedPattern::Contains((*needle).to_owned()))
+            .collect();
+        let walks = vec![Walk::Full; patterns.len()];
         let (walked, walk_ns) = run_on_pool(pool, "contains walk", move || {
             timed_section(|| {
                 walk_dictionary(
@@ -526,7 +533,7 @@ impl FtsReader {
                     layout,
                     &owned_column,
                     &patterns,
-                    &[Walk::Full],
+                    &walks,
                     true,
                     // No cap: an exact answer needs every covered term.
                     usize::MAX,
@@ -538,13 +545,16 @@ impl FtsReader {
         .await
         .map_err(|_| FtsError::TaskDropped("contains walk"))?;
         work.kernel_cpu_ns += walk_ns;
-        let walked = walked?.pop().expect("one collector per pattern");
-        let proven = self.union_rows(col, walked.proven, pool, &mut work).await?;
-        let mut doubtful = self
-            .union_rows(col, walked.doubtful, pool, &mut work)
-            .await?;
-        doubtful -= &proven;
-        Ok((ContainsRows { proven, doubtful }, work))
+        let mut out = Vec::with_capacity(needles.len());
+        for walked in walked? {
+            let proven = self.union_rows(col, walked.proven, pool, &mut work).await?;
+            let mut doubtful = self
+                .union_rows(col, walked.doubtful, pool, &mut work)
+                .await?;
+            doubtful -= &proven;
+            out.push(ContainsRows { proven, doubtful });
+        }
+        Ok((out, work))
     }
 
     /// The Parquet rows the postings behind `values` hold, unioned. Inline
@@ -1100,10 +1110,15 @@ mod tests {
             .collect()
     }
 
-    fn contains(r: &FtsReader, needle: &str) -> (ContainsRows, MatchWork) {
+    fn contains_all(r: &FtsReader, needles: &[&str]) -> (Vec<ContainsRows>, MatchWork) {
         let rt = Runtime::new().expect("runtime");
-        rt.block_on(r.contains_rows("body", needle, None))
+        rt.block_on(r.contains_rows("body", needles, None))
             .expect("contains_rows")
+    }
+
+    fn contains(r: &FtsReader, needle: &str) -> (ContainsRows, MatchWork) {
+        let (mut rows, work) = contains_all(r, &[needle]);
+        (rows.remove(0), work)
     }
 
     /// The kernel's contract, held to Arrow: a proven row matches, a
@@ -1203,16 +1218,45 @@ mod tests {
     }
 
     #[test]
+    fn several_needles_share_one_walk_and_answer_as_each_alone() {
+        // The needles of an `OR` on one column: one dictionary fetch for
+        // all of them, and each needle's rows exactly what it gets on its
+        // own — a repeated needle included.
+        let docs = contains_docs();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let (blob, json) = build_standard_blob(&refs);
+        let r = FtsReader::open(blob, &json).expect("open");
+        let needles = ["bbc", "xi", "taxi", "bbc", "zzq"];
+        let (together, work) = contains_all(&r, &needles);
+        assert_eq!(together.len(), needles.len());
+        // Alone, each needle pays one dictionary range plus its postings'.
+        let mut posting_ranges = 0;
+        for (needle, rows) in needles.iter().zip(&together) {
+            let (alone, alone_work) = contains(&r, needle);
+            assert_eq!(rows, &alone, "{needle}");
+            posting_ranges += alone_work.planned_ranges - 1;
+        }
+        assert_eq!(
+            work.planned_ranges,
+            1 + posting_ranges,
+            "one dictionary range for the whole set"
+        );
+        let (none, work) = contains_all(&r, &[]);
+        assert!(none.is_empty());
+        assert_eq!(work.planned_ranges, 0, "no needle, no fetch");
+    }
+
+    #[test]
     fn contains_rows_refuses_a_column_indexed_by_another_analyzer() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let rt = Runtime::new().expect("runtime");
         let err = rt
-            .block_on(r.contains_rows("body", "rust", None))
+            .block_on(r.contains_rows("body", &["rust"], None))
             .expect_err("ascii_lower column");
         assert!(matches!(err, FtsError::ExactNeedsStandard { .. }), "{err}");
         let err = rt
-            .block_on(r.contains_rows("nope", "rust", None))
+            .block_on(r.contains_rows("nope", &["rust"], None))
             .expect_err("unknown column");
         assert!(matches!(err, FtsError::UnknownColumn(_)));
     }

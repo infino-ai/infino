@@ -755,24 +755,26 @@ mod tests {
         options_id_cat_title_with(ASCII_LOWER_TOKENIZER)
     }
 
-    /// [`options_id_cat_title`] with `title` analyzed by the named analyzer.
-    fn options_id_cat_title_with(analyzer: &str) -> SupertableOptions {
-        // Single-threaded writer pool so each commit produces
-        // exactly one superfile — keeps assertions on per-superfile
-        // counts deterministic.
-        let pool = Arc::new(
+    /// Single-threaded writer pool so each commit produces exactly one
+    /// superfile — keeps assertions on per-superfile counts deterministic.
+    fn one_superfile_per_commit_pool() -> Arc<rayon::ThreadPool> {
+        Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .expect("rayon pool"),
-        );
+        )
+    }
+
+    /// [`options_id_cat_title`] with `title` analyzed by the named analyzer.
+    fn options_id_cat_title_with(analyzer: &str) -> SupertableOptions {
         SupertableOptions::new(
             schema_id_cat_title(),
             vec![FtsConfig::new("title").analyzer(analyzer)],
             vec![],
         )
         .expect("valid options")
-        .with_writer_pool(pool)
+        .with_writer_pool(one_superfile_per_commit_pool())
     }
 
     // Ingest `batch` on a measured supertable, then return a second handle over
@@ -2196,6 +2198,145 @@ mod tests {
             "SELECT title FROM supertable WHERE CAST(title AS VARCHAR) ILIKE '%bbc%'",
         ] {
             assert_same_rows(&rt, &oracle, &st, sql, "a rewritten filter");
+        }
+    }
+
+    /// `AND` / `OR` trees over the exact-`ILIKE` fixture's one column: exact
+    /// when every leaf is, verified when any leaf is not or a `NOT` sits
+    /// above them. The doubtful needles (`%xi%`, `%taxi%`) ride along so a
+    /// tree's doubtful rows are checked against the whole tree.
+    const EXACT_ILIKE_TREES: &[&str] = &[
+        "title ILIKE '%bbc%' OR title ILIKE '%taxi%'",
+        "title ILIKE '%japan%' OR title ILIKE '%xi%' OR title ILIKE '%kelvin%'",
+        "(title ILIKE '%bbc%' AND title ILIKE '%news%') OR title ILIKE '%sun%'",
+        "title ILIKE '%bbc%' AND (title ILIKE '%news%' OR title ILIKE '%funded%')",
+        "title ILIKE '%bbc%' OR title ILIKE '%BBC%'",
+        "(title ILIKE '%xi%' OR title ILIKE '%bbc%') AND category = 'y'",
+        // Verified: a leaf that is not exact, or a negation above.
+        "title ILIKE '%bbc%' OR title ILIKE 'bbc%'",
+        "title ILIKE '%bbc%' OR category = 'y'",
+        "NOT (title ILIKE '%bbc%' OR title ILIKE '%taxi%')",
+    ];
+
+    #[test]
+    fn query_sql_exact_ilike_trees_match_datafusion_on_a_memtable() {
+        let rt = Runtime::new().expect("runtime");
+        for name in [STANDARD_TOKENIZER, ASCII_LOWER_TOKENIZER] {
+            let (st, oracle) = exact_ilike_table(name);
+            for tree in EXACT_ILIKE_TREES {
+                for sql in [
+                    format!("SELECT title FROM supertable WHERE {tree}"),
+                    format!("SELECT COUNT(*) FROM supertable WHERE {tree}"),
+                    format!(
+                        "SELECT category, COUNT(*) FROM supertable WHERE {tree} GROUP BY category"
+                    ),
+                ] {
+                    assert_same_rows(&rt, &oracle, &st, &sql, name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_exact_ilike_tree_is_checked_nowhere_and_a_mixed_one_keeps_its_check() {
+        let (st, _) = exact_ilike_table(STANDARD_TOKENIZER);
+        for tree in &EXACT_ILIKE_TREES[..6] {
+            let plan = explain_physical(&st, &format!("SELECT title FROM supertable WHERE {tree}"));
+            assert!(!plan.contains("ILIKE"), "{tree}: {plan}");
+        }
+        for tree in &EXACT_ILIKE_TREES[6..] {
+            let plan = explain_physical(&st, &format!("SELECT title FROM supertable WHERE {tree}"));
+            assert!(plan.contains("ILIKE"), "{tree}: {plan}");
+        }
+    }
+
+    /// Two nullable full-text columns, for trees across columns and the
+    /// NULLs an exact tree must read as SQL does.
+    fn schema_title_body() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, true),
+            Field::new("body", DataType::LargeUtf8, true),
+        ]))
+    }
+
+    /// Rows of the two-column fixture: the needle in either column, both,
+    /// neither, or NULL beside it, and a dotted capital I beside a plain
+    /// match in the other column.
+    const TITLE_BODY_ROWS: &[(Option<&str>, Option<&str>)] = &[
+        (Some("BBC News"), Some("the evening news")),
+        (Some("BBC News"), None),
+        (None, Some("bbc report")),
+        (None, None),
+        (Some("TAX\u{130} rank"), Some("taxi stand")),
+        (Some("TAX\u{130} rank"), None),
+        (Some("weather"), Some("sunny")),
+        (Some(""), Some("BBC")),
+    ];
+
+    /// Trees across the two columns, exact first, then verified ones.
+    const TITLE_BODY_TREES: &[&str] = &[
+        "title ILIKE '%bbc%' OR body ILIKE '%bbc%'",
+        "title ILIKE '%bbc%' AND body ILIKE '%news%'",
+        "(title ILIKE '%bbc%' AND body ILIKE '%news%') OR body ILIKE '%taxi%'",
+        "title ILIKE '%taxi%' OR body ILIKE '%taxi%'",
+        "title ILIKE '%taxi%' AND body ILIKE '%taxi%'",
+        "NOT (title ILIKE '%bbc%' OR body ILIKE '%bbc%')",
+        "title ILIKE '%bbc%' OR body IS NULL",
+    ];
+
+    /// How many of [`TITLE_BODY_TREES`] are exact.
+    const TITLE_BODY_EXACT_TREES: usize = 5;
+
+    #[test]
+    fn exact_ilike_trees_across_nullable_columns_match_datafusion() {
+        // A NULL holds no term, so every leaf reads it as false; with only
+        // AND and OR above the leaves that is SQL's answer too, which the
+        // oracle confirms row by row. A NOT above them is not exact.
+        let rt = Runtime::new().expect("runtime");
+        let titles: Vec<Option<&str>> = TITLE_BODY_ROWS.iter().map(|(t, _)| *t).collect();
+        let bodies: Vec<Option<&str>> = TITLE_BODY_ROWS.iter().map(|(_, b)| *b).collect();
+        let batch = RecordBatch::try_new(
+            schema_title_body(),
+            vec![
+                Arc::new(LargeStringArray::from(titles)),
+                Arc::new(LargeStringArray::from(bodies)),
+            ],
+        )
+        .expect("batch");
+        let half = batch.num_rows() / 2;
+        let parts = [
+            batch.slice(0, half),
+            batch.slice(half, batch.num_rows() - half),
+        ];
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema_title_body(),
+                vec![
+                    FtsConfig::new("title").analyzer(STANDARD_TOKENIZER),
+                    FtsConfig::new("body").analyzer(STANDARD_TOKENIZER),
+                ],
+                vec![],
+            )
+            .expect("valid options")
+            .with_writer_pool(one_superfile_per_commit_pool()),
+        )
+        .expect("create");
+        for part in &parts {
+            let mut w = st.writer().expect("writer");
+            w.append(part).expect("append");
+            w.commit().expect("commit");
+        }
+        let oracle = memtable_oracle(schema_title_body(), parts.to_vec());
+        for (i, tree) in TITLE_BODY_TREES.iter().enumerate() {
+            for sql in [
+                format!("SELECT title, body FROM supertable WHERE {tree}"),
+                format!("SELECT COUNT(*) FROM supertable WHERE {tree}"),
+            ] {
+                assert_same_rows(&rt, &oracle, &st, &sql, "two columns");
+            }
+            let plan = explain_physical(&st, &format!("SELECT title FROM supertable WHERE {tree}"));
+            let exact = i < TITLE_BODY_EXACT_TREES;
+            assert_eq!(!plan.contains("ILIKE"), exact, "{tree}: {plan}");
         }
     }
 

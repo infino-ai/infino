@@ -57,10 +57,11 @@
 //! ## The exact shape
 //!
 //! One `LIKE` shape skips pass 2 entirely: `col ILIKE '%word%'` on a
-//! `standard` column, where `word` is one whole ASCII token. The
-//! dictionary decides its rows (see [`exact_contains`]), the provider
-//! reports it `Exact`, and its scan selects exactly those rows — every
-//! other shape above stays a verified superset.
+//! `standard` column, where `word` is one whole ASCII token, and any `AND`
+//! / `OR` of such filters. The dictionary decides their rows (see
+//! [`exact_contains`] and [`ExactFilter`]), the provider reports them
+//! `Exact`, and the scan selects exactly those rows — every other shape
+//! above stays a verified superset.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -84,7 +85,8 @@ use crate::{
         ReadError, SuperfileReader,
         fts::{
             reader::{
-                BoolMode, FetchedTermMemo, LONG_S_ASCII, MatchWork, TermPattern, has_fold_partner,
+                BoolMode, ContainsRows, FetchedTermMemo, LONG_S_ASCII, MatchWork, TermPattern,
+                has_fold_partner,
             },
             tokenize::{ASCII_LOWER_TOKENIZER, MAX_TOKEN_CHARS, STANDARD_TOKENIZER, Tokenizer},
         },
@@ -972,6 +974,119 @@ pub(crate) fn exact_contains(
         column: parts.column.to_owned(),
         needle,
     })
+}
+
+/// A `WHERE` conjunct the term dictionary answers exactly: one
+/// [`ExactContains`] leaf, or an `AND` / `OR` of exact conjuncts —
+/// `title ILIKE '%japan%' OR title ILIKE '%japanese%'`, across columns
+/// too.
+///
+/// Why a tree of exact leaves is exact. Each leaf splits a superfile's
+/// rows into proven, doubtful and false; `AND` and `OR` combine those
+/// splits row by row ([`Self::rows`]), and a row the combination leaves
+/// doubtful is checked against the whole conjunct's text. A NULL value
+/// holds no term, so every leaf reads it as false — which is also how SQL
+/// reads the tree: with only `AND` and `OR` above them, an unknown leaf
+/// makes the conjunct true exactly when a false one would, and `WHERE`
+/// keeps only the true rows. `NOT` would break that (`NOT NULL` is
+/// unknown, `NOT false` is true), so a negation is never exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExactFilter {
+    Contains(ExactContains),
+    And(Vec<ExactFilter>),
+    Or(Vec<ExactFilter>),
+}
+
+impl ExactFilter {
+    /// Every leaf of the tree, in order, repeats included.
+    pub(crate) fn leaves(&self) -> Vec<&ExactContains> {
+        fn walk<'a>(filter: &'a ExactFilter, out: &mut Vec<&'a ExactContains>) {
+            match filter {
+                ExactFilter::Contains(leaf) => out.push(leaf),
+                ExactFilter::And(children) | ExactFilter::Or(children) => {
+                    for child in children {
+                        walk(child, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &mut out);
+        out
+    }
+
+    /// The tree's rows in one superfile, from each leaf's
+    /// (`leaf_rows`). A row is proven when the tree holds with every
+    /// doubtful leaf read as false, and admitted when it holds with every
+    /// doubtful leaf read as true; the admitted rows that are not proven
+    /// are the doubtful ones. Under `AND` that is the intersection of the
+    /// children's proven rows, and of their admitted rows; under `OR` the
+    /// union of each.
+    pub(crate) fn rows(&self, leaf_rows: &dyn Fn(&ExactContains) -> ContainsRows) -> ContainsRows {
+        match self {
+            ExactFilter::Contains(leaf) => leaf_rows(leaf),
+            ExactFilter::And(children) => combine_rows(children, leaf_rows, true),
+            ExactFilter::Or(children) => combine_rows(children, leaf_rows, false),
+        }
+    }
+}
+
+/// [`ExactFilter::rows`] of an `AND` (`and`) or an `OR` of `children`.
+fn combine_rows(
+    children: &[ExactFilter],
+    leaf_rows: &dyn Fn(&ExactContains) -> ContainsRows,
+    and: bool,
+) -> ContainsRows {
+    let mut proven: Option<RoaringBitmap> = None;
+    let mut admitted: Option<RoaringBitmap> = None;
+    for child in children {
+        let rows = child.rows(leaf_rows);
+        let child_admitted = &rows.proven | &rows.doubtful;
+        let merge = |acc: Option<RoaringBitmap>, next: RoaringBitmap| match acc {
+            Some(acc) if and => acc & next,
+            Some(acc) => acc | next,
+            None => next,
+        };
+        proven = Some(merge(proven, rows.proven));
+        admitted = Some(merge(admitted, child_admitted));
+    }
+    let proven = proven.unwrap_or_default();
+    let mut doubtful = admitted.unwrap_or_default();
+    doubtful -= &proven;
+    ContainsRows { proven, doubtful }
+}
+
+/// `filter` as an [`ExactFilter`], or `None` when some part of it is not
+/// exact — then the whole conjunct stays a bounded, verified filter.
+pub(crate) fn exact_filter(
+    filter: &Expr,
+    fts_cols: &HashSet<&str>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
+) -> Option<ExactFilter> {
+    match filter {
+        Expr::BinaryExpr(be) if matches!(be.op, Operator::And | Operator::Or) => {
+            let children = [&be.left, &be.right]
+                .into_iter()
+                .map(|side| exact_filter(side, fts_cols, resolve))
+                .collect::<Option<Vec<ExactFilter>>>()?;
+            // Flatten a chain of the same operator into one node, as the
+            // SQL planner nests `a OR b OR c` two at a time.
+            let and = be.op == Operator::And;
+            let mut flat = Vec::with_capacity(children.len());
+            for child in children {
+                match child {
+                    ExactFilter::And(inner) if and => flat.extend(inner),
+                    ExactFilter::Or(inner) if !and => flat.extend(inner),
+                    other => flat.push(other),
+                }
+            }
+            Some(match and {
+                true => ExactFilter::And(flat),
+                false => ExactFilter::Or(flat),
+            })
+        }
+        _ => exact_contains(filter, fts_cols, resolve).map(ExactFilter::Contains),
+    }
 }
 
 /// One maximal run of literal (non-wildcard) pattern characters, and
@@ -2231,5 +2346,83 @@ mod tests {
         for resolve in [ascii_resolver, stemming_resolver, stopping_resolver] {
             assert_eq!(exact_contains(&expr, &fts_cols(), &resolve), None);
         }
+    }
+
+    /// `exact_filter` over `title` and `body`, both standard.
+    fn exact_tree(expr: Expr) -> Option<ExactFilter> {
+        let cols: HashSet<&str> = HashSet::from(["title", "body"]);
+        exact_filter(&expr, &cols, &standard_resolver)
+    }
+
+    fn leaf(column: &str, needle: &str) -> ExactFilter {
+        ExactFilter::Contains(ExactContains {
+            column: column.into(),
+            needle: needle.into(),
+        })
+    }
+
+    #[test]
+    fn exact_filter_takes_and_or_trees_of_exact_leaves_flattening_chains() {
+        let japan = || col("title").ilike(lit("%Japan%"));
+        let japanese = || col("title").ilike(lit("%Japanese%"));
+        let bbc = || col("body").ilike(lit("%bbc%"));
+        assert_eq!(exact_tree(japan()), Some(leaf("title", "japan")));
+        assert_eq!(
+            exact_tree(japan().or(japanese()).or(bbc())),
+            Some(ExactFilter::Or(vec![
+                leaf("title", "japan"),
+                leaf("title", "japanese"),
+                leaf("body", "bbc"),
+            ])),
+            "a chain of ORs is one node, across columns"
+        );
+        assert_eq!(
+            exact_tree(japan().and(bbc()).or(japanese())),
+            Some(ExactFilter::Or(vec![
+                ExactFilter::And(vec![leaf("title", "japan"), leaf("body", "bbc")]),
+                leaf("title", "japanese"),
+            ]))
+        );
+        // One part that is not exact leaves the whole tree verified.
+        for expr in [
+            japan().or(col("category").eq(lit("y"))),
+            japan().or(col("title").ilike(lit("japan%"))),
+            japan().or(col("title").like(lit("%japan%"))),
+            japan().and(japanese().or(col("title").ilike(lit("%_x%")))),
+            Expr::Not(Box::new(japan().or(japanese()))),
+            Expr::Not(Box::new(japan())),
+        ] {
+            assert_eq!(exact_tree(expr.clone()), None, "{expr}");
+        }
+    }
+
+    #[test]
+    fn exact_rows_combine_proven_and_doubtful_through_and_and_or() {
+        let rows = |proven: &[u32], doubtful: &[u32]| ContainsRows {
+            proven: proven.iter().copied().collect(),
+            doubtful: doubtful.iter().copied().collect(),
+        };
+        // a: proves 1 2, doubts 3; b: proves 2 4, doubts 1 5.
+        let leaf_rows = |leaf: &ExactContains| match leaf.needle.as_str() {
+            "a" => rows(&[1, 2], &[3]),
+            "b" => rows(&[2, 4], &[1, 5]),
+            other => panic!("no leaf {other}"),
+        };
+        let (a, b) = (leaf("title", "a"), leaf("title", "b"));
+        // AND: proven in both; admitted in both, less the proven.
+        assert_eq!(
+            ExactFilter::And(vec![a.clone(), b.clone()]).rows(&leaf_rows),
+            rows(&[2], &[1])
+        );
+        // OR: proven in either; admitted in either, less the proven.
+        assert_eq!(
+            ExactFilter::Or(vec![a.clone(), b.clone()]).rows(&leaf_rows),
+            rows(&[1, 2, 4], &[3, 5])
+        );
+        // Nested: (a AND b) OR a.
+        assert_eq!(
+            ExactFilter::Or(vec![ExactFilter::And(vec![a.clone(), b]), a]).rows(&leaf_rows),
+            rows(&[1, 2], &[3])
+        );
     }
 }
