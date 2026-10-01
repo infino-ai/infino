@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 pub mod brute_force_oracle;
+mod count_from_term_index;
 mod covered_agg;
 pub mod fanout_concurrency;
 pub mod fanout_floor;
