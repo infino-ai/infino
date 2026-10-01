@@ -140,6 +140,17 @@ pub struct OpStats {
     /// counting them would break the warm/cold invariance);
     /// [`Self::rows_materialized`] is that leg's invariant signal.
     pub planned_read_ranges: u64,
+    /// Superfiles this query entered — opened for reading — across every
+    /// fan-out. Read against [`Self::superfiles_considered`] it says how much
+    /// of the table the query actually touched.
+    pub superfiles_opened: u64,
+    /// Superfiles the prune was asked about: the table's live set, before the
+    /// manifest summaries and the term index had their say.
+    pub superfiles_considered: u64,
+    /// Superfiles the prune excluded. `considered - pruned` is what the fan-out
+    /// was handed, so a zero here on a selective predicate means routing found
+    /// nothing to skip — which is a different problem from a slow scan.
+    pub superfiles_pruned: u64,
     /// Parquet **data-page** bytes SQL scans requested through the
     /// DataFusion store, independent of whether they were served from
     /// resident bytes or fetched. Footer and page-index reads never
@@ -255,6 +266,9 @@ pub(crate) struct OpStatsCollector {
     /// Superfiles a query entered — opened for reading — across every
     /// fan-out. What bound-ordered opening is meant to shrink.
     superfiles_opened: AtomicU64,
+    /// Superfiles the prune was asked about, and how many it excluded.
+    superfiles_considered: AtomicU64,
+    superfiles_pruned: AtomicU64,
     sql_page_bytes: AtomicU64,
     rows_materialized: AtomicU64,
     kernel_cpu_ns: AtomicU64,
@@ -291,6 +305,16 @@ impl OpStatsCollector {
     /// Count superfiles a fan-out opened for this operation.
     pub(crate) fn add_superfiles_opened(&self, n: u64) {
         self.superfiles_opened.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Count superfiles the prune was asked about.
+    pub(crate) fn add_superfiles_considered(&self, n: u64) {
+        self.superfiles_considered.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Count superfiles the prune excluded.
+    pub(crate) fn add_superfiles_pruned(&self, n: u64) {
+        self.superfiles_pruned.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Superfiles opened so far by this operation.
@@ -386,6 +410,9 @@ impl OpStatsCollector {
             vector_candidates_scanned: self.vector_candidates_scanned.load(Ordering::Relaxed),
             vector_rows_reranked: self.vector_rows_reranked.load(Ordering::Relaxed),
             planned_read_ranges: self.planned_read_ranges.load(Ordering::Relaxed),
+            superfiles_opened: self.superfiles_opened.load(Ordering::Relaxed),
+            superfiles_considered: self.superfiles_considered.load(Ordering::Relaxed),
+            superfiles_pruned: self.superfiles_pruned.load(Ordering::Relaxed),
             sql_page_bytes: self.sql_page_bytes.load(Ordering::Relaxed),
             rows_materialized: self.rows_materialized.load(Ordering::Relaxed),
             kernel_cpu_ns: self.kernel_cpu_ns.load(Ordering::Relaxed),
