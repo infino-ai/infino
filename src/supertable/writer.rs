@@ -10537,21 +10537,21 @@ async fn write_superfile_list_with_threshold(
     // leaves headroom for a concurrent maintenance pass without saturation.
     let write_concurrency = commit_write_concurrency().get();
 
-    let replace_futs =
-        pending_storage_replaces
-            .iter()
-            .enumerate()
-            .map(|(i, (storage_key, bytes))| {
-                let storage = Arc::clone(storage);
-                let path = storage_key.clone();
-                let bytes = bytes.clone();
-                async move {
-                    put_superfile_replace(&storage, &path, bytes)
-                        .await
-                        .map(|()| i)
-                        .map_err(SupertableCommitError::from)
-                }
-            });
+    // Owned before the map, for the same reason as the PUTs below.
+    let to_replace: Vec<(usize, String, Bytes)> = pending_storage_replaces
+        .iter()
+        .enumerate()
+        .map(|(i, (storage_key, bytes))| (i, storage_key.clone(), bytes.clone()))
+        .collect();
+    let replace_futs = to_replace.into_iter().map(|(i, path, bytes)| {
+        let storage = Arc::clone(storage);
+        async move {
+            put_superfile_replace(&storage, &path, bytes)
+                .await
+                .map(|()| i)
+                .map_err(SupertableCommitError::from)
+        }
+    });
     let mut err = None;
     let mut successful_replace_idx = Vec::with_capacity(pending_storage_replaces.len());
     for r in stream::iter(replace_futs)
@@ -10573,19 +10573,23 @@ async fn write_superfile_list_with_threshold(
     }
 
     let multipart_threshold = put_multipart_threshold_bytes;
-    let put_futs = pending_storage_writes
+    // Owned before the map rather than cloned inside it. Identical work — the
+    // closure cloned both fields anyway — but its signature then names no
+    // lifetime, which is what lets a caller spawn this future: borrowing one
+    // here leaves `Send` inference unable to generalise over it.
+    let to_put: Vec<(usize, String, Bytes)> = pending_storage_writes
         .iter()
         .enumerate()
-        .map(|(i, (storage_key, bytes))| {
-            let storage = Arc::clone(storage);
-            let storage_key = storage_key.clone();
-            let bytes = bytes.clone();
-            async move {
-                put_new_superfile_bytes(&storage, multipart_threshold, storage_key, bytes)
-                    .await
-                    .map(|()| i)
-            }
-        });
+        .map(|(i, (storage_key, bytes))| (i, storage_key.clone(), bytes.clone()))
+        .collect();
+    let put_futs = to_put.into_iter().map(|(i, storage_key, bytes)| {
+        let storage = Arc::clone(storage);
+        async move {
+            put_new_superfile_bytes(&storage, multipart_threshold, storage_key, bytes)
+                .await
+                .map(|()| i)
+        }
+    });
 
     let mut err = None;
     let mut successful_writes_idx = Vec::with_capacity(pending_storage_writes.len());
@@ -11224,7 +11228,15 @@ pub(in crate::supertable) async fn finalize_compaction_commit(
     if !pending_cache_inserts.is_empty()
         && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
     {
-        warm_cache_after_commit(&inner, &cache, pending_cache_inserts);
+        // Spawned rather than awaited. This runs on the loop that admits
+        // merges and makes commits, and a multi-gigabyte output takes real
+        // time to land in the local cache — time in which no merge starts and
+        // no finished merge commits, so its inputs stay sealed for it. The
+        // warm is best-effort either way: a miss is a cold fetch on first
+        // read, which is what the pre-commit state was anyway.
+        inner.query_runtime().spawn(async move {
+            warm_cache_inserts(&cache, pending_cache_inserts).await;
+        });
     }
     if let (Some(cache), Some(budget)) = (
         inner.options.disk_cache.as_ref(),

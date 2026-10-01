@@ -11,6 +11,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     io::{BufWriter, Write},
+    mem,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -68,7 +69,7 @@ use crate::{
             CommitFence, NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
             finalize_compaction_commit, maint_pool, prepare_superfile_named,
             recalibrate_probe_laws, refresh_slow_vector_state, split_overflow_cells,
-            try_commit_attempt,
+            try_commit_attempt, write_superfile_list,
         },
     },
     utils::trace::{detail_span, record},
@@ -1397,11 +1398,49 @@ impl Supertable {
     ) {
         let table = self.clone();
         merging.spawn(async move {
-            (
-                plan_index,
-                table.prepare_compaction_job(job, stale_seal_timeout).await,
-            )
+            let prepared = match table.prepare_compaction_job(job, stale_seal_timeout).await {
+                Ok(prepared) => prepared,
+                Err(e) => return (plan_index, Err(e)),
+            };
+            let uploaded = table.upload_prepared_output(prepared).await;
+            (plan_index, uploaded)
         });
+    }
+
+    /// Put this job's merged bytes in storage, inside its own task.
+    ///
+    /// The commit used to do this, on the loop that admits merges and makes
+    /// commits: a multi-gigabyte PUT there stops every other merge from
+    /// starting and every finished one from committing, so their inputs stay
+    /// sealed for the length of someone else's upload. The bytes still precede
+    /// the pointer, which is what crash safety rests on, and a job that never
+    /// commits leaves them for gc exactly as a dropped one already does.
+    async fn upload_prepared_output(
+        &self,
+        mut prepared: PreparedJob,
+    ) -> Result<PreparedJob, CompactionError> {
+        if prepared.pending_storage_writes.is_empty() {
+            return Ok(prepared);
+        }
+        let inner = self.inner();
+        let Some(storage) = inner.manifest.load_full().options.storage.clone() else {
+            return Err(CompactionError::NoStorage);
+        };
+        let opts = Arc::clone(&inner.options);
+        let mut writes = mem::take(&mut prepared.pending_storage_writes);
+        let mut replaces: Vec<(String, Bytes)> = Vec::new();
+        let outcome = write_superfile_list(&storage, &opts, &mut writes, &mut replaces).await;
+        // Whatever did not land goes back, so a commit retry re-PUTs exactly
+        // the outstanding bytes as it did when the upload lived there.
+        prepared.pending_storage_writes = writes;
+        match outcome {
+            Ok(()) => Ok(prepared),
+            Err(e) => {
+                let wal_store = WalStore::new(storage);
+                unseal_batch(&wal_store, vec![prepared]).await;
+                Err(CompactionError::Commit(e.to_string()))
+            }
+        }
     }
 
     /// Drain merges still running after a pass has given up, clearing the
