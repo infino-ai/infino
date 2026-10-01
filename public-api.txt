@@ -385,6 +385,7 @@ impl core::marker::UnsafeUnpin for infino::Bm25SearchOptions
 impl core::panic::unwind_safe::RefUnwindSafe for infino::Bm25SearchOptions
 impl core::panic::unwind_safe::UnwindSafe for infino::Bm25SearchOptions
 pub struct infino::CompactionSettings
+pub infino::CompactionSettings::max_concurrent_jobs: core::option::Option<usize>
 pub infino::CompactionSettings::max_memory_mb: u64
 pub infino::CompactionSettings::min_fill_percent: u8
 pub infino::CompactionSettings::min_superfiles_for_merge: u64

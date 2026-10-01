@@ -25,6 +25,8 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 pub use crate::config::DEFAULT_STALE_SEAL_TIMEOUT_MS;
@@ -70,8 +72,8 @@ pub enum TombstonesAdminError {
 /// unless a table's `CompactionSettings::stale_seal_timeout_ms`
 /// overrides it.
 pub fn is_seal_stale(
-    sealed_at: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
+    sealed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
     stale_timeout: Duration,
 ) -> bool {
     let age = (now - sealed_at).to_std().unwrap_or(Duration::ZERO);
@@ -103,7 +105,7 @@ pub async fn seal(
     wal_store: &WalStore,
     superfile_id: Uuid,
     compaction_id: Uuid,
-    sealed_at: chrono::DateTime<chrono::Utc>,
+    sealed_at: DateTime<Utc>,
     stale_timeout: Duration,
 ) -> Result<(TombstonesSidecar, Etag), TombstonesAdminError> {
     let (existing, etag_opt) = match wal_store.get_tombstones(superfile_id).await? {
@@ -130,7 +132,7 @@ pub async fn seal(
 
     let bitmap = existing
         .map(|sc| sc.bitmap)
-        .unwrap_or_else(roaring::RoaringBitmap::new);
+        .unwrap_or_else(RoaringBitmap::new);
     let sealed = TombstonesSidecar {
         seal: Some(SealRecord {
             compaction_id,
@@ -158,7 +160,7 @@ pub async fn seal(
 pub async fn unseal(
     wal_store: &WalStore,
     superfile_id: Uuid,
-    bitmap: roaring::RoaringBitmap,
+    bitmap: RoaringBitmap,
     etag: &Etag,
 ) -> Result<(), TombstonesAdminError> {
     let unsealed = TombstonesSidecar { seal: None, bitmap };
@@ -168,6 +170,43 @@ pub async fn unseal(
     {
         Ok(_) => Ok(()),
         Err(WalStoreError::CasFailed { .. }) => Ok(()),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Re-stamp a seal this compactor already holds, conditioned on the etag
+/// [`seal`] returned. One CAS-PUT, no GET.
+///
+/// Two jobs in one call. It proves nothing has touched the sidecar since the
+/// seal was placed: a writer that found the seal stale steals it and lands a
+/// bit, which changes the etag and fails this CAS. And it moves `sealed_at`
+/// forward, so the seal reads as live again for another staleness window.
+///
+/// `Ok` means the seal is still ours and the sidecar holds exactly the bits
+/// the merge read. `Err(CasLost)` means a writer or another compactor got
+/// there first, so anything built from that input is stale and must not be
+/// committed over.
+pub async fn refresh_seal(
+    wal_store: &WalStore,
+    superfile_id: Uuid,
+    compaction_id: Uuid,
+    bitmap: RoaringBitmap,
+    sealed_at: DateTime<Utc>,
+    etag: &Etag,
+) -> Result<Etag, TombstonesAdminError> {
+    let resealed = TombstonesSidecar {
+        seal: Some(SealRecord {
+            compaction_id,
+            sealed_at,
+        }),
+        bitmap,
+    };
+    match wal_store
+        .put_tombstones(superfile_id, Some(etag), &resealed)
+        .await
+    {
+        Ok(new_etag) => Ok(new_etag),
+        Err(WalStoreError::CasFailed { .. }) => Err(TombstonesAdminError::CasLost { superfile_id }),
         Err(other) => Err(other.into()),
     }
 }
@@ -193,7 +232,7 @@ pub async fn live_rows(
 ) -> Result<Vec<u32>, TombstonesAdminError> {
     let bitmap = match wal_store.get_tombstones(superfile_id).await? {
         Some((sc, _etag)) => sc.bitmap,
-        None => roaring::RoaringBitmap::new(),
+        None => RoaringBitmap::new(),
     };
     let mut out: Vec<u32> = Vec::with_capacity(n_docs as usize);
     for doc_id in 0..n_docs {
@@ -208,7 +247,6 @@ pub async fn live_rows(
 mod tests {
     use std::sync::Arc;
 
-    use chrono::Utc;
     use tempfile::TempDir;
 
     use super::*;
@@ -245,7 +283,7 @@ mod tests {
         let (_dir, ws) = fixture();
         let sf = Uuid::from_u128(0x200);
         // Pre-write an unsealed sidecar with 3 bits.
-        let mut bitmap = roaring::RoaringBitmap::new();
+        let mut bitmap = RoaringBitmap::new();
         bitmap.insert(1);
         bitmap.insert(5);
         bitmap.insert(7);
@@ -375,7 +413,7 @@ mod tests {
     async fn live_rows_excludes_tombstoned_bits() {
         let (_dir, ws) = fixture();
         let sf = Uuid::from_u128(0x600);
-        let mut bitmap = roaring::RoaringBitmap::new();
+        let mut bitmap = RoaringBitmap::new();
         bitmap.insert(1);
         bitmap.insert(3);
         ws.put_tombstones(sf, None, &TombstonesSidecar { seal: None, bitmap })
@@ -389,7 +427,7 @@ mod tests {
     async fn live_rows_works_on_sealed_sidecar() {
         let (_dir, ws) = fixture();
         let sf = Uuid::from_u128(0x700);
-        let mut bitmap = roaring::RoaringBitmap::new();
+        let mut bitmap = RoaringBitmap::new();
         bitmap.insert(2);
         ws.put_tombstones(sf, None, &TombstonesSidecar { seal: None, bitmap })
             .await
@@ -414,7 +452,7 @@ mod tests {
         // Writer-side: land a tombstone at doc_id=3 via the
         // codec layer directly (mimicking what the WAL pipeline
         // does internally).
-        let mut bitmap = roaring::RoaringBitmap::new();
+        let mut bitmap = RoaringBitmap::new();
         bitmap.insert(3);
         ws.put_tombstones(sf, None, &TombstonesSidecar { seal: None, bitmap })
             .await
