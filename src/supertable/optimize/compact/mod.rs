@@ -9,7 +9,7 @@
 //! re-compacted.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::{BufWriter, Write},
     sync::{
         Arc, OnceLock,
@@ -20,13 +20,14 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures::{
-    FutureExt,
-    stream::{self, Stream, StreamExt},
-};
+use futures::stream::{self, StreamExt};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
-use tokio::{sync::Semaphore, task::JoinSet, time};
+use tokio::{
+    sync::Semaphore,
+    task::{JoinError, JoinSet},
+    time,
+};
 #[cfg(not(feature = "detailed-tracing"))]
 use tracing::Span;
 #[cfg(feature = "detailed-tracing")]
@@ -1089,77 +1090,108 @@ impl Supertable {
         concurrency: usize,
     ) -> Result<(), CompactionError> {
         let concurrency = concurrency.max(1);
-        let mut rest = jobs.as_slice();
-        while !rest.is_empty() {
-            let (wave, remainder) = admit_wave(rest, concurrency).await;
-            rest = remainder;
-            // Unordered, so a finished merge can commit without waiting on a
-            // slower sibling. A job's inputs stay sealed from its prepare
-            // until its commit, and a writer treats a seal older than the
-            // staleness threshold as abandoned — so holding the whole wave's
-            // seals for the slowest merge would hand every delete that lands
-            // meanwhile a reason to steal one, and cost those jobs their
-            // merges at commit. Plan order is restored within each batch
-            // below, which is as much of it as committing early can preserve.
-            let mut merges = stream::iter(wave.iter().cloned().enumerate().map(
-                |(plan_index, job)| async move {
-                    (
-                        plan_index,
-                        self.prepare_compaction_job(job, stale_seal_timeout).await,
-                    )
-                },
-            ))
-            .buffer_unordered(concurrency);
+        let mut queued: VecDeque<(usize, CompactionJob)> = jobs.into_iter().enumerate().collect();
+        let mut merging: JoinSet<(usize, Result<PreparedJob, CompactionError>)> = JoinSet::new();
+        let mut first_error: Option<CompactionError> = None;
+        let mut fatal: Option<CompactionError> = None;
 
-            let mut first_error: Option<CompactionError> = None;
-            let mut fatal: Option<CompactionError> = None;
-            while let Some(first) = merges.next().await {
-                let mut ready: Vec<(usize, PreparedJob)> = Vec::new();
-                let mut take = |(plan_index, outcome): (usize, Result<_, CompactionError>)| {
-                    match outcome {
-                        Ok(p) => ready.push((plan_index, p)),
-                        // A failed prepare already cleared its own seals.
-                        Err(e) => {
-                            first_error.get_or_insert(e);
-                        }
+        while !queued.is_empty() || !merging.is_empty() {
+            // Nothing running: start one without consulting the host. A table
+            // whose single job does not fit still has to compact, and stalling
+            // it would strand exactly the tables that most need compacting.
+            if merging.is_empty() {
+                let (plan_index, job) = queued.pop_front().expect("loop condition");
+                self.spawn_merge(&mut merging, plan_index, job, stale_seal_timeout);
+                continue;
+            }
+
+            // Cheap half of the admission test, as a select guard; the half
+            // that reads the host runs inside the branch, after the settle.
+            let may_admit = admits_another_merge(merging.len(), concurrency, queued.len(), true);
+            let joined = tokio::select! {
+                // Completions first: a merge that has finished should commit
+                // and free its slot rather than wait behind an admission.
+                biased;
+                joined = merging.join_next() => joined,
+                // The settle runs with every admitted merge in flight, so the
+                // reading that follows it sees their allocations rather than
+                // an idle host. That is the whole feedback loop: admit, let it
+                // land, look at what is left, decide again.
+                _ = time::sleep(MERGE_ADMIT_SETTLE), if may_admit => {
+                    if admits_another_merge(
+                        merging.len(),
+                        concurrency,
+                        queued.len(),
+                        host_has_room_for_another_merge(),
+                    ) {
+                        let (plan_index, job) = queued.pop_front().expect("guarded above");
+                        self.spawn_merge(&mut merging, plan_index, job, stale_seal_timeout);
                     }
-                };
-                take(first);
-                // Whatever else has already finished rides along in the same
-                // CAS. Polling once never waits, so an early commit costs a
-                // sibling nothing and merges that land together still batch.
-                while let Some(Some(done)) = merges.next().now_or_never() {
-                    take(done);
-                }
-                if ready.is_empty() {
                     continue;
                 }
-                ready.sort_by_key(|(plan_index, _)| *plan_index);
-                let batch: Vec<PreparedJob> =
-                    ready.into_iter().map(|(_, prepared)| prepared).collect();
+            };
+            let Some(joined) = joined else {
+                continue;
+            };
 
-                let commit = self.commit_compaction_batch(batch).await;
-                self.refresh()
-                    .await
-                    .map_err(|e| CompactionError::Refresh(e.to_string()))?;
-                if let Err(e) = commit {
-                    fatal = Some(e);
-                    break;
-                }
+            let mut ready: Vec<(usize, PreparedJob)> = Vec::new();
+            collect_merge(joined, &mut ready, &mut first_error);
+            // Whatever else has already finished rides along in the same CAS.
+            // Polling once never waits, so committing early costs a sibling
+            // nothing and merges that land together still batch.
+            while let Some(next) = merging.try_join_next() {
+                collect_merge(next, &mut ready, &mut first_error);
             }
+            if ready.is_empty() {
+                continue;
+            }
+            // Plan order within the batch, which is as much of it as
+            // committing merges when they finish can preserve.
+            ready.sort_by_key(|(plan_index, _)| *plan_index);
+            let batch: Vec<PreparedJob> = ready.into_iter().map(|(_, prepared)| prepared).collect();
 
-            if let Some(e) = fatal {
-                // Merges still in flight hold seals this pass will not commit.
-                // Let them finish and clear their own, rather than dropping
-                // the futures and leaving the seals to age out.
-                self.unseal_remaining(merges).await;
-                return Err(e);
-            }
-            if let Some(e) = first_error {
-                return Err(e);
+            let commit = self.commit_compaction_batch(batch).await;
+            self.refresh()
+                .await
+                .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+            if let Err(e) = commit {
+                fatal = Some(e);
+                break;
             }
         }
+
+        if let Some(e) = fatal {
+            // Merges still running hold seals this pass will not commit. Let
+            // them finish and clear their own, rather than dropping the tasks
+            // and leaving the seals to age out.
+            self.unseal_remaining(merging).await;
+            return Err(e);
+        }
+        if let Some(e) = first_error {
+            return Err(e);
+        }
         Ok(())
+    }
+
+    /// Start one merge, tagged with its position in the plan.
+    ///
+    /// Spawned rather than held in a future this loop polls: the loop awaits a
+    /// commit between admissions, and a merge parked in an unpolled future
+    /// would make no progress while that commit ran.
+    fn spawn_merge(
+        &self,
+        merging: &mut JoinSet<(usize, Result<PreparedJob, CompactionError>)>,
+        plan_index: usize,
+        job: CompactionJob,
+        stale_seal_timeout: Duration,
+    ) {
+        let table = self.clone();
+        merging.spawn(async move {
+            (
+                plan_index,
+                table.prepare_compaction_job(job, stale_seal_timeout).await,
+            )
+        });
     }
 
     /// Drain merges still running after a pass has given up, clearing the
@@ -1167,22 +1199,22 @@ impl Supertable {
     /// a job dropped from a batch leaves behind.
     async fn unseal_remaining(
         &self,
-        mut merges: impl Stream<Item = (usize, Result<PreparedJob, CompactionError>)> + Unpin,
+        mut merging: JoinSet<(usize, Result<PreparedJob, CompactionError>)>,
     ) {
         let Some(storage) = self.inner().manifest.load_full().options.storage.clone() else {
             return;
         };
         let wal_store = WalStore::new(storage);
-        while let Some((_, outcome)) = merges.next().await {
-            if let Ok(prepared) = outcome {
+        while let Some(joined) = merging.join_next().await {
+            if let Ok((_, Ok(prepared))) = joined {
                 unseal_batch(&wal_store, vec![prepared]).await;
             }
         }
     }
 }
 
-/// Share of the host's memory the runner keeps free: it stops widening a wave
-/// once less than this is available.
+/// Share of the host's memory the runner keeps free: it stops admitting
+/// merges once less than this is available.
 ///
 /// The width comes from feedback rather than an estimate of what a merge
 /// costs. A merge's footprint depends on term cardinality, posting density,
@@ -1192,13 +1224,15 @@ impl Supertable {
 /// looks at what the host has left, and admits another only if there is still
 /// room. A corpus twice as expensive per byte gets a narrower wave, with
 /// nothing to re-tune.
-const WAVE_MEMORY_RESERVE_PERCENT: u64 = 40;
+const MERGE_MEMORY_RESERVE_PERCENT: u64 = 40;
 
 /// How long to let an admitted merge's allocation materialize before reading
 /// memory again. Resident size lags admission, so deciding immediately would
-/// widen the wave against a reading that has not caught up yet. Merges run for
-/// minutes; a short settle between admissions costs nothing measurable.
-const WAVE_ADMIT_SETTLE: Duration = Duration::from_millis(250);
+/// widen against a reading that has not caught up yet. The admitted merges run
+/// throughout this wait, which is what makes the next reading mean something.
+/// Merges run for minutes; a short settle between admissions costs nothing
+/// measurable.
+const MERGE_ADMIT_SETTLE: Duration = Duration::from_millis(250);
 
 /// Whether the host still has room for one more concurrent merge: reads the
 /// machine once and hands both figures to [`has_room_for_another_merge`].
@@ -1222,37 +1256,48 @@ fn has_room_for_another_merge(available: Option<u64>, total: Option<u64>) -> boo
     let (Some(available), Some(total)) = (available, total) else {
         return true;
     };
-    total > 0 && available.saturating_mul(100) / total >= WAVE_MEMORY_RESERVE_PERCENT
+    total > 0 && available.saturating_mul(100) / total >= MERGE_MEMORY_RESERVE_PERCENT
 }
 
-/// How many merges a wave may admit at most: the work that exists, capped by
-/// the width knob. A width of zero still admits one, so a misconfigured knob
-/// cannot stall compaction outright.
-fn wave_ceiling(jobs: usize, concurrency: usize) -> usize {
-    jobs.min(concurrency.max(1))
-}
-
-/// Take the next wave off `jobs`, widening it only while the host has room.
+/// Whether another merge may start right now.
 ///
-/// One merge is admitted unconditionally: a table whose single job does not
-/// fit the host still has to compact, and stalling it would strand exactly the
-/// tables that most need compacting. Each further merge is admitted only once
-/// the previous one's allocation has had time to land and the host still
-/// reports headroom, so the width follows what this corpus costs.
-async fn admit_wave(
-    jobs: &[CompactionJob],
+/// The first is unconditional, whatever the host says: a table whose single
+/// job does not fit still has to compact, and stalling it would strand exactly
+/// the tables that most need compacting. Past that the width knob caps how
+/// many run at once, the host has to report headroom, and a pass never starts
+/// work it did not plan. A width of zero still admits one, so a misconfigured
+/// knob cannot stall compaction outright.
+fn admits_another_merge(
+    in_flight: usize,
     concurrency: usize,
-) -> (&[CompactionJob], &[CompactionJob]) {
-    let ceiling = wave_ceiling(jobs.len(), concurrency);
-    let mut taken = 1.min(ceiling);
-    while taken < ceiling {
-        time::sleep(WAVE_ADMIT_SETTLE).await;
-        if !host_has_room_for_another_merge() {
-            break;
-        }
-        taken += 1;
+    queued: usize,
+    host_has_room: bool,
+) -> bool {
+    if queued == 0 {
+        return false;
     }
-    jobs.split_at(taken)
+    if in_flight == 0 {
+        return true;
+    }
+    in_flight < concurrency.max(1) && host_has_room
+}
+
+/// Sort one finished merge into the batch being assembled, or record why it
+/// produced nothing. A failed prepare has already cleared its own seals.
+fn collect_merge(
+    joined: Result<(usize, Result<PreparedJob, CompactionError>), JoinError>,
+    ready: &mut Vec<(usize, PreparedJob)>,
+    first_error: &mut Option<CompactionError>,
+) {
+    match joined {
+        Ok((plan_index, Ok(prepared))) => ready.push((plan_index, prepared)),
+        Ok((_, Err(e))) => {
+            first_error.get_or_insert(e);
+        }
+        Err(e) => {
+            first_error.get_or_insert(CompactionError::Build(format!("merge task failed: {e}")));
+        }
+    }
 }
 
 /// One merge that has run and is waiting for its manifest commit.
@@ -4161,64 +4206,50 @@ mod tests {
         }
     }
 
-    // ---- wave admission --------------------------------------------------
-
-    /// A job for the admission tests. Its size is deliberately absent: the
-    /// runner admits against the host's free memory, not against anything it
-    /// can read off the job, which is the whole point of the design.
-    fn wave_job() -> CompactionJob {
-        CompactionJob {
-            partition_key: Vec::new(),
-            inputs: vec![Uuid::new_v4(), Uuid::new_v4()],
-            estimated_output_bytes: 0,
-        }
-    }
-
-    /// One merge is admitted unconditionally, however big it is: refusing it
-    /// would stall exactly the tables that most need compacting.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_wave_always_admits_at_least_one_job() {
-        let jobs = vec![wave_job(), wave_job()];
-        let (wave, rest) = admit_wave(&jobs, 8).await;
-        assert!(!wave.is_empty(), "a wave must never be empty");
-        assert_eq!(wave.len() + rest.len(), jobs.len(), "no job may be dropped");
-    }
-
-    /// The width knob is still a hard cap: the runner may admit fewer when the
-    /// host is tight, never more than asked for.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_wave_never_exceeds_the_width_knob() {
-        let jobs: Vec<CompactionJob> = (0..64).map(|_| wave_job()).collect();
-        let (wave, rest) = admit_wave(&jobs, 3).await;
-        assert!(wave.len() <= 3, "wave of {} exceeded the knob", wave.len());
-        assert_eq!(wave.len() + rest.len(), jobs.len());
-    }
+    // ---- merge admission -------------------------------------------------
 
     /// A width far above any plausible job count.
     const ABSURD_WIDTH: usize = 4096;
 
-    /// The wave is capped by the work that exists, which is why no separate
-    /// ceiling is needed: a pass with fewer jobs than the width runs them all.
-    /// Stated against the ceiling itself rather than a split, because
-    /// `split_at` makes `wave.len() <= jobs.len()` true of any implementation.
+    /// One merge starts whatever the host says. Refusing it would stall
+    /// exactly the tables that most need compacting, and there is nothing
+    /// running yet for a memory reading to be about.
     #[test]
-    fn a_wave_is_capped_by_the_jobs_that_exist() {
-        assert_eq!(
-            wave_ceiling(2, ABSURD_WIDTH),
-            2,
-            "two jobs cap the wave at two"
+    fn a_merge_starts_even_when_the_host_is_tight() {
+        assert!(admits_another_merge(0, ABSURD_WIDTH, 4, false));
+        assert!(
+            admits_another_merge(0, 0, 1, false),
+            "a zero width still runs one merge at a time"
         );
-        assert_eq!(
-            wave_ceiling(64, 3),
-            3,
-            "the knob caps the wave when work is plentiful"
-        );
-        assert_eq!(wave_ceiling(5, 0), 1, "a zero width still admits one job");
-        assert_eq!(wave_ceiling(0, 8), 0, "no jobs, no wave");
+    }
+
+    /// Past the first, the host decides. This is the half that was dead while
+    /// admission ran before any merge had started: every reading saw an idle
+    /// machine, so a tight host admitted the full width anyway.
+    #[test]
+    fn a_tight_host_admits_no_further_merge() {
+        assert!(admits_another_merge(1, 4, 3, true));
+        assert!(!admits_another_merge(1, 4, 3, false));
+    }
+
+    /// The width knob is a hard cap: the runner may admit fewer when the host
+    /// is tight, never more than asked for.
+    #[test]
+    fn merges_in_flight_never_exceed_the_width_knob() {
+        assert!(!admits_another_merge(3, 3, 61, true));
+        assert!(!admits_another_merge(1, 1, 5, true));
+    }
+
+    /// A pass never starts work it did not plan, which is why no separate
+    /// ceiling on the width is needed.
+    #[test]
+    fn no_merge_starts_without_planned_work() {
+        assert!(!admits_another_merge(0, ABSURD_WIDTH, 0, true));
+        assert!(!admits_another_merge(2, ABSURD_WIDTH, 0, true));
     }
 
     /// The reserve the cases below encode, written out rather than read from
-    /// [`WAVE_MEMORY_RESERVE_PERCENT`]: a test that takes its inputs from the
+    /// [`MERGE_MEMORY_RESERVE_PERCENT`]: a test that takes its inputs from the
     /// value it is checking moves with a wrong edit instead of failing on it.
     const SHIPPED_RESERVE_PERCENT: u64 = 40;
     /// One point under the reserve — the widest share that must be denied.
@@ -4252,7 +4283,7 @@ mod tests {
     #[test]
     fn room_for_another_merge_is_judged_against_the_host() {
         assert_eq!(
-            WAVE_MEMORY_RESERVE_PERCENT, SHIPPED_RESERVE_PERCENT,
+            MERGE_MEMORY_RESERVE_PERCENT, SHIPPED_RESERVE_PERCENT,
             "the shares below are written against a {SHIPPED_RESERVE_PERCENT}% reserve"
         );
 
