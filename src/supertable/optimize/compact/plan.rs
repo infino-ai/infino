@@ -10,7 +10,12 @@
 //!
 //! The packing is single-level and single-pass. A superfile already at
 //! target size is done and never re-merged, and each candidate lands in
-//! **exactly one** job, which is what lets the jobs run independently.
+//! **at most one** job, which is what lets the jobs run independently.
+//! At most, not exactly: a candidate is dropped when it is already at
+//! target size or sealed by another compactor, and a trailing group that
+//! clears neither leg of the merge trigger is left for a later pass. The
+//! property the concurrent runner depends on is that no two jobs name the
+//! same superfile, which [`prop_jobs_never_share_an_input`] pins.
 
 use std::{collections::BTreeMap, mem};
 
@@ -210,6 +215,9 @@ impl PendingJob {
 
 #[cfg(test)]
 pub(in crate::supertable::optimize::compact) mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use proptest::prelude::*;
     use uuid::Uuid;
 
     use super::*;
@@ -441,6 +449,117 @@ pub(in crate::supertable::optimize::compact) mod tests {
         p.push(&a);
         let b = seg(2, 60, 1000, 0); // would push raw to 120 MiB > 100 MiB cap
         assert!(!p.fits(&b, target, max_memory));
+    }
+
+    // ---- job disjointness (the invariant concurrent merging rests on) ----
+
+    /// Upper bound on generated superfiles per case. Large enough that the
+    /// packer emits several jobs per partition, small enough to keep a
+    /// 256-case proptest run under a second.
+    const PROP_MAX_SUPERFILES: usize = 40;
+    /// Distinct partition keys a generated case spreads its superfiles over,
+    /// so the multi-partition path is exercised and not just one packer run.
+    const PROP_PARTITIONS: u64 = 3;
+
+    prop_compose! {
+        /// One superfile. `index` supplies the id, so a generated vector
+        /// never repeats one -- `select` debug-asserts that its input is
+        /// already deduped, and duplicate inputs are a separate, upstream
+        /// concern (`listed_once` in the schedule).
+        fn arb_stats(index: usize)(
+            partition in 0u64..PROP_PARTITIONS,
+            size_mib in 0u64..3000,
+            n_docs in 0u64..10_000,
+            tombstone_pct in 0u64..=100,
+            sealed_by_other in any::<bool>(),
+            birth_version in 0u64..100,
+        ) -> SuperfileStats {
+            SuperfileStats {
+                superfile_id: Uuid::from_u128(index as u128 + 1),
+                partition_key: partition.to_le_bytes().to_vec(),
+                size_bytes: mib(size_mib),
+                n_docs,
+                tombstoned_docs: n_docs * tombstone_pct / 100,
+                sealed_by_other,
+                birth_version,
+            }
+        }
+    }
+
+    fn arb_stats_vec() -> impl Strategy<Value = Vec<SuperfileStats>> {
+        (0..=PROP_MAX_SUPERFILES).prop_flat_map(|len| (0..len).map(arb_stats).collect::<Vec<_>>())
+    }
+
+    prop_compose! {
+        /// Settings across the whole trigger space: fill floors from "merge
+        /// anything" to "merge nothing", count legs below and above the
+        /// clamp, and memory ceilings tight enough to cut a job short.
+        fn arb_cfg()(
+            target_superfile_size_mb in 1u64..4096,
+            min_fill_percent in 0u8..=100,
+            min_superfiles_for_merge in 0u64..12,
+            max_memory_mb in 1u64..8192,
+        ) -> CompactionSettings {
+            CompactionSettings {
+                target_superfile_size_mb,
+                min_fill_percent,
+                min_superfiles_for_merge,
+                max_memory_mb,
+                ..CompactionSettings::default()
+            }
+        }
+    }
+
+    proptest! {
+        /// The property the concurrent job runner rests on: the jobs a single
+        /// `select` returns never name the same superfile twice, so two jobs
+        /// can seal, merge and commit without coordinating.
+        ///
+        /// Coverage is deliberately NOT asserted -- a candidate legitimately
+        /// reaches no job at all (already at target size, sealed by another
+        /// compactor, or a trailing group below both trigger legs).
+        #[test]
+        fn prop_jobs_never_share_an_input(
+            stats in arb_stats_vec(),
+            cfg in arb_cfg(),
+        ) {
+            let jobs = select(&stats, &cfg);
+
+            let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
+            let candidates: HashSet<Uuid> = stats.iter().map(|s| s.superfile_id).collect();
+            let by_id: HashMap<Uuid, &SuperfileStats> =
+                stats.iter().map(|s| (s.superfile_id, s)).collect();
+
+            let mut claimed: HashSet<Uuid> = HashSet::new();
+            for job in &jobs {
+                prop_assert!(
+                    job.inputs.len() >= 2,
+                    "a job with fewer than two inputs is a no-op rewrite: {:?}",
+                    job
+                );
+                for id in &job.inputs {
+                    prop_assert!(
+                        claimed.insert(*id),
+                        "superfile {id} appears in two jobs; concurrent jobs would \
+                         seal and merge the same input"
+                    );
+                    prop_assert!(
+                        candidates.contains(id),
+                        "job names {id}, which was never offered to select"
+                    );
+                    // Each input must also have survived the packer's filters,
+                    // which is the other half of "no two compactors touch it".
+                    let s = by_id.get(id).expect("input is a candidate");
+                    prop_assert!(!s.sealed_by_other, "sealed input {id} was packed");
+                    prop_assert!(s.size_bytes < target_bytes, "at-target input {id} was packed");
+                    prop_assert_eq!(
+                        &s.partition_key,
+                        &job.partition_key,
+                        "job mixes partitions"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
