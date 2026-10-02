@@ -152,25 +152,17 @@ fn over_fetch_ceiling(k: usize, total: usize) -> usize {
         .min(total)
 }
 
-/// Give one search table-function call a logical scan of its own.
+/// Give one search table-function call a scan name of its own, so
+/// DataFusion never merges two calls.
 ///
-/// DataFusion names every table-function scan after the function alone
-/// (`token_match()`), whatever its arguments, and compares two scans by
-/// that name, their projection, schema, filters and fetch — never by the
-/// provider, which is the only place a call's arguments live. Two calls
-/// that differ only in their arguments therefore compare equal, and the
-/// optimizer merges them as one common subexpression: `SELECT (SELECT
-/// count(*) FROM token_match('a', ..)), (SELECT count(*) FROM
-/// token_match('b', ..))` answered the first count in both columns, across
-/// tables as well as terms.
-///
-/// The returned provider hands DataFusion a logical plan in place of
-/// itself: a scan of `provider` under a name unique to this call, inside a
-/// reserved catalog so it cannot match a real table's scan either. The SQL
-/// planner inlines that plan beneath the function's own alias, so column
-/// references are unchanged and no two calls compare equal. Two calls with
-/// identical arguments are no longer merged either; they run twice, which
-/// costs a repeated search but can never return the wrong rows.
+/// - DataFusion names every table-function scan after the function alone
+///   (`token_match()`) and compares scans without their arguments, so two
+///   calls with different arguments looked equal and both returned the
+///   first call's rows.
+/// - The returned provider swaps in a scan of `provider` named
+///   `__infino_internal.search_tvf_call.token_match#7`, unique per call,
+///   under the function's own alias, so column names don't change.
+/// - Identical calls are not merged either; they now run twice.
 pub(crate) fn scope_to_call(
     function: &str,
     provider: Arc<dyn TableProvider>,
