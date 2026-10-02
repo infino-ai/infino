@@ -1183,9 +1183,16 @@ fn an_exact_ilike_inside_a_small_bound_reads_no_postings_of_its_own() {
     // `filler3%` bounds a few rows (3, 30..39, 300..399). Inside so small a
     // bound the exact conjunct's rows are checked against their text, not
     // its needle's postings unioned over the whole superfile, so the
-    // statement reads exactly the postings the bound reads alone.
+    // statement reads exactly the postings the bound reads alone. (Those
+    // are none: each `filler…` term holds one row, stored inline in the
+    // dictionary. The needle's term holds many, so alone it reads some.)
     let dir = TempDir::new().expect("tempdir");
     let db = sql_like_fixture(&dir, true, &[]);
+    let needle = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title ILIKE '%NIMBLE%'");
+    assert!(
+        needle.fts_postings_bytes > 0,
+        "the needle alone reads its term's postings"
+    );
     let bound = "title LIKE 'filler3%'";
     let alone = scoped_sql_stats(&db, &format!("SELECT title FROM docs WHERE {bound}"));
     let (batches, both) = with_op_stats(|| {
@@ -1201,7 +1208,6 @@ fn an_exact_ilike_inside_a_small_bound_reads_no_postings_of_its_own() {
         batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
         expected
     );
-    assert!(alone.fts_postings_bytes > 0, "the bound reads postings");
     assert_eq!(
         both.fts_postings_bytes, alone.fts_postings_bytes,
         "the exact conjunct read postings of its own inside a small bound"
