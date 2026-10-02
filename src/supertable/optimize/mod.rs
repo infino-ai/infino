@@ -78,6 +78,7 @@ impl Supertable {
             .map_err(|e| OptimizeError::Build(e.to_string()))?;
         // The knowledge graph's adjacency over an edge table, rebuilt only
         // when the rows changed; before gc for the same reason.
+        #[cfg(feature = "graph-index")]
         if let Some(spec) = &opts.adjacency {
             self.refresh_adjacency_sync(spec)
                 .map_err(|e| OptimizeError::Build(e.to_string()))?;

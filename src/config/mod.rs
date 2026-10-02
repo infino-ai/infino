@@ -970,6 +970,7 @@ impl GcSettings {
 /// Which columns of an edge table carry the graph `optimize()` builds a
 /// resident adjacency index over: the `Int64` source and destination node
 /// columns, and the string column holding the source node's key.
+#[cfg(feature = "graph-index")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdjacencySpec {
     pub(crate) src: String,
@@ -989,6 +990,7 @@ pub struct OptimizeOptions {
     /// The edge columns of a table whose rows are a graph; set, `optimize()`
     /// builds and publishes the resident adjacency index the graph walks
     /// read, as it builds the `hnsw` graph over a vector column.
+    #[cfg(feature = "graph-index")]
     pub(crate) adjacency: Option<AdjacencySpec>,
 }
 
@@ -999,6 +1001,7 @@ impl OptimizeOptions {
             compaction: settings,
             gc: GcSettings::default(),
             recalibrate: RecalibratePolicy::default(),
+            #[cfg(feature = "graph-index")]
             adjacency: None,
         }
     }
@@ -1009,7 +1012,9 @@ impl OptimizeOptions {
     /// index over them, in the lifecycle of the `hnsw` graph: one
     /// content-addressed blob referenced from the manifest, memory-mapped
     /// when the store is local, held resident once hydrated, kept by GC
-    /// while referenced, and rebuilt only when the rows changed.
+    /// while referenced, and rebuilt only when the rows changed. Behind the
+    /// `graph-index` feature, off the curated public surface.
+    #[cfg(feature = "graph-index")]
     pub fn with_adjacency(mut self, src: &str, dst: &str, key: &str) -> Self {
         self.adjacency = Some(AdjacencySpec {
             src: src.to_string(),

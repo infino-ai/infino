@@ -26,6 +26,8 @@
 pub(crate) mod build;
 pub mod error;
 pub(crate) mod gc;
+#[cfg(feature = "graph-index")]
+pub(crate) mod graph_index;
 pub mod handle;
 pub(crate) mod hidden_deleted;
 pub mod lazy_source;
