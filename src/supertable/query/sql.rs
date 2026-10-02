@@ -176,7 +176,7 @@ fn exec_query_error(e: DataFusionError) -> QueryError {
         other if permission_denied_in_chain(&other) => {
             QueryError::PermissionDenied(other.to_string())
         }
-        other => QueryError::Execute(other.to_string()),
+        other => QueryError::DataFusion(other.to_string()),
     }
 }
 
@@ -489,7 +489,7 @@ impl SupertableReader {
                 })
                 .await
                 .map_err(|join| {
-                    QueryError::Plan(format!("predicate resolve task failed: {join}"))
+                    QueryError::Internal(format!("predicate resolve task failed: {join}"))
                 })?
         };
 
@@ -538,7 +538,7 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
     let mut out: Vec<i128> = Vec::new();
     for batch in batches {
         if batch.num_columns() != 1 {
-            return Err(QueryError::Plan(format!(
+            return Err(QueryError::Internal(format!(
                 "scan_ids_matching: expected 1-column batch, got {}",
                 batch.num_columns()
             )));
@@ -548,7 +548,7 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
             .as_any()
             .downcast_ref::<Decimal128Array>()
             .ok_or_else(|| {
-                QueryError::Plan("scan_ids_matching: _id column not Decimal128".into())
+                QueryError::Internal("scan_ids_matching: _id column not Decimal128".into())
             })?;
         for i in 0..arr.len() {
             if arr.is_null(i) {

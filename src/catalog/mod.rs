@@ -1045,7 +1045,8 @@ impl Connection {
                 .instrument(detail_span!("sql.plan"))
                 .in_current_span();
             let (task_ctx, plan) = Handle::current().spawn(planning).await.map_err(|join| {
-                InfinoError::Query(format!("planning task failed: {join}"))
+                // A panic while planning is the engine's fault, never the query's.
+                InfinoError::Backend(format!("planning task failed: {join}"))
                     .with_context("query_sql", None)
             })??;
             // The shared meter-collect-harvest step: the root wrapper

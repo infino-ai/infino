@@ -67,7 +67,9 @@ pub enum InfinoError {
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
-    /// SQL planning or execution failure.
+    /// The query or search is wrong: it does not parse or plan, names a
+    /// column or function that does not exist, or fails on the caller's own
+    /// data (a bad cast). A failure inside the engine is `Io` or `Backend`.
     #[error("query: {0}")]
     Query(String),
 
@@ -81,7 +83,8 @@ pub enum InfinoError {
 
     /// A concurrent writer won the race: an optimistic-concurrency
     /// (compare-and-set) precondition failed and the operation's own retry
-    /// budget was exhausted.
+    /// budget was exhausted, or another writer in this process holds the
+    /// table's single writer slot.
     ///
     /// **Retryable.** Nothing partial is left visible — the losing writer's
     /// manifest swap never published, and a mutation whose WAL did become
@@ -146,36 +149,63 @@ impl From<StorageError> for InfinoError {
     }
 }
 
+/// `Query` is only for the caller's own mistakes: a query that does not parse
+/// or plan, a search over a column the table does not index. Everything the
+/// engine failed at on its own, mid-query, is something else, so a caller can
+/// tell "fix the query" from "the engine failed":
+///
+/// | `QueryError` | public | why |
+/// |---|---|---|
+/// | `InvalidQuery`, `Plan` | `Query` | the request itself is wrong |
+/// | `DataFusion` | `Query` | cause not told apart yet; see the variant |
+/// | `Store`, `Parquet` | `Io` | a read failed; retrying can succeed |
+/// | `ManifestLoad` | as a [`ManifestLoadError`] would | same failure, same answer |
+/// | `Internal` | `Backend` | the engine broke its own invariant: a bug |
+/// | `OverBudget`, `PermissionDenied` | the same names | |
+///
+/// The match names every variant, so a new one has to choose its public
+/// variant rather than fall into `Query`.
 impl From<QueryError> for InfinoError {
     fn from(e: QueryError) -> Self {
-        if let Some(msg) = e.over_budget() {
-            return InfinoError::OverBudget(msg.to_string());
-        }
-        if e.is_permission_denied() {
-            return InfinoError::PermissionDenied(e.to_string());
-        }
-        InfinoError::Query(e.to_string())
+        let variant = match &e {
+            QueryError::InvalidQuery(_) | QueryError::Plan(_) | QueryError::DataFusion(_) => {
+                InfinoError::Query
+            }
+            QueryError::Store(_) | QueryError::Parquet(_) => InfinoError::Io,
+            QueryError::ManifestLoad(load) => manifest_load_variant(load),
+            QueryError::Internal(_) => InfinoError::Backend,
+            QueryError::OverBudget(_) => InfinoError::OverBudget,
+            QueryError::PermissionDenied(_) => InfinoError::PermissionDenied,
+        };
+        variant(e.to_string())
     }
 }
 
 impl From<ManifestLoadError> for InfinoError {
     fn from(e: ManifestLoadError) -> Self {
-        let msg = e.to_string();
-        if e.is_permission_denied() {
-            return InfinoError::PermissionDenied(msg);
-        }
-        match e {
-            // The table this handle was reading has been dropped and purged, so
-            // the name it was opened under no longer resolves to anything —
-            // `NotFound`, not a backend fault, is what a caller must react to.
-            ManifestLoadError::PointerVanished => InfinoError::NotFound(msg),
-            // A storage fault reading the manifest — the pointer probe or a
-            // part load — is a transient I/O hiccup, not a permanent failure.
-            // Surface it as `Io` so a caller can retry (e.g. against another
-            // copy of the data) rather than treat it as a hard backend fault.
-            ManifestLoadError::Storage(_) => InfinoError::Io(msg),
-            _ => InfinoError::Backend(msg),
-        }
+        manifest_load_variant(&e)(e.to_string())
+    }
+}
+
+/// The public variant a manifest load failure maps to, wherever it is met:
+/// opening a table, or in the middle of a query. Returned as the variant's
+/// constructor, so each caller wraps its own message (a mid-query failure
+/// keeps its `manifest load error:` label).
+fn manifest_load_variant(e: &ManifestLoadError) -> fn(String) -> InfinoError {
+    if e.is_permission_denied() {
+        return InfinoError::PermissionDenied;
+    }
+    match e {
+        // The table this handle was reading has been dropped and purged, so
+        // the name it was opened under no longer resolves to anything:
+        // `NotFound`, not a backend fault, is what a caller must react to.
+        ManifestLoadError::PointerVanished => InfinoError::NotFound,
+        // A storage fault reading the manifest (the pointer probe or a part
+        // load) is a transient I/O hiccup, not a permanent failure.
+        // Surface it as `Io` so a caller can retry (e.g. against another
+        // copy of the data) rather than treat it as a hard backend fault.
+        ManifestLoadError::Storage(_) => InfinoError::Io,
+        _ => InfinoError::Backend,
     }
 }
 
@@ -462,6 +492,76 @@ mod tests {
                 source: "bad region".into(),
             }),
             InfinoError::Io(_)
+        ));
+    }
+
+    /// `Query` is the caller's mistake alone. What the engine fails at in the
+    /// middle of a query maps elsewhere, so a caller can tell "fix the query"
+    /// from "the engine failed" without reading the message.
+    #[test]
+    fn a_query_error_is_the_callers_only_when_the_request_is_wrong() {
+        let ordinary_storage_fault = || StorageError::Permanent {
+            uri: "u".into(),
+            source: "bad region".into(),
+        };
+        // The request itself is wrong.
+        assert!(matches!(
+            InfinoError::from(QueryError::InvalidQuery("unknown vector column".into())),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(QueryError::Plan("p".into())),
+            InfinoError::Query(_)
+        ));
+        // A read failed: retrying can succeed.
+        assert!(matches!(
+            InfinoError::from(QueryError::Store("s".into())),
+            InfinoError::Io(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(QueryError::Parquet("p".into())),
+            InfinoError::Io(_)
+        ));
+        // A manifest load answers the same mid-query as it does on open.
+        assert!(matches!(
+            InfinoError::from(QueryError::ManifestLoad(ManifestLoadError::Storage(
+                ordinary_storage_fault()
+            ))),
+            InfinoError::Io(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(QueryError::ManifestLoad(ManifestLoadError::PointerVanished)),
+            InfinoError::NotFound(_)
+        ));
+        // The engine's own invariants.
+        assert!(matches!(
+            InfinoError::from(QueryError::Internal("_id column missing".into())),
+            InfinoError::Backend(_)
+        ));
+        // A DataFusion run failure may be the caller's data: it stays `Query`.
+        assert!(matches!(
+            InfinoError::from(QueryError::DataFusion("Cast error".into())),
+            InfinoError::Query(_)
+        ));
+        // The budget refusal keeps its own, already labelled message.
+        assert_eq!(
+            InfinoError::from(QueryError::OverBudget("during scan, over".into())).to_string(),
+            "over budget: during scan, over"
+        );
+        // The message is the internal error's, unchanged.
+        assert_eq!(
+            InfinoError::from(QueryError::Store("s".into())).to_string(),
+            "io: superfile store error during query: s"
+        );
+    }
+
+    /// Another writer holding the table's writer slot is the same retryable
+    /// condition as a lost commit race, not a schema problem.
+    #[test]
+    fn a_taken_writer_slot_is_a_conflict() {
+        assert!(matches!(
+            InfinoError::from(SupertableBuildError::SupertableInUse),
+            InfinoError::Conflict(_)
         ));
     }
 

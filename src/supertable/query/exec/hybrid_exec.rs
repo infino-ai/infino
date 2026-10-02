@@ -343,7 +343,7 @@ impl Supertable {
                     {
                         return hits_id_score_batch(&reader, &hits)?
                             .project(&indices)
-                            .map_err(|e| QueryError::Execute(e.to_string()));
+                            .map_err(|e| QueryError::Internal(e.to_string()));
                     }
                     // Boundary-replica stubs carry an IVF local that does not
                     // address a Parquet row; remap to the owning placement by

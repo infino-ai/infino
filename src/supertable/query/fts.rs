@@ -1075,7 +1075,7 @@ impl SupertableReader {
                                 },
                             )
                             .await
-                            .map_err(|e| QueryError::Execute(e.to_string()))?
+                            .map_err(|e| QueryError::Internal(e.to_string()))?
                             .map_err(fts_read_error)?
                         } else {
                             op_stats::timed_kernel(&op_stats, || {
@@ -1156,7 +1156,7 @@ impl SupertableReader {
                                     },
                                 )
                                 .await
-                                .map_err(|e| QueryError::Execute(e.to_string()))?
+                                .map_err(|e| QueryError::Internal(e.to_string()))?
                                 .map_err(fts_read_error)?
                             }
                             prep => op_stats::timed_kernel(&op_stats, || {
@@ -1571,7 +1571,7 @@ impl SupertableReader {
                                 },
                             )
                             .await
-                            .map_err(|e| QueryError::Execute(e.to_string()))?
+                            .map_err(|e| QueryError::Internal(e.to_string()))?
                             .map_err(fts_read_error)
                             .map(rows_as_local_ids)
                         } else {
@@ -2260,7 +2260,7 @@ impl SupertableReader {
                     // below is charged on both arms.
                     None => take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
                         .await
-                        .map_err(|e| QueryError::Execute(e.to_string()))?,
+                        .map_err(|e| QueryError::Internal(e.to_string()))?,
                 };
                 // The verify decode materialized one row per candidate,
                 // on either arm. Folding it here rather than per-arm keeps
@@ -2274,7 +2274,7 @@ impl SupertableReader {
                         .as_any()
                         .downcast_ref::<LargeStringArray>()
                         .ok_or_else(|| {
-                            QueryError::Execute(format!(
+                            QueryError::Internal(format!(
                                 "exact_match column '{}' is not LargeUtf8",
                                 column_arc
                             ))

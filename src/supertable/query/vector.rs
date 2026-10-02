@@ -643,7 +643,7 @@ fn eligible_summary<'e>(
         Some(vs) if !vs.cells.is_empty() => {
             for cell in &vs.cells {
                 if cell.clusters.dim as usize != query_dim {
-                    return Err(QueryError::Execute(format!(
+                    return Err(QueryError::Internal(format!(
                         "vector summary dimension {} for column `{column}` on superfile {} \
                          does not match query dimension {query_dim}",
                         cell.clusters.dim, entry.superfile_id,
@@ -652,13 +652,13 @@ fn eligible_summary<'e>(
             }
             Ok(vs)
         }
-        Some(_) => Err(QueryError::Execute(format!(
+        Some(_) => Err(QueryError::Internal(format!(
             "superfile {} has no cluster centroids in its vector summary for \
              column `{column}` — malformed build; refusing to degrade to a \
              blind per-superfile probe",
             entry.superfile_id
         ))),
-        None => Err(QueryError::Execute(format!(
+        None => Err(QueryError::Internal(format!(
             "superfile {} has no vector summary for column `{column}` — \
              malformed build; refusing to degrade to a blind per-superfile \
              probe",
@@ -1052,7 +1052,7 @@ fn centroid_router_walk(
         let sfid = sf.superfile_id;
         for (flat, mut vec) in vr
             .global_fine_cluster_vectors(column, section, sfid)
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+            .map_err(|e| QueryError::Internal(e.to_string()))?
         {
             gfc_prepare_for_metric(metric, &mut vec);
             vecs.push(vec);
@@ -1584,7 +1584,7 @@ async fn lookup_user_placements_by_id(
         if row_id_from_manifest_entry(&entry, 0).is_some() {
             for index in matching {
                 let local = u32::try_from(user_row_ids[index] - entry.id_min).map_err(|_| {
-                    QueryError::Execute(format!(
+                    QueryError::Internal(format!(
                         "local_doc_id out of range for id {}",
                         user_row_ids[index]
                     ))
@@ -1673,7 +1673,7 @@ async fn lookup_user_placements_by_id(
         .enumerate()
         .map(|(index, placement)| {
             placement.ok_or_else(|| {
-                QueryError::Execute(format!("no user superfile owns id {}", user_row_ids[index]))
+                QueryError::Internal(format!("no user superfile owns id {}", user_row_ids[index]))
             })
         })
         .collect()
@@ -1686,7 +1686,7 @@ fn id_values_from_batch(batch: &RecordBatch) -> Result<Vec<i128>, QueryError> {
         .as_any()
         .downcast_ref::<Decimal128Array>()
         .map(|a| a.values().to_vec())
-        .ok_or_else(|| QueryError::Execute("_id column missing".into()))
+        .ok_or_else(|| QueryError::Internal("_id column missing".into()))
 }
 
 /// Build one gapped superfile's sorted `stable_id -> local` index (#556): read
@@ -1752,7 +1752,7 @@ async fn build_gapped_placement_index(
         },
     )
     .await
-    .map_err(|e| QueryError::Execute(e.to_string()))?;
+    .map_err(|e| QueryError::Internal(e.to_string()))?;
     Ok(Arc::new(index))
 }
 
@@ -1803,7 +1803,7 @@ pub(crate) async fn stable_ids_by_local_for_routing(
     if reader.parquet_bytes().is_some() {
         let batch = reader
             .take_by_local_doc_ids(&locals, &[id_column])
-            .map_err(|e| QueryError::Execute(e.to_string()))?;
+            .map_err(|e| QueryError::Internal(e.to_string()))?;
         return id_values_from_batch(&batch);
     }
     read_ids_for_locals(manifest, entry, &locals, id_column, true, op_stats).await
@@ -1869,7 +1869,7 @@ async fn read_ids_for_locals(
                 },
             )
             .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+            .map_err(|e| QueryError::Internal(e.to_string()))?
         };
         if let Some(ids) = resident {
             if let Some(stats) = op_stats {
@@ -1882,7 +1882,7 @@ async fn read_ids_for_locals(
             && let Some(ids) = v
                 .inline_stable_ids_for_locals_async(local_ids)
                 .await
-                .map_err(|e| QueryError::Execute(e.to_string()))?
+                .map_err(|e| QueryError::Internal(e.to_string()))?
         {
             if let Some(stats) = op_stats {
                 stats.add_planned_read_ranges(1);
@@ -1904,12 +1904,12 @@ async fn read_ids_for_locals(
                     op_stats::timed_section(|| {
                         reader
                             .take_by_local_doc_ids(&locals, &[id_column.as_str()])
-                            .map_err(|e| QueryError::Execute(e.to_string()))
+                            .map_err(|e| QueryError::Internal(e.to_string()))
                     })
                 },
             )
             .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+            .map_err(|e| QueryError::Internal(e.to_string()))?
         };
         if let Some(stats) = op_stats {
             stats.add_kernel_cpu_ns(decode_ns);
@@ -1918,7 +1918,7 @@ async fn read_ids_for_locals(
     }
     let batch = take_rows_byte_source(&reader, local_ids, &[id_column])
         .await
-        .map_err(|error| QueryError::Execute(error.to_string()))?;
+        .map_err(|error| QueryError::Internal(error.to_string()))?;
     id_values_from_batch(&batch)
 }
 
@@ -1958,7 +1958,7 @@ async fn hidden_hits_user_ids(
             .await
             .map_err(QueryError::ManifestLoad)?
             .ok_or_else(|| {
-                QueryError::Execute(format!("hidden superfile {uri:?} missing from manifest"))
+                QueryError::Internal(format!("hidden superfile {uri:?} missing from manifest"))
             })?;
         // Contiguous span → arithmetic, no read.
         if row_id_from_manifest_entry(&entry, 0).is_some() {
@@ -2080,7 +2080,7 @@ pub(crate) fn hits_id_score_batch(
     let mut scores = Vec::with_capacity(hits.len());
     for hit in hits {
         let id = hit.stable_id.ok_or_else(|| {
-            QueryError::Execute(format!(
+            QueryError::Internal(format!(
                 "hit {:?}/{} missing stable _id before output materialization",
                 hit.superfile, hit.local_doc_id
             ))
@@ -2088,7 +2088,7 @@ pub(crate) fn hits_id_score_batch(
         ids.push(id);
         scores.push(hit.score);
     }
-    id_score_batch(user_reader, &ids, &scores).map_err(|e| QueryError::Execute(e.to_string()))
+    id_score_batch(user_reader, &ids, &scores).map_err(|e| QueryError::Internal(e.to_string()))
 }
 
 /// Locate each hit's user-table `(superfile, local_doc_id)` for scalar
@@ -2137,7 +2137,7 @@ pub(crate) async fn user_placement_for_scalar_resolve(
             )
             .await?[0]
         } else {
-            return Err(QueryError::Execute(format!(
+            return Err(QueryError::Internal(format!(
                 "hit superfile {:?} missing from manifests",
                 hit.superfile
             )));
@@ -2324,7 +2324,7 @@ async fn collect_hnsw_plane(
         };
         for row in rows {
             if row.encoded.codes.len() != stride {
-                return Err(QueryError::Execute(format!(
+                return Err(QueryError::Internal(format!(
                     "hnsw: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
                     row.encoded.codes.len()
                 )));
@@ -2723,14 +2723,14 @@ async fn gather_sq16_rows(
             stable_ids_by_local_for_routing(manifest, entry, reader.as_ref(), op_stats).await?;
         for row in rows {
             if row.encoded.codes.len() != stride {
-                return Err(QueryError::Execute(format!(
+                return Err(QueryError::Internal(format!(
                     "vector index: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
                     row.encoded.codes.len()
                 )));
             }
             let local = row.local_doc_id as usize;
             let stable_id = *ids.get(local).ok_or_else(|| {
-                QueryError::Execute(format!(
+                QueryError::Internal(format!(
                     "vector index: local_doc_id {local} out of range ({} ids) on `{column}`",
                     ids.len()
                 ))
@@ -2889,7 +2889,7 @@ pub(crate) async fn assemble_flat_sections(
         },
     )
     .await
-    .map_err(|e| QueryError::Execute(e.to_string()))?;
+    .map_err(|e| QueryError::Internal(e.to_string()))?;
     if recall < floor {
         return Ok(IndexOutcome::Unavailable(
             IndexUnavailable::BelowRegisterFloor { recall, floor },
@@ -3044,7 +3044,7 @@ pub(crate) async fn assemble_hnsw_sections(
             },
         )
         .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        .map_err(|e| QueryError::Internal(e.to_string()))?;
         if !pchoice.registered {
             tracing::info!(
                 column,
@@ -3211,7 +3211,7 @@ pub(crate) async fn assemble_hnsw_sections(
         },
     )
     .await
-    .map_err(|e| QueryError::Execute(e.to_string()))?;
+    .map_err(|e| QueryError::Internal(e.to_string()))?;
     if !choice.registered {
         tracing::info!(
             column,
@@ -3356,14 +3356,14 @@ pub(crate) async fn assemble_hnsw_incremental(
             stable_ids_by_local_for_routing(manifest, entry, reader.as_ref(), op_stats).await?;
         for row in rows {
             if row.encoded.codes.len() != stride {
-                return Err(QueryError::Execute(format!(
+                return Err(QueryError::Internal(format!(
                     "hnsw: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
                     row.encoded.codes.len()
                 )));
             }
             let local = row.local_doc_id as usize;
             let stable_id = *ids.get(local).ok_or_else(|| {
-                QueryError::Execute(format!(
+                QueryError::Internal(format!(
                     "hnsw: local_doc_id {local} out of range ({} ids) on `{column}`",
                     ids.len()
                 ))
@@ -3598,7 +3598,7 @@ pub(crate) async fn assemble_hnsw_incremental(
         },
     )
     .await
-    .map_err(|e| QueryError::Execute(e.to_string()))?;
+    .map_err(|e| QueryError::Internal(e.to_string()))?;
     if recall < floor {
         return Ok(IndexOutcome::Unavailable(
             IndexUnavailable::BelowRegisterFloor { recall, floor },
@@ -3744,7 +3744,7 @@ impl SupertableReader {
             },
         )
         .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        .map_err(|e| QueryError::Internal(e.to_string()))?;
         Ok(IndexOutcome::Ready(top_k_ascending(vec![hits], k)))
     }
 
@@ -3902,7 +3902,7 @@ impl SupertableReader {
             },
         )
         .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        .map_err(|e| QueryError::Internal(e.to_string()))?;
         Ok(IndexOutcome::Ready(top_k_ascending(vec![hits], k)))
     }
 
@@ -4054,7 +4054,7 @@ impl SupertableReader {
                     let read = section
                         .read_cell(entry.superfile_id, column, d.cell_id)
                         .map_err(|e| {
-                            QueryError::Execute(format!("centroid section spill read: {e}"))
+                            QueryError::Internal(format!("centroid section spill read: {e}"))
                         })?;
                     let Some(fp32) = read else {
                         leftovers.push(d);
@@ -4114,7 +4114,7 @@ impl SupertableReader {
         };
         if let Some(d) = deferred.first() {
             let entry = &superfiles[d.si];
-            return Err(QueryError::Execute(format!(
+            return Err(QueryError::Internal(format!(
                 "deferred admit rescore: no manifest-published fp32 covers superfile {} column \
                  {column} cell {:?} ({} cell(s) uncovered) — the centroid section / full parts \
                  must cover every stripped summary cell",
@@ -4153,21 +4153,20 @@ impl SupertableReader {
     /// cells, take one global shortlist cut, and exact-rerank where the winners
     /// live. The router overrides only cluster SELECTION; the byte fetch, 1-bit
     /// shortlist, rerank, and id remap are the stamped path's own code.
+    /// `metric` is `column`'s, already resolved by the caller's up-front check.
     async fn global_fine_fanout(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
         column: &str,
+        metric: Metric,
         query: &[f32],
         k: usize,
         options: &VectorSearchOptions,
         fanout: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
-        let metric = column_metric(&manifest.options.vector_columns, column).ok_or_else(|| {
-            QueryError::Execute(format!("global-fine: unknown vector column `{column}`"))
-        })?;
         let section = self.centroid_section().await.ok_or_else(|| {
-            QueryError::Execute("global-fine: centroid section unavailable".into())
+            QueryError::Internal("global-fine: centroid section unavailable".into())
         })?;
         // Path-scoped rerank: a caller-set `rerank_mult` wins, else this
         // path's own configured default — never the shared 256 that serves
@@ -4292,7 +4291,7 @@ impl SupertableReader {
                         Some(budget),
                     )
                     .await
-                    .map_err(|e| QueryError::Execute(e.to_string()))?;
+                    .map_err(|e| QueryError::Internal(e.to_string()))?;
                 Ok::<_, QueryError>((si, scan))
             });
         }
@@ -4347,7 +4346,7 @@ impl SupertableReader {
                 let (hits, rerank_ns) = reader
                     .vector_rerank_selected(column, query, k, selected, None)
                     .await
-                    .map_err(|e| QueryError::Execute(e.to_string()))?;
+                    .map_err(|e| QueryError::Internal(e.to_string()))?;
                 if let Some(stats) = &self.op_stats {
                     stats.add_kernel_cpu_ns(rerank_ns);
                 }
@@ -4483,12 +4482,12 @@ impl SupertableReader {
             .iter()
             .find(|vc| vc.column == column)
             .ok_or_else(|| {
-                QueryError::Execute(format!("eager centroid-router: unknown column `{column}`"))
+                QueryError::Internal(format!("eager centroid-router: unknown column `{column}`"))
             })?;
         let dim = vector_config.dim;
         let metric = vector_config.metric;
         let section = self.centroid_section().await.ok_or_else(|| {
-            QueryError::Execute("eager centroid-router: centroid section unavailable".into())
+            QueryError::Internal("eager centroid-router: centroid section unavailable".into())
         })?;
         let entries = manifest
             .get_all_superfiles_loaded()
@@ -4537,19 +4536,28 @@ impl SupertableReader {
         // Unfiltered hidden path only; `stamped` (or a filtered/user-table
         // query) leaves the stamped-law path below untouched.
         let vcfg = &config::global().vector;
-        // Validate the queried column exists BEFORE any serving branch. An
-        // undeclared column is a caller error and must be rejected uniformly —
-        // otherwise a drained table would answer an unknown-column query from
-        // the graph (which carries its own column check but is reached first),
-        // while an undrained table rejects it later at the grid lookup.
-        if !manifest
+        // Validate the query BEFORE any serving branch. An undeclared column or
+        // a query vector of the wrong length is a caller error and must be
+        // rejected uniformly, as `InvalidQuery`: otherwise a drained table would
+        // answer an unknown-column query from the graph (which carries its own
+        // column check but is reached first), while an undrained table rejects
+        // it later at the grid lookup, and a wrong length would surface deep in
+        // the probe as if the stored index were at fault.
+        let Some(vector_config) = manifest
             .options
             .vector_columns
             .iter()
-            .any(|vc| vc.column == column)
-        {
-            return Err(QueryError::Execute(format!(
+            .find(|vc| vc.column == column)
+        else {
+            return Err(QueryError::InvalidQuery(format!(
                 "unknown vector column `{column}`"
+            )));
+        };
+        if query.len() != vector_config.dim {
+            return Err(QueryError::InvalidQuery(format!(
+                "query vector has {} dimensions; column `{column}` has {}",
+                query.len(),
+                vector_config.dim
             )));
         }
         // HNSW search mode (`vector.search_mode = hnsw_ivf`): walk the
@@ -4626,7 +4634,15 @@ impl SupertableReader {
             && resolved_fanout > 0
         {
             return self
-                .global_fine_fanout(&superfiles, column, query, k, &options, resolved_fanout)
+                .global_fine_fanout(
+                    &superfiles,
+                    column,
+                    vector_config.metric,
+                    query,
+                    k,
+                    &options,
+                    resolved_fanout,
+                )
                 .await;
         }
         // Borrow routing — do not clone the VectorCell centroid grid just to
@@ -4679,17 +4695,10 @@ impl SupertableReader {
         // fp32 centroids. Rank every (superfile, cluster) with [`distance`]
         // on the resident centroid slices (zero-copy, no dequant), then
         // probe only the globally-closest clusters.
-        // Undeclared column = caller error, rejected here — not a silent
-        // L2Sq default that fails later with a per-superfile decode error.
-        // `rot_seed` feeds the 1-bit admit prefilter (same rotation as the
-        // column's row codes).
-        let (metric, rot_seed) = manifest
-            .options
-            .vector_columns
-            .iter()
-            .find(|vc| vc.column == column)
-            .map(|vc| (vc.metric, vc.rot_seed))
-            .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
+        // The column's own metric, never a default: the up-front check above
+        // resolved it. `rot_seed` feeds the 1-bit admit prefilter (same
+        // rotation as the column's row codes).
+        let (metric, rot_seed) = (vector_config.metric, vector_config.rot_seed);
 
         let grid = manifest
             .global_vector_index()
@@ -4786,7 +4795,7 @@ impl SupertableReader {
             // override on top.
             let mut cell_routing = if hidden_vector_index {
                 let base = hidden_routing.ok_or_else(|| {
-                    QueryError::Execute("hidden manifest missing cell routing".into())
+                    QueryError::Internal("hidden manifest missing cell routing".into())
                 })?;
                 if filtered {
                     // Allow-set queries widen to the filtered floor and
@@ -4956,7 +4965,7 @@ impl SupertableReader {
                 .copied()
                 .collect();
             if ranked_for_beam.is_empty() {
-                return Err(QueryError::Execute(
+                return Err(QueryError::Internal(
                     "vector candidates name no cell present in the grid — \
                      malformed cell tags"
                         .into(),
@@ -5697,7 +5706,7 @@ impl SupertableReader {
                 // differently-seeded unit, fail the query loudly instead of
                 // silently ranking incomparable estimates.
                 if pooled.windows(2).any(|w| w[0].1 != w[1].1) {
-                    return Err(QueryError::Execute(
+                    return Err(QueryError::Internal(
                         "pooled 1-bit estimates require one rotation seed per column".into(),
                     ));
                 }
@@ -6141,7 +6150,7 @@ impl SupertableReader {
                 .await
                 .map_err(QueryError::ManifestLoad)?
                 .ok_or_else(|| {
-                    QueryError::Execute(format!("user superfile {uri:?} missing from manifest"))
+                    QueryError::Internal(format!("user superfile {uri:?} missing from manifest"))
                 })?;
             if row_id_from_manifest_entry(&entry, 0).is_some() {
                 for local in bm.iter() {
@@ -6216,7 +6225,7 @@ impl SupertableReader {
                 .prepare_vector_stable_allow_async(Arc::new(stable_ids))
                 .await?;
             if !prepared.use_hidden_index {
-                return Err(QueryError::Execute(
+                return Err(QueryError::Internal(
                     "drained filtered-vector ids resolved to a user allow-set instead of the \
                      hidden index"
                         .into(),
@@ -6301,7 +6310,7 @@ impl SupertableReader {
                     })
                     .await?;
                 if allow_by_uri.is_empty() {
-                    return Err(QueryError::Execute(
+                    return Err(QueryError::Internal(
                         "global allow ids for drained filtered-vector rows did not map to any \
                          hidden superfile"
                             .into(),
@@ -6313,7 +6322,7 @@ impl SupertableReader {
                 });
             }
             if !drained.is_empty() {
-                return Err(QueryError::Execute(
+                return Err(QueryError::Internal(
                     "hidden vector manifest has drained ranges but no hidden superfiles".into(),
                 ));
             }
@@ -6514,7 +6523,7 @@ impl SupertableReader {
                     })
                     .await?;
                 if allow_by_uri.is_empty() {
-                    return Err(QueryError::Execute(
+                    return Err(QueryError::Internal(
                         "stable ids for drained filtered-vector rows did not map to any hidden \
                          superfile"
                             .into(),
@@ -6526,7 +6535,7 @@ impl SupertableReader {
                 });
             }
             if !drained.is_empty() {
-                return Err(QueryError::Execute(
+                return Err(QueryError::Internal(
                     "hidden vector manifest has drained ranges but no hidden superfiles".into(),
                 ));
             }
@@ -6620,7 +6629,7 @@ impl SupertableReader {
         }
         if prepared.use_hidden_index {
             let vit = self.vector_index_table().ok_or_else(|| {
-                QueryError::Execute("prepared hidden allow-set but no hidden index table".into())
+                QueryError::Internal("prepared hidden allow-set but no hidden index table".into())
             })?;
             let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
             let superfiles = hidden_reader
@@ -6717,7 +6726,7 @@ impl SupertableReader {
                         all.insert_range(0..r.n_docs() as u32);
                         Ok(all)
                     }
-                    None => Err(QueryError::Execute(
+                    None => Err(QueryError::Internal(
                         "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
                     )),
                 }
@@ -6800,7 +6809,7 @@ impl SupertableReader {
             // were ever reclaimed, return incomplete results). A genuinely absent
             // index (never configured, or pre-first-drain) falls back.
             if let Some(reason) = self.hidden_index_open_error() {
-                return Err(QueryError::Execute(format!(
+                return Err(QueryError::Internal(format!(
                     "hidden vector index present but failed to open: {reason}"
                 )));
             }
@@ -6832,7 +6841,7 @@ impl SupertableReader {
             vit.ensure_fresh_async().await;
             vit.pinned_reader_with(self.op_stats.clone())
                 .hidden_deleted_ids()
-                .map_err(|error| QueryError::Execute(error.to_string()))
+                .map_err(|error| QueryError::Internal(error.to_string()))
         };
         let user_parts = self.manifest().get_undrained_superfiles_loaded(&drained);
         // Three concurrent legs, one span each: which one the query waited on
@@ -6866,7 +6875,7 @@ impl SupertableReader {
         loop {
             let mut combined = top_k_ascending(vec![hidden_hits, user_hits], requested);
             if let Some(hit) = combined.iter().find(|hit| hit.stable_id.is_none()) {
-                return Err(QueryError::Execute(format!(
+                return Err(QueryError::Internal(format!(
                     "hit {:?}/{} missing stable _id before combined delete filtering",
                     hit.superfile, hit.local_doc_id
                 )));
@@ -7029,7 +7038,7 @@ impl SupertableReader {
             {
                 let batch = hits_id_score_batch(self, &hits)?
                     .project(&indices)
-                    .map_err(|e| QueryError::Execute(e.to_string()))?;
+                    .map_err(|e| QueryError::Internal(e.to_string()))?;
                 return Ok(vec![batch]);
             }
             let resolve = async {
@@ -8951,9 +8960,32 @@ mod tests {
         // not the old shape (silent metric default + blind per-superfile
         // probe, surfacing later as a kernel decode error).
         assert!(
-            matches!(&err, QueryError::Execute(m) if m.contains("unknown vector column")),
+            matches!(&err, QueryError::InvalidQuery(m) if m.contains("unknown vector column")),
             "got {err:?}"
         );
+    }
+
+    /// A query vector of the wrong length is the caller's mistake, named as
+    /// such before any probe runs, not a mismatch found deep in the index.
+    #[test]
+    fn vector_search_wrong_dimension_errors() {
+        let dim = 16;
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
+        let mut w = st.writer().expect("writer");
+        let schema = st.options().schema.clone();
+        w.append(&build_vector_batch(0, 8, dim, schema)).expect("a");
+        w.commit().expect("c");
+        let r = st.reader().expect("reader");
+        for len in [dim - 1, dim + 1] {
+            let q = vec![0.1f32; len];
+            let err = r
+                .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
+                .expect_err("expected error");
+            assert!(
+                matches!(&err, QueryError::InvalidQuery(m) if m.contains("dimensions")),
+                "len {len}: got {err:?}"
+            );
+        }
     }
 
     // ---- Tombstone filter helper: direct-call coverage --------------

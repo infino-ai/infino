@@ -135,7 +135,7 @@ pub(crate) fn verify_superfile_vector_codecs(
         return Ok(());
     }
     let vector = reader.vec().ok_or_else(|| {
-        QueryError::Execute("superfile is missing configured vector index".into())
+        QueryError::Internal("superfile is missing configured vector index".into())
     })?;
     for config in expected {
         let mut matched = false;
@@ -148,7 +148,7 @@ pub(crate) fn verify_superfile_vector_codecs(
             let usable = stored.supports_metric(config.metric)
                 && (!vector.is_multi_cell() || stored.is_ivf_mergeable());
             if !usable {
-                return Err(QueryError::Execute(format!(
+                return Err(QueryError::Internal(format!(
                     "vector codec {} stored for {:?} cannot serve this table (metric {:?}{})",
                     stored.name(),
                     config.column,
@@ -162,7 +162,7 @@ pub(crate) fn verify_superfile_vector_codecs(
             }
         }
         if !matched {
-            return Err(QueryError::Execute(format!(
+            return Err(QueryError::Internal(format!(
                 "superfile is missing configured vector column {:?}",
                 config.column
             )));
@@ -332,7 +332,7 @@ pub(crate) async fn attach_stable_ids(
         let (batch, decode_ns) = op_stats::timed_section(|| {
             reader
                 .take_by_local_doc_ids(&locals, &[id_column])
-                .map_err(|error| QueryError::Execute(error.to_string()))
+                .map_err(|error| QueryError::Internal(error.to_string()))
         });
         if let Some(stats) = op_stats {
             stats.add_kernel_cpu_ns(decode_ns);
@@ -341,13 +341,13 @@ pub(crate) async fn attach_stable_ids(
     } else {
         take_rows_byte_source(reader, &locals, &[id_column])
             .await
-            .map_err(|error| QueryError::Execute(error.to_string()))?
+            .map_err(|error| QueryError::Internal(error.to_string()))?
     };
     let ids = batch
         .column(0)
         .as_any()
         .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
+        .ok_or_else(|| QueryError::Internal("_id column missing".into()))?;
     for (hit, id) in hits.iter_mut().zip(ids.values()) {
         hit.stable_id = Some(*id);
     }
@@ -374,9 +374,9 @@ pub(crate) async fn attach_stable_ids_to_hits(
     // dominated large-k scored latency on real corpora.
     stamp_stable_ids(table_reader, hits)
         .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        .map_err(|e| QueryError::Internal(e.to_string()))?;
     if let Some(missing) = hits.iter().find(|h| h.stable_id.is_none()) {
-        return Err(QueryError::Execute(format!(
+        return Err(QueryError::Internal(format!(
             "hit {:?}/{} missing stable _id after search-wave stamping",
             missing.superfile, missing.local_doc_id
         )));
@@ -415,7 +415,7 @@ pub(crate) async fn apply_resolved_tombstone_filter(
         let (batch, decode_ns) = op_stats::timed_section(|| {
             reader
                 .take_by_local_doc_ids(&locals, &[id_column])
-                .map_err(|e| QueryError::Execute(e.to_string()))
+                .map_err(|e| QueryError::Internal(e.to_string()))
         });
         if let Some(stats) = op_stats {
             stats.add_kernel_cpu_ns(decode_ns);
@@ -423,13 +423,13 @@ pub(crate) async fn apply_resolved_tombstone_filter(
         batch?
     } else {
         let storage = storage.ok_or_else(|| {
-            QueryError::Execute(
+            QueryError::Internal(
                 "MultiCell tombstone resolve needs resident bytes or storage".into(),
             )
         })?;
         let (object_store, path) = storage
             .object_store_handle(&entry.storage_path())
-            .ok_or_else(|| QueryError::Execute("no object_store handle for superfile".into()))?;
+            .ok_or_else(|| QueryError::Internal("no object_store handle for superfile".into()))?;
         let file_size = entry
             .subsection_offsets
             .as_ref()
@@ -444,13 +444,13 @@ pub(crate) async fn apply_resolved_tombstone_filter(
             &[id_column],
         )
         .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?
+        .map_err(|e| QueryError::Internal(e.to_string()))?
     };
     let ids = batch
         .column(0)
         .as_any()
         .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
+        .ok_or_else(|| QueryError::Internal("_id column missing".into()))?;
     let deleted: HashSet<i128> = ids.values().iter().copied().collect();
     hits.retain(|hit| hit.stable_id.is_none_or(|id| !deleted.contains(&id)));
     Ok(())
@@ -477,7 +477,7 @@ async fn stable_ids_for_tagged_hits(
         && let Some(ids) = v
             .inline_stable_ids_for_locals_async(locals)
             .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+            .map_err(|e| QueryError::Internal(e.to_string()))?
     {
         return Ok(Some(ids));
     }
@@ -493,12 +493,12 @@ async fn stable_ids_for_tagged_hits(
     let id_column = reader.id_column();
     let batch = reader
         .take_by_local_doc_ids(locals, &[id_column])
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        .map_err(|e| QueryError::Internal(e.to_string()))?;
     let array = batch
         .column(0)
         .as_any()
         .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
+        .ok_or_else(|| QueryError::Internal("_id column missing".into()))?;
     Ok(Some(array.values().to_vec()))
 }
 

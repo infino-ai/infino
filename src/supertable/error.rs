@@ -197,7 +197,9 @@ impl BuildError {
     /// compare-and-set race, so reissuing against fresh state can succeed.
     pub(crate) fn is_conflict(&self) -> bool {
         match self {
-            BuildError::WriteContention => true,
+            // Another writer holds this table's single writer slot: the same
+            // retry-after-the-other-writer answer as a lost commit race.
+            BuildError::WriteContention | BuildError::SupertableInUse => true,
             BuildError::StorageConstruction(e) => e.is_conflict(),
             _ => false,
         }
@@ -640,8 +642,22 @@ pub enum QueryError {
     #[error("failed to plan the query: {0}")]
     Plan(String),
 
+    /// The engine broke one of its own invariants: a superfile without the
+    /// `_id` column every superfile has, a hit the pipeline failed to stamp,
+    /// a build that left out what it must carry. Neither the caller nor a
+    /// retry can fix it; it is a bug, and maps to the public `Backend`. A
+    /// caller's mistake is [`Self::InvalidQuery`], a failed read
+    /// [`Self::Store`] or [`Self::Parquet`].
     #[error("failed to run the query: {0}")]
-    Execute(String),
+    Internal(String),
+
+    /// A DataFusion plan failed while it ran. Its cause is not told apart:
+    /// a predicate that fails on the caller's own data (a bad cast, pushed
+    /// down into the parquet scan) arrives as text, the same way a failed
+    /// read does. So it keeps the public `Query` it has always had, rather
+    /// than calling a caller's mistake an engine fault.
+    #[error("failed to run the query: {0}")]
+    DataFusion(String),
 
     /// A query crossed the connection memory budget. The string is already
     /// labelled with the operation; routes to `InfinoError::OverBudget` via
