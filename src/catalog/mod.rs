@@ -1471,7 +1471,8 @@ mod tests {
 
     use arrow::util::pretty::pretty_format_batches;
     use arrow_array::{
-        Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, StringViewArray,
+        Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, StringArray,
+        StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
@@ -4772,6 +4773,110 @@ mod tests {
             .flat_map(|b| column(b, 0).into_iter().zip(column(b, 1)))
             .collect();
         assert_eq!(reached, TRAVERSAL_FROM_1);
+    }
+
+    /// Append `edges` to the edge table `kedges`, creating it on first use, each row with its
+    /// source's key, `n<id>`.
+    fn keyed_edges(conn: &Connection, edges: &[(i64, i64)]) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("src", DataType::Int64, false),
+            Field::new("dst", DataType::Int64, false),
+            Field::new("src_key", DataType::Utf8, false),
+        ]));
+        let (src, dst): (Vec<i64>, Vec<i64>) = edges.iter().copied().unzip();
+        let keys: Vec<String> = src.iter().map(|s| format!("n{s}")).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(src)),
+                Arc::new(Int64Array::from(dst)),
+                Arc::new(StringArray::from(keys)),
+            ],
+        )
+        .expect("edge batch");
+        let table = match conn.open_table("kedges") {
+            Ok(table) => table,
+            Err(_) => conn
+                .create_table("kedges", schema, IndexSpec::new())
+                .expect("create kedges"),
+        };
+        table.append(&batch).expect("append edges");
+    }
+
+    /// `(node, hop)` of every row a statement returns, from its first two columns.
+    fn node_hops(conn: &Connection, sql: &str) -> Vec<(i64, i64)> {
+        let batches = conn.query_sql(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let column = |batch: &RecordBatch, i: usize| {
+            batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 column")
+                .values()
+                .to_vec()
+        };
+        let mut rows: Vec<(i64, i64)> = batches
+            .iter()
+            .flat_map(|b| column(b, 0).into_iter().zip(column(b, 1)))
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    #[test]
+    fn graph_walk_answers_what_the_recursive_walk_answers() {
+        // The same walk two ways over one edge table: the recursive CTE scans the table per hop,
+        // `graph_walk` walks its cached adjacency list. Same nodes, same shortest hops; the seed
+        // is hop 0 in `graph_walk` only. An append publishes a new snapshot, and the next walk
+        // sees the new edge rather than the cached graph.
+        let conn = connect("memory://").expect("connect");
+        keyed_edges(&conn, &TRAVERSAL_EDGES);
+        let walk = "SELECT node, hop FROM graph_walk('kedges', 'src', 'dst', 'src_key', 3, 100, \
+                    'n1') WHERE hop > 0";
+        let recursive = "WITH RECURSIVE walk AS ( \
+                           SELECT dst AS node, 1 AS hop FROM kedges WHERE src = 1 \
+                           UNION ALL \
+                           SELECT e.dst, w.hop + 1 FROM walk w JOIN kedges e ON e.src = w.node \
+                           WHERE w.hop < 3) \
+                         SELECT node, MIN(hop) AS hop FROM walk WHERE node <> 1 GROUP BY node";
+        assert_eq!(node_hops(&conn, walk), node_hops(&conn, recursive));
+        assert_eq!(node_hops(&conn, walk), TRAVERSAL_FROM_1.to_vec());
+
+        keyed_edges(&conn, &[(5, 6)]);
+        assert_eq!(
+            node_hops(&conn, walk),
+            node_hops(&conn, recursive),
+            "the walk after an append matches the recursive walk"
+        );
+        assert!(
+            node_hops(&conn, walk).contains(&(6, 3)),
+            "and reaches the appended edge's node"
+        );
+
+        let keys = conn
+            .query_sql(
+                "SELECT key FROM graph_walk('kedges', 'src', 'dst', 'src_key', 1, 100, 'n2', \
+                 'no such node') ORDER BY hop, key",
+            )
+            .expect("walk by key");
+        let keys: Vec<String> = keys
+            .iter()
+            .flat_map(|b| {
+                let col = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 key");
+                (0..col.len())
+                    .map(|i| col.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["n2", "n3", "n5"],
+            "the seed, then its neighbours by key; an unknown seed reaches nothing"
+        );
     }
 
     /// Exhaustive over `LogicalPlan`, so a DataFusion upgrade that adds a variant fails to compile

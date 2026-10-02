@@ -14,6 +14,7 @@
 
 pub mod common;
 pub mod fts_exec;
+pub(crate) mod graph_exec;
 pub mod hybrid_exec;
 pub mod match_exec;
 pub mod metered_exec;

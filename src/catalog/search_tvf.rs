@@ -40,6 +40,7 @@ use crate::{
         query::exec::{
             common::arg_to_string,
             fts_exec::{BM25_PREFIX_UDTF, BM25_SEARCH_UDTF, Bm25PrefixFunc, Bm25SearchFunc},
+            graph_exec::{GRAPH_WALK_UDTF, GraphWalkFunc},
             hybrid_exec::{HYBRID_SEARCH_UDTF, HybridSearchFunc},
             match_exec::{EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_UDTF, TokenMatchFunc},
             vector_exec::{VECTOR_SEARCH_UDTF, VectorSearchFunc},
@@ -174,8 +175,23 @@ pub(crate) fn register_search_tvfs(ctx: &SessionContext, conn: Connection) {
     );
     ctx.register_udtf(
         HYBRID_SEARCH_UDTF,
-        Arc::new(HybridSearchCatalogFunc { resolver }),
+        Arc::new(HybridSearchCatalogFunc {
+            resolver: Arc::clone(&resolver),
+        }),
     );
+    ctx.register_udtf(GRAPH_WALK_UDTF, Arc::new(GraphWalkCatalogFunc { resolver }));
+}
+
+#[derive(Debug)]
+struct GraphWalkCatalogFunc {
+    resolver: Arc<TableResolver>,
+}
+impl TableFunctionImpl for GraphWalkCatalogFunc {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let (t, rest) = self.resolver.split_leading(args.exprs(), "graph_walk")?;
+
+        GraphWalkFunc::new(t.reader).call_with_args(TableFunctionArgs::new(rest, args.session()))
+    }
 }
 
 #[derive(Debug)]

@@ -81,8 +81,8 @@ use crate::{
             covered_agg::CoveredAggregateRewrite,
             exec::{
                 common::collect_plan_metered, fts_exec::register_bm25,
-                hybrid_exec::register_hybrid_search, match_exec::register_match,
-                vector_exec::register_vector_search,
+                graph_exec::register_graph_walk, hybrid_exec::register_hybrid_search,
+                match_exec::register_match, vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
         },
@@ -351,7 +351,7 @@ impl SupertableReader {
     /// Freshness policy is applied when the reader is created by
     /// [`Supertable::reader`](crate::supertable::handle::Supertable::reader).
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
-    fn sql_session_context(&self) -> Result<SessionContext, QueryError> {
+    pub(crate) fn sql_session_context(&self) -> Result<SessionContext, QueryError> {
         // This reader already pins the snapshot; clone is a handful of
         // Arc refcount bumps. Detach any per-query work collector: this
         // context is CACHED across queries, and a collector riding into it
@@ -432,6 +432,8 @@ impl SupertableReader {
         // Unranked token / exact match TVFs (siblings of bm25_search).
         register_match(&ctx, Arc::clone(&reader), schemas.scalar().clone());
         register_hybrid_search(&ctx, Arc::clone(&reader), schemas.scalar().clone());
+        // Bounded walks over a table of edges.
+        register_graph_walk(&ctx, Arc::clone(&reader));
 
         Ok(ctx)
     }

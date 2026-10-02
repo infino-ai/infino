@@ -58,6 +58,7 @@ use crate::{
         options::Consistency,
         query::{
             fts::GlobalIdfCache,
+            graph::CachedEdgeGraph,
             scalar_cache::DecodedScalarCache,
             sql::{SqlSchemas, build_sql_schemas},
         },
@@ -183,6 +184,12 @@ pub(super) struct SupertableInner {
     /// tombstone overlays and query-stable functions retain their semantics.
     pub(super) sql_logical_plan_cache:
         Mutex<Option<(Arc<ManifestSnapshot>, HashMap<String, LogicalPlan>)>>,
+    /// The table's rows as an adjacency list for `graph_walk`, keyed on the
+    /// manifest `Arc` and the three columns it was built from, like
+    /// `sql_session_cache`: a commit publishes a new manifest and the next
+    /// walk rebuilds it. One slot — an edge table is walked over one set of
+    /// columns.
+    pub(super) graph_cache: Mutex<Option<CachedEdgeGraph>>,
     /// Bounded decoded-row cache shared by all readers of this immutable
     /// supertable handle.
     pub(super) decoded_scalar_cache: DecodedScalarCache,
@@ -1839,6 +1846,7 @@ async fn build_handle(
         id_generator: Mutex::new(id_generator),
         sql_session_cache: Mutex::new(None),
         sql_logical_plan_cache: Mutex::new(None),
+        graph_cache: Mutex::new(None),
         decoded_scalar_cache: DecodedScalarCache::default(),
         global_idf_cache: GlobalIdfCache::default(),
         term_stats_cache: StdRwLock::new(None),
@@ -2360,6 +2368,12 @@ impl SupertableReader {
         &self,
     ) -> &Mutex<Option<(Arc<ManifestSnapshot>, SessionContext)>> {
         &self.inner.sql_session_cache
+    }
+
+    /// Cached adjacency list for `graph_walk` over this table (see
+    /// [`CachedEdgeGraph`]).
+    pub(crate) fn graph_cache(&self) -> &Mutex<Option<CachedEdgeGraph>> {
+        &self.inner.graph_cache
     }
 
     /// Cached deterministic scalar SQL plans for this reader's manifest.
