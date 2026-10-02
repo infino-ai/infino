@@ -48,7 +48,7 @@ const RSS_MEDIAN_PERCENTILE: usize = 50;
 const RSS_P90_PERCENTILE: usize = 90;
 /// Divisor converting a percentile rank to a `[0, 1]` fraction.
 const PERCENT_SCALE: f64 = 100.0;
-/// Process status file carrying `VmRSS`.
+/// Process status file carrying `VmRSS` and `RssAnon`.
 const PROC_SELF_STATUS: &str = "/proc/self/status";
 /// System memory summary carrying `MemAvailable`.
 const PROC_MEMINFO: &str = "/proc/meminfo";
@@ -60,18 +60,34 @@ const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
 /// cgroup v2 memory ceiling, or the literal `max`.
 const CGROUP_MEMORY_MAX: &str = "memory.max";
+/// cgroup v2 memory throttle, or the literal `max`.
+const CGROUP_MEMORY_HIGH: &str = "memory.high";
 /// cgroup v2 current charge: anonymous, page cache and kernel memory.
 const CGROUP_MEMORY_CURRENT: &str = "memory.current";
 /// cgroup v2 breakdown of that charge, read for its reclaimable part.
 const CGROUP_MEMORY_STAT: &str = "memory.stat";
-/// `memory.max` for a cgroup with no ceiling of its own.
+/// `memory.max` or `memory.high` for a cgroup with no limit of its own.
 const CGROUP_UNLIMITED: &str = "max";
 
 /// One-shot read of the calling process's current VmRSS in bytes.
 pub fn current_rss_bytes() -> Option<u64> {
+    status_field_bytes("VmRSS:")
+}
+
+/// The calling process's anonymous resident bytes (`RssAnon`), read from
+/// `/proc/self/status`: the kernel's counter, with no allocator purge and no
+/// walk of the mappings, so it is cheap enough to poll while a query runs.
+/// Unlike [`current_anon_rss_bytes`] it includes pages the allocator has freed
+/// but not yet returned, which is what a memory limit counts.
+pub(crate) fn status_anon_rss_bytes() -> Option<u64> {
+    status_field_bytes("RssAnon:")
+}
+
+/// A `/proc/self/status` field that the kernel reports in kB, in bytes.
+fn status_field_bytes(field: &str) -> Option<u64> {
     let s = fs::read_to_string(PROC_SELF_STATUS).ok()?;
     for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
+        if let Some(rest) = line.strip_prefix(field) {
             let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
             return Some(kb * KIB_TO_BYTES);
         }
@@ -130,11 +146,10 @@ pub fn memory_budget() -> Option<(u64, u64)> {
 /// there and sizes against the whole machine, which is the failure this path
 /// exists to prevent.
 fn cgroup_budget() -> Option<(u64, u64)> {
-    let root = Path::new(CGROUP_MOUNT);
-    let mut dir = cgroup_dir()?;
+    let leaf = cgroup_dir()?;
     let mut tightest: Option<(u64, u64)> = None;
-    loop {
-        if let Some(budget) = cgroup_level_budget(&dir) {
+    for dir in cgroup_levels(Path::new(CGROUP_MOUNT), &leaf) {
+        if let Some(budget) = cgroup_level_budget(dir) {
             tightest = Some(match tightest {
                 // Headroom and ceiling are tracked together rather than
                 // minimised apart: a level's headroom is only meaningful
@@ -144,14 +159,32 @@ fn cgroup_budget() -> Option<(u64, u64)> {
                 _ => budget,
             });
         }
-        if dir == root {
-            return tightest;
-        }
-        match dir.parent() {
-            Some(parent) if parent.starts_with(root) => dir = parent.to_path_buf(),
-            _ => return tightest,
-        }
     }
+    tightest
+}
+
+/// The cgroups whose limits bind a process in `leaf`: `leaf` and each
+/// ancestor up to and including `root`, leaf first.
+fn cgroup_levels<'a>(root: &'a Path, leaf: &'a Path) -> impl Iterator<Item = &'a Path> {
+    leaf.ancestors()
+        .take_while(move |dir| dir.starts_with(root))
+}
+
+/// The tightest memory limit set on this process's cgroup or any ancestor:
+/// the lowest `memory.high` (the throttle) or `memory.max` (the kill) from
+/// its cgroup directory up to the mount root. `None` without cgroup v2, or
+/// where no level sets either.
+pub(crate) fn cgroup_memory_limit_bytes() -> Option<u64> {
+    lowest_cgroup_limit(Path::new(CGROUP_MOUNT), &cgroup_dir()?)
+}
+
+/// [`cgroup_memory_limit_bytes`] over the hierarchy mounted at `root`, from
+/// `leaf` up.
+fn lowest_cgroup_limit(root: &Path, leaf: &Path) -> Option<u64> {
+    cgroup_levels(root, leaf)
+        .flat_map(|dir| [CGROUP_MEMORY_HIGH, CGROUP_MEMORY_MAX].map(|file| dir.join(file)))
+        .filter_map(|file| parse_cgroup_limit(&fs::read_to_string(file).ok()?))
+        .min()
 }
 
 /// Headroom and ceiling for one cgroup directory. `None` when it sets no
@@ -174,7 +207,7 @@ fn cgroup_level_budget(dir: &Path) -> Option<(u64, u64)> {
 }
 
 /// The directory holding this process's own cgroup v2 memory files, the leaf
-/// of the walk in [`cgroup_budget`].
+/// of the walk in [`cgroup_budget`] and [`cgroup_memory_limit_bytes`].
 ///
 /// Not simply the mount root. That is the process's own cgroup only when it
 /// has a private cgroup namespace, which `docker run -m` gives it; a systemd
@@ -214,8 +247,8 @@ fn parse_cgroup_path(raw: &str) -> Option<&str> {
         .map(|path| path.trim().trim_start_matches('/'))
 }
 
-/// `memory.max`, as bytes. `None` for the literal `max`, a cgroup with no
-/// ceiling of its own.
+/// `memory.max` or `memory.high`, as bytes. `None` for the literal `max`, a
+/// cgroup with no limit of its own.
 fn parse_cgroup_limit(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     if raw == CGROUP_UNLIMITED {
@@ -438,6 +471,8 @@ pub fn fmt_bytes(b: u64) -> String {
 mod tests {
     use std::hint::black_box;
 
+    use tempfile::TempDir;
+
     use super::*;
 
     const TEST_SAMPLER_INTERVAL_MS: u64 = 1_000;
@@ -575,5 +610,85 @@ mod tests {
         assert_eq!(memory_stat_field(raw, "slab_reclaimable"), Some(256));
         assert_eq!(memory_stat_field(raw, "file"), Some(2048));
         assert_eq!(memory_stat_field(raw, "absent"), None);
+    }
+
+    /// A worker unit's cgroup, under a fake mount root.
+    const WORKER_CGROUP: &str = "system.slice/worker.service";
+    /// The worker unit's throttle (`memory.high`).
+    const WORKER_HIGH: u64 = 7_516_192_768;
+    /// The worker unit's kill (`memory.max`).
+    const WORKER_MAX: u64 = 8_589_934_592;
+    /// A parent slice's limit, tighter than the worker's own.
+    const PARENT_MAX: u64 = 1000;
+
+    /// A fake cgroup v2 hierarchy: `files` are (path under the root, content).
+    fn hierarchy(files: &[(&str, String)]) -> TempDir {
+        let root = TempDir::new().expect("tempdir");
+        for (path, content) in files {
+            let file = root.path().join(path);
+            fs::create_dir_all(file.parent().expect("a file under the root"))
+                .expect("create cgroup dir");
+            fs::write(file, content).expect("write cgroup file");
+        }
+        root
+    }
+
+    #[test]
+    fn the_cgroup_memory_limit_is_the_lowest_set_on_the_path() {
+        let root = hierarchy(&[
+            ("system.slice/memory.high", CGROUP_UNLIMITED.into()),
+            ("system.slice/memory.max", CGROUP_UNLIMITED.into()),
+            (
+                "system.slice/worker.service/memory.high",
+                WORKER_HIGH.to_string(),
+            ),
+            (
+                "system.slice/worker.service/memory.max",
+                WORKER_MAX.to_string(),
+            ),
+        ]);
+        let leaf = root.path().join(WORKER_CGROUP);
+        assert_eq!(lowest_cgroup_limit(root.path(), &leaf), Some(WORKER_HIGH));
+    }
+
+    #[test]
+    fn a_parent_cgroup_limit_tighter_than_the_leafs_wins() {
+        let root = hierarchy(&[
+            ("system.slice/memory.max", PARENT_MAX.to_string()),
+            (
+                "system.slice/worker.service/memory.max",
+                WORKER_MAX.to_string(),
+            ),
+        ]);
+        let leaf = root.path().join(WORKER_CGROUP);
+        assert_eq!(lowest_cgroup_limit(root.path(), &leaf), Some(PARENT_MAX));
+    }
+
+    #[test]
+    fn a_cgroup_path_with_no_limit_anywhere_has_none() {
+        let root = hierarchy(&[
+            ("system.slice/memory.max", CGROUP_UNLIMITED.into()),
+            (
+                "system.slice/worker.service/memory.high",
+                CGROUP_UNLIMITED.into(),
+            ),
+            (
+                "system.slice/worker.service/memory.max",
+                CGROUP_UNLIMITED.into(),
+            ),
+        ]);
+        let leaf = root.path().join(WORKER_CGROUP);
+        assert_eq!(lowest_cgroup_limit(root.path(), &leaf), None);
+    }
+
+    /// The walk reads the leaf, every ancestor and the mount root, and
+    /// nothing above the root.
+    #[test]
+    fn cgroup_levels_run_from_the_leaf_to_the_mount_root() {
+        let root = Path::new(CGROUP_MOUNT);
+        let leaf = root.join(WORKER_CGROUP);
+        let slice = root.join("system.slice");
+        let levels: Vec<&Path> = cgroup_levels(root, &leaf).collect();
+        assert_eq!(levels, [leaf.as_path(), slice.as_path(), root]);
     }
 }

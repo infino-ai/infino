@@ -15,11 +15,11 @@
 //! orchestrator instead of each re-implementing the fan-out. The
 //! division of labor is the project-wide model:
 //!
-//!   * **tokio bounds I/O concurrency — stays wide.** One `tokio::spawn`
-//!     task per work unit: each opens its superfile reader and runs the
-//!     kernel, so superfile opens and cold object-store range GETs
-//!     across hundreds of superfiles are all in flight at once on the
-//!     shared multi-thread query runtime. Never cap the fan-out's task
+//!   * **tokio bounds I/O concurrency — stays wide.** One spawned tokio
+//!     task per work unit, aborted if its caller goes away: each opens its
+//!     superfile reader and runs the kernel, so superfile opens and cold
+//!     object-store range GETs across hundreds of superfiles are all in
+//!     flight at once on the shared multi-thread query runtime. Never cap the fan-out's task
 //!     count at the reader pool's width — `tokio::spawn` dispatches a
 //!     task, not an OS thread, and object-store GETs are latency-bound,
 //!     so narrowing their concurrency only hurts cold latency.
@@ -42,6 +42,7 @@
 use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
 
 use arrow_array::Decimal128Array;
+use datafusion::common::runtime::SpawnedTask;
 use futures::{
     future::try_join_all,
     stream::{FuturesUnordered, StreamExt},
@@ -599,9 +600,7 @@ impl FanoutContext {
     }
 
     /// [`Self::run`] on its own task on the shared query runtime, so the
-    /// units' cold opens overlap. The join error is flattened into a
-    /// `QueryError` so a collecting caller short-circuits on the first
-    /// failing superfile.
+    /// units' cold opens overlap (see [`spawn_unit`]).
     fn spawn<P, R, B, Fut>(
         &self,
         body: &B,
@@ -625,13 +624,24 @@ impl FanoutContext {
     {
         let ctx = self.clone();
         let body = body.clone();
-        let handle =
-            tokio::spawn(async move { ctx.run(body, entry, params).await }.in_current_span());
-        async move {
-            handle
-                .await
-                .map_err(|e| QueryError::Store(format!("fan-out task join: {e}")))?
-        }
+        spawn_unit(async move { ctx.run(body, entry, params).await }.in_current_span())
+    }
+}
+
+/// `unit` on its own task on the shared query runtime, aborted if the returned
+/// future is dropped first: when a collecting caller short-circuits on another
+/// unit's error, or the statement driving the fan-out is cancelled (a SQL
+/// statement refused for memory). A bare `tokio::spawn` handle would leave the
+/// task fetching and decoding after its caller had gone. The join error is
+/// flattened into a `QueryError`, so a collecting caller short-circuits on
+/// the first failing superfile.
+fn spawn_unit<R: Send + 'static>(
+    unit: impl Future<Output = Result<R, QueryError>> + Send + 'static,
+) -> impl Future<Output = Result<R, QueryError>> {
+    let task = SpawnedTask::spawn(unit);
+    async move {
+        task.await
+            .map_err(|e| QueryError::Store(format!("fan-out task join: {e}")))?
     }
 }
 
@@ -640,11 +650,11 @@ impl FanoutContext {
 /// `R`.
 ///
 /// It warms the tombstone sidecar cache for every distinct superfile in
-/// one batch, `tokio::spawn`s one task per unit on the shared query
-/// runtime (each opening its reader concurrently), then collects every
-/// task with [`futures::future::try_join_all`] — so the **first**
-/// per-superfile error (in time, not spawn order) short-circuits the
-/// whole fan-out and returns early.
+/// one batch, spawns one task per unit on the shared query runtime (each
+/// opening its reader concurrently), then collects every task with
+/// [`futures::future::try_join_all`] — so the **first** per-superfile
+/// error (in time, not spawn order) short-circuits the whole fan-out,
+/// returns early and aborts the units still running (see [`spawn_unit`]).
 ///
 /// `body` runs inside each task with the opened reader, the superfile
 /// entry, the (warmed) tombstone cache + the batch `now` instant, and
@@ -1018,5 +1028,46 @@ mod fanout_tier_tests {
 
         let reopened = Supertable::open(options()).expect("reopen");
         assert_eq!(fanout_tiers(&reopened).await, [0, 0, 0, COMMITS, 0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod spawn_unit_tests {
+    use std::{future::pending, time::Duration};
+
+    use tokio::{sync::oneshot, time::timeout};
+
+    use super::*;
+
+    /// Ample time for an aborted task to be dropped by the runtime.
+    const ABORT_WAIT: Duration = Duration::from_secs(5);
+
+    /// Sends on its channel when dropped: the unit's future was dropped, which
+    /// for a task that never finishes means it was aborted.
+    struct SignalOnDrop(Option<oneshot::Sender<()>>);
+
+    impl Drop for SignalOnDrop {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_a_unit_aborts_its_task() {
+        let (started_tx, started) = oneshot::channel();
+        let (dropped_tx, dropped) = oneshot::channel();
+        let unit = spawn_unit(async move {
+            let _signal = SignalOnDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            pending::<Result<(), QueryError>>().await
+        });
+        started.await.expect("the unit's task started");
+        drop(unit);
+        timeout(ABORT_WAIT, dropped)
+            .await
+            .expect("dropping the unit aborts its task instead of leaving it running")
+            .expect("the task's future was dropped");
     }
 }

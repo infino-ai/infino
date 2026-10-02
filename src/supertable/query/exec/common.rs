@@ -38,6 +38,7 @@ use datafusion::{
     catalog::{Session, TableProvider},
     common::{
         Column, DFSchema, TableReference,
+        runtime::SpawnedTask,
         tree_node::{Transformed, TreeNode},
     },
     datasource::provider_as_source,
@@ -66,6 +67,7 @@ use rayon::prelude::*;
 use tracing::{Instrument, Span};
 
 use crate::{
+    memory::{over_process_limit, process_limit, process_limit_exceeded, process_over_limit},
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::{OpStatsCollector, timed_section},
     superfile::{
@@ -259,6 +261,10 @@ pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
 /// SQL execution site (catalog, reader-level, predicate resolve) goes
 /// through here; error mapping stays with the caller, whose surface it
 /// belongs to.
+///
+/// When the process has a memory limit (see `memory::resident`), the collect
+/// races it, and a process past the limit ends the statement with a
+/// `ResourcesExhausted` refusal.
 pub(crate) async fn collect_plan_metered(
     plan: &Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
@@ -266,7 +272,37 @@ pub(crate) async fn collect_plan_metered(
 ) -> DfResult<Vec<RecordBatch>> {
     let metered: Arc<dyn ExecutionPlan> =
         Arc::new(MeteredExec::new(Arc::clone(plan), op_stats.clone()));
-    let batches = collect(metered, task_ctx).await?;
+    let collected = collect(metered, task_ctx);
+    let batches = match process_limit() {
+        None => collected.await?,
+        // With a process limit, run the collect as its own task and race it
+        // against the sampler. The streamed batches are never reserved, so
+        // this is the only bound on them.
+        //  - over the limit before we start: refuse without spawning anything.
+        //  - own task, because a plan over cached data can finish all its work
+        //    in one poll, so a check in the same task would only run once the
+        //    result is ready.
+        //  - limit wins: dropping the task stops DataFusion's partition tasks
+        //    and the search functions' fan-out. A batch already being
+        //    processed still finishes first.
+        //  - `biased` checks the limit first, so a reading over it wins even if
+        //    the result lands in the same wakeup.
+        Some(limit) => {
+            if let Some(anon) = process_over_limit(limit) {
+                return Err(over_process_limit(anon, limit));
+            }
+            let collecting = SpawnedTask::spawn(collected);
+            tokio::select! {
+                biased;
+                anon = process_limit_exceeded(limit) => {
+                    return Err(over_process_limit(anon, limit));
+                }
+                joined = collecting => {
+                    joined.map_err(|join| DataFusionError::ExecutionJoin(Box::new(join)))??
+                }
+            }
+        }
+    };
     // Harvesting the unwrapped plan and the wrapped one reach the same
     // leaves — the walk dedupes by node identity and sums childless nodes
     // only, and the meter delegates `execute` to this same tree.
