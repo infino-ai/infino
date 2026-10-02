@@ -145,7 +145,10 @@ pub struct Config {
 pub struct MemorySettings {
     /// Per-connection memory (heap) budget in bytes. `0` (the default) is
     /// measure-only: usage is tracked but never refused. A positive value
-    /// enforces a ceiling so one connection can't exhaust process memory.
+    /// enforces a ceiling on what this connection's search and ingest work may
+    /// hold. Compaction is not charged to it — see
+    /// [`ConnectOptions::with_connection_memory_budget_bytes`] — so this is not
+    /// a ceiling on the process.
     ///
     /// Applies to connections built from a config file (`apply_config`). Code
     /// that opens a connection programmatically sets the budget on
