@@ -60,7 +60,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     str::from_utf8,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex, OnceLock, atomic::Ordering},
     thread::available_parallelism,
     time,
 };
@@ -85,7 +85,10 @@ use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::{
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::{
+        Semaphore,
+        mpsc::{Receiver, Sender, channel},
+    },
     time::sleep,
 };
 use tracing::{debug, error, info, warn};
@@ -11225,25 +11228,56 @@ pub(in crate::supertable) async fn finalize_compaction_commit(
     pending_cache_inserts: Vec<(SuperfileUri, Bytes)>,
 ) {
     schedule_background_storage_reclaim(Arc::clone(&inner));
-    if !pending_cache_inserts.is_empty()
-        && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
-    {
-        // Spawned rather than awaited. This runs on the loop that admits
-        // merges and makes commits, and a multi-gigabyte output takes real
-        // time to land in the local cache — time in which no merge starts and
-        // no finished merge commits, so its inputs stay sealed for it. The
-        // warm is best-effort either way: a miss is a cold fetch on first
-        // read, which is what the pre-commit state was anyway.
-        inner.query_runtime().spawn(async move {
-            warm_cache_inserts(&cache, pending_cache_inserts).await;
-        });
+    let budget = inner.options.memory_budget_bytes;
+    let Some(cache) = inner.options.disk_cache.as_ref().cloned() else {
+        return;
+    };
+    if pending_cache_inserts.is_empty() {
+        if let Some(budget) = budget {
+            cache.sweep_for_budget(budget);
+        }
+        return;
     }
-    if let (Some(cache), Some(budget)) = (
-        inner.options.disk_cache.as_ref(),
-        inner.options.memory_budget_bytes,
-    ) {
-        cache.sweep_for_budget(budget);
-    }
+
+    // Spawned rather than awaited. This runs on the loop that admits merges and
+    // makes commits, and a multi-gigabyte output takes real time to land in the
+    // local cache — time in which no merge starts and no finished merge
+    // commits, so its inputs stay sealed for it. The warm is best-effort
+    // either way: a miss is a cold fetch on first read, which is what the
+    // pre-commit state was anyway.
+    //
+    // Permitted, because the blocking call it replaced was the only thing
+    // bounding how many outputs' bytes were held at once. Each pending warm
+    // pins its output until it is written, so an unbounded spawn lets a wide
+    // pass on a slow disk pile up outputs that the old shape could not. With a
+    // permit the held bytes stay in the same order as before while the loop
+    // stays free; a disk that cannot keep up now queues warms instead of
+    // growing the heap, which degrades the cache rather than the process.
+    let permits = warm_permits();
+    inner.query_runtime().spawn(async move {
+        let _permit = permits.acquire_owned().await.expect("never closed");
+        warm_cache_inserts(&cache, pending_cache_inserts).await;
+        // After the warm, not before it: swept ahead of the bytes landing, this
+        // measures a cache that does not yet hold them and leaves it over
+        // budget until some later commit happens to sweep.
+        if let Some(budget) = budget {
+            cache.sweep_for_budget(budget);
+        }
+    });
+}
+
+/// Concurrent post-commit cache warms allowed process-wide.
+///
+/// Two rather than one: a commit's warm should not have to wait out an
+/// unrelated table's, and two outputs in flight is still the same order of held
+/// bytes as the blocking call this replaced.
+fn warm_permits() -> Arc<Semaphore> {
+    static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+    /// Enough to keep a slow disk busy without letting outputs accumulate.
+    const CONCURRENT_WARMS: usize = 2;
+
+    Arc::clone(PERMITS.get_or_init(|| Arc::new(Semaphore::new(CONCURRENT_WARMS))))
 }
 
 /// Pre-populate the warm cache with each just-published superfile's bytes.
