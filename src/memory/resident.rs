@@ -25,7 +25,7 @@
 use std::{
     future::pending,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     thread::{self, Thread},
@@ -126,12 +126,37 @@ struct Sampler {
     thread: Thread,
 }
 
-/// Started on first use. `None` when the thread could not be spawned; a
-/// statement then gets the check at its start only.
-static SAMPLER: OnceLock<Option<Sampler>> = OnceLock::new();
+/// Started on first use. A spawn can fail for a moment (a thread limit, memory
+/// pressure), so a failure is not remembered: that statement gets the check at
+/// its start only, and the next one tries again.
+static SAMPLER: OnceLock<Sampler> = OnceLock::new();
+
+/// Held while the sampler starts, so two statements racing to start it cannot
+/// each spawn a thread; the one that lost would park forever.
+static SAMPLER_STARTING: Mutex<()> = Mutex::new(());
 
 fn sampler() -> Option<&'static Sampler> {
-    SAMPLER.get_or_init(start_sampler).as_ref()
+    start_once(&SAMPLER, &SAMPLER_STARTING, start_sampler)
+}
+
+/// The value in `cell`, starting it with `start` if it is empty. A `start`
+/// that returns `None` leaves `cell` empty for the next call to retry, and
+/// `starting` keeps two calls from starting it at once.
+fn start_once<T>(
+    cell: &'static OnceLock<T>,
+    starting: &Mutex<()>,
+    start: impl FnOnce() -> Option<T>,
+) -> Option<&'static T> {
+    if let Some(started) = cell.get() {
+        return Some(started);
+    }
+    let _starting = starting.lock().unwrap_or_else(PoisonError::into_inner);
+    // Another call may have started it while this one waited for the lock.
+    if let Some(started) = cell.get() {
+        return Some(started);
+    }
+    let started = start()?;
+    Some(cell.get_or_init(|| started))
 }
 
 fn start_sampler() -> Option<Sampler> {
@@ -163,8 +188,8 @@ fn start_sampler() -> Option<Sampler> {
         Err(error) => {
             warn!(
                 %error,
-                "the SQL memory sampler did not start; the process memory limit is \
-                 checked only when a statement starts"
+                "the SQL memory sampler did not start; this statement is checked against \
+                 the process memory limit only at its start, and the next one retries"
             );
             None
         }
@@ -210,6 +235,8 @@ pub(crate) fn over_process_limit(anon: u64, limit: u64) -> DataFusionError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Barrier, atomic::AtomicUsize};
+
     use tokio::{runtime::Runtime, time::timeout};
 
     use super::*;
@@ -217,6 +244,13 @@ mod tests {
     /// Longer than several samples, so a limit that was going to trip would
     /// have.
     const SETTLE: Duration = Duration::from_millis(500);
+    /// What the test starters return once they succeed.
+    const STARTED: u32 = 7;
+    /// Calls racing to start the same value at once.
+    const RACERS: usize = 8;
+    /// How long a racing start takes: long enough that, without the lock,
+    /// every racer would find the value missing and start it too.
+    const START_TAKES: Duration = Duration::from_millis(50);
     /// The worker unit's throttle (`memory.high`).
     const WORKER_HIGH: u64 = 7_516_192_768;
     /// A limit that is not a whole number of hundreds, so the remainder counts.
@@ -236,6 +270,48 @@ mod tests {
         }
         // Below 100 bytes the exact share is 0, which would read as no limit.
         assert_eq!(share_of_cgroup_limit(1), 1);
+    }
+
+    #[test]
+    fn a_start_that_fails_is_retried_and_one_that_succeeds_is_kept() {
+        static CELL: OnceLock<u32> = OnceLock::new();
+        static STARTING: Mutex<()> = Mutex::new(());
+        assert_eq!(start_once(&CELL, &STARTING, || None), None);
+        assert_eq!(
+            start_once(&CELL, &STARTING, || Some(STARTED)),
+            Some(&STARTED)
+        );
+        assert_eq!(
+            start_once(&CELL, &STARTING, || panic!("started a second time")),
+            Some(&STARTED)
+        );
+    }
+
+    #[test]
+    fn racing_starts_start_once() {
+        static CELL: OnceLock<u32> = OnceLock::new();
+        static STARTING: Mutex<()> = Mutex::new(());
+        let starts = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(Barrier::new(RACERS));
+        let racers: Vec<_> = (0..RACERS)
+            .map(|_| {
+                let starts = Arc::clone(&starts);
+                let ready = Arc::clone(&ready);
+                thread::spawn(move || {
+                    ready.wait();
+                    start_once(&CELL, &STARTING, || {
+                        starts.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(START_TAKES);
+                        Some(STARTED)
+                    })
+                    .copied()
+                })
+            })
+            .collect();
+        for racer in racers {
+            assert_eq!(racer.join().expect("racer"), Some(STARTED));
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(target_os = "linux")]
