@@ -18,12 +18,14 @@
 //!   memory by writing its buffered run to disk, then continues. The query still
 //!   succeeds, just slower.
 //! - Otherwise it surfaces as [`InfinoError::OverBudget`], when:
-//!     - the operator can't spill at all:
-//!        - non-spillable (hash-join build side, nested-loop join, window aggregate), or
-//!        - a streaming operator (scan / filter / projection) that buffers nothing, so a single
-//!          allocation already exceeds the budget and there is nothing to write out; or
+//!     - the operator can't spill at all (hash-join build side, nested-loop join), or
 //!     - it is spillable but can't reserve even the minimum it needs to run the
 //!       spill / merge (e.g. the sort's merge reservation).
+//!
+//! Some operators never ask this pool: the streaming ones — scan, filter,
+//! projection, `unnest` — and window functions, which buffer without
+//! reserving. Nothing they allocate is gated, however large; the process
+//! memory limit (see `resident`) is what bounds them.
 //!
 //! Spilling needs a disk manager; we use DataFusion's default (OS temp dir).
 //!

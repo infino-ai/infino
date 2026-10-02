@@ -156,12 +156,20 @@ pub struct MemorySettings {
     ///
     /// [`ConnectOptions::with_connection_memory_budget_bytes`]: crate::ConnectOptions::with_connection_memory_budget_bytes
     pub connection_budget_bytes: u64,
+    /// Process-wide limit for SQL, in bytes of anonymous resident memory: a
+    /// running statement is refused once the process passes it. Unset (the
+    /// default) takes 90% of the process's cgroup memory limit, the lower of
+    /// `memory.high` and `memory.max` up its cgroup v2 hierarchy, and sets no
+    /// limit where there is none; `0` sets no limit; a positive value is the
+    /// limit. Read once per process.
+    pub process_limit_bytes: Option<u64>,
 }
 
 impl Default for MemorySettings {
     fn default() -> Self {
         Self {
             connection_budget_bytes: DEFAULT_CONNECTION_BUDGET_BYTES,
+            process_limit_bytes: None,
         }
     }
 }
@@ -2132,6 +2140,17 @@ storage:
     fn memory_budget_defaults_to_measure_only() {
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.memory.connection_budget_bytes, 0);
+    }
+
+    #[test]
+    fn process_limit_defaults_to_unset_and_parses_a_value() {
+        // Unset means "take it from the cgroup", not "no limit".
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.memory.process_limit_bytes, None);
+        let yaml = "memory:\n  process_limit_bytes: 1000\n";
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
+        assert_eq!(cfg.memory.process_limit_bytes, Some(1000));
     }
 
     #[test]

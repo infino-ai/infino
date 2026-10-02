@@ -182,10 +182,13 @@ pub(crate) fn sql_session_context(
 ///
 /// The credential check reads the error's source chain rather than its message:
 /// a scan failure reaches DataFusion wrapped, and the underlying storage error
-/// is still typed inside it.
+/// is still typed inside it. The budget check reads the root for the same
+/// reason: an external sort wraps the pool's refusal in context of its own.
 fn exec_query_error(e: DataFusionError) -> QueryError {
+    if let DataFusionError::ResourcesExhausted(msg) = e.find_root() {
+        return QueryError::OverBudget(msg.clone());
+    }
     match e {
-        DataFusionError::ResourcesExhausted(msg) => QueryError::OverBudget(msg),
         other if permission_denied_in_chain(&other) => {
             QueryError::PermissionDenied(other.to_string())
         }
@@ -1230,6 +1233,28 @@ mod tests {
             matches!(&err, QueryError::OverBudget(msg) if msg.contains("exact ILIKE")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn query_sql_sort_over_budget_is_refused() {
+        // The external sort wraps the pool's refusal in context of its own;
+        // the reader path still reports it as OverBudget, not as an execute
+        // error.
+        let categories: Vec<String> = (0..HIGH_CARDINALITY_ROWS)
+            .map(|value| format!("category-{value}"))
+            .collect();
+        let category_refs: Vec<&str> = categories.iter().map(String::as_str).collect();
+        let titles = vec!["title"; HIGH_CARDINALITY_ROWS];
+        let (_dir, st) =
+            zero_gate_reader_after_ingest(&build_cat_batch(0, &category_refs, &titles));
+
+        let err = st
+            .reader()
+            .expect("reader")
+            .query_sql("SELECT category FROM supertable ORDER BY category")
+            .expect_err("0-byte gate refuses the sort");
+
+        assert!(matches!(err, QueryError::OverBudget(_)), "got {err:?}");
     }
 
     #[test]

@@ -17,7 +17,9 @@
 //! reserves the bytes *before* it allocates them — so the budget can say no in
 //! advance:
 //!   - the vector shortlist fetched for a search,
-//!   - SQL result / intermediate batches,
+//!   - the working state of the SQL operators that buffer — sorts, aggregates,
+//!     joins, repartitions — which DataFusion reserves through the pool in
+//!     `datafusion_pool`,
 //!   - ingest buffers.
 //!
 //! # What we don't
@@ -31,6 +33,22 @@
 //! of the value given in config** — the spare 10% absorbs all of these
 //! untracked allocations. We trade exact accounting for far less plumbing, the
 //! same bargain the query engines make.
+//!
+//! Nor the batches a SQL plan streams between its operators — a scan's decoded
+//! pages, a filter's or projection's output, the rows an `unnest` repeats, the
+//! result as it is collected. DataFusion reserves none of them, and a streaming
+//! scan runs even at a zero gate. They are bounded per batch, not by the
+//! budget, and a batch is only as small as its rows: one that repeats a long
+//! text column many times over can be larger than the whole budget.
+//!
+//! # Process memory limit
+//!
+//! What bounds those batches is a process-wide limit on SQL (`resident`): a
+//! running statement is refused once the process's anonymous resident memory
+//! passes it. It reads the process, not the reservations, so it sees every
+//! batch whichever operator allocated it. The limit is 90% of the process's
+//! cgroup memory limit, or `memory.process_limit_bytes` in config; with
+//! neither, there is none.
 //!
 //! # When the budget is full
 //!
@@ -92,8 +110,21 @@ use std::{
 };
 
 mod datafusion_pool;
+mod resident;
 
 pub(crate) use datafusion_pool::budgeted_session_context;
+pub(crate) use resident::{
+    over_process_limit, process_limit, process_limit_exceeded, process_over_limit,
+};
+
+test_visible! {
+    /// Replace this process's SQL memory limit — resolved from config or the
+    /// cgroup on first use — with `limit` (`None`: no limit). Process-wide, so
+    /// only a test binary of its own may call it.
+    fn set_process_memory_limit(limit: Option<u64>) {
+        resident::set_process_limit(limit)
+    }
+}
 
 /// The fraction of a configured budget we actually enforce: gate at 9/10 and
 /// leave the final 1/10 as headroom for allocations too small to track. Applied

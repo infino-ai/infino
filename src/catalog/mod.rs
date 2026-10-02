@@ -1225,10 +1225,15 @@ fn build_options(
 
 /// Map a SQL execution error to the public error: a budget exhaustion becomes
 /// [`InfinoError::OverBudget`], anything else a generic query error.
+///
+/// Classified by the error's root, not its outer variant: an operator may wrap
+/// a refusal in context of its own (an external sort reports "Not enough memory
+/// to continue external sort" around the pool's refusal), and a wrapped
+/// refusal is still a budget refusal.
 fn sql_exec_error(e: DataFusionError) -> InfinoError {
-    match e {
-        DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg),
-        other => InfinoError::Query(other.to_string()),
+    match e.find_root() {
+        DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg.clone()),
+        _ => InfinoError::Query(e.to_string()),
     }
 }
 
@@ -3813,6 +3818,34 @@ mod tests {
             .query_sql("SELECT title FROM docs")
             .expect("a streaming scan is not gated");
         assert_eq!(n_rows(&out), n);
+    }
+
+    #[test]
+    fn query_sql_sort_over_a_tiny_budget_is_refused_as_over_budget() {
+        // The sort wraps the pool's refusal in context of its own ("Not enough
+        // memory to continue external sort"); the wrapped refusal is still a
+        // budget refusal, not a generic query error.
+        let (_dir, conn, _n) = tiny_budget_conn_after_ingest();
+        let err = conn
+            .query_sql("SELECT title FROM docs ORDER BY title")
+            .expect_err("a 0-byte gate refuses the sort");
+        assert!(
+            matches!(err, InfinoError::OverBudget(_)),
+            "expected OverBudget, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sql_exec_error_classifies_a_wrapped_refusal_by_its_root() {
+        let wrapped = DataFusionError::ResourcesExhausted("over".into()).context("sorting");
+        assert!(matches!(
+            sql_exec_error(wrapped),
+            InfinoError::OverBudget(msg) if msg == "over"
+        ));
+        assert!(matches!(
+            sql_exec_error(DataFusionError::Execution("boom".into())),
+            InfinoError::Query(_)
+        ));
     }
 
     #[test]
