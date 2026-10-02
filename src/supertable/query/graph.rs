@@ -13,10 +13,7 @@
 //! values — and a hit carries the node's id and key, so the caller joins
 //! back to its rows by either.
 
-use crate::{
-    superfile::vector::adjacency::AdjacencyIndex,
-    supertable::{SupertableReader, error::QueryError},
-};
+use crate::supertable::{SupertableReader, error::QueryError};
 
 /// Probability a PageRank surfer jumps back to a seed at each step: the
 /// standard 0.15, under which a node's score is dominated by paths of a few
@@ -42,6 +39,12 @@ pub struct GraphHit {
     pub score: f64,
 }
 
+/// What a traversal starts from: the nodes with these ids, or these keys.
+enum Seeds<'a> {
+    Ids(&'a [i64]),
+    Keys(&'a [&'a str]),
+}
+
 impl SupertableReader {
     test_visible! {
         /// Every node within `hops` edges of the nodes with ids `seeds`,
@@ -50,19 +53,7 @@ impl SupertableReader {
         /// not hold is skipped. An error when the table has no published
         /// adjacency index: `optimize()` with an adjacency spec builds one.
         fn graph_walk(&self, seeds: &[i64], hops: u32, limit: usize) -> Result<Vec<GraphHit>, QueryError> {
-            self.with_adjacency(|index, seeds| {
-                index
-                    .graph()
-                    .walk_base(seeds, hops, limit)
-                    .into_iter()
-                    .map(|(node, hop)| GraphHit {
-                        id: index.id(node),
-                        key: index.key(node).to_string(),
-                        hop,
-                        score: 0.0,
-                    })
-                    .collect()
-            }, seeds)
+            self.traverse(Seeds::Ids(seeds), hops, limit, false)
         }
     }
 
@@ -73,29 +64,34 @@ impl SupertableReader {
         /// paths from the seeds pass through scores high, so a hub's thousand
         /// neighbours do not outrank the few nodes the seeds share.
         fn graph_rank(&self, seeds: &[i64], hops: u32, limit: usize) -> Result<Vec<GraphHit>, QueryError> {
-            self.with_adjacency(|index, seeds| {
-                index
-                    .graph()
-                    .rank_base(seeds, hops, limit, PAGERANK_RESTART, PAGERANK_ITERATIONS)
-                    .into_iter()
-                    .map(|(node, hop, score)| GraphHit {
-                        id: index.id(node),
-                        key: index.key(node).to_string(),
-                        hop,
-                        score,
-                    })
-                    .collect()
-            }, seeds)
+            self.traverse(Seeds::Ids(seeds), hops, limit, true)
         }
     }
 
-    /// Run `f` over the resident adjacency index with `seeds` resolved to
-    /// nodes, hydrating the index through the resident slot first.
-    fn with_adjacency<T>(
+    test_visible! {
+        /// [`Self::graph_walk`] from the nodes keyed `seeds` — what a SQL
+        /// statement seeds with, since it holds keys, not ids.
+        fn graph_walk_keys(&self, seeds: &[&str], hops: u32, limit: usize) -> Result<Vec<GraphHit>, QueryError> {
+            self.traverse(Seeds::Keys(seeds), hops, limit, false)
+        }
+    }
+
+    test_visible! {
+        /// [`Self::graph_rank`] from the nodes keyed `seeds`.
+        fn graph_rank_keys(&self, seeds: &[&str], hops: u32, limit: usize) -> Result<Vec<GraphHit>, QueryError> {
+            self.traverse(Seeds::Keys(seeds), hops, limit, true)
+        }
+    }
+
+    /// Walk (or, with `rank`, rank) from `seeds` over the resident adjacency
+    /// index, hydrating it through the resident slot first.
+    fn traverse(
         &self,
-        f: impl FnOnce(&AdjacencyIndex, &[u32]) -> T,
-        seeds: &[i64],
-    ) -> Result<T, QueryError> {
+        seeds: Seeds<'_>,
+        hops: u32,
+        limit: usize,
+        rank: bool,
+    ) -> Result<Vec<GraphHit>, QueryError> {
         let resident = self.block_on(self.resident_vector_index()).ok_or_else(|| {
             QueryError::Execute("no adjacency index is published for this table".into())
         })?;
@@ -104,8 +100,31 @@ impl SupertableReader {
                 "the table's resident index is not an adjacency index".into(),
             ));
         };
-        let nodes: Vec<u32> = seeds.iter().filter_map(|&id| index.node_of(id)).collect();
-        Ok(f(index, &nodes))
+        let nodes: Vec<u32> = match seeds {
+            Seeds::Ids(ids) => ids.iter().filter_map(|&id| index.node_of(id)).collect(),
+            Seeds::Keys(keys) => index.nodes_of_keys(keys),
+        };
+        let hit = |node: u32, hop: u32, score: f64| GraphHit {
+            id: index.id(node),
+            key: index.key(node).to_string(),
+            hop,
+            score,
+        };
+        Ok(if rank {
+            index
+                .graph()
+                .rank_base(&nodes, hops, limit, PAGERANK_RESTART, PAGERANK_ITERATIONS)
+                .into_iter()
+                .map(|(node, hop, score)| hit(node, hop, score))
+                .collect()
+        } else {
+            index
+                .graph()
+                .walk_base(&nodes, hops, limit)
+                .into_iter()
+                .map(|(node, hop)| hit(node, hop, 0.0))
+                .collect()
+        })
     }
 }
 
@@ -221,6 +240,17 @@ mod tests {
         );
         let hits = reader.graph_walk(&[1], 1, usize::MAX).expect("walk");
         assert_eq!(hits[1].key, "n2");
+        let by_key: Vec<(i64, u32)> = reader
+            .graph_walk_keys(&["n1", "missing"], 1, usize::MAX)
+            .expect("walk by key")
+            .into_iter()
+            .map(|hit| (hit.id, hit.hop))
+            .collect();
+        assert_eq!(
+            by_key,
+            vec![(1, 0), (2, 1)],
+            "seeded by key, an unknown key skipped"
+        );
         assert_eq!(
             walked(&table, 1, 3).len(),
             5,

@@ -33,6 +33,8 @@ use datafusion::{
 };
 
 use super::Connection;
+#[cfg(feature = "graph-index")]
+use crate::supertable::query::exec::graph_exec::{GraphFunc, Traversal};
 use crate::{
     runtime_metrics::op_stats::{self, OpStatsCollector},
     supertable::{
@@ -176,6 +178,52 @@ pub(crate) fn register_search_tvfs(ctx: &SessionContext, conn: Connection) {
         HYBRID_SEARCH_UDTF,
         Arc::new(HybridSearchCatalogFunc { resolver }),
     );
+}
+
+/// Register `graph_walk` / `graph_rank` on `ctx` over tables of `conn`.
+/// Without `table` they take the edge table's name first
+/// (`graph_walk('edges', seeds, hops, k)`), like every search function.
+/// With it they take `(seeds, hops, k)` over that one table — the form a
+/// graph attached from another catalog is served in
+/// (`Connection::attach_graph`), where the table is not one the statement
+/// could name.
+#[cfg(feature = "graph-index")]
+pub(crate) fn register_graph_tvfs(ctx: &SessionContext, conn: Connection, table: Option<String>) {
+    let resolver = Arc::new(TableResolver::new(conn));
+    for traversal in [Traversal::Walk, Traversal::Rank] {
+        ctx.register_udtf(
+            traversal.name(),
+            Arc::new(GraphCatalogFunc {
+                resolver: Arc::clone(&resolver),
+                table: table.clone(),
+                traversal,
+            }),
+        );
+    }
+}
+
+#[cfg(feature = "graph-index")]
+#[derive(Debug)]
+struct GraphCatalogFunc {
+    resolver: Arc<TableResolver>,
+    /// The edge table, when fixed at registration; else the leading argument.
+    table: Option<String>,
+    traversal: Traversal,
+}
+
+#[cfg(feature = "graph-index")]
+impl TableFunctionImpl for GraphCatalogFunc {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let (t, rest) = match &self.table {
+            Some(name) => (self.resolver.resolve(name)?, args.exprs()),
+            None => self
+                .resolver
+                .split_leading(args.exprs(), self.traversal.name())?,
+        };
+
+        GraphFunc::new(t.reader, self.traversal)
+            .call_with_args(TableFunctionArgs::new(rest, args.session()))
+    }
 }
 
 #[derive(Debug)]

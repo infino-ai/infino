@@ -195,6 +195,8 @@ pub fn connect_with(
             connection_memory_budget,
             usage_meter,
             gcs_credential,
+            #[cfg(feature = "graph-index")]
+            graph: Mutex::new(None),
         }),
     })
 }
@@ -228,6 +230,8 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             connection_memory_budget,
             usage_meter: UsageMeter::new(),
             gcs_credential: None,
+            #[cfg(feature = "graph-index")]
+            graph: Mutex::new(None),
         }),
     })
 }
@@ -261,6 +265,11 @@ struct ConnectionInner {
     usage_meter: Arc<UsageMeter>,
     /// Swappable GCS credential shared by every provider on this connection.
     gcs_credential: Option<Arc<SwappableGcpCredential>>,
+    /// A graph attached from another catalog (see [`Connection::attach_graph`]):
+    /// the connection it lives in and its edge table, served to this
+    /// connection's SQL as `graph_walk` / `graph_rank` with no table argument.
+    #[cfg(feature = "graph-index")]
+    graph: Mutex<Option<(Connection, String)>>,
 }
 
 /// Where the `name → table` map lives. Durable backends persist it on the
@@ -307,6 +316,26 @@ enum CatalogStore {
 }
 
 impl Connection {
+    test_visible! {
+        /// Serve `table` of `graph` — an edge table `graph` has indexed with
+        /// `OptimizeOptions::with_adjacency` — to this connection's
+        /// [`query_sql`](Self::query_sql) as `graph_walk(seeds, hops, k)` and
+        /// `graph_rank(seeds, hops, k)`, with no table argument. The table
+        /// stays `graph`'s: it is not listed, opened or scanned here, and a
+        /// statement reaches it only through the two functions. How a
+        /// platform keeps a derived graph in a catalog of its own while
+        /// statements over the user's tables join to it. Attaching again
+        /// replaces the earlier graph.
+        #[cfg(feature = "graph-index")]
+        fn attach_graph(&self, graph: Connection, table: &str) {
+            *self
+                .inner
+                .graph
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some((graph, table.to_string()));
+        }
+    }
+
     /// Cumulative object-store usage for this connection (read-only snapshot).
     /// Shared by every table provider created through this connection; take
     /// two snapshots and call [`UsageSnapshot::since`] for a window delta.
@@ -988,6 +1017,23 @@ impl Connection {
         // the catalog at call time (so a table named only inside a TVF —
         // not as a `FROM` relation — still resolves).
         search_tvf::register_search_tvfs(&ctx, self.clone());
+        // The graph functions walk an edge table of this catalog by name, or
+        // the one attached from another catalog with no name.
+        #[cfg(feature = "graph-index")]
+        {
+            let attached = self
+                .inner
+                .graph
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            match attached {
+                Some((graph, table)) => {
+                    search_tvf::register_graph_tvfs(&ctx, graph, Some(table));
+                }
+                None => search_tvf::register_graph_tvfs(&ctx, self.clone(), None),
+            }
+        }
         trace::follow_spans_into_datafusion_tasks();
 
         let sql = sql.to_owned();

@@ -20,6 +20,8 @@
 //! ([`Hnsw::to_bytes`]). The id and key sections are served as zero-copy
 //! slices of the mapped bundle; the graph decodes as every HNSW graph does.
 
+use std::collections::HashSet;
+
 use bytes::Bytes;
 
 use crate::superfile::vector::hnsw::{Cursor, Hnsw};
@@ -209,6 +211,26 @@ impl AdjacencyIndex {
         None
     }
 
+    /// The nodes keyed by `keys`, in node order: how a walk is seeded by
+    /// keys rather than ids. A key no node carries is skipped, as an unknown
+    /// id is by [`Self::node_of`]. Keys are stored in id order, not key
+    /// order, so a lookup is a scan of the key section — one scan for all
+    /// the keys, a few milliseconds over a million nodes.
+    pub(crate) fn nodes_of_keys(&self, keys: &[&str]) -> Vec<u32> {
+        let wanted: HashSet<&[u8]> = keys
+            .iter()
+            .filter(|key| !key.is_empty())
+            .map(|key| key.as_bytes())
+            .collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        (0..self.n)
+            .filter(|&node| wanted.contains(self.raw_key(node)))
+            .map(|node| node as u32)
+            .collect()
+    }
+
     fn raw_key(&self, node: usize) -> &[u8] {
         let start = offset_at(&self.key_offsets, node) as usize;
         let end = offset_at(&self.key_offsets, node + 1) as usize;
@@ -267,6 +289,11 @@ mod tests {
         assert_eq!(targets, vec![3, 11], "row order");
         assert_eq!(index.node_of(4), None);
         assert_eq!(index.key(index.node_of(-5).expect("-5")), "n-5");
+        assert_eq!(
+            index.nodes_of_keys(&["n7", "n-5", "nope", ""]),
+            vec![index.node_of(-5).expect("-5"), seven],
+            "found by key, in node order; an unknown or empty key is skipped"
+        );
     }
 
     /// A node that is only a destination is still a node, with no key and no
