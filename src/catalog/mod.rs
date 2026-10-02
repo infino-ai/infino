@@ -4595,6 +4595,80 @@ mod tests {
         }
     }
 
+    /// Rows in the first append of the ordering test: under one default
+    /// DataFusion batch (8192), so the superfile is smaller than the next.
+    const ORDER_FIRST_APPEND_ROWS: usize = 3_000;
+    /// Rows in the second append: past one batch, so the two superfiles
+    /// together carry enough rows that the planner repartitions above the sort.
+    const ORDER_SECOND_APPEND_ROWS: usize = 9_000;
+    /// Times the ordered query runs: the bad order depends on which output
+    /// partition finishes first, so one run can come back sorted by chance.
+    const ORDER_QUERY_RUNS: usize = 8;
+
+    /// Every `_id` in `batches`' single string column, parsed back to its number.
+    fn ids_from_strings(batches: &[RecordBatch]) -> Vec<u128> {
+        let mut ids = Vec::new();
+        for batch in batches {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("SQL strings come back as LargeUtf8");
+            for i in 0..col.len() {
+                ids.push(col.value(i).parse().expect("_id renders as an integer"));
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn query_sql_order_by_holds_across_superfiles() {
+        // Two appends, two superfiles; the second holds the larger ids. The final
+        // cast to `LargeUtf8` makes the planner split the sorted stream across
+        // partitions above the sort, and collecting those partitions must not
+        // undo the order. Every run must return all ids ascending.
+        let conn = connect("memory://").expect("connect");
+        let t = conn
+            .create_table("t", schema_id_title(), IndexSpec::new())
+            .expect("create t");
+        for rows in [ORDER_FIRST_APPEND_ROWS, ORDER_SECOND_APPEND_ROWS] {
+            let titles: Vec<String> = (0..rows).map(|i| format!("row {i}")).collect();
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            t.append(&build_title_batch(&refs)).expect("append");
+        }
+        let sql = "SELECT CAST(_id AS VARCHAR) AS v FROM t ORDER BY _id";
+
+        // The plan shape, which does not depend on timing: no repartition may
+        // sit between the root and the merge that produces the sorted stream.
+        let explain = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+        let text = pretty_format_batches(&explain)
+            .expect("format explain")
+            .to_string();
+        let physical = &text[text.find("physical_plan").expect("physical plan row")..];
+        let merge_at = physical
+            .find("SortPreservingMergeExec")
+            .expect("the sorted result comes from a merge");
+        assert!(
+            !physical[..merge_at].contains("RepartitionExec"),
+            "a repartition splits the sorted result:\n{text}"
+        );
+
+        let total = ORDER_FIRST_APPEND_ROWS + ORDER_SECOND_APPEND_ROWS;
+        for run in 0..ORDER_QUERY_RUNS {
+            let batches = conn.query_sql(sql).expect("ordered select");
+            let ids = ids_from_strings(&batches);
+            assert_eq!(ids.len(), total, "run {run}: row count");
+            if let Some(at) = ids.windows(2).position(|w| w[0] >= w[1]) {
+                panic!(
+                    "run {run}: ids not ascending at row {}: {} then {}",
+                    at + 1,
+                    ids[at],
+                    ids[at + 1]
+                );
+            }
+        }
+    }
+
     /// Exhaustive over `LogicalPlan`, so a DataFusion upgrade that adds a variant fails to compile
     /// here. On that failure:
     ///  - classify the new variant below;

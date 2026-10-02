@@ -30,6 +30,7 @@ pub mod provider;
 pub mod prune;
 pub(crate) mod scalar_cache;
 pub mod skip;
+pub(crate) mod sorted_root;
 pub mod sql;
 pub mod superfile_reader;
 pub mod vector;

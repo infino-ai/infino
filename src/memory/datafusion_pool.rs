@@ -37,11 +37,12 @@ use datafusion::{
     execution::{
         memory_pool::{MemoryLimit, MemoryPool, MemoryReservation},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
+        session_state::SessionStateBuilder,
     },
     prelude::{SessionConfig, SessionContext},
 };
 
-use crate::memory::ConnectionMemoryBudget;
+use crate::{memory::ConnectionMemoryBudget, supertable::query::sorted_root::KeepSortedRoot};
 
 /// A DataFusion memory pool over a [`ConnectionMemoryBudget`]: measured never
 /// refuses, bounded refuses at the 90% gate (DataFusion then spills, or errors
@@ -142,10 +143,16 @@ pub(crate) fn budgeted_session_context(
         .execution
         .skip_partial_aggregation_probe_ratio_threshold = PARTIAL_AGG_SKIP_PROBE_RATIO;
 
-    Ok(SessionContext::new_with_config_rt(
-        config,
-        budgeted_runtime(budget)?,
-    ))
+    // Appended after DataFusion's own rules: the round-robin repartition it
+    // removes is one `EnforceDistribution` adds above a sorted result, which
+    // splits an `ORDER BY` back into partitions collected in completion order.
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_runtime_env(budgeted_runtime(budget)?)
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(KeepSortedRoot))
+        .build();
+    Ok(SessionContext::new_with_state(state))
 }
 
 #[cfg(test)]
