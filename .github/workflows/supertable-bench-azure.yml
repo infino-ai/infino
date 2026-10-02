@@ -333,6 +333,14 @@ jobs:
               | sh -s -- -y --default-toolchain stable --profile minimal
           fi
 
+          # The Azure-hosted Ubuntu mirror can serve at ~60 KB/s for hours. apt only
+          # gives up on a stalled connection, not a slow one, so the install runs past
+          # this step's timeout. Install from Canonical's archive instead.
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+            if [ -f "$f" ]; then
+              sudo sed -i 's#azure\.archive\.ubuntu\.com#archive.ubuntu.com#g' "$f"
+            fi
+          done
           sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential pkg-config cmake clang protobuf-compiler git

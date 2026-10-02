@@ -36,8 +36,10 @@
 use std::{
     collections::HashMap,
     env, fmt,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::OnceLock,
+    thread::available_parallelism,
     time::Duration,
 };
 
@@ -51,7 +53,10 @@ use serde::{
     ser::Serializer,
 };
 
-use crate::supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT;
+use crate::{
+    runtime_metrics::rss::available_memory_bytes,
+    supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT,
+};
 
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
@@ -140,7 +145,10 @@ pub struct Config {
 pub struct MemorySettings {
     /// Per-connection memory (heap) budget in bytes. `0` (the default) is
     /// measure-only: usage is tracked but never refused. A positive value
-    /// enforces a ceiling so one connection can't exhaust process memory.
+    /// enforces a ceiling on what this connection's search and ingest work may
+    /// hold. Compaction is not charged to it — see
+    /// [`ConnectOptions::with_connection_memory_budget_bytes`] — so this is not
+    /// a ceiling on the process.
     ///
     /// Applies to connections built from a config file (`apply_config`). Code
     /// that opens a connection programmatically sets the budget on
@@ -278,8 +286,29 @@ pub struct CompactionSettings {
     /// tables. Values below 2 are raised to 2 — merging fewer than two inputs
     /// is a no-op rewrite.
     pub min_superfiles_for_merge: u64,
-    /// Maximum memory budget for materializing inputs during a single merge, in MiB.
+    /// Ceiling on the raw input bytes one merge may accumulate, in MiB. The
+    /// packer stops adding superfiles to a job once it would cross this.
+    ///
+    /// Independent of `target_superfile_size_mb`: raising the target does not
+    /// raise this. Most jobs never approach it, because the output target
+    /// closes them out first — it is the backstop for a partition of unusually
+    /// large superfiles, not a typical job's size.
+    ///
+    /// It is also NOT a bound on the merge's resident set, which runs several
+    /// times higher once rows are decoded and the output encoded, and it does
+    /// not govern how many merges run at once: the runner admits them against
+    /// the host's free memory.
     pub max_memory_mb: u64,
+    /// How many of a pass's merge jobs may be in flight at once.
+    ///
+    /// `None` (the default) derives the ceiling from the maintenance pool and
+    /// lets the runner admit another merge only while the host reports free
+    /// memory; `Some(n)` forces exactly `n`, and `Some(1)` is strictly serial.
+    ///
+    /// Not a thread count: a job is an async task whose CPU work runs on the
+    /// shared maintenance pool, so this is how many merges may overlap, not
+    /// how many threads they get.
+    pub max_concurrent_jobs: Option<usize>,
     /// How old a sealed tombstone sidecar has to be, in milliseconds,
     /// before it's treated as abandoned
     pub stale_seal_timeout_ms: u64,
@@ -292,6 +321,7 @@ impl Default for CompactionSettings {
             min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
             min_superfiles_for_merge: DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE,
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
+            max_concurrent_jobs: None,
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
         }
     }
@@ -1021,6 +1051,175 @@ pub enum RecalibratePolicy {
     Skip,
 }
 
+/// What a reindex repairs, per superfile.
+///
+/// Two things go out of date independently — the on-disk layout and the
+/// terms — and repairing the terms costs far more. The mode chooses how
+/// much to repair; [`ReindexMode::Auto`] decides per superfile, so a file
+/// that is only behind on layout never pays for a re-analysis it does not
+/// need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ReindexMode {
+    /// Give each superfile the cheapest repair that makes it current:
+    /// [`ReindexMode::Rewrite`] where only its layout is behind,
+    /// [`ReindexMode::Reanalyze`] where its terms are.
+    ///
+    /// The default, because it is the only mode that leaves no stale
+    /// superfile behind and charges the expensive repair only where it is
+    /// the one that works.
+    #[default]
+    Auto,
+    /// Bring each superfile's index into the current on-disk layout,
+    /// keeping its terms.
+    ///
+    /// Cheap: postings are copied, not rebuilt. Recovers the pruning the
+    /// newer layout allows. Does not fix terms produced by an older
+    /// analyzer — nothing that copies postings can — so superfiles whose
+    /// terms are stale are left alone and reported.
+    Rewrite,
+    /// Rebuild terms by re-analyzing the text each superfile stored, and
+    /// bring the layout current as a side effect.
+    ///
+    /// Expensive: every document is tokenized again and every index
+    /// rebuilt. This is what repairs a table whose terms predate a change
+    /// in how text is analyzed — a query analyzed one way cannot find
+    /// terms written another. Columns whose text was never stored cannot
+    /// be repaired and are reported.
+    ///
+    /// Applies to every stale superfile, including ones whose recorded
+    /// revision says their terms are already current — which is the only
+    /// thing this offers over [`ReindexMode::Auto`], and the reason to
+    /// reach for it is not trusting that record.
+    Reanalyze,
+}
+
+/// What a reindex repairs.
+///
+/// Tiered by where the thing lives, so the two ways this grows are two
+/// different edits: a new *kind* of target — the manifest, the tombstone
+/// sidecars — is a variant here, while a new index inside a superfile is
+/// a variant of [`SuperfileIndex`]. Only superfile indexes have a repair
+/// today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReindexTarget {
+    /// An index held inside each superfile.
+    Superfile(SuperfileIndex),
+}
+
+impl Default for ReindexTarget {
+    fn default() -> Self {
+        Self::Superfile(SuperfileIndex::default())
+    }
+}
+
+/// Which of a superfile's indexes a reindex repairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SuperfileIndex {
+    /// The full-text index. Vectors, the Parquet body and the hidden
+    /// vector index are copied or left untouched.
+    #[default]
+    Fts,
+}
+
+/// Knobs for [`crate::Supertable::reindex`].
+///
+/// No sizing knobs, because a reindex has nothing to decide there: it
+/// rewrites every stale superfile, one in and one out, so there is no
+/// target size to pack toward and no fill threshold to clear. Taking
+/// [`CompactionSettings`] instead would hand a caller three knobs the
+/// operation ignores.
+// Every field's default is its type's, so the derive cannot drift from
+// the enums it defers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ReindexOptions {
+    /// What to repair. Defaults to the superfile full-text index, the
+    /// only one with a repair today; a default naming one index can never
+    /// silently widen to cover another.
+    pub target: ReindexTarget,
+    /// How much to repair. Defaults to [`ReindexMode::Auto`], which gives
+    /// each superfile the cheapest repair that makes it current.
+    pub mode: ReindexMode,
+    /// How old a sealed tombstone sidecar has to be, in milliseconds,
+    /// before a rewrite treats it as abandoned and takes it over.
+    ///
+    /// `None`, the default, uses the table's
+    /// [`CompactionSettings::stale_seal_timeout_ms`]: the seal is the same
+    /// guard and a reindex job takes it the same way, so a table that
+    /// tuned it for compaction meant it for this too. A value here
+    /// overrides that for one run.
+    pub stale_seal_timeout_ms: Option<u64>,
+    /// Credit a superfile that records no analysis revision with the one
+    /// the engine that wrote it emitted, instead of treating it as
+    /// unknown. Defaults to `false`.
+    ///
+    /// Revisions were not recorded before this field existed, so every
+    /// older superfile reads as stale and `Auto` re-analyzes it — correct,
+    /// but it re-tokenizes corpora whose terms are already current.
+    /// Setting this reads the writer's version out of `inf.builder` and
+    /// credits what that version's chains emitted, skipping those files.
+    ///
+    /// **Only sound when the table never held superfiles older than the
+    /// writer's version.** A merge carries postings rather than
+    /// re-analyzing them, and engines that did not record revisions did
+    /// not lower the output to its oldest input either — so a compaction
+    /// run by one of them could have folded much older terms into a file
+    /// stamped with its own version, and nothing in that file says so.
+    /// Crediting it leaves those terms in place and reports the table
+    /// migrated. Leave this off unless the table's whole history is known.
+    pub trust_writer_analysis: bool,
+}
+
+impl ReindexOptions {
+    /// Repair layouts only, leaving superfiles whose terms are stale
+    /// untouched and reported.
+    pub fn rewriting() -> Self {
+        Self {
+            mode: ReindexMode::Rewrite,
+            ..Self::default()
+        }
+    }
+
+    /// Re-analyze every stale superfile, including ones whose recorded
+    /// revision says their terms are current.
+    pub fn reanalyzing() -> Self {
+        Self {
+            mode: ReindexMode::Reanalyze,
+            ..Self::default()
+        }
+    }
+
+    /// Repair `target` instead of the default.
+    pub fn with_target(mut self, target: ReindexTarget) -> Self {
+        self.target = target;
+        self
+    }
+
+    /// Repair to `mode` instead of the default.
+    pub fn with_mode(mut self, mode: ReindexMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Override the table's seal-takeover age for this run.
+    pub fn with_stale_seal_timeout_ms(mut self, ms: u64) -> Self {
+        self.stale_seal_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Credit a superfile recording no analysis revision with the one its
+    /// writer emitted. Read
+    /// [`ReindexOptions::trust_writer_analysis`] before setting this: it
+    /// is unsound on a table whose history is not known.
+    pub fn trusting_writer_analysis(mut self) -> Self {
+        self.trust_writer_analysis = true;
+        self
+    }
+}
+
 /// Persistent storage backend selected by [`StorageSettings`].
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1252,6 +1451,47 @@ impl Serialize for ThreadCount {
 }
 
 impl Config {
+    /// How many compaction merge jobs a pass may run at once.
+    ///
+    /// An explicit setting is honored as written. Unset, the width derives
+    /// from the maintenance pool, because merges run on that pool and more
+    /// concurrent jobs than it has threads is width without throughput.
+    ///
+    /// This is a CPU ceiling only. The memory bound lives in the compaction
+    /// runner, which admits another merge only while the host reports free memory
+    /// — an observation, where this layer could only guess from the
+    /// `max_memory_mb` cap. The one exception is a host with no procfs:
+    /// nothing downstream can bound the merges there, so the derived width is 1.
+    /// `compaction` is the settings the pass actually runs with, not
+    /// necessarily `self.compaction`: the hidden vector index compacts under
+    /// its own derived settings and resolves its own width from them.
+    pub(crate) fn compaction_concurrency(&self, compaction: &CompactionSettings) -> usize {
+        let maintenance = self
+            .vector
+            .maintenance_threads
+            .resolve_or_default(available_parallelism().map(NonZeroUsize::get).unwrap_or(1));
+        let resolved = match available_memory_bytes() {
+            // Memory is observable, so the runner reads what this process may
+            // actually spend — its cgroup ceiling where it has one, the host's
+            // `MemAvailable` otherwise — between admissions, and stops
+            // widening once less than its reserve share is free. That measures
+            // what merges cost on this corpus, where this layer could only
+            // guess from the `max_memory_mb` CAP, which real jobs are
+            // routinely a fraction of. The derived value is then just the CPU
+            // ceiling.
+            Some(_) => maintenance,
+            // No procfs: nothing downstream can bound the merges, so stay serial
+            // rather than invent a width.
+            None => 1,
+        };
+        // No upper clamp. An explicit setting is honored as written, and the
+        // real bounds are structural: the merges in flight never exceed the jobs
+        // the pass actually planned, memory narrows it further wherever the
+        // host reports any, and compaction's input opens ride a process-wide
+        // semaphore that bounds object-store fan-out on its own.
+        compaction.max_concurrent_jobs.unwrap_or(resolved).max(1)
+    }
+
     /// Load from the standard hierarchy. See module docs for the
     /// precedence order.
     pub fn load() -> Result<Self, ConfigError> {
@@ -2124,5 +2364,66 @@ vector:
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Fixed(12));
         // Untouched keys fall through to the embedded default.
         assert_eq!(cfg.vector.drain_batch_superfiles, 64);
+    }
+
+    /// An arbitrary per-merge input cap. The figure carries no meaning: the
+    /// test below asserts the derived width is INDEPENDENT of it.
+    const ANY_BUDGET_MB: u64 = 3072;
+
+    /// The derived width is a CPU ceiling, not a memory one.
+    ///
+    /// The memory bound belongs to the compaction runner, which admits merges
+    /// only while the host reports free memory. Deriving it here could only
+    /// divide by `max_memory_mb` — the cap the packer stops at, which real jobs
+    /// rarely approach — so the width caps at the pool and nothing else.
+    #[test]
+    fn the_derived_width_is_the_pool_width_not_a_memory_estimate() {
+        let cfg = Config::default();
+        let derived = cfg.compaction_concurrency(&CompactionSettings {
+            max_memory_mb: ANY_BUDGET_MB,
+            ..CompactionSettings::default()
+        });
+        // Never zero, whatever the host — a zero would stall the merge loop.
+        assert!(derived >= 1, "width must be at least one");
+        // Crucially it does NOT scale with the memory budget: a four-fold
+        // budget is the same width, because memory is judged downstream.
+        let wide_budget = cfg.compaction_concurrency(&CompactionSettings {
+            max_memory_mb: ANY_BUDGET_MB * 4,
+            ..CompactionSettings::default()
+        });
+        assert_eq!(
+            derived, wide_budget,
+            "the config layer must not size width off the budget cap"
+        );
+    }
+
+    /// An explicit setting is honored as written, in both directions.
+    ///
+    /// Deliberately unclamped: the merges in flight never exceed the jobs the
+    /// pass planned, memory narrows it wherever the host reports any, and
+    /// input opens ride a process-wide semaphore. A ceiling here would only
+    /// second-guess an operator who asked for something specific.
+    #[test]
+    fn an_explicit_width_is_honored_as_written() {
+        let cfg = Config::default();
+        let serial = cfg.compaction_concurrency(&CompactionSettings {
+            max_concurrent_jobs: Some(1),
+            ..CompactionSettings::default()
+        });
+        assert_eq!(serial, 1, "an explicit 1 must stay serial");
+        /// Wider than any pool this would run on, to prove nothing trims it.
+        const VERY_WIDE: usize = 4096;
+        let wide = cfg.compaction_concurrency(&CompactionSettings {
+            max_concurrent_jobs: Some(VERY_WIDE),
+            ..CompactionSettings::default()
+        });
+        assert_eq!(wide, VERY_WIDE, "an explicit width must not be trimmed");
+    }
+
+    /// The shipped default derives the width rather than forcing one: a serial
+    /// pass was measured holding a 44-core box at a load average of 1.16.
+    #[test]
+    fn the_default_width_is_derived() {
+        assert_eq!(CompactionSettings::default().max_concurrent_jobs, None);
     }
 }

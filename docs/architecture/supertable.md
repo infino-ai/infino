@@ -34,7 +34,9 @@ SQL across them. The handle's public operations are **synchronous
 methods on the supertable itself**: `append`, `update`, `delete`, the
 search methods (`bm25_search` / `vector_search` / `hybrid_search`,
 returning Arrow rows; the unranked `token_match` / `exact_match`), and
-`schema`.
+`schema`. Alongside them sit the maintenance operations, which an
+operator drives rather than an application: `optimize`, `gc`, and the
+index repair described below.
 
 Internally those methods drive a **reader** (a pinned, consistent
 snapshot) for queries and a single **writer** (staged changes published
@@ -313,6 +315,43 @@ range, scalar statistics, and the full-text and vector summaries.
 - **Publish.** The superfile bytes are written to the storage backend and
 a successor manifest containing the existing and new entries is
 published atomically.
+
+## Index repair
+
+A superfile's indexes can fall behind what the engine writes today on two
+independent axes, and they need different repairs:
+
+- **The layout** — the index blob's version. Copying the postings into a
+current blob fixes it; the terms themselves are fine.
+- **The analysis** — which revision of a named analysis chain produced the
+terms. Copying postings cannot fix this, so only re-analyzing the stored
+text does, and a column whose text was never stored cannot be repaired at
+all.
+
+A repair is planned from the files rather than from a journal, so an
+interrupted run resumes by re-planning: the superfiles already repaired
+are no longer behind and drop out. Each superfile is repaired on its own
+and published on its own, so a reader sees either the old file or its
+replacement, never a half-repaired table.
+
+The invariants a repair holds to:
+
+- **One in, one out.** A repair never merges or splits, so it leaves the
+table's layout exactly as it found it. Reshaping is compaction's job.
+- **Rows and ids are unchanged**, tombstoned rows included. Dropping dead
+rows would renumber the survivors, so every doc id in the vector blob and
+the id sidecar would have to be rewritten.
+- **Only the index is rebuilt.** The Parquet body and the vector blob are
+copied as raw byte ranges, so a repair never re-encodes a row or decodes
+a vector.
+- **Deletions survive.** The input's tombstones are carried onto the
+output and registered in the same manifest that publishes it — either
+step later would leave the file live with its deletions invisible.
+
+Because a repair is planned off one manifest snapshot, a concurrent
+compaction can merge a superfile the plan named; that job then finds its
+input gone and does nothing, and the merged output is picked up by the
+next run rather than this one.
 
 ## Storage
 

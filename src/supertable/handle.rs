@@ -939,15 +939,24 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
-    /// Build and publish the global term-stats sidecar over the current
-    /// membership (see `manifest::term_stats`). Not part of the public
-    /// API — [`Supertable::optimize`] calls this after compaction so the
-    /// artifact describes the post-merge superfile set.
+    /// Rebuild the table-level term index over the current membership
+    /// (see `manifest::term_index`), and the global term-stats sidecar only
+    /// if the index still does not cover every superfile. Not part of the
+    /// public API — [`Supertable::optimize`] calls this after compaction so
+    /// the artifacts describe the post-merge superfile set.
+    ///
+    /// A complete index already holds every term's df in every superfile,
+    /// and queries sum global df from it without opening the sidecar, so
+    /// building the sidecar then is a full pass over every dictionary for
+    /// nothing. It stays the fallback for an index that is incomplete.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn refresh_term_stats_sync(&self) -> Result<(), BuildError> {
         self.block_on_query(async {
-            super::writer::stamp_term_stats(&self.inner).await?;
-            super::writer::stamp_term_index(&self.inner).await
+            super::writer::stamp_term_index(&self.inner).await?;
+            if self.inner.manifest.load().term_index_complete() {
+                return Ok(());
+            }
+            super::writer::stamp_term_stats(&self.inner).await
         })
     }
 
@@ -1616,7 +1625,9 @@ const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 /// Aggressive compaction profile for the hidden vector-index table: keep
 /// ~one compact packed shard object per partition key instead of many
 /// small delta files.
-pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
+pub(crate) fn hidden_vector_index_compaction_settings(
+    max_concurrent_jobs: Option<usize>,
+) -> crate::config::CompactionSettings {
     let cfg = crate::config::global();
     let vector = &cfg.vector;
     crate::config::CompactionSettings {
@@ -1628,6 +1639,19 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
         min_fill_percent: cfg.compaction.min_fill_percent,
         min_superfiles_for_merge: vector.compaction_min_superfiles_for_merge,
         max_memory_mb: vector.compaction_max_memory_mb,
+        // The width the user table's pass runs at, so an operator who asked for
+        // one merge at a time gets one here too: this pass runs on the same
+        // machine, out of the same pools, and a setting that only made half the
+        // work serial would not be the setting they asked for. Unset derives it,
+        // as the user table does.
+        //
+        // Running them at all is safe for the same reason as the user table's: a
+        // pass's jobs never share an input. The hidden table partitions by vector
+        // cell, so its jobs are per-cell and disjoint by construction, and the
+        // over-cap cell split is a separate phase that completes before merge
+        // selection begins — no merge can race a split that would remove a
+        // superfile it planned to use.
+        max_concurrent_jobs,
         ..Default::default()
     }
 }
@@ -2512,6 +2536,29 @@ mod tests {
         let old = st.inner.manifest.load();
         let new = old.with_appended(entries);
         st.inner.manifest.store(Arc::new(new));
+    }
+
+    /// The hidden vector index runs at the width the pass was asked for.
+    ///
+    /// An operator who sets `max_concurrent_jobs` is sizing one machine, and
+    /// the hidden pass runs on it out of the same pools. Deriving its own width
+    /// there would leave `Some(1)` meaning "serial, except for half the work".
+    #[test]
+    fn the_hidden_index_follows_the_width_it_was_given() {
+        assert_eq!(
+            hidden_vector_index_compaction_settings(Some(1)).max_concurrent_jobs,
+            Some(1),
+            "a serial pass must be serial on both tables"
+        );
+        assert_eq!(
+            hidden_vector_index_compaction_settings(Some(4)).max_concurrent_jobs,
+            Some(4)
+        );
+        assert_eq!(
+            hidden_vector_index_compaction_settings(None).max_concurrent_jobs,
+            None,
+            "unset still derives, as the user table does"
+        );
     }
 
     #[test]
@@ -4308,6 +4355,7 @@ mod tests {
             min_fill_percent: 1,
             min_superfiles_for_merge: 2,
             max_memory_mb: 64,
+            max_concurrent_jobs: Some(1),
             stale_seal_timeout_ms: crate::config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         };
 
@@ -7083,7 +7131,7 @@ mod tests {
         // Merge the hidden index: the superseded parent blocks are dropped and
         // the parent superfile is reclaimed.
         hidden
-            .compact(&hidden_vector_index_compaction_settings())
+            .compact(&hidden_vector_index_compaction_settings(None))
             .expect("hidden merge");
 
         let reader = hidden.reader().expect("reader");

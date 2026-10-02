@@ -60,7 +60,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     str::from_utf8,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex, OnceLock, atomic::Ordering},
     thread::available_parallelism,
     time,
 };
@@ -77,7 +77,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
 use futures::{
-    future::try_join_all,
+    future::{BoxFuture, try_join_all},
     stream::{self, FuturesUnordered, StreamExt},
 };
 use object_store::{MultipartUpload, PutPayload, UploadPart};
@@ -85,7 +85,10 @@ use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::{
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::{
+        Semaphore,
+        mpsc::{Receiver, Sender, channel},
+    },
     time::sleep,
 };
 use tracing::{debug, error, info, warn};
@@ -3079,6 +3082,7 @@ pub(in crate::supertable) fn build_term_contribution(
 /// dictionary yields its terms sorted, so the contribution is in the
 /// ascending key order the merge requires. A superfile with no text index
 /// contributes no terms but is still listed by the index.
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 async fn write_superfile_terms(
     reader: &SuperfileReader,
     writer: &mut term_index::ContributionWriter,
@@ -3088,20 +3092,25 @@ async fn write_superfile_terms(
     };
     let mut columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
     columns.sort();
+    let fst_bytes = fts
+        .dict_bytes_async()
+        .await
+        .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
     for column in &columns {
-        let term_bytes = fts
-            .iter_column_terms(column)
-            .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
-        let terms: Vec<&str> = term_bytes
-            .iter()
-            .map(|t| from_utf8(t).map_err(|_| TermIndexError::Build("non-utf8 term".into())))
-            .collect::<Result<_, _>>()?;
-        for chunk in terms.chunks(TERM_INDEX_BATCH_TERMS) {
-            let facts = reader
-                .term_index_facts(column, chunk)
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let chunk = fts
+                .term_index_facts_after(
+                    &fst_bytes,
+                    column,
+                    after.as_deref(),
+                    TERM_INDEX_BATCH_TERMS,
+                )
                 .await
                 .map_err(|e| TermIndexError::Build(format!("term facts: {e}")))?;
-            for (term, fact) in chunk.iter().zip(facts) {
+            for (term, fact) in &chunk {
+                let term =
+                    from_utf8(term).map_err(|_| TermIndexError::Build("non-utf8 term".into()))?;
                 // A term the dictionary lists but no cursor could describe
                 // keeps its presence and is given the ceiling that prunes
                 // nothing rather than one that could be wrong.
@@ -3114,6 +3123,11 @@ async fn write_superfile_terms(
                     None => (0, f32::INFINITY, term_index::Location::None),
                 };
                 writer.push(&make_key(column, term), df, bound, location)?;
+            }
+            let done = chunk.len() < TERM_INDEX_BATCH_TERMS;
+            after = chunk.into_iter().last().map(|(term, _)| term);
+            if done {
+                break;
             }
         }
     }
@@ -9157,9 +9171,11 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             &[],
             &no_removals,
             NewEntryBirthVersions::StampCommit,
+            None,
             &mut Vec::new(),
             &mut Vec::new(),
             &[],
+            None,
         )
         .await
         {
@@ -9857,7 +9873,10 @@ pub(in crate::supertable) async fn stamp_term_index(
             let reference = term_index::write_built(storage.as_ref(), built)
                 .await
                 .map_err(|e| BuildError::Store(e.to_string()))?;
-            if old.term_index_ref() == Some(&reference) {
+            // The root is content-addressed, so an unchanged reference can
+            // still sit beside a stale "incomplete" mark; this build covers
+            // the whole membership, so publish whenever that mark is wrong.
+            if old.term_index_ref() == Some(&reference) && old.term_index_complete() {
                 return Ok(None);
             }
             Ok(Some(old.with_term_index(reference)))
@@ -9895,7 +9914,7 @@ async fn collect_and_build_term_index(
     term_index::build(&contributions, &term_index::BuildPolicy::default())
 }
 
-/// Terms per batched dictionary read during the term-index build.
+/// Terms per batch of facts read during the term-index build.
 const TERM_INDEX_BATCH_TERMS: usize = 4096;
 
 /// Publish/refresh the slow-CAS serving state (Commit B, "settle").
@@ -10279,9 +10298,11 @@ pub(in crate::supertable) async fn persist_commit_async(
                 &new_entries,
                 entries_to_remove,
                 NewEntryBirthVersions::StampCommit,
+                None,
                 pending_writes,
                 pending_replaces,
                 contributions,
+                None,
             )
             .await
             {
@@ -10519,21 +10540,21 @@ async fn write_superfile_list_with_threshold(
     // leaves headroom for a concurrent maintenance pass without saturation.
     let write_concurrency = commit_write_concurrency().get();
 
-    let replace_futs =
-        pending_storage_replaces
-            .iter()
-            .enumerate()
-            .map(|(i, (storage_key, bytes))| {
-                let storage = Arc::clone(storage);
-                let path = storage_key.clone();
-                let bytes = bytes.clone();
-                async move {
-                    put_superfile_replace(&storage, &path, bytes)
-                        .await
-                        .map(|()| i)
-                        .map_err(SupertableCommitError::from)
-                }
-            });
+    // Owned before the map, for the same reason as the PUTs below.
+    let to_replace: Vec<(usize, String, Bytes)> = pending_storage_replaces
+        .iter()
+        .enumerate()
+        .map(|(i, (storage_key, bytes))| (i, storage_key.clone(), bytes.clone()))
+        .collect();
+    let replace_futs = to_replace.into_iter().map(|(i, path, bytes)| {
+        let storage = Arc::clone(storage);
+        async move {
+            put_superfile_replace(&storage, &path, bytes)
+                .await
+                .map(|()| i)
+                .map_err(SupertableCommitError::from)
+        }
+    });
     let mut err = None;
     let mut successful_replace_idx = Vec::with_capacity(pending_storage_replaces.len());
     for r in stream::iter(replace_futs)
@@ -10555,19 +10576,23 @@ async fn write_superfile_list_with_threshold(
     }
 
     let multipart_threshold = put_multipart_threshold_bytes;
-    let put_futs = pending_storage_writes
+    // Owned before the map rather than cloned inside it. Identical work — the
+    // closure cloned both fields anyway — but its signature then names no
+    // lifetime, which is what lets a caller spawn this future: borrowing one
+    // here leaves `Send` inference unable to generalise over it.
+    let to_put: Vec<(usize, String, Bytes)> = pending_storage_writes
         .iter()
         .enumerate()
-        .map(|(i, (storage_key, bytes))| {
-            let storage = Arc::clone(storage);
-            let storage_key = storage_key.clone();
-            let bytes = bytes.clone();
-            async move {
-                put_new_superfile_bytes(&storage, multipart_threshold, storage_key, bytes)
-                    .await
-                    .map(|()| i)
-            }
-        });
+        .map(|(i, (storage_key, bytes))| (i, storage_key.clone(), bytes.clone()))
+        .collect();
+    let put_futs = to_put.into_iter().map(|(i, storage_key, bytes)| {
+        let storage = Arc::clone(storage);
+        async move {
+            put_new_superfile_bytes(&storage, multipart_threshold, storage_key, bytes)
+                .await
+                .map(|()| i)
+        }
+    });
 
     let mut err = None;
     let mut successful_writes_idx = Vec::with_capacity(pending_storage_writes.len());
@@ -10623,6 +10648,24 @@ pub(crate) enum NewEntryBirthVersions {
     Preserve,
 }
 
+/// A condition that has to still hold at the instant a commit becomes visible.
+///
+/// Everything a commit does before its pointer PUT is invisible until that PUT lands, so a safety
+/// property proved *before* that work has a hole exactly as wide as the work is slow — and
+/// uploading the new superfiles is the slow part, minutes of it at scale. A fence is checked once
+/// that is done, leaving the manifest parts and list and then the pointer PUT: a handful of small
+/// writes rather than the uploads. Not zero, but the closest to the swap that a condition on a
+/// separate object can be checked at all.
+///
+/// Compaction uses it to re-stamp the seals on the inputs this commit is about to remove: a seal
+/// that expired during a long upload lets a delete land a tombstone on a superfile that is then
+/// removed, and the deletion is lost. Ordinary writer commits remove nothing and pass `None`.
+pub(crate) trait CommitFence: Send {
+    /// `Err` aborts the attempt before anything is visible, so the caller can retry or give up
+    /// with nothing published.
+    fn check(&mut self) -> BoxFuture<'_, Result<(), SupertableCommitError>>;
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_commit_attempt(
     storage: Arc<dyn StorageProvider>,
@@ -10631,9 +10674,14 @@ pub(crate) async fn try_commit_attempt(
     new_entries: &[Arc<SuperfileEntry>],
     entries_to_remove: &[Arc<SuperfileEntry>],
     birth_versions: NewEntryBirthVersions,
+    // A superfile in `new_entries` whose tombstone sidecar is already
+    // written and must be named by this successor.
+    sidecar_to_register: Option<Uuid>,
     pending_storage_writes: &mut Vec<(String, Bytes)>,
     pending_storage_replaces: &mut Vec<(String, Bytes)>,
     term_contributions: &[TermContribution],
+    // Checked immediately before the pointer PUT; see [`CommitFence`].
+    fence: Option<&mut dyn CommitFence>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
@@ -10657,6 +10705,10 @@ pub(crate) async fn try_commit_attempt(
                 .await?
         }
     };
+
+    // 2a. Name any already-written sidecar in this same successor; a later
+    //     manifest would leave its tombstones unreadable in between.
+    new_manifest.register_tombstone_sidecar(sidecar_to_register);
 
     // 2b. Hidden VectorCell membership lives in the slow-state blob.
     //     `update` clears the ref; restamp it onto this same successor
@@ -10802,6 +10854,11 @@ pub(crate) async fn try_commit_attempt(
         .flat_map(|ep| [Some(ep.encoded.as_slice()), ep.routing_encoded.as_deref()])
         .flatten()
         .collect();
+    // Whatever this commit's safety rests on has to still hold here. What is left after it is the
+    // manifest parts and list and then the pointer PUT — small writes, not the uploads above.
+    if let Some(fence) = fence {
+        fence.check().await?;
+    }
     new_manifest
         .write(storage.as_ref(), prev_etag.as_deref(), &encoded_refs)
         .await?;
@@ -11173,17 +11230,56 @@ pub(in crate::supertable) async fn finalize_compaction_commit(
     pending_cache_inserts: Vec<(SuperfileUri, Bytes)>,
 ) {
     schedule_background_storage_reclaim(Arc::clone(&inner));
-    if !pending_cache_inserts.is_empty()
-        && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
-    {
-        warm_cache_after_commit(&inner, &cache, pending_cache_inserts);
+    let budget = inner.options.memory_budget_bytes;
+    let Some(cache) = inner.options.disk_cache.as_ref().cloned() else {
+        return;
+    };
+    if pending_cache_inserts.is_empty() {
+        if let Some(budget) = budget {
+            cache.sweep_for_budget(budget);
+        }
+        return;
     }
-    if let (Some(cache), Some(budget)) = (
-        inner.options.disk_cache.as_ref(),
-        inner.options.memory_budget_bytes,
-    ) {
-        cache.sweep_for_budget(budget);
-    }
+
+    // Spawned rather than awaited. This runs on the loop that admits merges and
+    // makes commits, and a multi-gigabyte output takes real time to land in the
+    // local cache — time in which no merge starts and no finished merge
+    // commits, so its inputs stay sealed for it. The warm is best-effort
+    // either way: a miss is a cold fetch on first read, which is what the
+    // pre-commit state was anyway.
+    //
+    // Permitted, because the blocking call it replaced was the only thing
+    // bounding how many outputs' bytes were held at once. Each pending warm
+    // pins its output until it is written, so an unbounded spawn lets a wide
+    // pass on a slow disk pile up outputs that the old shape could not. With a
+    // permit the held bytes stay in the same order as before while the loop
+    // stays free; a disk that cannot keep up now queues warms instead of
+    // growing the heap, which degrades the cache rather than the process.
+    let permits = warm_permits();
+    inner.query_runtime().spawn(async move {
+        let _permit = permits.acquire_owned().await.expect("never closed");
+        warm_cache_inserts(&cache, pending_cache_inserts).await;
+        // After the warm, not before it: swept ahead of the bytes landing, this
+        // measures a cache that does not yet hold them and leaves it over
+        // budget until some later commit happens to sweep.
+        if let Some(budget) = budget {
+            cache.sweep_for_budget(budget);
+        }
+    });
+}
+
+/// Concurrent post-commit cache warms allowed process-wide.
+///
+/// Two rather than one: a commit's warm should not have to wait out an
+/// unrelated table's, and two outputs in flight is still the same order of held
+/// bytes as the blocking call this replaced.
+fn warm_permits() -> Arc<Semaphore> {
+    static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+    /// Enough to keep a slow disk busy without letting outputs accumulate.
+    const CONCURRENT_WARMS: usize = 2;
+
+    Arc::clone(PERMITS.get_or_init(|| Arc::new(Semaphore::new(CONCURRENT_WARMS))))
 }
 
 /// Pre-populate the warm cache with each just-published superfile's bytes.

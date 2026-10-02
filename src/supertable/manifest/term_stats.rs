@@ -136,18 +136,16 @@ fn encode(covered: &[Uuid], entries: &BTreeMap<Vec<u8>, u64>) -> Vec<u8> {
 
 /// Build the artifact bytes over `readers`: for every FTS column of
 /// every superfile, walk its dictionary terms and sum gross df. The df
-/// reads are the batched header probes [`SuperfileReader::term_dfs`]
-/// performs (one dictionary parse + coalesced header fetches per batch)
-/// — no posting bodies are read, which is what makes this a *light*
-/// stats-only pass rather than a compaction.
-/// `open` is called once per entry and its reader is dropped before the next
-/// one opens, so the pass costs one superfile's open-time state rather than
-/// the whole table's. That matters because a lazy reader pins its term
-/// dictionary for its lifetime — megabytes each — so holding every reader at
-/// once made this scale with table size instead of with the work: on a
+/// reads are the batched header probes `FtsReader::term_dfs_with`
+/// performs (coalesced header fetches per batch) — no posting bodies are
+/// read, which is what makes this a *light* stats-only pass rather than a
+/// compaction. Each superfile's dictionary is fetched once and shared by
+/// its term walk and every df batch.
+/// `open` is called once per entry and its reader, with its dictionary, is
+/// dropped before the next one opens, so the pass costs one superfile's
+/// state rather than the whole table's. Holding every reader at once made
+/// this scale with table size instead of with the work: on a
 /// 30,000-superfile table it reached roughly 100 GB and could not run at all.
-/// Entries are still visited in order and one at a time, so throughput is
-/// unchanged; only the lifetime is.
 pub(crate) async fn build<F, Fut>(
     entries: &[Arc<SuperfileEntry>],
     mut open: F,
@@ -163,17 +161,25 @@ where
         let reader = open(entry).await?;
         let Some(fts) = reader.fts() else { continue };
         let columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
+        if columns.is_empty() {
+            continue;
+        }
+        // Fetched once: the term walk and every df batch read it.
+        let fst_bytes = fts
+            .dict_bytes_async()
+            .await
+            .map_err(|e| TermStatsError::Build(format!("dict fetch: {e}")))?;
         for column in &columns {
             let term_bytes = fts
-                .iter_column_terms(column)
+                .iter_column_terms_with(&fst_bytes, column)
                 .map_err(|e| TermStatsError::Build(format!("term walk: {e}")))?;
             let terms: Vec<&str> = term_bytes
                 .iter()
                 .map(|t| from_utf8(t).map_err(|_| TermStatsError::Build("non-utf8 term".into())))
                 .collect::<Result<_, _>>()?;
             for chunk in terms.chunks(BUILD_DF_BATCH_TERMS) {
-                let (dfs, _work) = reader
-                    .term_dfs(column, chunk)
+                let (dfs, _work) = fts
+                    .term_dfs_with(&fst_bytes, column, chunk)
                     .await
                     .map_err(|e| TermStatsError::Build(format!("df batch: {e}")))?;
                 for (term, df) in chunk.iter().zip(dfs) {

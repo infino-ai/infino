@@ -378,14 +378,10 @@ fn blob_version(
 ) -> u32 {
     match era {
         BlobEra::V7 if doc_map.is_some() => format::fts::VERSION_V8,
-        BlobEra::V7 => format::fts::VERSION_V7,
-        BlobEra::V6 => format::fts::VERSION_V6,
-        BlobEra::V5 => format::fts::VERSION_V5,
-        BlobEra::V2ToV4 if finish_profile.saw_bitset_block => format::fts::VERSION_V4,
-        BlobEra::V2ToV4 if positions_region_len > format::CRC_BYTES as u64 => {
-            format::fts::VERSION_V3
-        }
-        BlobEra::V2ToV4 => format::fts::VERSION_V2,
+        _ => era.stamped_version(
+            finish_profile.saw_bitset_block,
+            positions_region_len > format::CRC_BYTES as u64,
+        ),
     }
 }
 
@@ -416,17 +412,39 @@ pub(crate) enum BlobEra {
 }
 
 impl BlobEra {
-    /// The version this era stamps, for the layout table. `V2ToV4` reads
-    /// as `V4` — the sub-index and the bitset encoding are written; the
-    /// header's version is then set by what the blob actually contains.
-    fn layout(self) -> BlobLayout {
-        let version = match self {
+    /// The version this era writes, before the blob's contents narrow it.
+    /// `V2ToV4` reads as `V4` — the sub-index and the bitset encoding are
+    /// written; which of the three the header ends up stamping is
+    /// [`Self::stamped_version`].
+    fn version(self) -> u32 {
+        match self {
             Self::V7 => format::fts::VERSION_V7,
             Self::V6 => format::fts::VERSION_V6,
             Self::V5 => format::fts::VERSION_V5,
             Self::V2ToV4 => format::fts::VERSION_V4,
-        };
-        BlobLayout::for_version(version).expect("every era names a known version")
+        }
+    }
+
+    /// The version the header stamps, given what the finished blob holds.
+    ///
+    /// Within the pre-coarse era the version is decided by *content*, not
+    /// by the writer: a bitset block makes it `V4`, a non-empty positions
+    /// region `V3`, and neither `V2`. Every later era stamps its own
+    /// version. Split out from the header assembly so the invariant that
+    /// the era production writes stamps `VERSION_CURRENT` can be asserted
+    /// rather than assumed.
+    fn stamped_version(self, saw_bitset_block: bool, has_positions: bool) -> u32 {
+        match self {
+            Self::V2ToV4 if saw_bitset_block => format::fts::VERSION_V4,
+            Self::V2ToV4 if has_positions => format::fts::VERSION_V3,
+            Self::V2ToV4 => format::fts::VERSION_V2,
+            _ => self.version(),
+        }
+    }
+
+    /// The layout of the bytes this era writes.
+    fn layout(self) -> BlobLayout {
+        BlobLayout::for_version(self.version()).expect("every era names a known version")
     }
 
     /// The per-document length as this era stores it — what both the
@@ -5045,6 +5063,26 @@ mod tests {
         b.add_doc(0, 1, "b").expect("add doc");
         b.add_doc(0, 2, "c").expect("add doc");
         assert_eq!(b.n_docs, 3);
+    }
+
+    /// The version a current build stamps must be the one the staleness
+    /// check treats as current.
+    ///
+    /// These are separate constants on purpose (see `VERSION_CURRENT`),
+    /// which means they can drift: raising `VERSION_CURRENT` without
+    /// adding the era that writes it would mark every file stale,
+    /// including ones this engine just wrote, and a reindex would rewrite
+    /// the whole table into files it still considered stale. This fails
+    /// first instead.
+    #[test]
+    fn current_version_matches_the_written_era() {
+        let production_era = FtsBuilder::new(tokenizer()).era;
+        assert_eq!(
+            production_era.stamped_version(false, false),
+            format::fts::VERSION_CURRENT,
+            "the current era writes a version the staleness check does not \
+             consider current",
+        );
     }
 
     #[test]

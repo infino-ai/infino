@@ -31,6 +31,7 @@ use std::sync::Arc;
 use datafusion::scalar::ScalarValue;
 
 use crate::{
+    runtime_metrics::op_stats,
     superfile::fts::reader::BoolMode,
     supertable::{
         error::QueryError,
@@ -277,11 +278,21 @@ pub(crate) async fn select_superfiles(
         }
     }
 
-    Ok(superfiles
+    let considered = superfiles.len() as u64;
+    let kept: Vec<Arc<SuperfileEntry>> = superfiles
         .into_iter()
         .zip(mask)
         .filter_map(|(entry, keep)| keep.then_some(entry))
-        .collect())
+        .collect();
+    // What the summaries and the term index spared this query, separately from
+    // what the fan-out then opened. Without both numbers a query that opens the
+    // whole table is ambiguous: the prune may have failed, or the term may
+    // genuinely be in every superfile.
+    if let Some(stats) = op_stats::current() {
+        stats.add_superfiles_considered(considered);
+        stats.add_superfiles_pruned(considered - kept.len() as u64);
+    }
+    Ok(kept)
 }
 
 /// Element-wise `dst &= src`. Both slices are one bool per surviving

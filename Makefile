@@ -1,4 +1,4 @@
-.PHONY: check fmt test doctest doc \
+.PHONY: corpus test-corpus check fmt test doctest doc \
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update api-parity api-parity-update \
@@ -53,6 +53,20 @@ public-api-update:
 # never reaches the bindings. Pure Python 3; no toolchain needed.
 api-parity:
 	python3 scripts/check_api_parity.py
+
+# Generate the versioned corpus the format-migration tests read. Each shape
+# is written by a pinned published release, so this builds those crates the
+# first time and is a no-op afterwards.
+corpus:
+	tests/corpus/generate.sh
+
+# The corpus is generated, not committed, so its tests skip when it is
+# absent. That is right for a fresh checkout and wrong for CI, where a
+# silent skip looks identical to a pass — INFINO_CORPUS_REQUIRED turns a
+# missing corpus into a failure. CI should run this target, not `test`.
+test-corpus: corpus
+	INFINO_CORPUS_REQUIRED=1 cargo test --test supertable corpus_shapes
+	INFINO_CORPUS_REQUIRED=1 cargo test --test supertable reindex
 
 api-parity-update:
 	python3 scripts/check_api_parity.py --update
