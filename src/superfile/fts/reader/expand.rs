@@ -15,7 +15,7 @@ use roaring::RoaringBitmap;
 
 use super::{core::*, cursor::TermCursor, metadata::ColumnMeta, work::MatchWork};
 use crate::{
-    memory::{ConnectionMemoryBudget, Reservation},
+    memory::{ConnectionMemoryBudget, OverBudget, Reservation},
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::timed_section,
     superfile::{
@@ -81,6 +81,11 @@ const DOTTED_I_BASE: char = 'i';
 /// caps how many superfiles fetch at once, so the waves of a scan over many
 /// superfiles are bounded by both rather than by this size alone.
 const CONTAINS_FETCH_BATCH_BYTES: usize = 8 << 20;
+
+/// Term values a walk's budget charge grows by at a time (see
+/// `ValueCharge`): small next to any budget a connection sets, and
+/// enough that the budget's shared counter stays off the per-key path.
+const VALUE_CHARGE_STEP: usize = 4096;
 
 /// The query-term weight a match-only cursor is built with: nothing is
 /// scored, so nothing is weighted.
@@ -343,9 +348,46 @@ fn reserve_exact(
         .map(|budget| {
             budget
                 .try_reserve(bytes)
-                .map_err(|e| FtsError::OverBudget(format!("exact ILIKE {what}, {e}")))
+                .map_err(|refusal| exact_over_budget(what, refusal))
         })
         .transpose()
+}
+
+/// The budget's refusal of the exact path's `what`, as
+/// [`FtsError::OverBudget`].
+fn exact_over_budget(what: &str, refusal: OverBudget) -> FtsError {
+    FtsError::OverBudget(format!("exact ILIKE {what}, {refusal}"))
+}
+
+/// Term values a walk keeps, charged to a budget while it walks: the
+/// reservation runs up to [`VALUE_CHARGE_STEP`] values ahead of what has
+/// been admitted, so a broad needle over a large vocabulary is refused
+/// part-way through the walk rather than after it has collected every
+/// value.
+struct ValueCharge {
+    held: Reservation,
+    /// Values the reservation covers.
+    covered: usize,
+}
+
+impl ValueCharge {
+    fn new(budget: &Arc<ConnectionMemoryBudget>) -> Result<Self, FtsError> {
+        let held = budget
+            .try_reserve(0)
+            .map_err(|refusal| exact_over_budget("term values", refusal))?;
+        Ok(Self { held, covered: 0 })
+    }
+
+    /// Grow the reservation, a step at a time, until it covers `values`.
+    fn cover(&mut self, values: usize) -> Result<(), FtsError> {
+        while self.covered < values {
+            self.held
+                .try_grow(VALUE_CHARGE_STEP * size_of::<FstValue>())
+                .map_err(|refusal| exact_over_budget("term values", refusal))?;
+            self.covered += VALUE_CHARGE_STEP;
+        }
+        Ok(())
+    }
 }
 
 /// One `Pfor` term's postings reference, as the exact path's fetch waves
@@ -359,9 +401,10 @@ struct TermBody {
 }
 
 impl TermBody {
-    /// What the body counts against [`CONTAINS_FETCH_BATCH_BYTES`]: its
-    /// length, or — when the slot could not hold it — the slot's limit,
-    /// which such a body is at least.
+    /// The bytes reserved for the body before it is fetched: its length,
+    /// or — when the slot could not hold it — the slot's limit, which such
+    /// a body is at least. Its wave's reservation grows to the bytes that
+    /// actually came once it is fetched.
     fn budget_bytes(&self) -> usize {
         self.length.unwrap_or(PFOR_LENGTH_UNKNOWN as usize)
     }
@@ -369,14 +412,19 @@ impl TermBody {
 
 /// How many of `bodies`, from the front, one fetch wave takes: bodies
 /// until their bytes would pass [`CONTAINS_FETCH_BATCH_BYTES`], and
-/// always at least one.
+/// always at least one. A body whose length the slot could not hold is at
+/// least the slot's limit but could be any size past it, so it is fetched
+/// alone: several of them in one wave could pass the cap many times over.
 fn wave_len(bodies: &[TermBody]) -> usize {
     let mut bytes = 0usize;
     bodies
         .iter()
-        .position(|body| {
-            bytes += body.budget_bytes();
-            bytes > CONTAINS_FETCH_BATCH_BYTES
+        .position(|body| match body.length {
+            None => true,
+            Some(length) => {
+                bytes += length;
+                bytes > CONTAINS_FETCH_BATCH_BYTES
+            }
         })
         .map_or(bodies.len(), |past| past.max(1))
 }
@@ -453,7 +501,9 @@ impl FtsReader {
                     max_terms,
                     allow_full_walk,
                     Keep::Terms,
+                    None,
                 )
+                .map(|(collected, _)| collected)
             })
             .await
             .map_err(|_| FtsError::TaskDropped("like expansion"))??
@@ -552,6 +602,8 @@ impl FtsReader {
             .map(|needle| OwnedPattern::Contains((*needle).to_owned()))
             .collect();
         let walks = vec![Walk::Full; patterns.len()];
+        // The values the walk keeps are charged as it admits them.
+        let charge = budget.map(ValueCharge::new).transpose()?;
         let (walked, walk_ns) = run_on_pool(pool, "contains walk", move || {
             timed_section(|| {
                 walk_dictionary(
@@ -565,19 +617,15 @@ impl FtsReader {
                     usize::MAX,
                     true,
                     Keep::Values,
+                    charge,
                 )
             })
         })
         .await
         .map_err(|_| FtsError::TaskDropped("contains walk"))?;
         work.kernel_cpu_ns += walk_ns;
-        let walked = walked?;
-        // Held until every needle's rows are unioned.
-        let values: usize = walked
-            .iter()
-            .map(|slot| slot.proven.len() + slot.doubtful.len())
-            .sum();
-        let _values = reserve_exact(budget, values * size_of::<FstValue>(), "term values")?;
+        // The charge is held until every needle's rows are unioned.
+        let (walked, _values) = walked?;
         let mut out = Vec::with_capacity(needles.len());
         for walked in walked {
             let proven = self
@@ -636,7 +684,7 @@ impl FtsReader {
             let (wave, tail) = rest.split_at(wave_len(rest));
             rest = tail;
             // Released once this wave is unioned, before the next is fetched.
-            let _wave = reserve_exact(
+            let mut held = reserve_exact(
                 budget,
                 wave.iter().map(TermBody::budget_bytes).sum(),
                 "postings",
@@ -646,7 +694,15 @@ impl FtsReader {
                 .map(|body| (body.metadata_offset, body.length))
                 .collect();
             let fetched = self.fetch_term_postings(&refs).await?;
-            work.postings_bytes += fetched.iter().map(|b| b.len() as u64).sum::<u64>();
+            let fetched_bytes: usize = fetched.iter().map(|b| b.len()).sum();
+            // A body of unknown length was reserved at its lower bound;
+            // charge what actually came before it is unioned.
+            if let Some(held) = held.as_mut() {
+                let short = fetched_bytes.saturating_sub(held.size());
+                held.try_grow(short)
+                    .map_err(|refusal| exact_over_budget("postings", refusal))?;
+            }
+            work.postings_bytes += fetched_bytes as u64;
             // One range per body, and one more for a header probed for a
             // length the slot could not hold — as a match's build counts.
             work.planned_ranges += wave
@@ -737,10 +793,33 @@ fn rows_of(
     Ok(rows)
 }
 
+/// Charge `admitted` values to `charge`, when the walk carries one. `false`,
+/// with the refusal left in `refused`, once the budget says no: the walk
+/// stops there.
+fn charge_admitted(
+    charge: &mut Option<ValueCharge>,
+    admitted: usize,
+    refused: &mut Option<FtsError>,
+) -> bool {
+    let Some(charge) = charge.as_mut() else {
+        return true;
+    };
+    match charge.cover(admitted) {
+        Ok(()) => true,
+        Err(refusal) => {
+            *refused = Some(refusal);
+            false
+        }
+    }
+}
+
 /// The CPU half of [`FtsReader::expand_terms`] and
 /// [`FtsReader::contains_rows`]: one pass over the fetched dictionary that
 /// fills every pattern's collector, keeping what `keep` names. Runs on the
-/// reader pool, so it takes owned inputs.
+/// reader pool, so it takes owned inputs. With a `charge`, the values it
+/// admits are charged to its budget as it goes (a refusal ends the walk
+/// with `FtsError::OverBudget`), and the charge comes back with the
+/// collectors for the caller to hold while it uses them.
 fn walk_dictionary(
     fst_bytes: &[u8],
     layout: DictLayout,
@@ -751,33 +830,42 @@ fn walk_dictionary(
     max_terms: usize,
     allow_full_walk: bool,
     keep: Keep,
-) -> Result<Vec<Collected>, FtsError> {
+    mut charge: Option<ValueCharge>,
+) -> Result<(Vec<Collected>, Option<ValueCharge>), FtsError> {
     let dict = FtsReader::open_dict_with(fst_bytes, layout)?;
     let mut collected: Vec<Collected> = patterns.iter().map(|_| Collected::new()).collect();
     // Every key in the column's range starts with `<column>\x1F`; the
     // term is what follows. `for_each_prefix` only visits keys carrying
     // the prefix it was given, and every prefix below begins with that
     // column key, so the slice never runs past a key. A key that is not
-    // UTF-8 ends the walk with an error (see `non_utf8_key`).
+    // UTF-8 ends the walk with an error (see `non_utf8_key`), as does a
+    // refused charge.
     let term_start = make_key(column, "").len();
     let mut bad_key = false;
+    let mut refused: Option<FtsError> = None;
+    let mut admitted = 0usize;
     for ((slot, pattern), walk) in collected.iter_mut().zip(patterns).zip(walks) {
+        if bad_key || refused.is_some() {
+            break;
+        }
         if *walk == Walk::Subtree {
             dict.for_each_prefix(&make_key(column, pattern.borrow().text()), |key, value| {
-                match str::from_utf8(&key[term_start..]) {
-                    Ok(term) => slot.admit(term, value, false, keep, max_terms),
-                    Err(_) => {
-                        bad_key = true;
-                        false
-                    }
+                let Ok(term) = str::from_utf8(&key[term_start..]) else {
+                    bad_key = true;
+                    return false;
+                };
+                if !slot.admit(term, value, false, keep, max_terms) {
+                    return false;
                 }
+                admitted += 1;
+                charge_admitted(&mut charge, admitted, &mut refused)
             });
         }
     }
     let mut full: Vec<usize> = (0..patterns.len())
         .filter(|&i| walks[i] == Walk::Full && allow_full_walk)
         .collect();
-    if !full.is_empty() && !bad_key {
+    if !full.is_empty() && !bad_key && refused.is_none() {
         dict.for_each_prefix(&make_key(column, ""), |key, value| {
             let Ok(term) = str::from_utf8(&key[term_start..]) else {
                 bad_key = true;
@@ -801,16 +889,22 @@ fn walk_dictionary(
                 } else {
                     return true;
                 };
-                collected[i].admit(term, value, doubtful, keep, max_terms)
+                let kept = collected[i].admit(term, value, doubtful, keep, max_terms);
+                admitted += usize::from(kept);
+                kept
             });
-            // Stop once every full-walk pattern has hit its cap.
-            !full.is_empty()
+            // Stop once the budget refuses, or every full-walk pattern has
+            // hit its cap.
+            charge_admitted(&mut charge, admitted, &mut refused) && !full.is_empty()
         });
+    }
+    if let Some(refusal) = refused {
+        return Err(refusal);
     }
     if bad_key {
         return Err(non_utf8_key());
     }
-    Ok(collected)
+    Ok((collected, charge))
 }
 
 #[cfg(test)]
@@ -1341,6 +1435,7 @@ mod tests {
                 usize::MAX,
                 true,
                 keep,
+                None,
             )
             .err()
             .unwrap_or_else(|| panic!("{walk:?} / {keep:?} skipped the key"));
@@ -1349,6 +1444,74 @@ mod tests {
                 "{walk:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn a_value_charge_grows_a_step_ahead_and_refuses_past_the_budget() {
+        let step_bytes = VALUE_CHARGE_STEP * size_of::<FstValue>();
+        let measured = ConnectionMemoryBudget::measured();
+        let mut charge = ValueCharge::new(&measured).expect("measured");
+        charge.cover(1).expect("measured");
+        assert_eq!(
+            measured.used_bytes(),
+            step_bytes,
+            "one step covers one value"
+        );
+        charge.cover(VALUE_CHARGE_STEP).expect("measured");
+        assert_eq!(measured.used_bytes(), step_bytes, "and a whole step");
+        charge.cover(VALUE_CHARGE_STEP + 1).expect("measured");
+        assert_eq!(measured.used_bytes(), 2 * step_bytes);
+        drop(charge);
+        assert_eq!(measured.used_bytes(), 0, "released with the charge");
+        // A budget below one step refuses the first value.
+        let bounded = ConnectionMemoryBudget::with_limit(step_bytes as u64);
+        let mut charge = ValueCharge::new(&bounded).expect("an empty charge fits");
+        let err = charge.cover(1).expect_err("a step is past 90% of one step");
+        assert!(matches!(err, FtsError::OverBudget(_)), "{err}");
+    }
+
+    #[test]
+    fn a_charged_walk_holds_its_values_and_stops_when_refused() {
+        let docs = contains_docs();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let (blob, json) = build_standard_blob(&refs);
+        let r = FtsReader::open(blob, &json).expect("open");
+        let rt = Runtime::new().expect("runtime");
+        let fst = rt.block_on(r.dict_bytes_async()).expect("dictionary");
+        let walk = |charge: Option<ValueCharge>| {
+            walk_dictionary(
+                &fst,
+                r.dict_layout,
+                "body",
+                &[OwnedPattern::Contains("common".into())],
+                &[Walk::Full],
+                true,
+                usize::MAX,
+                true,
+                Keep::Values,
+                charge,
+            )
+        };
+        let measured = ConnectionMemoryBudget::measured();
+        let (collected, charge) = walk(Some(ValueCharge::new(&measured).expect("measured")))
+            .expect("a measured budget never refuses");
+        let kept = collected[0].proven.len() + collected[0].doubtful.len();
+        let charge = charge.expect("the charge comes back");
+        assert!(
+            kept > 0 && charge.covered >= kept,
+            "{} < {kept}",
+            charge.covered
+        );
+        assert!(measured.used_bytes() > 0, "held while the caller unions");
+        drop(charge);
+        assert_eq!(measured.used_bytes(), 0);
+        // Below one step, the first value admitted ends the walk.
+        let step_bytes = (VALUE_CHARGE_STEP * size_of::<FstValue>()) as u64;
+        let bounded = ConnectionMemoryBudget::with_limit(step_bytes);
+        let err = walk(Some(ValueCharge::new(&bounded).expect("empty")))
+            .err()
+            .expect("refused part-way through the walk");
+        assert!(matches!(err, FtsError::OverBudget(_)), "{err}");
     }
 
     /// A budget smaller than one document bitset of the contains fixture.
@@ -1403,10 +1566,13 @@ mod tests {
             1,
             "one body over the budget goes alone"
         );
-        // A body too long for its slot counts as at least the slot's limit.
+        // A body too long for its slot could be any size past its limit,
+        // so it goes alone, and a wave of known lengths stops before it.
         let unknown = [body(None); 8];
-        let per_wave = CONTAINS_FETCH_BATCH_BYTES / PFOR_LENGTH_UNKNOWN as usize;
-        assert_eq!(wave_len(&unknown), per_wave.clamp(1, unknown.len()));
+        assert_eq!(wave_len(&unknown), 1, "an unknown length goes alone");
+        let mixed = [body(Some(1)), body(Some(1)), body(None), body(Some(1))];
+        assert_eq!(wave_len(&mixed), 2, "known lengths stop before it");
+        assert_eq!(wave_len(&mixed[2..]), 1);
     }
 
     #[test]
