@@ -31,13 +31,13 @@ use std::{collections::HashSet, mem, sync::Arc};
 use tracing::{debug, warn};
 
 use crate::{
-    storage::StorageProvider,
+    storage::{StorageError, StorageProvider},
     supertable::{
         ManifestSnapshot,
         error::GcError,
         gc::{delete_objects, list_refs, refresh_to_committed, term_index_slices},
         handle::SupertableInner,
-        manifest::{SuperfileEntry, commit::manifest_uri, list::RoutingRef},
+        manifest::{ManifestLoadError, SuperfileEntry, commit::manifest_uri, list::RoutingRef},
         wal::persistence::WalStore,
     },
 };
@@ -132,6 +132,13 @@ pub(in crate::supertable) async fn reclaim(
 ) -> Result<ReclaimReport, GcError> {
     let storage = inner.options.storage.clone().ok_or(GcError::NoStorage)?;
     if let Err(error) = refresh_to_committed(inner).await {
+        // A purge took the objects this sweep exists to delete, so there is
+        // nothing left to do and nothing worth reporting. The keys are let go
+        // rather than held: no later sweep can run against a dead handle.
+        if table_was_purged(storage.as_ref(), &error).await {
+            debug!("gc: table dropped before its superseded objects were reclaimed");
+            return Ok(ReclaimReport::default());
+        }
         inner.hold_superseded(superseded);
         return Err(error);
     }
@@ -169,6 +176,35 @@ pub(in crate::supertable) async fn reclaim(
         "gc: reclaimed superseded objects"
     );
     Ok(report)
+}
+
+/// Everything a table keeps beside its data: the pointer and the manifest objects.
+const MANIFEST_PREFIX: &str = "_supertable/";
+
+/// Whether this gc failure is the table having been dropped and purged.
+///
+/// An absent pointer on its own does not say that. A transient `NotFound`, a provider rebound to
+/// another prefix, and a pointer deleted by hand all read identically, and in each the table's
+/// objects are still there for a sweep to collect — so each should still be reported. What a
+/// purge establishes is stronger: `Connection::drop_table` deletes every object under the table's
+/// location, so the manifest prefix is empty afterwards. That emptiness is the corroboration, and
+/// without it this reports a failure as before.
+///
+/// A listing that cannot be read is not evidence of anything, so it reports the table as present.
+async fn table_was_purged(storage: &dyn StorageProvider, error: &GcError) -> bool {
+    let GcError::Storage(StorageError::Permanent { source, .. }) = error else {
+        return false;
+    };
+    if !matches!(
+        source.downcast_ref::<ManifestLoadError>(),
+        Some(ManifestLoadError::PointerVanished)
+    ) {
+        return false;
+    }
+    storage
+        .list_with_prefix(MANIFEST_PREFIX)
+        .await
+        .is_ok_and(|objects| objects.is_empty())
 }
 
 /// The slices the replaced term-index `roots` name and the `latest` root does not. A rebuilt index

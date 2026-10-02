@@ -72,7 +72,7 @@ use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
-    memory::{ConnectionMemoryBudget, budgeted_session_context},
+    memory::ConnectionMemoryBudget,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::{
         io::{UsageMeter, UsageSnapshot},
@@ -95,7 +95,7 @@ use crate::{
         Supertable as SupertableHandle,
         manifest::disk_cache::ManifestDiskCache,
         options::SupertableOptions,
-        query::exec::common::collect_plan_metered,
+        query::{exec::common::collect_plan_metered, sql::sql_session_context},
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
     utils::trace::{self, CloseOut, detail_span},
@@ -947,8 +947,10 @@ impl Connection {
         ensure_sql_within_connective_cap(sql)?;
 
         // Gate SQL heap on the connection budget: DataFusion allocates the
-        // working set (sort / aggregate / join), so its pool is the gate.
-        let ctx = budgeted_session_context(&self.inner.connection_memory_budget)
+        // working set (sort / aggregate / join), so its pool is the gate. The
+        // same constructor as a table reader's, so covered aggregates are
+        // answered from manifest statistics here too.
+        let ctx = sql_session_context(&self.inner.connection_memory_budget)
             .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
 
         // Resolve the relations the query names and register each that is a
@@ -1462,6 +1464,7 @@ mod tests {
         time::Duration,
     };
 
+    use arrow::util::pretty::pretty_format_batches;
     use arrow_array::{Array, Int64Array, LargeStringArray, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
@@ -1474,7 +1477,7 @@ mod tests {
     use crate::{
         Bm25SearchOptions, BoolMode, Consistency, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
-        supertable::manifest::commit::POINTER_PATH,
+        supertable::{manifest::commit::POINTER_PATH, query::provider::TABLE_NAME},
         test_helpers::{build_title_batch, schema_id_title},
     };
 
@@ -3514,6 +3517,201 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 3, "2 from docs + 1 from more");
+    }
+
+    /// A three-value `title` over two superfiles, so a grouped count merges two superfiles'
+    /// value counts.
+    fn create_cab_types(conn: &Connection, name: &str) {
+        let table = conn
+            .create_table(name, schema_id_title(), IndexSpec::new())
+            .expect("create");
+        table
+            .append(&build_title_batch(&["yellow", "green", "yellow"]))
+            .expect("append 1");
+        table
+            .append(&build_title_batch(&["fhv", "yellow"]))
+            .expect("append 2");
+    }
+
+    /// `(group, count)` rows of a grouped count, sorted by group.
+    fn grouped_counts(batches: &[RecordBatch]) -> Vec<(String, i64)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let groups = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeUtf8 group");
+            let counts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 count");
+            for i in 0..batch.num_rows() {
+                rows.push((groups.value(i).to_string(), counts.value(i)));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// Whether `EXPLAIN` output plans a scan of any table.
+    fn scans(explained: &[RecordBatch]) -> bool {
+        pretty_format_batches(explained)
+            .expect("format plan")
+            .to_string()
+            .contains("TableScan")
+    }
+
+    /// `GROUP BY col, COUNT(*)` and a single-column filtered `COUNT(*)` are answered from the
+    /// manifest's value counts through the public API, with no scan.
+    #[test]
+    fn query_sql_answers_covered_aggregates_from_manifest_stats() {
+        let conn = connect("memory://").expect("connect");
+        create_cab_types(&conn, "cabs");
+
+        let grouped = "SELECT title, count(*) FROM cabs GROUP BY title";
+        assert_eq!(
+            grouped_counts(&conn.query_sql(grouped).expect("grouped")),
+            vec![
+                ("fhv".to_string(), 1),
+                ("green".to_string(), 1),
+                ("yellow".to_string(), 3)
+            ]
+        );
+        let filtered = "SELECT count(*) FROM cabs WHERE title = 'yellow'";
+        let n = conn.query_sql(filtered).expect("filtered")[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 count")
+            .value(0);
+        assert_eq!(n, 3);
+
+        for sql in [grouped, filtered] {
+            let plan = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+            assert!(
+                !scans(&plan),
+                "answered from manifest stats, no scan: {sql}"
+            );
+        }
+    }
+
+    /// The catalog and a table's reader plan the same aggregate the same way: same rows, and
+    /// neither scans. The two build their SQL context separately, and once drifted apart.
+    #[test]
+    fn query_sql_plans_aggregates_like_the_table_reader() {
+        let conn = connect("memory://").expect("connect");
+        create_cab_types(&conn, "cabs");
+        let reader = conn
+            .open_table_handle("cabs")
+            .expect("handle")
+            .reader()
+            .expect("reader");
+
+        let sql = "SELECT title, count(*) FROM {} GROUP BY title";
+        let through_catalog = conn.query_sql(&sql.replace("{}", "cabs")).expect("catalog");
+        let through_reader = reader
+            .query_sql(&sql.replace("{}", TABLE_NAME))
+            .expect("reader");
+        assert_eq!(
+            grouped_counts(&through_catalog),
+            grouped_counts(&through_reader)
+        );
+
+        let catalog_plan = conn
+            .query_sql(&format!("EXPLAIN {}", sql.replace("{}", "cabs")))
+            .expect("catalog explain");
+        let reader_plan = reader
+            .query_sql(&format!("EXPLAIN {}", sql.replace("{}", TABLE_NAME)))
+            .expect("reader explain");
+        assert!(!scans(&catalog_plan), "catalog plan scans");
+        assert!(!scans(&reader_plan), "reader plan scans");
+    }
+
+    /// Deleted rows never reach a covered aggregate: a superfile with tombstones is not clean, so
+    /// the rewrite scans it and the scan drops the deleted rows.
+    #[test]
+    fn query_sql_covered_aggregates_see_deletes() {
+        // Deletes need durable storage; `memory://` refuses them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = connect(dir.path().to_str().expect("utf8 path")).expect("connect");
+        create_cab_types(&conn, "cabs");
+        conn.open_table("cabs")
+            .expect("open")
+            .delete(col("title").eq(lit("green")))
+            .expect("delete");
+
+        assert_eq!(
+            grouped_counts(
+                &conn
+                    .query_sql("SELECT title, count(*) FROM cabs GROUP BY title")
+                    .expect("grouped")
+            ),
+            vec![("fhv".to_string(), 1), ("yellow".to_string(), 3)],
+            "the deleted group is gone"
+        );
+        let n = conn
+            .query_sql("SELECT count(*) FROM cabs WHERE title = 'green'")
+            .expect("filtered")[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 count")
+            .value(0);
+        assert_eq!(n, 0, "deleted rows are not counted");
+    }
+
+    /// A fresh connection to a durable table, as a cold worker opens it: a clean table is
+    /// answered from stats, and once rows are deleted the counts still leave them out.
+    #[test]
+    fn query_sql_covered_aggregates_after_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        create_cab_types(&connect(&uri).expect("connect"), "cabs");
+        let grouped = "SELECT title, count(*) FROM cabs GROUP BY title";
+
+        let reopened = connect(&uri).expect("reopen");
+        let plan = reopened
+            .query_sql(&format!("EXPLAIN {grouped}"))
+            .expect("explain");
+        assert!(
+            !scans(&plan),
+            "a clean reopened table is answered from stats"
+        );
+
+        reopened
+            .open_table("cabs")
+            .expect("open")
+            .delete(col("title").eq(lit("green")))
+            .expect("delete");
+        let after_delete = connect(&uri).expect("reopen after delete");
+        assert_eq!(
+            grouped_counts(&after_delete.query_sql(grouped).expect("grouped")),
+            vec![("fhv".to_string(), 1), ("yellow".to_string(), 3)]
+        );
+    }
+
+    /// The rewrite only answers an aggregate over one table's scan; an aggregate over a join of
+    /// two tables still scans both and counts the joined rows.
+    #[test]
+    fn query_sql_does_not_rewrite_an_aggregate_over_a_join() {
+        let conn = connect("memory://").expect("connect");
+        create_cab_types(&conn, "cabs");
+        create_cab_types(&conn, "fares");
+
+        let sql = "SELECT a.title, count(*) FROM cabs a JOIN fares b ON a.title = b.title \
+                   GROUP BY a.title";
+        assert_eq!(
+            grouped_counts(&conn.query_sql(sql).expect("join")),
+            vec![
+                ("fhv".to_string(), 1),
+                ("green".to_string(), 1),
+                ("yellow".to_string(), 9)
+            ]
+        );
+        let plan = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+        assert!(scans(&plan), "a join is planned as scans");
     }
 
     // Many distinct group keys force DataFusion's aggregate to build a real

@@ -20,6 +20,7 @@ def test_package_metadata():
     assert set(infino.__all__) == {
         "connect",
         "ConflictError",
+        "AlreadyRunningError",
         "Connection",
         "InfinoError",
         "ConnectionMemoryBudgetError",
@@ -28,6 +29,10 @@ def test_package_metadata():
         "MutationStats",
         "GcReport",
         "OptimizeOptions",
+        "ReindexOptions",
+        "ReindexReport",
+        "StalenessReport",
+        "PlannedRepair",
     }
 
 

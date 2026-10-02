@@ -398,6 +398,19 @@ pub struct ColumnMeta {
     pub stopwords: Stopwords,
     pub stemmer: Stemmer,
     pub stored: bool,
+    /// Revision of the analysis that produced this column's terms (from
+    /// `inf.fts.columns`), or `None` when the file predates the field.
+    ///
+    /// Below what this engine's chain emits, the column's terms and a
+    /// query's terms can disagree for the same text, so the column is
+    /// stale and a reindex must re-analyze it. Carried across a rewrite
+    /// unchanged: copying postings does not re-analyze them.
+    ///
+    /// `None` is not `Some(0)`. A recorded zero is a known-stale carry; an
+    /// absent field is an unknown, and only a caller that can rule out a
+    /// carry may credit it with the writer's revision — see
+    /// [`FtsReader::staleness`](crate::superfile::fts::reader::FtsReader).
+    pub analysis_revision: Option<u32>,
     /// Where the length array is read from when the norms are first needed.
     pub(super) source: Source,
     pub(super) n_docs: u32,
@@ -603,6 +616,16 @@ impl ColumnMeta {
         self.length_stats().n_scored_docs
     }
 
+    /// The tf a df=1 inline dictionary slot scores with. On a positional
+    /// column the slot carries the term's single position, tf implied 1:
+    /// the builder only inlines tf == 1 postings there.
+    pub(super) fn inline_tf(&self, slot: u32) -> u32 {
+        match self.positions {
+            true => 1,
+            false => slot,
+        }
+    }
+
     /// The average document length this column is scored at — the one
     /// its norm table decodes with.
     pub fn avgdl(&self) -> f32 {
@@ -658,6 +681,30 @@ pub struct FtsColumnConfig {
     /// and unknown-name-fails rules as [`FtsColumnConfig::stopwords`].
     #[serde(default)]
     pub stemmer: Option<String>,
+    /// Revision of the analysis that produced this column's terms.
+    ///
+    /// Per column rather than per file, for two reasons. It is derived
+    /// from [`Self::tokenizer`], [`Self::stopwords`] and
+    /// [`Self::stemmer`], which a caller sets per field — two columns of
+    /// one table can be analyzed by different chains and so sit at
+    /// different revisions. And a re-analysis can only rebuild columns
+    /// whose text was stored, carrying the rest across untouched, so it
+    /// leaves a file holding both the new revision and the old one. A
+    /// file-level field would have to claim one of them for columns it
+    /// did not repair.
+    ///
+    /// `None` on every file written before revisions were recorded, and
+    /// only on those: this engine emits the field unconditionally, zero
+    /// included. That is what keeps "written by an engine that did not
+    /// record revisions" distinguishable from "recorded as stale", which
+    /// otherwise both read as zero and mean different things.
+    ///
+    /// Unlike the other defaults here, a missing field is not "the
+    /// feature was off": it is "unknown". Treating it as the oldest
+    /// revision is the only reading that cannot make a stale column look
+    /// current.
+    #[serde(default)]
+    pub analysis_revision: Option<u32>,
 }
 
 impl FtsColumnConfig {

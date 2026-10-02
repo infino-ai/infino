@@ -77,6 +77,7 @@ use crate::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
         slow_vector_state::{CentroidSection, ResidentVectorIndex},
+        wal::pipeline::DEFAULT_MAX_SEALED_RETRIES,
     },
 };
 
@@ -553,6 +554,12 @@ pub struct SupertableOptions {
     /// concurrent-writer contention; writer-heavy workloads can
     /// raise via [`Self::with_max_commit_retries`].
     pub max_commit_retries: u32,
+    /// How many sealed-sidecar retries a mutation may spend without forward
+    /// progress before it gives up with `SealedSidecarRetryExhausted`.
+    /// Progress refunds the budget, so a healthy table never reaches this;
+    /// tests lower it to reach the exhausted path in bounded time. Raise via
+    /// [`Self::with_max_sealed_retries`].
+    pub max_sealed_retries: u32,
     /// Auto-flush threshold for the writer's in-memory buffer,
     /// in MiB of accumulated raw payload (Arrow scalar columns +
     /// f32 vector slices). When the buffer crosses this
@@ -801,6 +808,7 @@ impl SupertableOptions {
             drain_consolidate: DrainConsolidate::Kmeans,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
             max_commit_retries: DEFAULT_MAX_COMMIT_RETRIES,
+            max_sealed_retries: DEFAULT_MAX_SEALED_RETRIES,
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
             superfile_buffer_split_mb: DEFAULT_SUPERFILE_BUFFER_SPLIT_MB,
             put_multipart_threshold_bytes: DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES,
@@ -1057,6 +1065,14 @@ impl SupertableOptions {
     /// `10`.
     pub fn with_max_commit_retries(mut self, n: u32) -> Self {
         self.max_commit_retries = n;
+        self
+    }
+
+    /// Override the sealed-sidecar retry budget. See
+    /// [`Self::max_sealed_retries`] for semantics. Clamped to at least 1 where
+    /// it is read, so a zero cannot disable the retry entirely.
+    pub fn with_max_sealed_retries(mut self, n: u32) -> Self {
+        self.max_sealed_retries = n;
         self
     }
 

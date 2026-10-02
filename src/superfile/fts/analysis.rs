@@ -184,6 +184,16 @@ pub(crate) const ENGLISH_STOPWORDS: &[&str] = &[
 const ENGLISH_STOPWORD_MAX_LEN: usize = 5;
 
 impl Stopwords {
+    /// This filter's analysis revision (see [`chain_revision`]).
+    ///
+    /// The shipped list has not changed since it was introduced, so a
+    /// column filtered by it holds the same terms it always did.
+    pub(crate) fn revision(self) -> u32 {
+        match self {
+            Self::None | Self::English => 0,
+        }
+    }
+
     /// Whether `token` — already lowercased by the base tokenizer, and
     /// not yet stemmed — is in this set.
     #[inline]
@@ -215,6 +225,20 @@ impl Base {
     /// no filters.
     pub(crate) fn name(self) -> &'static str {
         chain_name(self, Stopwords::None, Stemmer::None)
+    }
+
+    /// This base's analysis revision (see [`chain_revision`]).
+    ///
+    /// Both bases are at 1: the token-length cap applies to each, and
+    /// folding every entry point through one emitter changed what the
+    /// ASCII fast paths emitted. `Standard` also began emitting emoji as
+    /// tokens in the same change, which is a second reason for the same
+    /// bump rather than a separate revision — a revision numbers a
+    /// chain's output, not the changes that produced it.
+    pub(crate) fn revision(self) -> u32 {
+        match self {
+            Base::AsciiLower | Base::Standard => 1,
+        }
     }
 
     /// Resolve a base tokenizer name.
@@ -415,6 +439,89 @@ pub(crate) fn chain_name(base: Base, stopwords: Stopwords, stemmer: Stemmer) -> 
     }
 }
 
+/// The revision of the terms a chain emits.
+///
+/// A column's stored `tokenizer` name says *which* analysis produced its
+/// postings; it cannot say which **version** of that analysis, because a
+/// name does not change when the tokens behind it do. Two files can name
+/// `standard` and hold different terms for the same text, and nothing in
+/// the file distinguishes them — so a query analyzed by today's chain can
+/// look up a term an older index never wrote, and match nothing.
+///
+/// This number closes that gap: it is stamped per column and compared
+/// rather than inferred. Bump the component that actually moved whenever a
+/// change can alter the tokens a chain emits for any input — a new
+/// boundary rule, a different fold, a cap, a filter's word list. A change
+/// that cannot alter output (a faster path over identical tokens) leaves it
+/// alone.
+///
+/// The chain's revision is the sum of its parts', so each part moves it
+/// independently — see [`combine_revisions`].
+pub(crate) fn chain_revision(base: Base, stopwords: Stopwords, stemmer: Stemmer) -> u32 {
+    combine_revisions(base.revision(), stopwords.revision(), stemmer.revision())
+}
+
+/// Prefix an `inf.builder` value carries when this engine wrote the file.
+const BUILDER_PREFIX: &str = "infino/";
+
+/// First crate version whose chains emit the revision they emit today.
+///
+/// The token-length cap, the single emitter behind the ASCII fast paths
+/// and `standard`'s emoji tokens all landed together and first shipped
+/// here; nothing has moved the tokenizer since. A file written by this
+/// version or later therefore holds revision-1 terms even though the
+/// field did not exist yet to say so.
+const FIRST_VERSION_AT_CURRENT_REVISION: (u32, u32, u32) = (0, 8, 3);
+
+/// The revision the chains were at from
+/// [`FIRST_VERSION_AT_CURRENT_REVISION`] onward.
+const REVISION_AT_THAT_VERSION: u32 = 1;
+
+/// The analysis revision an engine identified by `builder` emitted.
+///
+/// `builder` is an `inf.builder` value — `infino/<version>+<hash>`. It
+/// answers what a file's terms *would* be at when the file itself records
+/// nothing, which is only sound where that file cannot have carried
+/// postings from an older engine; see
+/// [`FtsReader::staleness`](super::reader::FtsReader::staleness).
+///
+/// Anything unparseable, or written by something other than this engine,
+/// reads as [`UNKNOWN_ANALYSIS_REVISION`] — a writer this cannot identify
+/// is never credited.
+pub(crate) fn analysis_revision_written_by(builder: &str) -> u32 {
+    let Some(rest) = builder.strip_prefix(BUILDER_PREFIX) else {
+        return UNKNOWN_ANALYSIS_REVISION;
+    };
+    // `+<hash>` is optional; a `-dirty` marker rides on the hash, so
+    // splitting at the `+` leaves the version alone.
+    let version = rest.split('+').next().unwrap_or_default();
+    let mut parts = version.split('.');
+    let mut next = || parts.next().and_then(|p| p.parse::<u32>().ok());
+    let (Some(major), Some(minor), Some(patch)) = (next(), next(), next()) else {
+        return UNKNOWN_ANALYSIS_REVISION;
+    };
+    match (major, minor, patch) >= FIRST_VERSION_AT_CURRENT_REVISION {
+        true => REVISION_AT_THAT_VERSION,
+        false => UNKNOWN_ANALYSIS_REVISION,
+    }
+}
+
+/// The revision to credit terms whose own is unknown.
+///
+/// The oldest, so a column recording no revision can never read as
+/// current on the strength of an assumption.
+pub(crate) const UNKNOWN_ANALYSIS_REVISION: u32 = 0;
+
+/// Fold a chain's part revisions into the one number the format stores.
+///
+/// Summing rather than taking the maximum is what makes a filter bump
+/// visible: under a maximum, a stemmer moving from 0 to 1 is swallowed by
+/// a base already at 1, so the chain keeps its old revision and every file
+/// analyzed by the old stemmer reads as current.
+fn combine_revisions(base: u32, stopwords: u32, stemmer: u32) -> u32 {
+    base + stopwords + stemmer
+}
+
 /// Build the tokenizer for a chain: the bare base tokenizer when no
 /// filter is active, otherwise a [`ChainTokenizer`].
 ///
@@ -477,6 +584,16 @@ impl Stopwords {
 }
 
 impl Stemmer {
+    /// This filter's analysis revision (see [`chain_revision`]).
+    ///
+    /// The algorithm is Snowball English via `rust-stemmers`, unchanged
+    /// since it was introduced.
+    pub(crate) fn revision(self) -> u32 {
+        match self {
+            Self::None | Self::English => 0,
+        }
+    }
+
     /// The name this stemmer persists under; see
     /// [`Stopwords::as_str`].
     pub(crate) fn as_str(self) -> Option<&'static str> {
@@ -677,6 +794,166 @@ mod tests {
             8,
             "two bases x two stopword sets x two stemmers"
         );
+    }
+
+    /// Every shipped chain emits exactly these tokens. A change here is a
+    /// format change: columns already built hold the old terms and would
+    /// be queried with the new ones. Bump the part that moved
+    /// ([`Base::revision`] and friends) so a reindex can repair them —
+    /// do not re-record the expectations.
+    ///
+    /// The text covers what separates the chains: case, a hyphen split, a
+    /// digit run, a stopword, an inflected word, and non-ASCII including
+    /// an emoji — which `standard` emits as a token and `ascii_lower`
+    /// drops.
+    #[test]
+    fn every_chain_emits_its_recorded_tokens() {
+        const TEXT: &str = "The Quick brown-foxes JUMPED over 42 lazy dogs! Café ☕ naïve";
+        let expected: [(&str, &[&str]); 8] = [
+            (
+                "ascii_lower",
+                &[
+                    "the", "quick", "brown", "foxes", "jumped", "over", "42", "lazy", "dogs",
+                ],
+            ),
+            (
+                "ascii_lower+stop=english",
+                &[
+                    "quick", "brown", "foxes", "jumped", "over", "42", "lazy", "dogs",
+                ],
+            ),
+            (
+                "ascii_lower+stem=english",
+                &[
+                    "the", "quick", "brown", "fox", "jump", "over", "42", "lazi", "dog",
+                ],
+            ),
+            (
+                "ascii_lower+stop=english+stem=english",
+                &["quick", "brown", "fox", "jump", "over", "42", "lazi", "dog"],
+            ),
+            (
+                "standard",
+                &[
+                    "the", "quick", "brown", "foxes", "jumped", "over", "42", "lazy", "dogs",
+                    "café", "☕", "naïve",
+                ],
+            ),
+            (
+                "standard+stop=english",
+                &[
+                    "quick", "brown", "foxes", "jumped", "over", "42", "lazy", "dogs", "café",
+                    "☕", "naïve",
+                ],
+            ),
+            (
+                "standard+stem=english",
+                &[
+                    "the", "quick", "brown", "fox", "jump", "over", "42", "lazi", "dog", "café",
+                    "☕", "naïv",
+                ],
+            ),
+            (
+                "standard+stop=english+stem=english",
+                &[
+                    "quick", "brown", "fox", "jump", "over", "42", "lazi", "dog", "café", "☕",
+                    "naïv",
+                ],
+            ),
+        ];
+        for (name, want) in expected {
+            assert_eq!(
+                tokens(name, TEXT),
+                want,
+                "{name:?} changed what it emits. This is a format change: \
+                 bump the part that moved rather than re-recording this."
+            );
+        }
+    }
+
+    /// Every chain is at revision 1 today, which is what makes summing the
+    /// parts a no-op for existing files: no column's recorded revision
+    /// changes meaning under the new rule.
+    #[test]
+    fn every_shipped_chain_is_at_revision_one() {
+        for base in [Base::AsciiLower, Base::Standard] {
+            for stop in [Stopwords::None, Stopwords::English] {
+                for stem in [Stemmer::None, Stemmer::English] {
+                    let name = chain_name(base, stop, stem);
+                    assert_eq!(
+                        chain_revision(base, stop, stem),
+                        1,
+                        "{name:?} moved off revision 1 — every file it wrote \
+                         reads as stale, so this needs to be deliberate"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Reading a writer's revision off its `inf.builder` string.
+    ///
+    /// The comparison is numeric per component: `0.8.10` is newer than
+    /// `0.8.3`, which a string compare gets backwards. Anything this
+    /// cannot parse reads as unknown, so an unrecognized writer is never
+    /// credited with terms it may not hold.
+    #[test]
+    fn a_writers_analysis_revision_is_read_from_its_version() {
+        for builder in [
+            "infino/0.8.3+abc123def456",
+            "infino/0.8.6+abc123def456",
+            "infino/0.8.10+abc123def456",
+            "infino/0.9.0+abc123def456",
+            "infino/1.0.0+abc123def456",
+            "infino/0.8.6+abc123def456-dirty",
+            "infino/0.8.6+unknown",
+            "infino/0.8.6",
+        ] {
+            assert_eq!(
+                analysis_revision_written_by(builder),
+                1,
+                "{builder} shipped the current chains"
+            );
+        }
+
+        for builder in [
+            "infino/0.8.2+abc123def456",
+            "infino/0.1.0+abc123def456",
+            "infino/0.0.0+abc123def456",
+        ] {
+            assert_eq!(
+                analysis_revision_written_by(builder),
+                UNKNOWN_ANALYSIS_REVISION,
+                "{builder} predates the current chains"
+            );
+        }
+
+        for builder in [
+            "",
+            "infino/",
+            "infino/x.y.z+abc",
+            "0.8.6",
+            "other/9.9.9+abc",
+        ] {
+            assert_eq!(
+                analysis_revision_written_by(builder),
+                UNKNOWN_ANALYSIS_REVISION,
+                "{builder:?} is not a writer this engine recognizes"
+            );
+        }
+    }
+
+    /// A bump in any one part must move the chain's revision. Taking the
+    /// maximum instead hides a filter bump behind a higher base, so a
+    /// column whose stemmer moved keeps reporting the revision it had and
+    /// a reindex leaves its terms stale.
+    #[test]
+    fn a_chain_revision_moves_when_any_single_part_moves() {
+        let flat = combine_revisions(1, 0, 0);
+        assert_eq!(combine_revisions(2, 0, 0), flat + 1, "base moved");
+        assert_eq!(combine_revisions(1, 1, 0), flat + 1, "stopwords moved");
+        assert_eq!(combine_revisions(1, 0, 1), flat + 1, "stemmer moved");
+        assert_eq!(combine_revisions(2, 1, 1), flat + 3, "every part moved");
     }
 
     /// The persisted field values round-trip, and a value this engine

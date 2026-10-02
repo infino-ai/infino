@@ -507,6 +507,14 @@ pub struct FtsReader {
     /// How this blob lays out its term dictionary (front-coded blocks
     /// from `VERSION_V7`, an FST of packed values before).
     pub(super) dict_layout: DictLayout,
+    /// The blob version from the header, kept verbatim.
+    ///
+    /// The decode fields above carry everything the read path needs to
+    /// interpret the bytes, but each groups the versions that decode
+    /// alike — so together they still cannot say which version a file
+    /// actually is. A migration has to report and plan on that, hence
+    /// the raw number.
+    pub(super) version: u32,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
     /// The Parquet row each doc id in this blob stands for. The
@@ -969,6 +977,7 @@ impl FtsReader {
                 stopwords,
                 stemmer,
                 stored: col_cfg.stored,
+                analysis_revision: col_cfg.analysis_revision,
                 source: source.clone(),
                 n_docs,
                 doc_length_bytes,
@@ -1040,6 +1049,7 @@ impl FtsReader {
             positions_grouped,
             doc_length_bytes,
             has_bitset_blocks,
+            version,
             bounds,
             dict_layout,
             columns,
@@ -1195,7 +1205,7 @@ impl FtsReader {
     /// zero-copy for in-memory / warm sources; for a cold `Lazy`
     /// source it `await`s the object-store range on the caller's
     /// runtime (no sync bridge).
-    pub(super) async fn dict_bytes_async(&self) -> Result<Bytes, FtsError> {
+    pub(crate) async fn dict_bytes_async(&self) -> Result<Bytes, FtsError> {
         self.source
             .range_async(self.fst_range.clone())
             .await
@@ -1381,7 +1391,7 @@ impl FtsReader {
         // dictionary range for the whole batch.
         if !terms.is_empty() {
             let term_cursors = self
-                .build_term_cursors_opt(column_id, terms, global_idf, false, None, prefetched)
+                .build_term_cursors_opt(column_id, terms, global_idf, false, None, prefetched, None)
                 .await?;
             dict_ranges += 1;
             for cursor in term_cursors {
@@ -1501,6 +1511,28 @@ impl FtsReader {
     /// column) at commit time, not on the query hot path.
     pub fn iter_column_terms(&self, column: &str) -> Result<Vec<Vec<u8>>, FtsError> {
         self.iter_terms_with_prefix(column, b"")
+    }
+
+    /// [`Self::iter_column_terms`] over `fst_bytes`, this reader's
+    /// dictionary already fetched by the caller.
+    pub(crate) fn iter_column_terms_with(
+        &self,
+        fst_bytes: &[u8],
+        column: &str,
+    ) -> Result<Vec<Vec<u8>>, FtsError> {
+        self.debug_assert_own_dict(fst_bytes);
+        // An unregistered column has no keys, so the walk is empty.
+        collect_terms_with_prefix(fst_bytes, self.dict_layout, column, b"")
+    }
+
+    /// Catches a caller handing in a dictionary of the wrong size, such as
+    /// another reader's. A same-sized one is not caught.
+    pub(super) fn debug_assert_own_dict(&self, fst_bytes: &[u8]) {
+        debug_assert_eq!(
+            fst_bytes.len(),
+            self.fst_range.len(),
+            "dictionary bytes are not the size of this reader's"
+        );
     }
 
     /// Stream a column's postings for the FTS compaction merge: for every term
@@ -2236,7 +2268,11 @@ mod tests {
     }
     use std::{
         collections::{HashMap, HashSet},
-        sync::atomic::{AtomicBool, Ordering},
+        str::from_utf8,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
 
@@ -3791,6 +3827,41 @@ mod tests {
         assert_eq!(out, vec![(RowId::new(9), 5.0), (RowId::new(5), 2.0)]);
     }
 
+    /// A lazy source that records every range it serves.
+    #[derive(Debug)]
+    struct RecordingSource {
+        inner: BytesLazyByteSource,
+        ranges: Mutex<Vec<(u64, u64)>>,
+    }
+    impl RecordingSource {
+        fn note(&self, start: u64, len: u64) {
+            self.ranges.lock().expect("ranges").push((start, len));
+        }
+        fn touches(&self, since: usize, region: &Range<usize>) -> usize {
+            self.ranges.lock().expect("ranges")[since..]
+                .iter()
+                .filter(|&&(s, l)| (s as usize) < region.end && (s + l) as usize > region.start)
+                .count()
+        }
+        fn len(&self) -> usize {
+            self.ranges.lock().expect("ranges").len()
+        }
+    }
+    #[async_trait]
+    impl LazyByteSource for RecordingSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.note(start, len);
+            self.inner.range(start, len).await
+        }
+        fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
+            self.note(start, len);
+            self.inner.try_get_range_sync(start, len)
+        }
+    }
+
     /// A lazy open reads the header and the doc-lengths directory and
     /// nothing else. A match-only query served from a memo of already
     /// resolved terms then reads postings alone — neither the dictionary
@@ -3799,42 +3870,6 @@ mod tests {
     /// a second scored query reads neither again.
     #[tokio::test]
     async fn open_lazy_reads_header_and_directory_only_until_a_query_needs_more() {
-        use std::sync::Mutex;
-
-        #[derive(Debug)]
-        struct RecordingSource {
-            inner: BytesLazyByteSource,
-            ranges: Mutex<Vec<(u64, u64)>>,
-        }
-        impl RecordingSource {
-            fn note(&self, start: u64, len: u64) {
-                self.ranges.lock().expect("ranges").push((start, len));
-            }
-            fn touches(&self, since: usize, region: &Range<usize>) -> usize {
-                self.ranges.lock().expect("ranges")[since..]
-                    .iter()
-                    .filter(|&&(s, l)| (s as usize) < region.end && (s + l) as usize > region.start)
-                    .count()
-            }
-            fn len(&self) -> usize {
-                self.ranges.lock().expect("ranges").len()
-            }
-        }
-        #[async_trait]
-        impl LazyByteSource for RecordingSource {
-            fn size(&self) -> u64 {
-                self.inner.size()
-            }
-            async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
-                self.note(start, len);
-                self.inner.range(start, len).await
-            }
-            fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
-                self.note(start, len);
-                self.inner.try_get_range_sync(start, len)
-            }
-        }
-
         let (blob, json) = build_blob();
         // An eager twin resolves the term's dictionary entry for the memo,
         // the way a table-level term index would hand it to a reader.
@@ -3913,6 +3948,53 @@ mod tests {
             recording.touches(before_second, &lengths),
             0,
             "the norms are resident"
+        );
+    }
+
+    /// The optimizer's term passes read the dictionary once per superfile:
+    /// the caller's fetch serves the term walk, every df batch and every
+    /// facts batch, none of which fetch it again.
+    #[tokio::test]
+    async fn term_passes_read_the_dictionary_once() {
+        // One term per batch, so every term is its own batch.
+        const BATCH: usize = 1;
+        let (blob, json) = build_mixed_df_blob();
+        let recording = Arc::new(RecordingSource {
+            inner: BytesLazyByteSource::new(blob),
+            ranges: Mutex::new(Vec::new()),
+        });
+        let src: Arc<dyn LazyByteSource> = recording.clone();
+        let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        let dictionary = r.fst_range.clone();
+        let opened = recording.len();
+        let fst_bytes = r.dict_bytes_async().await.expect("dict");
+
+        let terms = r.iter_column_terms_with(&fst_bytes, "body").expect("terms");
+        let names: Vec<&str> = terms.iter().map(|t| from_utf8(t).expect("utf8")).collect();
+        assert!(names.len() > BATCH, "the walk spans several batches");
+        for chunk in names.chunks(BATCH) {
+            r.term_dfs_with(&fst_bytes, "body", chunk)
+                .await
+                .expect("df batch");
+        }
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let chunk = r
+                .term_index_facts_after(&fst_bytes, "body", after.as_deref(), BATCH)
+                .await
+                .expect("facts batch");
+            let done = chunk.len() < BATCH;
+            after = chunk.into_iter().last().map(|(term, _)| term);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(
+            recording.touches(opened, &dictionary),
+            1,
+            "only the caller's fetch reads the dictionary"
         );
     }
 
