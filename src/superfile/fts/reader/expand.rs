@@ -786,6 +786,11 @@ fn rows_of(
         let mut rest = word;
         while rest != 0 {
             let doc = index as u32 * u64::BITS + rest.trailing_zeros();
+            // The bitset's last word runs past the blob's last document; a
+            // bit set there came from a damaged posting body.
+            if doc >= n_docs {
+                return Err(posting_past_documents());
+            }
             rest &= rest - 1;
             rows.insert(doc_map.row_of(FtsDocId::new(doc)).get());
         }

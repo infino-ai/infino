@@ -525,9 +525,25 @@ impl SupertableProvider {
             work.merge(column_work);
             leaf_rows.extend(needles.into_iter().map(|needle| (column, needle)).zip(rows));
         }
-        let mut rows = check
+        // Every leaf the tree reads has its rows; checked up front so the
+        // lookup below cannot miss.
+        if let Some(leaf) = check
             .filter
-            .rows(&|leaf| leaf_rows[&(leaf.column.as_str(), leaf.needle.as_str())].clone());
+            .leaves()
+            .into_iter()
+            .find(|leaf| !leaf_rows.contains_key(&(leaf.column.as_str(), leaf.needle.as_str())))
+        {
+            return Err(DataFusionError::Internal(format!(
+                "exact rows of column {:?}: no result for needle {:?}",
+                leaf.column, leaf.needle
+            )));
+        }
+        let mut rows = check.filter.rows(&|leaf| {
+            leaf_rows
+                .get(&(leaf.column.as_str(), leaf.needle.as_str()))
+                .cloned()
+                .unwrap_or_default()
+        });
         if let Some(bound) = bound {
             rows.proven &= bound;
             rows.doubtful &= bound;
@@ -902,7 +918,9 @@ impl ExactCheck {
     }
 
     /// Of `rows` in `reader`'s superfile, the ones the conjunction holds
-    /// for, read from their stored text `batch_size` rows at a time.
+    /// for, read from their stored text `batch_size` rows at a time. The
+    /// ids are drawn from `rows` one batch at a time, never copied out
+    /// whole.
     async fn rows_holding(
         &self,
         reader: &Arc<SuperfileReader>,
@@ -911,9 +929,14 @@ impl ExactCheck {
         batch_size: usize,
     ) -> DfResult<RoaringBitmap> {
         let names: Vec<&str> = self.columns.iter().map(String::as_str).collect();
-        let ids: Vec<u32> = rows.iter().collect();
+        let mut ids = rows.iter();
         let mut kept = RoaringBitmap::new();
-        for chunk in ids.chunks(batch_size.max(1)) {
+        loop {
+            let chunk: Vec<u32> = ids.by_ref().take(batch_size.max(1)).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let chunk = chunk.as_slice();
             let batch = take_rows(reader, chunk, &names, pool).await?;
             if batch.num_rows() != chunk.len() {
                 return Err(DataFusionError::Internal(format!(
