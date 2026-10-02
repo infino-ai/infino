@@ -10650,10 +10650,12 @@ pub(crate) enum NewEntryBirthVersions {
 
 /// A condition that has to still hold at the instant a commit becomes visible.
 ///
-/// Everything a commit does before its pointer PUT — uploading the new superfiles, writing the
-/// manifest parts — is invisible until that PUT lands, so a safety property proved *before* that
-/// work has a hole exactly as wide as the work is slow. A fence is checked with only the pointer
-/// PUT left to do, which is the closest to the swap a separate object can be checked.
+/// Everything a commit does before its pointer PUT is invisible until that PUT lands, so a safety
+/// property proved *before* that work has a hole exactly as wide as the work is slow — and
+/// uploading the new superfiles is the slow part, minutes of it at scale. A fence is checked once
+/// that is done, leaving the manifest parts and list and then the pointer PUT: a handful of small
+/// writes rather than the uploads. Not zero, but the closest to the swap that a condition on a
+/// separate object can be checked at all.
 ///
 /// Compaction uses it to re-stamp the seals on the inputs this commit is about to remove: a seal
 /// that expired during a long upload lets a delete land a tombstone on a superfile that is then
@@ -10852,8 +10854,8 @@ pub(crate) async fn try_commit_attempt(
         .flat_map(|ep| [Some(ep.encoded.as_slice()), ep.routing_encoded.as_deref()])
         .flatten()
         .collect();
-    // The last thing before the swap: whatever this commit's safety rests on has to still hold
-    // here, with only the pointer PUT left to outlive it.
+    // Whatever this commit's safety rests on has to still hold here. What is left after it is the
+    // manifest parts and list and then the pointer PUT — small writes, not the uploads above.
     if let Some(fence) = fence {
         fence.check().await?;
     }

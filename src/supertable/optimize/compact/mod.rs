@@ -1527,9 +1527,9 @@ fn has_room_for_another_merge(available: Option<u64>, total: Option<u64>) -> boo
 }
 
 /// How much of the staleness window a commit keeps in hand. A seal younger
-/// than the window minus this cannot have been stolen yet and cannot expire
-/// before the CAS lands, so re-stamping it would be a round trip that only
-/// confirms what the clock already proves. It also absorbs modest clock skew
+/// than the window minus this cannot have been stolen yet, and has this much
+/// left to cover the manifest writes and the pointer PUT, so re-stamping it
+/// would be a round trip that only confirms what the clock already proves. It also absorbs modest clock skew
 /// between this process and whichever one might steal a seal, since the two
 /// judge staleness against their own clocks.
 const SEAL_RESTAMP_MARGIN: Duration = Duration::from_secs(30);
@@ -1632,12 +1632,13 @@ pub(crate) struct PreparedJob {
     term_contributions: Vec<TermContribution>,
 }
 
-/// Re-stamps a batch's seals with only the pointer PUT left to outlive them.
+/// Re-stamps a batch's seals once the uploads are behind it.
 ///
 /// The early re-stamp before the uploads is a cheap way to drop a job whose sidecar has already
 /// moved, so a multi-gigabyte upload is not spent on work that cannot commit. It is not what makes
 /// the commit safe: the uploads take minutes at scale, and a seal can expire inside them. This
-/// runs after them, leaving one pointer PUT for a freshly stamped seal to outlive.
+/// runs after them, leaving a freshly stamped seal to outlive the manifest parts and list and the
+/// pointer PUT — small writes, where the uploads were minutes.
 ///
 /// A lost CAS here fails the whole attempt rather than dropping one job: the outputs are already
 /// uploaded and the manifest is already built against this batch, so there is nothing left to drop
@@ -1691,7 +1692,8 @@ impl CommitFence for SealFence<'_> {
 /// superfile was built from the bitmap the merge read. So a job whose re-stamp
 /// loses the CAS is named in the result and must leave the batch, to be merged
 /// again next pass with the tombstone in view. A won re-stamp also moves
-/// `sealed_at` forward, so the seal cannot expire before the CAS lands.
+/// `sealed_at` forward, giving the seal a full window to outlive the manifest
+/// writes and the pointer PUT that follow.
 ///
 /// Seals too young to have been stolen are skipped: the round trip could only
 /// confirm what the clock already proves, and this runs on the critical path
@@ -5489,8 +5491,8 @@ mod tests {
     /// PUT, so a re-stamp proved only before that work leaves a window as wide
     /// as the upload is slow: the seal expires mid-upload, a delete takes it
     /// over and marks its row, and the pointer PUT removes the input anyway.
-    /// The fence is checked with only the pointer PUT left to outlive a
-    /// freshly stamped seal.
+    /// The fence is checked once the uploads are done, leaving a freshly
+    /// stamped seal to outlive only the manifest writes and the pointer PUT.
     ///
     /// Driven directly rather than through a slowed upload: making the expiry
     /// fall strictly between the early re-stamp and the pointer PUT needs a
