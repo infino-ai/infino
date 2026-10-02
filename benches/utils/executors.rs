@@ -3410,6 +3410,28 @@ pub mod sql {
         }
 
         #[test]
+        fn every_ilike_needle_is_a_plain_word() {
+            // `ilike` writes its needle into the pattern as is: a quote,
+            // `%`, `_` or `\` in it would break the SQL or widen the
+            // match. Escaping would change the measured SQL instead, so
+            // the needles are held to letters and digits.
+            let chain = ilike_or_chain(ILIKE_OR_LONG);
+            let chain_needles = chain.split(" OR ").map(|leaf| {
+                leaf.trim_start_matches("title ILIKE '%")
+                    .trim_end_matches("%'")
+            });
+            for needle in [ILIKE_RARE, ILIKE_MID, ILIKE_BROAD]
+                .into_iter()
+                .chain(chain_needles)
+            {
+                assert!(
+                    !needle.is_empty() && needle.bytes().all(|b| b.is_ascii_alphanumeric()),
+                    "{needle:?} needs escaping"
+                );
+            }
+        }
+
+        #[test]
         fn an_ilike_or_chain_has_one_distinct_leaf_per_rank() {
             let chain = ilike_or_chain(ILIKE_OR_SHORT);
             let leaves: HashSet<&str> = chain.split(" OR ").collect();
