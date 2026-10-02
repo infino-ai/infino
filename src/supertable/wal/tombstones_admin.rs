@@ -186,6 +186,20 @@ pub async fn unseal(
     }
 }
 
+/// The age at which a writer treats a seal as abandoned and takes it over.
+///
+/// One reading, because two parties have to agree about it: the delete path that steals a seal,
+/// and the compactor that must re-stamp its own before it can be stolen from. When those read
+/// different numbers the gap between them is a window where a delete lands a bit on a superfile
+/// the compactor is about to remove, and the deletion is lost.
+///
+/// Not the same question as the `stale_seal_timeout` a compaction pass runs with. That one decides
+/// when one compactor takes over another's abandoned seal, where disagreeing only costs duplicated
+/// merge work, and a caller may legitimately set its own.
+pub fn writer_steal_timeout() -> Duration {
+    Duration::from_millis(crate::config::global().compaction.stale_seal_timeout_ms)
+}
+
 /// Re-stamp a seal this compactor already holds, conditioned on the etag
 /// [`seal`] returned. One CAS-PUT, no GET.
 ///

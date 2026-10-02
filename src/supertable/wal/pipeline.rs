@@ -1205,11 +1205,11 @@ async fn do_tombstone_apply(
 
     let mut sealed_attempts = 0u32;
     let max_sealed_retries = inner.options.max_sealed_retries.max(1);
-    // The threshold a seal is judged stale by, from the same settings compaction
-    // seals under rather than the shipped default: an operator who raises it for
-    // large targets moves both sides, or neither side means anything.
-    let stale_seal_timeout =
-        Duration::from_millis(crate::config::global().compaction.stale_seal_timeout_ms);
+    // The threshold a seal is judged stale by, from the one place that answers
+    // it: the compactor's re-stamp decision reads the same helper, and the gap
+    // between two different readings is a window where a delete lands a bit on
+    // a superfile about to be removed.
+    let stale_seal_timeout = tombstones_admin::writer_steal_timeout();
     warn_if_budget_cannot_outlast_seal(max_sealed_retries, stale_seal_timeout);
     // What the manifest listed at the last sealed attempt, so a superfile
     // disappearing can refund the budget below. Seeded with the current

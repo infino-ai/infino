@@ -1536,12 +1536,18 @@ const SEAL_RESTAMP_MARGIN: Duration = Duration::from_secs(30);
 
 /// Whether a seal placed at `sealed_at` could have been taken over by now.
 ///
-/// Measured against the threshold a WRITER uses, which is the shipped default
-/// rather than this table's configured one: that is the clock deciding whether
-/// a delete was allowed to steal, and it is the steal this guards against.
-fn seal_may_have_been_stolen(sealed_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    let steal_after = Duration::from_millis(tombstones_admin::DEFAULT_STALE_SEAL_TIMEOUT_MS)
-        .saturating_sub(SEAL_RESTAMP_MARGIN);
+/// Measured against the threshold a WRITER steals at, read from the one place
+/// that answers that question: a compactor judging it by anything else leaves
+/// a window where a delete may take a seal over that this skips re-stamping as
+/// too young, which is a lost deletion. Not this pass's own
+/// `stale_seal_timeout`, which decides when a compactor takes over another
+/// compactor's seal.
+fn seal_may_have_been_stolen(
+    sealed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    writer_steals_after: Duration,
+) -> bool {
+    let steal_after = writer_steals_after.saturating_sub(SEAL_RESTAMP_MARGIN);
     match (now - sealed_at).to_std() {
         Ok(age) => age >= steal_after,
         // A seal stamped in the future is a clock that moved; re-stamp rather
@@ -1705,7 +1711,11 @@ async fn restamp_seals(
 ) -> Result<Vec<usize>, CompactionError> {
     let mut stale = Vec::new();
     for (i, prepared) in batch.iter_mut().enumerate() {
-        if !seal_may_have_been_stolen(prepared.sealed_at, now) {
+        if !seal_may_have_been_stolen(
+            prepared.sealed_at,
+            now,
+            tombstones_admin::writer_steal_timeout(),
+        ) {
             continue;
         }
         let compaction_id = prepared.compaction_id;
@@ -4886,6 +4896,53 @@ mod tests {
 
     /// A width far above any plausible job count.
     const ABSURD_WIDTH: usize = 4096;
+
+    /// The compactor must re-stamp before a writer may steal, at whatever
+    /// threshold is in force.
+    ///
+    /// Both sides read `writer_steal_timeout`, so a seal the writer could take
+    /// over is never one this skips as too young. Reading different numbers —
+    /// a hard-coded default here against a configured one there — leaves the
+    /// gap between them as a window where a delete lands a bit on a superfile
+    /// about to be removed, and the deletion is lost. Checked across a range
+    /// of thresholds, because the one in force is configurable and a predicate
+    /// that only agrees with the default would say nothing about the rest.
+    #[test]
+    fn a_re_stamp_never_skips_a_seal_a_writer_could_steal() {
+        /// Thresholds either side of the shipped default, including ones below
+        /// the re-stamp margin.
+        const THRESHOLDS_SECS: [u64; 5] = [10, 45, 90, 120, 600];
+
+        let now = Utc::now();
+        for secs in THRESHOLDS_SECS {
+            let steals_after = Duration::from_secs(secs);
+            let placed_at =
+                |age: Duration| now - chrono::Duration::from_std(age).expect("representable");
+
+            assert!(
+                seal_may_have_been_stolen(placed_at(steals_after), now, steals_after),
+                "a seal old enough for a writer to steal must be re-stamped ({secs}s)"
+            );
+            assert!(
+                seal_may_have_been_stolen(
+                    placed_at(steals_after.saturating_sub(SEAL_RESTAMP_MARGIN)),
+                    now,
+                    steals_after
+                ),
+                "the margin's worth of life left is already at risk ({secs}s)"
+            );
+            // Below the margin there is no safe window left to skip in, and
+            // the floor at zero makes every seal a candidate — conservative,
+            // and the only correct answer when a writer steals sooner than a
+            // commit can be relied on to finish.
+            let expected = steals_after <= SEAL_RESTAMP_MARGIN;
+            assert_eq!(
+                seal_may_have_been_stolen(placed_at(Duration::ZERO), now, steals_after),
+                expected,
+                "a seal just placed, against a {secs}s threshold"
+            );
+        }
+    }
 
     /// One merge starts whatever the host says. Refusing it would stall
     /// exactly the tables that most need compacting, and there is nothing
