@@ -4712,6 +4712,68 @@ mod tests {
         }
     }
 
+    /// Edges of the [`query_sql_runs_a_recursive_traversal`] fixture, as `(src, dst)`: a chain
+    /// 1→2→3→4, a branch 2→5, and a cycle back 4→1.
+    const TRAVERSAL_EDGES: [(i64, i64); 5] = [(1, 2), (2, 3), (3, 4), (2, 5), (4, 1)];
+
+    /// The nodes a walk of at most three hops from node 1 reaches over [`TRAVERSAL_EDGES`], each
+    /// with the first hop it is reached at, by hand: 2 at one, 3 and 5 at two, 4 at three.
+    const TRAVERSAL_FROM_1: [(i64, i64); 4] = [(2, 1), (3, 2), (4, 3), (5, 2)];
+
+    #[test]
+    fn query_sql_runs_a_recursive_traversal() {
+        // A k-hop walk over an edge table, written as a recursive CTE, is a read like any other:
+        //  - the gate allows it (`RecursiveQuery` is side-effect-free);
+        //  - the hop bound stops it, so the cycle 4→1 cannot run forever;
+        //  - the result is the reachable set with each node's shortest hop.
+        // The anchor names its columns with `AS`: a column list on the CTE (`walk(node, hop)`)
+        // does not reach the recursive term, which sees only the anchor's own names
+        // (`No field named w.node` with the list alone).
+        let conn = connect("memory://").expect("connect");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("src", DataType::Int64, false),
+            Field::new("dst", DataType::Int64, false),
+        ]));
+        let (src, dst): (Vec<i64>, Vec<i64>) = TRAVERSAL_EDGES.iter().copied().unzip();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(src)),
+                Arc::new(Int64Array::from(dst)),
+            ],
+        )
+        .expect("edge batch");
+        conn.create_table("edges", schema, IndexSpec::new())
+            .expect("create edges")
+            .append(&batch)
+            .expect("append edges");
+
+        let batches = conn
+            .query_sql(
+                "WITH RECURSIVE walk AS ( \
+                     SELECT dst AS node, 1 AS hop FROM edges WHERE src = 1 \
+                     UNION ALL \
+                     SELECT e.dst, w.hop + 1 FROM walk w JOIN edges e ON e.src = w.node \
+                     WHERE w.hop < 3) \
+                 SELECT node, MIN(hop) AS hop FROM walk GROUP BY node ORDER BY node",
+            )
+            .expect("recursive CTE");
+        let column = |batch: &RecordBatch, i: usize| {
+            batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 column")
+                .values()
+                .to_vec()
+        };
+        let reached: Vec<(i64, i64)> = batches
+            .iter()
+            .flat_map(|b| column(b, 0).into_iter().zip(column(b, 1)))
+            .collect();
+        assert_eq!(reached, TRAVERSAL_FROM_1);
+    }
+
     /// Exhaustive over `LogicalPlan`, so a DataFusion upgrade that adds a variant fails to compile
     /// here. On that failure:
     ///  - classify the new variant below;
