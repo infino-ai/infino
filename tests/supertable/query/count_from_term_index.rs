@@ -16,6 +16,7 @@ use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
 use datafusion::prelude::{col, lit};
 use infino::{
     BoolMode,
+    runtime_metrics::op_stats::with_op_stats,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::builder::FtsConfig,
     supertable::{Supertable, SupertableOptions},
@@ -70,6 +71,21 @@ fn two_superfiles_on_storage(dir: &TempDir) -> Supertable {
     st
 }
 
+/// `count`'s answer and the superfiles it opened reaching it.
+///
+/// The reader is minted INSIDE the scope on purpose: a reader carries the
+/// collector it was created under, so one minted outside meters nothing and
+/// would report zero opens for any query at all.
+fn count_and_opens(st: &Supertable, query: &str) -> (u64, u64) {
+    let (counted, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .count("title", query, BoolMode::Or)
+            .expect("count")
+    });
+    (counted, stats.superfiles_opened)
+}
+
 /// The count a full fan-out would produce, for the shortcut to be checked
 /// against: the cardinality of the match set.
 fn fanout_count(st: &Supertable, term: &str) -> u64 {
@@ -87,11 +103,18 @@ fn a_single_term_count_matches_the_fan_out() {
     let st = two_superfiles_on_storage(&dir);
     let reader = st.reader().expect("reader");
     for term in ["rust", "go", "python", "java"] {
-        let counted = reader.count("title", term, BoolMode::Or).expect("count");
+        let (counted, opens) = count_and_opens(&st, term);
         assert_eq!(
             counted,
             fanout_count(&st, term),
             "count of {term:?} must equal the match set's cardinality"
+        );
+        // The answer alone cannot tell the shortcut from the fan-out, since
+        // both are correct. What separates them is the work: a sum over the
+        // index opens nothing.
+        assert_eq!(
+            opens, 0,
+            "count of {term:?} must be summed from the term index, not fanned out"
         );
     }
     // Sanity: the fixture really does span both superfiles, so a sum is
@@ -179,6 +202,17 @@ fn shapes_that_are_not_a_sum_still_agree() {
             .expect("token_match")
             .len() as u64;
         assert_eq!(counted, expected, "{query:?} must agree with its match set");
+    }
+
+    // And each of these really does fan out. Without this, the `opens == 0`
+    // the single-term test asserts would also hold for a counter that never
+    // moves, and would pin nothing.
+    for query in ["rust go", "+rust +go", "rust -go"] {
+        let (_, opens) = count_and_opens(&st, query);
+        assert!(
+            opens > 0,
+            "{query:?} is not a sum of document frequencies, so it must open superfiles"
+        );
     }
 }
 
