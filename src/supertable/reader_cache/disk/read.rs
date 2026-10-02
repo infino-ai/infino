@@ -204,6 +204,14 @@ impl DiskCacheStore {
         entry.has_whole_file().then(|| Arc::clone(&entry))
     }
 
+    /// The whole-file entry's bytes for `uri` (see [`Self::whole_file_in_memory`]), as one source
+    /// over the entire file. A block source the cache entry no longer points at reads through it
+    /// instead of object storage.
+    pub(crate) fn whole_file_source(&self, uri: &SuperfileUri) -> Option<Arc<dyn LazyByteSource>> {
+        self.whole_file_in_memory(uri)
+            .map(|entry| entry.reader.byte_source())
+    }
+
     /// Tier 3: a cached lazy ([`Residency::Paged`]) entry. A query shares its block cache instead
     /// of opening a second stream.
     fn open_lazy_reader(&self, uri: &SuperfileUri) -> Option<Arc<CachedEntry>> {
