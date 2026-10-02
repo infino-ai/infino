@@ -1879,24 +1879,6 @@ impl SupertableReader {
         Ok(hits)
     }
 
-    /// Count documents whose `column` matches `query`'s tokens under
-    /// `mode` (`Or` = any token, `And` = every token), over this reader's
-    /// pinned snapshot — **count only, no scoring and no row
-    /// materialization**.
-    ///
-    /// With a `+must` clause, the count is the musts' intersection
-    /// cardinality — bare (should) tokens affect only scores, so they
-    /// never change which docs are counted (see
-    /// [`Self::parse_and_prune`]). `count("+climate policy")` is the
-    /// number of docs containing `climate`.
-    ///
-    /// Fast path: a single-token query against a superfile with no
-    /// tombstones resolves from the term dictionary's stored document
-    /// frequency ([`SuperfileReader::term_df`]) — O(1) per superfile, no
-    /// posting decode. A multi-token query, or a superfile with deletes,
-    /// falls back to materializing the matching local doc ids and
-    /// counting those not tombstoned. Tombstoned (deleted) rows are
-    /// always excluded so the count matches what a search would return.
     /// A single term's count, straight from the term index, or `None` when
     /// that cannot be exact.
     ///
@@ -1951,6 +1933,28 @@ impl SupertableReader {
         Some(total)
     }
 
+    /// Count documents whose `column` matches `query`'s tokens under
+    /// `mode` (`Or` = any token, `And` = every token), over this reader's
+    /// pinned snapshot — **count only, no scoring and no row
+    /// materialization**.
+    ///
+    /// With a `+must` clause, the count is the musts' intersection
+    /// cardinality — bare (should) tokens affect only scores, so they
+    /// never change which docs are counted (see
+    /// [`Self::parse_and_prune`]). `count("+climate policy")` is the
+    /// number of docs containing `climate`.
+    ///
+    /// Two fast paths, tried in that order. A single bare term over
+    /// delete-free superfiles the term index lists is a sum of the
+    /// document frequencies the index already holds, and opens nothing at
+    /// all ([`Self::count_from_term_index`]). Failing that, a single-token
+    /// query against a superfile with no tombstones resolves from the term
+    /// dictionary's stored document frequency
+    /// ([`SuperfileReader::term_df`]) — O(1) per superfile, no posting
+    /// decode. A multi-token query, or a superfile with deletes, falls back
+    /// to materializing the matching local doc ids and counting those not
+    /// tombstoned. Tombstoned (deleted) rows are always excluded so the
+    /// count matches what a search would return.
     pub(crate) async fn token_match_count_async(
         &self,
         column: &str,
@@ -2405,9 +2409,12 @@ impl SupertableReader {
 
     /// Count documents matching `query`'s tokens under `mode` over this
     /// reader's pinned snapshot — count only, no scoring or row
-    /// materialization. A single-token query on a delete-free superfile
-    /// resolves in O(1) from the stored document frequency. Drives the
-    /// async kernel via the sync→async bridge.
+    /// materialization. A single bare term over delete-free superfiles the
+    /// term index lists is answered by summing the document frequencies it
+    /// records, without opening any superfile; otherwise a single-token
+    /// query on a delete-free superfile resolves in O(1) from the stored
+    /// document frequency. Drives the async kernel via the sync→async
+    /// bridge.
     pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.token_match_count_async(column, query, mode))
