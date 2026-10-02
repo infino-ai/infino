@@ -1190,10 +1190,21 @@ impl Supertable {
                         None => Ok(()),
                     };
                 }
-                Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                // A lost pointer CAS and a seal taken over are the same kind of
+                // failure: nothing was published, and the next attempt
+                // re-resolves against what is there now. Without this arm a
+                // single stolen seal would take the catch-all below, unsealing
+                // and discarding every finished, already-uploaded merge in the
+                // batch and ending the pass.
+                Err(
+                    e @ (CommitError::WriteContentionExhausted | CommitError::InputsChanged { .. }),
+                ) if attempt + 1 < max_retries => {
                     warn!(
                         jobs = batch.len(),
-                        attempt, max_retries, "compaction commit lost race, retrying"
+                        attempt,
+                        max_retries,
+                        error = %e,
+                        "compaction commit lost a race, retrying"
                     );
                     // Put the undrained writes and the borrowed contributions
                     // back so the next attempt still knows what it owes.
@@ -1630,9 +1641,25 @@ struct SealFence<'a> {
     batch: &'a mut Vec<PreparedJob>,
 }
 
+/// Fault injection for the fence: the next check fails as though a writer took a seal over during
+/// the upload. The real interleaving needs a delete to land between the early re-stamp and the
+/// pointer PUT, which is microseconds apart in a test and minutes apart only on a real upload.
+#[cfg(test)]
+pub(crate) static FENCE_FAILS_ONCE: AtomicBool = AtomicBool::new(false);
+
 impl CommitFence for SealFence<'_> {
     fn check(&mut self) -> BoxFuture<'_, Result<(), CommitError>> {
         Box::pin(async move {
+            #[cfg(test)]
+            if FENCE_FAILS_ONCE.swap(false, Ordering::SeqCst) {
+                let superfile_id = self
+                    .batch
+                    .first()
+                    .and_then(|p| p.sealed.first())
+                    .map(|s| s.superfile_id)
+                    .unwrap_or_default();
+                return Err(CommitError::InputsChanged { superfile_id });
+            }
             let stale = restamp_seals(self.wal_store, self.batch, Utc::now())
                 .await
                 .map_err(|e| CommitError::Encode(e.to_string()))?;
@@ -1644,9 +1671,7 @@ impl CommitFence for SealFence<'_> {
                 .first()
                 .map(|s| s.superfile_id)
                 .unwrap_or_default();
-            Err(CommitError::Encode(
-                CompactionError::SidecarChangedUnderSeal { superfile_id }.to_string(),
-            ))
+            Err(CommitError::InputsChanged { superfile_id })
         })
     }
 }
@@ -5308,6 +5333,71 @@ mod tests {
             .await
             .expect("prepare"),
         ]
+    }
+
+    /// A seal taken over at the fence costs its own job, not the batch.
+    ///
+    /// The fence runs after every merged superfile is uploaded, so a failure
+    /// there is expensive: the catch-all arm would unseal the batch, fail the
+    /// commit, and `run_compaction_jobs` would treat that as fatal and end the
+    /// pass — throwing away every finished, already-uploaded merge in it for
+    /// one stolen seal. `InputsChanged` is a lost race with nothing published,
+    /// so it takes the retry arm instead: the attempt re-resolves, its early
+    /// re-stamp drops the job whose sidecar moved, and the rest commit.
+    ///
+    /// The failure is injected. Reaching it for real needs a delete to land
+    /// between the early re-stamp and the pointer PUT, which is minutes apart
+    /// on a multi-gigabyte upload and microseconds apart here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_seal_taken_over_at_the_fence_costs_only_its_own_job() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        for term in ["alpha", "bravo", "charlie", "delta"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let live = listed_ids(&st);
+        assert_eq!(live.len(), 4, "fixture");
+        let before_docs = st.reader().expect("reader").n_docs_total();
+
+        let mut batch = Vec::new();
+        for pair in [[live[0], live[1]], [live[2], live[3]]] {
+            batch.push(
+                st.prepare_compaction_job(
+                    CompactionJob {
+                        partition_key: Vec::new(),
+                        inputs: pair.to_vec(),
+                        estimated_output_bytes: 0,
+                    },
+                    DEFAULT_STALE_SEAL_TIMEOUT,
+                )
+                .await
+                .expect("prepare"),
+            );
+        }
+
+        // The first attempt's fence fails, as a seal taken over mid-upload
+        // would. Nothing is published by that attempt.
+        FENCE_FAILS_ONCE.store(true, Ordering::SeqCst);
+        st.commit_compaction_batch(batch)
+            .await
+            .expect("a seal taken over at the fence must not fail the commit");
+        assert!(
+            !FENCE_FAILS_ONCE.load(Ordering::SeqCst),
+            "the injected failure must have been consumed"
+        );
+
+        // The retry committed: both jobs' inputs are merged away, since the
+        // injected failure named a seal nothing had actually taken over.
+        let after = listed_ids(&st);
+        assert!(
+            after.len() < live.len(),
+            "the retry must have committed, got {after:?}"
+        );
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            before_docs,
+            "no rows may be lost by the retry"
+        );
     }
 
     /// The fence passes a commit whose inputs nobody touched, re-stamping the
