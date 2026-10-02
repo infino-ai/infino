@@ -62,6 +62,32 @@
 //! [`exact_contains`] and [`ExactFilter`]), the provider reports them
 //! `Exact`, and the scan selects exactly those rows — every other shape
 //! above stays a verified superset.
+//!
+//! Why one leaf is exact. Arrow matches `%f%` case-insensitively under
+//! simple case folding. The one-token condition means every character of
+//! `f` is a word character or a joiner the word rules keep inside a word
+//! (`.` between letters, `'`, `_`, …), so an occurrence of `f` in any text
+//! lies inside one word, and that word, lowercased, contains `f`
+//! lowercased; conversely a word containing the lowercased `f` spells it
+//! out in its row. Case folding and lowercasing agree on ASCII but for the
+//! characters the dictionary walk folds back (`ſ`, the Kelvin sign) and the
+//! dotted capital I, which the walk marks doubtful. A word longer than the
+//! tokenizer's cut is indexed in pieces, and a match across a cut is marked
+//! doubtful too. Doubtful rows are checked against their text; every other
+//! row is decided by the dictionary. What the rule leaves out needs the
+//! text: an anchored `f%` or `%f` (the dictionary does not know which word
+//! starts or ends a value, nor the punctuation beside it), case-sensitive
+//! `LIKE` (terms are lowercased), `_` and several literals (order and
+//! gaps), a literal with a separator in it (a phrase), a non-ASCII literal,
+//! and other analyzers.
+//!
+//! Why a tree of exact leaves is exact. Each leaf splits a superfile's rows
+//! into proven, doubtful and false; `AND` and `OR` combine those splits row
+//! by row, and a row the combination leaves doubtful is checked against the
+//! whole conjunct's text. With only `AND` and `OR` above the leaves, an
+//! unknown (NULL) leaf makes the conjunct true exactly when a false one
+//! would, and `WHERE` keeps only the true rows; `NOT` breaks that (`NOT
+//! NULL` is unknown, `NOT false` is true).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -922,33 +948,18 @@ pub(crate) struct ExactContains {
     pub(crate) needle: String,
 }
 
-/// `filter` as an [`ExactContains`], or `None` when the dictionary cannot
-/// answer it exactly and it stays a bounded, verified filter.
+/// `filter` as an [`ExactContains`], or `None` when it stays a bounded,
+/// verified filter.
 ///
-/// The rule: an `ILIKE` (not `NOT ILIKE`, not case-sensitive `LIKE`) of a
-/// bare FTS column the `standard` analyzer indexes, against a pattern of
-/// wildcards `%`, one literal `f`, and wildcards `%` again — no `_`, no
-/// second literal — where `f` is ASCII and tokenizes to exactly one token,
-/// `f` lowercased.
+/// Exact only when all of these hold:
+///  - `ILIKE`, not `NOT ILIKE` or case-sensitive `LIKE`;
+///  - a bare FTS column indexed by `standard`;
+///  - the pattern is `%f%` with one literal `f` and no `_`;
+///  - `f` is ASCII and tokenizes to exactly one token, `f` lowercased.
 ///
-/// Why that is exact. Arrow matches `%f%` case-insensitively under simple
-/// case folding. The one-token condition means every character of `f` is
-/// a word character or a joiner the word rules keep inside a word (`.`
-/// between letters, `'`, `_`, …), so an occurrence of `f` in any text
-/// lies inside one word, and that word, lowercased, contains `f`
-/// lowercased; conversely a word containing the lowercased `f` spells it
-/// out in its row. Case folding and lowercasing agree on ASCII but for
-/// the characters the dictionary walk folds back (`ſ`, the Kelvin sign)
-/// and the dotted capital I, which the walk marks doubtful. A word longer
-/// than the tokenizer's cut is indexed in pieces, and a match across a
-/// cut is marked doubtful too. Doubtful rows are checked against their
-/// text; every other row is decided by the dictionary.
-///
-/// What is left out needs the text: an anchored `f%` or `%f` (the
-/// dictionary does not know which word starts or ends a value, nor the
-/// punctuation beside it), case-sensitive `LIKE` (terms are lowercased),
-/// `_` and several literals (order and gaps), a literal with a separator
-/// in it (a phrase), a non-ASCII literal, and other analyzers.
+/// Rows the dictionary can't decide (a dotted capital I, a match across a
+/// 255-char cut) come back doubtful and are checked against their text.
+/// Why the rule is exact is in the module's "The exact shape" section.
 pub(crate) fn exact_contains(
     filter: &Expr,
     fts_cols: &HashSet<&str>,
@@ -976,20 +987,12 @@ pub(crate) fn exact_contains(
     })
 }
 
-/// A `WHERE` conjunct the term dictionary answers exactly: one
-/// [`ExactContains`] leaf, or an `AND` / `OR` of exact conjuncts —
-/// `title ILIKE '%japan%' OR title ILIKE '%japanese%'`, across columns
-/// too.
+/// An `AND` / `OR` tree of [`ExactContains`] leaves, e.g. `title ILIKE
+/// '%japan%' OR title ILIKE '%japanese%'`.
 ///
-/// Why a tree of exact leaves is exact. Each leaf splits a superfile's
-/// rows into proven, doubtful and false; `AND` and `OR` combine those
-/// splits row by row ([`Self::rows`]), and a row the combination leaves
-/// doubtful is checked against the whole conjunct's text. A NULL value
-/// holds no term, so every leaf reads it as false — which is also how SQL
-/// reads the tree: with only `AND` and `OR` above them, an unknown leaf
-/// makes the conjunct true exactly when a false one would, and `WHERE`
-/// keeps only the true rows. `NOT` would break that (`NOT NULL` is
-/// unknown, `NOT false` is true), so a negation is never exact.
+/// Leaves combine row by row ([`Self::rows`]). A NULL holds no term, so
+/// every leaf reads it as false, which matches SQL only while there is no
+/// `NOT` above it, so `NOT` is never exact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExactFilter {
     Contains(ExactContains),

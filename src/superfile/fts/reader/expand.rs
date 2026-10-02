@@ -8,13 +8,14 @@
 //! ([`FtsReader::contains_rows`]). Its own `impl FtsReader` block, split
 //! from the reader `core`.
 
-use std::{borrow::Cow, str};
+use std::{borrow::Cow, mem::size_of, str, sync::Arc};
 
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 
 use super::{core::*, cursor::TermCursor, metadata::ColumnMeta, work::MatchWork};
 use crate::{
+    memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::timed_section,
     superfile::{
@@ -74,10 +75,11 @@ const DOTTED_I_BASE: char = 'i';
 /// Postings bytes one fetch wave of [`FtsReader::contains_rows`] may pull
 /// before its terms are unioned and the bytes released. The exact path
 /// has no term cap, so a needle covering much of a large vocabulary would
-/// otherwise hold every covered term's postings at once. 8 MiB keeps a
-/// cold superfile's wave small next to a query's memory budget with every
-/// survivor of a scan fetching together, and still carries thousands of
-/// typical terms per round trip.
+/// otherwise hold every covered term's postings at once. 8 MiB still
+/// carries thousands of typical terms per round trip. Each wave is charged
+/// to the connection memory budget while it is held, and the table layer
+/// caps how many superfiles fetch at once, so the waves of a scan over many
+/// superfiles are bounded by both rather than by this size alone.
 const CONTAINS_FETCH_BATCH_BYTES: usize = 8 << 20;
 
 /// The query-term weight a match-only cursor is built with: nothing is
@@ -328,6 +330,24 @@ fn non_utf8_key() -> FtsError {
     ))
 }
 
+/// `bytes` of `budget` for the exact path's `what`, held until the guard
+/// drops; `None` when no budget is attached. A refusal is
+/// [`FtsError::OverBudget`], raised before the bytes are fetched or
+/// allocated.
+fn reserve_exact(
+    budget: Option<&Arc<ConnectionMemoryBudget>>,
+    bytes: usize,
+    what: &str,
+) -> Result<Option<Reservation>, FtsError> {
+    budget
+        .map(|budget| {
+            budget
+                .try_reserve(bytes)
+                .map_err(|e| FtsError::OverBudget(format!("exact ILIKE {what}, {e}")))
+        })
+        .transpose()
+}
+
 /// One `Pfor` term's postings reference, as the exact path's fetch waves
 /// read it.
 #[derive(Debug, Clone, Copy)]
@@ -493,6 +513,11 @@ impl FtsReader {
     /// fetches are I/O on this runtime; the walk and the unions are CPU on
     /// `pool`, like [`Self::expand_terms`].
     ///
+    /// The covered terms' values, each union's document bitset and each
+    /// fetch wave's postings are charged to `budget` while they are held
+    /// (no charge when `None`); a refusal fails the call with
+    /// `FtsError::OverBudget`.
+    ///
     /// Errors with `FtsError::UnknownColumn` when `column` is not
     /// FTS-indexed here, and with `FtsError::ExactNeedsStandard` when this
     /// superfile indexed it with another analyzer — the rule the answer
@@ -503,6 +528,7 @@ impl FtsReader {
         column: &str,
         needles: &[&str],
         pool: Option<&ThreadPool>,
+        budget: Option<&Arc<ConnectionMemoryBudget>>,
     ) -> Result<(Vec<ContainsRows>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         let col = &self.columns[column_id as usize];
@@ -545,11 +571,20 @@ impl FtsReader {
         .await
         .map_err(|_| FtsError::TaskDropped("contains walk"))?;
         work.kernel_cpu_ns += walk_ns;
+        let walked = walked?;
+        // Held until every needle's rows are unioned.
+        let values: usize = walked
+            .iter()
+            .map(|slot| slot.proven.len() + slot.doubtful.len())
+            .sum();
+        let _values = reserve_exact(budget, values * size_of::<FstValue>(), "term values")?;
         let mut out = Vec::with_capacity(needles.len());
-        for walked in walked? {
-            let proven = self.union_rows(col, walked.proven, pool, &mut work).await?;
+        for walked in walked {
+            let proven = self
+                .union_rows(col, walked.proven, pool, budget, &mut work)
+                .await?;
             let mut doubtful = self
-                .union_rows(col, walked.doubtful, pool, &mut work)
+                .union_rows(col, walked.doubtful, pool, budget, &mut work)
                 .await?;
             doubtful -= &proven;
             out.push(ContainsRows { proven, doubtful });
@@ -563,12 +598,14 @@ impl FtsReader {
     /// into one document bitset on `pool`, each wave's bytes released
     /// before the next is fetched. The bitset becomes rows through the
     /// blob's doc map last: a merged superfile numbers its documents in an
-    /// order of its own.
+    /// order of its own. The bitset, and each wave while it is held, are
+    /// charged to `budget`.
     async fn union_rows(
         &self,
         col: &ColumnMeta,
         values: Vec<FstValue>,
         pool: Option<&ThreadPool>,
+        budget: Option<&Arc<ConnectionMemoryBudget>>,
         work: &mut MatchWork,
     ) -> Result<RoaringBitmap, FtsError> {
         if values.is_empty() {
@@ -591,11 +628,19 @@ impl FtsReader {
                 }),
             }
         }
-        let mut bits = vec![0u64; n_docs as usize / u64::BITS as usize + 1];
+        let words = n_docs as usize / u64::BITS as usize + 1;
+        let _bits = reserve_exact(budget, words * size_of::<u64>(), "row bitset")?;
+        let mut bits = vec![0u64; words];
         let mut rest = bodies.as_slice();
         while !rest.is_empty() {
             let (wave, tail) = rest.split_at(wave_len(rest));
             rest = tail;
+            // Released once this wave is unioned, before the next is fetched.
+            let _wave = reserve_exact(
+                budget,
+                wave.iter().map(TermBody::budget_bytes).sum(),
+                "postings",
+            )?;
             let refs: Vec<(usize, Option<usize>)> = wave
                 .iter()
                 .map(|body| (body.metadata_offset, body.length))
@@ -782,7 +827,7 @@ mod tests {
         },
         *,
     };
-    use crate::superfile::fts::builder::BlobEra;
+    use crate::{superfile::fts::builder::BlobEra, utils::terms::DictBuilder};
 
     /// Generous cap so a test never trips the too-many fallback by accident.
     const MAX_TERMS: usize = 64;
@@ -1112,7 +1157,7 @@ mod tests {
 
     fn contains_all(r: &FtsReader, needles: &[&str]) -> (Vec<ContainsRows>, MatchWork) {
         let rt = Runtime::new().expect("runtime");
-        rt.block_on(r.contains_rows("body", needles, None))
+        rt.block_on(r.contains_rows("body", needles, None, None))
             .expect("contains_rows")
     }
 
@@ -1252,13 +1297,93 @@ mod tests {
         let r = FtsReader::open(blob, &json).expect("open");
         let rt = Runtime::new().expect("runtime");
         let err = rt
-            .block_on(r.contains_rows("body", &["rust"], None))
+            .block_on(r.contains_rows("body", &["rust"], None, None))
             .expect_err("ascii_lower column");
         assert!(matches!(err, FtsError::ExactNeedsStandard { .. }), "{err}");
         let err = rt
-            .block_on(r.contains_rows("nope", &["rust"], None))
+            .block_on(r.contains_rows("nope", &["rust"], None, None))
             .expect_err("unknown column");
         assert!(matches!(err, FtsError::UnknownColumn(_)));
+    }
+
+    /// A byte UTF-8 never contains, to end a dictionary key with.
+    const NOT_UTF8_BYTE: u8 = 0xFF;
+
+    #[test]
+    fn a_non_utf8_dictionary_key_fails_every_walk_rather_than_skip_its_rows() {
+        // `body`'s terms: `rust`, and one that is `r` plus a byte no UTF-8
+        // holds. Skipping the second could drop the rows it indexes.
+        let mut dict = DictBuilder::new();
+        dict.insert(&make_key("body", "rust"), FstValue::pack_inline(0, 1));
+        let mut bad = make_key("body", "r");
+        bad.push(NOT_UTF8_BYTE);
+        dict.insert(&bad, FstValue::pack_inline(1, 1));
+        let fst = dict.finish();
+        let walks = [
+            // The LIKE expansion's shared walk and a prefix's subtree walk.
+            (OwnedPattern::Contains("us".into()), Walk::Full, Keep::Terms),
+            (OwnedPattern::Prefix("r".into()), Walk::Subtree, Keep::Terms),
+            // The exact path's walk.
+            (
+                OwnedPattern::Contains("us".into()),
+                Walk::Full,
+                Keep::Values,
+            ),
+        ];
+        for (pattern, walk, keep) in walks {
+            let err = walk_dictionary(
+                &fst,
+                DictLayout::Fst,
+                "body",
+                &[pattern],
+                &[walk],
+                true,
+                usize::MAX,
+                true,
+                keep,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{walk:?} / {keep:?} skipped the key"));
+            assert!(
+                matches!(err, FtsError::Read(ReadError::MalformedVersion(_))),
+                "{walk:?}: {err}"
+            );
+        }
+    }
+
+    /// A budget smaller than one document bitset of the contains fixture.
+    const TOO_SMALL_FOR_A_BITSET: u64 = 1;
+
+    #[test]
+    fn contains_rows_charges_the_budget_and_refuses_past_it() {
+        let docs = contains_docs();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let (blob, json) = build_standard_blob(&refs);
+        let r = FtsReader::open(blob, &json).expect("open");
+        let rt = Runtime::new().expect("runtime");
+        // Measured: charged while held, all of it released on return.
+        let measured = ConnectionMemoryBudget::measured();
+        rt.block_on(r.contains_rows("body", &["common"], None, Some(&measured)))
+            .expect("a measured budget never refuses");
+        let bitset = (docs.len() / u64::BITS as usize + 1) * size_of::<u64>();
+        assert!(
+            measured.peak() >= bitset,
+            "the document bitset is charged: peak {} < {bitset}",
+            measured.peak()
+        );
+        assert_eq!(measured.used_bytes(), 0, "and released on return");
+        // Bounded below one bitset: refused, as a budget refusal.
+        let bounded = ConnectionMemoryBudget::with_limit(TOO_SMALL_FOR_A_BITSET);
+        let err = rt
+            .block_on(r.contains_rows("body", &["common"], None, Some(&bounded)))
+            .expect_err("over the budget");
+        assert!(matches!(err, FtsError::OverBudget(_)), "{err}");
+        assert!(
+            ReadError::from(err).over_budget().is_some(),
+            "reads as a budget refusal through the read error"
+        );
+        assert!(bounded.denials() > 0);
+        assert_eq!(bounded.used_bytes(), 0, "a refusal holds nothing");
     }
 
     #[test]

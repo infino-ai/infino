@@ -4208,7 +4208,10 @@ mod tests {
             got.sort();
             assert_eq!(got, want, "{needle}");
             // A count over the same selection, which spans the merged
-            // file's row groups, decodes no column at all.
+            // file's row groups, agrees with it. It does not prove the
+            // covered-aggregate guard: the deletes leave tombstones, which
+            // refuse the statistics rewrite on their own; the counts over
+            // the clean tables in `query::sql` do.
             let counted = reader
                 .query_sql(&format!(
                     "SELECT COUNT(*) FROM supertable WHERE title ILIKE '%{needle}%'"

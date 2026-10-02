@@ -98,14 +98,14 @@ use parquet::{
 };
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
     runtime_metrics::op_stats,
     superfile::{
-        SuperfileReader,
+        ReadError, SuperfileReader,
         fts::{
             reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
@@ -472,16 +472,31 @@ impl SupertableProvider {
     /// `OR` tree ([`ExactFilter::rows`]), and the rows that leaves doubtful
     /// are checked against their stored text, tombstoned ones left out
     /// first since the scan skips them anyway.
+    ///
+    /// A `bound` of at most `gate` rows — the bounded path's own selection
+    /// limit — skips the dictionary: its rows are checked against their
+    /// text directly. That is exact too, and far cheaper than walking the
+    /// whole dictionary and unioning every covered term's postings only to
+    /// keep the few rows the bound allows.
     async fn exact_rows(
         &self,
         prepared: &PreparedScanFile,
         check: &ExactCheck,
         bound: Option<&RoaringBitmap>,
+        gate: u64,
         tombstones: &RoaringBitmap,
         batch_size: usize,
     ) -> DfResult<(RoaringBitmap, MatchWork)> {
         let pool: &ThreadPool = &self.manifest.options.reader_pool;
         let mut work = MatchWork::default();
+        if let Some(bound) = bound.filter(|bound| bound.len() <= gate) {
+            let checked = bound - tombstones;
+            let verified = check
+                .rows_holding(&prepared.reader, &checked, pool, batch_size)
+                .await?;
+            self.count_rows_checked(checked.len(), verified.len());
+            return Ok((verified, work));
+        }
         // Each column's distinct needles, in first-seen order.
         let mut by_column: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for leaf in check.filter.leaves() {
@@ -490,13 +505,23 @@ impl SupertableProvider {
                 needles.push(&leaf.needle);
             }
         }
+        let budget = &self.manifest.options.connection_memory_budget;
         let mut leaf_rows: HashMap<(&str, &str), ContainsRows> = HashMap::new();
         for (column, needles) in by_column {
             let (rows, column_work) = prepared
                 .reader
-                .contains_rows(column, &needles, Some(pool))
+                .contains_rows(column, &needles, Some(pool), Some(budget))
                 .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                .map_err(scan_read_df_error)?;
+            // One result per needle, or the zip below would pair needles
+            // with another needle's rows.
+            if rows.len() != needles.len() {
+                return Err(DataFusionError::Internal(format!(
+                    "exact rows of column {column:?}: {} results for {} needles",
+                    rows.len(),
+                    needles.len()
+                )));
+            }
             work.merge(column_work);
             leaf_rows.extend(needles.into_iter().map(|needle| (column, needle)).zip(rows));
         }
@@ -511,10 +536,18 @@ impl SupertableProvider {
         let verified = check
             .rows_holding(&prepared.reader, &rows.doubtful, pool, batch_size)
             .await?;
-        if let Some(stats) = self.scan_store.op_stats() {
-            stats.add_rows_materialized(rows.doubtful.len());
-        }
+        self.count_rows_checked(rows.doubtful.len(), verified.len());
         Ok((rows.proven | verified, work))
+    }
+
+    /// Count the rows an exact check decoded to read their text but the
+    /// scan will not emit (`checked` of them, `kept` passing). The ones it
+    /// keeps are counted once, when the scan emits them, so the total stays
+    /// rows decoded.
+    fn count_rows_checked(&self, checked: u64, kept: u64) {
+        if let Some(stats) = self.scan_store.op_stats() {
+            stats.add_rows_materialized(checked.saturating_sub(kept));
+        }
     }
 
     /// Open and prepare one superfile once for this pinned manifest.
@@ -814,6 +847,17 @@ fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
         && max.distance(min).map(|d| d as u64) == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
 }
 
+/// A superfile read error inside the scan as DataFusion's: a budget refusal
+/// as `ResourcesExhausted`, the channel the memory pool refuses through, so
+/// the SQL error classifiers surface it as `OverBudget`; anything else as an
+/// execution error.
+fn scan_read_df_error(e: ReadError) -> DataFusionError {
+    match e.over_budget() {
+        Some(msg) => DataFusionError::ResourcesExhausted(msg.to_owned()),
+        None => DataFusionError::Execution(e.to_string()),
+    }
+}
+
 /// A scan's exact conjuncts ([`SupertableProvider::exact_filter`]),
 /// compiled once per scan together with the check their doubtful rows get.
 struct ExactCheck {
@@ -873,7 +917,7 @@ impl ExactCheck {
             let batch = take_rows(reader, chunk, &names, pool).await?;
             if batch.num_rows() != chunk.len() {
                 return Err(DataFusionError::Internal(format!(
-                    "read {} rows to check {} doubtful ones",
+                    "read {} rows to check {} against their text",
                     batch.num_rows(),
                     chunk.len()
                 )));
@@ -1114,6 +1158,12 @@ impl TableProvider for SupertableProvider {
         // work and run on the reader pool behind a oneshot; only their FST
         // fetches stay on this runtime.
         let reader_pool: &ThreadPool = &self.manifest.options.reader_pool;
+        // Superfiles answering exact conjuncts at once. Their walks and
+        // unions run on the reader pool, so more in flight than it has
+        // threads only queue there, each holding its fetched postings and
+        // bitsets; what they do hold is charged to the connection budget.
+        let exact_slots = Semaphore::new(reader_pool.current_num_threads());
+        let exact_slots = &exact_slots;
 
         // Pass 1 (per superfile), fanned out: every survivor resolves its
         // candidate rows in its own future and `try_join_all` drives them
@@ -1227,17 +1277,23 @@ impl TableProvider for SupertableProvider {
                         };
 
                         // The exact conjuncts' rows, within whatever the
-                        // bounded ones kept. No selectivity gate applies:
-                        // DataFusion no longer checks these conjuncts, so
-                        // the selection must be exactly their rows however
-                        // many there are.
+                        // bounded ones kept. No selectivity gate sends them to
+                        // a scan: DataFusion no longer checks these
+                        // conjuncts, so the selection must be exactly their
+                        // rows however many there are. A bounded selection
+                        // within the gate is checked against its text instead
+                        // of the dictionary (see `exact_rows`).
                         let candidates = match exact_check {
                             Some(check) => {
+                                let _slot = exact_slots.acquire().await.map_err(|e| {
+                                    DataFusionError::Internal(format!("exact rows slot: {e}"))
+                                })?;
                                 let (rows, exact_work) = self
                                     .exact_rows(
                                         &prepared,
                                         check,
                                         candidates.as_ref(),
+                                        gate,
                                         &tombstones,
                                         batch_size,
                                     )

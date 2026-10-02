@@ -3790,6 +3790,21 @@ mod tests {
     }
 
     #[test]
+    fn query_sql_exact_ilike_over_a_tiny_budget_is_refused_as_over_budget() {
+        // `title` is `standard`-analyzed, so `%filler%` is answered from the
+        // dictionary, which charges what it holds to the connection budget
+        // while the plan is built. A 0-byte gate refuses it as OverBudget.
+        let (_dir, conn, _n) = tiny_budget_conn_after_ingest();
+        let err = conn
+            .query_sql("SELECT title FROM docs WHERE title ILIKE '%filler%'")
+            .expect_err("a 0-byte gate refuses the exact path");
+        assert!(
+            matches!(&err, InfinoError::OverBudget(msg) if msg.contains("exact ILIKE")),
+            "expected OverBudget, got {err:?}"
+        );
+    }
+
+    #[test]
     fn query_sql_streaming_scan_is_not_refused_under_a_tiny_budget() {
         // A projection streams (no buffering), so it reserves nothing and runs
         // even at a 0-byte gate: the budget bounds sort/aggregate/join, not scans.

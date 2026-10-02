@@ -193,6 +193,17 @@ fn exec_query_error(e: DataFusionError) -> QueryError {
     }
 }
 
+/// Classify a physical-planning error: budget exhaustion ->
+/// [`QueryError::OverBudget`], else a plan error. Building the plan runs the
+/// provider's scan, and an exact `ILIKE` charges its postings and bitsets to
+/// the connection budget there, so a refusal can come out of planning.
+fn plan_query_error(e: DataFusionError) -> QueryError {
+    match e.find_root() {
+        DataFusionError::ResourcesExhausted(msg) => QueryError::OverBudget(msg.clone()),
+        _ => QueryError::Plan(e.to_string()),
+    }
+}
+
 impl SupertableReader {
     fn cached_sql_logical_plan(&self, sql: &str) -> Option<LogicalPlan> {
         let guard = self
@@ -430,10 +441,7 @@ impl SupertableReader {
         task_ctx: Arc<TaskContext>,
         op_stats: &Option<Arc<OpStatsCollector>>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
-        let plan = df
-            .create_physical_plan()
-            .await
-            .map_err(|e| QueryError::Plan(e.to_string()))?;
+        let plan = df.create_physical_plan().await.map_err(plan_query_error)?;
         collect_plan_metered(&plan, task_ctx, op_stats)
             .await
             .map_err(exec_query_error)
@@ -791,17 +799,28 @@ mod tests {
     // reader. The returned `TempDir` guard must be held: dropping it deletes the
     // store the reader is still reading through.
     fn zero_gate_reader_after_ingest(batch: &RecordBatch) -> (tempfile::TempDir, Supertable) {
+        zero_gate_reader_after_ingest_with(batch, ASCII_LOWER_TOKENIZER)
+    }
+
+    /// [`zero_gate_reader_after_ingest`] with `title` analyzed by the named
+    /// analyzer.
+    fn zero_gate_reader_after_ingest_with(
+        batch: &RecordBatch,
+        analyzer: &str,
+    ) -> (tempfile::TempDir, Supertable) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
 
-        let ingest = Supertable::create(options_id_cat_title().with_storage(Arc::clone(&storage)))
-            .expect("create");
+        let ingest = Supertable::create(
+            options_id_cat_title_with(analyzer).with_storage(Arc::clone(&storage)),
+        )
+        .expect("create");
         let mut w = ingest.writer().expect("writer");
         w.append(batch).expect("append");
         w.commit().expect("commit");
 
-        let mut qopts = options_id_cat_title().with_storage(storage);
+        let mut qopts = options_id_cat_title_with(analyzer).with_storage(storage);
         qopts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
         (dir, Supertable::open(qopts).expect("open"))
     }
@@ -889,21 +908,52 @@ mod tests {
         }
     }
 
-    /// The physical plan DataFusion prints for `sql`.
-    fn explain_physical(st: &Supertable, sql: &str) -> String {
+    /// The logical and the physical plan DataFusion prints for `sql`.
+    fn explain(st: &Supertable, sql: &str) -> (String, String) {
         let batches = st
             .reader()
             .expect("reader")
             .query_sql(&format!("EXPLAIN {sql}"))
             .expect("explain");
+        let (mut logical, mut physical) = (None, None);
         for batch in &batches {
             for i in 0..batch.num_rows() {
-                if string_at(batch.column(0), i) == "physical_plan" {
-                    return string_at(batch.column(1), i);
+                match string_at(batch.column(0), i).as_str() {
+                    "logical_plan" => logical = Some(string_at(batch.column(1), i)),
+                    "physical_plan" => physical = Some(string_at(batch.column(1), i)),
+                    _ => {}
                 }
             }
         }
-        panic!("no physical plan in EXPLAIN output");
+        (
+            logical.expect("a logical plan in EXPLAIN output"),
+            physical.expect("a physical plan in EXPLAIN output"),
+        )
+    }
+
+    /// The physical plan DataFusion prints for `sql`.
+    fn explain_physical(st: &Supertable, sql: &str) -> String {
+        explain(st, sql).1
+    }
+
+    /// `sql`'s `ILIKE` is answered exactly: a scan in the logical plan
+    /// lists it among the filters the provider answers in full, and nothing
+    /// in the physical plan evaluates it. Both halves, so the witness cannot
+    /// pass because the filter vanished for some other reason.
+    fn assert_answered_exactly(st: &Supertable, sql: &str) -> String {
+        let (logical, physical) = explain(st, sql);
+        let in_full = logical.lines().any(|line| {
+            line.contains("TableScan")
+                && line
+                    .split_once("full_filters=")
+                    .is_some_and(|(_, full)| full.contains("ILIKE"))
+        });
+        assert!(
+            in_full,
+            "{sql}: no scan answers the ILIKE in full: {logical}"
+        );
+        assert!(!physical.contains("ILIKE"), "{sql}: {physical}");
+        physical
     }
 
     #[test]
@@ -1160,6 +1210,26 @@ mod tests {
             .expect_err("0-byte gate refuses the aggregate");
 
         assert!(matches!(err, QueryError::OverBudget(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn query_sql_exact_ilike_over_budget_is_refused() {
+        // The exact path charges its term values, postings and bitsets to the
+        // connection budget while the plan is built, so its refusal comes out
+        // of planning, and it is a budget refusal there too, not a plan error.
+        let (_dir, st) = zero_gate_reader_after_ingest_with(
+            &build_cat_batch(0, &["x", "y"], &["BBC News", "other"]),
+            STANDARD_TOKENIZER,
+        );
+        let err = st
+            .reader()
+            .expect("reader")
+            .query_sql("SELECT title FROM supertable WHERE title ILIKE '%bbc%'")
+            .expect_err("a 0-byte gate refuses the exact path");
+        assert!(
+            matches!(&err, QueryError::OverBudget(msg) if msg.contains("exact ILIKE")),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -2058,6 +2128,8 @@ mod tests {
         "%_bbc%",
         "%bbc news%",
         "%bbc%news%",
+        // Not ASCII (a long s), so not exact: it stays verified.
+        "%\u{17F}un%",
     ];
 
     /// The fixture committed as [`EXACT_FIXTURE_COMMITS`] superfiles under
@@ -2146,8 +2218,7 @@ mod tests {
             "SELECT a.title FROM supertable a JOIN supertable b ON a.title = b.title \
              WHERE a.title ILIKE '%bbc%'",
         ] {
-            let plan = explain_physical(&st, sql);
-            assert!(!plan.contains("ILIKE"), "{sql}: {plan}");
+            assert_answered_exactly(&st, sql);
         }
         // A count projects no column, so the text is never decoded.
         let count = explain_physical(
@@ -2160,14 +2231,11 @@ mod tests {
             .expect("a DataSourceExec in the physical plan");
         assert!(!scan.contains("title"), "{scan}");
         // Beside a verified conjunct, only that conjunct is checked.
-        let mixed = explain_physical(
+        let mixed = assert_answered_exactly(
             &st,
             "SELECT title FROM supertable WHERE title ILIKE '%bbc%' AND category = 'y'",
         );
-        assert!(
-            !mixed.contains("ILIKE") && mixed.contains("category@"),
-            "{mixed}"
-        );
+        assert!(mixed.contains("category@"), "{mixed}");
         // Every control keeps its check, and so does a cast column; under
         // another analyzer nothing is exact.
         let (ascii, _) = exact_ilike_table(ASCII_LOWER_TOKENIZER);
@@ -2181,6 +2249,10 @@ mod tests {
             (
                 &st,
                 "SELECT title FROM supertable WHERE title ILIKE '%bbc news%'",
+            ),
+            (
+                &st,
+                "SELECT title FROM supertable WHERE title ILIKE '%\u{17F}un%'",
             ),
             (
                 &st,
@@ -2248,8 +2320,7 @@ mod tests {
     fn an_exact_ilike_tree_is_checked_nowhere_and_a_mixed_one_keeps_its_check() {
         let (st, _) = exact_ilike_table(STANDARD_TOKENIZER);
         for tree in &EXACT_ILIKE_TREES[..6] {
-            let plan = explain_physical(&st, &format!("SELECT title FROM supertable WHERE {tree}"));
-            assert!(!plan.contains("ILIKE"), "{tree}: {plan}");
+            assert_answered_exactly(&st, &format!("SELECT title FROM supertable WHERE {tree}"));
         }
         for tree in &EXACT_ILIKE_TREES[6..] {
             let plan = explain_physical(&st, &format!("SELECT title FROM supertable WHERE {tree}"));
@@ -2341,9 +2412,13 @@ mod tests {
             ] {
                 assert_same_rows(&rt, &oracle, &st, &sql, "two columns");
             }
-            let plan = explain_physical(&st, &format!("SELECT title FROM supertable WHERE {tree}"));
-            let exact = i < TITLE_BODY_EXACT_TREES;
-            assert_eq!(!plan.contains("ILIKE"), exact, "{tree}: {plan}");
+            let probe = format!("SELECT title FROM supertable WHERE {tree}");
+            if i < TITLE_BODY_EXACT_TREES {
+                assert_answered_exactly(&st, &probe);
+            } else {
+                let plan = explain_physical(&st, &probe);
+                assert!(plan.contains("ILIKE"), "{tree}: {plan}");
+            }
         }
     }
 
