@@ -26,7 +26,7 @@ use infino::{
         builder::{FtsConfig, VectorConfig},
         fts::{
             reader::{Bm25Stats, BoolMode},
-            tokenize::STANDARD_TOKENIZER,
+            tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER},
         },
         vector::rerank_codec::RerankCodec,
     },
@@ -1040,8 +1040,8 @@ const LIKE_PADDING: &str = " the quick brown fox jumps over the lazy dog again a
 /// A `standard`-analyzer table for the `LIKE` pushdown: the substring
 /// `nimble` occurs only inside the term `nimblefox`, planted in every
 /// [`LIKE_NEEDLE_STRIDE`]-th row. `padded` appends [`LIKE_PADDING`] to
-/// every row.
-fn sql_like_fixture(dir: &TempDir, padded: bool) -> Connection {
+/// every row; `extra` rows follow the [`LIKE_ROWS`] fixture rows.
+fn sql_like_fixture(dir: &TempDir, padded: bool, extra: &[String]) -> Connection {
     let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
     let schema = Arc::new(Schema::new(vec![
         Field::new("title", DataType::LargeUtf8, false),
@@ -1063,11 +1063,14 @@ fn sql_like_fixture(dir: &TempDir, padded: bool) -> Connection {
                 format!("filler{i} rust{padding}")
             }
         })
+        .chain(extra.iter().cloned())
         .collect();
     let title_arr: ArrayRef = Arc::new(LargeStringArray::from(
         titles.iter().map(String::as_str).collect::<Vec<_>>(),
     ));
-    let ratings: ArrayRef = Arc::new(Int64Array::from((0..LIKE_ROWS as i64).collect::<Vec<_>>()));
+    let ratings: ArrayRef = Arc::new(Int64Array::from(
+        (0..titles.len() as i64).collect::<Vec<_>>(),
+    ));
     let batch = RecordBatch::try_new(schema, vec![title_arr, ratings]).expect("batch");
     docs.append(&batch).expect("append");
     db
@@ -1080,7 +1083,7 @@ fn a_like_predicate_is_answered_from_the_index() {
     // FTS work the counters must show. The same query used to decode
     // every row of `title` to test the substring.
     let dir = TempDir::new().expect("tempdir");
-    let db = sql_like_fixture(&dir, true);
+    let db = sql_like_fixture(&dir, true, &[]);
     let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%nimble%'");
     assert!(
         stats.fts_postings_bytes > 0,
@@ -1143,6 +1146,74 @@ fn a_like_predicate_is_answered_from_the_index() {
     );
 }
 
+/// Characters ahead of the needle in a cut row: one short of the
+/// tokenizer's cut, so `nimble` starts in the first piece of the word and
+/// ends in the second, and only the row's text can say it matches.
+const CUT_HEAD: usize = MAX_TOKEN_CHARS - 1;
+
+#[test]
+fn an_exact_ilike_counts_each_row_it_checks_once() {
+    // A match across a tokenizer cut, and a near miss beside one: the
+    // dictionary leaves both doubtful, and their text decides. The count is
+    // rows decoded, so the checked row the scan then emits counts once, and
+    // the one the check rejects counts once too.
+    let across = format!("{}nimble", "x".repeat(CUT_HEAD));
+    let beside = format!("{}ni mble", "x".repeat(CUT_HEAD - 1));
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_like_fixture(&dir, true, &[across, beside]);
+    let (batches, stats) = with_op_stats(|| {
+        db.query_sql("SELECT title FROM docs WHERE title ILIKE '%NIMBLE%'")
+            .expect("query_sql")
+    });
+    let returned = batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64;
+    assert_eq!(
+        returned,
+        (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as u64 + 1,
+        "the needle rows and the match across the cut"
+    );
+    assert_eq!(
+        stats.rows_materialized,
+        returned + 1,
+        "every returned row once, plus the near miss the check rejected"
+    );
+}
+
+#[test]
+fn an_exact_ilike_inside_a_small_bound_reads_no_postings_of_its_own() {
+    // `filler3%` bounds a few rows (3, 30..39, 300..399). Inside so small a
+    // bound the exact conjunct's rows are checked against their text, not
+    // its needle's postings unioned over the whole superfile, so the
+    // statement reads exactly the postings the bound reads alone. (Those
+    // are none: each `filler…` term holds one row, stored inline in the
+    // dictionary. The needle's term holds many, so alone it reads some.)
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_like_fixture(&dir, true, &[]);
+    let needle = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title ILIKE '%NIMBLE%'");
+    assert!(
+        needle.fts_postings_bytes > 0,
+        "the needle alone reads its term's postings"
+    );
+    let bound = "title LIKE 'filler3%'";
+    let alone = scoped_sql_stats(&db, &format!("SELECT title FROM docs WHERE {bound}"));
+    let (batches, both) = with_op_stats(|| {
+        db.query_sql(&format!(
+            "SELECT title FROM docs WHERE {bound} AND title ILIKE '%NIMBLE%'"
+        ))
+        .expect("query_sql")
+    });
+    let expected = (0..LIKE_ROWS)
+        .filter(|i| i.to_string().starts_with('3') && i % LIKE_NEEDLE_STRIDE == 0)
+        .count();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        expected
+    );
+    assert_eq!(
+        both.fts_postings_bytes, alone.fts_postings_bytes,
+        "the exact conjunct read postings of its own inside a small bound"
+    );
+}
+
 #[test]
 fn a_whole_dictionary_walk_is_skipped_when_the_scan_is_cheaper() {
     // One unique word per row makes the vocabulary as large as the column
@@ -1152,7 +1223,7 @@ fn a_whole_dictionary_walk_is_skipped_when_the_scan_is_cheaper() {
     // exactly. The prefix `nimble%` walks only its own subtree, which the
     // gate does not touch, so it stays index-bounded.
     let dir = TempDir::new().expect("tempdir");
-    let db = sql_like_fixture(&dir, false);
+    let db = sql_like_fixture(&dir, false, &[]);
     let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%nimble%'");
     assert_eq!(
         stats.fts_postings_bytes, 0,
@@ -1182,7 +1253,7 @@ fn a_whole_dictionary_walk_is_skipped_when_the_scan_is_cheaper() {
 #[test]
 fn a_like_inside_a_boolean_tree_keeps_its_bound() {
     let dir = TempDir::new().expect("tempdir");
-    let db = sql_like_fixture(&dir, true);
+    let db = sql_like_fixture(&dir, true, &[]);
     let needle_rows = (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as u64;
 
     // Two fragments: `filler1` names the rows whose filler term starts

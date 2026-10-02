@@ -196,6 +196,17 @@ fn exec_query_error(e: DataFusionError) -> QueryError {
     }
 }
 
+/// Classify a physical-planning error: budget exhaustion ->
+/// [`QueryError::OverBudget`], else a plan error. Building the plan runs the
+/// provider's scan, and an exact `ILIKE` charges its postings and bitsets to
+/// the connection budget there, so a refusal can come out of planning.
+fn plan_query_error(e: DataFusionError) -> QueryError {
+    match e.find_root() {
+        DataFusionError::ResourcesExhausted(msg) => QueryError::OverBudget(msg.clone()),
+        _ => QueryError::Plan(e.to_string()),
+    }
+}
+
 impl SupertableReader {
     fn cached_sql_logical_plan(&self, sql: &str) -> Option<LogicalPlan> {
         let guard = self
@@ -433,10 +444,7 @@ impl SupertableReader {
         task_ctx: Arc<TaskContext>,
         op_stats: &Option<Arc<OpStatsCollector>>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
-        let plan = df
-            .create_physical_plan()
-            .await
-            .map_err(|e| QueryError::Plan(e.to_string()))?;
+        let plan = df.create_physical_plan().await.map_err(plan_query_error)?;
         collect_plan_metered(&plan, task_ctx, op_stats)
             .await
             .map_err(exec_query_error)
@@ -574,11 +582,12 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
 mod tests {
     use std::{collections::HashSet, sync::Arc};
 
+    use arrow::util::display::array_value_to_string;
     use arrow_array::{
         Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
         LargeStringArray, RecordBatch, StringArray, StringViewArray,
     };
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use datafusion::{datasource::MemTable, prelude::SessionContext};
     use tokio::runtime::Runtime;
 
@@ -587,7 +596,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER},
+            fts::tokenize::{ASCII_LOWER_TOKENIZER, MAX_TOKEN_CHARS, STANDARD_TOKENIZER},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -764,24 +773,26 @@ mod tests {
         options_id_cat_title_with(ASCII_LOWER_TOKENIZER)
     }
 
-    /// [`options_id_cat_title`] with `title` analyzed by the named analyzer.
-    fn options_id_cat_title_with(analyzer: &str) -> SupertableOptions {
-        // Single-threaded writer pool so each commit produces
-        // exactly one superfile — keeps assertions on per-superfile
-        // counts deterministic.
-        let pool = Arc::new(
+    /// Single-threaded writer pool so each commit produces exactly one
+    /// superfile — keeps assertions on per-superfile counts deterministic.
+    fn one_superfile_per_commit_pool() -> Arc<rayon::ThreadPool> {
+        Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .expect("rayon pool"),
-        );
+        )
+    }
+
+    /// [`options_id_cat_title`] with `title` analyzed by the named analyzer.
+    fn options_id_cat_title_with(analyzer: &str) -> SupertableOptions {
         SupertableOptions::new(
             schema_id_cat_title(),
             vec![FtsConfig::new("title").analyzer(analyzer)],
             vec![],
         )
         .expect("valid options")
-        .with_writer_pool(pool)
+        .with_writer_pool(one_superfile_per_commit_pool())
     }
 
     // Ingest `batch` on a measured supertable, then return a second handle over
@@ -791,17 +802,28 @@ mod tests {
     // reader. The returned `TempDir` guard must be held: dropping it deletes the
     // store the reader is still reading through.
     fn zero_gate_reader_after_ingest(batch: &RecordBatch) -> (tempfile::TempDir, Supertable) {
+        zero_gate_reader_after_ingest_with(batch, ASCII_LOWER_TOKENIZER)
+    }
+
+    /// [`zero_gate_reader_after_ingest`] with `title` analyzed by the named
+    /// analyzer.
+    fn zero_gate_reader_after_ingest_with(
+        batch: &RecordBatch,
+        analyzer: &str,
+    ) -> (tempfile::TempDir, Supertable) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
 
-        let ingest = Supertable::create(options_id_cat_title().with_storage(Arc::clone(&storage)))
-            .expect("create");
+        let ingest = Supertable::create(
+            options_id_cat_title_with(analyzer).with_storage(Arc::clone(&storage)),
+        )
+        .expect("create");
         let mut w = ingest.writer().expect("writer");
         w.append(batch).expect("append");
         w.commit().expect("commit");
 
-        let mut qopts = options_id_cat_title().with_storage(storage);
+        let mut qopts = options_id_cat_title_with(analyzer).with_storage(storage);
         qopts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
         (dir, Supertable::open(qopts).expect("open"))
     }
@@ -889,21 +911,52 @@ mod tests {
         }
     }
 
-    /// The physical plan DataFusion prints for `sql`.
-    fn explain_physical(st: &Supertable, sql: &str) -> String {
+    /// The logical and the physical plan DataFusion prints for `sql`.
+    fn explain(st: &Supertable, sql: &str) -> (String, String) {
         let batches = st
             .reader()
             .expect("reader")
             .query_sql(&format!("EXPLAIN {sql}"))
             .expect("explain");
+        let (mut logical, mut physical) = (None, None);
         for batch in &batches {
             for i in 0..batch.num_rows() {
-                if string_at(batch.column(0), i) == "physical_plan" {
-                    return string_at(batch.column(1), i);
+                match string_at(batch.column(0), i).as_str() {
+                    "logical_plan" => logical = Some(string_at(batch.column(1), i)),
+                    "physical_plan" => physical = Some(string_at(batch.column(1), i)),
+                    _ => {}
                 }
             }
         }
-        panic!("no physical plan in EXPLAIN output");
+        (
+            logical.expect("a logical plan in EXPLAIN output"),
+            physical.expect("a physical plan in EXPLAIN output"),
+        )
+    }
+
+    /// The physical plan DataFusion prints for `sql`.
+    fn explain_physical(st: &Supertable, sql: &str) -> String {
+        explain(st, sql).1
+    }
+
+    /// `sql`'s `ILIKE` is answered exactly: a scan in the logical plan
+    /// lists it among the filters the provider answers in full, and nothing
+    /// in the physical plan evaluates it. Both halves, so the witness cannot
+    /// pass because the filter vanished for some other reason.
+    fn assert_answered_exactly(st: &Supertable, sql: &str) -> String {
+        let (logical, physical) = explain(st, sql);
+        let in_full = logical.lines().any(|line| {
+            line.contains("TableScan")
+                && line
+                    .split_once("full_filters=")
+                    .is_some_and(|(_, full)| full.contains("ILIKE"))
+        });
+        assert!(
+            in_full,
+            "{sql}: no scan answers the ILIKE in full: {logical}"
+        );
+        assert!(!physical.contains("ILIKE"), "{sql}: {physical}");
+        physical
     }
 
     #[test]
@@ -1160,6 +1213,26 @@ mod tests {
             .expect_err("0-byte gate refuses the aggregate");
 
         assert!(matches!(err, QueryError::OverBudget(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn query_sql_exact_ilike_over_budget_is_refused() {
+        // The exact path charges its term values, postings and bitsets to the
+        // connection budget while the plan is built, so its refusal comes out
+        // of planning, and it is a budget refusal there too, not a plan error.
+        let (_dir, st) = zero_gate_reader_after_ingest_with(
+            &build_cat_batch(0, &["x", "y"], &["BBC News", "other"]),
+            STANDARD_TOKENIZER,
+        );
+        let err = st
+            .reader()
+            .expect("reader")
+            .query_sql("SELECT title FROM supertable WHERE title ILIKE '%bbc%'")
+            .expect_err("a 0-byte gate refuses the exact path");
+        assert!(
+            matches!(&err, QueryError::OverBudget(msg) if msg.contains("exact ILIKE")),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1892,6 +1965,53 @@ mod tests {
         }
     }
 
+    /// Every row of `batches` with each cell rendered as text, sorted: a
+    /// comparison that ignores row order and which string width a plan
+    /// chose for a column, but not a repeated or missing row.
+    fn rendered_rows(batches: &[RecordBatch]) -> Vec<String> {
+        let mut rows: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(move |i| {
+                    b.columns()
+                        .iter()
+                        .map(|c| array_value_to_string(c, i).expect("render cell"))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// DataFusion over `batches` in a plain in-memory table named like the
+    /// supertable: the oracle the index-bounded plans are judged against.
+    fn memtable_oracle(schema: SchemaRef, batches: Vec<RecordBatch>) -> SessionContext {
+        let ctx = SessionContext::new();
+        let mem = MemTable::try_new(schema, vec![batches]).expect("mem");
+        ctx.register_table("supertable", Arc::new(mem))
+            .expect("register");
+        ctx
+    }
+
+    /// Assert `sql` returns exactly the oracle's rows from `st`; `context`
+    /// names the fixture in the failure message.
+    fn assert_same_rows(
+        rt: &Runtime,
+        oracle: &SessionContext,
+        st: &Supertable,
+        sql: &str,
+        context: &str,
+    ) {
+        let expected = rendered_rows(
+            &rt.block_on(async { oracle.sql(sql).await?.collect().await })
+                .expect("datafusion oracle"),
+        );
+        let got = rendered_rows(&st.reader().expect("reader").query_sql(sql).expect("query"));
+        assert_eq!(got, expected, "{sql} ({context})");
+    }
+
     #[test]
     fn query_sql_like_and_ilike_match_datafusion_on_a_memtable() {
         // The oracle here is DataFusion itself over the same rows in a
@@ -1922,21 +2042,407 @@ mod tests {
             w.commit().expect("commit apart");
             assert_eq!(st.reader().expect("reader").n_superfiles(), 2);
 
-            let ctx = SessionContext::new();
-            let mem = MemTable::try_new(schema_id_cat_title(), vec![vec![batch, apart_batch]])
-                .expect("mem");
-            ctx.register_table("supertable", Arc::new(mem))
-                .expect("register");
-
+            let oracle = memtable_oracle(schema_id_cat_title(), vec![batch, apart_batch]);
             for (op, pattern) in FOLD_PATTERNS {
                 let quoted = pattern.replace('\'', "''");
                 let sql = format!("SELECT title FROM supertable WHERE title {op} '{quoted}'");
-                let expected = title_set(
-                    &rt.block_on(async { ctx.sql(&sql).await?.collect().await })
-                        .expect("datafusion oracle"),
-                );
-                let got = title_set(&st.reader().expect("reader").query_sql(&sql).expect("query"));
-                assert_eq!(got, expected, "{op} {pattern:?} under {name}");
+                assert_same_rows(&rt, &oracle, &st, &sql, name);
+            }
+        }
+    }
+
+    /// Characters planted ahead of a word in the cut rows: one short of
+    /// the tokenizer's cut, so the word's first character ends the first
+    /// piece and the rest of it starts the second.
+    const CUT_HEAD_RUN: usize = MAX_TOKEN_CHARS - 1;
+
+    /// A pattern word past the tokenizer's cut, so the query side cuts it
+    /// into a piece of the cut length and a remainder.
+    const LONG_PATTERN_WORD: usize = MAX_TOKEN_CHARS + 45;
+
+    #[test]
+    fn query_sql_like_finds_matches_across_a_tokenizer_cut() {
+        // A word past the cut is indexed as pieces, so a match running
+        // across a cut sits in no single term: `x…xBBC` (254 x's) is
+        // `x…xb` and `bc`, neither holding `bbc`. And a pattern word past
+        // the cut is cut on the query side too, where the edge between two
+        // pieces is no word boundary for the row. Both used to drop
+        // matching rows; the oracle is DataFusion over the same rows.
+        let rt = Runtime::new().expect("runtime");
+        let head = "x".repeat(CUT_HEAD_RUN);
+        let long_word = "a".repeat(LONG_PATTERN_WORD);
+        let planted = [
+            format!("{head}BBC"),
+            format!("{head}bbc"),
+            format!("{}bb cz", "x".repeat(CUT_HEAD_RUN - 1)),
+            format!("y{long_word}"),
+            "the bbc news".to_owned(),
+        ];
+        let planted_refs: Vec<&str> = planted.iter().map(String::as_str).collect();
+        let titles = with_walk_filler(&planted_refs);
+        let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let cats: Vec<&str> = title_refs.iter().map(|_| "x").collect();
+        let batch = build_cat_batch(0, &cats, &title_refs);
+        let oracle = memtable_oracle(schema_id_cat_title(), vec![batch.clone()]);
+        let cases = [
+            ("LIKE", "%bbc%".to_owned()),
+            ("ILIKE", "%BBC%".to_owned()),
+            ("LIKE", "%bbc".to_owned()),
+            ("LIKE", format!("%{long_word}%")),
+            ("ILIKE", format!("%{long_word}%")),
+            ("LIKE", format!("%{long_word}")),
+        ];
+        for name in [ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER] {
+            let st = Supertable::create(options_id_cat_title_with(name)).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            for (op, pattern) in &cases {
+                let sql = format!("SELECT title FROM supertable WHERE title {op} '{pattern}'");
+                assert_same_rows(&rt, &oracle, &st, &sql, name);
+            }
+        }
+    }
+
+    /// Superfiles the exact-`ILIKE` fixture is committed as, so every
+    /// answer is a union across files.
+    const EXACT_FIXTURE_COMMITS: usize = 4;
+
+    /// Rows the exact-`ILIKE` path decides from the dictionary alone, the
+    /// rows it must check against their text (a cut word, a dotted capital
+    /// I), and near misses of both.
+    fn exact_ilike_titles() -> Vec<String> {
+        let head = "x".repeat(CUT_HEAD_RUN);
+        let planted = [
+            "BBC News at six".to_owned(),
+            "the bbc's report".to_owned(),
+            "abbcd".to_owned(),
+            "BBC-funded (BBC) www.bbc.co.uk".to_owned(),
+            format!("{head}BBC"),
+            format!("{}bb cz", "x".repeat(CUT_HEAD_RUN - 1)),
+            format!("{head}\u{130}"),
+            "TAX\u{130} rank".to_owned(),
+            "TAXI rank".to_owned(),
+            "\u{17F}un and \u{212A}elvin".to_owned(),
+            "don't stop".to_owned(),
+            "version 3.5 of the u.s rules".to_owned(),
+            "b_c joined".to_owned(),
+        ];
+        let refs: Vec<&str> = planted.iter().map(String::as_str).collect();
+        with_walk_filler(&refs)
+    }
+
+    /// `ILIKE` patterns over the fixture: the ones the dictionary answers
+    /// exactly under `standard`, then controls that stay verified.
+    const EXACT_ILIKE_PATTERNS: &[&str] = &[
+        "%bbc%",
+        "%BBC%",
+        "%%bbc%%",
+        "%taxi%",
+        "%xi%",
+        "%sun%",
+        "%kelvin%",
+        "%zzq%",
+        "%don''t%",
+        "%3.5%",
+        "%u.s%",
+        r"%b\_c%",
+        "%lorem%",
+        "bbc%",
+        "%bbc",
+        "%_bbc%",
+        "%bbc news%",
+        "%bbc%news%",
+        // Not ASCII (a long s), so not exact: it stays verified.
+        "%\u{17F}un%",
+    ];
+
+    /// The fixture committed as [`EXACT_FIXTURE_COMMITS`] superfiles under
+    /// analyzer `name`, categories alternating `x` / `y`, and a DataFusion
+    /// oracle over the same rows.
+    fn exact_ilike_table(name: &str) -> (Supertable, SessionContext) {
+        let titles = exact_ilike_titles();
+        let st = Supertable::create(options_id_cat_title_with(name)).expect("create");
+        let mut batches = Vec::new();
+        let mut offset = 0;
+        for chunk in titles.chunks(titles.len().div_ceil(EXACT_FIXTURE_COMMITS)) {
+            let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            let cats: Vec<&str> = (0..refs.len())
+                .map(|i| if (offset + i) % 2 == 0 { "x" } else { "y" })
+                .collect();
+            let batch = build_cat_batch(offset as u64, &cats, &refs);
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            offset += refs.len();
+            batches.push(batch);
+        }
+        assert_eq!(
+            st.reader().expect("reader").n_superfiles(),
+            EXACT_FIXTURE_COMMITS
+        );
+        (st, memtable_oracle(schema_id_cat_title(), batches))
+    }
+
+    #[test]
+    fn query_sql_exact_ilike_matches_datafusion_on_a_memtable() {
+        // `col ILIKE '%word%'` on a `standard` column is answered from the
+        // dictionary and reported exact, so nothing re-checks it: every
+        // shape of query over it must still return exactly DataFusion's
+        // rows, as must every control that stays verified, under both
+        // analyzers.
+        let rt = Runtime::new().expect("runtime");
+        for name in [STANDARD_TOKENIZER, ASCII_LOWER_TOKENIZER] {
+            let (st, oracle) = exact_ilike_table(name);
+            for pattern in EXACT_ILIKE_PATTERNS {
+                let like = format!("title ILIKE '{pattern}'");
+                for sql in [
+                    format!("SELECT title FROM supertable WHERE {like}"),
+                    format!("SELECT COUNT(*) FROM supertable WHERE {like}"),
+                    format!(
+                        "SELECT category, COUNT(*) FROM supertable WHERE {like} GROUP BY category"
+                    ),
+                    format!("SELECT MIN(title), MAX(title) FROM supertable WHERE {like}"),
+                    format!("SELECT title FROM supertable WHERE {like} AND category = 'y'"),
+                    format!(
+                        "SELECT COUNT(*) FROM supertable WHERE {like} AND title ILIKE '%news%'"
+                    ),
+                    format!("SELECT title FROM supertable WHERE {like} OR category = 'y'"),
+                    format!(
+                        "SELECT COUNT(*) FROM \
+                         (SELECT title FROM supertable WHERE {like} LIMIT 3)"
+                    ),
+                ] {
+                    assert_same_rows(&rt, &oracle, &st, &sql, name);
+                }
+            }
+            // A regex match DataFusion rewrites to the same `ILIKE`.
+            assert_same_rows(
+                &rt,
+                &oracle,
+                &st,
+                "SELECT title FROM supertable WHERE title ~* 'bbc'",
+                name,
+            );
+        }
+    }
+
+    #[test]
+    fn an_exact_ilike_is_checked_nowhere_and_a_count_reads_no_text() {
+        // An exact filter leaves nothing in the plan that evaluates it: no
+        // `FilterExec`, no Parquet row filter, no pruning predicate. A
+        // verified one shows up in one of those, as `ILIKE`.
+        let (st, oracle) = exact_ilike_table(STANDARD_TOKENIZER);
+        for sql in [
+            "SELECT title FROM supertable WHERE title ILIKE '%bbc%'",
+            "SELECT COUNT(*) FROM supertable WHERE title ILIKE '%bbc%'",
+            // Through a qualifier, a CTE or a join it is the same filter.
+            "SELECT t.title FROM supertable t WHERE t.title ILIKE '%%bbc%%'",
+            "WITH c AS (SELECT title FROM supertable) SELECT title FROM c \
+             WHERE title ILIKE '%bbc%'",
+            "SELECT a.title FROM supertable a JOIN supertable b ON a.title = b.title \
+             WHERE a.title ILIKE '%bbc%'",
+        ] {
+            assert_answered_exactly(&st, sql);
+        }
+        // A count projects no column, so the text is never decoded.
+        let count = explain_physical(
+            &st,
+            "SELECT COUNT(*) FROM supertable WHERE title ILIKE '%bbc%'",
+        );
+        let scan = count
+            .lines()
+            .find(|l| l.contains("DataSourceExec"))
+            .expect("a DataSourceExec in the physical plan");
+        assert!(!scan.contains("title"), "{scan}");
+        // Beside a verified conjunct, only that conjunct is checked.
+        let mixed = assert_answered_exactly(
+            &st,
+            "SELECT title FROM supertable WHERE title ILIKE '%bbc%' AND category = 'y'",
+        );
+        assert!(mixed.contains("category@"), "{mixed}");
+        // Every control keeps its check, and so does a cast column; under
+        // another analyzer nothing is exact.
+        let (ascii, _) = exact_ilike_table(ASCII_LOWER_TOKENIZER);
+        for (table, sql) in [
+            (&st, "SELECT title FROM supertable WHERE title ILIKE 'bbc%'"),
+            (&st, "SELECT title FROM supertable WHERE title ILIKE '%bbc'"),
+            (
+                &st,
+                "SELECT title FROM supertable WHERE title ILIKE '%_bbc%'",
+            ),
+            (
+                &st,
+                "SELECT title FROM supertable WHERE title ILIKE '%bbc news%'",
+            ),
+            (
+                &st,
+                "SELECT title FROM supertable WHERE title ILIKE '%\u{17F}un%'",
+            ),
+            (
+                &st,
+                "SELECT title FROM supertable WHERE CAST(title AS VARCHAR) ILIKE '%bbc%'",
+            ),
+            (
+                &ascii,
+                "SELECT title FROM supertable WHERE title ILIKE '%bbc%'",
+            ),
+        ] {
+            let plan = explain_physical(table, sql);
+            assert!(plan.contains("ILIKE"), "{sql}: {plan}");
+        }
+        // And each rewrite still returns DataFusion's rows.
+        let rt = Runtime::new().expect("runtime");
+        for sql in [
+            "SELECT t.title FROM supertable t WHERE t.title ILIKE '%%bbc%%'",
+            "WITH c AS (SELECT title FROM supertable) SELECT title FROM c \
+             WHERE title ILIKE '%bbc%'",
+            "SELECT a.title FROM supertable a JOIN supertable b ON a.title = b.title \
+             WHERE a.title ILIKE '%bbc%'",
+            "SELECT title FROM supertable WHERE CAST(title AS VARCHAR) ILIKE '%bbc%'",
+        ] {
+            assert_same_rows(&rt, &oracle, &st, sql, "a rewritten filter");
+        }
+    }
+
+    /// `AND` / `OR` trees over the exact-`ILIKE` fixture's one column: exact
+    /// when every leaf is, verified when any leaf is not or a `NOT` sits
+    /// above them. The doubtful needles (`%xi%`, `%taxi%`) ride along so a
+    /// tree's doubtful rows are checked against the whole tree.
+    const EXACT_ILIKE_TREES: &[&str] = &[
+        "title ILIKE '%bbc%' OR title ILIKE '%taxi%'",
+        "title ILIKE '%japan%' OR title ILIKE '%xi%' OR title ILIKE '%kelvin%'",
+        "(title ILIKE '%bbc%' AND title ILIKE '%news%') OR title ILIKE '%sun%'",
+        "title ILIKE '%bbc%' AND (title ILIKE '%news%' OR title ILIKE '%funded%')",
+        "title ILIKE '%bbc%' OR title ILIKE '%BBC%'",
+        "(title ILIKE '%xi%' OR title ILIKE '%bbc%') AND category = 'y'",
+        // Verified: a leaf that is not exact, or a negation above.
+        "title ILIKE '%bbc%' OR title ILIKE 'bbc%'",
+        "title ILIKE '%bbc%' OR category = 'y'",
+        "NOT (title ILIKE '%bbc%' OR title ILIKE '%taxi%')",
+    ];
+
+    #[test]
+    fn query_sql_exact_ilike_trees_match_datafusion_on_a_memtable() {
+        let rt = Runtime::new().expect("runtime");
+        for name in [STANDARD_TOKENIZER, ASCII_LOWER_TOKENIZER] {
+            let (st, oracle) = exact_ilike_table(name);
+            for tree in EXACT_ILIKE_TREES {
+                for sql in [
+                    format!("SELECT title FROM supertable WHERE {tree}"),
+                    format!("SELECT COUNT(*) FROM supertable WHERE {tree}"),
+                    format!(
+                        "SELECT category, COUNT(*) FROM supertable WHERE {tree} GROUP BY category"
+                    ),
+                ] {
+                    assert_same_rows(&rt, &oracle, &st, &sql, name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_exact_ilike_tree_is_checked_nowhere_and_a_mixed_one_keeps_its_check() {
+        let (st, _) = exact_ilike_table(STANDARD_TOKENIZER);
+        for tree in &EXACT_ILIKE_TREES[..6] {
+            assert_answered_exactly(&st, &format!("SELECT title FROM supertable WHERE {tree}"));
+        }
+        for tree in &EXACT_ILIKE_TREES[6..] {
+            let plan = explain_physical(&st, &format!("SELECT title FROM supertable WHERE {tree}"));
+            assert!(plan.contains("ILIKE"), "{tree}: {plan}");
+        }
+    }
+
+    /// Two nullable full-text columns, for trees across columns and the
+    /// NULLs an exact tree must read as SQL does.
+    fn schema_title_body() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, true),
+            Field::new("body", DataType::LargeUtf8, true),
+        ]))
+    }
+
+    /// Rows of the two-column fixture: the needle in either column, both,
+    /// neither, or NULL beside it, and a dotted capital I beside a plain
+    /// match in the other column.
+    const TITLE_BODY_ROWS: &[(Option<&str>, Option<&str>)] = &[
+        (Some("BBC News"), Some("the evening news")),
+        (Some("BBC News"), None),
+        (None, Some("bbc report")),
+        (None, None),
+        (Some("TAX\u{130} rank"), Some("taxi stand")),
+        (Some("TAX\u{130} rank"), None),
+        (Some("weather"), Some("sunny")),
+        (Some(""), Some("BBC")),
+    ];
+
+    /// Trees across the two columns, exact first, then verified ones.
+    const TITLE_BODY_TREES: &[&str] = &[
+        "title ILIKE '%bbc%' OR body ILIKE '%bbc%'",
+        "title ILIKE '%bbc%' AND body ILIKE '%news%'",
+        "(title ILIKE '%bbc%' AND body ILIKE '%news%') OR body ILIKE '%taxi%'",
+        "title ILIKE '%taxi%' OR body ILIKE '%taxi%'",
+        "title ILIKE '%taxi%' AND body ILIKE '%taxi%'",
+        "NOT (title ILIKE '%bbc%' OR body ILIKE '%bbc%')",
+        "title ILIKE '%bbc%' OR body IS NULL",
+    ];
+
+    /// How many of [`TITLE_BODY_TREES`] are exact.
+    const TITLE_BODY_EXACT_TREES: usize = 5;
+
+    #[test]
+    fn exact_ilike_trees_across_nullable_columns_match_datafusion() {
+        // A NULL holds no term, so every leaf reads it as false; with only
+        // AND and OR above the leaves that is SQL's answer too, which the
+        // oracle confirms row by row. A NOT above them is not exact.
+        let rt = Runtime::new().expect("runtime");
+        let titles: Vec<Option<&str>> = TITLE_BODY_ROWS.iter().map(|(t, _)| *t).collect();
+        let bodies: Vec<Option<&str>> = TITLE_BODY_ROWS.iter().map(|(_, b)| *b).collect();
+        let batch = RecordBatch::try_new(
+            schema_title_body(),
+            vec![
+                Arc::new(LargeStringArray::from(titles)),
+                Arc::new(LargeStringArray::from(bodies)),
+            ],
+        )
+        .expect("batch");
+        let half = batch.num_rows() / 2;
+        let parts = [
+            batch.slice(0, half),
+            batch.slice(half, batch.num_rows() - half),
+        ];
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema_title_body(),
+                vec![
+                    FtsConfig::new("title").analyzer(STANDARD_TOKENIZER),
+                    FtsConfig::new("body").analyzer(STANDARD_TOKENIZER),
+                ],
+                vec![],
+            )
+            .expect("valid options")
+            .with_writer_pool(one_superfile_per_commit_pool()),
+        )
+        .expect("create");
+        for part in &parts {
+            let mut w = st.writer().expect("writer");
+            w.append(part).expect("append");
+            w.commit().expect("commit");
+        }
+        let oracle = memtable_oracle(schema_title_body(), parts.to_vec());
+        for (i, tree) in TITLE_BODY_TREES.iter().enumerate() {
+            for sql in [
+                format!("SELECT title, body FROM supertable WHERE {tree}"),
+                format!("SELECT COUNT(*) FROM supertable WHERE {tree}"),
+            ] {
+                assert_same_rows(&rt, &oracle, &st, &sql, "two columns");
+            }
+            let probe = format!("SELECT title FROM supertable WHERE {tree}");
+            if i < TITLE_BODY_EXACT_TREES {
+                assert_answered_exactly(&st, &probe);
+            } else {
+                let plan = explain_physical(&st, &probe);
+                assert!(plan.contains("ILIKE"), "{tree}: {plan}");
             }
         }
     }

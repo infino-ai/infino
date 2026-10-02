@@ -1824,26 +1824,16 @@ impl FtsReader {
                         },
                     gidf,
                 }) => {
-                    let cursor = match short {
-                        true => TermCursor::new_short(
-                            bytes,
-                            col_meta,
-                            gidf,
-                            weight,
-                            header_probed,
-                            count_only,
-                        )?,
-                        false => TermCursor::new(
-                            bytes,
-                            col_meta,
-                            self.bounds,
-                            gidf,
-                            weight,
-                            header_probed,
-                            count_only,
-                        )?,
-                    };
-                    cursors.push(Some(cursor));
+                    cursors.push(Some(TermCursor::for_body(
+                        bytes,
+                        short,
+                        col_meta,
+                        self.bounds,
+                        gidf,
+                        weight,
+                        header_probed,
+                        count_only,
+                    )?));
                 }
                 Some(Resolved::Inline { doc_id, tf, gidf }) => {
                     // Scoring must use the implied tf, never the slot.
@@ -1870,26 +1860,16 @@ impl FtsReader {
                     short,
                 }) => {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
-                    let cursor = match short {
-                        true => TermCursor::new_short(
-                            term_bytes,
-                            col_meta,
-                            gidf,
-                            weight,
-                            header_probed,
-                            count_only,
-                        )?,
-                        false => TermCursor::new(
-                            term_bytes,
-                            col_meta,
-                            self.bounds,
-                            gidf,
-                            weight,
-                            header_probed,
-                            count_only,
-                        )?,
-                    };
-                    cursors.push(Some(cursor));
+                    cursors.push(Some(TermCursor::for_body(
+                        term_bytes,
+                        short,
+                        col_meta,
+                        self.bounds,
+                        gidf,
+                        weight,
+                        header_probed,
+                        count_only,
+                    )?));
                 }
             }
         }

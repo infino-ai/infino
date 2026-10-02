@@ -1427,6 +1427,10 @@ impl Tokenizer for StandardTokenizer {
 
 #[cfg(test)]
 mod tests {
+    use arrow::{
+        array::{Scalar, StringArray},
+        compute::kernels::comparison::ilike,
+    };
     use proptest::prelude::*;
 
     use super::*;
@@ -2679,5 +2683,97 @@ mod tests {
         let mut out = Vec::new();
         dynt.tokenize_each("Hello, World rust", &mut |s| out.push(s.to_string()));
         assert_eq!(out, vec!["hello", "world", "rust"]);
+    }
+
+    // ---- premises of the exact `ILIKE '%word%'` answer ----
+    //
+    // The table layer answers `ILIKE '%word%'` on a `standard` column from
+    // the dictionary alone (`candidate::exact_contains`). That rests on
+    // facts about Unicode lowercasing, Arrow's case folding and this
+    // tokenizer's word rules that no other test states. They are pinned
+    // here, exhaustively where they range over characters: if one stops
+    // holding — a Unicode or dependency upgrade, or a change to how
+    // `standard` splits or lowercases ASCII — the exact path is wrong on
+    // every file already written, since the analyzer's name does not
+    // change with its behavior.
+
+    /// Dotted capital I, whose lowercase is `i` plus a combining dot.
+    const DOTTED_CAPITAL_I: char = '\u{130}';
+
+    /// Kelvin sign, which lowercases to an ASCII `k`.
+    const KELVIN: char = '\u{212A}';
+
+    /// Long s, which Unicode case folding puts in `s`'s class.
+    const LONG_S: char = '\u{17F}';
+
+    #[test]
+    fn only_the_dotted_i_and_the_kelvin_sign_lowercase_into_ascii() {
+        let mut into_ascii = Vec::new();
+        let mut widening = Vec::new();
+        for c in (0..=char::MAX as u32).filter_map(char::from_u32) {
+            if c.is_ascii() {
+                continue;
+            }
+            if c.to_lowercase().any(|l| l.is_ascii()) {
+                into_ascii.push(c);
+            }
+            if c.to_lowercase().count() > 1 {
+                widening.push(c);
+            }
+        }
+        assert_eq!(into_ascii, vec![DOTTED_CAPITAL_I, KELVIN]);
+        assert_eq!(
+            widening,
+            vec![DOTTED_CAPITAL_I],
+            "no other lowercase widens"
+        );
+    }
+
+    #[test]
+    fn arrows_ilike_folds_only_the_long_s_and_the_kelvin_sign_onto_ascii_letters() {
+        // A character in an ASCII letter's case-folding class is a cased
+        // letter, so the alphabetic characters are every candidate.
+        let candidates: Vec<String> = (0..=char::MAX as u32)
+            .filter_map(char::from_u32)
+            .filter(|c| !c.is_ascii() && c.is_alphabetic())
+            .map(String::from)
+            .collect();
+        let haystack = StringArray::from_iter_values(candidates.iter());
+        let mut folded = Vec::new();
+        for letter in 'a'..='z' {
+            let pattern = Scalar::new(StringArray::from(vec![format!("%{letter}%")]));
+            let matched = ilike(&haystack, &pattern).expect("ilike");
+            for (i, text) in candidates.iter().enumerate() {
+                if matched.value(i) {
+                    folded.push((letter, text.clone()));
+                }
+            }
+        }
+        assert_eq!(
+            folded,
+            vec![('k', KELVIN.to_string()), ('s', LONG_S.to_string())]
+        );
+    }
+
+    #[test]
+    fn standard_keeps_joined_words_whole_and_cuts_long_ones_after_lowercasing() {
+        let standard = |text: &str| -> Vec<String> { StandardTokenizer.tokenize(text).collect() };
+        for (text, want) in [
+            ("www.bbc.co.uk", vec!["www.bbc.co.uk"]),
+            ("BBC's", vec!["bbc's"]),
+            ("BBC1", vec!["bbc1"]),
+            ("BBC_News", vec!["bbc_news"]),
+            ("BBC-funded", vec!["bbc", "funded"]),
+            ("(BBC)", vec!["bbc"]),
+        ] {
+            assert_eq!(standard(text), want, "{text}");
+        }
+        assert_eq!(standard("TAX\u{130}"), vec!["taxi\u{307}"]);
+        let head = "x".repeat(MAX_TOKEN_CHARS - 1);
+        assert_eq!(
+            standard(&format!("{head}BBC")),
+            vec![format!("{head}b"), "bc".to_owned()],
+            "cut after lowercasing, at the cut length"
+        );
     }
 }

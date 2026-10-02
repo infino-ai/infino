@@ -92,7 +92,7 @@ use crate::{
             exec::{
                 common::{
                     PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
-                    fill_top_k, output_schema_with_score, resolve_hits_named,
+                    fill_top_k, output_schema_with_score, resolve_hits_named, scope_to_call,
                     search_query_df_error, traced_tvf,
                 },
                 vector_exec::arg_to_query_vector,
@@ -401,18 +401,21 @@ impl TableFunctionImpl for HybridSearchFunc {
                 "hybrid_search: supertable consumer dropped before execution".into(),
             )
         })?;
-        Ok(Arc::new(HybridSearchTable {
-            reader,
-            text_col,
-            q_text,
-            mode: BoolMode::Or,
-            vec_col,
-            q_vec,
-            options: VectorSearchOptions::new(),
-            k,
-            scalar_schema: Arc::clone(&self.scalar_schema),
-            output_schema: Arc::clone(&self.output_schema),
-        }))
+        scope_to_call(
+            HYBRID_SEARCH_UDTF,
+            Arc::new(HybridSearchTable {
+                reader,
+                text_col,
+                q_text,
+                mode: BoolMode::Or,
+                vec_col,
+                q_vec,
+                options: VectorSearchOptions::new(),
+                k,
+                scalar_schema: Arc::clone(&self.scalar_schema),
+                output_schema: Arc::clone(&self.output_schema),
+            }),
+        )
     }
 }
 
@@ -1270,7 +1273,7 @@ mod tests {
         let st = demo(dim);
         let reader = Arc::new(st.reader().expect("reader"));
         let scalar_schema = reader.options().scalar_schema();
-        use crate::supertable::query::exec::common::test_support::call_tvf;
+        use crate::supertable::query::exec::common::test_support::{call_tvf, scoped_inner};
         let func = HybridSearchFunc::new(reader, scalar_schema);
         let table = call_tvf(
             &func,
@@ -1287,7 +1290,9 @@ mod tests {
         let dbg = format!("{table:?}");
         assert!(dbg.contains("HybridSearchTable"), "Debug missing: {dbg}");
         assert!(
-            table.downcast_ref::<HybridSearchTable>().is_some(),
+            scoped_inner(&table)
+                .downcast_ref::<HybridSearchTable>()
+                .is_some(),
             "as_any downcasts to HybridSearchTable"
         );
         assert_eq!(table.table_type(), TableType::Base);
