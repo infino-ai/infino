@@ -20,12 +20,23 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    mem::swap,
     sync::Arc,
 };
 
 use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
 
 use crate::supertable::manifest::ManifestSnapshot;
+
+/// Probability a PageRank surfer jumps back to a seed at each step: the
+/// standard 0.15, under which a node's score is dominated by paths of a few
+/// hops — the neighbourhood a GraphRAG answer is drawn from.
+pub(crate) const PAGERANK_RESTART: f64 = 0.15;
+
+/// Power steps a ranking runs: the residual after them is
+/// `(1 - PAGERANK_RESTART)^50`, about 3e-4 of the total score, well under
+/// the gap that separates a node from its neighbours in a ranking.
+pub(crate) const PAGERANK_ITERATIONS: usize = 50;
 
 /// One table's walk index, and the snapshot and columns it was built from.
 pub(crate) struct CachedEdgeGraph {
@@ -72,6 +83,15 @@ pub(crate) struct Reached {
     pub(crate) id: i64,
     pub(crate) key: String,
     pub(crate) hop: u32,
+}
+
+/// One node a ranking reached: its fewest hops and its score.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Ranked {
+    pub(crate) id: i64,
+    pub(crate) key: String,
+    pub(crate) hop: u32,
+    pub(crate) score: f64,
 }
 
 /// The strings of a key column, whichever string layout it has.
@@ -175,9 +195,21 @@ impl EdgeGraph {
     /// the order the walk reached them, which follows the edge table's row
     /// order and is stable for one snapshot.
     pub(crate) fn walk(&self, seeds: &[u32], hops: u32, limit: usize) -> Vec<Reached> {
+        self.walk_dense(seeds, hops, limit)
+            .into_iter()
+            .map(|(u, hop)| Reached {
+                id: self.ids[u as usize],
+                key: self.keys[u as usize].clone(),
+                hop,
+            })
+            .collect()
+    }
+
+    /// [`Self::walk`] as `(dense index, hop)` pairs.
+    fn walk_dense(&self, seeds: &[u32], hops: u32, limit: usize) -> Vec<(u32, u32)> {
         let mut hop_of: Vec<u32> = vec![u32::MAX; self.ids.len()];
         let mut queue: VecDeque<u32> = VecDeque::new();
-        let mut out: Vec<Reached> = Vec::new();
+        let mut out: Vec<(u32, u32)> = Vec::new();
         for &seed in seeds {
             if (seed as usize) < hop_of.len() && hop_of[seed as usize] == u32::MAX {
                 hop_of[seed as usize] = 0;
@@ -189,19 +221,11 @@ impl EdgeGraph {
                 break;
             }
             let hop = hop_of[u as usize];
-            out.push(Reached {
-                id: self.ids[u as usize],
-                key: self.keys[u as usize].clone(),
-                hop,
-            });
+            out.push((u, hop));
             if hop >= hops {
                 continue;
             }
-            let (a, b) = (
-                self.offsets[u as usize] as usize,
-                self.offsets[u as usize + 1] as usize,
-            );
-            for &v in &self.targets[a..b] {
+            for &v in self.neighbours(u) {
                 if hop_of[v as usize] == u32::MAX {
                     hop_of[v as usize] = hop + 1;
                     queue.push_back(v);
@@ -209,6 +233,104 @@ impl EdgeGraph {
             }
         }
         out
+    }
+
+    /// Node `u`'s targets.
+    fn neighbours(&self, u: u32) -> &[u32] {
+        let (a, b) = (
+            self.offsets[u as usize] as usize,
+            self.offsets[u as usize + 1] as usize,
+        );
+        &self.targets[a..b]
+    }
+
+    /// The nodes within `hops` of `seeds`, ranked by personalized PageRank
+    /// from the seeds over the subgraph those nodes span, at most `limit`,
+    /// highest score first (ties by fewer hops, then node id).
+    ///
+    /// A random surfer starts at a seed, follows an out-edge of its node
+    /// within the subgraph, and with probability [`PAGERANK_RESTART`] jumps
+    /// back to a seed; a node with no out-edge in the subgraph sends its whole
+    /// score back to the seeds. A node's score is how often the surfer is
+    /// there: high for nodes many short paths from the seeds pass through, so
+    /// a hub's thousand neighbours do not outrank the few nodes the seeds
+    /// share. Scores sum to 1 over the subgraph, up to the residual of
+    /// `iterations` power steps (`(1 - restart)^iterations`).
+    pub(crate) fn rank(
+        &self,
+        seeds: &[u32],
+        hops: u32,
+        limit: usize,
+        iterations: usize,
+    ) -> Vec<Ranked> {
+        let reached = self.walk_dense(seeds, hops, usize::MAX);
+        let n = reached.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut local: HashMap<u32, usize> = HashMap::with_capacity(n);
+        for (i, &(u, _)) in reached.iter().enumerate() {
+            local.insert(u, i);
+        }
+        // The subgraph's edges, by local index.
+        let out: Vec<Vec<usize>> = reached
+            .iter()
+            .map(|&(u, _)| {
+                self.neighbours(u)
+                    .iter()
+                    .filter_map(|v| local.get(v).copied())
+                    .collect()
+            })
+            .collect();
+        let seed_locals: Vec<usize> = reached
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, hop))| *hop == 0)
+            .map(|(i, _)| i)
+            .collect();
+        let seed_share = 1.0 / seed_locals.len() as f64;
+        let mut score = vec![0.0f64; n];
+        for &s in &seed_locals {
+            score[s] = seed_share;
+        }
+        let mut next = vec![0.0f64; n];
+        for _ in 0..iterations {
+            next.iter_mut().for_each(|x| *x = 0.0);
+            let mut back_to_seeds = PAGERANK_RESTART;
+            for (u, targets) in out.iter().enumerate() {
+                let walked = (1.0 - PAGERANK_RESTART) * score[u];
+                if targets.is_empty() {
+                    back_to_seeds += walked;
+                    continue;
+                }
+                let each = walked / targets.len() as f64;
+                for &v in targets {
+                    next[v] += each;
+                }
+            }
+            for &s in &seed_locals {
+                next[s] += back_to_seeds * seed_share;
+            }
+            swap(&mut score, &mut next);
+        }
+        let mut ranked: Vec<Ranked> = reached
+            .iter()
+            .zip(&score)
+            .map(|(&(u, hop), &score)| Ranked {
+                id: self.ids[u as usize],
+                key: self.keys[u as usize].clone(),
+                hop,
+                score,
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then(a.hop.cmp(&b.hop))
+                .then(a.id.cmp(&b.id))
+        });
+        ranked.truncate(limit);
+        ranked
     }
 }
 
@@ -309,5 +431,113 @@ mod tests {
                 .collect();
             prop_assert_eq!(got, oracle(&edges, &seeds, hops));
         }
+
+        /// Against a dense-matrix PageRank over the same subgraph — the
+        /// nodes the relaxation oracle reaches, every edge between them
+        /// counted with its multiplicity — run to the same number of steps:
+        /// the same score per node, and the scores sum to one.
+        #[test]
+        fn a_ranking_matches_the_dense_oracle(
+            edges in prop::collection::vec((0..PROP_NODES, 0..PROP_NODES), 1..PROP_MAX_EDGES),
+            seed_picks in prop::collection::vec(any::<prop::sample::Index>(), 1..4),
+            hops in 0..=PROP_MAX_HOPS,
+        ) {
+            let graph = EdgeGraph::from_batches(&[batch(&edges)]).expect("graph");
+            let mut seeds: Vec<i64> =
+                seed_picks.iter().map(|p| edges[p.index(edges.len())].0).collect();
+            seeds.sort_unstable();
+            seeds.dedup();
+            let dense: Vec<u32> = seeds
+                .iter()
+                .map(|s| graph.find_key(&format!("n{s}")).expect("a source has a key"))
+                .collect();
+            let got: BTreeMap<i64, f64> = graph
+                .rank(&dense, hops, usize::MAX, ORACLE_STEPS)
+                .into_iter()
+                .map(|r| (r.id, r.score))
+                .collect();
+            let want = dense_pagerank(&edges, &seeds, hops);
+            prop_assert_eq!(got.keys().collect::<Vec<_>>(), want.keys().collect::<Vec<_>>());
+            for (node, score) in &got {
+                prop_assert!((score - want[node]).abs() < SCORE_TOLERANCE, "node {node}");
+            }
+            let total: f64 = got.values().sum();
+            prop_assert!((total - 1.0).abs() < SCORE_TOLERANCE, "total {total}");
+        }
+    }
+
+    /// Power steps both sides of the PageRank oracle run.
+    const ORACLE_STEPS: usize = 200;
+    /// How far two float sums of the same terms in different orders may
+    /// drift apart.
+    const SCORE_TOLERANCE: f64 = 1e-9;
+
+    /// PageRank from `seeds` over the subgraph within `hops`, the textbook
+    /// way: a dense count matrix, row-normalized, power-iterated.
+    fn dense_pagerank(edges: &[(i64, i64)], seeds: &[i64], hops: u32) -> BTreeMap<i64, f64> {
+        let nodes: Vec<i64> = oracle(edges, seeds, hops).into_keys().collect();
+        let at = |id: i64| nodes.iter().position(|&n| n == id);
+        let n = nodes.len();
+        let mut count = vec![vec![0.0f64; n]; n];
+        for &(s, d) in edges {
+            if let (Some(i), Some(j)) = (at(s), at(d)) {
+                count[i][j] += 1.0;
+            }
+        }
+        let start: Vec<f64> = nodes
+            .iter()
+            .map(|id| {
+                if seeds.contains(id) {
+                    1.0 / seeds.len() as f64
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let mut score = start.clone();
+        for _ in 0..ORACLE_STEPS {
+            let mut next: Vec<f64> = start.iter().map(|s| PAGERANK_RESTART * s).collect();
+            for i in 0..n {
+                let degree: f64 = count[i].iter().sum();
+                let walked = (1.0 - PAGERANK_RESTART) * score[i];
+                if degree == 0.0 {
+                    for (j, s) in start.iter().enumerate() {
+                        next[j] += walked * s;
+                    }
+                } else {
+                    for j in 0..n {
+                        next[j] += walked * count[i][j] / degree;
+                    }
+                }
+            }
+            score = next;
+        }
+        nodes.into_iter().zip(score).collect()
+    }
+
+    #[test]
+    fn a_neighbour_the_seeds_share_outranks_a_hubs_leaves() {
+        // Seeds 1 and 2 both point at 3; seed 1 also points at hub 4, which points at twenty
+        // leaves. Within two hops the walk reaches all of them, nearest first, and the leaves
+        // come first in no particular order; the ranking puts 3 above every leaf.
+        /// Leaves of the hub.
+        const LEAVES: i64 = 20;
+        /// First leaf's id.
+        const FIRST_LEAF: i64 = 10;
+        let mut edges = vec![(1, 3), (2, 3), (1, 4)];
+        edges.extend((FIRST_LEAF..FIRST_LEAF + LEAVES).map(|leaf| (4, leaf)));
+        let graph = EdgeGraph::from_batches(&[batch(&edges)]).expect("graph");
+        let seeds = [
+            graph.find_key("n1").expect("n1"),
+            graph.find_key("n2").expect("n2"),
+        ];
+        let ranked = graph.rank(&seeds, 2, usize::MAX, PAGERANK_ITERATIONS);
+        let position = |id: i64| ranked.iter().position(|r| r.id == id).expect("ranked");
+        let best_leaf = (FIRST_LEAF..FIRST_LEAF + LEAVES)
+            .map(position)
+            .min()
+            .expect("leaves");
+        assert!(position(3) < best_leaf, "{ranked:?}");
+        assert_eq!(graph.rank(&seeds, 2, 3, PAGERANK_ITERATIONS).len(), 3);
     }
 }

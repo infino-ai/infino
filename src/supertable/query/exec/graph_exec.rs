@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! `graph_walk` — a bounded walk over an edge table, as a table function.
+//! `graph_walk` and `graph_rank` — bounded walks over an edge table, as
+//! table functions.
 //!
 //! An edge table is an ordinary table of directed edges: an `Int64` source
 //! node, an `Int64` destination node, and the source node's readable key.
 //! The same walk is expressible as a recursive CTE, which scans the whole
-//! table once per hop; `graph_walk` builds the table's
-//! [`EdgeGraph`] once per snapshot and touches only the neighbours each hop
-//! expands, so a walk costs what it reaches rather than what the table holds.
+//! table once per hop; these functions build the table's [`EdgeGraph`] once
+//! per snapshot and touch only the neighbours each hop expands, so a walk
+//! costs what it reaches rather than what the table holds.
 //!
 //! ## Query shape
 //!
@@ -16,17 +17,21 @@
 //! -- every node within two hops of either seed, nearest first, at most 100:
 //! SELECT key, hop FROM graph_walk('src', 'dst', 'src_key', 2, 100,
 //!                                 'logs/12345', 'logs/67890');
+//! -- the same nodes ranked by personalized PageRank from the seeds:
+//! SELECT key, score FROM graph_rank('src', 'dst', 'src_key', 2, 20,
+//!                                   'logs/12345', 'logs/67890');
 //! ```
 //!
 //! Arguments: the source, destination and key column names, the most hops,
 //! the most nodes returned, then one or more seed keys (each its own
-//! argument, so a key may hold any character). Output: `key`, `node`, `hop`,
-//! one row per node reached, seeds at hop 0, ordered by hop. A seed key the
-//! table does not hold reaches nothing.
+//! argument, so a key may hold any character). `graph_walk` returns `key`,
+//! `node`, `hop`, one row per node reached, seeds at hop 0, ordered by hop;
+//! `graph_rank` adds `score` and orders by it, highest first (see
+//! [`EdgeGraph::rank`]). A seed key the table does not hold reaches nothing.
 
 use std::{fmt, sync::Arc};
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -50,7 +55,7 @@ use crate::{
         handle::{SupertableReader, WeakReader},
         query::{
             exec::common::{arg_to_string, arg_to_usize, scope_to_call, traced_tvf},
-            graph::{CachedEdgeGraph, EdgeGraph, Reached},
+            graph::{CachedEdgeGraph, EdgeGraph, PAGERANK_ITERATIONS, Ranked, Reached},
             provider::TABLE_NAME,
         },
     },
@@ -59,6 +64,8 @@ use crate::{
 
 /// SQL name of the walk TVF.
 pub(crate) const GRAPH_WALK_UDTF: &str = "graph_walk";
+/// SQL name of the ranking TVF.
+pub(crate) const GRAPH_RANK_UDTF: &str = "graph_rank";
 /// The most hops one walk may take. Past a handful a walk over a connected
 /// graph reaches most of it, and the answer stops being about the seeds.
 const MAX_GRAPH_HOPS: usize = 8;
@@ -68,19 +75,49 @@ const FIXED_ARGS: usize = 5;
 const KEY_COLUMN: &str = "key";
 const NODE_COLUMN: &str = "node";
 const HOP_COLUMN: &str = "hop";
+const SCORE_COLUMN: &str = "score";
 
-/// The walk's output schema: `key`, `node`, `hop`.
-fn walk_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new(KEY_COLUMN, DataType::Utf8, false),
-        Field::new(NODE_COLUMN, DataType::Int64, false),
-        Field::new(HOP_COLUMN, DataType::Int64, false),
-    ]))
+/// Which of the two functions a call is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GraphKind {
+    /// `graph_walk`: every node reached, nearest first.
+    Walk,
+    /// `graph_rank`: the nodes reached, by personalized PageRank.
+    Rank,
 }
 
-/// Register `graph_walk` on `ctx`, bound to the query's pinned `reader`.
-pub(crate) fn register_graph_walk(ctx: &SessionContext, reader: Arc<SupertableReader>) {
-    ctx.register_udtf(GRAPH_WALK_UDTF, Arc::new(GraphWalkFunc::new(reader)));
+impl GraphKind {
+    /// The function's SQL name.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Walk => GRAPH_WALK_UDTF,
+            Self::Rank => GRAPH_RANK_UDTF,
+        }
+    }
+
+    /// The output schema: `key`, `node`, `hop`, and `score` for a ranking.
+    fn schema(self) -> SchemaRef {
+        let mut fields = vec![
+            Field::new(KEY_COLUMN, DataType::Utf8, false),
+            Field::new(NODE_COLUMN, DataType::Int64, false),
+            Field::new(HOP_COLUMN, DataType::Int64, false),
+        ];
+        if self == Self::Rank {
+            fields.push(Field::new(SCORE_COLUMN, DataType::Float64, false));
+        }
+        Arc::new(Schema::new(fields))
+    }
+}
+
+/// Register `graph_walk` and `graph_rank` on `ctx`, bound to the query's
+/// pinned `reader`.
+pub(crate) fn register_graph(ctx: &SessionContext, reader: Arc<SupertableReader>) {
+    for kind in [GraphKind::Walk, GraphKind::Rank] {
+        ctx.register_udtf(
+            kind.name(),
+            Arc::new(GraphWalkFunc::new(Arc::clone(&reader), kind)),
+        );
+    }
 }
 
 /// One parsed `graph_walk` call.
@@ -94,29 +131,30 @@ struct WalkCall {
 }
 
 impl WalkCall {
-    fn parse(args: &[Expr]) -> DfResult<Self> {
+    /// Parse the arguments of a call to the function named `name`.
+    fn parse(name: &str, args: &[Expr]) -> DfResult<Self> {
         if args.len() <= FIXED_ARGS {
             return Err(DataFusionError::Plan(format!(
-                "graph_walk expects (source column, destination column, key column, hops, \
+                "{name} expects (source column, destination column, key column, hops, \
                  limit, seed key, ...), got {} argument(s)",
                 args.len()
             )));
         }
         let columns = [
-            arg_to_string(&args[0], "graph_walk source column")?,
-            arg_to_string(&args[1], "graph_walk destination column")?,
-            arg_to_string(&args[2], "graph_walk key column")?,
+            arg_to_string(&args[0], &format!("{name} source column"))?,
+            arg_to_string(&args[1], &format!("{name} destination column"))?,
+            arg_to_string(&args[2], &format!("{name} key column"))?,
         ];
-        let hops = arg_to_usize(&args[3], "graph_walk hops")?;
+        let hops = arg_to_usize(&args[3], &format!("{name} hops"))?;
         if hops > MAX_GRAPH_HOPS {
             return Err(DataFusionError::Plan(format!(
-                "graph_walk hops must be at most {MAX_GRAPH_HOPS}, got {hops}"
+                "{name} hops must be at most {MAX_GRAPH_HOPS}, got {hops}"
             )));
         }
-        let limit = arg_to_usize(&args[4], "graph_walk limit")?;
+        let limit = arg_to_usize(&args[4], &format!("{name} limit"))?;
         let seeds = args[FIXED_ARGS..]
             .iter()
-            .map(|a| arg_to_string(a, "graph_walk seed key"))
+            .map(|a| arg_to_string(a, &format!("{name} seed key")))
             .collect::<DfResult<Vec<_>>>()?;
         Ok(Self {
             columns,
@@ -128,41 +166,54 @@ impl WalkCall {
     }
 }
 
-/// `TableFunctionImpl` for `graph_walk`.
+/// `TableFunctionImpl` for `graph_walk` and `graph_rank`.
 #[derive(Debug)]
 pub(crate) struct GraphWalkFunc {
     reader: WeakReader,
+    kind: GraphKind,
 }
 
 impl GraphWalkFunc {
-    pub(crate) fn new(reader: Arc<SupertableReader>) -> Self {
+    pub(crate) fn new(reader: Arc<SupertableReader>, kind: GraphKind) -> Self {
         Self {
             reader: WeakReader::from_reader(&reader),
+            kind,
         }
     }
 }
 
 impl TableFunctionImpl for GraphWalkFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let call = WalkCall::parse(args.exprs())?;
+        let name = self.kind.name();
+        let call = WalkCall::parse(name, args.exprs())?;
         let reader = self.reader.upgrade().ok_or_else(|| {
-            DataFusionError::Execution(
-                "graph_walk: supertable consumer dropped before execution".into(),
-            )
+            DataFusionError::Execution(format!(
+                "{name}: supertable consumer dropped before execution"
+            ))
         })?;
-        scope_to_call(GRAPH_WALK_UDTF, Arc::new(GraphWalkTable { reader, call }))
+        scope_to_call(
+            name,
+            Arc::new(GraphWalkTable {
+                reader,
+                call,
+                kind: self.kind,
+            }),
+        )
     }
 }
 
-/// One `graph_walk` call as a `TableProvider`; `scan` lowers to [`GraphWalkExec`].
+/// One `graph_walk` / `graph_rank` call as a `TableProvider`; `scan` lowers
+/// to [`GraphWalkExec`].
 struct GraphWalkTable {
     reader: Arc<SupertableReader>,
     call: WalkCall,
+    kind: GraphKind,
 }
 
 impl fmt::Debug for GraphWalkTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GraphWalkTable")
+            .field("kind", &self.kind)
             .field("call", &self.call)
             .finish()
     }
@@ -171,7 +222,7 @@ impl fmt::Debug for GraphWalkTable {
 #[async_trait]
 impl TableProvider for GraphWalkTable {
     fn schema(&self) -> SchemaRef {
-        walk_schema()
+        self.kind.schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -188,16 +239,18 @@ impl TableProvider for GraphWalkTable {
         Ok(Arc::new(GraphWalkExec::try_new(
             Arc::clone(&self.reader),
             self.call.clone(),
+            self.kind,
             projection.cloned(),
         )?))
     }
 }
 
 /// Custom `ExecutionPlan`: builds (or reuses) the table's [`EdgeGraph`] and
-/// walks it inside `execute()`.
+/// walks or ranks it inside `execute()`.
 struct GraphWalkExec {
     reader: Arc<SupertableReader>,
     call: WalkCall,
+    kind: GraphKind,
     projection: Option<Vec<usize>>,
     projected_schema: SchemaRef,
     cache: Arc<PlanProperties>,
@@ -207,9 +260,10 @@ impl GraphWalkExec {
     fn try_new(
         reader: Arc<SupertableReader>,
         call: WalkCall,
+        kind: GraphKind,
         projection: Option<Vec<usize>>,
     ) -> DfResult<Self> {
-        let schema = walk_schema();
+        let schema = kind.schema();
         let projected_schema = match &projection {
             Some(indices) => Arc::new(
                 schema
@@ -227,6 +281,7 @@ impl GraphWalkExec {
         Ok(Self {
             reader,
             call,
+            kind,
             projection,
             projected_schema,
             cache,
@@ -235,7 +290,8 @@ impl GraphWalkExec {
 
     fn describe(&self) -> String {
         format!(
-            "GraphWalkExec: columns={:?}, hops={}, limit={}, seeds={}",
+            "GraphWalkExec: kind={:?}, columns={:?}, hops={}, limit={}, seeds={}",
+            self.kind,
             self.call.columns,
             self.call.hops,
             self.call.limit,
@@ -306,7 +362,7 @@ async fn edge_graph(
     Ok(graph)
 }
 
-/// The nodes reached as the walk's output batch.
+/// The nodes a walk reached as its output batch.
 fn reached_batch(reached: &[Reached]) -> DfResult<RecordBatch> {
     let columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from_iter_values(
@@ -317,7 +373,25 @@ fn reached_batch(reached: &[Reached]) -> DfResult<RecordBatch> {
             reached.iter().map(|r| i64::from(r.hop)),
         )),
     ];
-    RecordBatch::try_new(walk_schema(), columns)
+    RecordBatch::try_new(GraphKind::Walk.schema(), columns)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
+/// The nodes a ranking reached as its output batch.
+fn ranked_batch(ranked: &[Ranked]) -> DfResult<RecordBatch> {
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from_iter_values(
+            ranked.iter().map(|r| r.key.as_str()),
+        )),
+        Arc::new(Int64Array::from_iter_values(ranked.iter().map(|r| r.id))),
+        Arc::new(Int64Array::from_iter_values(
+            ranked.iter().map(|r| i64::from(r.hop)),
+        )),
+        Arc::new(Float64Array::from_iter_values(
+            ranked.iter().map(|r| r.score),
+        )),
+    ];
+    RecordBatch::try_new(GraphKind::Rank.schema(), columns)
         .map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
@@ -353,25 +427,35 @@ impl ExecutionPlan for GraphWalkExec {
         }
         let reader = Arc::clone(&self.reader);
         let call = self.call.clone();
+        let kind = self.kind;
         let projection = self.projection.clone();
         let fut = async move {
             let graph = edge_graph(&reader, &call.columns).await?;
             let pool = Arc::clone(&reader.options().reader_pool);
-            let reached = run_on_pool(
+            let batch = run_on_pool(
                 Some(&pool),
-                "graph_walk walk: reader pool dropped result",
+                "graph walk: reader pool dropped result",
                 move || {
                     let seeds: Vec<u32> = call
                         .seeds
                         .iter()
                         .filter_map(|key| graph.find_key(key))
                         .collect();
-                    graph.walk(&seeds, call.hops, call.limit)
+                    match kind {
+                        GraphKind::Walk => {
+                            reached_batch(&graph.walk(&seeds, call.hops, call.limit))
+                        }
+                        GraphKind::Rank => ranked_batch(&graph.rank(
+                            &seeds,
+                            call.hops,
+                            call.limit,
+                            PAGERANK_ITERATIONS,
+                        )),
+                    }
                 },
             )
             .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            let batch = reached_batch(&reached)?;
+            .map_err(|e| DataFusionError::Execution(e.to_string()))??;
             match &projection {
                 Some(indices) => batch
                     .project(indices)
@@ -404,15 +488,18 @@ mod tests {
 
     #[test]
     fn a_call_names_three_columns_two_bounds_and_its_seeds() {
-        let call = WalkCall::parse(&[
-            lit("src"),
-            lit("dst"),
-            lit("src_key"),
-            int(2),
-            int(10),
-            lit("logs/1"),
-            lit("a,b=c"),
-        ])
+        let call = WalkCall::parse(
+            GRAPH_WALK_UDTF,
+            &[
+                lit("src"),
+                lit("dst"),
+                lit("src_key"),
+                int(2),
+                int(10),
+                lit("logs/1"),
+                lit("a,b=c"),
+            ],
+        )
         .expect("parse");
         assert_eq!(call.columns, ["src", "dst", "src_key"].map(String::from));
         assert_eq!((call.hops, call.limit), (2, 10));
@@ -422,16 +509,22 @@ mod tests {
             "a seed may hold any character"
         );
 
-        let no_seed = WalkCall::parse(&[lit("src"), lit("dst"), lit("k"), int(2), int(10)]);
+        let no_seed = WalkCall::parse(
+            GRAPH_RANK_UDTF,
+            &[lit("src"), lit("dst"), lit("k"), int(2), int(10)],
+        );
         assert!(no_seed.is_err(), "at least one seed");
-        let too_far = WalkCall::parse(&[
-            lit("src"),
-            lit("dst"),
-            lit("k"),
-            int(MAX_GRAPH_HOPS as i64 + 1),
-            int(10),
-            lit("s"),
-        ]);
+        let too_far = WalkCall::parse(
+            GRAPH_WALK_UDTF,
+            &[
+                lit("src"),
+                lit("dst"),
+                lit("k"),
+                int(MAX_GRAPH_HOPS as i64 + 1),
+                int(10),
+                lit("s"),
+            ],
+        );
         assert!(too_far.is_err(), "hops are bounded");
     }
 }

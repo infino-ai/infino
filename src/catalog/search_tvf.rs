@@ -40,7 +40,7 @@ use crate::{
         query::exec::{
             common::arg_to_string,
             fts_exec::{BM25_PREFIX_UDTF, BM25_SEARCH_UDTF, Bm25PrefixFunc, Bm25SearchFunc},
-            graph_exec::{GRAPH_WALK_UDTF, GraphWalkFunc},
+            graph_exec::{GraphKind, GraphWalkFunc},
             hybrid_exec::{HYBRID_SEARCH_UDTF, HybridSearchFunc},
             match_exec::{EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_UDTF, TokenMatchFunc},
             vector_exec::{VECTOR_SEARCH_UDTF, VectorSearchFunc},
@@ -179,18 +179,30 @@ pub(crate) fn register_search_tvfs(ctx: &SessionContext, conn: Connection) {
             resolver: Arc::clone(&resolver),
         }),
     );
-    ctx.register_udtf(GRAPH_WALK_UDTF, Arc::new(GraphWalkCatalogFunc { resolver }));
+    for kind in [GraphKind::Walk, GraphKind::Rank] {
+        ctx.register_udtf(
+            kind.name(),
+            Arc::new(GraphCatalogFunc {
+                resolver: Arc::clone(&resolver),
+                kind,
+            }),
+        );
+    }
 }
 
 #[derive(Debug)]
-struct GraphWalkCatalogFunc {
+struct GraphCatalogFunc {
     resolver: Arc<TableResolver>,
+    kind: GraphKind,
 }
-impl TableFunctionImpl for GraphWalkCatalogFunc {
+impl TableFunctionImpl for GraphCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args.exprs(), "graph_walk")?;
+        let (t, rest) = self
+            .resolver
+            .split_leading(args.exprs(), self.kind.name())?;
 
-        GraphWalkFunc::new(t.reader).call_with_args(TableFunctionArgs::new(rest, args.session()))
+        GraphWalkFunc::new(t.reader, self.kind)
+            .call_with_args(TableFunctionArgs::new(rest, args.session()))
     }
 }
 

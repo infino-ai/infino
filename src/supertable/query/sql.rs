@@ -80,9 +80,9 @@ use crate::{
         query::{
             covered_agg::CoveredAggregateRewrite,
             exec::{
-                common::collect_plan_metered, fts_exec::register_bm25,
-                graph_exec::register_graph_walk, hybrid_exec::register_hybrid_search,
-                match_exec::register_match, vector_exec::register_vector_search,
+                common::collect_plan_metered, fts_exec::register_bm25, graph_exec::register_graph,
+                hybrid_exec::register_hybrid_search, match_exec::register_match,
+                vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
         },
@@ -432,8 +432,8 @@ impl SupertableReader {
         // Unranked token / exact match TVFs (siblings of bm25_search).
         register_match(&ctx, Arc::clone(&reader), schemas.scalar().clone());
         register_hybrid_search(&ctx, Arc::clone(&reader), schemas.scalar().clone());
-        // Bounded walks over a table of edges.
-        register_graph_walk(&ctx, Arc::clone(&reader));
+        // Bounded walks and rankings over a table of edges.
+        register_graph(&ctx, Arc::clone(&reader));
 
         Ok(ctx)
     }

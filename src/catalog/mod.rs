@@ -1471,8 +1471,8 @@ mod tests {
 
     use arrow::util::pretty::pretty_format_batches;
     use arrow_array::{
-        Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, StringArray,
-        StringViewArray,
+        Array, FixedSizeListArray, Float32Array, Float64Array, Int64Array, LargeStringArray,
+        StringArray, StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
@@ -4877,6 +4877,58 @@ mod tests {
             vec!["n2", "n3", "n5"],
             "the seed, then its neighbours by key; an unknown seed reaches nothing"
         );
+    }
+
+    /// How far a ranking's scores may sum from one: the residual of its fifty power steps,
+    /// `0.85^50` ≈ 3e-4, rounded up.
+    const RANK_RESIDUAL: f64 = 1e-3;
+
+    #[test]
+    fn graph_rank_ranks_what_graph_walk_reaches() {
+        // Over the same table and bounds, `graph_rank` returns the nodes `graph_walk` reaches,
+        // highest score first; the scores sum to one up to the power iteration's residual, and
+        // the seed, which every restart returns to, ranks first.
+        let conn = connect("memory://").expect("connect");
+        keyed_edges(&conn, &TRAVERSAL_EDGES);
+        let reached = node_hops(
+            &conn,
+            "SELECT node, hop FROM graph_walk('kedges', 'src', 'dst', 'src_key', 3, 100, 'n1')",
+        );
+        let batches = conn
+            .query_sql(
+                "SELECT node, hop, score FROM graph_rank('kedges', 'src', 'dst', 'src_key', 3, \
+                 100, 'n1')",
+            )
+            .expect("graph_rank");
+        let mut ranked: Vec<(i64, f64)> = Vec::new();
+        for b in &batches {
+            let nodes = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("node");
+            let scores = b
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("score");
+            ranked.extend((0..b.num_rows()).map(|i| (nodes.value(i), scores.value(i))));
+        }
+        let mut ranked_nodes: Vec<i64> = ranked.iter().map(|(n, _)| *n).collect();
+        ranked_nodes.sort_unstable();
+        let mut walked: Vec<i64> = reached.iter().map(|(n, _)| *n).collect();
+        walked.sort_unstable();
+        assert_eq!(ranked_nodes, walked, "the same nodes");
+        assert!(
+            ranked.windows(2).all(|w| w[0].1 >= w[1].1),
+            "highest score first: {ranked:?}"
+        );
+        let total: f64 = ranked.iter().map(|(_, s)| s).sum();
+        assert!(
+            (total - 1.0).abs() < RANK_RESIDUAL,
+            "scores sum to one: {total}"
+        );
+        assert_eq!(ranked[0].0, 1, "the seed ranks first");
     }
 
     /// Exhaustive over `LogicalPlan`, so a DataFusion upgrade that adds a variant fails to compile
