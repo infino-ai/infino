@@ -35,7 +35,7 @@ use crate::{
     config,
     runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
-    superfile::vector::{flat, hnsw},
+    superfile::vector::{adjacency, flat, hnsw},
     supertable::{
         manifest::{
             SuperfileEntry, VectorSummary,
@@ -644,6 +644,9 @@ pub(crate) enum ResidentIndexKind {
     /// The flat 4-bit index: a nibble plane + ruler + node→doc-id map, and
     /// deliberately no Sq16 plane.
     Flat(flat::Sq4FlatIndex),
+    /// A knowledge graph's adjacency over an edge table: node ids and keys
+    /// plus the single-level graph the walks read.
+    Adjacency(adjacency::AdjacencyIndex),
 }
 
 impl ResidentIndexKind {
@@ -655,7 +658,7 @@ impl ResidentIndexKind {
     pub(crate) fn graph(&self) -> Option<&hnsw::HnswIndex> {
         match self {
             ResidentIndexKind::Graph(g) => Some(g),
-            ResidentIndexKind::Flat(_) => None,
+            ResidentIndexKind::Flat(_) | ResidentIndexKind::Adjacency(_) => None,
         }
     }
 
@@ -663,7 +666,16 @@ impl ResidentIndexKind {
     pub(crate) fn flat(&self) -> Option<&flat::Sq4FlatIndex> {
         match self {
             ResidentIndexKind::Flat(f) => Some(f),
-            ResidentIndexKind::Graph(_) => None,
+            ResidentIndexKind::Graph(_) | ResidentIndexKind::Adjacency(_) => None,
+        }
+    }
+
+    /// The adjacency, or `None` when this generation published a vector
+    /// index.
+    pub(crate) fn adjacency(&self) -> Option<&adjacency::AdjacencyIndex> {
+        match self {
+            ResidentIndexKind::Adjacency(a) => Some(a),
+            ResidentIndexKind::Graph(_) | ResidentIndexKind::Flat(_) => None,
         }
     }
 }
@@ -744,6 +756,9 @@ pub(crate) async fn hydrate_resident_index(
             Some((hnsw::PayloadKind::Flat, b)) => {
                 flat::Sq4FlatIndex::decode(b).map(ResidentIndexKind::Flat)
             }
+            Some((hnsw::PayloadKind::Adjacency, b)) => {
+                adjacency::AdjacencyIndex::decode(b).map(ResidentIndexKind::Adjacency)
+            }
         };
         Ok::<_, SlowVectorStateError>((bundle.high_water_id, data))
     })
@@ -766,6 +781,11 @@ pub(crate) async fn hydrate_resident_index(
             residual = idx.has_residual(),
             resident_mib = idx.resident_bytes() / (1024 * 1024),
             "flat: resident index hydrated"
+        ),
+        Some(ResidentIndexKind::Adjacency(idx)) => tracing::debug!(
+            nodes = idx.len(),
+            resident_graph_mib = idx.resident_graph_bytes() / (1024 * 1024),
+            "adjacency: resident index hydrated"
         ),
         None => {}
     }

@@ -25,6 +25,7 @@ pub mod df_object_store;
 pub mod dispatch;
 pub mod exec;
 pub mod fts;
+pub mod graph;
 pub mod hierarchical_iter;
 pub mod provider;
 pub mod prune;

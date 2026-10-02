@@ -967,6 +967,16 @@ impl GcSettings {
     }
 }
 
+/// Which columns of an edge table carry the graph `optimize()` builds a
+/// resident adjacency index over: the `Int64` source and destination node
+/// columns, and the string column holding the source node's key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdjacencySpec {
+    pub(crate) src: String,
+    pub(crate) dst: String,
+    pub(crate) key: String,
+}
+
 /// Options for [`crate::Supertable::optimize`].
 ///
 /// Additional operation kinds (e.g. vector-index maintenance) will be
@@ -976,6 +986,10 @@ pub struct OptimizeOptions {
     pub(crate) compaction: CompactionSettings,
     pub(crate) gc: GcSettings,
     pub(crate) recalibrate: RecalibratePolicy,
+    /// The edge columns of a table whose rows are a graph; set, `optimize()`
+    /// builds and publishes the resident adjacency index the graph walks
+    /// read, as it builds the `hnsw` graph over a vector column.
+    pub(crate) adjacency: Option<AdjacencySpec>,
 }
 
 impl OptimizeOptions {
@@ -985,7 +999,24 @@ impl OptimizeOptions {
             compaction: settings,
             gc: GcSettings::default(),
             recalibrate: RecalibratePolicy::default(),
+            adjacency: None,
         }
+    }
+
+    /// Treat the table's rows as a graph's edges — `src` and `dst` the
+    /// `Int64` node columns, `key` the string column with the source node's
+    /// key — and have `optimize()` build and publish the resident adjacency
+    /// index over them, in the lifecycle of the `hnsw` graph: one
+    /// content-addressed blob referenced from the manifest, memory-mapped
+    /// when the store is local, held resident once hydrated, kept by GC
+    /// while referenced, and rebuilt only when the rows changed.
+    pub fn with_adjacency(mut self, src: &str, dst: &str, key: &str) -> Self {
+        self.adjacency = Some(AdjacencySpec {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            key: key.to_string(),
+        });
+        self
     }
 
     /// Override the gc settings `optimize()`'s bundled sweep uses.

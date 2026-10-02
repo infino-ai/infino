@@ -327,7 +327,7 @@ impl SupertableReader {
     /// Freshness policy is applied when the reader is created by
     /// [`Supertable::reader`](crate::supertable::handle::Supertable::reader).
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
-    fn sql_session_context(&self) -> Result<SessionContext, QueryError> {
+    pub(crate) fn sql_session_context(&self) -> Result<SessionContext, QueryError> {
         // This reader already pins the snapshot; clone is a handful of
         // Arc refcount bumps. Detach any per-query work collector: this
         // context is CACHED across queries, and a collector riding into it

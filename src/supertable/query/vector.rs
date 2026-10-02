@@ -3913,7 +3913,7 @@ impl SupertableReader {
     /// ref (older generation / above the scale ceiling) or the fetch failed
     /// — `hnsw_search` then returns `None` and the caller falls through to
     /// the ivf scan.
-    async fn resident_vector_index(&self) -> Option<Arc<ResidentVectorIndex>> {
+    pub(crate) async fn resident_vector_index(&self) -> Option<Arc<ResidentVectorIndex>> {
         let manifest = self.manifest();
         let slot = Arc::clone(&manifest.options.resident_index_cache);
         let Some(reference) = manifest.resident_vector_index_blob().cloned() else {

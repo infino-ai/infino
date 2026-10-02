@@ -478,6 +478,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::MutationStats
 pub struct infino::OptimizeOptions
 impl infino::OptimizeOptions
 pub fn infino::OptimizeOptions::compact(infino::CompactionSettings) -> Self
+pub fn infino::OptimizeOptions::with_adjacency(self, &str, &str, &str) -> Self
 pub fn infino::OptimizeOptions::with_gc(self, infino::GcSettings) -> Self
 pub fn infino::OptimizeOptions::with_recalibrate(self, infino::RecalibratePolicy) -> Self
 impl core::clone::Clone for infino::OptimizeOptions

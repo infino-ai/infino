@@ -1474,6 +1474,33 @@ impl ManifestSnapshot {
         self.list.as_ref()?.slow_vector_state_centroids.as_ref()
     }
 
+    /// Successor manifest (bumped id) with the resident-index ref replaced
+    /// by `reference` — the knowledge graph's adjacency, stamped by the
+    /// maintenance publish the way [`Self::with_term_stats`] stamps its
+    /// sidecar. The ref lives in the same list slot as the `hnsw` graph's: a
+    /// table carries one resident index, and an edge table has no vector
+    /// column to carry the other.
+    pub(crate) fn with_adjacency_ref(&self, reference: RoutingRef) -> Self {
+        let next_id = self.get_next_manifest_id();
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.manifest_id = next_id;
+            list.slow_vector_state_graphs = Some(reference.clone());
+            list
+        });
+        let mut superfile_list = self.superfile_list.clone();
+        superfile_list.manifest_id = next_id;
+        Self {
+            superfile_list,
+            list: new_list,
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+        }
+    }
+
     /// The graph-sections sibling ref (persisted `hnsw` HNSW graphs),
     /// or `None` on manifests written before it existed or above the
     /// data-graph scale ceiling. Consumers fall back to the lazy build /

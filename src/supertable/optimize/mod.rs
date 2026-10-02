@@ -76,6 +76,12 @@ impl Supertable {
         // set names the fresh artifact.
         self.refresh_term_stats_sync()
             .map_err(|e| OptimizeError::Build(e.to_string()))?;
+        // The knowledge graph's adjacency over an edge table, rebuilt only
+        // when the rows changed; before gc for the same reason.
+        if let Some(spec) = &opts.adjacency {
+            self.refresh_adjacency_sync(spec)
+                .map_err(|e| OptimizeError::Build(e.to_string()))?;
+        }
         match self.gc(opts.gc.safety_gap) {
             Ok(_) | Err(GcError::NoStorage) => {}
             Err(e) => return Err(OptimizeError::Gc(e)),
