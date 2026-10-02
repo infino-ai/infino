@@ -19,6 +19,9 @@ use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::builder::FtsConfig,
     supertable::{Supertable, SupertableOptions},
+    test_helpers::{
+        build_title_batch, copy_dir_recursive, old_format_fts_fixture, open_old_format_fts_fixture,
+    },
 };
 use tempfile::TempDir;
 
@@ -177,4 +180,50 @@ fn shapes_that_are_not_a_sum_still_agree() {
             .len() as u64;
         assert_eq!(counted, expected, "{query:?} must agree with its match set");
     }
+}
+
+/// **The guard the other tests cannot reach.** Every table above was written
+/// by the current engine, so the term index lists all of its superfiles and
+/// `is_indexed` is true for free.
+///
+/// A table upgraded from an older engine is the shape that breaks it: the
+/// committed fixture's superfiles predate the table-level term index and are
+/// absent from it, while a superfile appended now is listed. Summing only the
+/// listed superfiles' document frequencies would then answer for the newest
+/// commit alone and silently lose every older row, so the shortcut has to
+/// stand aside until the index covers everything that survived the prune.
+#[test]
+fn an_unindexed_superfile_sends_the_count_back_to_the_fan_out() {
+    let dir = TempDir::new().expect("tempdir");
+    copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+    let (_storage, st) = open_old_format_fts_fixture(dir.path(), |o| o);
+
+    // Every fixture row carries `shared`; one more from the current engine
+    // lands in a superfile the term index does list.
+    let mut w = st.writer().expect("writer");
+    w.append(&build_title_batch(&["shared freshly appended row"]))
+        .expect("append");
+    w.commit().expect("commit");
+    drop(w);
+
+    let reader = st.reader().expect("reader");
+    let counted = reader
+        .count("title", "shared", BoolMode::Or)
+        .expect("count");
+    let fanout = reader
+        .token_match("title", "shared", BoolMode::Or)
+        .expect("token_match")
+        .len() as u64;
+
+    assert_eq!(
+        counted, fanout,
+        "the count must see the superfiles the term index does not list"
+    );
+    // Pin the magnitude too: the failure this guards against answers with the
+    // appended row alone, which is a plausible-looking small number rather
+    // than an obvious zero.
+    assert!(
+        counted > 1,
+        "the fixture's own rows must be counted as well, got {counted}"
+    );
 }
