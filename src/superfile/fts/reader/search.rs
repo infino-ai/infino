@@ -1563,7 +1563,9 @@ impl FtsReader {
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<Vec<TermCursor>, FtsError> {
         Ok(self
-            .build_term_cursors_opt(column_id, terms, global_idf, count_only, qtf, prefetched)
+            .build_term_cursors_opt(
+                column_id, terms, global_idf, count_only, qtf, prefetched, None,
+            )
             .await?
             .into_iter()
             .flatten()
@@ -1682,6 +1684,9 @@ impl FtsReader {
     /// scales both the score and the BlockMaxWAND skip ceilings, so a deduplicated
     /// repeated term ranks identically to the duplicates it replaced (BM25 is
     /// linear in idf). `None` leaves idf unweighted.
+    /// `dict_bytes`, when present, is this reader's dictionary already fetched
+    /// by the caller, so it is not fetched again.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn build_term_cursors_opt(
         &self,
         column_id: u32,
@@ -1690,6 +1695,7 @@ impl FtsReader {
         count_only: bool,
         qtf: Option<&[u32]>,
         prefetched: Option<&FetchedTermMemo>,
+        dict_bytes: Option<&[u8]>,
     ) -> Result<Vec<Option<TermCursor>>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         // Scoring needs the column's norms; a match-only build does not,
@@ -1725,13 +1731,14 @@ impl FtsReader {
             },
         }
         let all_prefetched = prefetched.is_some_and(|m| terms.iter().all(|t| m.contains(t)));
-        let dict_bytes = match all_prefetched {
-            true => None,
-            false => Some(self.dict_bytes_async().await?),
-        };
-        let dict = match dict_bytes.as_ref() {
-            Some(b) => Some(self.open_dict(b)?),
-            None => None,
+        let fetched;
+        let dict = match (all_prefetched, dict_bytes) {
+            (true, _) => None,
+            (false, Some(b)) => Some(self.open_dict(b)?),
+            (false, None) => {
+                fetched = self.dict_bytes_async().await?;
+                Some(self.open_dict(&fetched)?)
+            }
         };
         let mut resolved: Vec<Option<Resolved>> = Vec::with_capacity(terms.len());
         let mut pfor_offsets: Vec<(usize, Option<usize>)> = Vec::new();

@@ -270,6 +270,43 @@ impl UnrankedMatchSet {
     }
 }
 
+/// The presence leaf a match set prunes with: its bare terms plus every
+/// phrase's members, under the strongest mode those atoms allow.
+///
+/// A phrase's members are conjunctive — a match contains all of them, adjacent
+/// — but that only constrains the whole query when nothing else could satisfy
+/// it. So the mode is `And` when the caller already requires every atom (a
+/// must-side prune), and also for the single quoted phrase with no bare terms,
+/// where matching the query *is* matching the phrase. A disjunction of a phrase
+/// with anything else is `(a AND b) OR c`, which one presence leaf cannot
+/// express, so it falls back to the union over every atom — weaker, never
+/// wrong.
+///
+/// Flattening the members into the query's mode unconditionally is what makes a
+/// quoted phrase of common words prune nothing: `"wine beer"` asks only whether
+/// a superfile holds `wine` or `beer`, which at corpus scale every superfile
+/// does.
+fn presence_leaf(
+    column: &str,
+    terms: &[String],
+    phrases: &[Phrase<String>],
+    mode: BoolMode,
+) -> PruneLeaf {
+    let mut atoms: Vec<String> = terms.to_vec();
+    for p in phrases {
+        atoms.extend(p.iter().cloned());
+    }
+    let conjunctive = matches!(mode, BoolMode::And) || (terms.is_empty() && phrases.len() == 1);
+    PruneLeaf::TermPresence {
+        column: column.to_owned(),
+        terms: atoms,
+        mode: match conjunctive {
+            true => BoolMode::And,
+            false => mode,
+        },
+    }
+}
+
 /// An unranked query's negated atoms (docs containing any are
 /// excluded).
 #[derive(Default)]
@@ -684,27 +721,9 @@ impl SupertableReader {
         // the union: a doc matching the phrase contains each member).
         // Negated atoms never prune, and shoulds never prune once a
         // must exists, since they only affect scores.
-        let (mut prune_terms, prune_mode) = if !has_musts {
-            (shoulds.clone(), mode)
-        } else {
-            (musts.clone(), BoolMode::And)
-        };
-        match has_musts {
-            true => {
-                for p in &must_phrases {
-                    prune_terms.extend(p.iter().cloned());
-                }
-            }
-            false => {
-                for p in &should_phrases {
-                    prune_terms.extend(p.iter().cloned());
-                }
-            }
-        }
-        let prune_leaf = PruneLeaf::TermPresence {
-            column: column_owned.clone(),
-            terms: prune_terms,
-            mode: prune_mode,
+        let prune_leaf = match has_musts {
+            true => presence_leaf(&column_owned, &musts, &must_phrases, BoolMode::And),
+            false => presence_leaf(&column_owned, &shoulds, &should_phrases, mode),
         };
         let phases = self.phase_spans();
         let select_span = trace::phase(phases, || {
@@ -1704,17 +1723,8 @@ impl SupertableReader {
                 mode,
             },
         };
-        // Prune on the match set's terms plus its phrases' members —
-        // a phrase match requires every member present.
-        let mut prune_terms = match_set.terms.clone();
-        for p in &match_set.phrases {
-            prune_terms.extend(p.iter().cloned());
-        }
-        let prune_leaf = PruneLeaf::TermPresence {
-            column: column.to_owned(),
-            terms: prune_terms,
-            mode: match_set.mode,
-        };
+        let prune_leaf =
+            presence_leaf(column, &match_set.terms, &match_set.phrases, match_set.mode);
         let kept =
             select_superfiles(self.manifest().as_ref(), slice::from_ref(&prune_leaf)).await?;
         Ok((match_set, negs, kept))
@@ -1869,6 +1879,60 @@ impl SupertableReader {
         Ok(hits)
     }
 
+    /// A single term's count, straight from the term index, or `None` when
+    /// that cannot be exact.
+    ///
+    /// The index already records a per-superfile document frequency for every
+    /// term it routes, so counting one term is summing numbers it holds — no
+    /// superfile need be opened at all. Four conditions have to hold for that
+    /// sum to be the same answer the fan-out would give:
+    ///
+    /// - **One bare term.** Phrases need positions, and several terms need the
+    ///   union or intersection of their doc sets, neither of which is a sum.
+    /// - **No negations.** An excluded term removes docs the df still counts.
+    /// - **Every surviving superfile is indexed.** One the index does not list
+    ///   contributes a df nobody recorded.
+    /// - **None of them has a tombstone sidecar.** The recorded df is GROSS, so
+    ///   a deleted doc is still in it.
+    ///
+    /// Any of those failing falls through to the fan-out, which is always
+    /// correct and merely slower.
+    async fn count_from_term_index(
+        &self,
+        column: &str,
+        match_set: &UnrankedMatchSet,
+        negatives: &UnrankedNegatives,
+        kept: &[Arc<SuperfileEntry>],
+    ) -> Option<u64> {
+        if match_set.has_phrases() || !negatives.is_empty() || match_set.terms.len() != 1 {
+            return None;
+        }
+        let manifest = self.manifest();
+        let index = manifest.term_index().await?;
+        if !kept.iter().all(|e| index.is_indexed(&e.superfile_id)) {
+            return None;
+        }
+        // A superfile listed here may hold deleted rows, which the gross df
+        // would still count.
+        if let Some(seqs) = manifest.get_tombstone_seqs()
+            && kept.iter().any(|e| seqs.contains_key(&e.superfile_id))
+        {
+            return None;
+        }
+
+        let term = match_set.terms.first()?;
+        let postings = index.postings(column, term).await.ok()?;
+        let wanted: HashSet<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
+        let mut total: u64 = 0;
+        for posting in postings.iter() {
+            let id = index.superfile_id(posting.superfile)?;
+            if wanted.contains(&id) {
+                total = total.checked_add(posting.df)?;
+            }
+        }
+        Some(total)
+    }
+
     /// Count documents whose `column` matches `query`'s tokens under
     /// `mode` (`Or` = any token, `And` = every token), over this reader's
     /// pinned snapshot — **count only, no scoring and no row
@@ -1880,13 +1944,17 @@ impl SupertableReader {
     /// [`Self::parse_and_prune`]). `count("+climate policy")` is the
     /// number of docs containing `climate`.
     ///
-    /// Fast path: a single-token query against a superfile with no
-    /// tombstones resolves from the term dictionary's stored document
-    /// frequency ([`SuperfileReader::term_df`]) — O(1) per superfile, no
-    /// posting decode. A multi-token query, or a superfile with deletes,
-    /// falls back to materializing the matching local doc ids and
-    /// counting those not tombstoned. Tombstoned (deleted) rows are
-    /// always excluded so the count matches what a search would return.
+    /// Two fast paths, tried in that order. A single bare term over
+    /// delete-free superfiles the term index lists is a sum of the
+    /// document frequencies the index already holds, and opens nothing at
+    /// all ([`Self::count_from_term_index`]). Failing that, a single-token
+    /// query against a superfile with no tombstones resolves from the term
+    /// dictionary's stored document frequency
+    /// ([`SuperfileReader::term_df`]) — O(1) per superfile, no posting
+    /// decode. A multi-token query, or a superfile with deletes, falls back
+    /// to materializing the matching local doc ids and counting those not
+    /// tombstoned. Tombstoned (deleted) rows are always excluded so the
+    /// count matches what a search would return.
     pub(crate) async fn token_match_count_async(
         &self,
         column: &str,
@@ -1896,6 +1964,13 @@ impl SupertableReader {
         let (match_set, negatives, kept) = self.parse_and_prune(column, query, mode).await?;
         if kept.is_empty() {
             return Ok(0);
+        }
+
+        if let Some(total) = self
+            .count_from_term_index(column, &match_set, &negatives, &kept)
+            .await
+        {
+            return Ok(total);
         }
 
         let match_mode = match_set.mode;
@@ -2334,9 +2409,12 @@ impl SupertableReader {
 
     /// Count documents matching `query`'s tokens under `mode` over this
     /// reader's pinned snapshot — count only, no scoring or row
-    /// materialization. A single-token query on a delete-free superfile
-    /// resolves in O(1) from the stored document frequency. Drives the
-    /// async kernel via the sync→async bridge.
+    /// materialization. A single bare term over delete-free superfiles the
+    /// term index lists is answered by summing the document frequencies it
+    /// records, without opening any superfile; otherwise a single-token
+    /// query on a delete-free superfile resolves in O(1) from the stored
+    /// document frequency. Drives the async kernel via the sync→async
+    /// bridge.
     pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.token_match_count_async(column, query, mode))
@@ -2829,6 +2907,90 @@ mod tests {
         future::Future,
         sync::Arc,
     };
+
+    /// A phrase's members are conjunctive, so a quoted phrase on its own
+    /// prunes on all of them.
+    ///
+    /// Flattening them into the query's `Or` is what makes a phrase of common
+    /// words prune nothing: `"wine beer"` would ask only whether a superfile
+    /// holds `wine` or `beer`, which at corpus scale every superfile does, so
+    /// the fan-out opens the entire table.
+    #[test]
+    fn a_lone_phrase_prunes_on_every_member() {
+        let phrase = super::Phrase::adjacent(vec!["wine".to_string(), "beer".to_string()]);
+        let leaf = super::presence_leaf(
+            "text",
+            &[],
+            std::slice::from_ref(&phrase),
+            super::BoolMode::Or,
+        );
+        let super::PruneLeaf::TermPresence { terms, mode, .. } = leaf else {
+            panic!("expected a term-presence leaf");
+        };
+        assert_eq!(terms, vec!["wine".to_string(), "beer".to_string()]);
+        assert!(
+            matches!(mode, super::BoolMode::And),
+            "a lone phrase requires every member, so the leaf must be And"
+        );
+    }
+
+    /// The soundness boundary. `wine OR "beer stout"` matches a doc holding
+    /// only `wine`, so requiring the phrase's members would prune away
+    /// superfiles that genuinely match. One presence leaf cannot express
+    /// `(a AND b) OR c`, so the union over every atom is the strongest thing
+    /// that stays correct.
+    #[test]
+    fn a_phrase_beside_a_bare_term_stays_a_union() {
+        let phrase = super::Phrase::adjacent(vec!["beer".to_string(), "stout".to_string()]);
+        let leaf = super::presence_leaf(
+            "text",
+            &["wine".to_string()],
+            std::slice::from_ref(&phrase),
+            super::BoolMode::Or,
+        );
+        let super::PruneLeaf::TermPresence { mode, terms, .. } = leaf else {
+            panic!("expected a term-presence leaf");
+        };
+        assert!(
+            matches!(mode, super::BoolMode::Or),
+            "a phrase OR a bare term must not become a conjunction"
+        );
+        assert_eq!(terms.len(), 3, "every atom still joins the union");
+    }
+
+    /// Two phrases under `Or` are `(a AND b) OR (c AND d)`, equally
+    /// inexpressible, so they also stay a union.
+    #[test]
+    fn two_phrases_under_or_stay_a_union() {
+        let phrases = vec![
+            super::Phrase::adjacent(vec!["wine".to_string(), "beer".to_string()]),
+            super::Phrase::adjacent(vec!["gin".to_string(), "tonic".to_string()]),
+        ];
+        let leaf = super::presence_leaf("text", &[], &phrases, super::BoolMode::Or);
+        let super::PruneLeaf::TermPresence { mode, terms, .. } = leaf else {
+            panic!("expected a term-presence leaf");
+        };
+        assert!(matches!(mode, super::BoolMode::Or));
+        assert_eq!(terms.len(), 4);
+    }
+
+    /// A must-side prune already requires every atom, so a phrase there needs
+    /// no special case — and must not lose the conjunction either.
+    #[test]
+    fn a_must_side_phrase_keeps_its_conjunction() {
+        let phrase = super::Phrase::adjacent(vec!["beer".to_string(), "stout".to_string()]);
+        let leaf = super::presence_leaf(
+            "text",
+            &["wine".to_string()],
+            std::slice::from_ref(&phrase),
+            super::BoolMode::And,
+        );
+        let super::PruneLeaf::TermPresence { mode, terms, .. } = leaf else {
+            panic!("expected a term-presence leaf");
+        };
+        assert!(matches!(mode, super::BoolMode::And));
+        assert_eq!(terms.len(), 3, "musts and phrase members all required");
+    }
 
     /// The skip decision at its boundary: a ceiling equal to the floor is
     /// opened, one an ulp below it is skipped, and nothing is skipped before

@@ -42,7 +42,7 @@ fn dictionary_fetches(tokens: &[&str], prefetched: Option<&FetchedTermMemo>) -> 
 }
 
 /// One term's entry in a table-level term index, as read from one
-/// superfile: see [`FtsReader::term_index_facts`].
+/// superfile: see [`FtsReader::term_index_facts_with`].
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TermIndexFact {
     /// Documents in this superfile containing the term.
@@ -371,24 +371,41 @@ impl FtsReader {
     /// the maximum over its skip entries, for a short or inline term the
     /// maximum over its postings. A query rescales it for a global idf the
     /// same way the in-superfile bounds are.
+    #[cfg(test)]
     pub(crate) async fn term_index_facts(
         &self,
         column: &str,
         tokens: &[&str],
     ) -> Result<Vec<Option<TermIndexFact>>, FtsError> {
-        let column_id = self.resolve_column_id(column)?;
+        self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
         let fst_bytes = self.dict_bytes_async().await?;
-        let dict = self.open_dict(&fst_bytes)?;
+        self.term_index_facts_with(&fst_bytes, column, tokens).await
+    }
+
+    /// [`Self::term_index_facts`] over `fst_bytes`, this reader's dictionary
+    /// already fetched by the caller.
+    pub(crate) async fn term_index_facts_with(
+        &self,
+        fst_bytes: &[u8],
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<Vec<Option<TermIndexFact>>, FtsError> {
+        self.debug_assert_own_dict(fst_bytes);
+        let column_id = self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dict = self.open_dict(fst_bytes)?;
         let col_meta = &self.columns[column_id as usize];
         let entries: Vec<Option<FstValue>> = tokens
             .iter()
             .map(|token| dict.lookup(&make_key(&col_meta.name, token)))
             .collect();
         let cursors = self
-            .build_term_cursors_opt(column_id, tokens, None, false, None, None)
+            .build_term_cursors_opt(column_id, tokens, None, false, None, None, Some(fst_bytes))
             .await?;
         Ok(entries
             .into_iter()
@@ -405,7 +422,7 @@ impl FtsReader {
     }
 
     /// Up to `limit` of `column`'s terms after `after` (from the first when
-    /// `None`), in term order, each with what [`Self::term_index_facts`]
+    /// `None`), in term order, each with what [`Self::term_index_facts_with`]
     /// records for it. Walks the dictionary with its values, avoiding a
     /// separate term lookup for each entry.A df=1 inline term gets its fact
     /// straight from its entry: its one posting's score is its bound, so no
@@ -471,7 +488,8 @@ impl FtsReader {
                 .map(|&i| from_utf8(&out[i].0))
                 .collect::<Result<Vec<&str>, _>>()
                 .map_err(|_| FtsError::Read(ReadError::MalformedVersion("non-utf8 term".into())))?;
-            self.term_index_facts(column, &terms).await?
+            self.term_index_facts_with(fst_bytes, column, &terms)
+                .await?
         };
         for (i, fact) in with_postings.into_iter().zip(facts) {
             out[i].1 = fact;
@@ -498,12 +516,28 @@ impl FtsReader {
         column: &str,
         tokens: &[&str],
     ) -> Result<(Vec<u64>, MatchWork), FtsError> {
-        let column_id = self.resolve_column_id(column)?;
+        self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let fst_bytes = self.dict_bytes_async().await?;
-        let dict = self.open_dict(&fst_bytes)?;
+        self.term_dfs_with(&fst_bytes, column, tokens).await
+    }
+
+    /// [`Self::term_dfs`] over `fst_bytes`, this reader's dictionary already
+    /// fetched by the caller.
+    pub(crate) async fn term_dfs_with(
+        &self,
+        fst_bytes: &[u8],
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<(Vec<u64>, MatchWork), FtsError> {
+        self.debug_assert_own_dict(fst_bytes);
+        let column_id = self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok((Vec::new(), MatchWork::default()));
+        }
+        let dict = self.open_dict(fst_bytes)?;
         let col_meta = &self.columns[column_id as usize];
 
         // First pass — pure in-memory FST lookups. Absent and inline

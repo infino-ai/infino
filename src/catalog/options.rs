@@ -116,9 +116,17 @@ impl ConnectOptions {
     }
 
     /// Set a per-connection memory budget, in bytes. Unset (the default)
-    /// tracks usage without enforcing; a positive value enforces a ceiling so
-    /// one connection can't exhaust process memory. Shared across all of the
+    /// tracks usage without enforcing; a positive value enforces a ceiling on
+    /// what this connection's work may hold. Shared across all of the
     /// connection's tables.
+    ///
+    /// Covers search and ingest. It does **not** cover compaction: a merge is
+    /// not work done on behalf of a connection, and sizing it from a budget set
+    /// for queries meant a pass could be refused on a machine with the memory
+    /// to spare. What bounds a merge is the host — the compaction runner admits
+    /// one at a time against free memory, and `compaction.max_memory_mb` caps
+    /// the input bytes a single merge packs. So this is not a ceiling on the
+    /// process: an optimize running alongside holds memory outside it.
     pub fn with_connection_memory_budget_bytes(mut self, bytes: u64) -> Self {
         self.connection_memory_budget_bytes = Some(bytes);
         self

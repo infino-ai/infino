@@ -145,7 +145,10 @@ pub struct Config {
 pub struct MemorySettings {
     /// Per-connection memory (heap) budget in bytes. `0` (the default) is
     /// measure-only: usage is tracked but never refused. A positive value
-    /// enforces a ceiling so one connection can't exhaust process memory.
+    /// enforces a ceiling on what this connection's search and ingest work may
+    /// hold. Compaction is not charged to it — see
+    /// [`ConnectOptions::with_connection_memory_budget_bytes`] — so this is not
+    /// a ceiling on the process.
     ///
     /// Applies to connections built from a config file (`apply_config`). Code
     /// that opens a connection programmatically sets the budget on
@@ -1476,12 +1479,14 @@ impl Config {
             .maintenance_threads
             .resolve_or_default(available_parallelism().map(NonZeroUsize::get).unwrap_or(1));
         let resolved = match available_memory_bytes() {
-            // Memory is observable, so the runner reads `MemAvailable`
-            // between admissions and stops widening once less than its reserve
-            // share is free — a measurement of what merges cost on this
-            // corpus, where this layer could only guess from the
-            // `max_memory_mb` CAP, which real jobs are routinely a fraction
-            // of. The derived value is then just the CPU ceiling.
+            // Memory is observable, so the runner reads what this process may
+            // actually spend — its cgroup ceiling where it has one, the host's
+            // `MemAvailable` otherwise — between admissions, and stops
+            // widening once less than its reserve share is free. That measures
+            // what merges cost on this corpus, where this layer could only
+            // guess from the `max_memory_mb` CAP, which real jobs are
+            // routinely a fraction of. The derived value is then just the CPU
+            // ceiling.
             Some(_) => maintenance,
             // No procfs: nothing downstream can bound the merges, so stay serial
             // rather than invent a width.

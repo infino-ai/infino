@@ -616,6 +616,7 @@ export class Connection {
     return new Table(guard(this.remote, () => this.inner.openTable(name)), this.remote);
   }
 
+  /** Drop a table. `purge` defaults to `true`, which also deletes the table's storage; pass `false` to only unregister it and keep the bytes. */
   dropTable(name: string, purge?: boolean): void {
     guard(this.remote, () => this.inner.dropTable(name, purge));
   }

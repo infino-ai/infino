@@ -70,7 +70,7 @@ use tokio::runtime::Handle;
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
-    memory::budgeted_session_context,
+    memory::{ConnectionMemoryBudget, budgeted_session_context},
     runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::permission_denied_in_chain,
     supertable::{
@@ -161,6 +161,19 @@ fn cacheable_scalar_plan(plan: &LogicalPlan) -> bool {
 
     let mut found_scan = false;
     visit(plan, &mut found_scan) && found_scan
+}
+
+/// The SQL context every entry point plans in: DataFusion's memory gated on `budget`, plus the
+/// covered-aggregate rewrite, which answers covered aggregates from manifest statistics and scans
+/// only the boundary segments. One constructor, so a query plans the same way whichever API
+/// (`Connection::query_sql` or a reader's) it arrives through.
+pub(crate) fn sql_session_context(
+    budget: &Arc<ConnectionMemoryBudget>,
+) -> Result<SessionContext, DataFusionError> {
+    let ctx = budgeted_session_context(budget)?;
+    // Appended after the built-in rules, so it sees pushed-down, normalized plans.
+    ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite));
+    Ok(ctx)
 }
 
 /// Classify a SQL execution error: budget exhaustion -> [`QueryError::OverBudget`]
@@ -395,14 +408,8 @@ impl SupertableReader {
 
         // Gate SQL heap on the connection budget (shared across contexts, so
         // this reader's SQL counts against the same ceiling as the rest).
-        let ctx = budgeted_session_context(&self.options().connection_memory_budget)
+        let ctx = sql_session_context(&self.options().connection_memory_budget)
             .map_err(|e| QueryError::Plan(e.to_string()))?;
-
-        // Covered/residual aggregate rewrite: filter-aligned range
-        // aggregates answer covered segments from manifest statistics
-        // and scan only the boundary segments. Appended after the
-        // built-in rules so it sees pushed-down, normalized plans.
-        ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite));
         ctx.register_table(TABLE_NAME, Arc::new(provider))
             .map_err(|e| QueryError::Plan(e.to_string()))?;
 
