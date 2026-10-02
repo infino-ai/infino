@@ -109,10 +109,14 @@ fn configured_or_cgroup_limit() -> Option<u64> {
 }
 
 /// The SQL limit for a cgroup limit of `bytes`: [`CGROUP_LIMIT_PERCENT`] of
-/// it, scaled before dividing so a small limit is not rounded away, and never
-/// 0, which would read as no limit.
+/// it, exact across the whole range, and never 0, which would read as no
+/// limit. The whole hundreds and the remainder are scaled apart: scaling all
+/// of `bytes` first would overflow near `u64::MAX`, and dividing first would
+/// round a limit under 100 bytes away.
 fn share_of_cgroup_limit(bytes: u64) -> u64 {
-    (bytes.saturating_mul(CGROUP_LIMIT_PERCENT) / PERCENT).max(1)
+    let share =
+        bytes / PERCENT * CGROUP_LIMIT_PERCENT + bytes % PERCENT * CGROUP_LIMIT_PERCENT / PERCENT;
+    share.max(1)
 }
 
 /// The shared sampler: the channel its readings go out on, and its thread, to
@@ -215,17 +219,23 @@ mod tests {
     const SETTLE: Duration = Duration::from_millis(500);
     /// The worker unit's throttle (`memory.high`).
     const WORKER_HIGH: u64 = 7_516_192_768;
+    /// A limit that is not a whole number of hundreds, so the remainder counts.
+    const NOT_WHOLE_HUNDREDS: u64 = 199;
+
+    /// The share computed in 128 bits, where nothing can overflow: the
+    /// reference the 64-bit split is checked against.
+    fn wide_share(bytes: u64) -> u64 {
+        let share = u128::from(bytes) * u128::from(CGROUP_LIMIT_PERCENT) / u128::from(PERCENT);
+        u64::try_from(share).expect("a share of a u64 fits in a u64")
+    }
 
     #[test]
     fn the_sql_limit_is_ninety_percent_of_the_cgroups_and_never_rounds_to_none() {
-        assert_eq!(
-            share_of_cgroup_limit(WORKER_HIGH),
-            WORKER_HIGH * CGROUP_LIMIT_PERCENT / PERCENT
-        );
-        // Below 100 bytes, dividing first would give 0: no limit at all.
+        for bytes in [WORKER_HIGH, NOT_WHOLE_HUNDREDS, u64::MAX - 1, u64::MAX] {
+            assert_eq!(share_of_cgroup_limit(bytes), wide_share(bytes), "{bytes}");
+        }
+        // Below 100 bytes the exact share is 0, which would read as no limit.
         assert_eq!(share_of_cgroup_limit(1), 1);
-        // A limit near the top of the range saturates instead of overflowing.
-        assert!(share_of_cgroup_limit(u64::MAX) > 0);
     }
 
     #[cfg(target_os = "linux")]
