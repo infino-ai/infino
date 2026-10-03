@@ -25,8 +25,9 @@
 //! fetching, and the entry's shared `size_bytes` counter grows as blocks
 //! land — so eviction sees a lazy entry's true footprint. On budget
 //! exhaustion, or once this source's cache entry has been replaced (eviction
-//! / mmap promotion), reads degrade to plain uncached passthrough instead of
-//! failing. The source releases its accounted bytes on `Drop` (i.e. when the
+//! / mmap promotion), reads stop filling blocks instead of failing: they come
+//! from a whole-file local copy when the cache holds one, else uncached from
+//! object storage. The source releases its accounted bytes on `Drop` (i.e. when the
 //! last in-flight reader over it goes away); the sparse file and its persisted
 //! index stay on disk so a later generation can adopt them.
 
@@ -302,6 +303,25 @@ impl BlockCachedSource {
         (b0 as u32, b1 as u32)
     }
 
+    /// The block file that can serve `start..start + len`, or `None` when the read bypasses the
+    /// blocks: an exact passthrough range, no block file, or a range past the end (which the
+    /// inner source reports as an error).
+    fn blocks_for(&self, start: u64, len: u64) -> Option<&BlockFile> {
+        if self.in_passthrough(start, len) {
+            return None;
+        }
+        let bf = self.block_file()?;
+        (start.saturating_add(len) <= bf.size).then_some(bf)
+    }
+
+    /// The cache's fully resident copy of this superfile, when it holds one. Every async read the
+    /// blocks cannot serve goes through it before object storage, so a reader a query still holds
+    /// after a promotion stays off object storage. The copy is plain bytes, never another block
+    /// source, so the read cannot come back here.
+    fn whole_file(&self) -> Option<Arc<dyn LazyByteSource>> {
+        self.store.upgrade()?.whole_file_source(&self.uri)
+    }
+
     fn all_filled(&self, b0: u32, b1: u32) -> bool {
         let filled = self.filled.lock().expect("filled bitmap mutex poisoned");
         (b0..=b1).all(|b| filled.contains(b))
@@ -489,26 +509,22 @@ impl LazyByteSource for BlockCachedSource {
         if len == 0 {
             return Ok(Bytes::new());
         }
-        if self.in_passthrough(start, len) {
-            return self.inner.range(start, len).await;
+        if let Some(bf) = self.blocks_for(start, len) {
+            let (b0, b1) = Self::block_span(start, len);
+            if (self.all_filled(b0, b1) || self.fill_missing(bf, b0, b1).await?)
+                && let Some(bytes) = self.read_local(bf, start, len)
+            {
+                return Ok(bytes);
+            }
         }
-        let Some(bf) = self.block_file() else {
-            return self.inner.range(start, len).await;
-        };
-        if start.saturating_add(len) > bf.size {
-            // Out-of-bounds: let the inner source surface its typed error.
-            return self.inner.range(start, len).await;
-        }
-        let (b0, b1) = Self::block_span(start, len);
-        if !self.all_filled(b0, b1) && !self.fill_missing(bf, b0, b1).await? {
-            return self.inner.range(start, len).await;
-        }
-        match self.read_local(bf, start, len) {
-            Some(bytes) => Ok(bytes),
+
+        match self.whole_file() {
+            Some(file) => file.range(start, len).await,
             None => self.inner.range(start, len).await,
         }
     }
 
+    // No whole-file fallback here: a caller that gets `None` takes the async `range`, which has it.
     fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         if len == 0 {
             return Some(Bytes::new());

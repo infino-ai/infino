@@ -1569,6 +1569,8 @@ impl LazyByteSource for HoleFallbackSource {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
+        fs,
         path::PathBuf,
         sync::{Arc, atomic::Ordering},
         time::Duration,
@@ -1580,19 +1582,26 @@ mod tests {
 
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
-        superfile::reader::{OpenOptions, SuperfileReader},
+        superfile::{
+            LazyByteSource,
+            reader::{OpenOptions, SuperfileReader},
+        },
         supertable::{
+            StorageRangeSource,
             manifest::{SubsectionOffsets, SuperfileUri},
             reader_cache::{
-                block_source::BlockCachedSource,
+                block_source::{BlockCachedSource, CACHE_BLOCK_BYTES},
                 config::{ColdFetchMode, DiskCacheConfig},
-                disk::{fetch::*, test_support::*},
+                disk::{fetch::*, sources::mmap_readonly_with_handle, test_support::*},
             },
         },
     };
 
     /// Poll cadence while a test waits for a background fill to finish.
     const FILL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    /// How long a read that must finish gets before the test calls it stuck.
+    const READ_DEADLINE: Duration = Duration::from_secs(5);
 
     /// A store over recording storage holding one vector superfile, with a Warm open whose fill is
     /// parked at the only fill permit. Returns the held reader, the permit and the vector hole.
@@ -2877,6 +2886,225 @@ mod tests {
         assert!(!store.hole_path(&uri).exists(), "the holed copy is deleted");
         assert!(!store.blocks_path(&uri).exists(), "and so is its .blocks");
         store.assert_budget_consistent();
+    }
+
+    /// A query holds its lazy reader while the background fill promotes the file. The reader's
+    /// block source is no longer the entry's, so it cannot fill; a block it never read must come
+    /// from the promoted local copy, not from object storage.
+    #[tokio::test]
+    async fn a_replaced_block_source_reads_the_promoted_copy() {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let recording = RecordingStorage::over(local);
+        let store = DiskCacheStore::new_unpinned(
+            Arc::clone(&recording) as Arc<dyn StorageProvider>,
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+                mmap_cold_threshold_secs: 0,
+                // The fill goes ahead while the query still holds its reader.
+                promotion_defer_timeout: Duration::ZERO,
+                ..Default::default()
+            },
+        )
+        .expect("store");
+        let uri = SuperfileUri::new_v4();
+        let bytes = multi_block_superfile_bytes();
+        assert!(
+            bytes.len() as u64 > 2 * CACHE_BLOCK_BYTES,
+            "the fixture spans several blocks"
+        );
+        put_superfile(&store, &uri, bytes.clone()).await;
+
+        let held = store
+            .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Warm)
+            .await
+            .expect("warm open");
+        let stale = store
+            .cached
+            .get(&uri)
+            .and_then(|entry| entry.block_source().cloned())
+            .expect("a lazy entry and its block source");
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("promote");
+
+        // A block in the middle of the file: no open read touched it.
+        let (start, len) = (CACHE_BLOCK_BYTES, 4096);
+        let want = bytes.slice(start as usize..(start + len) as usize);
+        let gets = recording.n_ranges();
+        assert!(
+            stale.range(start, len).await.expect("read") == want,
+            "the read returns the file's bytes"
+        );
+        assert_eq!(recording.n_ranges(), gets, "the read made no GET");
+        drop(held);
+    }
+
+    /// Every read a replaced source cannot serve from its blocks comes from the whole-file copy:
+    /// an exact passthrough range (how FTS subsection reads go) as much as a block it never filled.
+    #[tokio::test]
+    async fn every_bypassed_read_of_a_replaced_source_reads_the_whole_file_copy() {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let recording = RecordingStorage::over(local);
+        let storage = Arc::clone(&recording) as Arc<dyn StorageProvider>;
+        let store = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                ..Default::default()
+            },
+        )
+        .expect("store");
+        let uri = SuperfileUri::new_v4();
+        let bytes = multi_block_superfile_bytes();
+        put_superfile(&store, &uri, bytes.clone()).await;
+
+        let passthrough = (CACHE_BLOCK_BYTES / 2, 4096);
+        let inner: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
+            storage,
+            uri.storage_path(),
+            bytes.len() as u64,
+        ));
+        let source = BlockCachedSource::new_with_accounting(
+            inner,
+            Arc::downgrade(&store),
+            uri,
+            store.blocks_path(&uri),
+            true,
+            Some(passthrough),
+        );
+        // The whole file lands in the cache; this source is not the entry's.
+        store
+            .insert_warm(&uri, bytes.clone())
+            .await
+            .expect("whole-file copy");
+
+        let gets = recording.n_ranges();
+        for (start, len) in [passthrough, (CACHE_BLOCK_BYTES, 4096)] {
+            let want = bytes.slice(start as usize..(start + len) as usize);
+            assert!(
+                source.range(start, len).await.expect("read") == want,
+                "range {start}+{len} returns the file's bytes"
+            );
+        }
+        assert_eq!(recording.n_ranges(), gets, "no read went to object storage");
+    }
+
+    /// A copy with a vector hole is not used by a replaced source: its hole is zeros on disk. A
+    /// read of the hole through the replaced source goes to object storage and returns the real
+    /// vector bytes, never the zeros.
+    #[tokio::test]
+    async fn a_replaced_source_never_reads_a_holed_copys_zeros() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_vector_superfile_bytes();
+        put_superfile(&store, &uri, bytes.clone()).await;
+        let inner: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
+            Arc::clone(&store.storage),
+            uri.storage_path(),
+            bytes.len() as u64,
+        ));
+        // Its own block file, so its blocks start empty and every read takes the replaced path;
+        // sharing the entry's would adopt the blocks the open already filled.
+        let replaced = BlockCachedSource::new_with_accounting(
+            inner,
+            Arc::downgrade(&store),
+            uri,
+            store.config.cache_root.join("replaced.blocks"),
+            true,
+            None,
+        );
+        drop(
+            store
+                .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Warm)
+                .await
+                .expect("warm open"),
+        );
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("promote");
+        assert!(
+            store
+                .cached
+                .get(&uri)
+                .is_some_and(|entry| entry.block_source().is_some()),
+            "promoted with the vector blob left out of the file"
+        );
+
+        let (start, len) = {
+            let reader = SuperfileReader::open(bytes.clone()).expect("open original");
+            vector_blob_range(&reader).expect("vector range")
+        };
+        let want = bytes.slice(start as usize..(start + len) as usize);
+        assert!(
+            replaced.range(start, len).await.expect("read the hole") == want,
+            "the hole reads as the real vector bytes"
+        );
+    }
+
+    /// A holed copy's own block source that cannot fill (budget full, the file pinned so nothing
+    /// can be evicted) still finishes a read of the hole, from object storage. It must not ask the
+    /// cache for the whole file: the holed copy's hole fallback is this same source.
+    #[tokio::test]
+    async fn a_holed_copys_own_source_that_cannot_fill_still_finishes_a_read() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_vector_superfile_bytes();
+        put_superfile(&store, &uri, bytes.clone()).await;
+        let (hole_start, hole_len) = {
+            let reader = SuperfileReader::open(bytes.clone()).expect("open original");
+            vector_blob_range(&reader).expect("vector range")
+        };
+
+        // Nothing can be charged and nothing evicted, so the source can never fill a block.
+        store.budget_bytes.store(0, Ordering::Release);
+        store.set_pinned_fn(Arc::new(move || HashSet::from([uri])));
+
+        // The holed copy as a fill leaves it: the vector range zeroed on disk, served by `source`.
+        let mut holed = bytes.to_vec();
+        holed[hole_start as usize..(hole_start + hole_len) as usize].fill(0);
+        fs::create_dir_all(&store.config.cache_root).expect("cache root");
+        fs::write(store.hole_path(&uri), &holed).expect("holed copy");
+        let (mmap, local) = mmap_readonly_with_handle(&store.hole_path(&uri)).expect("mmap");
+        let inner: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
+            Arc::clone(&store.storage),
+            uri.storage_path(),
+            bytes.len() as u64,
+        ));
+        let source = BlockCachedSource::new_with_accounting(
+            inner,
+            Arc::downgrade(&store),
+            uri,
+            store.blocks_path(&uri),
+            true,
+            None,
+        );
+        let entry = store
+            .holed_mmap_entry(
+                mmap,
+                local,
+                (hole_start, hole_len),
+                Arc::clone(&source),
+                bytes.len() as u64,
+            )
+            .await
+            .expect("holed entry");
+        store.admit_entry(uri, entry);
+
+        let read = timeout(READ_DEADLINE, source.range(hole_start, hole_len))
+            .await
+            .expect("the read finishes")
+            .expect("read the hole");
+        let want = bytes.slice(hole_start as usize..(hole_start + hole_len) as usize);
+        assert!(read == want, "the hole reads as the real vector bytes");
     }
 
     #[tokio::test]
