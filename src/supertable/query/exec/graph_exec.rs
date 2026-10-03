@@ -25,7 +25,7 @@
 //! share. The walk itself runs inside the plan's `execute`, like the search
 //! kernels, so the index hydrates and the rows resolve on the query runtime.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Instant};
 
 use arrow::compute::cast;
 use arrow_array::{Array, Decimal128Array, ListArray};
@@ -49,15 +49,17 @@ use futures::stream;
 
 use crate::{
     supertable::{
+        error::QueryError,
         handle::{SupertableReader, WeakReader},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
             SuperfileHit,
+            dispatch::apply_tombstone_filter,
             exec::common::{
                 arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits,
                 search_query_df_error, traced_tvf,
             },
-            vector::lookup_user_placements_by_id_opt,
+            vector::{MissingRow, place_for_scalar_resolve},
         },
     },
     utils::trace::detail_span,
@@ -337,7 +339,7 @@ impl ExecutionPlan for GraphExec {
                 .traverse(&seeds, hops, usize::MAX, traversal == Traversal::Rank)
                 .await
                 .map_err(search_query_df_error)?;
-            let (ids, scores): (Vec<i128>, Vec<f32>) = reached
+            let by_id: Vec<SuperfileHit> = reached
                 .into_iter()
                 .filter(|hit| hit.table == target_name)
                 .take(k)
@@ -346,28 +348,19 @@ impl ExecutionPlan for GraphExec {
                         Traversal::Walk => hit.hop as f32,
                         Traversal::Rank => hit.score as f32,
                     };
-                    (hit.id, score)
-                })
-                .unzip();
-            // Rows the edge table names that are gone since are skipped, as
-            // a search skips a deleted row.
-            let placements =
-                lookup_user_placements_by_id_opt(target.manifest(), &ids, &target.op_stats)
-                    .await
-                    .map_err(search_query_df_error)?;
-            let hits: Vec<SuperfileHit> = placements
-                .into_iter()
-                .zip(ids.iter().zip(scores))
-                .filter_map(|(placement, (&id, score))| {
-                    let (entry, local_doc_id) = placement?;
-                    Some(SuperfileHit {
-                        superfile: entry.uri,
-                        local_doc_id,
-                        score,
-                        stable_id: Some(id),
-                    })
+                    SuperfileHit::by_id(hit.id, score)
                 })
                 .collect();
+            // Placed by id like a hidden-index hit, then the final list
+            // checked against the table's tombstones, as a search's hits
+            // are: a row the edge table names that is gone since — rewritten
+            // under a new id, or deleted — is skipped.
+            let placed = place_for_scalar_resolve(&target, &by_id, MissingRow::Skip)
+                .await
+                .map_err(search_query_df_error)?;
+            let hits = drop_tombstoned(&target, placed)
+                .await
+                .map_err(search_query_df_error)?;
             resolve_hits(
                 &target,
                 &hits,
@@ -389,6 +382,50 @@ impl ExecutionPlan for GraphExec {
             stream,
         )))
     }
+}
+
+/// `hits` without the tombstoned ones: each superfile's deny bitmap, from
+/// the table's tombstone cache after one batched prefetch, applied through
+/// the same post-rank filter the search fan-outs use. Order is kept.
+async fn drop_tombstoned(
+    reader: &SupertableReader,
+    hits: Vec<SuperfileHit>,
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    let Some(cache) = reader.tombstone_cache.as_ref() else {
+        return Ok(hits);
+    };
+    let manifest = reader.manifest();
+    let mut entries = Vec::new();
+    for hit in &hits {
+        if entries.iter().any(|(uri, _)| *uri == hit.superfile) {
+            continue;
+        }
+        let entry = manifest
+            .lookup_superfile_entry(hit.superfile)
+            .await
+            .map_err(QueryError::ManifestLoad)?
+            .ok_or_else(|| {
+                QueryError::Execute(format!(
+                    "placed hit names superfile {:?} missing from the manifest",
+                    hit.superfile
+                ))
+            })?;
+        entries.push((hit.superfile, entry));
+    }
+    let now = Instant::now();
+    let ids: Vec<_> = entries.iter().map(|(_, e)| e.superfile_id).collect();
+    cache.prefetch(&ids, now).await;
+    let mut kept = hits;
+    for (uri, entry) in &entries {
+        let mut of_entry: Vec<SuperfileHit> = kept
+            .iter()
+            .filter(|h| h.superfile == *uri)
+            .copied()
+            .collect();
+        apply_tombstone_filter(Some(cache), entry, &mut of_entry, now)?;
+        kept.retain(|h| h.superfile != *uri || of_entry.contains(h));
+    }
+    Ok(kept)
 }
 
 /// The engine's id type, which every `_id` column has.
@@ -460,7 +497,9 @@ mod tests {
     use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{Field, Schema};
     use datafusion::{
-        functions_nested::make_array::MakeArray, logical_expr::ScalarUDF, prelude::lit,
+        functions_nested::make_array::MakeArray,
+        logical_expr::ScalarUDF,
+        prelude::{col, lit},
     };
     use tempfile::TempDir;
 
@@ -622,6 +661,26 @@ mod tests {
             .query_sql("SELECT name FROM graph_walk('edges', 'things', 'things', [999999], 3, 10)")
             .expect("unknown seed");
         assert!(column_strings(&rows, 0).is_empty(), "a seed that is no row");
+
+        // A row deleted after the edges were written is still in the graph,
+        // and is skipped: the final list is checked against the table's
+        // tombstones.
+        db.open_table(THINGS)
+            .expect("things")
+            .delete(col("name").eq(lit("two")))
+            .expect("delete two");
+        let rows = db
+            .query_sql(&format!(
+                "SELECT name FROM graph_walk('edges', 'things', 'things', [{}], 2, 10) \
+                 ORDER BY score",
+                ids[0]
+            ))
+            .expect("walk past a deleted row");
+        assert_eq!(
+            column_strings(&rows, 0),
+            vec!["one", "three"],
+            "the deleted row is skipped; the walk still passes through it"
+        );
 
         assert!(
             db.query_sql("SELECT name FROM graph_walk('edges', 'things', 'things', [1], 2)")

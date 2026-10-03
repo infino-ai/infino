@@ -3087,6 +3087,12 @@ pub struct SubsectionOffsets {
 pub struct SuperfileUri(pub Uuid);
 
 impl SuperfileUri {
+    /// The uri of a hit that is not placed yet — one known only by its
+    /// stable `_id`, as a graph walk reaches rows — which placement
+    /// (`user_placement_for_scalar_resolve`) resolves by that id. Never a
+    /// committed superfile's uri: those are v4 uuids.
+    pub(crate) const UNPLACED: Self = Self(Uuid::nil());
+
     /// Generate a fresh URI. Called by the writer at commit time
     /// when assigning a key for a new superfile's bytes.
     pub fn new_v4() -> Self {

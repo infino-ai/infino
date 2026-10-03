@@ -2104,12 +2104,36 @@ pub(crate) fn hits_id_score_batch(
     id_score_batch(user_reader, &ids, &scores).map_err(|e| QueryError::Execute(e.to_string()))
 }
 
+/// What placement does with a hit whose `_id` no live superfile owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissingRow {
+    /// A search hit's id is always a row — identity resolution belongs
+    /// before this boundary — so a missing one is an upstream bug.
+    Error,
+    /// A graph walk reaches rows through an edge table that can lag the
+    /// rows it names; one gone since the edge was written is skipped, as a
+    /// deleted row is.
+    Skip,
+}
+
 /// Locate each hit's user-table `(superfile, local_doc_id)` for scalar
 /// column decode. Hidden-index hits already carry the user `_id` on
 /// `stable_id`; user-table hits pass through unchanged.
 pub(crate) async fn user_placement_for_scalar_resolve(
     user_reader: &SupertableReader,
     hits: &[SuperfileHit],
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    place_for_scalar_resolve(user_reader, hits, MissingRow::Error).await
+}
+
+/// [`user_placement_for_scalar_resolve`] with `missing` saying what a hit
+/// whose id is no row becomes. A hit of [`SuperfileUri::UNPLACED`] — one
+/// known by its `_id` alone (`SuperfileHit::by_id`) — is placed by the id
+/// without a manifest lookup, like a hidden-index hit.
+pub(crate) async fn place_for_scalar_resolve(
+    user_reader: &SupertableReader,
+    hits: &[SuperfileHit],
+    missing: MissingRow,
 ) -> Result<Vec<SuperfileHit>, QueryError> {
     if hits.is_empty() {
         return Ok(Vec::new());
@@ -2130,10 +2154,11 @@ pub(crate) async fn user_placement_for_scalar_resolve(
     let mut out: Vec<Option<SuperfileHit>> = vec![None; hits.len()];
     let mut placement_requests: Vec<(usize, i128)> = Vec::new();
     for (i, hit) in hits.iter().enumerate() {
-        if let Some(user_entry) = user_manifest
-            .lookup_superfile_entry(hit.superfile)
-            .await
-            .map_err(QueryError::ManifestLoad)?
+        if hit.superfile != SuperfileUri::UNPLACED
+            && let Some(user_entry) = user_manifest
+                .lookup_superfile_entry(hit.superfile)
+                .await
+                .map_err(QueryError::ManifestLoad)?
             && !(user_entry.vector_layout == VectorLayout::MultiCellIvf && hit.stable_id.is_some())
         {
             out[i] = Some(*hit);
@@ -2164,11 +2189,23 @@ pub(crate) async fn user_placement_for_scalar_resolve(
         placement_requests.push((i, user_row_id));
     }
     let requested_ids: Vec<i128> = placement_requests.iter().map(|(_, id)| *id).collect();
-    let placements =
-        lookup_user_placements_by_id(user_manifest, &requested_ids, &user_reader.op_stats).await?;
-    for ((index, stable_id), (entry, local_doc_id)) in
-        placement_requests.into_iter().zip(placements)
-    {
+    let placements = match missing {
+        MissingRow::Error => {
+            lookup_user_placements_by_id(user_manifest, &requested_ids, &user_reader.op_stats)
+                .await?
+                .into_iter()
+                .map(Some)
+                .collect()
+        }
+        MissingRow::Skip => {
+            lookup_user_placements_by_id_opt(user_manifest, &requested_ids, &user_reader.op_stats)
+                .await?
+        }
+    };
+    for ((index, stable_id), placement) in placement_requests.into_iter().zip(placements) {
+        let Some((entry, local_doc_id)) = placement else {
+            continue;
+        };
         out[index] = Some(SuperfileHit {
             superfile: entry.uri,
             local_doc_id,

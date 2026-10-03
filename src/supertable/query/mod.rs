@@ -78,3 +78,17 @@ pub struct SuperfileHit {
     /// then falls back to the region/scalar read.
     pub stable_id: Option<i128>,
 }
+
+impl SuperfileHit {
+    /// A hit known by its stable `_id` alone, before placement — what a
+    /// graph walk reaches. `user_placement_for_scalar_resolve` places it
+    /// by the id, like a hidden-index hit.
+    pub(crate) fn by_id(stable_id: i128, score: f32) -> Self {
+        Self {
+            superfile: SuperfileUri::UNPLACED,
+            local_doc_id: 0,
+            score,
+            stable_id: Some(stable_id),
+        }
+    }
+}
