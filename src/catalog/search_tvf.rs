@@ -323,6 +323,7 @@ impl TableFunctionImpl for Bm25SearchCatalogFunc {
             return Ok(Arc::new(RerankedSearch {
                 inner,
                 reranker: Arc::clone(reranker),
+                function: BM25_SEARCH_UDTF,
                 table,
                 query_text,
                 k,
@@ -382,6 +383,7 @@ impl TableFunctionImpl for HybridSearchCatalogFunc {
             return Ok(Arc::new(RerankedSearch {
                 inner,
                 reranker: Arc::clone(reranker),
+                function: HYBRID_SEARCH_UDTF,
                 table,
                 query_text,
                 k,

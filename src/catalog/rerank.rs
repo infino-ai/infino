@@ -56,11 +56,14 @@ pub trait SearchReranker: Send + Sync + fmt::Debug {
 
     /// `rows` — the pool, in the engine's order, carrying every text column
     /// of `table` whatever the statement projected — in the order the
-    /// statement's `k` are taken from, cut to `k`. The schema comes back as
-    /// it went in. `Err` is the failure in a sentence; the statement fails
-    /// with it.
+    /// statement's `k` are taken from, cut to `k`. `function` is the search
+    /// function that ranked them (`bm25_search`, `hybrid_search`), so a
+    /// reranker can treat a lexical order and an embedding's differently.
+    /// The schema comes back as it went in. `Err` is the failure in a
+    /// sentence; the statement fails with it.
     fn rerank<'a>(
         &'a self,
+        function: &'a str,
         table: &'a str,
         query_text: &'a str,
         rows: RecordBatch,
@@ -74,6 +77,8 @@ pub trait SearchReranker: Send + Sync + fmt::Debug {
 pub(crate) struct RerankedSearch {
     pub(crate) inner: Arc<dyn TableProvider>,
     pub(crate) reranker: Arc<dyn SearchReranker>,
+    /// The search function the rows came from, for the reranker.
+    pub(crate) function: &'static str,
     /// The table the function searched, for the reranker.
     pub(crate) table: String,
     /// The text the function ranked by, for the reranker to read the rows
@@ -148,6 +153,7 @@ impl TableProvider for RerankedSearch {
         let exec = RerankExec::try_new(
             inner,
             Arc::clone(&self.reranker),
+            self.function,
             self.table.clone(),
             self.query_text.clone(),
             self.k,
@@ -163,6 +169,7 @@ impl TableProvider for RerankedSearch {
 struct RerankExec {
     inner: Arc<dyn ExecutionPlan>,
     reranker: Arc<dyn SearchReranker>,
+    function: &'static str,
     table: String,
     query_text: String,
     k: usize,
@@ -173,9 +180,11 @@ struct RerankExec {
 }
 
 impl RerankExec {
+    #[allow(clippy::too_many_arguments)]
     fn try_new(
         inner: Arc<dyn ExecutionPlan>,
         reranker: Arc<dyn SearchReranker>,
+        function: &'static str,
         table: String,
         query_text: String,
         k: usize,
@@ -196,6 +205,7 @@ impl RerankExec {
         Ok(Self {
             inner,
             reranker,
+            function,
             table,
             query_text,
             k,
@@ -206,7 +216,10 @@ impl RerankExec {
     }
 
     fn describe(&self) -> String {
-        format!("RerankExec: table={}, k={}", self.table, self.k)
+        format!(
+            "RerankExec: function={}, table={}, k={}",
+            self.function, self.table, self.k
+        )
     }
 }
 
@@ -245,6 +258,7 @@ impl ExecutionPlan for RerankExec {
         Ok(Arc::new(Self::try_new(
             inner,
             Arc::clone(&self.reranker),
+            self.function,
             self.table.clone(),
             self.query_text.clone(),
             self.k,
@@ -264,6 +278,7 @@ impl ExecutionPlan for RerankExec {
         }
         let inner = Arc::clone(&self.inner);
         let reranker = Arc::clone(&self.reranker);
+        let function = self.function;
         let table = self.table.clone();
         let query_text = self.query_text.clone();
         let k = self.k;
@@ -280,7 +295,7 @@ impl ExecutionPlan for RerankExec {
                 whole.slice(0, whole.num_rows().min(k))
             } else {
                 let ordered = reranker
-                    .rerank(&table, &query_text, whole, k)
+                    .rerank(function, &table, &query_text, whole, k)
                     .await
                     .map_err(DataFusionError::Execution)?;
                 if ordered.schema() != read_schema {
@@ -319,6 +334,7 @@ mod tests {
     /// What one call of the test reranker saw.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Seen {
+        function: String,
         table: String,
         query_text: String,
         columns: Vec<String>,
@@ -340,6 +356,7 @@ mod tests {
 
         fn rerank<'a>(
             &'a self,
+            function: &'a str,
             table: &'a str,
             query_text: &'a str,
             rows: RecordBatch,
@@ -347,6 +364,7 @@ mod tests {
         ) -> BoxFuture<'a, Result<RecordBatch, String>> {
             async move {
                 self.seen.lock().expect("seen").push(Seen {
+                    function: function.to_string(),
                     table: table.to_string(),
                     query_text: query_text.to_string(),
                     columns: rows
@@ -445,6 +463,7 @@ mod tests {
         );
         let seen = reranker.seen.lock().expect("seen").clone();
         assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].function, "bm25_search");
         assert_eq!(seen[0].table, "docs");
         assert_eq!(seen[0].query_text, "rust");
         assert_eq!(seen[0].k, TEST_K);
@@ -484,6 +503,7 @@ mod tests {
             }
             fn rerank<'a>(
                 &'a self,
+                _function: &'a str,
                 _table: &'a str,
                 _query_text: &'a str,
                 rows: RecordBatch,
