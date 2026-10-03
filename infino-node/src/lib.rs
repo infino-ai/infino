@@ -50,7 +50,7 @@ use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
     InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
     RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions, Stemmer,
-    Stopwords,
+    Stopwords, SchemaPatch,
 };
 
 // ---------------------------------------------------------------------------
@@ -975,6 +975,33 @@ impl Connection {
         Ok(Table { inner })
     }
 
+    /// The table's schema document as JSON text, or — with `patch_json`, a
+    /// patch in the same shape — the document after merging the patch into
+    /// the schema (creating the table when there is none). The JS wrapper
+    /// parses the result and stringifies the patch; `expected_schema_id` is
+    /// a compare-and-set against the current `schema_id`.
+    #[napi]
+    pub fn schema(
+        &self,
+        name: String,
+        patch_json: Option<String>,
+        expected_schema_id: Option<u32>,
+    ) -> Result<String> {
+        let doc = match patch_json {
+            None => self.inner.schema(&name).map_err(map_err)?,
+            Some(text) => {
+                let invalid = |e: String| Error::new(Status::InvalidArg, format!("schema patch: {e}"));
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|e| invalid(e.to_string()))?;
+                let patch = SchemaPatch::from_json(&value).map_err(invalid)?;
+                self.inner
+                    .apply_schema(&name, &patch, expected_schema_id)
+                    .map_err(map_err)?
+            }
+        };
+        Ok(doc.to_json().to_string())
+    }
+
     /// Drop a table. `purge` defaults to `true`, which also deletes the
     /// table's storage subtree after the catalog commit, reclaiming the bytes;
     /// pass `false` to only unregister it from the catalog and keep the bytes.
@@ -1021,7 +1048,7 @@ impl Table {
             return Ok(());
         }
         self.inner
-            .append(&self.align_batches(batches)?)
+            .append(&self.merge_batches(batches)?)
             .map_err(map_err)
     }
 
@@ -1037,7 +1064,7 @@ impl Table {
             return Ok(());
         }
         self.inner
-            .append_named(&self.align_batches(batches)?, &source_name)
+            .append_named(&self.merge_batches(batches)?, &source_name)
             .map_err(map_err)
     }
 
@@ -1242,7 +1269,7 @@ impl Table {
         let aligned = if batches.is_empty() {
             RecordBatch::new_empty(self.inner.schema())
         } else {
-            self.align_batches(batches)?
+            self.merge_batches(batches)?
         };
         Ok(self.inner.update(expr, &aligned).map_err(map_err)?.into())
     }
@@ -1336,19 +1363,16 @@ impl Table {
 }
 
 impl Table {
-    /// Merge IPC batches into one and re-wrap under the table's declared
-    /// schema, so the exact-schema check accepts otherwise-nullable inputs (a
-    /// genuine type mismatch still errors). Caller guarantees `batches` is
-    /// non-empty. Shared by `append` and `update`.
-    fn align_batches(&self, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
-        let declared = self.inner.schema();
-        let merged = if batches.len() == 1 {
-            batches.into_iter().next().expect("len == 1")
-        } else {
-            let schema = batches[0].schema();
-            concat_batches(&schema, &batches).map_err(arrow_err)?
-        };
-        RecordBatch::try_new(declared, merged.columns().to_vec()).map_err(arrow_err)
+    /// Merge IPC batches into one. The engine brings the result to the
+    /// table's shape (a column it does not have joins the schema, an absent
+    /// nullable one is null-filled), so nothing is re-wrapped here. Caller
+    /// guarantees `batches` is non-empty. Shared by `append` and `update`.
+    fn merge_batches(&self, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+        if batches.len() == 1 {
+            return Ok(batches.into_iter().next().expect("len == 1"));
+        }
+        let schema = batches[0].schema();
+        concat_batches(&schema, &batches).map_err(arrow_err)
     }
 
     /// Parse a SQL predicate string into a DataFusion `Expr`, resolved against

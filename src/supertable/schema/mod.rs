@@ -21,9 +21,12 @@
 //! manifest list and returned to a caller that asks for the schema.
 
 pub mod cast;
+pub mod change;
+pub mod error;
 #[cfg(test)]
 mod generations;
 pub mod map;
+pub mod resolve;
 pub mod types;
 
 use std::{collections::HashMap, fmt, sync::Arc};
@@ -104,19 +107,25 @@ pub enum ColumnIndex {
     Fts {
         /// The base tokenizer's name.
         analyzer: String,
+        /// The stopword filter applied after tokenizing.
         stopwords: Stopwords,
+        /// The stemmer applied after tokenizing.
         stemmer: Stemmer,
         /// Whether token positions are recorded (phrase queries).
         positions: bool,
         /// Whether the text is also kept in the Parquet body.
         stored: bool,
+        /// The BM25 parameters the index is scored with.
         bm25: Bm25Params,
     },
     /// A vector index over a `vector` (fixed-size `f32` list) column; the
     /// dimension is the column type's.
     Vector {
+        /// The distance the index is built and searched with.
         metric: Metric,
+        /// Seed of the random rotation applied before quantization.
         rot_seed: u64,
+        /// How candidates are re-scored after the coarse search.
         rerank_codec: RerankCodec,
     },
 }
@@ -438,7 +447,7 @@ impl TableSchema {
     }
 
     /// `stored` with every field stamped with its id under
-    /// [`FIELD_ID_META_KEY`]: a live column gets its id, the field named
+    /// `FIELD_ID_META_KEY`: a live column gets its id, the field named
     /// `id_column` gets [`FieldId::ID_COLUMN`], and a field that is neither
     /// is left as it is. Existing metadata on a field is kept.
     pub fn stamp_field_ids(&self, stored: &Schema, id_column: &str) -> Arc<Schema> {
@@ -483,7 +492,7 @@ fn column_index(name: &str, fts: &[FtsConfig], vectors: &[VectorConfig]) -> Opti
         })
 }
 
-fn index_to_json(index: &ColumnIndex) -> Value {
+pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
     let mut out = Map::new();
     match index {
         ColumnIndex::Fts {
@@ -524,7 +533,7 @@ fn index_to_json(index: &ColumnIndex) -> Value {
     Value::Object(out)
 }
 
-fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
+pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
     let obj = json
         .as_object()
         .ok_or_else(|| "index is not an object".to_string())?;

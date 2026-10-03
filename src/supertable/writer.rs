@@ -50,6 +50,7 @@
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
 use std::{
+    borrow::Cow,
     cmp,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
     env, fmt, fs,
@@ -72,6 +73,7 @@ use arrow::{
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array,
 };
+use arrow_schema::{Field, Schema};
 use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -110,7 +112,7 @@ use crate::{
     storage::{StorageError, StorageProvider},
     superfile::{
         BuildError as SuperfileBuildError, ReadError, SuperfileReader,
-        builder::{SuperfileBuilder, VectorConfig},
+        builder::{BuilderOptions, SuperfileBuilder, VectorConfig},
         format::{
             CRC_BYTES,
             footer::read_kv_metadata,
@@ -183,7 +185,13 @@ use crate::{
         reader_cache::{
             DiskCacheStore, ReadIntent, SuperfileReaderCache, disk::mmap_readonly_bytes,
         },
-        schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId, LegacyNames, PhysicalSchema},
+        schema::{
+            DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId, LegacyNames, PhysicalSchema,
+            TableSchema,
+            change::{MergeContext, SchemaPatch, merge},
+            error::SchemaError,
+            resolve::{conform, resolve_batch, union_schema},
+        },
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
         utils::vector_split::split_vectors,
         wal::{
@@ -196,7 +204,6 @@ use crate::{
             },
         },
     },
-    utils::schema::compare_schema,
 };
 
 /// Multipart chunk size for large superfile uploads.
@@ -509,28 +516,88 @@ pub(in crate::supertable) fn owned_vector_arrays(
     let configs = manifest.vector_configs();
     let mut vectors = Vec::with_capacity(configs.len());
     for vc in &configs {
-        let col_idx = batch
-            .schema()
-            .index_of(&vc.column)
-            .map_err(|_| BuildError::BatchSchemaMismatch)?;
-
-        let fsl = batch
-            .column(col_idx)
+        let col_idx =
+            batch
+                .schema()
+                .index_of(&vc.column)
+                .map_err(|_| BuildError::VectorColumnMissing {
+                    column: vc.column.clone(),
+                })?;
+        let column = batch.column(col_idx);
+        let not_fixed_size_list = || BuildError::VectorColumnNotFixedSizeList {
+            column: vc.column.clone(),
+            dim: vc.dim,
+            actual: format!("{:?}", column.data_type()),
+        };
+        let fsl = column
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
-            .ok_or(BuildError::BatchSchemaMismatch)?;
-
-        let values = fsl.values();
-
-        let f32_arr = values
+            .ok_or_else(not_fixed_size_list)?;
+        let f32_arr = fsl
+            .values()
             .as_any()
             .downcast_ref::<Float32Array>()
-            .ok_or(BuildError::BatchSchemaMismatch)?
+            .ok_or_else(not_fixed_size_list)?
             .clone();
 
         vectors.push(Arc::new(f32_arr));
     }
     Ok(vectors)
+}
+
+/// Commit `metadata` with no superfiles: the next list carries its stamps
+/// and nothing else changes. Storage-backed tables go through the pointer
+/// CAS; an in-memory table swaps its snapshot.
+pub(in crate::supertable) fn persist_list_metadata(
+    inner: &SupertableInner,
+    metadata: CommitListMetadata,
+) -> Result<(), BuildError> {
+    match inner.options.storage.as_ref() {
+        Some(storage) => persist_commit(
+            inner,
+            Arc::clone(storage),
+            Vec::new(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+            metadata,
+            Vec::new(),
+        )
+        .map_err(BuildError::from),
+        None => {
+            let old = inner.manifest.load();
+            metadata.check_schema(&old)?;
+            inner.manifest.store(Arc::new(metadata.apply(&old)));
+            Ok(())
+        }
+    }
+}
+
+/// `scalar_no_id` with the engine-minted `ids` prepended as the id column.
+pub(in crate::supertable) fn with_id_column(
+    scalar_no_id: &RecordBatch,
+    ids: Vec<i128>,
+    id_column: &str,
+) -> RecordBatch {
+    let id_array = Decimal128Array::from(ids)
+        .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
+        .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
+    let mut fields: Vec<Arc<Field>> = Vec::with_capacity(scalar_no_id.num_columns() + 1);
+    fields.push(TableSchema::id_field(id_column));
+    fields.extend(scalar_no_id.schema().fields().iter().cloned());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(scalar_no_id.num_columns() + 1);
+    columns.push(Arc::new(id_array));
+    columns.extend(scalar_no_id.columns().iter().cloned());
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .expect("the id column has one value per row of the batch it joins")
+}
+
+/// The builder options for a superfile built under `manifest`'s schema,
+/// scoring with the table-wide corpus statistics it carries.
+pub(in crate::supertable) fn builder_options_of(manifest: &ManifestSnapshot) -> BuilderOptions {
+    manifest
+        .builder_options()
+        .with_fts_corpus_stats(manifest.fts_corpus_stats(&HashSet::new()))
 }
 
 /// Ingested work accumulated across the buffered appends of one commit.
@@ -947,6 +1014,25 @@ impl Supertable {
         Ok(())
     }
 
+    /// The table's schema document as this handle last saw it.
+    pub fn table_schema(&self) -> Arc<TableSchema> {
+        self.inner().manifest.load().table_schema()
+    }
+
+    /// Merge `patch` into the schema and commit the result; see
+    /// [`SupertableWriter::apply_schema`].
+    pub fn apply_schema(
+        &self,
+        patch: &SchemaPatch,
+        expected: Option<u32>,
+    ) -> Result<Arc<TableSchema>, InfinoError> {
+        let mut w = self
+            .writer()
+            .map_err(|e| InfinoError::from(e).with_context("apply_schema", None))?;
+        w.apply_schema(patch, expected)
+            .map_err(|e| InfinoError::from(e).with_context("apply_schema", None))
+    }
+
     /// Replace every row matching `predicate` with `new_rows`, then
     /// commit. `new_rows.num_rows()` must equal the match count.
     /// Durable when this returns.
@@ -1196,7 +1282,12 @@ impl SupertableWriter {
         let options = &self.inner.options;
         let manifest = self.inner.manifest.load();
 
-        // Validate + split. Batch schema is user_schema (no id col).
+        // Bring the batch to the table's shape. A column it adds rides in
+        // the buffered batch after the table's columns and joins the
+        // schema when the buffer commits; the vector check is the one
+        // this snapshot's vector columns need.
+        let resolved = resolve_batch(batch, &manifest.table_schema(), &options.id_column)?;
+        let batch = &resolved.batch;
         let (scalar_no_id, _vector_slices) = split_vectors(batch, &manifest)?;
 
         // Owned handles for the buffer: the &[f32] slices from split_vectors
@@ -1220,17 +1311,7 @@ impl SupertableWriter {
             }
         }
 
-        let id_array = Decimal128Array::from(ids)
-            .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
-            .expect(
-                "invariant: precision 38 + scale 0 always valid \
-                 for any i128 payload",
-            );
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(scalar_no_id.num_columns() + 1);
-        columns.push(Arc::new(id_array));
-        columns.extend(scalar_no_id.columns().iter().cloned());
-        let scalar = RecordBatch::try_new(manifest.scalar_schema(), columns)
-            .map_err(|_| BuildError::BatchSchemaMismatch)?;
+        let scalar = with_id_column(&scalar_no_id, ids, &options.id_column);
 
         // Estimate byte cost per input class. get_array_memory_size accounts for
         // Arrow buffer allocations (rough but good enough); the vector payload is
@@ -1434,21 +1515,19 @@ impl SupertableWriter {
             .as_ref()
             .ok_or(MutationError::NoStorageAttached)?;
 
-        // Schema check (no _id column on the user-facing path).
-        let user_schema = self.inner.manifest.load().user_schema();
-        if !compare_schema(&new_rows.schema(), &user_schema) {
-            return Err(MutationError::SchemaMismatch(format!(
-                "expected {:?}, got {:?}",
-                user_schema.fields(),
-                new_rows.schema().fields()
-            )));
-        }
-
-        // The vector check `append` runs, at call time rather than in the
-        // commit's append phase — where it would surface as a partial commit
-        // for a mutation that buffered nothing.
-        split_vectors(&new_rows, &self.inner.manifest.load())
-            .map_err(MutationError::InvalidNewRows)?;
+        // The replacement rows obey every append rule, at call time rather
+        // than in the commit's append phase — where a refusal would surface
+        // as a partial commit for a mutation that buffered nothing. The
+        // resolved rows are what the WAL captures.
+        let manifest = self.inner.manifest.load();
+        let new_rows = resolve_batch(
+            &new_rows,
+            &manifest.table_schema(),
+            &self.inner.options.id_column,
+        )
+        .map_err(|e| MutationError::InvalidNewRows(BuildError::Schema(e)))?
+        .batch;
+        split_vectors(&new_rows, &manifest).map_err(MutationError::InvalidNewRows)?;
 
         // Resolve the predicate against the latest committed manifest, not a
         // bounded-staleness snapshot: a stale resolve would miss a row
@@ -1710,6 +1789,7 @@ impl SupertableWriter {
                     tombstoned_in_superfile: None,
                 })
                 .collect(),
+            schema_id: Some(self.inner.manifest.load().table_schema().schema_id()),
         }
     }
 
@@ -1862,6 +1942,7 @@ impl SupertableWriter {
                     tombstoned_in_superfile: None,
                 })
                 .collect(),
+            schema_id: None,
         }
     }
 
@@ -1981,7 +2062,7 @@ impl SupertableWriter {
         self.buffer_vector_bytes = 0;
         self.buffer_fts_bytes = 0;
 
-        match self.commit_appends_with_taken_buffer(&buffer, stem) {
+        match self.commit_appends_rebuilding(&buffer, stem) {
             Ok(()) => {
                 // Durable now, so the ingested work is real work. An
                 // all-empty-batch commit publishes nothing and reports
@@ -2008,6 +2089,78 @@ impl SupertableWriter {
         }
     }
 
+    /// [`Self::commit_appends_with_taken_buffer`], rebuilt when the table's
+    /// schema moved under the build. The commit that found it moved had
+    /// refreshed the manifest first, so the next build resolves the buffer
+    /// against the winner's schema; a buffer that cannot be resolved against
+    /// it is refused whole.
+    fn commit_appends_rebuilding(
+        &self,
+        buffer: &[BufferedBatch],
+        stem: Option<&str>,
+    ) -> Result<(), BuildError> {
+        let attempts = self.inner.options.max_commit_retries.max(1);
+        for attempt in 0..attempts {
+            match self.commit_appends_with_taken_buffer(buffer, stem) {
+                Err(BuildError::SchemaMoved { expected, current }) if attempt + 1 < attempts => {
+                    warn!(
+                        expected,
+                        current,
+                        "schema moved under the commit; rebuilding against the current one"
+                    );
+                }
+                other => return other,
+            }
+        }
+        Err(BuildError::WriteContention)
+    }
+
+    /// Merge `patch` into the table's schema and commit the result, with
+    /// `expected` as an optional compare-and-set on the current
+    /// `schema_id`. Applying what the table reads back, or any subset of
+    /// it, changes nothing and commits nothing. Returns the document the
+    /// table holds afterwards.
+    pub fn apply_schema(
+        &mut self,
+        patch: &SchemaPatch,
+        expected: Option<u32>,
+    ) -> Result<Arc<TableSchema>, BuildError> {
+        let manifest = self.inner.manifest.load_full();
+        let current = manifest.table_schema();
+        if let Some(expected) = expected
+            && expected != current.schema_id()
+        {
+            return Err(SchemaError::SchemaConflict {
+                expected,
+                current: current.schema_id(),
+            }
+            .into());
+        }
+        let vector_index_column = manifest.get_global_vector_index().map(|g| g.column);
+        let ctx = MergeContext {
+            id_column: &self.inner.options.id_column,
+            // Rows this writer holds count: they land under the schema the
+            // table has when they commit.
+            table_empty: manifest.get_all_superfiles().is_empty()
+                && self.buffer.is_empty()
+                && self.pending_updates.is_empty(),
+            vector_index_column: vector_index_column.as_deref(),
+        };
+        let changes = merge(&current, patch, ctx)?;
+        if changes.is_empty() {
+            return Ok(current);
+        }
+        let next = Arc::new(current.apply(&changes)?);
+        let metadata = CommitListMetadata::schema_change(Arc::clone(&next), current.schema_id());
+        match persist_list_metadata(&self.inner, metadata) {
+            Ok(()) => Ok(next),
+            Err(BuildError::SchemaMoved { expected, current }) => {
+                Err(SchemaError::SchemaConflict { expected, current }.into())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Body of [`Self::commit_appends_internal`] after the buffer has been
     /// taken. On `Err`, the caller restores `buffer` onto the writer. `stem`
     /// is the source label every superfile this commit produces is keyed
@@ -2017,18 +2170,47 @@ impl SupertableWriter {
         buffer: &[BufferedBatch],
         stem: Option<&str>,
     ) -> Result<(), BuildError> {
+        // The schema this commit builds under: the table's, plus every
+        // column the buffered batches add. Earlier batches are null-filled
+        // to it, and the superfiles and the schema land in one list, which
+        // is refused if the table's schema has moved since.
+        let base = self.inner.manifest.load_full();
+        let built_against = base.table_schema().schema_id();
+        let schema_change = union_schema(
+            &base.table_schema(),
+            buffer.iter().map(|b| &b.scalar),
+            &self.inner.options.id_column,
+        )?
+        .map(Arc::new);
+        let manifest = match &schema_change {
+            Some(schema) => Arc::new(base.with_schema(Arc::clone(schema))),
+            None => base,
+        };
+        let scalar_schema = manifest.scalar_schema();
+        let buffer: Cow<'_, [BufferedBatch]> = if buffer
+            .iter()
+            .all(|b| b.scalar.schema().fields() == scalar_schema.fields())
+        {
+            Cow::Borrowed(buffer)
+        } else {
+            Cow::Owned(
+                buffer
+                    .iter()
+                    .map(|b| BufferedBatch {
+                        scalar: conform(&b.scalar, &scalar_schema),
+                        vectors: b.vectors.clone(),
+                    })
+                    .collect(),
+            )
+        };
+        let buffer: &[BufferedBatch] = &buffer;
         // Phase A — train the global cell grid from the FIRST committed batch
         // into pending OCC metadata (not a bare ArcSwap.store). The pack path
         // below reads the same local `pending_gvi` / existing manifest grid;
         // the stamp lands with the membership commit (S10).
-        let pending_gvi: Option<GlobalVectorIndex> = if self
-            .inner
-            .manifest
-            .load()
-            .get_global_vector_index()
-            .is_none()
+        let pending_gvi: Option<GlobalVectorIndex> = if manifest.get_global_vector_index().is_none()
             && !buffer.is_empty()
-            && let Some(vc) = self.inner.manifest.load().vector_configs().first()
+            && let Some(vc) = manifest.vector_configs().first()
             && let Some(grid) = bootstrap_centroids_from_batch(
                 buffer,
                 vc.dim,
@@ -2072,6 +2254,8 @@ impl SupertableWriter {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: schema_change,
+            expected_schema_id: Some(built_against),
         };
 
         // Vector commit: same row-shard fanout as the legacy path. Each writer
@@ -2080,12 +2264,12 @@ impl SupertableWriter {
         // fine k-means + Sq8), overlapped with Parquet+FTS, then splices IVF
         // blobs into the superfile and publishes. Drain does not write/S3 on
         // this path. No slow CAS.
-        if !self.inner.manifest.load().vector_configs().is_empty() {
+        if !manifest.vector_configs().is_empty() {
             let commit_t0 = time::Instant::now();
             let pack_grid = pending_gvi
                 .as_ref()
                 .cloned()
-                .or_else(|| self.inner.manifest.load().get_global_vector_index())
+                .or_else(|| manifest.get_global_vector_index())
                 .ok_or_else(|| {
                     BuildError::Store(
                         "vector columns present but global cell grid missing after Phase A".into(),
@@ -2125,6 +2309,7 @@ impl SupertableWriter {
                 let built = commit_shards_via_drain(
                     buffer,
                     &self.inner,
+                    &manifest,
                     &pack_grid,
                     metric,
                     packed_cell_shard_count(&self.inner.options),
@@ -2185,6 +2370,7 @@ impl SupertableWriter {
                 let (outputs, cell_hints) = commit_shards_via_drain(
                     buffer,
                     &self.inner,
+                    &manifest,
                     &pack_grid,
                     metric,
                     packed_cell_shard_count(&self.inner.options),
@@ -2292,10 +2478,9 @@ impl SupertableWriter {
         // hidden membership is written by drain / split / merge as
         // prepared superfiles — this keeps the path correct if one ever
         // appears.)
-        let shard_manifest = self.inner.manifest.load_full();
         let (shards, cell_hints): (Vec<Vec<BufferedBatch>>, Vec<Option<u32>>) =
             if let Some(PartitionStrategy::VectorCell { clusters, .. }) =
-                shard_manifest.partition_strategy()
+                manifest.partition_strategy()
             {
                 let metric = self
                     .inner
@@ -2339,7 +2524,7 @@ impl SupertableWriter {
                 pending_gvi
                     .as_ref()
                     .cloned()
-                    .or_else(|| self.inner.manifest.load().get_global_vector_index())
+                    .or_else(|| manifest.get_global_vector_index())
                     .filter(|g| g.grid.n_cent > 0 && g.grid.dim > 0)
                     .map(|g| g.grid.to_fp32().into())
             } else {
@@ -2355,6 +2540,7 @@ impl SupertableWriter {
             build_one_shard_with_layout(
                 slice.as_slice(),
                 &user_inner,
+                &manifest,
                 user_options.vector_layout,
                 user_global_centroids.clone(),
             )
@@ -2477,18 +2663,18 @@ fn reserve_build_scratch(
 fn build_one_shard_with_layout(
     slice: &[BufferedBatch],
     inner: &SupertableInner,
+    manifest: &ManifestSnapshot,
     vector_layout: crate::superfile::vector::layout::VectorLayout,
     provided_centroids: Option<std::sync::Arc<[f32]>>,
 ) -> Result<ShardOutput, BuildError> {
     let options = &inner.options;
     let mut builder = SuperfileBuilder::new(
-        inner
-            .builder_options()
+        builder_options_of(manifest)
             .with_vector_layout(vector_layout)
             .with_vector_centroids(provided_centroids),
     )?;
 
-    let scalar_schema = inner.manifest.load().scalar_schema();
+    let scalar_schema = manifest.scalar_schema();
     // The supertable always prepends the id column at index 0 of the
     // scalar schema, so we can skip the schema lookup here.
     let id_idx = 0;
@@ -3665,6 +3851,7 @@ async fn persist_superfile_publish_batch_async(
         return Ok(());
     }
     let old = inner.manifest.load();
+    list_metadata.check_schema(&old)?;
     // Local (no-storage) path: stamp list metadata onto the OCC base, then
     // append — `with_appended` preserves the stamped fields.
     let new = if list_metadata.is_empty() {
@@ -5349,6 +5536,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
         // Build the resident `hnsw` graph NOW, against a PROSPECTIVE manifest
@@ -6320,7 +6509,7 @@ fn build_one_shard_from_packed_cells(
         inner.manifest.load().scalar_schema(),
         vec![Arc::new(id_array) as ArrayRef],
     )
-    .map_err(|_| BuildError::BatchSchemaMismatch)?;
+    .map_err(|e| BuildError::Store(format!("ids-only batch: {e}")))?;
 
     let mut builder = SuperfileBuilder::new(
         inner
@@ -6434,7 +6623,7 @@ fn build_prepared_from_spilled_cells(
                 .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
             let scalar =
                 RecordBatch::try_new(scalar_schema.clone(), vec![Arc::new(id_array) as ArrayRef])
-                    .map_err(|_| BuildError::BatchSchemaMismatch)?;
+                    .map_err(|e| BuildError::Store(format!("ids-only batch: {e}")))?;
             ScalarStatsAgg::merge(
                 &mut scalar_stats,
                 &ScalarStatsAgg::from_batch(&scalar_schema, &scalar),
@@ -6592,6 +6781,7 @@ async fn upload_prepared_shards(
 fn commit_shards_via_drain(
     buffer: &[BufferedBatch],
     inner: &SupertableInner,
+    manifest: &ManifestSnapshot,
     clusters: &ClusterCentroids,
     metric: Metric,
     n_packed_shards: usize,
@@ -6638,7 +6828,7 @@ fn commit_shards_via_drain(
     if stable_ids.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let vector_configs = inner.manifest.load().vector_configs();
+    let vector_configs = manifest.vector_configs();
     let vector_views: Vec<VectorColumnView<'_>> = vector_configs
         .iter()
         .enumerate()
@@ -6655,7 +6845,7 @@ fn commit_shards_via_drain(
         )));
     }
 
-    let scalar_schema = inner.manifest.load().scalar_schema();
+    let scalar_schema = manifest.scalar_schema();
     let source_scalar = concat_batches(&scalar_schema, scalar_batches.iter().copied())
         .map_err(|err| BuildError::Store(err.to_string()))?;
     let local_by_id: HashMap<i128, u32> = stable_ids
@@ -6700,6 +6890,7 @@ fn commit_shards_via_drain(
                 &vector_views,
                 &local_by_id,
                 inner,
+                manifest,
                 &vc,
             )?;
             let Some(tx) = pipeline else {
@@ -6775,13 +6966,12 @@ fn commit_shards_via_drain(
 /// compaction merges both fail closed on it.
 pub(in crate::supertable) fn build_packed_update_superfile(
     inner: &SupertableInner,
+    manifest: &ManifestSnapshot,
     scalar_with_id: RecordBatch,
     vectors: Vec<Arc<Float32Array>>,
     op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Bytes, BuildError> {
-    let pack_grid = inner
-        .manifest
-        .load()
+    let pack_grid = manifest
         .get_global_vector_index()
         .ok_or_else(|| {
             BuildError::Store(
@@ -6804,6 +6994,7 @@ pub(in crate::supertable) fn build_packed_update_superfile(
     let (mut outputs, _cell_hints) = commit_shards_via_drain(
         &buffer,
         inner,
+        manifest,
         &pack_grid,
         metric,
         UPDATE_PACKED_SHARDS,
@@ -6842,6 +7033,7 @@ fn build_one_packed_shard_via_drain(
     vector_views: &[VectorColumnView<'_>],
     local_by_id: &HashMap<i128, u32>,
     inner: &SupertableInner,
+    manifest: &ManifestSnapshot,
     vc: &VectorConfig,
 ) -> Result<Option<ShardOutput>, BuildError> {
     let mut ordered_locals: Vec<u32> = Vec::new();
@@ -6876,7 +7068,15 @@ fn build_one_packed_shard_via_drain(
                 })
                 .collect::<Result<Vec<_>, BuildError>>()
         },
-        || build_shard_parquet_and_fts(source_scalar, vector_views, &ordered_locals, inner),
+        || {
+            build_shard_parquet_and_fts(
+                source_scalar,
+                vector_views,
+                &ordered_locals,
+                inner,
+                manifest,
+            )
+        },
     );
     let packed_groups = packed_groups?;
     let (mut builder, id_min, id_max, n_docs, scalar_stats) = body_and_fts?;
@@ -6921,6 +7121,7 @@ fn build_shard_parquet_and_fts(
     vector_views: &[VectorColumnView<'_>],
     ordered_locals: &[u32],
     inner: &SupertableInner,
+    manifest: &ManifestSnapshot,
 ) -> Result<
     (
         SuperfileBuilder,
@@ -6940,7 +7141,7 @@ fn build_shard_parquet_and_fts(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| BuildError::Store(err.to_string()))?;
     let scalar = RecordBatch::try_new(source_scalar.schema(), columns)
-        .map_err(|_| BuildError::BatchSchemaMismatch)?;
+        .map_err(|e| BuildError::Store(format!("shard rows: {e}")))?;
 
     // This shard's rows in IVF order — the one remaining vector copy on
     // the commit path, shard-sized and transient (the commit-wide flatten
@@ -6956,13 +7157,11 @@ fn build_shard_parquet_and_fts(
     let vector_slices: Vec<&[f32]> = ordered_vectors.iter().map(Vec::as_slice).collect();
 
     let mut builder = SuperfileBuilder::new(
-        inner
-            .builder_options()
-            .with_vector_layout(VectorLayout::MultiCellIvf),
+        builder_options_of(manifest).with_vector_layout(VectorLayout::MultiCellIvf),
     )?;
     builder.add_batch(&scalar, &vector_slices)?;
 
-    let scalar_schema = inner.manifest.load().scalar_schema();
+    let scalar_schema = manifest.scalar_schema();
     let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &[&scalar]);
 
     let id_col = scalar
@@ -7821,6 +8020,8 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         superseded_cells_additions: Some(superseded_additions),
         split_checks_additions: None,
         graph_ref: None,
+        schema: None,
+        expected_schema_id: None,
     };
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
     let new_manifest = match persist_commit_async(
@@ -8307,6 +8508,8 @@ pub(in crate::supertable) async fn split_repack_bulk(
         superseded_cells_additions: Some(superseded_additions),
         split_checks_additions: None,
         graph_ref: None,
+        schema: None,
+        expected_schema_id: None,
     };
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
     let new_manifest = match persist_commit_async(
@@ -9239,6 +9442,8 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let base = Arc::new(list_metadata.apply(&manifest));
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
@@ -10285,11 +10490,30 @@ pub(crate) struct CommitListMetadata {
     /// (the outer option) leaves the graph ref as `update` carried it forward
     /// — the only correct value for every non-drain commit.
     pub(crate) graph_ref: Option<Option<RoutingRef>>,
+    /// The table schema this commit publishes, when it changes it: the
+    /// columns an append added, or a schema write's result. Lands in the
+    /// same list as the superfiles built under it.
+    pub(crate) schema: Option<Arc<TableSchema>>,
+    /// The `schema_id` the commit was built against. The attempt is
+    /// refused with [`SupertableCommitError::SchemaMoved`] when the
+    /// committed schema has moved on, so a superfile never lands under a
+    /// schema it was not built for and ids are minted by one list at a
+    /// time; the caller re-resolves against the winner and retries.
+    pub(crate) expected_schema_id: Option<u32>,
 }
 
 impl CommitListMetadata {
     pub(crate) fn empty() -> Self {
         Self::default()
+    }
+
+    /// Metadata that publishes `schema` over the document at `expected`.
+    pub(crate) fn schema_change(schema: Arc<TableSchema>, expected: u32) -> Self {
+        Self {
+            schema: Some(schema),
+            expected_schema_id: Some(expected),
+            ..Self::default()
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -10299,6 +10523,21 @@ impl CommitListMetadata {
             && self.superseded_cells_additions.is_none()
             && self.split_checks_additions.is_none()
             && self.graph_ref.is_none()
+            && self.schema.is_none()
+    }
+
+    /// Refuse `base` when its schema is not the one this commit expects.
+    pub(crate) fn check_schema(
+        &self,
+        base: &ManifestSnapshot,
+    ) -> Result<(), SupertableCommitError> {
+        if let Some(expected) = self.expected_schema_id {
+            let current = base.table_schema().schema_id();
+            if current != expected {
+                return Err(SupertableCommitError::SchemaMoved { expected, current });
+            }
+        }
+        Ok(())
     }
 
     /// Overlay stamped fields onto `base`. `ManifestSnapshot` is not
@@ -10327,6 +10566,9 @@ impl CommitListMetadata {
             // field forward and `with_slow_vector_state_ref` preserves it, so
             // the graph ref survives to the durable list/pointer CAS.
             out = out.with_slow_vector_state_graphs(graphs.clone());
+        }
+        if let Some(schema) = &self.schema {
+            out = out.with_schema(Arc::clone(schema));
         }
         out
     }
@@ -10361,6 +10603,7 @@ pub(in crate::supertable) async fn persist_commit_async(
             // `base`: the stamps below may already carry this commit's own refs (a drain batch's
             // new graph), which would hide the ones they replace.
             let committed = Arc::clone(&old);
+            list_metadata.check_schema(&old)?;
             // Re-apply call-site stamps on every attempt. A pre-store of these
             // fields is not OCC-safe: contention refresh reloads from storage
             // and would drop them before a successful CAS.

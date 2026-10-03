@@ -34,8 +34,8 @@ use pyo3::types::{PyDict, PyList};
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
     GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
-    ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions, Stemmer, Stopwords,
-    VectorFilter,
+    ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions, SchemaPatch, Stemmer,
+    Stopwords, VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
 // the engine's public API and reachable only under `infino/test-helpers`.
@@ -504,6 +504,39 @@ impl Connection {
         Ok(Table { inner })
     }
 
+    /// The table's schema document as a `dict`: its fields with ids, types,
+    /// nullability and indexes, the field cap, and the `schema_id`. With
+    /// `patch` (a `dict` in the same shape), merge it into the schema — or
+    /// create the table from it when there is none — and return the document
+    /// afterwards. A field is matched by `id` when it carries one and by
+    /// `name` otherwise; an unmatched field is added, a different type
+    /// changes the column, `dropped: True` retires it, and a field not
+    /// mentioned is untouched. `expected_schema_id` is a compare-and-set
+    /// against the current `schema_id`.
+    #[pyo3(signature = (name, patch=None, expected_schema_id=None))]
+    fn schema<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        patch: Option<&Bound<'py, PyAny>>,
+        expected_schema_id: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let json = py.import("json")?;
+        let doc = match patch {
+            None => py.detach(|| self.inner.schema(name)).map_err(py_err)?,
+            Some(patch) => {
+                let text: String = json.call_method1("dumps", (patch,))?.extract()?;
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| PyValueError::new_err(format!("schema patch: {e}")))?;
+                let patch = SchemaPatch::from_json(&value)
+                    .map_err(|e| PyValueError::new_err(format!("schema patch: {e}")))?;
+                py.detach(|| self.inner.apply_schema(name, &patch, expected_schema_id))
+                    .map_err(py_err)?
+            }
+        };
+        json.call_method1("loads", (doc.to_json().to_string(),))
+    }
+
     /// Drop a table. By default (`purge=True`) this also deletes the table's
     /// storage subtree after the catalog commit, reclaiming the bytes. Pass
     /// `purge=False` to only unregister the table from the catalog and leave
@@ -822,11 +855,10 @@ impl Table {
         let declared = self.inner.schema();
         let py_schema = declared.as_ref().to_pyarrow(py)?;
         match coerce_to_record_batch(py, data, &py_schema)? {
-            Some(batch) => {
-                let aligned = align_to_schema(declared, batch)?;
-                // Append commits a superfile to storage — release the GIL.
-                py.detach(|| self.inner.append(&aligned)).map_err(py_err)
-            }
+            // Append commits a superfile to storage — release the GIL. The
+            // engine brings the batch to the table's shape: a column it does
+            // not have joins the schema, an absent nullable one is null-filled.
+            Some(batch) => py.detach(|| self.inner.append(&batch)).map_err(py_err),
             // Empty input — nothing to append (no empty commit).
             None => Ok(()),
         }
@@ -847,11 +879,9 @@ impl Table {
         let declared = self.inner.schema();
         let py_schema = declared.as_ref().to_pyarrow(py)?;
         match coerce_to_record_batch(py, data, &py_schema)? {
-            Some(batch) => {
-                let aligned = align_to_schema(declared, batch)?;
-                py.detach(|| self.inner.append_named(&aligned, source_name))
-                    .map_err(py_err)
-            }
+            Some(batch) => py
+                .detach(|| self.inner.append_named(&batch, source_name))
+                .map_err(py_err),
             None => Ok(()),
         }
     }
@@ -1219,14 +1249,14 @@ impl Table {
         let py_schema = declared.as_ref().to_pyarrow(py)?;
         // Pass an empty batch through rather than short-circuiting like
         // `append` does — we want the engine's cardinality check to run.
-        let aligned = match coerce_to_record_batch(py, new_rows, &py_schema)? {
-            Some(batch) => align_to_schema(declared, batch)?,
+        let rows = match coerce_to_record_batch(py, new_rows, &py_schema)? {
+            Some(batch) => batch,
             None => RecordBatch::new_empty(declared),
         };
         // Parse and mutate both off the GIL — neither touches Python.
         let stats = py.detach(|| {
             let expr = self.parse_predicate(predicate)?;
-            self.inner.update(expr, &aligned).map_err(py_err)
+            self.inner.update(expr, &rows).map_err(py_err)
         })?;
         Ok(MutationStats::from_core(&stats))
     }
@@ -1417,14 +1447,6 @@ fn parse_stats(stats: Option<&str>) -> PyResult<Bm25Stats> {
             "stats must be 'per_superfile' or 'global', got {other:?}"
         ))),
     }
-}
-
-/// Re-wrap a coerced batch under the table's declared schema. Python
-/// sources (pandas, list[dict]) are inherently nullable; this lets the
-/// exact-schema check accept them. A genuine type / null mismatch still errors.
-fn align_to_schema(declared: Arc<Schema>, batch: RecordBatch) -> PyResult<RecordBatch> {
-    RecordBatch::try_new(declared, batch.columns().to_vec())
-        .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 /// Coerce append input — a pyarrow `RecordBatch` / `Table`, a pandas

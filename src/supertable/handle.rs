@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
@@ -73,6 +73,7 @@ use crate::{
             lease::DEFAULT_LEASE_DURATION,
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
         },
+        writer::builder_options_of,
     },
     utils::trace::{CloseOut, TableRole, record},
 };
@@ -243,10 +244,11 @@ pub(super) struct SupertableInner {
     /// and purged elsewhere. Latched: the handle can only be discarded, and
     /// `Connection::open_table` checks this before serving it from cache.
     pub(super) pointer_vanished: OnceLock<()>,
-    /// Cached SQL schemas, built once from the immutable `options` (lock-free
-    /// lazy init). A pure function of the schema, so no snapshot invalidation
-    /// (unlike `sql_session_cache`). See [`SqlSchemas`].
-    pub(super) sql_schemas: OnceLock<Arc<SqlSchemas>>,
+    /// Cached SQL schemas, keyed by the `schema_id` they were built from:
+    /// a pure function of the table's schema, rebuilt when it changes and
+    /// otherwise shared (unlike `sql_session_cache`, which follows the
+    /// snapshot). See [`SqlSchemas`].
+    pub(super) sql_schemas: ArcSwapOption<(u32, Arc<SqlSchemas>)>,
     /// Decoded hidden deleted-`_id` set, cached per hidden manifest version.
     /// The set is a deliberate duplicate of the user-table tombstones, carried
     /// INLINE in the hidden manifest so hidden vector search drops deleted rows
@@ -263,10 +265,7 @@ impl SupertableInner {
     /// of the current manifest, so the new file bakes — and is scored at
     /// — the corpus average rather than its own.
     pub(super) fn builder_options(&self) -> BuilderOptions {
-        let manifest = self.manifest.load();
-        manifest
-            .builder_options()
-            .with_fts_corpus_stats(manifest.fts_corpus_stats(&HashSet::new()))
+        builder_options_of(&self.manifest.load())
     }
 
     /// Runtime driving the sync API's async kernels when the caller
@@ -296,10 +295,17 @@ impl SupertableInner {
     /// The table's cached SQL schemas, built once from the immutable options.
     /// Cheap `Arc` clone on every call after the first.
     pub(super) fn sql_schemas(&self) -> Arc<SqlSchemas> {
-        Arc::clone(
-            self.sql_schemas
-                .get_or_init(|| Arc::new(build_sql_schemas(&self.manifest.load()))),
-        )
+        let manifest = self.manifest.load();
+        let schema_id = manifest.table_schema().schema_id();
+        if let Some(cached) = self.sql_schemas.load().as_ref()
+            && cached.0 == schema_id
+        {
+            return Arc::clone(&cached.1);
+        }
+        let built = Arc::new(build_sql_schemas(&manifest));
+        self.sql_schemas
+            .store(Some(Arc::new((schema_id, Arc::clone(&built)))));
+        built
     }
 
     /// Push the current manifest's tombstone-seq view into the
@@ -1852,7 +1858,7 @@ async fn build_handle(
         superseded: Mutex::default(),
         pointer_vanished: OnceLock::new(),
         hidden_deleted_cache: Mutex::new(None),
-        sql_schemas: OnceLock::new(),
+        sql_schemas: ArcSwapOption::empty(),
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };
@@ -6260,6 +6266,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let no_removals = Vec::new();
         // The hidden table's own scoped provider — its pointer file, not the
@@ -6461,6 +6469,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden
@@ -6539,6 +6549,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let zero_manifest = hidden
             .block_on_query(persist_commit_async(
@@ -6742,6 +6754,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden
@@ -6924,6 +6938,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let hidden_storage = hidden
             .inner()

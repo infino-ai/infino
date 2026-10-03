@@ -20,7 +20,7 @@ use thiserror::Error;
 use crate::{
     storage::{StorageError, permission_denied_in_chain},
     superfile::error::BuildError as SuperfileBuildError,
-    supertable::{ManifestLoadError, manifest::part},
+    supertable::{ManifestLoadError, manifest::part, schema::error::SchemaError},
 };
 
 /// Errors raised when constructing or operating against a
@@ -106,8 +106,14 @@ pub enum BuildError {
     )]
     UnknownAnalyzer { column: String, analyzer: String },
 
-    #[error("input RecordBatch schema does not match the supertable's declared schema")]
-    BatchSchemaMismatch,
+    #[error("{0}")]
+    Schema(#[from] SchemaError),
+
+    #[error(
+        "the table's schema moved from {expected} to {current} while this commit was built; \
+         it is rebuilt against the current schema"
+    )]
+    SchemaMoved { expected: u32, current: u32 },
 
     #[error("error from underlying superfile layer: {0}")]
     Superfile(#[from] SuperfileBuildError),
@@ -194,7 +200,8 @@ impl BuildError {
     /// compare-and-set race, so reissuing against fresh state can succeed.
     pub(crate) fn is_conflict(&self) -> bool {
         match self {
-            BuildError::WriteContention => true,
+            BuildError::WriteContention | BuildError::SchemaMoved { .. } => true,
+            BuildError::Schema(SchemaError::SchemaConflict { .. }) => true,
             BuildError::StorageConstruction(e) => e.is_conflict(),
             _ => false,
         }
@@ -219,6 +226,9 @@ impl From<CommitError> for BuildError {
     fn from(e: CommitError) -> Self {
         match e {
             CommitError::PointerVanished => BuildError::TableGone,
+            CommitError::SchemaMoved { expected, current } => {
+                BuildError::SchemaMoved { expected, current }
+            }
             other if other.is_conflict() => BuildError::WriteContention,
             other if other.is_permission_denied() => {
                 BuildError::PermissionDenied(other.to_string())
@@ -279,6 +289,9 @@ pub enum CommitError {
     /// seal moved and committing the rest.
     #[error("input {superfile_id} changed under this commit's seal")]
     InputsChanged { superfile_id: uuid::Uuid },
+
+    #[error("the table's schema moved from {expected} to {current} under this commit")]
+    SchemaMoved { expected: u32, current: u32 },
 }
 
 impl CommitError {
@@ -290,8 +303,10 @@ impl CommitError {
     /// both shapes are classified together.
     pub(crate) fn is_conflict(&self) -> bool {
         match self {
-            // Both are a race lost to another writer with nothing published.
-            CommitError::WriteContentionExhausted | CommitError::InputsChanged { .. } => true,
+            // All three are a race lost to another writer with nothing published.
+            CommitError::WriteContentionExhausted
+            | CommitError::InputsChanged { .. }
+            | CommitError::SchemaMoved { .. } => true,
             CommitError::Storage(e) => e.is_conflict(),
             CommitError::Build(b) => b.is_conflict(),
             _ => false,

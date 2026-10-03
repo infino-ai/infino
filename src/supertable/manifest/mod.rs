@@ -354,6 +354,9 @@ pub struct ManifestSnapshot {
     /// it back via [`ManifestSnapshot::get_drained_ranges`] to persist it. Hidden
     /// manifest only.
     stamped_drained_ranges: Option<list::DrainedVersionRanges>,
+    /// The schema a commit stamped before the first list write lands, and
+    /// the in-memory table's only schema slot. Mirrors the other stamps.
+    stamped_schema: Option<Arc<TableSchema>>,
 }
 
 impl fmt::Debug for ManifestSnapshot {
@@ -413,6 +416,7 @@ impl ManifestSnapshot {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_schema: None,
             }
         } else {
             Self {
@@ -423,6 +427,7 @@ impl ManifestSnapshot {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_schema: None,
             }
         }
     }
@@ -446,6 +451,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         }
     }
 
@@ -464,6 +470,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         }
     }
 
@@ -511,6 +518,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         }
     }
 
@@ -569,7 +577,29 @@ impl ManifestSnapshot {
         self.list
             .as_ref()
             .and_then(|l| l.schema.clone())
+            .or_else(|| self.stamped_schema.clone())
             .unwrap_or_else(|| Arc::clone(&self.superfile_list.options.table_schema))
+    }
+
+    /// This snapshot with `schema` as the table's schema. Mirrors
+    /// [`ManifestSnapshot::with_global_vector_index`]: the list's document
+    /// when a list exists, and the in-memory stamp before one does.
+    pub(crate) fn with_schema(&self, schema: Arc<TableSchema>) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.schema = Some(Arc::clone(&schema));
+            list
+        });
+        Self {
+            superfile_list: self.superfile_list.clone(),
+            list: new_list,
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: Some(schema),
+        }
     }
 
     /// The stable id of `column` in this snapshot's table: a user column's
@@ -1159,6 +1189,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         };
 
         record("parts", new_manifest.parts.len() as u64);
@@ -1431,6 +1462,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1490,6 +1522,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1590,6 +1623,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1629,6 +1663,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1685,6 +1720,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: Some(strategy),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1706,6 +1742,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: Some(index),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1728,6 +1765,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: Some(ranges),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1750,6 +1788,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1777,6 +1816,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1798,6 +1838,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1872,6 +1913,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         })
     }
 
@@ -2439,6 +2481,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         };
 
         Ok((new_manifest, parts_to_write))
@@ -5450,6 +5493,7 @@ mod tests {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_schema: None,
             }
         }
 
@@ -5558,6 +5602,7 @@ mod tests {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_schema: None,
             };
             assert_eq!(before.parts.len(), n_parts, "all parts start resident");
 
@@ -5949,6 +5994,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         };
         let dbg = format!("{m:?}");
         assert!(dbg.contains("n_parts: 1"), "{dbg}");
@@ -6119,6 +6165,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         })
     }
 
@@ -6274,6 +6321,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Remove every superfile from part A only → A is emptied, B untouched.
@@ -6974,6 +7022,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Add new entry to the SAME partition (not a new/cold partition)
@@ -7131,6 +7180,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Commit one new superfile. Keep `new_entry` around — the second
@@ -7346,6 +7396,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Add 1 new superfile to same partition (2 + 1 = 3, within target)
@@ -7453,6 +7504,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Add 2 new superfiles to same partition (2 + 2 = 4, exceeds target of 2)
@@ -7589,6 +7641,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // 2 + 1 = 3 superfiles — far under the 10_000 count target, so only
@@ -7725,6 +7778,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Add one new entry for the partition
@@ -7868,6 +7922,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let new_entries = vec![make_new_entry_hinted(50, 0), make_new_entry_hinted(80, 1)];
@@ -8018,6 +8073,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Only touch partition A
@@ -8206,6 +8262,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let new_entries = vec![make_new_entry_hinted(75, 0), make_new_entry_hinted(90, 1)];
@@ -8390,6 +8447,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -8494,6 +8552,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let sf_new = make_new_entry(75);
@@ -8632,6 +8691,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -8779,6 +8839,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -8897,6 +8958,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -8991,6 +9053,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // sf_ghost was never added to any part; its superfile_id won't match anything
@@ -9126,6 +9189,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -9220,6 +9284,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         }
     }
 

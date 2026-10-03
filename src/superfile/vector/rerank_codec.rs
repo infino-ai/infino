@@ -379,7 +379,7 @@ impl RerankCodec {
     }
 
     /// Whether this is the flat single-plane `u16` codec. Scored via
-    /// [`crate::superfile::vector::distance::Sq16Kernel`] — the `Fp32`
+    /// `Sq16Kernel` — the `Fp32`
     /// distance path with a `u16 → f32` dequant front.
     #[inline]
     pub const fn is_sq16(self) -> bool {

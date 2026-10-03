@@ -32,6 +32,44 @@ export type SchemaDescriptor = Record<string, string | { vector: number }>;
 /** Accepted shapes for `Table.append`. */
 export type AppendData = RowRecord[] | arrow.Table | arrow.RecordBatch | Buffer | Uint8Array;
 
+/** A column's index in the schema document: full-text or vector. */
+export type ColumnIndex =
+  | { kind: "fts"; analyzer: string; stopwords?: string; stemmer?: string; positions: boolean; stored: boolean; k1: number; b: number }
+  | { kind: "vector"; metric: Metric; rot_seed: number; rerank_codec: string };
+/** One field of the schema document. `type` is the document's type vocabulary (`"i64"`, `"large_utf8"`, …); a vector column carries `dim`. */
+export interface SchemaField {
+  id: number;
+  name: string;
+  type: string;
+  dim?: number;
+  nullable: boolean;
+  index?: ColumnIndex;
+  converting_from?: { type: string; dim?: number };
+}
+/** The schema document `Connection.schema` returns. */
+export interface TableSchema {
+  schema_id: number;
+  last_field_id: number;
+  max_fields: number;
+  fields: SchemaField[];
+  tombstoned: number[];
+}
+/** One field of a schema patch: a new column (`type` required), or a change to a live one addressed by `id` or `name`. */
+export interface SchemaFieldPatch {
+  id?: number;
+  name: string;
+  type?: string;
+  dim?: number;
+  nullable?: boolean;
+  index?: ColumnIndex;
+  dropped?: boolean;
+}
+/** What `Connection.schema(name, patch)` accepts: the document's own shape, every key optional. */
+export interface SchemaPatch {
+  fields?: SchemaFieldPatch[];
+  max_fields?: number;
+}
+
 /**
  * Storage and cache config the `connect` URI can't carry. All optional.
  *
@@ -614,6 +652,23 @@ export class Connection {
 
   openTable(name: string): Table {
     return new Table(guard(this.remote, () => this.inner.openTable(name)), this.remote);
+  }
+
+  /**
+   * The schema document of `name`: its fields with ids, types, nullability
+   * and indexes, the field cap and the `schema_id`. With `patch` (the same
+   * shape), merge it into the schema — or create the table from it when
+   * there is none — and return the document afterwards. A field is matched
+   * by `id` when it carries one and by `name` otherwise; an unmatched field
+   * is added, a different type changes the column, `dropped: true` retires
+   * it, and a field not mentioned is untouched. `expectedSchemaId` is a
+   * compare-and-set against the current `schema_id`.
+   */
+  schema(name: string, patch?: SchemaPatch, expectedSchemaId?: number): TableSchema {
+    const text = guard(this.remote, () =>
+      this.inner.schema(name, patch === undefined ? undefined : JSON.stringify(patch), expectedSchemaId),
+    );
+    return JSON.parse(text) as TableSchema;
   }
 
   /** Drop a table. `purge` defaults to `true`, which also deletes the table's storage; pass `false` to only unregister it and keep the bytes. */

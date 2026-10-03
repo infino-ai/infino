@@ -108,6 +108,7 @@ fn build_delete_wal(target_id: i128, wal_id_value: i128) -> WalStateDoc {
             outcome: TombstoneOutcome::Pending,
             tombstoned_in_superfile: None,
         }],
+        schema_id: None,
     }
 }
 
