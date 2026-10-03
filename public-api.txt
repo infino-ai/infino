@@ -1006,3 +1006,4 @@ impl<'a> core::panic::unwind_safe::UnwindSafe for infino::VectorFilter<'a>
 pub const infino::BUILDER_ID: &str
 pub fn infino::connect(impl core::convert::AsRef<str>) -> core::result::Result<infino::Connection, infino::InfinoError>
 pub fn infino::connect_with(impl core::convert::AsRef<str>, infino::ConnectOptions) -> core::result::Result<infino::Connection, infino::InfinoError>
+pub fn infino::rows_to_batch(&[serde_json::value::Value], &infino::TableSchema) -> core::result::Result<arrow_array::record_batch::RecordBatch, infino::SchemaError>

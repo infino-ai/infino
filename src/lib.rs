@@ -177,6 +177,10 @@ pub use config::{
     CompactionSettings, GcSettings, OptimizeOptions, RecalibratePolicy, ReindexMode,
     ReindexOptions, ReindexTarget, SuperfileIndex,
 };
+/// Rows as JSON documents, mapped to one Arrow batch under a table's schema
+/// — what [`Supertable::append_rows`] does before it appends. For a server
+/// that accounts for a batch before writing it.
+pub use dynamic::rows_to_batch;
 /// The single public error type for the curated API.
 pub use error::InfinoError;
 /// JSON documents for `append_rows` / `update_rows`; import as `infino::serde_json`.
