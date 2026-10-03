@@ -79,12 +79,12 @@ use crate::{
         error::QueryError,
         handle::{SupertableReader, WeakReader},
         manifest::{ManifestSnapshot, SuperfileUri},
-        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
             SuperfileHit, candidate::CandidatePlan, exec::metered_exec::MeteredExec,
             superfile_reader::superfile_reader, vector::row_id_from_manifest_entry,
         },
         reader_cache::ReadIntent,
+        schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
     },
     utils::trace::record,
 };
@@ -360,7 +360,7 @@ pub(crate) async fn resolve_hits_named(
 ) -> Result<RecordBatch, QueryError> {
     // Stored shape: an index-only FTS column has no Parquet data to
     // project, so its name is rejected up front like any unknown column.
-    let scalar_schema = reader.options().stored_schema();
+    let scalar_schema = reader.manifest().stored_schema();
     let output_schema = output_schema_with_score(&scalar_schema);
     // `None` is the engine-native result: `_id` + `score` only.
     // `_id` decodes from its own dedicated id pages (cheap by
@@ -440,7 +440,7 @@ impl SupertableReader {
     /// is the same one [`resolve_hits_named`] checks at output materialization,
     /// so the two share one source of truth and the error message is identical.
     pub(crate) fn check_projection(&self, projection: Option<&[&str]>) -> Result<(), QueryError> {
-        let output_schema = output_schema_with_score(&self.options().stored_schema());
+        let output_schema = output_schema_with_score(&self.manifest().stored_schema());
         validate_projection(
             projection,
             self.options().id_column.as_str(),
@@ -467,7 +467,7 @@ pub(crate) fn candidate_plan_for_filters(
         .map(|c| c.column.as_str())
         .collect();
     CandidatePlan::from_filters(filters, &fts_cols, &|col| {
-        manifest.options.try_fts_tokenizer_for(col)
+        manifest.try_fts_tokenizer_for(col)
     })
 }
 
@@ -1807,7 +1807,7 @@ mod tests {
         let st = demo(16);
         let reader = st.reader().expect("reader");
         let hits = two_hits(&reader);
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
         let score_idx = scalar_schema.fields().len();
 
@@ -1846,7 +1846,7 @@ mod tests {
                 crate::supertable::query::dispatch::attach_stable_ids_to_hits(&reader, &mut hits),
             )
             .expect("stamp stable ids before scalar resolution");
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
 
         let batch = reader
@@ -1874,7 +1874,7 @@ mod tests {
         let st = demo(16);
         let reader = st.reader().expect("reader");
         let hits = two_hits(&reader);
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
 
         let batch = reader

@@ -18,6 +18,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Arc,
 };
 
 use arrow::compute::concat;
@@ -28,6 +29,7 @@ use arrow_schema::{DataType, Schema};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use datafusion::scalar::ScalarValue;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -49,7 +51,7 @@ use crate::{
             term_range::prefix_overlaps_range,
         },
         opann::RERANK_LAW_POOL_CELLS,
-        schema::{FieldId, LegacyNames, field_id_of, parse_wire_key, wire_key},
+        schema::{FieldId, LegacyNames, TableSchema, field_id_of, parse_wire_key, wire_key},
     },
 };
 
@@ -110,19 +112,17 @@ pub struct Manifest {
     /// — guards against schema/column-config drift across
     /// process restarts.
     pub options_hash: ContentHash,
-    /// Arrow-IPC bytes of the supertable's user schema.
-    /// Stored as bytes so we don't depend on Arrow's
-    /// JSON-schema serializer (which doesn't round-trip
-    /// `FixedSizeList<Float32>` correctly in 0.x).
-    pub schema: Vec<u8>,
+    /// The table's schema document: its columns with their ids, types and
+    /// indexes. `None` on a list written before the list carried it; the
+    /// options then derive the schema from the catalog's creation record,
+    /// and the first commit fills the slot.
+    pub schema: Option<Arc<TableSchema>>,
     /// Name of the user-supplied id column.
     pub id_column: String,
-    /// Per-FTS-column configuration. Stable across the
-    /// supertable's lifetime — schema change requires
-    /// external compaction.
-    pub fts_columns: Vec<FtsColumnInfo>,
-    /// Per-vector-column configuration.
-    pub vector_columns: Vec<VectorColumnInfo>,
+    /// Minted fresh for every list a commit writes, so a writer whose
+    /// pointer swap went through but whose response was lost can recognise
+    /// its own list on reload. Nil on a list written before tokens.
+    pub commit_token: Uuid,
     /// How superfiles are grouped into manifest parts. Locked
     /// at supertable creation; see
     /// [`crate::supertable::options::SupertableOptions::effective_partition_strategy`]
@@ -235,6 +235,15 @@ pub struct Manifest {
     /// contents are unchanged. Self-invalidating: a cell's fingerprint moves
     /// when its superfiles change, and an unknown cell is simply re-checked.
     pub split_checks: BTreeMap<u32, CellSplitCheck>,
+}
+
+impl Manifest {
+    /// Make this list the next generation: it takes `manifest_id` and a
+    /// fresh commit token.
+    pub(crate) fn start_generation(&mut self, manifest_id: u64) {
+        self.manifest_id = manifest_id;
+        self.commit_token = Uuid::new_v4();
+    }
 }
 
 /// A cached split-check result for one cell. `fingerprint` identifies the
@@ -397,21 +406,6 @@ impl DrainedVersionRanges {
         }
         self.ranges = merged;
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FtsColumnInfo {
-    pub column: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct VectorColumnInfo {
-    pub column: String,
-    pub dim: usize,
-    pub rot_seed: u64,
-    /// `"cosine"`, `"l2sq"`, or `"negdot"` — matches the
-    /// `VectorConfig::metric` shape.
-    pub metric: String,
 }
 
 /// Canonical `k` points the drain calibrates the probe-width law at.
@@ -1358,10 +1352,12 @@ struct ManifestDto {
     format_version: String,
     manifest_id: u64,
     options_hash: String, // "blake3:<64hex>"
-    schema: String,       // base64
+    /// The schema document; a string or null on a list written before it.
+    #[serde(default)]
+    schema: Value,
     id_column: String,
-    fts_columns: Vec<FtsColumnInfo>,
-    vector_columns: Vec<VectorColumnInfoDto>,
+    #[serde(default)]
+    commit_token: Option<String>,
     #[serde(default)]
     vector_index_storage_prefix: Option<String>,
     #[serde(default)]
@@ -1411,35 +1407,6 @@ struct GlobalVectorIndexDto {
     /// Absent on manifests written before the user-side grid existed.
     #[serde(default)]
     user_grid_b64: Option<String>,
-}
-
-// VectorColumnInfo's `dim` is `usize` in memory but JSON should
-// canonicalize as `u64` so round-trip on 32-bit hosts isn't a footgun.
-#[derive(Serialize, Deserialize)]
-struct VectorColumnInfoDto {
-    column: String,
-    dim: u64,
-    rot_seed: u64,
-    metric: String,
-}
-
-impl Serialize for FtsColumnInfo {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut st = s.serialize_struct("FtsColumnInfo", 1)?;
-        use serde::ser::SerializeStruct;
-        st.serialize_field("column", &self.column)?;
-        st.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for FtsColumnInfo {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Inner {
-            column: String,
-        }
-        Inner::deserialize(d).map(|i| Self { column: i.column })
-    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1956,19 +1923,9 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
         format_version: l.format_version.clone(),
         manifest_id: l.manifest_id,
         options_hash: encode_hash(&l.options_hash),
-        schema: encode_b64(&l.schema),
+        schema: l.schema.as_ref().map_or(Value::Null, |s| s.to_json()),
         id_column: l.id_column.clone(),
-        fts_columns: l.fts_columns.clone(),
-        vector_columns: l
-            .vector_columns
-            .iter()
-            .map(|c| VectorColumnInfoDto {
-                column: c.column.clone(),
-                dim: c.dim as u64,
-                rot_seed: c.rot_seed,
-                metric: c.metric.clone(),
-            })
-            .collect(),
+        commit_token: Some(l.commit_token.to_string()),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
         vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
         global_vector_index: l
@@ -2032,7 +1989,18 @@ fn list_from_dto(d: ManifestDto, legacy: &LegacyNames) -> Result<Manifest, ListP
     // A list from before field ids keys its aggregates by column name.
     let legacy = (d.format_version.split('.').next() == Some(FORMAT_MAJOR_NAMED)).then_some(legacy);
     let options_hash = decode_hash(&d.options_hash)?;
-    let schema = decode_b64(&d.schema, "schema")?;
+    let schema = match &d.schema {
+        Value::Object(_) => Some(Arc::new(
+            TableSchema::from_json(&d.schema)
+                .map_err(|e| ListParseError::BadFieldValue("schema", e))?,
+        )),
+        _ => None,
+    };
+    let commit_token = match d.commit_token.as_deref() {
+        None => Uuid::nil(),
+        Some(token) => Uuid::parse_str(token)
+            .map_err(|e| ListParseError::BadFieldValue("commit_token", e.to_string()))?,
+    };
     let mut parts = Vec::with_capacity(d.parts.len());
     for entry in d.parts {
         parts.push(entry_from_dto(entry, legacy)?);
@@ -2043,17 +2011,7 @@ fn list_from_dto(d: ManifestDto, legacy: &LegacyNames) -> Result<Manifest, ListP
         options_hash,
         schema,
         id_column: d.id_column,
-        fts_columns: d.fts_columns,
-        vector_columns: d
-            .vector_columns
-            .into_iter()
-            .map(|c| VectorColumnInfo {
-                column: c.column,
-                dim: c.dim as usize,
-                rot_seed: c.rot_seed,
-                metric: c.metric,
-            })
-            .collect(),
+        commit_token,
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
         vector_index_storage_prefix: d.vector_index_storage_prefix,
         global_vector_index: d
@@ -2763,10 +2721,9 @@ mod tests {
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: Vec::new(),
+            schema: None,
             id_column: "doc_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "doc_id".into(),
                 n_buckets: 64,
@@ -2857,21 +2814,11 @@ mod tests {
         let mut list = empty_list();
         list.manifest_id = 42;
         list.options_hash = ContentHash([0xab; 32]);
-        list.schema = vec![0x01, 0x02, 0x03, 0xff, 0xfe];
-        list.fts_columns = vec![
-            FtsColumnInfo {
-                column: "title".into(),
-            },
-            FtsColumnInfo {
-                column: "body".into(),
-            },
-        ];
-        list.vector_columns = vec![VectorColumnInfo {
-            column: "emb".into(),
-            dim: 384,
-            rot_seed: 7,
-            metric: "cosine".into(),
-        }];
+        list.schema = Some(Arc::new(TableSchema::from_user_schema(&Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("amount", DataType::Int64, true),
+        ]))));
+        list.commit_token = Uuid::from_u128(0xC0FFEE);
         list.partition_strategy = PartitionStrategy::TimeRange {
             column: "ts".into(),
             granularity_secs: 86_400,
@@ -2905,8 +2852,7 @@ mod tests {
         assert_eq!(a.options_hash, b.options_hash);
         assert_eq!(a.schema, b.schema);
         assert_eq!(a.id_column, b.id_column);
-        assert_eq!(a.fts_columns, b.fts_columns);
-        assert_eq!(a.vector_columns, b.vector_columns);
+        assert_eq!(a.commit_token, b.commit_token);
         assert_eq!(a.vector_index_storage_prefix, b.vector_index_storage_prefix);
         assert_eq!(a.partition_strategy, b.partition_strategy);
         assert_eq!(a.parts.len(), b.parts.len());
@@ -3923,8 +3869,7 @@ mod tests {
             "options_hash",
             "schema",
             "id_column",
-            "fts_columns",
-            "vector_columns",
+            "commit_token",
             "vector_index_storage_prefix",
             "partition_strategy",
             "parts",
@@ -3952,15 +3897,29 @@ mod tests {
         );
     }
 
+    /// The schema slot carries the document as JSON and the commit token
+    /// rides next to it; a list written before either (an empty string
+    /// where the document goes, no token) reads back with neither.
     #[test]
-    fn binary_safe_schema_roundtrip() {
-        // Arrow-IPC bytes contain arbitrary u8 — base64 must
-        // preserve the full byte range in both directions.
-        let mut list = empty_list();
-        list.schema = (0u8..=255).collect();
+    fn schema_document_and_commit_token_round_trip_and_default_when_absent() {
+        let list = rich_list(0);
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.schema, list.schema);
+        assert_eq!(decoded.commit_token, Uuid::from_u128(0xC0FFEE));
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["schema"]["fields"][0]["name"], "title");
+
+        let mut legacy = json;
+        legacy["schema"] = serde_json::Value::from("");
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("commit_token");
+        let legacy = serde_json::to_vec(&legacy).expect("json");
+        let decoded = decode(&legacy, &LegacyNames::none()).expect("decode");
+        assert!(decoded.schema.is_none(), "an empty slot is no document");
+        assert!(decoded.commit_token.is_nil());
     }
 
     #[test]
@@ -3968,11 +3927,34 @@ mod tests {
         let list = rich_list(1);
         let bytes = encode(&list).expect("encode");
         let s = from_utf8(&bytes).expect("utf8");
-        let tampered = s.replacen("\"schema\": \"", "\"schema\": \"!!!!", 1);
+        assert!(
+            s.contains("\"min\": \""),
+            "the fixture carries a base64 field"
+        );
+        let tampered = s.replacen("\"min\": \"", "\"min\": \"!!!!", 1);
         let err = decode(tampered.as_bytes(), &LegacyNames::none()).expect_err("must fail");
         assert!(
             matches!(err, ListParseError::Base64 { .. }),
             "expected Base64 error, got {err:?}"
+        );
+    }
+
+    /// A schema document that is an object but not a document is a typed
+    /// error on the slot, never an empty slot.
+    #[test]
+    fn malformed_schema_document_surfaces_typed_error() {
+        let list = rich_list(1);
+        let bytes = encode(&list).expect("encode");
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        json["schema"] = serde_json::json!({ "fields": [] });
+        let err = decode(
+            &serde_json::to_vec(&json).expect("json"),
+            &LegacyNames::none(),
+        )
+        .expect_err("must fail");
+        assert!(
+            matches!(err, ListParseError::BadFieldValue("schema", _)),
+            "expected a schema error, got {err:?}"
         );
     }
 

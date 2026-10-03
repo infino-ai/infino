@@ -263,9 +263,10 @@ impl SupertableInner {
     /// of the current manifest, so the new file bakes — and is scored at
     /// — the corpus average rather than its own.
     pub(super) fn builder_options(&self) -> BuilderOptions {
-        self.options
+        let manifest = self.manifest.load();
+        manifest
             .builder_options()
-            .with_fts_corpus_stats(self.manifest.load().fts_corpus_stats(&HashSet::new()))
+            .with_fts_corpus_stats(manifest.fts_corpus_stats(&HashSet::new()))
     }
 
     /// Runtime driving the sync API's async kernels when the caller
@@ -297,7 +298,7 @@ impl SupertableInner {
     pub(super) fn sql_schemas(&self) -> Arc<SqlSchemas> {
         Arc::clone(
             self.sql_schemas
-                .get_or_init(|| Arc::new(build_sql_schemas(&self.options))),
+                .get_or_init(|| Arc::new(build_sql_schemas(&self.manifest.load()))),
         )
     }
 
@@ -919,7 +920,7 @@ impl Supertable {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn schema(&self) -> SchemaRef {
-        self.inner.options.user_schema()
+        self.inner.manifest.load().user_schema()
     }
 
     /// Cached per-table SQL schemas (scan view + scalar schema).
@@ -1000,7 +1001,7 @@ impl Supertable {
             vcfg.search_mode,
             vcfg.ivf_router,
             vcfg.global_fine_fanout,
-            &self.inner.options.vector_columns,
+            &self.inner.manifest.load().vector_configs(),
         ) else {
             return;
         };
@@ -1660,12 +1661,11 @@ pub(crate) fn hidden_vector_index_compaction_settings(
 /// existing user-table IVF summary. Hidden commits use
 /// [`super::opann`] MVCC maintenance — never call this per commit.
 pub(crate) fn train_global_centroids(
-    user_opts: &SupertableOptions,
     manifest: &super::manifest::ManifestSnapshot,
     n_cells: usize,
 ) -> Option<super::manifest::ClusterCentroids> {
-    let vc = user_opts.vector_columns.first()?;
-    let vc_id = user_opts.field_id(&vc.column)?;
+    let vc = manifest.vector_configs().into_iter().next()?;
+    let vc_id = manifest.field_id(&vc.column)?;
     let mut all_centroids = Vec::new();
     let mut dim = 0usize;
     for entry in manifest.superfiles.iter() {
@@ -1801,7 +1801,7 @@ fn build_vector_index_options(
     }
     if let Some(manifest) = user_manifest
         && let Some(clusters) =
-            train_global_centroids(user_opts, manifest, hidden_vector_cell_count(user_opts))
+            train_global_centroids(manifest, hidden_vector_cell_count(user_opts))
     {
         hidden_opts = hidden_opts.with_partition_strategy(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {

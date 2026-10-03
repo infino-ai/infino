@@ -174,10 +174,9 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
         format_version: LIST_FORMAT_VERSION.into(),
         manifest_id,
         options_hash: ContentHash([0u8; 32]),
-        schema: Vec::new(),
+        schema: None,
         id_column: "doc_id".into(),
-        fts_columns: vec![],
-        vector_columns: vec![],
+        commit_token: Uuid::nil(),
         partition_strategy: PartitionStrategy::Hash {
             column: "doc_id".into(),
             n_buckets: DEFAULT_HASH_N_BUCKETS,

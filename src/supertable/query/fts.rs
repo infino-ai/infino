@@ -668,10 +668,10 @@ impl SupertableReader {
         // full-text section this scan reads and the low-level reader would
         // fail deep in the scan with an opaque missing-metadata error. Reject
         // up front instead, naming the column and the searchable set.
-        let Some(tokenizer) = manifest.options.try_fts_tokenizer_for(column) else {
+        let Some(tokenizer) = manifest.try_fts_tokenizer_for(column) else {
             return Err(QueryError::InvalidQuery(no_fts_index_message(
                 column,
-                &manifest.options.fts_columns,
+                &manifest.fts_configs(),
             )));
         };
 
@@ -1439,10 +1439,10 @@ impl SupertableReader {
         // Prefix expansion lowercases the prefix bytes directly rather than
         // tokenizing, so there is no tokenizer lookup to fold this into — but
         // it is the same single pass over `fts_columns`, once per query.
-        if manifest.options.try_fts_tokenizer_for(column).is_none() {
+        if manifest.try_fts_tokenizer_for(column).is_none() {
             return Err(QueryError::InvalidQuery(no_fts_index_message(
                 column,
-                &manifest.options.fts_columns,
+                &manifest.fts_configs(),
             )));
         }
         let pool_threads = manifest.options.reader_pool.current_num_threads();
@@ -1641,10 +1641,10 @@ impl SupertableReader {
         // Same up-front check as the scored path: without a full-text index
         // on `column` there is no analyzer to parse the query with, and no
         // postings to match it against.
-        let Some(tokenizer) = manifest.options.try_fts_tokenizer_for(column) else {
+        let Some(tokenizer) = manifest.try_fts_tokenizer_for(column) else {
             return Err(QueryError::InvalidQuery(no_fts_index_message(
                 column,
-                &manifest.options.fts_columns,
+                &manifest.fts_configs(),
             )));
         };
         let clauses = tokenizer.parse(query).into_clauses(mode);
@@ -2140,10 +2140,10 @@ impl SupertableReader {
         let manifest = self.manifest();
         // `exact_match` prunes through the column's own term dictionary, so
         // a column with no full-text index has nothing to prune with.
-        let Some(tokenizer) = manifest.options.try_fts_tokenizer_for(column) else {
+        let Some(tokenizer) = manifest.try_fts_tokenizer_for(column) else {
             return Err(QueryError::InvalidQuery(no_fts_index_message(
                 column,
-                &manifest.options.fts_columns,
+                &manifest.fts_configs(),
             )));
         };
         let term_strings: Vec<String> = tokenizer.tokenize(value).collect();
@@ -2852,12 +2852,12 @@ impl Supertable {
     /// have one.
     pub fn tokenize(&self, column: &str, text: &str) -> Result<Vec<String>, InfinoError> {
         let reader = self.reader()?;
-        let options = reader.options();
-        let Some(tokenizer) = options.try_fts_tokenizer_for(column) else {
+        let manifest = reader.manifest();
+        let Some(tokenizer) = manifest.try_fts_tokenizer_for(column) else {
             return Err(
                 InfinoError::from(QueryError::InvalidQuery(no_fts_index_message(
                     column,
-                    &options.fts_columns,
+                    &manifest.fts_configs(),
                 )))
                 .with_context("tokenize", None),
             );
@@ -2996,7 +2996,7 @@ mod tests {
             Supertable, SupertableOptions,
             error::QueryError,
             manifest::{SuperfileEntry, SuperfileUri},
-            options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+            schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         },
     };
 

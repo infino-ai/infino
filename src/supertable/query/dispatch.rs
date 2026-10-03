@@ -553,7 +553,7 @@ impl FanoutContext {
             store: Arc::clone(&manifest.options.store),
             disk_cache: manifest.options.disk_cache.as_ref().map(Arc::clone),
             storage: manifest.options.storage.as_ref().map(Arc::clone),
-            vector_columns: Arc::new(manifest.options.vector_columns.clone()),
+            vector_columns: Arc::new(manifest.vector_configs()),
             tombstone_cache,
             op_stats: reader.op_stats.clone(),
             now,

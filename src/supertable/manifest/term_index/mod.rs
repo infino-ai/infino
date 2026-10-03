@@ -57,8 +57,10 @@ use crate::{
     storage::{StorageError, StorageProvider},
     superfile::fts::{bm25::idf as bm25_idf, reader::BoolMode},
     supertable::{
-        manifest::{RoutingRef, SuperfileEntry, disk_cache::ManifestDiskCache, part::ContentHash},
-        options::SupertableOptions,
+        manifest::{
+            ManifestSnapshot, RoutingRef, SuperfileEntry, disk_cache::ManifestDiskCache,
+            part::ContentHash,
+        },
         query::prune::PruneLeaf,
         schema::FieldId,
     },
@@ -410,7 +412,7 @@ impl TermIndex {
     pub(crate) async fn route_leaf(
         &self,
         leaf: &PruneLeaf,
-        options: &SupertableOptions,
+        snapshot: &ManifestSnapshot,
     ) -> Option<HashSet<Uuid>> {
         match leaf {
             PruneLeaf::TermPresence {
@@ -418,12 +420,12 @@ impl TermIndex {
                 terms,
                 mode,
             } if !terms.is_empty() => {
-                let column = options.field_id(column)?;
+                let column = snapshot.field_id(column)?;
                 let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
                 self.route(column, &refs, *mode).await.ok()
             }
             PruneLeaf::Prefix { column, prefix } => {
-                let column = options.field_id(column)?;
+                let column = snapshot.field_id(column)?;
                 let prefix = std::str::from_utf8(prefix).ok()?;
                 self.route_prefix(column, prefix).await.ok()
             }
@@ -710,7 +712,11 @@ mod tests {
     use super::*;
     use crate::{
         storage::LocalFsStorageProvider,
-        supertable::{query::prune::select_superfiles, schema::TableSchema},
+        supertable::{
+            manifest::{commit::read_pointer, list, options_hash::compute_options_hash},
+            query::prune::select_superfiles,
+            schema::{LegacyNames, TableSchema},
+        },
         test_helpers::{
             copy_dir_recursive, fid, old_format_fts_fixture, open_old_format_fts_fixture,
         },
@@ -1081,6 +1087,25 @@ mod tests {
     }
 
     /// The live superfile ids and the root's covered set, for comparison.
+    /// The list the table's pointer names right now, decoded.
+    fn current_list(
+        storage: &Arc<dyn StorageProvider>,
+        legacy: &LegacyNames,
+        rt: &tokio::runtime::Runtime,
+    ) -> list::Manifest {
+        rt.block_on(async {
+            let (pointer, _) = read_pointer(storage.as_ref())
+                .await
+                .expect("pointer")
+                .expect("the table has a pointer");
+            let (bytes, _) = storage
+                .get(&pointer.manifest_uri)
+                .await
+                .expect("list bytes");
+            list::decode(&bytes, legacy).expect("decode")
+        })
+    }
+
     fn live_and_covered(
         st: &crate::supertable::Supertable,
         storage: &Arc<dyn StorageProvider>,
@@ -3144,6 +3169,56 @@ mod tests {
             shared.len(),
             live.len(),
             "`shared` is in every fixture superfile, filed under `title`'s id"
+        );
+    }
+
+    /// A table written before the list carried the schema leaves that
+    /// state on its first commit under this engine: the list it writes is
+    /// at the current format, carries the schema document (the fixture's
+    /// one column, minted id 1), bears a commit token, and is stamped with
+    /// the identity hash rather than the creation-record hash it opened
+    /// under.
+    #[test]
+    fn an_old_table_s_first_commit_writes_the_schema_into_the_list() {
+        let fixture = old_format_fts_fixture();
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&fixture, dir.path());
+        let (storage, st) = open_old_format(dir.path(), |o| o);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let options = Arc::clone(st.reader().expect("reader").options());
+        let legacy = options.legacy_names();
+
+        let before = current_list(&storage, &legacy, &rt);
+        assert!(
+            before.format_version.starts_with("1."),
+            "the fixture's list predates the schema slot: {}",
+            before.format_version
+        );
+        assert!(before.schema.is_none());
+        assert!(before.commit_token.is_nil());
+
+        commit_segment(&st, 3);
+
+        let after = current_list(&storage, &legacy, &rt);
+        assert!(
+            after.format_version.starts_with("2."),
+            "{}",
+            after.format_version
+        );
+        let schema = after
+            .schema
+            .as_ref()
+            .expect("the first commit fills the schema slot");
+        assert_eq!(schema.id_of("title"), Some(FieldId(1)));
+        assert_eq!(schema.schema_id(), 1);
+        assert!(!after.commit_token.is_nil());
+        assert_eq!(
+            after.options_hash,
+            compute_options_hash(&options, &after.partition_strategy)
+        );
+        assert_ne!(
+            after.options_hash, before.options_hash,
+            "the identity hash replaces the creation-record hash"
         );
     }
 

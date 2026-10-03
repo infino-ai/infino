@@ -1,7 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! `SupertableOptions` — the immutable per-supertable configuration.
+//! `SupertableOptions` — the immutable per-handle configuration.
+//!
+//! ## What the options are, and are not
+//!
+//! The options carry what a caller must supply to open a table (its id
+//! column and partition strategy — the identity the manifest list's hash
+//! verifies), the runtime knobs (pools, caches, consistency, thresholds),
+//! and the *creation seed*: the schema and index configs the table is
+//! created with. Once a table exists, the manifest list is the authority
+//! for its schema and index config: `ManifestSnapshot::table_schema` and
+//! the accessors beside it are what every read and write path consults.
+//! The seed is read to create the table, and to open a list written before
+//! the list carried a schema.
 //!
 //! ## Shape
 //!
@@ -45,7 +57,7 @@ use std::{
     time::Duration,
 };
 
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Schema};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
@@ -66,17 +78,14 @@ use crate::{
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
-        fts::{
-            analysis::{Base, chain_tokenizer},
-            tokenize::{Tokenizer, tokenizer_for_name},
-        },
+        fts::tokenize::tokenizer_for_name,
         vector::layout::VectorLayout,
     },
     supertable::{
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
-        schema::{FieldId, TableSchema},
+        schema::TableSchema,
         slow_vector_state::{CentroidSection, ResidentVectorIndex},
         wal::pipeline::DEFAULT_MAX_SEALED_RETRIES,
     },
@@ -191,20 +200,6 @@ fn shared_writer_pool() -> Arc<ThreadPool> {
 fn default_id_column() -> String {
     "_id".to_string()
 }
-
-/// Arrow / Parquet decimal precision for the id column. 38 is
-/// the maximum precision a `Decimal128` can carry — covers
-/// every possible 128-bit value without truncation, lets
-/// Parquet annotate the column as `DECIMAL(38, 0)`, and
-/// preserves byte-comparable / numerically-comparable sort
-/// order against the underlying `i128`.
-pub(crate) const DECIMAL128_PRECISION: u8 = 38;
-
-/// Scale of zero — the id column carries integers, not
-/// fractions. With precision 38 and scale 0, the column
-/// behaves as a signed 128-bit integer for both Arrow's
-/// comparison kernels and Parquet's stats encoding.
-pub(crate) const DECIMAL128_SCALE: i8 = 0;
 
 /// Default bounded-staleness window for read consistency — how long
 /// a hot query may reuse a manifest pointer before re-checking.
@@ -779,7 +774,11 @@ impl SupertableOptions {
         let writer_pool = shared_writer_pool();
         let store: Arc<dyn SuperfileReaderCache> = Arc::new(InMemoryReaderCache::new());
 
-        let table_schema = Arc::new(TableSchema::from_user_schema(&schema));
+        let table_schema = Arc::new(TableSchema::from_options(
+            &schema,
+            &fts_columns,
+            &vector_columns,
+        ));
         Ok(Self {
             schema,
             table_schema,
@@ -825,29 +824,6 @@ impl SupertableOptions {
             user_cell_count: None,
             hidden_cell_count: None,
         })
-    }
-
-    /// Schema as the user supplied it — the shape that
-    /// `Supertable::append`'s callers build their batches
-    /// against. By contract the user schema never contains
-    /// the id column; the supertable injects it at append
-    /// time.
-    pub fn user_schema(&self) -> Arc<Schema> {
-        Arc::clone(&self.schema)
-    }
-
-    /// Schema with the id column prepended — what the writer's
-    /// commit path hands to `SuperfileBuilder` and what Parquet
-    /// stores.
-    pub fn effective_schema(&self) -> Arc<Schema> {
-        let mut fields = vec![Arc::new(Field::new(
-            &self.id_column,
-            DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
-            false,
-        ))];
-        fields.extend(self.schema.fields().iter().cloned());
-        self.table_schema
-            .stamp_field_ids(&Schema::new(fields), &self.id_column)
     }
 
     /// Resolve the effective partition strategy for this
@@ -927,23 +903,6 @@ impl SupertableOptions {
     pub fn with_storage(mut self, storage: Arc<dyn StorageProvider>) -> Self {
         self.storage = Some(storage);
         self
-    }
-
-    /// Tokenizer configured for `column`, or `None` when `column` carries
-    /// no full-text index — a `None` return is exactly the "column is not
-    /// full-text-indexed" signal, which lets a search path reject up front
-    /// instead of failing deep in the scan. Resolves the column's analyzer
-    /// name from its `FtsConfig` (validated at construction, so the
-    /// resolution cannot fail for a registered column). The lookup is a
-    /// single pass over `fts_columns`.
-    pub fn try_fts_tokenizer_for(&self, column: &str) -> Option<Arc<dyn Tokenizer>> {
-        let cfg = self.fts_columns.iter().find(|c| c.column == column)?;
-        // The whole chain, not the base: every caller here tokenizes
-        // query-side text — search terms, an equality literal, a `LIKE`
-        // fragment — and must produce the forms the column was indexed
-        // under.
-        let base = Base::from_name(&cfg.analyzer)?;
-        Some(chain_tokenizer(base, cfg.stopwords, cfg.stemmer))
     }
 
     /// Attach a disk cache for storage-backed reads.
@@ -1317,107 +1276,27 @@ impl SupertableOptions {
         self.vector_layout = layout;
         self
     }
+}
 
-    /// Construct a `superfile::BuilderOptions` for one rayon
-    /// shard worker at commit time. The shard worker constructs
-    /// its own `SuperfileBuilder` from this and feeds its slice
-    /// of buffered batches into it.
-    ///
-    /// Differences from a "natural" superfile config:
-    /// - Schema is the **scalar-only** schema
-    ///   ([`SupertableOptions::scalar_schema`]) — vector columns
-    ///   live in the embedded vector blob, never in Parquet.
-    ///   The id column is prepended (Decimal128(38, 0)).
-    pub fn builder_options(&self) -> BuilderOptions {
-        BuilderOptions::new(
-            self.scalar_schema(),
-            self.id_column.clone(),
-            self.fts_columns.clone(),
-            self.vector_columns.clone(),
-        )
-        .with_vector_layout(self.vector_layout)
-        .with_schema_id(self.table_schema.schema_id())
-    }
-
-    /// Effective scalar-only schema — the user's columns with
-    /// vector columns projected out *and* the supertable-
-    /// injected id column prepended. This is what the
-    /// underlying `SuperfileBuilder` sees at ingest.
-    ///
-    /// Vectors live in the embedded vector blob, never in
-    /// Parquet, so they don't appear here. The id column is
-    /// always first. Index-only FTS columns DO appear here —
-    /// their text must reach the builder to be tokenized —
-    /// but the builder drops them from the Parquet body, so
-    /// the readable shape is [`Self::stored_schema`].
-    ///
-    /// Cost is one schema-walk + one `Vec::clone` of the
-    /// surviving fields per call. Caching on first call is a
-    /// future optimization if benches show this on the hot
-    /// path.
-    pub fn scalar_schema(&self) -> Arc<Schema> {
-        let vector_names: HashSet<&str> = self
-            .vector_columns
-            .iter()
-            .map(|vc| vc.column.as_str())
-            .collect();
-        let mut kept: Vec<Arc<Field>> = Vec::with_capacity(self.schema.fields().len() + 1);
-        kept.push(Arc::new(Field::new(
-            &self.id_column,
-            DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
-            false,
-        )));
-        kept.extend(
-            self.schema
-                .fields()
-                .iter()
-                .filter(|f| !vector_names.contains(f.name().as_str()))
-                .cloned(),
-        );
-        self.table_schema
-            .stamp_field_ids(&Schema::new(kept), &self.id_column)
-    }
-
-    /// The readable (stored) schema — [`Self::scalar_schema`] minus
-    /// index-only FTS columns (`stored: false`). Index-only text feeds
-    /// the FTS blob at ingest but never lands in Parquet, so it cannot
-    /// be scanned, projected, or filtered on; the SQL scan view and the
-    /// search-result projection surface resolve names against this
-    /// shape so such a column is rejected up front like any unknown
-    /// column, instead of failing mid-decode.
-    pub fn stored_schema(&self) -> Arc<Schema> {
-        let unstored: HashSet<&str> = self
-            .fts_columns
-            .iter()
-            .filter(|fc| !fc.stored)
-            .map(|fc| fc.column.as_str())
-            .collect();
-        let scalar = self.scalar_schema();
-        if unstored.is_empty() {
-            return scalar;
-        }
-        let kept: Vec<Arc<Field>> = scalar
-            .fields()
-            .iter()
-            .filter(|f| !unstored.contains(f.name().as_str()))
-            .cloned()
-            .collect();
-        Arc::new(Schema::new(kept))
-    }
+/// Builder options for a superfile of a table whose schema is `schema`
+/// and whose identity and layout knobs are `options`': the Parquet body
+/// holds the scalar schema, the indexes are the schema's, and the file
+/// records the schema generation it was written under.
+pub(crate) fn builder_options_for(
+    schema: &TableSchema,
+    options: &SupertableOptions,
+) -> BuilderOptions {
+    BuilderOptions::new(
+        schema.scalar_schema(&options.id_column),
+        options.id_column.clone(),
+        schema.fts_configs(),
+        schema.vector_configs(),
+    )
+    .with_vector_layout(options.vector_layout)
+    .with_schema_id(schema.schema_id())
 }
 
 impl SupertableOptions {
-    /// The stable id of `column`: a user column's id, or
-    /// [`FieldId::ID_COLUMN`] for the injected id column. `None` for a name
-    /// the table does not have.
-    pub(crate) fn field_id(&self, column: &str) -> Option<FieldId> {
-        if column == self.id_column {
-            Some(FieldId::ID_COLUMN)
-        } else {
-            self.table_schema.id_of(column)
-        }
-    }
-
     /// The name resolver for parts and lists written before field ids.
     pub(crate) fn legacy_names(&self) -> crate::supertable::schema::LegacyNames {
         crate::supertable::schema::LegacyNames::new(
@@ -1462,7 +1341,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::superfile::vector::{distance::Metric, rerank_codec::RerankCodec};
+    use crate::{
+        superfile::vector::{distance::Metric, rerank_codec::RerankCodec},
+        supertable::schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+    };
 
     fn fixed_list_f32(dim: usize) -> DataType {
         DataType::FixedSizeList(
@@ -1748,7 +1630,7 @@ mod tests {
         let s = schema_with_vector(16);
         let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
-        let scalar = opts.scalar_schema();
+        let scalar = opts.table_schema.scalar_schema(&opts.id_column);
         let names: Vec<_> = scalar.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["_id", "title"]);
         // _id field is `Decimal128(38, 0)`.
@@ -1767,7 +1649,7 @@ mod tests {
             false,
         )]));
         let opts = SupertableOptions::new(s, vec![fc("title")], vec![]).expect("valid options");
-        let scalar = opts.scalar_schema();
+        let scalar = opts.table_schema.scalar_schema(&opts.id_column);
         let names: Vec<_> = scalar.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["_id", "title"]);
     }
@@ -1777,7 +1659,7 @@ mod tests {
         let s = schema_with_vector(16);
         let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
-        let eff = opts.effective_schema();
+        let eff = opts.table_schema.effective_schema(&opts.id_column);
         let names: Vec<_> = eff.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["_id", "title", "emb"]);
     }
@@ -1787,7 +1669,7 @@ mod tests {
         let s = schema_with_vector(16);
         let opts = SupertableOptions::new(Arc::clone(&s), vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
-        let us = opts.user_schema();
+        let us = opts.table_schema.user_schema();
         assert_eq!(us.fields().len(), s.fields().len());
         for (a, b) in us.fields().iter().zip(s.fields().iter()) {
             assert_eq!(a.name(), b.name());
@@ -1803,7 +1685,7 @@ mod tests {
             .expect("override accepted");
         assert_eq!(opts.id_column, "row_id");
         // effective_schema now uses the new name.
-        let eff = opts.effective_schema();
+        let eff = opts.table_schema.effective_schema(&opts.id_column);
         assert_eq!(eff.field(0).name(), "row_id");
     }
 
@@ -1906,7 +1788,7 @@ supertable:
     fn stored_schemas_carry_field_ids_and_the_user_schema_does_not() {
         use crate::supertable::schema::{FieldId, field_id_of};
         let opts = plain_opts();
-        for f in opts.user_schema().fields() {
+        for f in opts.table_schema.user_schema().fields() {
             assert_eq!(
                 field_id_of(f),
                 None,
@@ -1914,7 +1796,7 @@ supertable:
                 f.name()
             );
         }
-        let scalar = opts.scalar_schema();
+        let scalar = opts.table_schema.scalar_schema(&opts.id_column);
         assert_eq!(field_id_of(scalar.field(0)), Some(FieldId::ID_COLUMN));
         for (i, f) in scalar.fields().iter().skip(1).enumerate() {
             assert_eq!(
@@ -1924,10 +1806,10 @@ supertable:
                 f.name()
             );
         }
-        let effective = opts.effective_schema();
+        let effective = opts.table_schema.effective_schema(&opts.id_column);
         assert_eq!(field_id_of(effective.field(0)), Some(FieldId::ID_COLUMN));
         assert_eq!(field_id_of(effective.field(1)), Some(FieldId(1)));
-        assert_eq!(opts.builder_options().schema_id, 1);
+        assert_eq!(builder_options_for(&opts.table_schema, &opts).schema_id, 1);
     }
 
     fn plain_opts() -> SupertableOptions {
@@ -2088,7 +1970,7 @@ supertable:
         let s = schema_with_vector(16);
         let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
-        let bo = opts.builder_options();
+        let bo = builder_options_for(&opts.table_schema, &opts);
         // builder_options carries the scalar-only schema (vectors
         // dropped, id prepended) and the same id column + role configs.
         let names: Vec<_> = bo

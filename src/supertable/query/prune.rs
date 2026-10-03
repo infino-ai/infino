@@ -42,7 +42,6 @@ use crate::{
             part::PartId,
             term_index::TermIndex,
         },
-        options::SupertableOptions,
         query::skip::{
             ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip, null_check_may_match,
             null_check_skip, scalar_skip, scalar_value_may_match, scalar_value_set_skip,
@@ -89,7 +88,7 @@ impl PruneLeaf {
     pub(crate) fn keep_parts(
         &self,
         list: &Manifest,
-        options: &SupertableOptions,
+        manifest: &ManifestSnapshot,
     ) -> Option<Vec<PartId>> {
         let all = || {
             list.parts
@@ -103,32 +102,32 @@ impl PruneLeaf {
                 terms,
                 mode,
             } => {
-                let Some(id) = options.field_id(column) else {
+                let Some(id) = manifest.field_id(column) else {
                     return Some(all());
                 };
                 let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
                 Some(prune_parts_for_fts_terms(list, id, &refs, *mode))
             }
             PruneLeaf::Prefix { column, prefix } => {
-                let Some(id) = options.field_id(column) else {
+                let Some(id) = manifest.field_id(column) else {
                     return Some(all());
                 };
                 Some(prune_parts_for_fts_prefix(list, id, prefix))
             }
             PruneLeaf::Scalar(pred) => {
-                let Some(id) = options.field_id(&pred.column) else {
+                let Some(id) = manifest.field_id(&pred.column) else {
                     return Some(all());
                 };
                 Some(scalar_keep_parts(list, id, pred))
             }
             PruneLeaf::ScalarValueSet { column, values } => {
-                let Some(id) = options.field_id(column) else {
+                let Some(id) = manifest.field_id(column) else {
                     return Some(all());
                 };
                 Some(scalar_value_set_keep_parts(list, id, values))
             }
             PruneLeaf::NullCheck { column, want_null } => {
-                let Some(id) = options.field_id(column) else {
+                let Some(id) = manifest.field_id(column) else {
                     return Some(all());
                 };
                 Some(null_check_keep_parts(list, id, *want_null))
@@ -212,13 +211,13 @@ async fn with_routing(
     superfiles: &[Arc<SuperfileEntry>],
     index: Option<&TermIndex>,
     leaf: &PruneLeaf,
-    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
     fallback: Vec<bool>,
 ) -> Vec<bool> {
     let Some(index) = index else {
         return fallback;
     };
-    let Some(routed) = index.route_leaf(leaf, options).await else {
+    let Some(routed) = index.route_leaf(leaf, manifest).await else {
         return fallback;
     };
     superfiles
@@ -294,7 +293,7 @@ pub(crate) async fn select_superfiles(
                         &superfiles,
                         term_index.as_deref(),
                         leaf,
-                        &manifest.options,
+                        manifest,
                         summaries,
                     )
                     .await,
@@ -311,7 +310,7 @@ pub(crate) async fn select_superfiles(
                         &superfiles,
                         term_index.as_deref(),
                         leaf,
-                        &manifest.options,
+                        manifest,
                         summaries,
                     )
                     .await,
@@ -372,7 +371,7 @@ mod tests {
     /// The id a test column resolves to through the table these tests
     /// open; a name the table lacks gets a stable id no entry carries.
     fn fid(name: &str) -> FieldId {
-        opts_title_fts()
+        ManifestSnapshot::empty(opts_title_fts())
             .field_id(name)
             .unwrap_or_else(|| crate::test_helpers::fid(name))
     }
@@ -460,10 +459,9 @@ mod tests {
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
-            schema: Vec::new(),
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 64,
