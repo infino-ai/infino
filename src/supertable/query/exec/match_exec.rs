@@ -594,7 +594,7 @@ mod tests {
     fn reader_and_schemas() -> (Arc<SupertableReader>, Arc<Schema>, Arc<Schema>) {
         let st = demo();
         let reader = Arc::new(st.reader().expect("reader"));
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
         (reader, scalar_schema, output_schema)
     }
@@ -717,7 +717,7 @@ mod tests {
         use crate::supertable::query::exec::common::test_support::call_tvf;
         let st = demo();
         let reader = Arc::new(st.reader().expect("reader"));
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let tf = TokenMatchFunc::new(Arc::clone(&reader), Arc::clone(&scalar_schema));
         // 1 arg → error; 2 args → ok.
         assert!(call_tvf(&tf, &[]).is_err(), "0 args must fail");
@@ -738,7 +738,7 @@ mod tests {
 
         let st = demo();
         let reader = Arc::new(st.reader().expect("reader"));
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let func = TokenMatchFunc::new(reader, scalar_schema);
         let table = call_tvf(&func, &[lit("title"), lit("rust")]).expect("match table");
 

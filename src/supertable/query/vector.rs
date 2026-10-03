@@ -1242,7 +1242,7 @@ fn decode_centroid_router_section(
 /// drain/compaction settle so the graph is published once per generation,
 /// `mmap`-loaded identically on every node and after a restart.
 pub(crate) async fn compose_centroid_router_section(
-    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
     section: &crate::supertable::slow_vector_state::CentroidSection,
     column: &str,
@@ -1251,7 +1251,8 @@ pub(crate) async fn compose_centroid_router_section(
     if entries.is_empty() {
         return None;
     }
-    let metric = column_metric(&options.vector_columns, column)?;
+    let options = &manifest.options;
+    let metric = column_metric(&manifest.vector_configs(), column)?;
     let readers = match open_readers_from_options(options, entries).await {
         Ok(readers) => readers,
         Err(error) => {
@@ -1259,7 +1260,7 @@ pub(crate) async fn compose_centroid_router_section(
             return None;
         }
     };
-    let column_id = options.field_id(column)?;
+    let column_id = manifest.field_id(column)?;
     let router =
         match build_centroid_router(entries, &readers, column, column_id, section, dim, metric) {
             Ok(router) => router,
@@ -3818,7 +3819,7 @@ impl SupertableReader {
         // right latency. The resident scorer knows which metric it serves (the
         // fixed grid serves Cosine; a fitted ruler serves its own metric).
         let served = data.scorer.served_metric();
-        let declared = column_metric(&self.manifest().options.vector_columns, column);
+        let declared = column_metric(&self.manifest().vector_configs(), column);
         if declared != Some(served) {
             return Ok(IndexOutcome::Unavailable(
                 IndexUnavailable::MetricMismatch {
@@ -4184,7 +4185,7 @@ impl SupertableReader {
         fanout: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
-        let metric = column_metric(&manifest.options.vector_columns, column).ok_or_else(|| {
+        let metric = column_metric(&manifest.vector_configs(), column).ok_or_else(|| {
             QueryError::Execute(format!("global-fine: unknown vector column `{column}`"))
         })?;
         let section = self.centroid_section().await.ok_or_else(|| {
@@ -4414,7 +4415,8 @@ impl SupertableReader {
         readers: &[Arc<SuperfileReader>],
         section: &CentroidSection,
     ) -> Result<Arc<StampedCentroidRouter>, QueryError> {
-        let options = &self.manifest().options;
+        let manifest = self.manifest();
+        let options = &manifest.options;
         let is_fresh = |entry: &StampedCentroidRouter| {
             entry.generation == generation && entry.column == column
         };
@@ -4435,7 +4437,7 @@ impl SupertableReader {
         {
             Some(graph) => graph,
             None => {
-                let column_id = options.field_id(column).ok_or_else(|| {
+                let column_id = manifest.field_id(column).ok_or_else(|| {
                     QueryError::Execute(format!("unknown vector column `{column}`"))
                 })?;
                 build_centroid_router(superfiles, readers, column, column_id, section, dim, metric)?
@@ -5944,7 +5946,7 @@ impl SupertableReader {
         // postings AND the manifest term blooms). A non-FTS filter column
         // matches nothing; no tokens (empty / punctuation-only) ⇒
         // nothing matches.
-        let Some(tokenizer) = manifest.options.try_fts_tokenizer_for(filter.column) else {
+        let Some(tokenizer) = manifest.try_fts_tokenizer_for(filter.column) else {
             return Ok(Vec::new());
         };
         let tokens: Vec<String> = tokenizer.tokenize(filter.query).collect();
@@ -6142,8 +6144,7 @@ impl SupertableReader {
         plan: &CandidatePlan,
     ) -> Result<CandidateScope, QueryError> {
         let manifest = self.manifest();
-        let leaves =
-            prune_leaves_for_filters(&manifest.options, &self.options().scalar_schema(), filters);
+        let leaves = prune_leaves_for_filters(manifest, &self.manifest().scalar_schema(), filters);
         let mut superfiles = select_superfiles(manifest, &leaves).await?;
         if let Some(surviving) = plan.surviving_superfile_ids(manifest).await? {
             superfiles.retain(|e| surviving.contains(&e.superfile_id.as_u128()));
@@ -8493,8 +8494,8 @@ mod tests {
             Field::new(
                 "_id",
                 DataType::Decimal128(
-                    crate::supertable::options::DECIMAL128_PRECISION,
-                    crate::supertable::options::DECIMAL128_SCALE,
+                    crate::supertable::schema::DECIMAL128_PRECISION,
+                    crate::supertable::schema::DECIMAL128_SCALE,
                 ),
                 false,
             ),
@@ -8517,8 +8518,8 @@ mod tests {
 
         let ids = arrow_array::Decimal128Array::from((0..n_total as i128).collect::<Vec<_>>())
             .with_precision_and_scale(
-                crate::supertable::options::DECIMAL128_PRECISION,
-                crate::supertable::options::DECIMAL128_SCALE,
+                crate::supertable::schema::DECIMAL128_PRECISION,
+                crate::supertable::schema::DECIMAL128_SCALE,
             )
             .expect("decimal128");
         let titles =
@@ -8569,8 +8570,8 @@ mod tests {
             Field::new(
                 "_id",
                 DataType::Decimal128(
-                    crate::supertable::options::DECIMAL128_PRECISION,
-                    crate::supertable::options::DECIMAL128_SCALE,
+                    crate::supertable::schema::DECIMAL128_PRECISION,
+                    crate::supertable::schema::DECIMAL128_SCALE,
                 ),
                 false,
             ),
@@ -8592,8 +8593,8 @@ mod tests {
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         let id_arr = Decimal128Array::from(ids.to_vec())
             .with_precision_and_scale(
-                crate::supertable::options::DECIMAL128_PRECISION,
-                crate::supertable::options::DECIMAL128_SCALE,
+                crate::supertable::schema::DECIMAL128_PRECISION,
+                crate::supertable::schema::DECIMAL128_SCALE,
             )
             .expect("decimal128");
         let titles = LargeStringArray::from(
@@ -9237,7 +9238,8 @@ mod tests {
         let opts = Arc::new(options_one_superfile_per_commit(DIM as usize));
         let mut entry = synthetic_entry(sf_id);
         entry.vector_summary.insert(
-            opts.field_id(column)
+            ManifestSnapshot::empty(Arc::clone(&opts))
+                .field_id(column)
                 .expect("the table declares the column"),
             VectorSummary {
                 centroid: vec![0.0; DIM as usize],
@@ -12249,7 +12251,7 @@ mod tests {
         let fts_cols: HashSet<&str> = HashSet::from(["title"]);
         let filters = [col("title").eq(lit("doc"))];
         let plan = CandidatePlan::from_filters(&filters, &fts_cols, &|col| {
-            manifest.options.try_fts_tokenizer_for(col)
+            manifest.try_fts_tokenizer_for(col)
         });
 
         let mut q = vec![0.0f32; dim];

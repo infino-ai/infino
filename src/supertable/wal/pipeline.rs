@@ -77,14 +77,13 @@ use crate::{
     storage::StorageError,
     superfile::{ReadError, SuperfileReader, builder::SuperfileBuilder},
     supertable::{
-        ManifestSnapshot, SupertableOptions,
+        ManifestSnapshot,
         error::CommitError as ManifestCommitError,
         handle::{Supertable, SupertableInner},
-        manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary},
-        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+        manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri},
         query::superfile_reader::superfile_reader,
         reader_cache::ReadIntent,
-        schema::{FieldId, PhysicalSchema},
+        schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, PhysicalSchema},
         utils::vector_split::split_vectors,
         wal::{
             persistence::{Etag, WalStore, WalStoreError},
@@ -95,8 +94,8 @@ use crate::{
             tombstones_codec::TombstonesSidecar,
         },
         writer::{
-            CommitListMetadata, build_column_vector_summary, build_fts_summary,
-            build_packed_update_superfile, build_subsection_offsets, build_term_contribution,
+            CommitListMetadata, build_fts_summary, build_packed_update_superfile,
+            build_subsection_offsets, build_term_contribution, build_vector_summary,
             owned_vector_arrays, persist_commit, read_vector_layout_from_bytes,
             stamp_tombstone_seqs,
         },
@@ -405,13 +404,12 @@ async fn do_apply(
     // Vector slices are zero-copy views into `user_batch`'s
     // buffers; we hold `user_batch` alive across the
     // `builder.add_batch` call below.
+    let manifest = inner.manifest.load();
     let (scalar_no_id, vector_slices) =
-        split_vectors(&user_batch, &inner.options).map_err(|e| {
-            AppendPhaseError::SuperfileBuild {
-                message: format!("vector_split: {e}"),
-            }
+        split_vectors(&user_batch, &manifest).map_err(|e| AppendPhaseError::SuperfileBuild {
+            message: format!("vector_split: {e}"),
         })?;
-    let scalar_with_id = prepend_id_column(&scalar_no_id, &flat_ids, &inner.options)?;
+    let scalar_with_id = prepend_id_column(&scalar_no_id, &flat_ids, &manifest)?;
 
     // ---- Step 4: Build the superfile bytes ----
     //
@@ -433,7 +431,7 @@ async fn do_apply(
     // carries the collector into `fanout_shards_metered`, which already
     // brackets each shard on its own pool worker — bracketing the pool
     // closure as well would count that CPU twice.
-    let bytes = if inner.options.vector_columns.is_empty() {
+    let bytes = if manifest.vector_configs().is_empty() {
         timed_kernel(&op_stats, || {
             let mut builder = SuperfileBuilder::new(inner.builder_options()).map_err(|e| {
                 AppendPhaseError::SuperfileBuild {
@@ -453,7 +451,7 @@ async fn do_apply(
             Ok::<_, AppendPhaseError>(Bytes::from(raw))
         })?
     } else {
-        let vectors = owned_vector_arrays(&user_batch, &inner.options).map_err(|e| {
+        let vectors = owned_vector_arrays(&user_batch, &manifest).map_err(|e| {
             AppendPhaseError::SuperfileBuild {
                 message: format!("vector handles: {e}"),
             }
@@ -486,21 +484,20 @@ async fn do_apply(
         .map_err(|e| AppendPhaseError::SuperfileOpenForSummary {
             message: e.to_string(),
         })?;
-    let fts_summary = build_fts_summary(&reader, &inner.options);
-    let vector_summary = build_vector_summary(&reader, &inner.options);
+    let fts_summary = build_fts_summary(&reader, &manifest);
+    let vector_summary = build_vector_summary(&reader, &manifest);
     // The replacement superfile's postings go into the term index in the
     // same commit as its entry, exactly as an appended superfile's do.
     let term_contribution = build_term_contribution(
         &reader,
-        &inner.options,
+        &manifest,
         preallocated_superfile_id,
         if flat_ids.is_empty() { 0 } else { flat_ids[0] },
     )
     .map_err(|e| AppendPhaseError::SuperfileBuild {
         message: format!("term index contribution: {e}"),
     })?;
-    let scalar_stats =
-        ScalarStatsAgg::from_batches(&inner.options.scalar_schema(), &[&scalar_with_id]);
+    let scalar_stats = ScalarStatsAgg::from_batches(&manifest.scalar_schema(), &[&scalar_with_id]);
 
     let (id_min, id_max) = if flat_ids.is_empty() {
         (0, 0)
@@ -638,7 +635,7 @@ fn decode_ipc_batch(
 fn prepend_id_column(
     scalar_no_id: &RecordBatch,
     flat_ids: &[i128],
-    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
 ) -> Result<RecordBatch, AppendPhaseError> {
     let id_values: Vec<i128> = flat_ids.to_vec();
     let id_array = Decimal128Array::from(id_values)
@@ -651,33 +648,11 @@ fn prepend_id_column(
     columns.push(Arc::new(id_array));
     columns.extend(scalar_no_id.columns().iter().cloned());
 
-    RecordBatch::try_new(options.scalar_schema(), columns).map_err(|e| {
+    RecordBatch::try_new(manifest.scalar_schema(), columns).map_err(|e| {
         AppendPhaseError::SuperfileBuild {
             message: format!("RecordBatch::try_new with _id prepended: {e}"),
         }
     })
-}
-
-/// Per-vector-column centroid summary (fp32 + 1-bit admit slab; see
-/// [`build_column_vector_summary`]). `None` from the reader → column
-/// absent from this superfile's vector blob → no entry in the map.
-fn build_vector_summary(
-    reader: &SuperfileReader,
-    options: &SupertableOptions,
-) -> HashMap<FieldId, VectorSummary> {
-    let mut out: HashMap<FieldId, VectorSummary> = HashMap::new();
-    let Some(vec_reader) = reader.vec() else {
-        return out;
-    };
-    for vc in &options.vector_columns {
-        if let (Some(id), Some(summary)) = (
-            options.field_id(&vc.column),
-            build_column_vector_summary(vec_reader, vc),
-        ) {
-            out.insert(id, summary);
-        }
-    }
-    out
 }
 
 // ============================================================

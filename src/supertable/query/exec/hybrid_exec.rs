@@ -1272,7 +1272,7 @@ mod tests {
         let dim = 16;
         let st = demo(dim);
         let reader = Arc::new(st.reader().expect("reader"));
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         use crate::supertable::query::exec::common::test_support::{call_tvf, scoped_inner};
         let func = HybridSearchFunc::new(reader, scalar_schema);
         let table = call_tvf(

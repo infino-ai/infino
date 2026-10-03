@@ -16,8 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::supertable::{
     error::{CommitError, ManifestError},
     handle::INCOMING_VECTOR_CELL,
-    manifest::{SuperfileEntry, list::PartitionStrategy},
-    options::SupertableOptions,
+    manifest::{ManifestSnapshot, SuperfileEntry, list::PartitionStrategy},
     schema::FieldId,
 };
 
@@ -140,7 +139,7 @@ pub fn decode_partition_key(
 pub fn assign_partition(
     seg: &SuperfileEntry,
     strategy: &PartitionStrategy,
-    options: &SupertableOptions,
+    snapshot: &ManifestSnapshot,
 ) -> Result<PartitionKey, ManifestError> {
     match strategy {
         PartitionStrategy::TimeRange {
@@ -154,7 +153,7 @@ pub fn assign_partition(
                     ),
                 });
             }
-            let (min, max) = scalar_i64_minmax(seg, column, options.field_id(column))?;
+            let (min, max) = scalar_i64_minmax(seg, column, snapshot.field_id(column))?;
             let g = *granularity_secs;
             let min_bucket = min.div_euclid(g);
             let max_bucket = max.div_euclid(g);
@@ -381,8 +380,12 @@ mod tests {
         SupertableOptions::new(schema, vec![], vec![]).expect("test options")
     }
 
+    fn test_snapshot() -> ManifestSnapshot {
+        ManifestSnapshot::empty(Arc::new(test_opts()))
+    }
+
     fn fid(name: &str) -> FieldId {
-        test_opts()
+        test_snapshot()
             .field_id(name)
             .unwrap_or_else(|| crate::test_helpers::fid(name))
     }
@@ -561,7 +564,7 @@ mod tests {
         };
         // 100 .. 90_000 → both buckets are 0..1 → same bucket 0.
         let seg = seg_with_i64("ts", 100, 80_000);
-        let key = assign_partition(&seg, &strategy, &test_opts()).expect("assign");
+        let key = assign_partition(&seg, &strategy, &test_snapshot()).expect("assign");
         assert_eq!(key, PartitionKey::TimeRange(0));
     }
 
@@ -573,7 +576,7 @@ mod tests {
             granularity_secs: 86_400,
         };
         let seg = seg_with_i64("ts", 100, 100_000);
-        let err = assign_partition(&seg, &strategy, &test_opts()).expect_err("must span");
+        let err = assign_partition(&seg, &strategy, &test_snapshot()).expect_err("must span");
         assert_spans_partition(err, "spans buckets");
     }
 
@@ -584,7 +587,7 @@ mod tests {
             granularity_secs: 0,
         };
         let seg = seg_with_i64("ts", 0, 0);
-        let err = assign_partition(&seg, &strategy, &test_opts()).expect_err("must reject");
+        let err = assign_partition(&seg, &strategy, &test_snapshot()).expect_err("must reject");
         assert_spans_partition(err, "granularity_secs must be > 0");
     }
 
@@ -595,7 +598,7 @@ mod tests {
             granularity_secs: -1,
         };
         let seg = seg_with_i64("ts", 0, 0);
-        let err = assign_partition(&seg, &strategy, &test_opts()).expect_err("must reject");
+        let err = assign_partition(&seg, &strategy, &test_snapshot()).expect_err("must reject");
         assert_spans_partition(err, "granularity_secs must be > 0");
     }
 
@@ -606,7 +609,7 @@ mod tests {
             granularity_secs: 86_400,
         };
         let seg = empty_seg(); // no scalar_stats at all
-        let err = assign_partition(&seg, &strategy, &test_opts()).expect_err("missing stats");
+        let err = assign_partition(&seg, &strategy, &test_snapshot()).expect_err("missing stats");
         assert_spans_partition(err, "no scalar_stats");
     }
 
@@ -641,7 +644,7 @@ mod tests {
             let mut seg = empty_seg();
             seg.scalar_stats
                 .insert(fid("ts"), ScalarStatsAgg::from_min_max(mn, mx));
-            let key = assign_partition(&seg, &strategy, &test_opts()).expect("assign");
+            let key = assign_partition(&seg, &strategy, &test_snapshot()).expect("assign");
             assert_eq!(key, PartitionKey::TimeRange(0));
         }
     }
@@ -659,7 +662,7 @@ mod tests {
         let mx: ArrayRef = Arc::new(Int32Array::from(vec![200]));
         seg.scalar_stats
             .insert(fid("ts"), ScalarStatsAgg::from_min_max(mn, mx));
-        let err = assign_partition(&seg, &strategy, &test_opts()).expect_err("unsupported");
+        let err = assign_partition(&seg, &strategy, &test_snapshot()).expect_err("unsupported");
         assert_spans_partition(err, "unsupported type");
     }
 
@@ -676,7 +679,7 @@ mod tests {
         let mx: ArrayRef = Arc::new(Int64Array::from(nulls));
         seg.scalar_stats
             .insert(fid("ts"), ScalarStatsAgg::from_min_max(mn, mx));
-        let err = assign_partition(&seg, &strategy, &test_opts()).expect_err("null stats");
+        let err = assign_partition(&seg, &strategy, &test_snapshot()).expect_err("null stats");
         assert_spans_partition(err, "empty or null at index 0");
     }
 
@@ -693,7 +696,7 @@ mod tests {
         };
         // -25 div_euclid 10 = -3; -21 div_euclid 10 = -3.
         let seg = seg_with_i64("ts", -25, -21);
-        let key = assign_partition(&seg, &strategy, &test_opts()).expect("assign");
+        let key = assign_partition(&seg, &strategy, &test_snapshot()).expect("assign");
         assert_eq!(key, PartitionKey::TimeRange(-3i64 as u64));
     }
 
@@ -709,7 +712,7 @@ mod tests {
             n_buckets: 1,
         };
         let seg = empty_seg();
-        let key = assign_partition(&seg, &strategy, &test_opts()).expect("assign");
+        let key = assign_partition(&seg, &strategy, &test_snapshot()).expect("assign");
         assert_eq!(key, PartitionKey::Hash(0));
     }
 
@@ -722,7 +725,7 @@ mod tests {
             n_buckets: 0,
         };
         let seg = empty_seg();
-        let key = assign_partition(&seg, &strategy, &test_opts()).expect("assign");
+        let key = assign_partition(&seg, &strategy, &test_snapshot()).expect("assign");
         assert_eq!(key, PartitionKey::Hash(0));
     }
 
@@ -734,7 +737,7 @@ mod tests {
         };
         let mut seg = empty_seg();
         seg.partition_hint = Some(2);
-        let key = assign_partition(&seg, &strategy, &test_opts()).expect("assign");
+        let key = assign_partition(&seg, &strategy, &test_snapshot()).expect("assign");
         assert_eq!(key, PartitionKey::Hash(2));
     }
 
@@ -745,7 +748,7 @@ mod tests {
             n_buckets: 4,
         };
         let seg = empty_seg(); // hint = None
-        let err = assign_partition(&seg, &strategy, &test_opts()).expect_err("must reject");
+        let err = assign_partition(&seg, &strategy, &test_snapshot()).expect_err("must reject");
         assert_spans_partition(err, "requires pre-sharded");
     }
 
@@ -757,7 +760,7 @@ mod tests {
         };
         let mut seg = empty_seg();
         seg.partition_hint = Some(4); // == n_buckets, off-by-one
-        let err = assign_partition(&seg, &strategy, &test_opts()).expect_err("out of range");
+        let err = assign_partition(&seg, &strategy, &test_snapshot()).expect_err("out of range");
         assert_spans_partition(err, "out of range");
     }
 
@@ -775,7 +778,8 @@ mod tests {
         seg.vector_layout = VectorLayout::MultiCellIvf;
         // writer_pool can exceed n_cells; shard_id=3 is valid for MultiCellIvf.
         seg.partition_hint = Some(3);
-        let key = assign_partition(&seg, &strategy, &test_opts()).expect("shard_id beyond n_cells");
+        let key =
+            assign_partition(&seg, &strategy, &test_snapshot()).expect("shard_id beyond n_cells");
         assert_eq!(key, PartitionKey::VectorCell(3));
     }
 
@@ -792,7 +796,7 @@ mod tests {
         let mut seg = empty_seg();
         seg.vector_layout = VectorLayout::Ivf;
         seg.partition_hint = Some(3); // >= n_cells=2
-        let err = assign_partition(&seg, &strategy, &test_opts())
+        let err = assign_partition(&seg, &strategy, &test_snapshot())
             .expect_err("legacy cell id out of range");
         assert_spans_partition(err, "out of range");
     }
@@ -876,7 +880,7 @@ mod tests {
             boundaries: vec![vec![]],
         };
         let seg = empty_seg();
-        let err = assign_partition(&seg, &strategy, &test_opts()).expect_err("not impl");
+        let err = assign_partition(&seg, &strategy, &test_snapshot()).expect_err("not impl");
         assert_spans_partition(err, "ColumnRange partition assignment lands");
     }
 }

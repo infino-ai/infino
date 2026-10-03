@@ -1236,13 +1236,7 @@ impl VectorReader {
             }
 
             // Soft cross-check: cfg.metric matches blob's metric.
-            let cfg_metric = match cfg.metric.as_str() {
-                "l2sq" => Some(Metric::L2Sq),
-                "cosine" => Some(Metric::Cosine),
-                "negdot" => Some(Metric::NegDot),
-                _ => None,
-            };
-            if let Some(m) = cfg_metric
+            if let Some(m) = Metric::from_name(&cfg.metric)
                 && m != metric
             {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
@@ -1334,16 +1328,12 @@ impl VectorReader {
             ))));
         }
         let cfg = &cols_json[0];
-        let metric = match cfg.metric.as_str() {
-            "l2sq" => Metric::L2Sq,
-            "cosine" => Metric::Cosine,
-            "negdot" => Metric::NegDot,
-            other => {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "unknown metric {other}"
-                ))));
-            }
-        };
+        let metric = Metric::from_name(&cfg.metric).ok_or_else(|| {
+            VectorError::Read(ReadError::MalformedVersion(format!(
+                "unknown metric {}",
+                cfg.metric
+            )))
+        })?;
         let mut columns = Vec::with_capacity(n_cells);
         let mut cell_ids = Vec::with_capacity(n_cells);
         let mut flat_cluster_base = Vec::with_capacity(n_cells + 1);

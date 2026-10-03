@@ -68,9 +68,8 @@ use uuid::Uuid;
 
 use crate::supertable::{
     manifest::{ManifestSnapshot, SuperfileEntry, add_sum_arrays, list::ScalarValueCounts},
-    options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
     query::provider::SupertableProvider,
-    schema::FieldId,
+    schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
 };
 
 /// The covered/residual aggregate rewrite. Registered on the

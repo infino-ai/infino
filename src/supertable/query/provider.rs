@@ -112,9 +112,8 @@ use crate::{
         },
     },
     supertable::{
-        SuperfileEntry, SupertableOptions,
+        SuperfileEntry,
         manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
-        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
             candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
             df_object_store::SuperfileObjectStore,
@@ -128,7 +127,7 @@ use crate::{
             superfile_reader::{OpenTierCounts, superfile_reader_tiered},
         },
         reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
-        schema::FieldId,
+        schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
         tombstones::SidecarCache,
     },
     utils::trace::{self, detail_span, tiered_span},
@@ -416,7 +415,7 @@ impl SupertableProvider {
     // Pure manifest work: reads stats only, opens no superfile. Returns the
     // survivor entries; `scan` is what opens and reads them.
     async fn select_survivors(&self, filters: &[Expr]) -> DfResult<Vec<Arc<SuperfileEntry>>> {
-        let leaves = prune_leaves_for_filters(&self.manifest.options, &self.schema, filters);
+        let leaves = prune_leaves_for_filters(&self.manifest, &self.schema, filters);
         let mut survivors = select_superfiles(self.manifest.as_ref(), &leaves)
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
@@ -451,8 +450,8 @@ impl SupertableProvider {
     /// exactly. It reads only the expression and the table options, so a
     /// cached plan stays valid.
     fn exact_filter(&self, filter: &Expr, fts_cols: &HashSet<&str>) -> Option<ExactFilter> {
-        let opts = &self.manifest.options;
-        exact_filter(filter, fts_cols, &|col| opts.try_fts_tokenizer_for(col))
+        let manifest = &self.manifest;
+        exact_filter(filter, fts_cols, &|col| manifest.try_fts_tokenizer_for(col))
     }
 
     /// Whether this provider answers any of `filters` exactly
@@ -1133,9 +1132,9 @@ impl TableProvider for SupertableProvider {
         // boolean tree over `token_match`; evaluated per superfile below
         // it yields a candidate row-id superset (or `Unbounded` = scan
         // the superfile). See `crate::supertable::query::candidate`.
-        let opts = &self.manifest.options;
+        let manifest = &self.manifest;
         let candidate_plan = CandidatePlan::from_filters(&bounded_filters, &fts_cols, &|col| {
-            opts.try_fts_tokenizer_for(col)
+            manifest.try_fts_tokenizer_for(col)
         });
         // A `LIKE` leaf is bound to each superfile's dictionary once, up
         // front, so the estimate and the evaluation below share one walk.
@@ -1792,18 +1791,21 @@ fn selection_access_plan_from_counts(
 /// of them possibly-present (`BoolMode::And`) never drops a match —
 /// bloom false positives can only keep a superfile, never drop one.
 fn scalar_predicates_to_prune_leaves(
-    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
     predicates: Vec<ScalarPredicate>,
 ) -> Vec<PruneLeaf> {
     let mut leaves = Vec::with_capacity(predicates.len());
     for pred in predicates {
         if pred.op == ScalarOp::Eq
-            && options.fts_columns.iter().any(|c| c.column == pred.column)
+            && manifest
+                .fts_configs()
+                .iter()
+                .any(|c| c.column == pred.column)
             && let Some(literal) = scalar_as_str(&pred.value)
         {
             // Per-column analyzer: prune with the tokenizer this column
             // was indexed with, not a single table-wide default.
-            let Some(tok) = options.try_fts_tokenizer_for(&pred.column) else {
+            let Some(tok) = manifest.try_fts_tokenizer_for(&pred.column) else {
                 leaves.push(PruneLeaf::Scalar(pred));
                 continue;
             };
@@ -1833,18 +1835,15 @@ fn scalar_predicates_to_prune_leaves(
 /// plain scan or over `bm25_search` / `hybrid_search`. Pure manifest
 /// work: reads statistics only, opens no superfile.
 pub(crate) fn prune_leaves_for_filters(
-    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
     schema: &SchemaRef,
     filters: &[Expr],
 ) -> Vec<PruneLeaf> {
-    let fts_cols: HashSet<&str> = options
-        .fts_columns
-        .iter()
-        .map(|c| c.column.as_str())
-        .collect();
-    let resolve = |col: &str| options.try_fts_tokenizer_for(col);
+    let fts_configs = manifest.fts_configs();
+    let fts_cols: HashSet<&str> = fts_configs.iter().map(|c| c.column.as_str()).collect();
+    let resolve = |col: &str| manifest.try_fts_tokenizer_for(col);
     let mut leaves =
-        scalar_predicates_to_prune_leaves(options, exprs_to_scalar_predicates(filters, schema));
+        scalar_predicates_to_prune_leaves(manifest, exprs_to_scalar_predicates(filters, schema));
     leaves.extend(exprs_to_value_set_leaves(
         filters, schema, &fts_cols, &resolve,
     ));
@@ -2808,7 +2807,7 @@ mod tests {
 
         let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
-            st.options().scalar_schema(),
+            reader.manifest().scalar_schema(),
             reader.manifest().clone(),
             st.options().store.clone(),
             st.options().disk_cache.clone(),
@@ -2913,7 +2912,7 @@ mod tests {
 
         let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
-            st.options().scalar_schema(),
+            reader.manifest().scalar_schema(),
             reader.manifest().clone(),
             st.options().store.clone(),
             st.options().disk_cache.clone(),
@@ -3090,7 +3089,7 @@ mod tests {
 
         let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
-            st.options().scalar_schema(),
+            reader.manifest().scalar_schema(),
             reader.manifest().clone(),
             st.options().store.clone(),
             st.options().disk_cache.clone(),

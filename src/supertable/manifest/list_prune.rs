@@ -283,10 +283,9 @@ mod tests {
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
-            schema: Vec::new(),
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 64,
