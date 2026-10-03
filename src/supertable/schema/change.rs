@@ -40,7 +40,8 @@ pub enum SchemaChange {
     WidenColumn { id: FieldId, to: DataType },
     /// A lossy type change: the type flips at once and files are
     /// converted by compaction; `converting_from` records the old type
-    /// until the last file is rewritten.
+    /// until the last file is rewritten. A value that does not cast
+    /// becomes null, so the column admits nulls from the flip on.
     RewriteColumn { id: FieldId, to: DataType },
     /// A nullable column becomes non-nullable (empty tables only).
     SetNonNullable { id: FieldId },
@@ -367,7 +368,11 @@ pub fn merge(
         if let Some(to) = &field.data_type
             && *to != live.data_type
         {
-            if live.converting_from.is_some() {
+            // While files in the old type remain, the one type change
+            // allowed is back to it: those files then read their originals
+            // through the identity path, and the files converted in between
+            // are cast back.
+            if live.converting_from.is_some() && live.converting_from.as_ref() != Some(to) {
                 return Err(SchemaError::ConversionInProgress {
                     column: live.name.clone(),
                 });
@@ -473,13 +478,14 @@ impl TableSchema {
             }
             SchemaChange::RewriteColumn { id, to } => {
                 let field = self.field_mut(*id)?;
-                if field.converting_from.is_some() {
+                if field.converting_from.is_some() && field.converting_from.as_ref() != Some(to) {
                     return Err(SchemaError::ConversionInProgress {
                         column: field.name.clone(),
                     });
                 }
                 field.converting_from = Some(field.data_type.clone());
                 field.data_type = to.clone();
+                field.nullable = true;
                 field.index = index_after_retype(field.index.take(), to);
             }
             SchemaChange::SetNonNullable { id } => self.field_mut(*id)?.nullable = false,
@@ -496,17 +502,30 @@ impl TableSchema {
             .ok_or(SchemaError::UnknownFieldId { id })
     }
 
-    /// The document with the conversion of column `id` complete: its old
-    /// type is forgotten. `None` when nothing was converting.
-    pub fn with_conversion_cleared(&self, id: FieldId) -> Option<TableSchema> {
-        let field = self.fields.iter().find(|f| f.id == id)?;
-        field.converting_from.as_ref()?;
+    /// The document with the conversions of the columns in `ids` complete:
+    /// their old types are forgotten. `None` when none of them was
+    /// converting.
+    pub fn with_conversions_cleared(&self, ids: &[FieldId]) -> Option<TableSchema> {
         let mut next = self.clone();
-        if let Some(f) = next.fields.iter_mut().find(|f| f.id == id) {
-            f.converting_from = None;
+        let mut cleared = false;
+        for f in next.fields.iter_mut() {
+            if ids.contains(&f.id) && f.converting_from.take().is_some() {
+                cleared = true;
+            }
+        }
+        if !cleared {
+            return None;
         }
         next.schema_id += 1;
         Some(next)
+    }
+
+    /// The columns whose conversion is outstanding.
+    pub fn converting(&self) -> impl Iterator<Item = FieldId> + '_ {
+        self.fields
+            .iter()
+            .filter(|f| f.converting_from.is_some())
+            .map(|f| f.id)
     }
 }
 
@@ -813,6 +832,7 @@ mod tests {
         let title = &flipped.fields()[0];
         assert_eq!(title.data_type, DataType::Int64);
         assert_eq!(title.converting_from, Some(DataType::LargeUtf8));
+        assert!(title.nullable, "what does not cast becomes null");
         assert!(
             title.index.is_none(),
             "a full-text index does not survive a retype to integers"
@@ -828,12 +848,34 @@ mod tests {
             ),
             Err(SchemaError::ConversionInProgress { .. })
         ));
+        assert_eq!(flipped.converting().collect::<Vec<_>>(), vec![FieldId(1)]);
+        // The one change allowed while converting: back to the old type.
+        let back = merge(
+            &flipped,
+            &SchemaPatch {
+                fields: vec![add("title", DataType::LargeUtf8)],
+                max_fields: None,
+            },
+            ctx(false),
+        )
+        .expect("flip back");
+        assert_eq!(
+            back,
+            vec![SchemaChange::RewriteColumn {
+                id: FieldId(1),
+                to: DataType::LargeUtf8
+            }]
+        );
+        let returned = flipped.apply(&back).expect("apply");
+        assert_eq!(returned.fields()[0].data_type, DataType::LargeUtf8);
+        assert_eq!(returned.fields()[0].converting_from, Some(DataType::Int64));
         let cleared = flipped
-            .with_conversion_cleared(FieldId(1))
+            .with_conversions_cleared(&[FieldId(1)])
             .expect("was converting");
         assert!(cleared.fields()[0].converting_from.is_none());
         assert_eq!(cleared.schema_id(), flipped.schema_id() + 1);
-        assert!(cleared.with_conversion_cleared(FieldId(1)).is_none());
+        assert!(cleared.with_conversions_cleared(&[FieldId(1)]).is_none());
+        assert_eq!(cleared.converting().count(), 0);
 
         let widen = merge(
             &t,

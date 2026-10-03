@@ -108,6 +108,11 @@ impl FileSchemaMap {
         self.columns.iter().any(Resolution::needs_cast)
     }
 
+    /// The columns the file holds in a type other than the table's.
+    pub fn stale_columns(&self) -> impl Iterator<Item = FieldId> + '_ {
+        self.columns.iter().filter(|r| r.needs_cast()).map(|r| r.id)
+    }
+
     /// Where the table column named `name` is in the file; `None` for a
     /// name the table does not have.
     pub fn resolve(&self, name: &str) -> Option<&Resolution> {

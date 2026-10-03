@@ -51,7 +51,7 @@ use crate::{
     supertable::{
         BuildError, CommitError, ManifestSnapshot, SuperfileEntry, Supertable,
         error::CompactionError,
-        handle::hidden_vector_index_compaction_settings,
+        handle::{SupertableInner, hidden_vector_index_compaction_settings},
         manifest::{
             SuperfileUri, list::PartitionStrategy, listed_once,
             term_index::Contribution as TermContribution,
@@ -59,16 +59,16 @@ use crate::{
         opann::rerank_pool_hint,
         query::dispatch::open_compaction_input,
         reader_cache::disk::mmap_readonly_bytes,
-        schema::{PhysicalSchema, map::FileSchemaMap},
+        schema::{FieldId, PhysicalSchema, map::FileSchemaMap},
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            CommitFence, NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
-            finalize_compaction_commit, maint_pool, prepare_superfile_named,
-            recalibrate_probe_laws, refresh_slow_vector_state, split_overflow_cells,
-            try_commit_attempt, write_superfile_list,
+            CommitFence, CommitListMetadata, NewEntryBirthVersions, PreparedSuperfile, ShardOutput,
+            backoff_delay, finalize_compaction_commit, maint_pool, persist_list_metadata_async,
+            prepare_superfile_named, recalibrate_probe_laws, refresh_slow_vector_state,
+            split_overflow_cells, try_commit_attempt, write_superfile_list,
         },
     },
     utils::trace::{detail_span, record},
@@ -155,11 +155,13 @@ pub(crate) struct MergeInputs<'a> {
     pub(crate) builder_options: BuilderOptions,
 }
 
-/// What compaction does: splice or carry, never re-tokenize.
+/// What compaction does: splice or carry, and re-tokenize only when an
+/// input's index is not the output's.
 ///
-/// Each arm is chosen by what the inputs hold, and every one of them
-/// carries the inputs' posting lists across rather than rebuilding them —
-/// re-tokenizing a corpus to merge it costs far more and changes nothing.
+/// Each arm is chosen by what the inputs hold, and the carrying arms move
+/// the inputs' posting lists across rather than rebuilding them —
+/// re-tokenizing a corpus to merge it costs far more and changes nothing
+/// while the index config is the same.
 pub(crate) struct CompactionMerge;
 
 impl SuperfileMerge for CompactionMerge {
@@ -190,15 +192,21 @@ impl SuperfileMerge for CompactionMerge {
             )?
         } else if sq8_merge == Some(true) {
             SuperfileBuilder::build_from_sq8_ivf_readers_to(inputs, builder_options, output)?
-        } else if first_vec.is_none() {
-            // FTS/scalar inputs (no vector index): carry each input's
-            // already-built posting lists across instead of re-tokenizing
-            // the whole corpus.
+        } else if first_vec.is_none()
+            && inputs
+                .iter()
+                .all(|input| builder_options.fts_carry_compatible(&input.reader))
+        {
+            // FTS/scalar inputs (no vector index) whose indexes match the
+            // output's: carry each input's already-built posting lists
+            // across instead of re-tokenizing the whole corpus.
             SuperfileBuilder::build_from_readers_fts_merge_to(inputs, builder_options, output)?
         } else {
             // A vector index is present but not IVF-mergeable (e.g. an fp32
-            // rerank codec); this path re-encodes both the FTS and the
-            // vectors from the decoded rows.
+            // rerank codec), or an input's full-text index does not match
+            // the output's (the column's index was added, dropped or renamed
+            // since the file was written); this path re-encodes both the
+            // FTS and the vectors from the decoded rows.
             SuperfileBuilder::build_from_readers_to(inputs, builder_options, output)?
         };
         Ok(stats)
@@ -503,6 +511,7 @@ impl Supertable {
                 info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   merge");
             }
         }
+        clear_completed_conversions(inner).await?;
 
         // The pass reshaped the hidden index (split children and/or merge
         // outputs committed): the probe laws were measured against the old
@@ -1993,6 +2002,41 @@ async fn seal_with_bounded_retry(
         }
     }
     Err(CompactionError::SealRetriesExhausted { superfile_id })
+}
+
+/// Commit the end of every type conversion whose files are all rewritten:
+/// a column with `converting_from` set whose old type no live file holds
+/// any more is cleared, one list commit for all of them. A file without a
+/// recorded physical schema leaves the question open, and a commit that
+/// loses to a concurrent schema change is left for the next run.
+async fn clear_completed_conversions(inner: &SupertableInner) -> Result<(), CompactionError> {
+    let manifest = inner.manifest.load_full();
+    let schema = manifest.table_schema();
+    let converting: Vec<FieldId> = schema.converting().collect();
+    if converting.is_empty() {
+        return Ok(());
+    }
+    let mut outstanding: HashSet<FieldId> = HashSet::new();
+    for entry in manifest.get_all_superfiles() {
+        match entry.physical_schema.as_ref() {
+            Some(physical) => outstanding.extend(
+                FileSchemaMap::new(&schema, &manifest.options.id_column, physical).stale_columns(),
+            ),
+            None => return Ok(()),
+        }
+    }
+    let completed: Vec<FieldId> = converting
+        .into_iter()
+        .filter(|id| !outstanding.contains(id))
+        .collect();
+    let Some(next) = schema.with_conversions_cleared(&completed) else {
+        return Ok(());
+    };
+    let metadata = CommitListMetadata::schema_change(Arc::new(next), schema.schema_id());
+    match persist_list_metadata_async(inner, metadata).await {
+        Ok(()) | Err(BuildError::SchemaMoved { .. }) => Ok(()),
+        Err(e) => Err(CompactionError::Build(e.to_string())),
+    }
 }
 
 #[cfg(test)]
