@@ -64,8 +64,8 @@ use crate::{
         fts::{
             bm25::Bm25Params,
             reader::{
-                self as fts_reader, BoolMode, ClauseLists, FetchedTermMemo, FtsReader, MatchWork,
-                OrCursorSet, PreparedClauses, TermPattern,
+                self as fts_reader, BoolMode, ClauseLists, ContainsRows, FetchedTermMemo,
+                FtsReader, MatchWork, OrCursorSet, PreparedClauses, TermPattern,
             },
             tokenize::{Phrase, Tokenizer},
         },
@@ -1436,6 +1436,24 @@ impl SuperfileReader {
         Ok(fts
             .expand_terms(column, patterns, fold, max_terms, allow_full_walk, pool)
             .await?)
+    }
+
+    /// For each of `needles`, the rows of `column` an `ILIKE '%needle%'`
+    /// matches, decided from the dictionary and postings in one walk but
+    /// for the rows it marks doubtful; every needle meets the exact rule.
+    /// What it holds meanwhile is charged to `budget`. Delegates to
+    /// [`FtsReader::contains_rows`].
+    pub(crate) async fn contains_rows(
+        &self,
+        column: &str,
+        needles: &[&str],
+        pool: Option<&ThreadPool>,
+        budget: Option<&Arc<ConnectionMemoryBudget>>,
+    ) -> Result<(Vec<ContainsRows>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.contains_rows(column, needles, pool, budget).await?)
     }
 
     /// Unranked token-match **count**: the number of `local_doc_id`s

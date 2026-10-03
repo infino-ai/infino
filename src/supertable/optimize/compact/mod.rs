@@ -11,6 +11,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     io::{BufWriter, Write},
+    mem,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -20,7 +21,10 @@ use std::{
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::stream::{self, StreamExt};
+use futures::{
+    future::BoxFuture,
+    stream::{self, StreamExt},
+};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::{
@@ -62,10 +66,10 @@ use crate::{
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
+            CommitFence, NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
             finalize_compaction_commit, maint_pool, prepare_superfile_named,
             recalibrate_probe_laws, refresh_slow_vector_state, split_overflow_cells,
-            try_commit_attempt,
+            try_commit_attempt, write_superfile_list,
         },
     },
     utils::trace::{detail_span, record},
@@ -290,7 +294,7 @@ impl Supertable {
         } else if let Some(hidden) = self.inner().vector_index_table.as_ref() {
             Self::compact_one_table(
                 hidden,
-                &hidden_vector_index_compaction_settings(),
+                &hidden_vector_index_compaction_settings(cfg.max_concurrent_jobs),
                 recalibrate,
             )
             .await?;
@@ -601,17 +605,14 @@ impl Supertable {
         // This reserves budget for the whole input size since merge still
         // loads it all at once. Real fix is streaming the merge and pooling
         // buffers instead of a flat reservation; picking that up later.
-        let input_bytes: u64 = superfiles
-            .iter()
-            .map(|e| e.subsection_offsets.as_ref().map_or(0, |o| o.total_size))
-            .sum();
-        // double the input bytes to account for the merge buffer and any overhead
-        let estimated_bytes = input_bytes.saturating_mul(2) as usize;
-        let _memory_reservation = manifest
-            .options
-            .connection_memory_budget
-            .try_reserve(estimated_bytes)
-            .map_err(|e| BuildError::MemoryBudgetExceeded(e.to_string()))?;
+        // Deliberately not reserved from `connection_memory_budget`: that budget
+        // bounds what search and ingest may hold on behalf of a connection, and
+        // a merge is neither. Charging it here made the optimizer's footprint a
+        // function of a knob set for queries — and with several merges running,
+        // a pass could be refused for a budget a serial pass fit inside, on a
+        // machine with the memory to spare. What bounds a merge is the host:
+        // the runner admits one at a time against free memory, and
+        // `max_memory_mb` caps the input bytes a single job may pack.
 
         let semaphore = input_open_permits();
         let mut superfile_readers_tasks = JoinSet::new();
@@ -1104,6 +1105,15 @@ impl Supertable {
             // The CAS on its own, separated from the cache warm and reclaim
             // that follow it: one span over the whole retry loop could not
             // tell a slow pointer write from several fast ones plus backoff.
+            // The seals have to still be ours when the swap lands, not merely
+            // when the uploads started: `try_commit_attempt` writes every
+            // merged superfile before its pointer PUT, and a seal that expired
+            // during that lets a delete land a tombstone on an input this
+            // commit then removes.
+            let mut fence = SealFence {
+                wal_store: &wal_store,
+                batch: &mut batch,
+            };
             let attempt_outcome = try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
@@ -1115,6 +1125,7 @@ impl Supertable {
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
                 &term_contributions,
+                Some(&mut fence),
             )
             .instrument(detail_span!(
                 "compaction_commit_attempt",
@@ -1179,10 +1190,21 @@ impl Supertable {
                         None => Ok(()),
                     };
                 }
-                Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                // A lost pointer CAS and a seal taken over are the same kind of
+                // failure: nothing was published, and the next attempt
+                // re-resolves against what is there now. Without this arm a
+                // single stolen seal would take the catch-all below, unsealing
+                // and discarding every finished, already-uploaded merge in the
+                // batch and ending the pass.
+                Err(
+                    e @ (CommitError::WriteContentionExhausted | CommitError::InputsChanged { .. }),
+                ) if attempt + 1 < max_retries => {
                     warn!(
                         jobs = batch.len(),
-                        attempt, max_retries, "compaction commit lost race, retrying"
+                        attempt,
+                        max_retries,
+                        error = %e,
+                        "compaction commit lost a race, retrying"
                     );
                     // Put the undrained writes and the borrowed contributions
                     // back so the next attempt still knows what it owes.
@@ -1387,11 +1409,49 @@ impl Supertable {
     ) {
         let table = self.clone();
         merging.spawn(async move {
-            (
-                plan_index,
-                table.prepare_compaction_job(job, stale_seal_timeout).await,
-            )
+            let prepared = match table.prepare_compaction_job(job, stale_seal_timeout).await {
+                Ok(prepared) => prepared,
+                Err(e) => return (plan_index, Err(e)),
+            };
+            let uploaded = table.upload_prepared_output(prepared).await;
+            (plan_index, uploaded)
         });
+    }
+
+    /// Put this job's merged bytes in storage, inside its own task.
+    ///
+    /// The commit used to do this, on the loop that admits merges and makes
+    /// commits: a multi-gigabyte PUT there stops every other merge from
+    /// starting and every finished one from committing, so their inputs stay
+    /// sealed for the length of someone else's upload. The bytes still precede
+    /// the pointer, which is what crash safety rests on, and a job that never
+    /// commits leaves them for gc exactly as a dropped one already does.
+    async fn upload_prepared_output(
+        &self,
+        mut prepared: PreparedJob,
+    ) -> Result<PreparedJob, CompactionError> {
+        if prepared.pending_storage_writes.is_empty() {
+            return Ok(prepared);
+        }
+        let inner = self.inner();
+        let Some(storage) = inner.manifest.load_full().options.storage.clone() else {
+            return Err(CompactionError::NoStorage);
+        };
+        let opts = Arc::clone(&inner.options);
+        let mut writes = mem::take(&mut prepared.pending_storage_writes);
+        let mut replaces: Vec<(String, Bytes)> = Vec::new();
+        let outcome = write_superfile_list(&storage, &opts, &mut writes, &mut replaces).await;
+        // Whatever did not land goes back, so a commit retry re-PUTs exactly
+        // the outstanding bytes as it did when the upload lived there.
+        prepared.pending_storage_writes = writes;
+        match outcome {
+            Ok(()) => Ok(prepared),
+            Err(e) => {
+                let wal_store = WalStore::new(storage);
+                unseal_batch(&wal_store, vec![prepared]).await;
+                Err(CompactionError::Commit(e.to_string()))
+            }
+        }
     }
 
     /// Drain merges still running after a pass has given up, clearing the
@@ -1467,21 +1527,27 @@ fn has_room_for_another_merge(available: Option<u64>, total: Option<u64>) -> boo
 }
 
 /// How much of the staleness window a commit keeps in hand. A seal younger
-/// than the window minus this cannot have been stolen yet and cannot expire
-/// before the CAS lands, so re-stamping it would be a round trip that only
-/// confirms what the clock already proves. It also absorbs modest clock skew
+/// than the window minus this cannot have been stolen yet, and has this much
+/// left to cover the manifest writes and the pointer PUT, so re-stamping it
+/// would be a round trip that only confirms what the clock already proves. It also absorbs modest clock skew
 /// between this process and whichever one might steal a seal, since the two
 /// judge staleness against their own clocks.
 const SEAL_RESTAMP_MARGIN: Duration = Duration::from_secs(30);
 
 /// Whether a seal placed at `sealed_at` could have been taken over by now.
 ///
-/// Measured against the threshold a WRITER uses, which is the shipped default
-/// rather than this table's configured one: that is the clock deciding whether
-/// a delete was allowed to steal, and it is the steal this guards against.
-fn seal_may_have_been_stolen(sealed_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    let steal_after = Duration::from_millis(tombstones_admin::DEFAULT_STALE_SEAL_TIMEOUT_MS)
-        .saturating_sub(SEAL_RESTAMP_MARGIN);
+/// Measured against the threshold a WRITER steals at, read from the one place
+/// that answers that question: a compactor judging it by anything else leaves
+/// a window where a delete may take a seal over that this skips re-stamping as
+/// too young, which is a lost deletion. Not this pass's own
+/// `stale_seal_timeout`, which decides when a compactor takes over another
+/// compactor's seal.
+fn seal_may_have_been_stolen(
+    sealed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    writer_steals_after: Duration,
+) -> bool {
+    let steal_after = writer_steals_after.saturating_sub(SEAL_RESTAMP_MARGIN);
     match (now - sealed_at).to_std() {
         Ok(age) => age >= steal_after,
         // A seal stamped in the future is a clock that moved; re-stamp rather
@@ -1566,6 +1632,57 @@ pub(crate) struct PreparedJob {
     term_contributions: Vec<TermContribution>,
 }
 
+/// Re-stamps a batch's seals once the uploads are behind it.
+///
+/// The early re-stamp before the uploads is a cheap way to drop a job whose sidecar has already
+/// moved, so a multi-gigabyte upload is not spent on work that cannot commit. It is not what makes
+/// the commit safe: the uploads take minutes at scale, and a seal can expire inside them. This
+/// runs after them, leaving a freshly stamped seal to outlive the manifest parts and list and the
+/// pointer PUT — small writes, where the uploads were minutes.
+///
+/// A lost CAS here fails the whole attempt rather than dropping one job: the outputs are already
+/// uploaded and the manifest is already built against this batch, so there is nothing left to drop
+/// a job from. The retry re-resolves, and its early re-stamp drops the job then.
+struct SealFence<'a> {
+    wal_store: &'a WalStore,
+    batch: &'a mut Vec<PreparedJob>,
+}
+
+/// Fault injection for the fence: the next check fails as though a writer took a seal over during
+/// the upload. The real interleaving needs a delete to land between the early re-stamp and the
+/// pointer PUT, which is microseconds apart in a test and minutes apart only on a real upload.
+#[cfg(test)]
+pub(crate) static FENCE_FAILS_ONCE: AtomicBool = AtomicBool::new(false);
+
+impl CommitFence for SealFence<'_> {
+    fn check(&mut self) -> BoxFuture<'_, Result<(), CommitError>> {
+        Box::pin(async move {
+            #[cfg(test)]
+            if FENCE_FAILS_ONCE.swap(false, Ordering::SeqCst) {
+                let superfile_id = self
+                    .batch
+                    .first()
+                    .and_then(|p| p.sealed.first())
+                    .map(|s| s.superfile_id)
+                    .unwrap_or_default();
+                return Err(CommitError::InputsChanged { superfile_id });
+            }
+            let stale = restamp_seals(self.wal_store, self.batch, Utc::now())
+                .await
+                .map_err(|e| CommitError::Encode(e.to_string()))?;
+            let Some(&i) = stale.first() else {
+                return Ok(());
+            };
+            let superfile_id = self.batch[i]
+                .sealed
+                .first()
+                .map(|s| s.superfile_id)
+                .unwrap_or_default();
+            Err(CommitError::InputsChanged { superfile_id })
+        })
+    }
+}
+
 /// Re-stamp every seal the batch still needs stamped, conditioned on the etag
 /// `seal` returned, and report which jobs are no longer ours.
 ///
@@ -1575,7 +1692,8 @@ pub(crate) struct PreparedJob {
 /// superfile was built from the bitmap the merge read. So a job whose re-stamp
 /// loses the CAS is named in the result and must leave the batch, to be merged
 /// again next pass with the tombstone in view. A won re-stamp also moves
-/// `sealed_at` forward, so the seal cannot expire before the CAS lands.
+/// `sealed_at` forward, giving the seal a full window to outlive the manifest
+/// writes and the pointer PUT that follow.
 ///
 /// Seals too young to have been stolen are skipped: the round trip could only
 /// confirm what the clock already proves, and this runs on the critical path
@@ -1595,7 +1713,11 @@ async fn restamp_seals(
 ) -> Result<Vec<usize>, CompactionError> {
     let mut stale = Vec::new();
     for (i, prepared) in batch.iter_mut().enumerate() {
-        if !seal_may_have_been_stolen(prepared.sealed_at, now) {
+        if !seal_may_have_been_stolen(
+            prepared.sealed_at,
+            now,
+            tombstones_admin::writer_steal_timeout(),
+        ) {
             continue;
         }
         let compaction_id = prepared.compaction_id;
@@ -1847,8 +1969,10 @@ async fn seal_with_bounded_retry(
 mod tests {
     use std::{collections::HashSet, env, mem, str, sync::Arc, time::Duration};
 
+    use arrow::util::pretty::pretty_format_batches;
     use arrow_array::{
-        ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+        ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
+        RecordBatch,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::{col, lit};
@@ -1866,7 +1990,7 @@ mod tests {
         memory::ConnectionMemoryBudget,
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::reader::Bm25SearchOptions,
+            fts::{reader::Bm25SearchOptions, tokenize::STANDARD_TOKENIZER},
             reader::SuperfileReader,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
@@ -1879,6 +2003,7 @@ mod tests {
         test_helpers::{
             build_title_batch, default_supertable_options, default_vector_config,
             fault_storage::{FaultKind, FaultOp, FaultStorage},
+            schema_id_title,
         },
     };
 
@@ -2990,45 +3115,39 @@ mod tests {
         assert_eq!(fts_hits.len(), 4, "all four 'alpha' docs must match");
     }
 
+    /// A merge is not charged to the connection memory budget.
+    ///
+    /// That budget bounds what search and ingest may hold for a connection; an
+    /// optimize is neither, and sizing it from a knob set for queries meant a
+    /// pass could be refused on a machine with the memory to spare — the more
+    /// easily the more merges ran at once. The host is what bounds a merge.
     #[tokio::test(flavor = "multi_thread")]
-    async fn merge_superfiles_respects_connection_memory_budget() {
+    async fn a_merge_is_not_charged_to_the_connection_budget() {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
-        // Write the data with a normal budget first — ingest draws from the
-        // same connection budget, so a tight limit here would starve the
-        // setup appends too.
+        // Written under a normal budget: ingest draws from the same one, so a
+        // tight limit here would starve the setup appends too.
         let st =
             Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
                 .expect("create supertable");
-        {
+        for titles in [["first doc", "second doc"], ["third doc", "fourth doc"]] {
             let mut w = st.writer().expect("writer");
-            let batch = build_title_batch(&["first doc", "second doc"]);
-            w.append(&batch).expect("append");
-            w.commit().expect("commit");
-        }
-        {
-            let mut w = st.writer().expect("writer");
-            let batch = build_title_batch(&["third doc", "fourth doc"]);
-            w.append(&batch).expect("append");
+            w.append(&build_title_batch(&titles)).expect("append");
             w.commit().expect("commit");
         }
 
-        // Reopen the same committed data under a starved budget to exercise
-        // the merge-time reservation.
+        // Reopened with a budget that cannot admit a single byte.
         let mut opts = default_supertable_options().with_storage(Arc::clone(&storage));
         opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
         let st = Supertable::create(opts).expect("reopen supertable");
 
         let reader = st.reader().expect("reader");
         let superfiles: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
-
-        match st.merge_superfiles(&superfiles, &no_tombstones()).await {
-            Err(BuildError::MemoryBudgetExceeded(_)) => {}
-            Err(other) => panic!("expected MemoryBudgetExceeded, got {other:?}"),
-            Ok(_) => panic!("merge must be refused over budget"),
-        }
+        st.merge_superfiles(&superfiles, &no_tombstones())
+            .await
+            .expect("a merge must not be refused by a budget that is not about it");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3992,6 +4111,122 @@ mod tests {
         }
     }
 
+    /// An `ILIKE '%word%'` answered from the dictionary reads postings in
+    /// the blob's own document order, so on a compacted superfile that
+    /// reorders its documents every id has to become its Parquet row, and
+    /// a deleted row has to stay out, with nothing re-checking the text.
+    /// The deletes include one through the exact filter itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exact_ilike_on_a_reordered_compacted_table_names_the_right_rows() {
+        const BATCHES: usize = 60;
+        const PER_BATCH: usize = 80;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let opts = SupertableOptions::new(
+            schema_id_title(),
+            vec![FtsConfig::new("title").analyzer(STANDARD_TOKENIZER)],
+            vec![],
+        )
+        .expect("options")
+        .with_writer_pool(pool)
+        .with_storage(Arc::clone(&storage));
+        let st = Supertable::create(opts).expect("create");
+        let mut titles: Vec<String> = Vec::with_capacity(BATCHES * PER_BATCH);
+        for b in 0..BATCHES {
+            let batch: Vec<String> = (0..PER_BATCH)
+                .map(|i| {
+                    let n = b * PER_BATCH + i;
+                    format!("uq{n} Shared t{} t{}", n % 37, n % 53)
+                })
+                .collect();
+            titles.extend(batch.iter().cloned());
+            let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
+            commit_titles(&st, &refs);
+        }
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+        let mut reordered = false;
+        for entry in st.reader().expect("reader").manifest().get_all_superfiles() {
+            let (bytes, _) = storage.get(&entry.storage_path()).await.expect("get");
+            let reader = SuperfileReader::open(bytes).expect("open");
+            reordered |= reader.fts().expect("fts").has_doc_map();
+        }
+        assert!(
+            reordered,
+            "the compaction must reorder for this test to mean anything"
+        );
+
+        let deleted = [3usize, 1000, 2222, 4000];
+        for n in deleted {
+            st.delete(col("title").eq(lit(titles[n].clone())))
+                .expect("delete");
+        }
+        let through_ilike = BATCHES * PER_BATCH - 1;
+        let stats = st
+            .delete(col("title").ilike(lit(format!("%uq{through_ilike}%"))))
+            .expect("delete through the exact filter");
+        assert_eq!(stats.matched(), 1);
+
+        for needle in ["uq12", "UQ4", "t36", "shared", "uq479", "uq3"] {
+            let lower = needle.to_ascii_lowercase();
+            let mut want: Vec<String> = titles
+                .iter()
+                .enumerate()
+                .filter(|&(n, title)| {
+                    !deleted.contains(&n)
+                        && n != through_ilike
+                        && title.to_ascii_lowercase().contains(&lower)
+                })
+                .map(|(_, title)| title.clone())
+                .collect();
+            want.sort();
+            let sql = format!("SELECT title FROM supertable WHERE title ILIKE '%{needle}%'");
+            let reader = st.reader().expect("reader");
+            let plan = pretty_format_batches(
+                &reader
+                    .query_sql(&format!("EXPLAIN {sql}"))
+                    .expect("explain"),
+            )
+            .expect("render the plan")
+            .to_string();
+            // The logical scan lists the filter as one it answers in full;
+            // nothing in the physical plan evaluates it.
+            let (logical, physical) = plan.split_once("physical_plan").expect("a physical plan");
+            assert!(
+                logical.contains("full_filters") && !physical.contains("ILIKE"),
+                "{needle} must be answered exactly: {plan}"
+            );
+            let mut got = titles_of(&reader.query_sql(&sql).expect("sql"));
+            got.sort();
+            assert_eq!(got, want, "{needle}");
+            // A count over the same selection, which spans the merged
+            // file's row groups, agrees with it. It does not prove the
+            // covered-aggregate guard: the deletes leave tombstones, which
+            // refuse the statistics rewrite on their own; the counts over
+            // the clean tables in `query::sql` do.
+            let counted = reader
+                .query_sql(&format!(
+                    "SELECT COUNT(*) FROM supertable WHERE title ILIKE '%{needle}%'"
+                ))
+                .expect("count");
+            let n = counted[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count is Int64")
+                .value(0);
+            assert_eq!(n as usize, want.len(), "COUNT for {needle}");
+        }
+    }
+
     /// Compacting an already-reordered superfile again must keep every
     /// document with its own postings.
     ///
@@ -4783,6 +5018,53 @@ mod tests {
     /// A width far above any plausible job count.
     const ABSURD_WIDTH: usize = 4096;
 
+    /// The compactor must re-stamp before a writer may steal, at whatever
+    /// threshold is in force.
+    ///
+    /// Both sides read `writer_steal_timeout`, so a seal the writer could take
+    /// over is never one this skips as too young. Reading different numbers —
+    /// a hard-coded default here against a configured one there — leaves the
+    /// gap between them as a window where a delete lands a bit on a superfile
+    /// about to be removed, and the deletion is lost. Checked across a range
+    /// of thresholds, because the one in force is configurable and a predicate
+    /// that only agrees with the default would say nothing about the rest.
+    #[test]
+    fn a_re_stamp_never_skips_a_seal_a_writer_could_steal() {
+        /// Thresholds either side of the shipped default, including ones below
+        /// the re-stamp margin.
+        const THRESHOLDS_SECS: [u64; 5] = [10, 45, 90, 120, 600];
+
+        let now = Utc::now();
+        for secs in THRESHOLDS_SECS {
+            let steals_after = Duration::from_secs(secs);
+            let placed_at =
+                |age: Duration| now - chrono::Duration::from_std(age).expect("representable");
+
+            assert!(
+                seal_may_have_been_stolen(placed_at(steals_after), now, steals_after),
+                "a seal old enough for a writer to steal must be re-stamped ({secs}s)"
+            );
+            assert!(
+                seal_may_have_been_stolen(
+                    placed_at(steals_after.saturating_sub(SEAL_RESTAMP_MARGIN)),
+                    now,
+                    steals_after
+                ),
+                "the margin's worth of life left is already at risk ({secs}s)"
+            );
+            // Below the margin there is no safe window left to skip in, and
+            // the floor at zero makes every seal a candidate — conservative,
+            // and the only correct answer when a writer steals sooner than a
+            // commit can be relied on to finish.
+            let expected = steals_after <= SEAL_RESTAMP_MARGIN;
+            assert_eq!(
+                seal_may_have_been_stolen(placed_at(Duration::ZERO), now, steals_after),
+                expected,
+                "a seal just placed, against a {secs}s threshold"
+            );
+        }
+    }
+
     /// One merge starts whatever the host says. Refusing it would stall
     /// exactly the tables that most need compacting, and there is nothing
     /// running yet for a memory reading to be about.
@@ -5212,6 +5494,167 @@ mod tests {
         assert!(
             !after.contains(&live[0]) && !after.contains(&live[1]),
             "the untouched job must still have merged"
+        );
+    }
+
+    /// Prepare one job over the whole table, for the fence tests below.
+    async fn one_job_over(st: &Supertable, live: &[Uuid]) -> Vec<PreparedJob> {
+        vec![
+            st.prepare_compaction_job(
+                CompactionJob {
+                    partition_key: Vec::new(),
+                    inputs: live.to_vec(),
+                    estimated_output_bytes: 0,
+                },
+                DEFAULT_STALE_SEAL_TIMEOUT,
+            )
+            .await
+            .expect("prepare"),
+        ]
+    }
+
+    /// A seal taken over at the fence costs its own job, not the batch.
+    ///
+    /// The fence runs after every merged superfile is uploaded, so a failure
+    /// there is expensive: the catch-all arm would unseal the batch, fail the
+    /// commit, and `run_compaction_jobs` would treat that as fatal and end the
+    /// pass — throwing away every finished, already-uploaded merge in it for
+    /// one stolen seal. `InputsChanged` is a lost race with nothing published,
+    /// so it takes the retry arm instead: the attempt re-resolves, its early
+    /// re-stamp drops the job whose sidecar moved, and the rest commit.
+    ///
+    /// The failure is injected. Reaching it for real needs a delete to land
+    /// between the early re-stamp and the pointer PUT, which is minutes apart
+    /// on a multi-gigabyte upload and microseconds apart here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_seal_taken_over_at_the_fence_costs_only_its_own_job() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        for term in ["alpha", "bravo", "charlie", "delta"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let live = listed_ids(&st);
+        assert_eq!(live.len(), 4, "fixture");
+        let before_docs = st.reader().expect("reader").n_docs_total();
+
+        let mut batch = Vec::new();
+        for pair in [[live[0], live[1]], [live[2], live[3]]] {
+            batch.push(
+                st.prepare_compaction_job(
+                    CompactionJob {
+                        partition_key: Vec::new(),
+                        inputs: pair.to_vec(),
+                        estimated_output_bytes: 0,
+                    },
+                    DEFAULT_STALE_SEAL_TIMEOUT,
+                )
+                .await
+                .expect("prepare"),
+            );
+        }
+
+        // The first attempt's fence fails, as a seal taken over mid-upload
+        // would. Nothing is published by that attempt.
+        FENCE_FAILS_ONCE.store(true, Ordering::SeqCst);
+        st.commit_compaction_batch(batch)
+            .await
+            .expect("a seal taken over at the fence must not fail the commit");
+        assert!(
+            !FENCE_FAILS_ONCE.load(Ordering::SeqCst),
+            "the injected failure must have been consumed"
+        );
+
+        // The retry committed: both jobs' inputs are merged away, since the
+        // injected failure named a seal nothing had actually taken over.
+        let after = listed_ids(&st);
+        assert!(
+            after.len() < live.len(),
+            "the retry must have committed, got {after:?}"
+        );
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            before_docs,
+            "no rows may be lost by the retry"
+        );
+    }
+
+    /// The fence passes a commit whose inputs nobody touched, re-stamping the
+    /// seals so they outlive the pointer PUT that follows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_commit_fence_passes_an_untouched_sidecar() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        for term in ["alpha", "bravo"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let live = listed_ids(&st);
+        let mut batch = one_job_over(&st, &live).await;
+        let wal_store = wal_store_for(&st);
+
+        // Old enough that the fence re-stamps rather than skipping, which is
+        // the state a long upload leaves the seals in.
+        age_seals_past_stale(&wal_store, &mut batch).await;
+        let mut fence = SealFence {
+            wal_store: &wal_store,
+            batch: &mut batch,
+        };
+        fence
+            .check()
+            .await
+            .expect("a sidecar nobody touched must pass the fence");
+    }
+
+    /// The fence refuses a commit whose input sidecar moved under its seal.
+    ///
+    /// `try_commit_attempt` writes every merged superfile before its pointer
+    /// PUT, so a re-stamp proved only before that work leaves a window as wide
+    /// as the upload is slow: the seal expires mid-upload, a delete takes it
+    /// over and marks its row, and the pointer PUT removes the input anyway.
+    /// The fence is checked once the uploads are done, leaving a freshly
+    /// stamped seal to outlive only the manifest writes and the pointer PUT.
+    ///
+    /// Driven directly rather than through a slowed upload: making the expiry
+    /// fall strictly between the early re-stamp and the pointer PUT needs a
+    /// fault-injection point inside `try_commit_attempt` that the harness does
+    /// not have. What this pins is the fence's own decision, which is what the
+    /// commit path calls at that moment.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_commit_fence_refuses_a_sidecar_that_moved_under_its_seal() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let doomed = "bravo first";
+        for term in ["alpha", "bravo"] {
+            commit_titles(&st, &[&format!("{term} first"), &format!("{term} second")]);
+        }
+        let live = listed_ids(&st);
+        let mut batch = one_job_over(&st, &live).await;
+        let wal_store = wal_store_for(&st);
+
+        // The seals age out, as they would inside a long upload, and a delete
+        // arriving meanwhile takes one over and marks its row.
+        age_seals_past_stale(&wal_store, &mut batch).await;
+        let deleting = st.clone();
+        let title = doomed.to_string();
+        let stats = task::spawn_blocking(move || deleting.delete(col("title").eq(lit(title))))
+            .await
+            .expect("delete task")
+            .expect("delete");
+        assert_eq!(
+            stats.n_tombstoned(),
+            1,
+            "the delete must take the expired seal over and land its bit"
+        );
+
+        // The job still holds the etag from before that bit landed. Committing
+        // would remove the input carrying it, so the fence must refuse.
+        let mut fence = SealFence {
+            wal_store: &wal_store,
+            batch: &mut batch,
+        };
+        let refused = fence.check().await;
+        assert!(
+            refused.is_err(),
+            "a sidecar that moved under the seal must fail the attempt, got {refused:?}"
         );
     }
 

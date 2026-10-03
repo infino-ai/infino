@@ -52,8 +52,8 @@ use crate::{
         handle::{SupertableReader, WeakReader},
         query::exec::{
             common::{
-                arg_to_string, output_schema_with_score, resolve_hits, search_query_df_error,
-                traced_tvf,
+                arg_to_string, output_schema_with_score, resolve_hits, scope_to_call,
+                search_query_df_error, traced_tvf,
             },
             fts_exec::arg_to_bool_mode,
         },
@@ -135,13 +135,16 @@ impl TableFunctionImpl for TokenMatchFunc {
                 "token_match: supertable consumer dropped before execution".into(),
             )
         })?;
-        Ok(Arc::new(MatchTable {
-            reader,
-            column,
-            query: MatchQuery::Token { query, mode },
-            scalar_schema: Arc::clone(&self.scalar_schema),
-            output_schema: Arc::clone(&self.output_schema),
-        }))
+        scope_to_call(
+            TOKEN_MATCH_UDTF,
+            Arc::new(MatchTable {
+                reader,
+                column,
+                query: MatchQuery::Token { query, mode },
+                scalar_schema: Arc::clone(&self.scalar_schema),
+                output_schema: Arc::clone(&self.output_schema),
+            }),
+        )
     }
 }
 
@@ -180,13 +183,16 @@ impl TableFunctionImpl for ExactMatchFunc {
                 "exact_match: supertable consumer dropped before execution".into(),
             )
         })?;
-        Ok(Arc::new(MatchTable {
-            reader,
-            column,
-            query: MatchQuery::Exact { value },
-            scalar_schema: Arc::clone(&self.scalar_schema),
-            output_schema: Arc::clone(&self.output_schema),
-        }))
+        scope_to_call(
+            EXACT_MATCH_UDTF,
+            Arc::new(MatchTable {
+                reader,
+                column,
+                query: MatchQuery::Exact { value },
+                scalar_schema: Arc::clone(&self.scalar_schema),
+                output_schema: Arc::clone(&self.output_schema),
+            }),
+        )
     }
 }
 
@@ -728,7 +734,7 @@ mod tests {
         use datafusion::{logical_expr::TableType, prelude::lit};
 
         use super::MatchTable;
-        use crate::supertable::query::exec::common::test_support::call_tvf;
+        use crate::supertable::query::exec::common::test_support::{call_tvf, scoped_inner};
 
         let st = demo();
         let reader = Arc::new(st.reader().expect("reader"));
@@ -739,7 +745,7 @@ mod tests {
         let dbg = format!("{table:?}");
         assert!(dbg.contains("MatchTable"), "Debug missing: {dbg}");
         assert!(
-            table.downcast_ref::<MatchTable>().is_some(),
+            scoped_inner(&table).downcast_ref::<MatchTable>().is_some(),
             "as_any downcasts to MatchTable"
         );
         assert_eq!(table.table_type(), TableType::Base);

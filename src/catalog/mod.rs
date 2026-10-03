@@ -72,7 +72,7 @@ use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
-    memory::{ConnectionMemoryBudget, budgeted_session_context},
+    memory::ConnectionMemoryBudget,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::{
         io::{UsageMeter, UsageSnapshot},
@@ -95,7 +95,7 @@ use crate::{
         Supertable as SupertableHandle,
         manifest::disk_cache::ManifestDiskCache,
         options::SupertableOptions,
-        query::exec::common::collect_plan_metered,
+        query::{exec::common::collect_plan_metered, sql::sql_session_context},
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
     utils::trace::{self, CloseOut, detail_span},
@@ -947,8 +947,10 @@ impl Connection {
         ensure_sql_within_connective_cap(sql)?;
 
         // Gate SQL heap on the connection budget: DataFusion allocates the
-        // working set (sort / aggregate / join), so its pool is the gate.
-        let ctx = budgeted_session_context(&self.inner.connection_memory_budget)
+        // working set (sort / aggregate / join), so its pool is the gate. The
+        // same constructor as a table reader's, so covered aggregates are
+        // answered from manifest statistics here too.
+        let ctx = sql_session_context(&self.inner.connection_memory_budget)
             .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
 
         // Resolve the relations the query names and register each that is a
@@ -1224,10 +1226,15 @@ fn build_options(
 
 /// Map a SQL execution error to the public error: a budget exhaustion becomes
 /// [`InfinoError::OverBudget`], anything else a generic query error.
+///
+/// Classified by the error's root, not its outer variant: an operator may wrap
+/// a refusal in context of its own (an external sort reports "Not enough memory
+/// to continue external sort" around the pool's refusal), and a wrapped
+/// refusal is still a budget refusal.
 fn sql_exec_error(e: DataFusionError) -> InfinoError {
-    match e {
-        DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg),
-        other => InfinoError::Query(other.to_string()),
+    match e.find_root() {
+        DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg.clone()),
+        _ => InfinoError::Query(e.to_string()),
     }
 }
 
@@ -1463,7 +1470,10 @@ mod tests {
         time::Duration,
     };
 
-    use arrow_array::{Array, Int64Array, LargeStringArray, StringViewArray};
+    use arrow::util::pretty::pretty_format_batches;
+    use arrow_array::{
+        Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, StringViewArray,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
         logical_expr::LogicalPlan,
@@ -1473,9 +1483,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bm25SearchOptions, BoolMode, Consistency, Stemmer, Stopwords,
+        Bm25SearchOptions, BoolMode, Consistency, Metric, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
-        supertable::manifest::commit::POINTER_PATH,
+        supertable::{manifest::commit::POINTER_PATH, query::provider::TABLE_NAME},
         test_helpers::{build_title_batch, schema_id_title},
     };
 
@@ -3517,6 +3527,201 @@ mod tests {
         assert_eq!(rows, 3, "2 from docs + 1 from more");
     }
 
+    /// A three-value `title` over two superfiles, so a grouped count merges two superfiles'
+    /// value counts.
+    fn create_cab_types(conn: &Connection, name: &str) {
+        let table = conn
+            .create_table(name, schema_id_title(), IndexSpec::new())
+            .expect("create");
+        table
+            .append(&build_title_batch(&["yellow", "green", "yellow"]))
+            .expect("append 1");
+        table
+            .append(&build_title_batch(&["fhv", "yellow"]))
+            .expect("append 2");
+    }
+
+    /// `(group, count)` rows of a grouped count, sorted by group.
+    fn grouped_counts(batches: &[RecordBatch]) -> Vec<(String, i64)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let groups = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeUtf8 group");
+            let counts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 count");
+            for i in 0..batch.num_rows() {
+                rows.push((groups.value(i).to_string(), counts.value(i)));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// Whether `EXPLAIN` output plans a scan of any table.
+    fn scans(explained: &[RecordBatch]) -> bool {
+        pretty_format_batches(explained)
+            .expect("format plan")
+            .to_string()
+            .contains("TableScan")
+    }
+
+    /// `GROUP BY col, COUNT(*)` and a single-column filtered `COUNT(*)` are answered from the
+    /// manifest's value counts through the public API, with no scan.
+    #[test]
+    fn query_sql_answers_covered_aggregates_from_manifest_stats() {
+        let conn = connect("memory://").expect("connect");
+        create_cab_types(&conn, "cabs");
+
+        let grouped = "SELECT title, count(*) FROM cabs GROUP BY title";
+        assert_eq!(
+            grouped_counts(&conn.query_sql(grouped).expect("grouped")),
+            vec![
+                ("fhv".to_string(), 1),
+                ("green".to_string(), 1),
+                ("yellow".to_string(), 3)
+            ]
+        );
+        let filtered = "SELECT count(*) FROM cabs WHERE title = 'yellow'";
+        let n = conn.query_sql(filtered).expect("filtered")[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 count")
+            .value(0);
+        assert_eq!(n, 3);
+
+        for sql in [grouped, filtered] {
+            let plan = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+            assert!(
+                !scans(&plan),
+                "answered from manifest stats, no scan: {sql}"
+            );
+        }
+    }
+
+    /// The catalog and a table's reader plan the same aggregate the same way: same rows, and
+    /// neither scans. The two build their SQL context separately, and once drifted apart.
+    #[test]
+    fn query_sql_plans_aggregates_like_the_table_reader() {
+        let conn = connect("memory://").expect("connect");
+        create_cab_types(&conn, "cabs");
+        let reader = conn
+            .open_table_handle("cabs")
+            .expect("handle")
+            .reader()
+            .expect("reader");
+
+        let sql = "SELECT title, count(*) FROM {} GROUP BY title";
+        let through_catalog = conn.query_sql(&sql.replace("{}", "cabs")).expect("catalog");
+        let through_reader = reader
+            .query_sql(&sql.replace("{}", TABLE_NAME))
+            .expect("reader");
+        assert_eq!(
+            grouped_counts(&through_catalog),
+            grouped_counts(&through_reader)
+        );
+
+        let catalog_plan = conn
+            .query_sql(&format!("EXPLAIN {}", sql.replace("{}", "cabs")))
+            .expect("catalog explain");
+        let reader_plan = reader
+            .query_sql(&format!("EXPLAIN {}", sql.replace("{}", TABLE_NAME)))
+            .expect("reader explain");
+        assert!(!scans(&catalog_plan), "catalog plan scans");
+        assert!(!scans(&reader_plan), "reader plan scans");
+    }
+
+    /// Deleted rows never reach a covered aggregate: a superfile with tombstones is not clean, so
+    /// the rewrite scans it and the scan drops the deleted rows.
+    #[test]
+    fn query_sql_covered_aggregates_see_deletes() {
+        // Deletes need durable storage; `memory://` refuses them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = connect(dir.path().to_str().expect("utf8 path")).expect("connect");
+        create_cab_types(&conn, "cabs");
+        conn.open_table("cabs")
+            .expect("open")
+            .delete(col("title").eq(lit("green")))
+            .expect("delete");
+
+        assert_eq!(
+            grouped_counts(
+                &conn
+                    .query_sql("SELECT title, count(*) FROM cabs GROUP BY title")
+                    .expect("grouped")
+            ),
+            vec![("fhv".to_string(), 1), ("yellow".to_string(), 3)],
+            "the deleted group is gone"
+        );
+        let n = conn
+            .query_sql("SELECT count(*) FROM cabs WHERE title = 'green'")
+            .expect("filtered")[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 count")
+            .value(0);
+        assert_eq!(n, 0, "deleted rows are not counted");
+    }
+
+    /// A fresh connection to a durable table, as a cold worker opens it: a clean table is
+    /// answered from stats, and once rows are deleted the counts still leave them out.
+    #[test]
+    fn query_sql_covered_aggregates_after_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        create_cab_types(&connect(&uri).expect("connect"), "cabs");
+        let grouped = "SELECT title, count(*) FROM cabs GROUP BY title";
+
+        let reopened = connect(&uri).expect("reopen");
+        let plan = reopened
+            .query_sql(&format!("EXPLAIN {grouped}"))
+            .expect("explain");
+        assert!(
+            !scans(&plan),
+            "a clean reopened table is answered from stats"
+        );
+
+        reopened
+            .open_table("cabs")
+            .expect("open")
+            .delete(col("title").eq(lit("green")))
+            .expect("delete");
+        let after_delete = connect(&uri).expect("reopen after delete");
+        assert_eq!(
+            grouped_counts(&after_delete.query_sql(grouped).expect("grouped")),
+            vec![("fhv".to_string(), 1), ("yellow".to_string(), 3)]
+        );
+    }
+
+    /// The rewrite only answers an aggregate over one table's scan; an aggregate over a join of
+    /// two tables still scans both and counts the joined rows.
+    #[test]
+    fn query_sql_does_not_rewrite_an_aggregate_over_a_join() {
+        let conn = connect("memory://").expect("connect");
+        create_cab_types(&conn, "cabs");
+        create_cab_types(&conn, "fares");
+
+        let sql = "SELECT a.title, count(*) FROM cabs a JOIN fares b ON a.title = b.title \
+                   GROUP BY a.title";
+        assert_eq!(
+            grouped_counts(&conn.query_sql(sql).expect("join")),
+            vec![
+                ("fhv".to_string(), 1),
+                ("green".to_string(), 1),
+                ("yellow".to_string(), 9)
+            ]
+        );
+        let plan = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+        assert!(scans(&plan), "a join is planned as scans");
+    }
+
     // Many distinct group keys force DataFusion's aggregate to build a real
     // hash table, so its memory pool (the connection budget) is exercised.
     fn many_distinct_titles() -> Vec<String> {
@@ -3593,6 +3798,21 @@ mod tests {
     }
 
     #[test]
+    fn query_sql_exact_ilike_over_a_tiny_budget_is_refused_as_over_budget() {
+        // `title` is `standard`-analyzed, so `%filler%` is answered from the
+        // dictionary, which charges what it holds to the connection budget
+        // while the plan is built. A 0-byte gate refuses it as OverBudget.
+        let (_dir, conn, _n) = tiny_budget_conn_after_ingest();
+        let err = conn
+            .query_sql("SELECT title FROM docs WHERE title ILIKE '%filler%'")
+            .expect_err("a 0-byte gate refuses the exact path");
+        assert!(
+            matches!(&err, InfinoError::OverBudget(msg) if msg.contains("exact ILIKE")),
+            "expected OverBudget, got {err:?}"
+        );
+    }
+
+    #[test]
     fn query_sql_streaming_scan_is_not_refused_under_a_tiny_budget() {
         // A projection streams (no buffering), so it reserves nothing and runs
         // even at a 0-byte gate: the budget bounds sort/aggregate/join, not scans.
@@ -3601,6 +3821,34 @@ mod tests {
             .query_sql("SELECT title FROM docs")
             .expect("a streaming scan is not gated");
         assert_eq!(n_rows(&out), n);
+    }
+
+    #[test]
+    fn query_sql_sort_over_a_tiny_budget_is_refused_as_over_budget() {
+        // The sort wraps the pool's refusal in context of its own ("Not enough
+        // memory to continue external sort"); the wrapped refusal is still a
+        // budget refusal, not a generic query error.
+        let (_dir, conn, _n) = tiny_budget_conn_after_ingest();
+        let err = conn
+            .query_sql("SELECT title FROM docs ORDER BY title")
+            .expect_err("a 0-byte gate refuses the sort");
+        assert!(
+            matches!(err, InfinoError::OverBudget(_)),
+            "expected OverBudget, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sql_exec_error_classifies_a_wrapped_refusal_by_its_root() {
+        let wrapped = DataFusionError::ResourcesExhausted("over".into()).context("sorting");
+        assert!(matches!(
+            sql_exec_error(wrapped),
+            InfinoError::OverBudget(msg) if msg == "over"
+        ));
+        assert!(matches!(
+            sql_exec_error(DataFusionError::Execution("boom".into())),
+            InfinoError::Query(_)
+        ));
     }
 
     #[test]
@@ -3956,6 +4204,166 @@ mod tests {
         assert_eq!(rows, 1, "one doc equals the raw string exactly");
     }
 
+    /// Embedding dimension of the [`conn_with_vector_table`] fixture.
+    const VEC_DIM: usize = 16;
+    /// Titles of the [`conn_with_vector_table`] fixture, one row each.
+    const VEC_TITLES: [&str; 4] = ["rust async", "python data", "rust systems", "go rust"];
+
+    /// A `memory://` connection holding table `vecs`: one row per
+    /// [`VEC_TITLES`] entry, row `i` one-hot at dim `i` (so a one-hot query
+    /// at dim 0 is the exact nearest neighbour of row 0), with a full-text
+    /// index on `title` and an L2 vector index on `emb`.
+    fn conn_with_vector_table() -> Connection {
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(Arc::clone(&item), VEC_DIM as i32),
+                false,
+            ),
+        ]));
+        let mut flat = Vec::<f32>::with_capacity(VEC_TITLES.len() * VEC_DIM);
+        for i in 0..VEC_TITLES.len() {
+            for d in 0..VEC_DIM {
+                flat.push(if d == i { 1.0 } else { 0.0 });
+            }
+        }
+        let list = FixedSizeListArray::new(
+            item,
+            VEC_DIM as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeStringArray::from(VEC_TITLES.to_vec())),
+                Arc::new(list),
+            ],
+        )
+        .expect("vector batch");
+
+        let conn = connect("memory://").expect("connect");
+        conn.create_table(
+            "vecs",
+            schema,
+            IndexSpec::new()
+                .fts("title")
+                .vector("emb", VEC_DIM, Metric::L2Sq),
+        )
+        .expect("create table")
+        .append(&batch)
+        .expect("append");
+        conn
+    }
+
+    /// The [`VEC_DIM`]-wide one-hot vector at `dim`, as the comma-separated
+    /// literal the vector TVFs take.
+    fn one_hot_csv(dim: usize) -> String {
+        (0..VEC_DIM)
+            .map(|d| if d == dim { "1" } else { "0" })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Two calls of one search table function in a statement are two
+    /// searches. DataFusion names every table-function scan after the
+    /// function alone and compares scans without their provider, where
+    /// the arguments live, so the optimizer used to merge calls that
+    /// differed only in arguments: each pair below answered the first
+    /// call's count in both columns — across tables as well as terms,
+    /// and for every search function.
+    #[test]
+    fn search_tvf_calls_differing_in_arguments_stay_distinct() {
+        let conn = conn_with_vector_table();
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs")
+            .append(&build_title_batch(&["rust", "zig"]))
+            .expect("append");
+        let v = one_hot_csv(0);
+        // (what, first call, second call, first count, second count)
+        let cases: Vec<(&str, String, String, i64, i64)> = vec![
+            (
+                "token_match, different terms",
+                "token_match('vecs', 'title', 'rust')".into(),
+                "token_match('vecs', 'title', 'python')".into(),
+                3,
+                1,
+            ),
+            (
+                "token_match, different tables",
+                "token_match('vecs', 'title', 'rust')".into(),
+                "token_match('docs', 'title', 'rust')".into(),
+                3,
+                1,
+            ),
+            (
+                "exact_match",
+                "exact_match('vecs', 'title', 'rust async')".into(),
+                "exact_match('vecs', 'title', 'no such title')".into(),
+                1,
+                0,
+            ),
+            (
+                "bm25_search, different terms",
+                "bm25_search('vecs', 'title', 'rust', 10)".into(),
+                "bm25_search('vecs', 'title', 'python', 10)".into(),
+                3,
+                1,
+            ),
+            (
+                "bm25_search, different k",
+                "bm25_search('vecs', 'title', 'rust', 1)".into(),
+                "bm25_search('vecs', 'title', 'rust', 10)".into(),
+                1,
+                3,
+            ),
+            (
+                "bm25_search_prefix",
+                "bm25_search_prefix('vecs', 'title', 'rus', 10)".into(),
+                "bm25_search_prefix('vecs', 'title', 'pyt', 10)".into(),
+                3,
+                1,
+            ),
+            (
+                "vector_search, different k",
+                format!("vector_search('vecs', 'emb', '{v}', 1)"),
+                format!("vector_search('vecs', 'emb', '{v}', 3)"),
+                1,
+                3,
+            ),
+            (
+                "hybrid_search, different k",
+                format!("hybrid_search('vecs', 'title', 'rust', 'emb', '{v}', 1)"),
+                format!("hybrid_search('vecs', 'title', 'rust', 'emb', '{v}', 3)"),
+                1,
+                3,
+            ),
+        ];
+        for (what, first, second, want_first, want_second) in cases {
+            let batches = conn
+                .query_sql(&format!(
+                    "SELECT (SELECT count(*) FROM {first}) AS a, \
+                            (SELECT count(*) FROM {second}) AS b"
+                ))
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let count = |i: usize| {
+                batches[0]
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("count(*) is Int64")
+                    .value(0)
+            };
+            assert_eq!(
+                (count(0), count(1)),
+                (want_first, want_second),
+                "{what}: each call answers its own count"
+            );
+        }
+    }
+
     /// The remaining catalog-level search TVFs — `bm25_search_prefix`,
     /// `vector_search`, and `hybrid_search` — resolve their leading
     /// table-name argument and forward the rest to the table's search
@@ -3963,71 +4371,11 @@ mod tests {
     /// carries both an FTS index and a vector index.
     #[test]
     fn query_sql_prefix_vector_and_hybrid_tvfs_resolve_table() {
-        use crate::Metric;
-
-        /// Embedding dimension for the fixture's vector column.
-        const DIM: usize = 16;
-        /// Rows in the fixture (one-hot vectors at dims 0..ROWS).
-        const ROWS: usize = 4;
         /// Top-k requested by the vector / hybrid queries.
         const TOP_K: usize = 4;
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("title", DataType::LargeUtf8, false),
-            Field::new(
-                "emb",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    DIM as i32,
-                ),
-                false,
-            ),
-        ]));
-
-        // Four docs; doc `i` is one-hot at dim `i`, so a one-hot query
-        // at dim 0 is the exact nearest neighbour of doc 0.
-        let batch = {
-            use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray};
-            let titles = ["rust async", "python data", "rust systems", "go rust"];
-            let mut flat = Vec::<f32>::with_capacity(ROWS * DIM);
-            for i in 0..ROWS {
-                for d in 0..DIM {
-                    flat.push(if d == i { 1.0 } else { 0.0 });
-                }
-            }
-            let field = Arc::new(Field::new("item", DataType::Float32, true));
-            let list = FixedSizeListArray::new(
-                field,
-                DIM as i32,
-                Arc::new(Float32Array::from(flat)),
-                None,
-            );
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(LargeStringArray::from(titles.to_vec())),
-                    Arc::new(list),
-                ],
-            )
-            .expect("vector batch")
-        };
-
-        let conn = connect("memory://").expect("connect");
-        let table = conn
-            .create_table(
-                "vecs",
-                schema,
-                IndexSpec::new()
-                    .fts("title")
-                    .vector("emb", DIM, Metric::L2Sq),
-            )
-            .expect("create table");
-        table.append(&batch).expect("append");
-
-        let one_hot_0 = (0..DIM)
-            .map(|d| if d == 0 { "1" } else { "0" })
-            .collect::<Vec<_>>()
-            .join(",");
+        let conn = conn_with_vector_table();
+        let one_hot_0 = one_hot_csv(0);
 
         // bm25_search_prefix: 'rus' expands to 'rust'.
         let prefix_rows: usize = conn

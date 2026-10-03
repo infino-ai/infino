@@ -30,11 +30,15 @@
 //!      We deliberately do **not** reimplement this commodity layer.
 //!
 //! Correctness is independent of either tier: every pushed filter
-//! is reported [`TableProviderFilterPushDown::Inexact`], so
-//! DataFusion always re-applies the full predicate in a
-//! `FilterExec` above the scan. Both skip tiers are pure
-//! *conservative* optimizations — they may keep a non-matching
-//! superfile/row group, never drop a matching one.
+//! but one shape is reported [`TableProviderFilterPushDown::Inexact`],
+//! so DataFusion re-applies it in a `FilterExec` above the scan. Both
+//! skip tiers are pure *conservative* optimizations — they may keep a
+//! non-matching superfile/row group, never drop a matching one.
+//!
+//! The one shape, `col ILIKE '%word%'` on a full-text column, is
+//! reported [`TableProviderFilterPushDown::Exact`]: the term dictionary
+//! decides its rows (see `candidate::exact_contains`), [`scan`] selects
+//! exactly those, and no `FilterExec` reads the column for it.
 //!
 //! ## Why an in-memory object store
 //!
@@ -47,7 +51,7 @@
 
 use std::{
     cmp,
-    collections::HashSet,
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::Range,
     sync::{Arc, atomic},
@@ -94,16 +98,16 @@ use parquet::{
 };
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
     runtime_metrics::op_stats,
     superfile::{
-        SuperfileReader,
+        ReadError, SuperfileReader,
         fts::{
-            reader::{BoolMode, MatchWork},
+            reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
         },
     },
@@ -112,9 +116,12 @@ use crate::{
         manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
-            candidate::{CandidatePlan, like_prune_leaves},
+            candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
             df_object_store::SuperfileObjectStore,
-            exec::metered_exec::MeteredExec,
+            exec::{
+                common::{BoundPredicate, PushedPredicate, take_rows},
+                metered_exec::MeteredExec,
+            },
             fts::{memos_from_plan_locations, plan_locations_for},
             prune::{PruneLeaf, select_superfiles},
             skip::{ScalarOp, ScalarPredicate},
@@ -433,6 +440,132 @@ impl SupertableProvider {
             .collect()
     }
 
+    /// `filter` as a conjunct this provider answers exactly from the term
+    /// dictionary (see [`ExactFilter`]), or `None` for one the index only
+    /// bounds and DataFusion verifies. The one classification
+    /// [`supports_filters_pushdown`](TableProvider::supports_filters_pushdown),
+    /// [`scan`](TableProvider::scan) and the covered-aggregate rewrite
+    /// share, so what DataFusion is told is exact is what the scan answers
+    /// exactly. It reads only the expression and the table options, so a
+    /// cached plan stays valid.
+    fn exact_filter(&self, filter: &Expr, fts_cols: &HashSet<&str>) -> Option<ExactFilter> {
+        let opts = &self.manifest.options;
+        exact_filter(filter, fts_cols, &|col| opts.try_fts_tokenizer_for(col))
+    }
+
+    /// Whether this provider answers any of `filters` exactly
+    /// ([`Self::exact_filter`]): DataFusion then keeps no `Filter` node for
+    /// it, and a scan carrying it returns fewer rows than the manifest's
+    /// statistics describe.
+    pub(crate) fn has_exact_filter(&self, filters: &[Expr]) -> bool {
+        let fts_cols = self.fts_cols_set();
+        filters
+            .iter()
+            .any(|filter| self.exact_filter(filter, &fts_cols).is_some())
+    }
+
+    /// The rows of one superfile its exact conjuncts hold for, within
+    /// `bound` (the other conjuncts' candidate rows, when the index bounded
+    /// them). Every leaf's rows come from the dictionary
+    /// ([`SuperfileReader::contains_rows`]), each column walked once for
+    /// all its needles; the leaves combine through the conjuncts' `AND` /
+    /// `OR` tree ([`ExactFilter::rows`]), and the rows that leaves doubtful
+    /// are checked against their stored text, tombstoned ones left out
+    /// first since the scan skips them anyway.
+    ///
+    /// A `bound` of at most `gate` rows — the bounded path's own selection
+    /// limit — skips the dictionary: its rows are checked against their
+    /// text directly. That is exact too, and far cheaper than walking the
+    /// whole dictionary and unioning every covered term's postings only to
+    /// keep the few rows the bound allows.
+    async fn exact_rows(
+        &self,
+        prepared: &PreparedScanFile,
+        check: &ExactCheck,
+        bound: Option<&RoaringBitmap>,
+        gate: u64,
+        tombstones: &RoaringBitmap,
+        batch_size: usize,
+    ) -> DfResult<(RoaringBitmap, MatchWork)> {
+        let pool: &ThreadPool = &self.manifest.options.reader_pool;
+        let mut work = MatchWork::default();
+        if let Some(bound) = bound.filter(|bound| bound.len() <= gate) {
+            let checked = bound - tombstones;
+            let verified = check
+                .rows_holding(&prepared.reader, &checked, pool, batch_size)
+                .await?;
+            self.count_rows_checked(checked.len(), verified.len());
+            return Ok((verified, work));
+        }
+        // Each column's distinct needles, in first-seen order.
+        let mut by_column: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for leaf in check.filter.leaves() {
+            let needles = by_column.entry(leaf.column.as_str()).or_default();
+            if !needles.contains(&leaf.needle.as_str()) {
+                needles.push(&leaf.needle);
+            }
+        }
+        let budget = &self.manifest.options.connection_memory_budget;
+        let mut leaf_rows: HashMap<(&str, &str), ContainsRows> = HashMap::new();
+        for (column, needles) in by_column {
+            let (rows, column_work) = prepared
+                .reader
+                .contains_rows(column, &needles, Some(pool), Some(budget))
+                .await
+                .map_err(scan_read_df_error)?;
+            // One result per needle, or the zip below would pair needles
+            // with another needle's rows.
+            if rows.len() != needles.len() {
+                return Err(DataFusionError::Internal(format!(
+                    "exact rows of column {column:?}: {} results for {} needles",
+                    rows.len(),
+                    needles.len()
+                )));
+            }
+            work.merge(column_work);
+            leaf_rows.extend(needles.into_iter().map(|needle| (column, needle)).zip(rows));
+        }
+        // Every leaf the tree reads has its rows; checked up front so the
+        // lookup below cannot miss.
+        if let Some(leaf) = check
+            .filter
+            .leaves()
+            .into_iter()
+            .find(|leaf| !leaf_rows.contains_key(&(leaf.column.as_str(), leaf.needle.as_str())))
+        {
+            return Err(DataFusionError::Internal(format!(
+                "exact rows of column {:?}: no result for needle {:?}",
+                leaf.column, leaf.needle
+            )));
+        }
+        let mut rows = check.filter.rows(&|leaf| {
+            leaf_rows
+                .get(&(leaf.column.as_str(), leaf.needle.as_str()))
+                .cloned()
+                .unwrap_or_default()
+        });
+        if let Some(bound) = bound {
+            rows.proven &= bound;
+            rows.doubtful &= bound;
+        }
+        rows.doubtful -= tombstones;
+        let verified = check
+            .rows_holding(&prepared.reader, &rows.doubtful, pool, batch_size)
+            .await?;
+        self.count_rows_checked(rows.doubtful.len(), verified.len());
+        Ok((rows.proven | verified, work))
+    }
+
+    /// Count the rows an exact check decoded to read their text but the
+    /// scan will not emit (`checked` of them, `kept` passing). The ones it
+    /// keeps are counted once, when the scan emits them, so the total stays
+    /// rows decoded.
+    fn count_rows_checked(&self, checked: u64, kept: u64) {
+        if let Some(stats) = self.scan_store.op_stats() {
+            stats.add_rows_materialized(checked.saturating_sub(kept));
+        }
+    }
+
     /// Open and prepare one superfile once for this pinned manifest.
     ///
     /// The [`OnceCell`] coalesces concurrent first scans. Errors are not
@@ -730,6 +863,101 @@ fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
         && max.distance(min).map(|d| d as u64) == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
 }
 
+/// A superfile read error inside the scan as DataFusion's: a budget refusal
+/// as `ResourcesExhausted`, the channel the memory pool refuses through, so
+/// the SQL error classifiers surface it as `OverBudget`; anything else as an
+/// execution error.
+fn scan_read_df_error(e: ReadError) -> DataFusionError {
+    match e.over_budget() {
+        Some(msg) => DataFusionError::ResourcesExhausted(msg.to_owned()),
+        None => DataFusionError::Execution(e.to_string()),
+    }
+}
+
+/// A scan's exact conjuncts ([`SupertableProvider::exact_filter`]),
+/// compiled once per scan together with the check their doubtful rows get.
+struct ExactCheck {
+    /// The conjunction as the dictionary answers it: an `AND` of the
+    /// conjuncts.
+    filter: ExactFilter,
+    /// The conjunction, bound to the columns it reads.
+    predicate: BoundPredicate,
+    /// Those columns' names, in the bound schema's order.
+    columns: Vec<String>,
+}
+
+impl ExactCheck {
+    /// `None` when there is no exact conjunct. `filters` and `conjuncts`
+    /// pair up: each filter is the expression its conjunct came from.
+    fn compile(
+        filters: &[Expr],
+        conjuncts: Vec<ExactFilter>,
+        schema: &SchemaRef,
+    ) -> DfResult<Option<Self>> {
+        if conjuncts.is_empty() {
+            return Ok(None);
+        }
+        // An exact conjunct reads one column of this table, so the
+        // compile can only fail on a bug; fail the scan rather than drop a
+        // filter DataFusion no longer applies.
+        let pushed = PushedPredicate::compile(filters, schema).ok_or_else(|| {
+            DataFusionError::Internal("an exact filter does not compile over its table".into())
+        })?;
+        let bound_schema = Arc::new(schema.project(pushed.columns())?);
+        let predicate = pushed.bind(&bound_schema)?;
+        let columns = bound_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        Ok(Some(Self {
+            filter: ExactFilter::And(conjuncts),
+            predicate,
+            columns,
+        }))
+    }
+
+    /// Of `rows` in `reader`'s superfile, the ones the conjunction holds
+    /// for, read from their stored text `batch_size` rows at a time. The
+    /// ids are drawn from `rows` one batch at a time, never copied out
+    /// whole.
+    async fn rows_holding(
+        &self,
+        reader: &Arc<SuperfileReader>,
+        rows: &RoaringBitmap,
+        pool: &ThreadPool,
+        batch_size: usize,
+    ) -> DfResult<RoaringBitmap> {
+        let names: Vec<&str> = self.columns.iter().map(String::as_str).collect();
+        let mut ids = rows.iter();
+        let mut kept = RoaringBitmap::new();
+        loop {
+            let chunk: Vec<u32> = ids.by_ref().take(batch_size.max(1)).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let chunk = chunk.as_slice();
+            let batch = take_rows(reader, chunk, &names, pool).await?;
+            if batch.num_rows() != chunk.len() {
+                return Err(DataFusionError::Internal(format!(
+                    "read {} rows to check {} against their text",
+                    batch.num_rows(),
+                    chunk.len()
+                )));
+            }
+            let mask = self.predicate.mask(&batch)?;
+            kept.extend(
+                chunk
+                    .iter()
+                    .zip(mask.iter())
+                    .filter(|&(_, holds)| holds == Some(true))
+                    .map(|(&row, _)| row),
+            );
+        }
+        Ok(kept)
+    }
+}
+
 /// Whether walking a column's whole dictionary (`terms` distinct terms) is
 /// worth it against scanning its `bytes` of stored text — see
 /// [`LIKE_WALK_MIN_BYTES_PER_TERM`]. A missing term count (0) passes.
@@ -774,20 +1002,35 @@ impl TableProvider for SupertableProvider {
         TableType::Base
     }
 
-    /// Report every filter as `Inexact`: DataFusion hands us the
-    /// predicates (for the superfile skip and the index bound) **and**
-    /// keeps a `FilterExec` above the scan, so correctness never depends
-    /// on our conservative pruning. The `FilterExec` also does the
-    /// candidate-superset verification in the same scan pass as the
-    /// projection (one decode), which a self-verifying `exact_match`
-    /// candidate would split into an extra pass — measured slower.
-    /// Returning `Unsupported` (the default) would withhold the filters
-    /// from [`scan`] entirely, disabling superfile + row-group skip.
+    /// Report a filter the term dictionary answers exactly
+    /// ([`Self::exact_filter`]: `col ILIKE '%word%'` on a `standard` FTS
+    /// column) as `Exact`, and every other as `Inexact`.
+    ///
+    /// An `Inexact` filter is handed to [`scan`] (for the superfile skip
+    /// and the index bound) **and** kept in a `FilterExec` above it, so
+    /// correctness never depends on our conservative pruning. The
+    /// `FilterExec` also does the candidate-superset verification in the
+    /// same scan pass as the projection (one decode), which a
+    /// self-verifying `exact_match` candidate would split into an extra
+    /// pass — measured slower.
+    ///
+    /// An `Exact` filter gets no `FilterExec`: the scan's access plan
+    /// selects exactly its rows, so its column is never decoded for it —
+    /// a `COUNT(*)` reads no text at all. Returning `Unsupported` (the
+    /// default) would withhold the filters from [`scan`] entirely,
+    /// disabling superfile + row-group skip.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        let fts_cols = self.fts_cols_set();
+        Ok(filters
+            .iter()
+            .map(|filter| match self.exact_filter(filter, &fts_cols) {
+                Some(_) => TableProviderFilterPushDown::Exact,
+                None => TableProviderFilterPushDown::Inexact,
+            })
+            .collect())
     }
 
     /// Whole-table statistics from a complete resident manifest view (no I/O)
@@ -860,13 +1103,33 @@ impl TableProvider for SupertableProvider {
             cache.prefetch(&ids, now).await;
         }
 
+        // Split the conjuncts into the ones the dictionary answers exactly
+        // (reported `Exact`: DataFusion applies them nowhere else) and the
+        // ones the index only bounds.
+        let fts_cols = self.fts_cols_set();
+        let mut exact_filters: Vec<Expr> = Vec::new();
+        let mut exact_conjuncts: Vec<ExactFilter> = Vec::new();
+        let mut bounded_filters: Vec<Expr> = Vec::new();
+        for filter in filters {
+            match self.exact_filter(filter, &fts_cols) {
+                Some(exact) => {
+                    exact_filters.push(filter.clone());
+                    exact_conjuncts.push(exact);
+                }
+                None => bounded_filters.push(filter.clone()),
+            }
+        }
+        let exact_check = ExactCheck::compile(&exact_filters, exact_conjuncts, &self.schema)?;
+        let exact_check = exact_check.as_ref();
+        let batch_size = state.config().batch_size();
+
         // Pass 1 — build the index candidate plan once for this scan. It
-        // lowers the FTS-resolvable part of the `WHERE` clause to a
+        // lowers the FTS-resolvable part of the bounded conjuncts to a
         // boolean tree over `token_match`; evaluated per superfile below
         // it yields a candidate row-id superset (or `Unbounded` = scan
         // the superfile). See `crate::supertable::query::candidate`.
         let opts = &self.manifest.options;
-        let candidate_plan = CandidatePlan::from_filters(filters, &self.fts_cols_set(), &|col| {
+        let candidate_plan = CandidatePlan::from_filters(&bounded_filters, &fts_cols, &|col| {
             opts.try_fts_tokenizer_for(col)
         });
         // A `LIKE` leaf is bound to each superfile's dictionary once, up
@@ -907,7 +1170,8 @@ impl TableProvider for SupertableProvider {
             candidates: Option<RoaringBitmap>,
             tombstones: Arc<RoaringBitmap>,
             /// This superfile's plan came out `Unbounded` — the whole plan
-            /// is, or a `LIKE` token found no bound in its dictionary.
+            /// is, or a `LIKE` token found no bound in its dictionary —
+            /// and no exact conjunct bounds it either.
             unbounded: bool,
             /// The pushdown predicate's df probes, dictionary walks and
             /// posting walks on this superfile.
@@ -917,6 +1181,12 @@ impl TableProvider for SupertableProvider {
         // work and run on the reader pool behind a oneshot; only their FST
         // fetches stay on this runtime.
         let reader_pool: &ThreadPool = &self.manifest.options.reader_pool;
+        // Superfiles answering exact conjuncts at once. Their walks and
+        // unions run on the reader pool, so more in flight than it has
+        // threads only queue there, each holding its fetched postings and
+        // bitsets; what they do hold is charged to the connection budget.
+        let exact_slots = Semaphore::new(reader_pool.current_num_threads());
+        let exact_slots = &exact_slots;
 
         // Pass 1 (per superfile), fanned out: every survivor resolves its
         // candidate rows in its own future and `try_join_all` drives them
@@ -986,7 +1256,10 @@ impl TableProvider for SupertableProvider {
                         } else {
                             candidate_plan
                         };
-                        let unbounded = matches!(plan, CandidatePlan::Unbounded);
+                        // An exact conjunct bounds the rows even when the
+                        // bounded ones cannot.
+                        let unbounded =
+                            matches!(plan, CandidatePlan::Unbounded) && exact_check.is_none();
                         let (est, est_work) = plan
                             .estimate(prepared.reader.as_ref(), Some(reader_pool))
                             .await
@@ -1024,6 +1297,34 @@ impl TableProvider for SupertableProvider {
                                 })?
                             }
                             None => Arc::new(RoaringBitmap::new()),
+                        };
+
+                        // The exact conjuncts' rows, within whatever the
+                        // bounded ones kept. No selectivity gate sends them to
+                        // a scan: DataFusion no longer checks these
+                        // conjuncts, so the selection must be exactly their
+                        // rows however many there are. A bounded selection
+                        // within the gate is checked against its text instead
+                        // of the dictionary (see `exact_rows`).
+                        let candidates = match exact_check {
+                            Some(check) => {
+                                let _slot = exact_slots.acquire().await.map_err(|e| {
+                                    DataFusionError::Internal(format!("exact rows slot: {e}"))
+                                })?;
+                                let (rows, exact_work) = self
+                                    .exact_rows(
+                                        &prepared,
+                                        check,
+                                        candidates.as_ref(),
+                                        gate,
+                                        &tombstones,
+                                        batch_size,
+                                    )
+                                    .await?;
+                                predicate_work.merge(exact_work);
+                                Some(rows)
+                            }
+                            None => candidates,
                         };
 
                         Ok::<SuperfileScan, DataFusionError>(SuperfileScan {
@@ -1099,9 +1400,11 @@ impl TableProvider for SupertableProvider {
         // (`with_pushdown_filters`) so the predicate columns are decoded
         // first and only surviving rows materialize.
         //
-        // The predicate itself is not attached here. Every filter is
-        // reported `Inexact`, so DataFusion keeps a `FilterExec` above the
-        // scan, and its physical filter-pushdown rule then offers that
+        // The predicate itself is not attached here. Every filter but an
+        // exact one is reported `Inexact`, so DataFusion keeps a
+        // `FilterExec` above the scan for those (an exact filter bounds
+        // every superfile's rows, so a scan holding one never turns row
+        // filters on), and its physical filter-pushdown rule then offers that
         // node's predicate to the source: with row filters enabled the
         // source accepts it once and the `FilterExec` is dropped; with them
         // disabled the source still keeps it for statistics pruning and the

@@ -153,9 +153,6 @@ pub enum BuildError {
     #[error("write contention: a concurrent writer won the commit race")]
     WriteContention,
 
-    #[error("merge needs more memory than the connection budget allows: {0}")]
-    MemoryBudgetExceeded(String),
-
     #[error("rayon thread pool creation failed: {0}")]
     ThreadPoolCreation(String),
 
@@ -276,6 +273,14 @@ pub enum CommitError {
     /// was dropped and purged while this handle stayed open. Not retryable.
     #[error("manifest pointer was deleted while this handle was open")]
     PointerVanished,
+
+    /// An input's tombstone sidecar changed under the seal this commit holds,
+    /// so a writer landed a bit on a superfile the commit is about to remove.
+    /// Retryable in the same sense as a lost pointer CAS: nothing was
+    /// published, and the next attempt re-resolves — dropping the job whose
+    /// seal moved and committing the rest.
+    #[error("input {superfile_id} changed under this commit's seal")]
+    InputsChanged { superfile_id: uuid::Uuid },
 }
 
 impl CommitError {
@@ -287,7 +292,8 @@ impl CommitError {
     /// both shapes are classified together.
     pub(crate) fn is_conflict(&self) -> bool {
         match self {
-            CommitError::WriteContentionExhausted => true,
+            // Both are a race lost to another writer with nothing published.
+            CommitError::WriteContentionExhausted | CommitError::InputsChanged { .. } => true,
             CommitError::Storage(e) => e.is_conflict(),
             CommitError::Build(b) => b.is_conflict(),
             _ => false,
