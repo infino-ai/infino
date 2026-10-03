@@ -284,6 +284,10 @@ pub(crate) enum CarryScope {
     /// Copy only the columns whose text is absent, and leave the rest for
     /// the caller to re-analyze from the batch.
     UnstoredOnly,
+    /// Copy nothing: every column is analyzed from the batch. For an input
+    /// whose index is not the output's (a column's index added, dropped or
+    /// renamed since the file was written), where there is nothing to carry.
+    Reanalyze,
 }
 
 impl CarryScope {
@@ -292,6 +296,7 @@ impl CarryScope {
         match self {
             Self::AllColumns => true,
             Self::UnstoredOnly => !column.stored,
+            Self::Reanalyze => false,
         }
     }
 }
@@ -870,6 +875,18 @@ impl BuilderOptions {
     /// Inputs from one table can never disagree (the table's options
     /// identity pins the per-column config), so every error here is a
     /// misuse of the merge entry points — made loud instead of silent.
+    /// Whether `reader`'s posting lists can be carried into a file built
+    /// with these options: the same full-text columns under the same
+    /// analysis. A file written before a column's index was added or
+    /// after it was dropped, or whose column has since been renamed, fails
+    /// this and is re-encoded from its rows instead.
+    pub(crate) fn fts_carry_compatible(&self, reader: &SuperfileReader) -> bool {
+        let remote = reader
+            .fts()
+            .map(|f| f.fts_columns_config().collect::<Vec<_>>());
+        self.check_fts_carry_compat(remote.as_deref()).is_ok()
+    }
+
     fn check_fts_carry_compat(&self, remote: Option<&[&ColumnMeta]>) -> Result<(), BuildError> {
         let remote = remote.unwrap_or(&[]);
         if self.fts_columns.len() != remote.len() {
@@ -2066,12 +2083,14 @@ impl SuperfileBuilder {
         adapter: Option<&FileSchemaMap>,
         scope: CarryScope,
     ) -> Result<SuperfileStats, BuildError> {
-        self.opts.check_fts_carry_compat(
-            reader
-                .fts()
-                .map(|f| f.fts_columns_config().collect::<Vec<_>>())
-                .as_deref(),
-        )?;
+        if scope != CarryScope::Reanalyze {
+            self.opts.check_fts_carry_compat(
+                reader
+                    .fts()
+                    .map(|f| f.fts_columns_config().collect::<Vec<_>>())
+                    .as_deref(),
+            )?;
+        }
         let record_batch = adapted_batch(reader, deleted_docs_bitmap.clone(), adapter, &self.opts)?;
 
         let superfile_stats = SuperfileStats::try_compute_from_record_batch(&record_batch)?;
@@ -2126,7 +2145,9 @@ impl SuperfileBuilder {
         // the merge is cheaper, byte-faithful to the input's index, and an
         // unstored column — whose text isn't in the batch at all — still
         // merges losslessly.
-        self.carry_fts_from_reader_scoped(reader, deleted_docs_bitmap.as_deref(), scope)?;
+        if scope != CarryScope::Reanalyze {
+            self.carry_fts_from_reader_scoped(reader, deleted_docs_bitmap.as_deref(), scope)?;
+        }
         // Re-analyze exactly what the carry left behind.
         let index_fts = scope != CarryScope::AllColumns;
         self.add_batch_inner(&record_batch, &slices, index_fts)?;
@@ -2166,11 +2187,18 @@ impl SuperfileBuilder {
 
         let mut stats_collector = Vec::with_capacity(inputs.len());
         for input in inputs {
+            // An input whose index is the output's lends its postings; one
+            // whose index is not is analyzed from its rows.
+            let scope = if superfile_builder.opts.fts_carry_compatible(&input.reader) {
+                CarryScope::AllColumns
+            } else {
+                CarryScope::Reanalyze
+            };
             let stats = superfile_builder.add_batch_from_reader_scoped(
                 &input.reader,
                 input.deleted.clone(),
                 input.adapter.as_ref(),
-                CarryScope::AllColumns,
+                scope,
             )?;
             stats_collector.push(stats);
         }

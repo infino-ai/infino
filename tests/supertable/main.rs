@@ -50,6 +50,7 @@ mod reindex_crash;
 mod reindex_invariance;
 mod schema_evolution;
 mod schema_property;
+mod schema_types;
 mod storage;
 mod update_crash_property;
 mod vector_cosine_normalize;

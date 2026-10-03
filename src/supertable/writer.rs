@@ -552,18 +552,35 @@ pub(in crate::supertable) fn persist_list_metadata(
     inner: &SupertableInner,
     metadata: CommitListMetadata,
 ) -> Result<(), BuildError> {
+    bridge_on_runtime(
+        persist_list_metadata_async(inner, metadata),
+        &inner.query_runtime(),
+    )
+}
+
+/// [`persist_list_metadata`] for callers already on the runtime.
+pub(in crate::supertable) async fn persist_list_metadata_async(
+    inner: &SupertableInner,
+    metadata: CommitListMetadata,
+) -> Result<(), BuildError> {
     match inner.options.storage.as_ref() {
-        Some(storage) => persist_commit(
-            inner,
-            Arc::clone(storage),
-            Vec::new(),
-            &[],
-            Vec::new(),
-            Vec::new(),
-            metadata,
-            Vec::new(),
-        )
-        .map_err(BuildError::from),
+        Some(storage) => {
+            let new_manifest = persist_commit_async(
+                inner,
+                Arc::clone(storage),
+                Vec::new(),
+                &[],
+                Vec::new(),
+                Vec::new(),
+                metadata,
+                Vec::new(),
+            )
+            .await
+            .map_err(BuildError::from)?;
+            inner.manifest.store(new_manifest);
+            inner.reconcile_tombstone_seqs();
+            Ok(())
+        }
         None => {
             let old = inner.manifest.load();
             metadata.check_schema(&old)?;

@@ -939,7 +939,8 @@ impl !core::panic::unwind_safe::UnwindSafe for infino::Supertable
 pub struct infino::TableSchema
 impl infino::TableSchema
 pub fn infino::TableSchema::apply(&self, &[infino::supertable::schema::change::SchemaChange]) -> core::result::Result<infino::TableSchema, infino::SchemaError>
-pub fn infino::TableSchema::with_conversion_cleared(&self, infino::FieldId) -> core::option::Option<infino::TableSchema>
+pub fn infino::TableSchema::converting(&self) -> impl core::iter::traits::iterator::Iterator<Item = infino::FieldId> + '_
+pub fn infino::TableSchema::with_conversions_cleared(&self, &[infino::FieldId]) -> core::option::Option<infino::TableSchema>
 impl infino::TableSchema
 pub fn infino::TableSchema::effective_schema(&self, &str) -> alloc::sync::Arc<arrow_schema::schema::Schema>
 pub fn infino::TableSchema::fields(&self) -> &[infino::FieldDef]
