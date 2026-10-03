@@ -11437,6 +11437,71 @@ mod tests {
     };
 
     /// Small fixed vector dimension accepted by the vector builder.
+    /// A committed entry carries the physical schema the writer derived
+    /// from the file it wrote, and that schema survives the part codec: a
+    /// handle that loads the table's parts from storage reads the same
+    /// columns, with the id column and `title` named by their ids.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn committed_entries_carry_their_physical_schema() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+        {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_title_batch(&["alpha", "beta"]))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let title = table
+            .reader()
+            .expect("reader")
+            .manifest()
+            .field_id("title")
+            .expect("title is a table column");
+        let expect_stamped = |entries: &[Arc<SuperfileEntry>]| {
+            assert_eq!(entries.len(), 1);
+            let physical = entries[0]
+                .physical_schema
+                .as_ref()
+                .expect("a committed entry carries its physical schema");
+            let ids: Vec<(&str, Option<FieldId>)> = physical
+                .columns()
+                .iter()
+                .map(|c| (c.name.as_str(), c.id))
+                .collect();
+            assert_eq!(
+                ids,
+                vec![("_id", Some(FieldId::ID_COLUMN)), ("title", Some(title))]
+            );
+        };
+        expect_stamped(
+            table
+                .reader()
+                .expect("reader")
+                .manifest()
+                .get_all_superfiles(),
+        );
+
+        let lazy = Supertable::open(
+            default_supertable_options()
+                .with_storage(Arc::clone(&storage))
+                .with_eager_load_threshold(0),
+        )
+        .expect("open");
+        let loaded = lazy
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("load parts");
+        expect_stamped(&loaded);
+    }
+
     const COMMIT_AS_DRAIN_TEST_DIM: usize = 16;
     /// Small row count that still exercises multiple global cells.
     const COMMIT_AS_DRAIN_TEST_ROWS: usize = 8;

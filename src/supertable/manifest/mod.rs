@@ -2059,7 +2059,6 @@ impl ManifestSnapshot {
                     birth_version
                 };
                 Ok(Arc::new(SuperfileEntry {
-                    physical_schema: None,
                     partition_key: encode_partition_key(&pk),
                     birth_version: entry_birth_version,
                     ..(**e).clone()
