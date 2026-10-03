@@ -244,6 +244,134 @@ fn a_buffer_of_two_appends_adds_both_columns_in_one_commit() {
 }
 
 #[test]
+fn a_retype_commits_the_rows_the_writer_is_holding_before_it_lands() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_score_schema(), IndexSpec::new().fts("title"))
+        .expect("create");
+    let mut writer = docs.local_handle().writer().expect("writer");
+    writer
+        .append(&batch(vec![
+            ("title", titles(&["a"])),
+            ("score", ints(vec![Some(7)])),
+        ]))
+        .expect("append under the Int64 score");
+    // These rows are acknowledged but un-flushed. Retyping `score` out
+    // from under them would leave them unable to commit under any schema,
+    // and dropping the writer would discard them.
+    let doc = writer
+        .apply_schema(
+            &patch(vec![FieldPatch {
+                id: Some(FieldId(2)),
+                ..add("score", DataType::LargeUtf8)
+            }]),
+            None,
+        )
+        .expect("retype score");
+    assert_eq!(doc.fields()[1].data_type, DataType::LargeUtf8);
+    writer.commit().expect("commit");
+    drop(writer);
+
+    assert_eq!(
+        rows(&db, "SELECT title FROM docs"),
+        vec!["a"],
+        "the acknowledged row is durable"
+    );
+}
+
+#[test]
+fn a_rename_follows_the_rows_the_writer_is_holding_instead_of_minting_a_second_column() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_score_schema(), IndexSpec::new().fts("title"))
+        .expect("create");
+    let mut writer = docs.local_handle().writer().expect("writer");
+    writer
+        .append(&batch(vec![
+            ("title", titles(&["a"])),
+            ("score", ints(vec![Some(7)])),
+        ]))
+        .expect("append under the old name");
+    let doc = writer
+        .apply_schema(
+            &patch(vec![FieldPatch {
+                id: Some(FieldId(2)),
+                ..add("points", DataType::Int64)
+            }]),
+            None,
+        )
+        .expect("rename score to points");
+    assert_eq!(
+        names(&doc),
+        vec![("title", FieldId(1)), ("points", FieldId(2))]
+    );
+    writer.commit().expect("commit");
+    drop(writer);
+
+    // One logical column, not two: the buffered rows landed under the old
+    // name before the rename, so they read back under the new one rather
+    // than bringing `score` back as a column of its own.
+    let after = db.schema(TABLE).expect("schema");
+    assert_eq!(
+        names(&after),
+        vec![("title", FieldId(1)), ("points", FieldId(2))]
+    );
+    assert_eq!(rows(&db, "SELECT title, points FROM docs"), vec!["a|7"]);
+    assert!(
+        db.query_sql("SELECT score FROM docs").is_err(),
+        "the old name is gone"
+    );
+}
+
+#[test]
+fn a_column_cannot_stop_admitting_nulls_over_rows_a_peer_committed() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().to_str().expect("utf8");
+    let stale = connect(path).expect("connect");
+    stale
+        .create_table(TABLE, title_score_schema(), IndexSpec::new().fts("title"))
+        .expect("create");
+    // The document this handle holds, read while the table is still empty.
+    let doc = stale.schema(TABLE).expect("schema");
+
+    let peer = connect(path).expect("connect");
+    peer.open_table(TABLE)
+        .expect("open")
+        .append(&batch(vec![
+            ("title", titles(&["a"])),
+            ("score", ints(vec![None])),
+        ]))
+        .expect("the peer commits a null score");
+
+    // An append over known columns leaves `schema_id` where it was, so the
+    // expectation the write carries is still satisfied — only the rows
+    // moved, and they are what forbids the change.
+    let err = stale
+        .apply_schema(
+            TABLE,
+            &patch(vec![FieldPatch {
+                id: Some(FieldId(2)),
+                nullable: Some(false),
+                ..add("score", DataType::Int64)
+            }]),
+            Some(doc.schema_id()),
+        )
+        .expect_err("score cannot stop admitting nulls over a committed null");
+    assert!(
+        matches!(&err, InfinoError::Schema(m) if m.contains("score") && m.contains("rows")),
+        "{err}"
+    );
+
+    let fresh = connect(path).expect("connect");
+    let after = fresh.schema(TABLE).expect("schema");
+    assert!(
+        after.fields()[1].nullable,
+        "the document still admits nulls"
+    );
+    assert_eq!(after.schema_id(), doc.schema_id(), "nothing was published");
+}
+
+#[test]
 fn the_schema_write_adds_renames_and_drops_and_reads_follow() {
     let db = connect("memory://").expect("connect");
     let docs = db

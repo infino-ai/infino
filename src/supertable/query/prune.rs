@@ -43,8 +43,9 @@ use crate::{
             term_index::TermIndex,
         },
         query::skip::{
-            ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip, null_check_may_match,
-            null_check_skip, scalar_skip, scalar_value_may_match, scalar_value_set_skip,
+            ColumnTypeGuard, ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip,
+            null_check_may_match, null_check_skip, scalar_skip, scalar_value_may_match,
+            scalar_value_set_skip,
         },
         schema::FieldId,
     },
@@ -118,19 +119,34 @@ impl PruneLeaf {
                 let Some(id) = manifest.field_id(&pred.column) else {
                     return Some(all());
                 };
-                Some(scalar_keep_parts(list, id, pred))
+                Some(scalar_keep_parts(
+                    list,
+                    id,
+                    &ColumnTypeGuard::new(manifest, id),
+                    pred,
+                ))
             }
             PruneLeaf::ScalarValueSet { column, values } => {
                 let Some(id) = manifest.field_id(column) else {
                     return Some(all());
                 };
-                Some(scalar_value_set_keep_parts(list, id, values))
+                Some(scalar_value_set_keep_parts(
+                    list,
+                    id,
+                    &ColumnTypeGuard::new(manifest, id),
+                    values,
+                ))
             }
             PruneLeaf::NullCheck { column, want_null } => {
                 let Some(id) = manifest.field_id(column) else {
                     return Some(all());
                 };
-                Some(null_check_keep_parts(list, id, *want_null))
+                Some(null_check_keep_parts(
+                    list,
+                    id,
+                    &ColumnTypeGuard::new(manifest, id),
+                    *want_null,
+                ))
             }
         }
     }
@@ -140,15 +156,23 @@ impl PruneLeaf {
 /// aggregate keeps the part (conservative — never a false prune). The
 /// stats are length-1 [`ArrayRef`]s decoded when the list loaded, so
 /// reading them here is free of per-query Arrow decode.
+///
+/// A part's aggregate folds one pair of bounds and one null count over
+/// every file it lists, each recorded in the type its file was written
+/// in. While `column` is converting those types differ across the part,
+/// so no aggregate over it describes what the rows read as and every part
+/// is kept; `guard` is what knows that.
 fn keep_parts_where_agg(
     list: &Manifest,
     column: FieldId,
+    guard: &ColumnTypeGuard,
     keep: impl Fn(&ScalarStatsAgg) -> bool,
 ) -> Vec<PartId> {
     list.parts
         .iter()
         .filter_map(|entry| {
-            let k = entry.scalar_stats_agg.get(&column).is_none_or(&keep);
+            let k = guard.aggregates_mix_types()
+                || entry.scalar_stats_agg.get(&column).is_none_or(&keep);
             k.then_some(entry.part_id)
         })
         .collect()
@@ -159,9 +183,10 @@ fn keep_parts_where_agg(
 fn keep_parts_where(
     list: &Manifest,
     column: FieldId,
+    guard: &ColumnTypeGuard,
     may_match: impl Fn(&ScalarValue, &ScalarValue) -> bool,
 ) -> Vec<PartId> {
-    keep_parts_where_agg(list, column, |agg| {
+    keep_parts_where_agg(list, column, guard, |agg| {
         agg_minmax(agg).is_none_or(|(min, max)| may_match(&min, &max))
     })
 }
@@ -178,13 +203,25 @@ fn agg_minmax(agg: &ScalarStatsAgg) -> Option<(ScalarValue, ScalarValue)> {
 }
 
 // Part-tier `IS [NOT] NULL` prune; the superfile-tier sibling lives in `skip`.
-fn null_check_keep_parts(list: &Manifest, column: FieldId, want_null: bool) -> Vec<PartId> {
-    keep_parts_where_agg(list, column, |agg| null_check_may_match(agg, want_null))
+fn null_check_keep_parts(
+    list: &Manifest,
+    column: FieldId,
+    guard: &ColumnTypeGuard,
+    want_null: bool,
+) -> Vec<PartId> {
+    keep_parts_where_agg(list, column, guard, |agg| {
+        null_check_may_match(agg, want_null)
+    })
 }
 
 // Part-tier scalar prune: keep parts whose min/max could satisfy `pred`.
-fn scalar_keep_parts(list: &Manifest, column: FieldId, pred: &ScalarPredicate) -> Vec<PartId> {
-    keep_parts_where(list, column, |min, max| {
+fn scalar_keep_parts(
+    list: &Manifest,
+    column: FieldId,
+    guard: &ColumnTypeGuard,
+    pred: &ScalarPredicate,
+) -> Vec<PartId> {
+    keep_parts_where(list, column, guard, |min, max| {
         scalar_value_may_match(min, max, pred.op, &pred.value)
     })
 }
@@ -194,9 +231,10 @@ fn scalar_keep_parts(list: &Manifest, column: FieldId, pred: &ScalarPredicate) -
 fn scalar_value_set_keep_parts(
     list: &Manifest,
     column: FieldId,
+    guard: &ColumnTypeGuard,
     values: &[ScalarValue],
 ) -> Vec<PartId> {
-    keep_parts_where(list, column, |min, max| {
+    keep_parts_where(list, column, guard, |min, max| {
         values
             .iter()
             .any(|v| scalar_value_may_match(min, max, ScalarOp::Eq, v))
@@ -267,7 +305,10 @@ pub(crate) async fn select_superfiles(
         })
         .collect();
     if !scalar_preds.is_empty() {
-        and_into(&mut mask, &scalar_skip(&superfiles, &scalar_preds));
+        and_into(
+            &mut mask,
+            &scalar_skip(manifest, &superfiles, &scalar_preds),
+        );
     }
 
     // The table-level term index answers term and prefix leaves exactly
@@ -322,7 +363,7 @@ pub(crate) async fn select_superfiles(
                 };
                 and_into(
                     &mut mask,
-                    &scalar_value_set_skip(&superfiles, column_id, values),
+                    &scalar_value_set_skip(manifest, &superfiles, column_id, values),
                 );
             }
             PruneLeaf::NullCheck { column, want_null } => {
@@ -331,7 +372,7 @@ pub(crate) async fn select_superfiles(
                 };
                 and_into(
                     &mut mask,
-                    &null_check_skip(&superfiles, column_id, *want_null),
+                    &null_check_skip(manifest, &superfiles, column_id, *want_null),
                 );
             }
             // Scalar leaves handled above as one conjunction.
@@ -374,6 +415,12 @@ mod tests {
         ManifestSnapshot::empty(opts_title_fts())
             .field_id(name)
             .unwrap_or_else(|| crate::test_helpers::fid(name))
+    }
+
+    /// The guard for `name` on a table with no column under conversion:
+    /// what every part-tier assertion below measures against.
+    fn current_types(name: &str) -> ColumnTypeGuard {
+        ColumnTypeGuard::new(&ManifestSnapshot::empty(opts_title_fts()), fid(name))
     }
     use std::{
         collections::{HashMap, HashSet},
@@ -496,17 +543,32 @@ mod tests {
 
         // x = 5 → only p0's [0,10] aggregate can contain it.
         assert_eq!(
-            scalar_keep_parts(&list, fid("x"), &pred("x", ScalarOp::Eq, 5)),
+            scalar_keep_parts(
+                &list,
+                fid("x"),
+                &current_types("x"),
+                &pred("x", ScalarOp::Eq, 5)
+            ),
             vec![p0.part_id]
         );
         // x = 105 → only p1's [100,110].
         assert_eq!(
-            scalar_keep_parts(&list, fid("x"), &pred("x", ScalarOp::Eq, 105)),
+            scalar_keep_parts(
+                &list,
+                fid("x"),
+                &current_types("x"),
+                &pred("x", ScalarOp::Eq, 105)
+            ),
             vec![p1.part_id]
         );
         // x > 50 → p0.max=10 can't; p1 kept.
         assert_eq!(
-            scalar_keep_parts(&list, fid("x"), &pred("x", ScalarOp::Gt, 50)),
+            scalar_keep_parts(
+                &list,
+                fid("x"),
+                &current_types("x"),
+                &pred("x", ScalarOp::Gt, 50)
+            ),
             vec![p1.part_id]
         );
     }
@@ -521,14 +583,16 @@ mod tests {
 
         // IN (5, 205) → p0 ([0,10]) and p2 ([200,210]); not p1.
         assert_eq!(
-            scalar_value_set_keep_parts(&list, fid("x"), &[i(5), i(205)]),
+            scalar_value_set_keep_parts(&list, fid("x"), &current_types("x"), &[i(5), i(205)]),
             vec![p0.part_id, p2.part_id]
         );
         // IN (50) → in no part's range.
-        assert!(scalar_value_set_keep_parts(&list, fid("x"), &[i(50)]).is_empty());
+        assert!(
+            scalar_value_set_keep_parts(&list, fid("x"), &current_types("x"), &[i(50)]).is_empty()
+        );
         // Unknown column → conservative keep-all.
         assert_eq!(
-            scalar_value_set_keep_parts(&list, fid("missing"), &[i(5)]),
+            scalar_value_set_keep_parts(&list, fid("missing"), &current_types("missing"), &[i(5)]),
             vec![p0.part_id, p1.part_id, p2.part_id]
         );
     }
@@ -553,7 +617,7 @@ mod tests {
         let p2 = part_from(&[seg_int("x", 200, 210)], 2);
         let list = list_with(vec![p0.clone(), p1, p2.clone()]);
         assert_eq!(
-            scalar_value_set_keep_parts(&list, fid(column), &values),
+            scalar_value_set_keep_parts(&list, fid(column), &current_types(column), &values),
             vec![p0.part_id, p2.part_id],
             "part tier prunes 1 of 3"
         );
@@ -562,7 +626,12 @@ mod tests {
         // superfiles → 1; [50,60] holds neither value, dropped here.
         let segs = vec![seg_int("x", 0, 10), seg_int("x", 50, 60)];
         assert_eq!(
-            scalar_value_set_skip(&segs, fid(column), &values),
+            scalar_value_set_skip(
+                &ManifestSnapshot::empty(opts_title_fts()),
+                &segs,
+                fid(column),
+                &values,
+            ),
             vec![true, false],
             "superfile tier prunes 1 of 2"
         );
@@ -574,7 +643,12 @@ mod tests {
         let p0 = part_from(&[seg_int("x", 0, 10)], 0);
         let list = list_with(vec![p0.clone()]);
         assert_eq!(
-            scalar_keep_parts(&list, fid("other"), &pred("other", ScalarOp::Eq, 5)),
+            scalar_keep_parts(
+                &list,
+                fid("other"),
+                &current_types("other"),
+                &pred("other", ScalarOp::Eq, 5),
+            ),
             vec![p0.part_id]
         );
     }

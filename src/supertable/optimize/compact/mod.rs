@@ -59,7 +59,7 @@ use crate::{
         opann::rerank_pool_hint,
         query::dispatch::open_compaction_input,
         reader_cache::disk::mmap_readonly_bytes,
-        schema::{FieldId, PhysicalSchema, map::FileSchemaMap},
+        schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
@@ -461,13 +461,8 @@ impl Supertable {
                     tombstoned_docs,
                     sealed_by_other,
                     birth_version: entry.birth_version,
-                    // A file without a recorded physical schema predates
-                    // field ids; it holds every column in the type the
-                    // table had then, which is the type it has now.
-                    stale_type: entry.physical_schema.as_ref().is_some_and(|physical| {
-                        FileSchemaMap::new(&schema, &manifest.options.id_column, physical)
-                            .has_stale_type()
-                    }),
+                    stale_type: !unconverted_columns(entry, &schema, &manifest.options.id_column)
+                        .is_empty(),
                 }
             })
             .collect();
@@ -2009,10 +2004,32 @@ async fn seal_with_bounded_retry(
     Err(CompactionError::SealRetriesExhausted { superfile_id })
 }
 
+/// The columns a file holds in a type the table has since left: what
+/// makes it an input to a conversion rewrite, whatever its size.
+///
+/// A file that records no physical schema was written before field ids
+/// existed. It holds every column in the type the table had then, which
+/// for a column under conversion is the old type — so it is one of that
+/// conversion's inputs. Both the job selection and the clear below read
+/// the absent schema this one way: taking it as "nothing stale" would
+/// leave the file out of every rewrite while still counting against the
+/// clear, and the conversion would never end.
+fn unconverted_columns(
+    entry: &SuperfileEntry,
+    schema: &TableSchema,
+    id_column: &str,
+) -> Vec<FieldId> {
+    match entry.physical_schema.as_ref() {
+        Some(physical) => FileSchemaMap::new(schema, id_column, physical)
+            .stale_columns()
+            .collect(),
+        None => schema.converting().collect(),
+    }
+}
+
 /// Commit the end of every type conversion whose files are all rewritten:
 /// a column with `converting_from` set whose old type no live file holds
-/// any more is cleared, one list commit for all of them. A file without a
-/// recorded physical schema leaves the question open, and a commit that
+/// any more is cleared, one list commit for all of them. A commit that
 /// loses to a concurrent schema change is left for the next run.
 async fn clear_completed_conversions(inner: &SupertableInner) -> Result<(), CompactionError> {
     let manifest = inner.manifest.load_full();
@@ -2023,12 +2040,11 @@ async fn clear_completed_conversions(inner: &SupertableInner) -> Result<(), Comp
     }
     let mut outstanding: HashSet<FieldId> = HashSet::new();
     for entry in manifest.get_all_superfiles() {
-        match entry.physical_schema.as_ref() {
-            Some(physical) => outstanding.extend(
-                FileSchemaMap::new(&schema, &manifest.options.id_column, physical).stale_columns(),
-            ),
-            None => return Ok(()),
-        }
+        outstanding.extend(unconverted_columns(
+            entry,
+            &schema,
+            &manifest.options.id_column,
+        ));
     }
     let completed: Vec<FieldId> = converting
         .into_iter()
@@ -2077,7 +2093,9 @@ mod tests {
             Supertable, SupertableOptions,
             error::CompactionError,
             manifest::commit::{POINTER_PATH, get_current_manifest_etag},
+            schema::change::{FieldPatch, SchemaPatch},
             storage::{LocalFsStorageProvider, StorageProvider},
+            writer::persist_commit_async,
         },
         test_helpers::{
             build_title_batch, default_supertable_options, default_vector_config,
@@ -2088,6 +2106,109 @@ mod tests {
 
     const DEFAULT_STALE_SEAL_TIMEOUT: Duration =
         Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
+
+    /// Titles that cast cleanly to the integers the column is flipped to,
+    /// so the rewritten file carries real values rather than nulls.
+    const NUMERIC_TITLES: [&str; 2] = ["11", "22"];
+
+    /// Flip the `title` column to integers: a lossy rewrite that sets
+    /// `converting_from` and leaves compaction to convert the files.
+    fn retype_title_to_int() -> SchemaPatch {
+        SchemaPatch {
+            fields: vec![FieldPatch {
+                id: None,
+                name: "title".into(),
+                data_type: Some(DataType::Int64),
+                nullable: None,
+                index: None,
+                dropped: false,
+            }],
+            max_fields: None,
+            max_depth: None,
+            templates: None,
+        }
+    }
+
+    /// A table whose files were written before field ids — no recorded
+    /// physical schema — still finishes a type conversion.
+    ///
+    /// Such a file holds every column in the type the table had when it
+    /// was written, which for a column under conversion is the old type.
+    /// It is therefore one of the conversion's inputs and must be
+    /// rewritten; reading it as "nothing to convert" instead leaves
+    /// `converting_from` set for good, and the column can never be
+    /// changed again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_conversion_completes_over_files_that_record_no_physical_schema() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_titles(&st, &NUMERIC_TITLES);
+
+        // Re-commit the one file as a file from before field ids: the same
+        // bytes under a fresh entry that records no physical schema.
+        let manifest = st.inner().manifest.load_full();
+        let live = manifest
+            .get_all_superfiles()
+            .first()
+            .expect("one superfile")
+            .clone();
+        let unrecorded = Arc::new(SuperfileEntry {
+            physical_schema: None,
+            superfile_id: Uuid::new_v4(),
+            partition_key: Vec::new(),
+            ..(*live).clone()
+        });
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let swapped = persist_commit_async(
+            st.inner(),
+            storage,
+            vec![unrecorded],
+            &[live],
+            Vec::new(),
+            Vec::new(),
+            CommitListMetadata::empty(),
+            Vec::new(),
+        )
+        .await
+        .expect("commit the file without its physical schema");
+        st.inner().manifest.store(swapped);
+
+        let flipped = st.apply_schema(&retype_title_to_int(), None).expect("flip");
+        assert_eq!(
+            flipped.fields()[0].converting_from,
+            Some(DataType::LargeUtf8),
+            "the flip is lossy, so the files owe a rewrite"
+        );
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact converts");
+
+        let after = st.inner().manifest.load_full().table_schema();
+        assert!(
+            after.fields()[0].converting_from.is_none(),
+            "every file holding the old type was rewritten, so the \
+             conversion is over"
+        );
+        let rows = st
+            .reader()
+            .expect("reader")
+            .query_sql("SELECT title FROM supertable ORDER BY _id")
+            .expect("sql");
+        let mut got: Vec<i64> = Vec::new();
+        for b in &rows {
+            let arr = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("title is Int64 after the flip");
+            got.extend((0..b.num_rows()).map(|i| arr.value(i)));
+        }
+        assert_eq!(got, vec![11, 22]);
+        st.apply_schema(&retype_title_to_int(), None)
+            .expect("a settled column can be changed again");
+    }
 
     /// A build that carries every row, so the runner must carry the
     /// input's tombstones onto its output.

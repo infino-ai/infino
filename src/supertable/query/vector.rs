@@ -2343,8 +2343,14 @@ async fn collect_hnsw_plane(
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
+        // A file written before a rename labels its vector blob with the name
+        // the column had then; the id is what finds the column in either file.
+        let file_column = reader.column_alias(manifest.field_id(column), column);
         let Some(rows) = vr
-            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .materialized_index_rows_excluding_async(
+                file_column,
+                superseded.get(&entry.superfile_id),
+            )
             .await
         else {
             continue;
@@ -2403,7 +2409,8 @@ async fn count_hnsw_rows(manifest: &ManifestSnapshot, column: &str) -> Result<us
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
-        if !vr.has_index_column(column) {
+        // The file's own label for the column; see the fan-out sites.
+        if !vr.has_index_column(reader.column_alias(manifest.field_id(column), column)) {
             continue;
         }
         let sup = superseded.get(&entry.superfile_id);
@@ -2740,8 +2747,14 @@ async fn gather_sq16_rows(
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
+        // A file written before a rename labels its vector blob with the name
+        // the column had then; the id is what finds the column in either file.
+        let file_column = reader.column_alias(manifest.field_id(column), column);
         let Some(rows) = vr
-            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .materialized_index_rows_excluding_async(
+                file_column,
+                superseded.get(&entry.superfile_id),
+            )
             .await
         else {
             continue;
@@ -3373,8 +3386,14 @@ pub(crate) async fn assemble_hnsw_incremental(
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
+        // A file written before a rename labels its vector blob with the name
+        // the column had then; the id is what finds the column in either file.
+        let file_column = reader.column_alias(manifest.field_id(column), column);
         let Some(rows) = vr
-            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .materialized_index_rows_excluding_async(
+                file_column,
+                superseded.get(&entry.superfile_id),
+            )
             .await
         else {
             continue;
@@ -4198,6 +4217,9 @@ impl SupertableReader {
         let metric = column_metric(&manifest.vector_configs(), column).ok_or_else(|| {
             QueryError::Execute(format!("global-fine: unknown vector column `{column}`"))
         })?;
+        // A file written before a rename labels its vector blob with the name
+        // the column had then; the id is what finds the column in either file.
+        let column_field_id = manifest.field_id(column);
         let section = self.centroid_section().await.ok_or_else(|| {
             QueryError::Execute("global-fine: centroid section unavailable".into())
         })?;
@@ -4296,6 +4318,10 @@ impl SupertableReader {
             let Some(vr) = readers[si].as_ref().vec() else {
                 continue;
             };
+            let file_column = readers[si]
+                .as_ref()
+                .column_alias(column_field_id, column)
+                .to_owned();
             let pool = Arc::clone(&scan_pool);
             let budget = Arc::clone(&scan_budget);
             scan_futs.push(async move {
@@ -4311,7 +4337,7 @@ impl SupertableReader {
                 };
                 let scan = vr
                     .search_clusters_scan_async(
-                        column,
+                        &file_column,
                         query,
                         k,
                         &fetch,
@@ -4376,8 +4402,9 @@ impl SupertableReader {
             for (si, selected) in by_seg {
                 let entry = &superfiles[si];
                 let reader = readers[si].as_ref();
+                let file_column = reader.column_alias(column_field_id, column);
                 let (hits, rerank_ns) = reader
-                    .vector_rerank_selected(column, query, k, selected, None)
+                    .vector_rerank_selected(file_column, query, k, selected, None)
                     .await
                     .map_err(|e| QueryError::Execute(e.to_string()))?;
                 if let Some(stats) = &self.op_stats {
@@ -4582,8 +4609,7 @@ impl SupertableReader {
         // the graph (which carries its own column check but is reached first),
         // while an undrained table rejects it later at the grid lookup.
         if !manifest
-            .options
-            .vector_columns
+            .vector_configs()
             .iter()
             .any(|vc| vc.column == column)
         {
@@ -4723,8 +4749,7 @@ impl SupertableReader {
         // `rot_seed` feeds the 1-bit admit prefilter (same rotation as the
         // column's row codes).
         let (metric, rot_seed) = manifest
-            .options
-            .vector_columns
+            .vector_configs()
             .iter()
             .find(|vc| vc.column == column)
             .map(|vc| (vc.metric, vc.rot_seed))
@@ -5541,6 +5566,7 @@ impl SupertableReader {
             }
             _ => options,
         };
+        let column_field_id = manifest.field_id(column);
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
         let column_arc2 = Arc::clone(&column_arc);
@@ -5584,6 +5610,10 @@ impl SupertableReader {
                 let max_replica_overhead = Arc::clone(&max_replica_overhead_body);
                 let op_stats = op_stats_scan.clone();
                 async move {
+                    // A file written before a rename labels its vector
+                    // blob with the name the column had then; the id is what
+                    // finds the column in either file.
+                    let column = reader.column_alias(column_field_id, &column).to_owned();
                     // Unfiltered user path on row-addressable locals: resolve the
                     // bitmap once (warm after the orchestrator's prefetch) and
                     // push it down. Filtered search leaves it `None` — its
@@ -5867,6 +5897,10 @@ impl SupertableReader {
                     let reader_pool = Arc::clone(&reader_pool);
                     let op_stats = op_stats_c.clone();
                     async move {
+                        // A file written before a rename labels its vector
+                        // blob with the name the column had then; the id is what
+                        // finds the column in either file.
+                        let column = reader.column_alias(column_field_id, &column).to_owned();
                         // Hidden-path invariants: no tombstone sidecars (the
                         // manifest's deletes apply after the stable-id
                         // remap upstream), replica slack mirrors phase A.

@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeStringArray,
-    RecordBatch,
+    Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
@@ -699,4 +699,116 @@ fn the_caps_are_themselves_capped_and_a_template_pattern_is_bounded() {
         matches!(&err, InfinoError::Schema(m) if m.contains("wildcards")),
         "{err}"
     );
+}
+
+/// How many rows `sql` returns.
+fn row_count(db: &Connection, sql: &str) -> usize {
+    db.query_sql(sql)
+        .expect("query")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum()
+}
+
+#[test]
+fn a_retyped_column_is_not_pruned_on_its_old_null_count() {
+    let (_dir, db, table) = storage_table(
+        Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::LargeUtf8,
+            true,
+        )])),
+        IndexSpec::new(),
+    );
+    table
+        .append(&batch(vec![("s", strings(vec![Some("abc"), Some("def")]))]))
+        .expect("append");
+    assert_eq!(row_count(&db, "SELECT s FROM t WHERE s IS NULL"), 0);
+
+    db.apply_schema(TABLE, &retype("s", DataType::Int64), None)
+        .expect("flip");
+    assert_eq!(column(&db, "s"), vec!["null", "null"]);
+    assert_eq!(
+        row_count(&db, "SELECT s FROM t WHERE s IS NULL"),
+        2,
+        "the file's null count was recorded over strings, not over the \
+         integers the column now reads"
+    );
+}
+
+#[test]
+fn a_retyped_column_is_not_pruned_on_its_old_bounds() {
+    let (_dir, db, table) = storage_table(
+        Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)])),
+        IndexSpec::new(),
+    );
+    table
+        .append(&batch(vec![(
+            "x",
+            Arc::new(Float64Array::from(vec![Some(1.5)])) as ArrayRef,
+        )]))
+        .expect("append");
+
+    db.apply_schema(TABLE, &retype("x", DataType::Int64), None)
+        .expect("flip");
+    assert_eq!(column(&db, "x"), vec!["1"], "the cast truncates");
+    assert_eq!(
+        row_count(&db, "SELECT x FROM t WHERE x = 1"),
+        1,
+        "the file's bounds say 1.5, which the truncated value is not"
+    );
+}
+
+#[test]
+fn a_renamed_vector_column_answers_search_over_the_old_files() {
+    /// Rows appended under the original name, enough that the index is
+    /// built and a search has candidates to rank.
+    const VECTOR_ROWS: usize = 64;
+    /// Neighbours asked for.
+    const K: usize = 5;
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let (_dir, db, table) = storage_table(
+        Arc::new(Schema::new(vec![Field::new(
+            "emb",
+            DataType::FixedSizeList(Arc::clone(&item), VECTOR_DIM as i32),
+            false,
+        )])),
+        IndexSpec::new().vector("emb", VECTOR_DIM, Metric::L2Sq),
+    );
+    let values = Float32Array::from(
+        (0..VECTOR_DIM * VECTOR_ROWS)
+            .map(|i| i as f32 / (VECTOR_DIM * VECTOR_ROWS) as f32)
+            .collect::<Vec<_>>(),
+    );
+    let emb = FixedSizeListArray::try_new(item, VECTOR_DIM as i32, Arc::new(values), None)
+        .expect("vectors");
+    table
+        .append(&batch(vec![("emb", Arc::new(emb) as ArrayRef)]))
+        .expect("append vectors");
+
+    db.apply_schema(
+        TABLE,
+        &SchemaPatch {
+            fields: vec![FieldPatch {
+                id: Some(FieldId(1)),
+                name: "embedding".into(),
+                data_type: None,
+                nullable: None,
+                index: None,
+                dropped: false,
+            }],
+            max_fields: None,
+            max_depth: None,
+            templates: None,
+        },
+        None,
+    )
+    .expect("rename the vector column");
+
+    let query = vec![0.0f32; VECTOR_DIM];
+    let hits = table
+        .vector_search("embedding", &query, K, None, None)
+        .expect("the file labels the column as it was, the id finds it");
+    assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), K);
 }
