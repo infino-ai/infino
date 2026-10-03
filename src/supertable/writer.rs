@@ -192,7 +192,7 @@ use crate::{
             TableSchema,
             change::{MergeContext, SchemaPatch, merge},
             error::SchemaError,
-            resolve::{conform, resolve_batch, union_schema},
+            resolve::{resolve_batch, try_conform, union_schema},
         },
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
         utils::vector_split::split_vectors,
@@ -547,6 +547,17 @@ pub(in crate::supertable) fn owned_vector_arrays(
     Ok(vectors)
 }
 
+/// A commit failure as a build failure, keeping intact a build error that
+/// only passed through the commit path. `From<CommitError>` has no variant
+/// for one, so it stringifies it into `Store`, and a caller can then no
+/// longer tell a refused schema change from a backend fault.
+fn build_error_from_commit(e: SupertableCommitError) -> BuildError {
+    match e {
+        SupertableCommitError::Build(e) => e,
+        other => BuildError::from(other),
+    }
+}
+
 /// Commit `metadata` with no superfiles: the next list carries its stamps
 /// and nothing else changes. Storage-backed tables go through the pointer
 /// CAS; an in-memory table swaps its snapshot.
@@ -578,14 +589,16 @@ pub(in crate::supertable) async fn persist_list_metadata_async(
                 Vec::new(),
             )
             .await
-            .map_err(BuildError::from)?;
+            .map_err(build_error_from_commit)?;
             inner.manifest.store(new_manifest);
             inner.reconcile_tombstone_seqs();
             Ok(())
         }
         None => {
             let old = inner.manifest.load();
-            metadata.check_schema(&old)?;
+            metadata
+                .check_schema(&old)
+                .map_err(build_error_from_commit)?;
             inner.manifest.store(Arc::new(metadata.apply(&old)));
             Ok(())
         }
@@ -2170,11 +2183,42 @@ impl SupertableWriter {
     /// `schema_id`. Applying what the table reads back, or any subset of
     /// it, changes nothing and commits nothing. Returns the document the
     /// table holds afterwards.
+    ///
+    /// Appends this writer is holding are committed first, under the
+    /// schema they were resolved against.
     pub fn apply_schema(
         &mut self,
         patch: &SchemaPatch,
         expected: Option<u32>,
     ) -> Result<Arc<TableSchema>, BuildError> {
+        // Buffered rows were resolved against the schema as it stands, and
+        // the change is about to move it out from under them: a retype
+        // leaves them unable to commit at all (every later commit is
+        // refused for the type they carry, and dropping the writer throws
+        // away rows the caller was told were accepted), and a rename
+        // leaves their old column name unmatched, so the commit mints it a
+        // second time beside the renamed one. Flushing rather than
+        // refusing is what keeps the acknowledged rows: they land under
+        // the schema they were written for, and the change then applies to
+        // rows that are already durable.
+        self.commit_appends_internal(None)?;
+        // Whether the table holds rows decides whether a column may start
+        // requiring a value, so it has to be read from the state this
+        // commit lands on. This handle's cached manifest is not that: a
+        // peer's append moves the membership without moving `schema_id`,
+        // so `expected` cannot notice it and a stale handle would tighten
+        // a column over a million committed nulls. The commit re-checks
+        // the membership on every attempt — see
+        // [`CommitListMetadata::check_schema`] — so the refresh here is
+        // what makes the common case a clean refusal rather than a lost
+        // race.
+        if let Some(storage) = self.inner.options.storage.clone() {
+            bridge_on_runtime(
+                refresh_inner_state_async(&self.inner, &storage),
+                &self.inner.query_runtime(),
+            )
+            .map_err(build_error_from_commit)?;
+        }
         let manifest = self.inner.manifest.load_full();
         let current = manifest.table_schema();
         if let Some(expected) = expected
@@ -2189,7 +2233,8 @@ impl SupertableWriter {
         let vector_index_column = manifest.get_global_vector_index().map(|g| g.column);
         let ctx = MergeContext {
             id_column: &self.inner.options.id_column,
-            // Rows this writer holds count: they land under the schema the
+            // The appends are flushed by now; rows a buffered update will
+            // add still count, since they land under whatever schema the
             // table has when they commit.
             table_empty: manifest.get_all_superfiles().is_empty()
                 && self.buffer.is_empty()
@@ -2243,14 +2288,20 @@ impl SupertableWriter {
         {
             Cow::Borrowed(buffer)
         } else {
+            // A column the schema tightened after these rows were resolved
+            // refuses the whole commit here rather than building a batch
+            // Arrow rejects; the buffer is restored to the writer by the
+            // caller, as for any other failed commit.
             Cow::Owned(
                 buffer
                     .iter()
-                    .map(|b| BufferedBatch {
-                        scalar: conform(&b.scalar, &scalar_schema),
-                        vectors: b.vectors.clone(),
+                    .map(|b| {
+                        Ok(BufferedBatch {
+                            scalar: try_conform(&b.scalar, &scalar_schema)?,
+                            vectors: b.vectors.clone(),
+                        })
                     })
-                    .collect(),
+                    .collect::<Result<Vec<BufferedBatch>, SchemaError>>()?,
             )
         };
         let buffer: &[BufferedBatch] = &buffer;
@@ -10531,6 +10582,27 @@ async fn record_hidden_deleted_ids(
     ))
 }
 
+/// The first column of `next` that requires a value where `base` did not:
+/// one tightened to non-nullable, or one added that admits no nulls.
+/// Either is only admitted on a table that holds no rows, so a commit
+/// publishing `next` has to land on a membership that is still empty.
+///
+/// Read off the two documents rather than carried alongside them, so the
+/// precondition holds for every caller that publishes a schema, whatever
+/// produced it.
+fn column_that_starts_requiring_a_value(base: &TableSchema, next: &TableSchema) -> Option<String> {
+    next.fields().iter().find_map(|field| {
+        if field.nullable {
+            return None;
+        }
+        match base.fields().iter().find(|before| before.id == field.id) {
+            // Already required a value before this document: unchanged.
+            Some(before) if !before.nullable => None,
+            _ => Some(field.name.clone()),
+        }
+    })
+}
+
 /// List-level metadata stamped onto the OCC base snapshot for one durable
 /// commit attempt. Applied inside every retry so contention refresh cannot
 /// drop grid / watermark / bootstrap stamps that must land with membership.
@@ -10592,7 +10664,18 @@ impl CommitListMetadata {
             && self.schema.is_none()
     }
 
-    /// Refuse `base` when its schema is not the one this commit expects.
+    /// Refuse `base` when the state this commit was decided against has
+    /// moved under it: its schema, and — for a document that makes a
+    /// column start requiring a value — its membership.
+    ///
+    /// The second check is not redundant. A column may only stop admitting
+    /// nulls while the table holds no rows, and an append moves the
+    /// membership without moving `schema_id`, so the schema precondition
+    /// alone would let a handle that last saw an empty table publish a
+    /// document declaring a column NOT NULL over rows that are already
+    /// committed with nulls in it. Re-reading it from `base` on every
+    /// attempt ties the decision to the state the commit actually lands
+    /// on.
     pub(crate) fn check_schema(
         &self,
         base: &ManifestSnapshot,
@@ -10602,6 +10685,14 @@ impl CommitListMetadata {
             if current != expected {
                 return Err(SupertableCommitError::SchemaMoved { expected, current });
             }
+        }
+        if let Some(next) = &self.schema
+            && !base.get_all_superfiles().is_empty()
+            && let Some(column) = column_that_starts_requiring_a_value(&base.table_schema(), next)
+        {
+            return Err(SupertableCommitError::Build(BuildError::Schema(
+                SchemaError::NotEmpty { column },
+            )));
         }
         Ok(())
     }
@@ -11781,6 +11872,7 @@ mod tests {
                 CellVectorSummary, ClusterCentroids, VectorSummary,
                 commit::{MANIFEST_DIR, POINTER_PATH, manifest_uri},
             },
+            schema::change::SchemaChange,
             slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
             storage::LocalFsStorageProvider,
             wal::{recovery::scan_and_recover, state_doc::SupertableHandleId},
@@ -11790,6 +11882,62 @@ mod tests {
             fault_storage::{FaultKind, FaultOp, FaultStorage},
         },
     };
+
+    /// The name of the column a tightening schema document adds in
+    /// [`a_schema_commit_that_tightens_a_column_is_refused_once_the_table_holds_rows`].
+    const REQUIRED_COLUMN: &str = "required";
+
+    #[test]
+    fn a_schema_commit_that_tightens_a_column_is_refused_once_the_table_holds_rows() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+        let mut writer = table.writer().expect("writer");
+        let empty = writer.inner.manifest.load_full();
+        let base = empty.table_schema();
+        // A column that admits no nulls can only join a table that holds
+        // no rows, so the commit publishing it must land on the emptiness
+        // it was decided against.
+        let next = Arc::new(
+            base.apply(&[SchemaChange::AddColumn {
+                name: REQUIRED_COLUMN.to_string(),
+                data_type: DataType::LargeUtf8,
+                nullable: false,
+                index: None,
+            }])
+            .expect("a document with a column that admits no nulls"),
+        );
+        let metadata = CommitListMetadata::schema_change(next, base.schema_id());
+        metadata
+            .check_schema(&empty)
+            .expect("an empty table admits it");
+
+        writer
+            .append(&build_title_batch(&["alpha"]))
+            .expect("append");
+        writer.commit().expect("commit");
+        let filled = writer.inner.manifest.load_full();
+        assert!(!filled.get_all_superfiles().is_empty(), "the rows landed");
+        assert_eq!(
+            filled.table_schema().schema_id(),
+            base.schema_id(),
+            "an append over known columns does not move the schema"
+        );
+        let err = metadata
+            .check_schema(&filled)
+            .expect_err("the committed rows forbid it");
+        assert!(
+            matches!(
+                &err,
+                SupertableCommitError::Build(BuildError::Schema(SchemaError::NotEmpty { column }))
+                    if column == REQUIRED_COLUMN
+            ),
+            "{err}"
+        );
+    }
 
     /// Small fixed vector dimension accepted by the vector builder.
     /// A committed entry carries the physical schema the writer derived

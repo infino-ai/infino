@@ -56,7 +56,7 @@ use crate::{
     },
     supertable::{
         manifest::{ManifestSnapshot, ScalarStatsAgg, SuperfileEntry},
-        schema::FieldId,
+        schema::{FieldId, map::Resolution},
     },
 };
 
@@ -252,18 +252,26 @@ pub struct ScalarPredicate {
 /// `predicates` paired with the id of the column each names; a predicate
 /// on a column the table does not have keeps every superfile.
 pub fn scalar_skip(
+    manifest: &ManifestSnapshot,
     superfiles: &[Arc<SuperfileEntry>],
     predicates: &[(Option<FieldId>, &ScalarPredicate)],
 ) -> Vec<bool> {
     if predicates.is_empty() {
         return vec![true; superfiles.len()];
     }
+    let guarded: Vec<(Option<ColumnTypeGuard>, &ScalarPredicate)> = predicates
+        .iter()
+        .map(|(id, p)| (id.map(|id| ColumnTypeGuard::new(manifest, id)), *p))
+        .collect();
     superfiles
         .iter()
         .map(|entry| {
-            predicates
-                .iter()
-                .all(|(id, p)| id.is_none_or(|id| superfile_may_match(entry, id, p)))
+            guarded.iter().all(|(guard, p)| match guard {
+                None => true,
+                Some(guard) => {
+                    guard.stats_are_stale(entry) || superfile_may_match(entry, guard.id(), p)
+                }
+            })
         })
         .collect()
 }
@@ -272,6 +280,7 @@ pub fn scalar_skip(
 /// `values` (an `IN` list is a disjunction). Empty `values` keeps all.
 /// The SQL-side sibling of [`scalar_skip`] for the `IN` shape.
 pub fn scalar_value_set_skip(
+    manifest: &ManifestSnapshot,
     superfiles: &[Arc<SuperfileEntry>],
     column: FieldId,
     values: &[ScalarValue],
@@ -280,13 +289,19 @@ pub fn scalar_value_set_skip(
         return vec![true; superfiles.len()];
     }
 
+    let guard = ColumnTypeGuard::new(manifest, column);
     superfiles
         .iter()
-        .map(|entry| match superfile_minmax(entry, column) {
-            None => true,
-            Some((min, max)) => values
-                .iter()
-                .any(|v| scalar_value_may_match(&min, &max, ScalarOp::Eq, v)),
+        .map(|entry| {
+            if guard.stats_are_stale(entry) {
+                return true;
+            }
+            match superfile_minmax(entry, column) {
+                None => true,
+                Some((min, max)) => values
+                    .iter()
+                    .any(|v| scalar_value_may_match(&min, &max, ScalarOp::Eq, v)),
+            }
         })
         .collect()
 }
@@ -294,19 +309,94 @@ pub fn scalar_value_set_skip(
 /// Keep each superfile whose `column` stats could still satisfy
 /// `IS [NOT] NULL`. A missing stat keeps the superfile.
 pub fn null_check_skip(
+    manifest: &ManifestSnapshot,
     superfiles: &[Arc<SuperfileEntry>],
     column: FieldId,
     want_null: bool,
 ) -> Vec<bool> {
+    let guard = ColumnTypeGuard::new(manifest, column);
     superfiles
         .iter()
         .map(|entry| {
-            entry
-                .scalar_stats
-                .get(&column)
-                .is_none_or(|agg| null_check_may_match(agg, want_null))
+            guard.stats_are_stale(entry)
+                || entry
+                    .scalar_stats
+                    .get(&column)
+                    .is_none_or(|agg| null_check_may_match(agg, want_null))
         })
         .collect()
+}
+
+/// Whether one column's persisted statistics still describe the values a
+/// file's rows read as.
+///
+/// Min, max and null count are recorded in the type the file was written
+/// in, and a retype flips the table's type at once: the read path casts
+/// every file that has not been rewritten yet. For those files the
+/// recorded statistics describe values the column no longer holds — a
+/// string column read as integers is all nulls whatever its null count
+/// said, and a truncating cast moves every value off its old bounds.
+/// Pruning on them would drop a file that does hold matches, so a file
+/// holding the column in another type keeps its place and is read.
+pub(crate) struct ColumnTypeGuard {
+    /// The column this guard covers.
+    id: FieldId,
+    /// The table's current view of the column, with no file bound to it
+    /// yet. `None` for the injected id column and for a column the table
+    /// does not have — neither can go stale.
+    current: Option<Resolution>,
+    /// Whether the table is converting this column from an older type.
+    converting: bool,
+}
+
+impl ColumnTypeGuard {
+    /// The guard for the column with id `column` in `manifest`'s table.
+    pub(crate) fn new(manifest: &ManifestSnapshot, column: FieldId) -> Self {
+        let schema = manifest.table_schema();
+        let field = schema.fields().iter().find(|f| f.id == column);
+        Self {
+            id: column,
+            current: field.map(|f| Resolution {
+                id: f.id,
+                name: f.name.clone(),
+                data_type: f.data_type.clone(),
+                physical: None,
+            }),
+            converting: field.is_some_and(|f| f.converting_from.is_some()),
+        }
+    }
+
+    /// The column this guard covers.
+    pub(crate) fn id(&self) -> FieldId {
+        self.id
+    }
+
+    /// Whether the aggregate statistics a manifest part folds over its
+    /// files can mix types, which they do for the whole span of a
+    /// conversion: some of the part's files hold the old type and some the
+    /// new, and one pair of bounds cannot describe both.
+    pub(crate) fn aggregates_mix_types(&self) -> bool {
+        self.converting
+    }
+
+    /// Whether `entry`'s statistics for the column are in a type the table
+    /// has since left.
+    pub(crate) fn stats_are_stale(&self, entry: &SuperfileEntry) -> bool {
+        let Some(current) = self.current.as_ref() else {
+            return false;
+        };
+        match entry.physical_schema.as_ref() {
+            Some(physical) => Resolution {
+                physical: physical.column_by_id(current.id).cloned(),
+                ..current.clone()
+            }
+            .needs_cast(),
+            // A file that records no physical schema was written before
+            // field ids: it holds every column in the type the table had
+            // then, which for a column under conversion is the old one.
+            None => self.converting,
+        }
+    }
 }
 
 /// Whether a column's stats could still match `IS [NOT] NULL`, shared by
@@ -493,6 +583,13 @@ mod tests {
     /// Pair each predicate with the id of its column, as the pruner does.
     fn pairs(preds: &[ScalarPredicate]) -> Vec<(Option<FieldId>, &ScalarPredicate)> {
         preds.iter().map(|p| (Some(fid(&p.column)), p)).collect()
+    }
+
+    /// A manifest whose table has no column under conversion and no file
+    /// holding one in an older type, so every mask below is the pure
+    /// statistics answer.
+    fn current_types() -> ManifestSnapshot {
+        ManifestSnapshot::empty(opts_simple())
     }
     use std::{collections::HashMap, sync::Arc};
 
@@ -822,7 +919,10 @@ mod tests {
             seg_with_int_stats("x", 0, 10),
             seg_with_int_stats("x", 100, 110),
         ];
-        assert_eq!(scalar_skip(&segs, &pairs(&[])), vec![true, true]);
+        assert_eq!(
+            scalar_skip(&current_types(), &segs, &pairs(&[])),
+            vec![true, true]
+        );
     }
 
     #[test]
@@ -835,21 +935,21 @@ mod tests {
         let i = |n| ScalarValue::Int64(Some(n));
         // IN (5, 205) → A's [0,10] and C's [200,210], not B.
         assert_eq!(
-            scalar_value_set_skip(&segs, fid("x"), &[i(5), i(205)]),
+            scalar_value_set_skip(&current_types(), &segs, fid("x"), &[i(5), i(205)]),
             vec![true, false, true]
         );
         // IN (50) → matches no range.
         assert_eq!(
-            scalar_value_set_skip(&segs, fid("x"), &[i(50)]),
+            scalar_value_set_skip(&current_types(), &segs, fid("x"), &[i(50)]),
             vec![false, false, false]
         );
         // Empty list and unknown column both keep all (conservative).
         assert_eq!(
-            scalar_value_set_skip(&segs, fid("x"), &[]),
+            scalar_value_set_skip(&current_types(), &segs, fid("x"), &[]),
             vec![true, true, true]
         );
         assert_eq!(
-            scalar_value_set_skip(&segs, fid("missing"), &[i(5)]),
+            scalar_value_set_skip(&current_types(), &segs, fid("missing"), &[i(5)]),
             vec![true, true, true]
         );
     }
@@ -891,8 +991,14 @@ mod tests {
     fn null_check_skip_keeps_on_missing_stat() {
         let segs = vec![seg_with_int_stats("x", 0, 10)];
         // Column not in stats → conservative keep for either predicate.
-        assert_eq!(null_check_skip(&segs, fid("missing"), true), vec![true]);
-        assert_eq!(null_check_skip(&segs, fid("missing"), false), vec![true]);
+        assert_eq!(
+            null_check_skip(&current_types(), &segs, fid("missing"), true),
+            vec![true]
+        );
+        assert_eq!(
+            null_check_skip(&current_types(), &segs, fid("missing"), false),
+            vec![true]
+        );
     }
 
     #[test]
@@ -903,18 +1009,21 @@ mod tests {
         ];
         // x = 5 → only A's [0,10] can contain it.
         let mask = scalar_skip(
+            &current_types(),
             &segs,
             &pairs(&[pred("x", ScalarOp::Eq, ScalarValue::Int64(Some(5)))]),
         );
         assert_eq!(mask, vec![true, false]);
         // x = 105 → only B's [100,110].
         let mask = scalar_skip(
+            &current_types(),
             &segs,
             &pairs(&[pred("x", ScalarOp::Eq, ScalarValue::Int64(Some(105)))]),
         );
         assert_eq!(mask, vec![false, true]);
         // Range boundary is inclusive.
         let mask = scalar_skip(
+            &current_types(),
             &segs,
             &pairs(&[pred("x", ScalarOp::Eq, ScalarValue::Int64(Some(10)))]),
         );
@@ -930,6 +1039,7 @@ mod tests {
         // x > 50 → A.max=10 can't; B kept.
         assert_eq!(
             scalar_skip(
+                &current_types(),
                 &segs,
                 &pairs(&[pred("x", ScalarOp::Gt, ScalarValue::Int64(Some(50)))])
             ),
@@ -938,6 +1048,7 @@ mod tests {
         // x < 50 → A.min=0 ok; B.min=100 can't.
         assert_eq!(
             scalar_skip(
+                &current_types(),
                 &segs,
                 &pairs(&[pred("x", ScalarOp::Lt, ScalarValue::Int64(Some(50)))])
             ),
@@ -946,6 +1057,7 @@ mod tests {
         // x >= 110 → A can't (max 10); B can (max 110).
         assert_eq!(
             scalar_skip(
+                &current_types(),
                 &segs,
                 &pairs(&[pred("x", ScalarOp::GtEq, ScalarValue::Int64(Some(110)))])
             ),
@@ -954,6 +1066,7 @@ mod tests {
         // x <= 0 → A can (min 0); B can't (min 100).
         assert_eq!(
             scalar_skip(
+                &current_types(),
                 &segs,
                 &pairs(&[pred("x", ScalarOp::LtEq, ScalarValue::Int64(Some(0)))])
             ),
@@ -973,17 +1086,26 @@ mod tests {
         ];
         // EventDate > 300 → A.max=200 can't; B kept.
         assert_eq!(
-            scalar_skip(&segs, &pairs(&[pred("EventDate", ScalarOp::Gt, d(300))])),
+            scalar_skip(
+                &current_types(),
+                &segs,
+                &pairs(&[pred("EventDate", ScalarOp::Gt, d(300))])
+            ),
             vec![false, true]
         );
         // EventDate < 300 → A.min=100 ok; B.min=500 can't.
         assert_eq!(
-            scalar_skip(&segs, &pairs(&[pred("EventDate", ScalarOp::Lt, d(300))])),
+            scalar_skip(
+                &current_types(),
+                &segs,
+                &pairs(&[pred("EventDate", ScalarOp::Lt, d(300))])
+            ),
             vec![true, false]
         );
         // BETWEEN 250 AND 450 (>=250 AND <=450) → both disjoint ranges pruned.
         assert_eq!(
             scalar_skip(
+                &current_types(),
                 &segs,
                 &pairs(&[
                     pred("EventDate", ScalarOp::GtEq, d(250)),
@@ -1003,13 +1125,17 @@ mod tests {
             pred("x", ScalarOp::LtEq, ScalarValue::Int64(Some(8))),
         ];
         // A: max=3 < 5 → the >=5 conjunct prunes it. B kept.
-        assert_eq!(scalar_skip(&segs, &pairs(&preds)), vec![false, true]);
+        assert_eq!(
+            scalar_skip(&current_types(), &segs, &pairs(&preds)),
+            vec![false, true]
+        );
     }
 
     #[test]
     fn scalar_skip_unknown_column_keeps_all() {
         let segs = vec![seg_with_int_stats("x", 0, 10)];
         let mask = scalar_skip(
+            &current_types(),
             &segs,
             &pairs(&[pred("not_a_col", ScalarOp::Eq, ScalarValue::Int64(Some(5)))]),
         );
@@ -1025,6 +1151,7 @@ mod tests {
         ];
         // name = 'banana' → within A's [apple, mango], outside B's.
         let mask = scalar_skip(
+            &current_types(),
             &segs,
             &pairs(&[pred(
                 "name",
@@ -1044,6 +1171,7 @@ mod tests {
             .insert(fid("x"), ScalarStatsAgg::from_min_max(mn, mx));
         let segs = vec![Arc::new(e)];
         let mask = scalar_skip(
+            &current_types(),
             &segs,
             &pairs(&[pred("x", ScalarOp::Eq, ScalarValue::Int64(Some(5)))]),
         );
@@ -1056,6 +1184,7 @@ mod tests {
         // x != 5 → constant all-5 superfile matches nothing → prune;
         // the ranged superfile is kept.
         let mask = scalar_skip(
+            &current_types(),
             &segs,
             &pairs(&[pred("x", ScalarOp::NotEq, ScalarValue::Int64(Some(5)))]),
         );

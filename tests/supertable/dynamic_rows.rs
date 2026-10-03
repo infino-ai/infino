@@ -8,7 +8,7 @@
 
 use std::{fs, path::Path, sync::Arc};
 
-use arrow_array::{Array, Float64Array, Int64Array, LargeStringArray};
+use arrow_array::{Array, Float64Array, Int64Array, LargeStringArray, ListArray};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
@@ -137,6 +137,55 @@ fn documents_grow_the_schema_and_read_back() {
         .bm25_search("title", "post", 10, Default::default(), None)
         .expect("search");
     assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+}
+
+#[test]
+fn an_array_of_objects_lines_its_leaves_up_by_element() {
+    // Three comments, the middle one unrated. Every leaf of the array is as
+    // long as the array, so one position names one comment in all of them —
+    // a rating cannot slide onto the wrong author.
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new())
+        .expect("create");
+    docs.append_rows(&[json!({
+        "title": "a",
+        "comments": [
+            {"user": "ann", "stars": 5},
+            {"user": "bob"},
+            {"user": "cy", "stars": 3}
+        ]
+    })])
+    .expect("append rows");
+
+    let batches = db
+        .query_sql(&format!(
+            "SELECT \"comments.user\", \"comments.stars\" FROM {TABLE}"
+        ))
+        .expect("query");
+    let batch = batches.first().expect("one batch");
+    let users = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("a list of users")
+        .value(0);
+    let users = users
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .expect("strings");
+    let stars = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("a list of ratings")
+        .value(0);
+    let stars = stars.as_any().downcast_ref::<Int64Array>().expect("ints");
+
+    assert_eq!(stars.len(), users.len(), "one position per comment");
+    assert_eq!(users.value(1), "bob");
+    assert!(stars.is_null(1), "bob left no rating, in bob's place");
+    assert_eq!(stars.value(2), 3, "cy's rating stays with cy");
 }
 
 #[test]

@@ -11,7 +11,9 @@
 //! `Utf8` path is `Utf8`), so a batch that disagrees with the schema is
 //! refused by the same resolver an Arrow producer meets, with the same
 //! error. A template decides the type and index of a path the table does
-//! not have yet. JSON `null` and `[]` create nothing. Columns come out in
+//! not have yet. JSON `null` and `[]` create nothing, and an array of
+//! objects becomes one list per leaf path, every one as long as the array,
+//! so a position names the same element in all of them. Columns come out in
 //! key order, which is sorted, so a batch's shape does not depend on the
 //! order a producer wrote its keys in.
 
@@ -38,11 +40,13 @@ const F64_EXACT_INT_BOUND: i128 = 1 << 53;
 /// Milliseconds in a day, for `Date64`.
 const MILLIS_PER_DAY: i64 = 86_400_000;
 
-/// A value a document carries on one path, with arrays kept whole.
+/// A value a document carries on one path, with arrays kept whole. A list
+/// position no value reached is `None`, which is how the leaves of an
+/// array of objects stay the same length as the array.
 #[derive(Debug, Clone)]
 enum Leaf<'a> {
     Scalar(&'a Value),
-    List(Vec<&'a Value>),
+    List(Vec<Option<&'a Value>>),
 }
 
 /// The kind of value a path carries, before a type is chosen for it.
@@ -112,7 +116,7 @@ impl Column<'_> {
     fn values(&self) -> impl Iterator<Item = &Value> + '_ {
         self.cells.iter().flatten().flat_map(|leaf| match leaf {
             Leaf::Scalar(v) => vec![*v],
-            Leaf::List(vs) => vs.clone(),
+            Leaf::List(vs) => vs.iter().flatten().copied().collect(),
         })
     }
 
@@ -153,6 +157,13 @@ impl Column<'_> {
 pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch, SchemaError> {
     let mut columns: Vec<Column<'_>> = Vec::new();
     let mut by_path: HashMap<String, usize> = HashMap::new();
+    // Each path the table does not have is a field the resolver would add,
+    // and each costs one cell per row right here. The cap that bounds those
+    // fields is therefore checked as the paths are discovered: a body with
+    // more distinct keys than the table admits is refused before its
+    // columns exist, not after they have been allocated.
+    let live_fields = schema.fields().len() as u32;
+    let mut new_paths: Vec<String> = Vec::new();
     for (row, value) in rows.iter().enumerate() {
         let object = value.as_object().ok_or_else(|| SchemaError::InvalidRow {
             row,
@@ -164,6 +175,16 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
             let index = match by_path.get(&path) {
                 Some(&i) => i,
                 None => {
+                    if schema.id_of(&path).is_none() {
+                        new_paths.push(path.clone());
+                        if live_fields + new_paths.len() as u32 > schema.max_fields() {
+                            return Err(SchemaError::FieldCapExceeded {
+                                cap: schema.max_fields(),
+                                current: live_fields,
+                                fields: new_paths,
+                            });
+                        }
+                    }
                     columns.push(Column {
                         path: path.clone(),
                         cells: vec![None; rows.len()],
@@ -242,7 +263,7 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
 fn observe<'a>(column: &mut Column<'a>, leaf: &Leaf<'a>) -> Result<(), SchemaError> {
     let (values, list): (Vec<&Value>, bool) = match leaf {
         Leaf::Scalar(v) => (vec![*v], false),
-        Leaf::List(vs) => (vs.clone(), true),
+        Leaf::List(vs) => (vs.iter().flatten().copied().collect(), true),
     };
     let seen_scalars = !column.kinds.is_empty() && !column.list;
     if (column.list && !list) || (seen_scalars && list) {
@@ -309,9 +330,14 @@ fn flatten<'a>(
                 }
                 if items.iter().all(Value::is_object) {
                     // An array of objects: one list per leaf path, with the
-                    // elements' values in order.
-                    let mut per_path: Vec<(String, Vec<&'a Value>)> = Vec::new();
-                    for item in items {
+                    // elements' values in order. A leaf an element does not
+                    // carry takes a null in that element's place, so reading
+                    // one position across the leaves reads one element of
+                    // the array; packing the values instead would make the
+                    // lists disagree about what a position means as soon as
+                    // two elements carried different keys.
+                    let mut per_path: Vec<(String, Vec<Option<&'a Value>>)> = Vec::new();
+                    for (element, item) in items.iter().enumerate() {
                         let mut leaves = Vec::new();
                         let inner = item.as_object().expect("every item is an object");
                         if depth + 1 > max_depth {
@@ -321,14 +347,26 @@ fn flatten<'a>(
                             });
                         }
                         flatten(inner, &path, depth + 1, max_depth, &mut leaves)?;
+                        let before: Vec<usize> = per_path.iter().map(|(_, v)| v.len()).collect();
                         for (leaf_path, leaf) in leaves {
                             let values = match leaf {
-                                Leaf::Scalar(v) => vec![v],
+                                Leaf::Scalar(v) => vec![Some(v)],
                                 Leaf::List(vs) => vs,
                             };
                             match per_path.iter_mut().find(|(p, _)| *p == leaf_path) {
                                 Some((_, all)) => all.extend(values),
-                                None => per_path.push((leaf_path, values)),
+                                None => {
+                                    // A path first seen on a later element
+                                    // is null in the elements before it.
+                                    let mut all = vec![None; element];
+                                    all.extend(values);
+                                    per_path.push((leaf_path, all));
+                                }
+                            }
+                        }
+                        for ((_, all), filled) in per_path.iter_mut().zip(before) {
+                            if all.len() == filled {
+                                all.push(None);
                             }
                         }
                     }
@@ -348,7 +386,7 @@ fn flatten<'a>(
                                     types: vec![json_kind_name(item).to_owned()],
                                 });
                             }
-                            scalar => values.push(scalar),
+                            scalar => values.push(Some(scalar)),
                         }
                     }
                     if !values.is_empty() {
@@ -377,7 +415,8 @@ fn resolve_type(column: &Column<'_>, kind: Kind, target: Option<&DataType>) -> D
                 && column.cells.iter().flatten().all(|leaf| match leaf {
                     Leaf::List(values) => values.len() == *dim as usize,
                     Leaf::Scalar(_) => false,
-                });
+                })
+                && column.values().all(float_in_f32_range);
             if fits {
                 return DataType::FixedSizeList(Arc::clone(item), *dim);
             }
@@ -399,7 +438,9 @@ fn resolve_type(column: &Column<'_>, kind: Kind, target: Option<&DataType>) -> D
         (Kind::Str, Some(t @ DataType::Timestamp(_, _))) if values().all(parses_as_time) => {
             t.clone()
         }
-        (Kind::Int, Some(t @ DataType::Timestamp(_, _))) => t.clone(),
+        (Kind::Int, Some(t @ DataType::Timestamp(_, _))) if values().all(parses_as_time) => {
+            t.clone()
+        }
         (Kind::Str, Some(t @ (DataType::Date32 | DataType::Date64)))
             if values().all(parses_as_date) =>
         {
@@ -465,6 +506,18 @@ fn float_exact_in_f32(value: &Value) -> bool {
     value.as_f64().is_some_and(|v| (v as f32) as f64 == v)
 }
 
+/// Whether `value` survives narrowing to `f32`. Rounding a coordinate to
+/// `f32` precision is what a `Float32` column is for, but a magnitude
+/// `f32` cannot reach is not rounded: it saturates to an infinity, or a
+/// nonzero value collapses to zero. Either one is a different number
+/// rather than a coarser one, so the column does not take it.
+fn float_in_f32_range(value: &Value) -> bool {
+    value.as_f64().is_some_and(|v| {
+        let narrowed = v as f32;
+        narrowed.is_finite() && (narrowed != 0.0 || v == 0.0)
+    })
+}
+
 /// A string as a point in time: RFC 3339 with an offset, or a naive
 /// `YYYY-MM-DDTHH:MM:SS[.fff]` read as UTC. `None` for anything else.
 fn parse_time(s: &str) -> Option<DateTime<Utc>> {
@@ -478,10 +531,14 @@ fn parse_time(s: &str) -> Option<DateTime<Utc>> {
         })
 }
 
-/// Whether `value` names a point in time: a time string, or an integral
-/// epoch count.
+/// Whether `value` names a point in time: a time string, or an epoch count
+/// a timestamp column can hold. An integer past `i64` names no instant,
+/// and a column that accepted it would hold a null where the literal was.
 fn parses_as_time(value: &Value) -> bool {
-    as_i128(value).is_some() || value.as_str().is_some_and(|s| parse_time(s).is_some())
+    match as_i128(value) {
+        Some(n) => i64::try_from(n).is_ok(),
+        None => value.as_str().is_some_and(|s| parse_time(s).is_some()),
+    }
 }
 
 /// A string as a calendar day, `YYYY-MM-DD`.
@@ -511,7 +568,7 @@ fn build_array(column: &Column<'_>, data_type: &DataType) -> Result<ArrayRef, Sc
             for cell in &column.cells {
                 match cell {
                     Some(Leaf::List(values)) => {
-                        flat.extend(values.iter().copied().map(Some));
+                        flat.extend(values.iter().copied());
                         nulls.push(true);
                     }
                     _ => nulls.push(false),
@@ -549,7 +606,7 @@ fn build_array(column: &Column<'_>, data_type: &DataType) -> Result<ArrayRef, Sc
             for cell in &column.cells {
                 match cell {
                     Some(Leaf::List(values)) => {
-                        flat.extend(values.iter().copied().map(Some));
+                        flat.extend(values.iter().copied());
                         nulls.push(true);
                     }
                     _ => {
@@ -706,6 +763,7 @@ fn build_scalar_array(
 #[cfg(test)]
 mod tests {
     use arrow_array::{
+        Array,
         cast::AsArray,
         types::{Float64Type, Int32Type, Int64Type},
     };
@@ -1036,5 +1094,121 @@ mod tests {
             data_type: None,
             index: None,
         };
+    }
+
+    #[test]
+    fn a_literal_a_narrow_column_cannot_hold_keeps_its_own_type() {
+        // A narrow type is chosen only when every value fits it, so a
+        // literal that does not fit leaves the path at the type it infers
+        // and the resolver refuses the batch. It is never quietly nulled,
+        // saturated or rounded into the column.
+        let t = table(vec![("tiny", DataType::Int8), ("f", DataType::Float32)]);
+        let batch = rows_to_batch(&[json!({"tiny": 999})], &t).expect("map");
+        assert_eq!(types(&batch)["tiny"], DataType::Int64);
+        assert!(matches!(
+            resolve_batch(&batch, &t, "_id"),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "tiny"
+        ));
+        let batch = rows_to_batch(&[json!({"f": 1e300})], &t).expect("map");
+        assert_eq!(types(&batch)["f"], DataType::Float64);
+        assert!(matches!(
+            resolve_batch(&batch, &t, "_id"),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "f"
+        ));
+    }
+
+    #[test]
+    fn a_magnitude_a_vector_or_a_timestamp_cannot_hold_is_refused() {
+        let vector =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2);
+        let t = table(vec![("emb", vector.clone())]);
+        // A coordinate `f32` cannot reach would be stored as an infinity,
+        // or flushed to zero, so the vector type does not take the list.
+        for row in [json!({"emb": [1e300, 1.0]}), json!({"emb": [1e-300, 1.0]})] {
+            let batch = rows_to_batch(&[row], &t).expect("map");
+            assert!(matches!(types(&batch)["emb"], DataType::List(_)));
+            assert!(matches!(
+                resolve_batch(&batch, &t, "_id"),
+                Err(SchemaError::TypeMismatch { column, .. }) if column == "emb"
+            ));
+        }
+        // A coordinate `f32` holds less precisely is still that coordinate.
+        let batch = rows_to_batch(&[json!({"emb": [0.1, 0.2]})], &t).expect("map");
+        assert_eq!(types(&batch)["emb"], vector);
+        resolve_batch(&batch, &t, "_id").expect("stored");
+
+        // An integral literal on a timestamp is an epoch count in the
+        // column's unit; one past `i64` names no instant and must not land
+        // as a null.
+        let t = table(vec![(
+            "at",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        )]);
+        let batch = rows_to_batch(&[json!({"at": u64::MAX})], &t).expect("map");
+        assert_eq!(types(&batch)["at"], DataType::Int64);
+        assert!(matches!(
+            resolve_batch(&batch, &t, "_id"),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "at"
+        ));
+        // Beside a time string it is refused outright, rather than joining
+        // the string's column and reading back as a null.
+        assert!(matches!(
+            rows_to_batch(
+                &[json!({"at": "2026-09-22T10:00:00Z"}), json!({"at": u64::MAX})],
+                &t
+            ),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "at"
+        ));
+        // An epoch count `i64` holds is still taken.
+        let batch = rows_to_batch(&[json!({"at": 1_790_000_000_000_i64})], &t).expect("map");
+        assert_eq!(
+            types(&batch)["at"],
+            DataType::Timestamp(TimeUnit::Millisecond, None)
+        );
+    }
+
+    #[test]
+    fn the_field_cap_bounds_the_columns_a_body_can_allocate() {
+        // The cap is the resolver's, enforced as the paths are discovered:
+        // a body cannot build a column per distinct key and only then meet
+        // the cap that exists to bound them.
+        let mut doc = table(vec![("title", DataType::LargeUtf8)]).to_json();
+        doc["max_fields"] = json!(3);
+        let t = TableSchema::from_json(&doc).expect("schema");
+        let at_cap =
+            rows_to_batch(&[json!({"title": "t", "a": 1, "b": 2})], &t).expect("at the cap");
+        assert_eq!(at_cap.num_columns(), 3);
+        resolve_batch(&at_cap, &t, "_id").expect("the resolver agrees");
+        assert!(matches!(
+            rows_to_batch(&[json!({"a": 1, "b": 2, "c": 3})], &t),
+            Err(SchemaError::FieldCapExceeded { cap: 3, current: 1, fields })
+                if fields == vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        ));
+        // The cap counts fields, not cells: one path over many rows is one
+        // field.
+        let many: Vec<Value> = (0..4).map(|i| json!({"a": i})).collect();
+        rows_to_batch(&many, &t).expect("one path");
+    }
+
+    #[test]
+    fn an_array_of_objects_gives_every_leaf_one_position_per_element() {
+        let t = table(vec![]);
+        let batch = rows_to_batch(&[json!({"xs": [{"a": 1, "b": 2}, {"a": 3}]})], &t).expect("map");
+        let a = col(&batch, "xs.a").as_list::<i32>().value(0);
+        assert_eq!(a.as_primitive::<Int64Type>().values(), &[1, 3]);
+        let b = col(&batch, "xs.b").as_list::<i32>().value(0);
+        let b = b.as_primitive::<Int64Type>();
+        assert_eq!(b.len(), 2, "as long as the array");
+        assert_eq!(b.value(0), 2);
+        assert!(b.is_null(1), "the element without `b` is null in its place");
+        resolve_batch(&batch, &t, "_id").expect("stored");
+
+        // A path the earlier elements do not carry is null in their places.
+        let batch = rows_to_batch(&[json!({"xs": [{"a": 1}, {"a": 2, "b": 9}]})], &t).expect("map");
+        let b = col(&batch, "xs.b").as_list::<i32>().value(0);
+        let b = b.as_primitive::<Int64Type>();
+        assert_eq!(b.len(), 2);
+        assert!(b.is_null(0));
+        assert_eq!(b.value(1), 9);
     }
 }

@@ -198,20 +198,48 @@ pub fn union_schema<'a>(
 /// `batch` by name, null-filled where `batch` lacks them. Every column
 /// `batch` has must be in `target` with its type; [`union_schema`] over
 /// the batch guarantees that.
-pub fn conform(batch: &RecordBatch, target: &Arc<Schema>) -> RecordBatch {
+///
+/// Nullability is not guaranteed that way, which is why this returns a
+/// result. A batch is resolved when it is appended and shaped when it
+/// commits, and the table's schema can tighten in between — a column the
+/// batch leaves to the null fill, or carries nulls in, can by then be one
+/// the table requires a value for. Building that batch anyway is a panic
+/// inside Arrow, so the refusal is returned instead and the commit fails
+/// with a message naming the column.
+pub fn try_conform(batch: &RecordBatch, target: &Arc<Schema>) -> Result<RecordBatch, SchemaError> {
+    // Identical fields carry identical nullability, and the batch was
+    // already built against them, so its nulls are where they are allowed.
     if batch.schema().fields() == target.fields() {
-        return batch.clone();
+        return Ok(batch.clone());
     }
-    let columns: Vec<ArrayRef> = target
-        .fields()
-        .iter()
-        .map(|field| match batch.schema().index_of(field.name()) {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(target.fields().len());
+    for field in target.fields() {
+        let array = match batch.schema().index_of(field.name()) {
             Ok(i) => Arc::clone(batch.column(i)),
             Err(_) => new_null_array(field.data_type(), batch.num_rows()),
-        })
-        .collect();
-    RecordBatch::try_new(Arc::clone(target), columns)
-        .expect("every column is the batch's or a null array of the batch's row count")
+        };
+        if !field.is_nullable() && array.null_count() > 0 {
+            return Err(SchemaError::NullInNonNullable {
+                column: field.name().clone(),
+            });
+        }
+        columns.push(array);
+    }
+    // Nullability is checked above and the types come from `target`, so
+    // what is left for `try_new` to reject is a row-count disagreement,
+    // which cannot happen: every column is this batch's or a null array
+    // cut to this batch's row count.
+    Ok(RecordBatch::try_new(Arc::clone(target), columns)
+        .expect("every column is the batch's or a null array of the batch's row count"))
+}
+
+/// [`try_conform`] for a caller that has already proved `batch` can fill
+/// every column `target` requires a value for — the rows were resolved
+/// against the schema `target` is shaped from, in the same breath, so no
+/// non-nullable column is absent or null there.
+pub fn conform(batch: &RecordBatch, target: &Arc<Schema>) -> RecordBatch {
+    try_conform(batch, target)
+        .expect("the rows were resolved against the schema this target is shaped from")
 }
 
 #[cfg(test)]
@@ -250,6 +278,39 @@ mod tests {
 
     fn ints(v: Vec<Option<i64>>) -> ArrayRef {
         Arc::new(Int64Array::from(v))
+    }
+
+    fn ids() -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(vec![7i128, 8])
+                .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
+                .expect("id type"),
+        )
+    }
+
+    #[test]
+    fn conforming_a_null_into_a_column_that_admits_none_is_refused_not_panicked() {
+        // `title` admits no nulls. A batch that reaches the commit without
+        // it — or with a null in it — can only happen when the schema
+        // tightened after the batch was resolved, and shaping it to the
+        // table would otherwise build a batch Arrow refuses from inside
+        // the commit.
+        let target = table().scalar_schema("_id");
+        let absent = batch(vec![("_id", ids()), ("score", ints(vec![Some(1), None]))]);
+        assert!(matches!(
+            try_conform(&absent, &target),
+            Err(SchemaError::NullInNonNullable { column }) if column == "title"
+        ));
+        let nulls: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("a"), None]));
+        let carried = batch(vec![("_id", ids()), ("title", nulls)]);
+        assert!(matches!(
+            try_conform(&carried, &target),
+            Err(SchemaError::NullInNonNullable { column }) if column == "title"
+        ));
+        // The column is there with a value in every row: shaping succeeds.
+        let whole = batch(vec![("_id", ids()), ("title", titles())]);
+        let shaped = try_conform(&whole, &target).expect("conform");
+        assert_eq!(shaped.schema().fields(), target.fields());
     }
 
     #[test]
