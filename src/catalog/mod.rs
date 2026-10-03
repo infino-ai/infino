@@ -18,6 +18,7 @@ mod manifest;
 mod options;
 #[cfg(feature = "remote")]
 mod remote;
+mod rerank;
 mod search_tvf;
 mod table;
 mod uri;
@@ -53,6 +54,7 @@ use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
 };
 pub use options::{ColdFetchMode, ConnectOptions};
+pub use rerank::SearchReranker;
 pub use table::Supertable;
 use tokio::runtime::{Handle, Runtime};
 use tracing::{Instrument, debug, info};
@@ -197,6 +199,7 @@ pub fn connect_with(
             gcs_credential,
             #[cfg(feature = "graph-index")]
             graph: Mutex::new(None),
+            reranker: Mutex::new(None),
         }),
     })
 }
@@ -232,6 +235,7 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             gcs_credential: None,
             #[cfg(feature = "graph-index")]
             graph: Mutex::new(None),
+            reranker: Mutex::new(None),
         }),
     })
 }
@@ -270,6 +274,10 @@ struct ConnectionInner {
     /// connection's SQL as `graph_walk` / `graph_rank` with no table argument.
     #[cfg(feature = "graph-index")]
     graph: Mutex<Option<(Connection, String)>>,
+    /// The order a host puts on a ranked search function's rows inside this
+    /// connection's SQL (see [`Connection::set_search_reranker`]); `None`
+    /// serves the engine's order.
+    reranker: Mutex<Option<Arc<dyn SearchReranker>>>,
 }
 
 /// Where the `name → table` map lives. Durable backends persist it on the
@@ -316,6 +324,26 @@ enum CatalogStore {
 }
 
 impl Connection {
+    test_visible! {
+        /// Put `reranker`'s order on the rows of `bm25_search` and
+        /// `hybrid_search` inside this connection's [`query_sql`](Self::query_sql)
+        /// (see [`rerank`]): the two functions fetch the reranker's pool,
+        /// hand it the rows with the table's text columns among them, and
+        /// emit the `k` it chooses, so a statement over the function sees
+        /// `k` rows of the shape it always saw. `None` serves the engine's
+        /// order again. How a platform ranks a search's rows by what its
+        /// grader says of them against the query, inside a statement as on
+        /// its own search routes. Statements already planned keep the
+        /// reranker they were planned with.
+        fn set_search_reranker(&self, reranker: Option<Arc<dyn SearchReranker>>) {
+            *self
+                .inner
+                .reranker
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = reranker;
+        }
+    }
+
     test_visible! {
         /// Serve `table` of `graph` — an edge table over this connection's
         /// rows that `graph` has indexed with `OptimizeOptions::with_adjacency`
@@ -1016,8 +1044,15 @@ impl Connection {
 
         // Search TVFs resolve their leading table-name argument through
         // the catalog at call time (so a table named only inside a TVF —
-        // not as a `FROM` relation — still resolves).
-        search_tvf::register_search_tvfs(&ctx, self.clone());
+        // not as a `FROM` relation — still resolves). The ranked ones
+        // take the host's reranker, when one is set, as it is now.
+        let reranker = self
+            .inner
+            .reranker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        search_tvf::register_search_tvfs(&ctx, self.clone(), reranker);
         // The graph functions walk an edge table of this catalog by name, or
         // the one attached from another catalog with no name.
         #[cfg(feature = "graph-index")]

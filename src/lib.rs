@@ -171,6 +171,11 @@ pub use catalog::Supertable;
 pub use catalog::{
     ColdFetchMode, ConnectOptions, Connection, FtsField, IndexSpec, connect, connect_with,
 };
+/// The order a host puts on a ranked search function's rows inside SQL
+/// (`Connection::set_search_reranker`). A platform seam like
+/// `attach_graph`: reachable under `test-helpers`, off the curated surface.
+#[cfg(feature = "test-helpers")]
+pub use catalog::SearchReranker;
 pub use config::{CompactionSettings, GcSettings, OptimizeOptions, RecalibratePolicy};
 /// The single public error type for the curated API.
 pub use error::InfinoError;

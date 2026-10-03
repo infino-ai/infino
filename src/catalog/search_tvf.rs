@@ -17,6 +17,10 @@
 //! function. The table name is a catalog table (a string literal), not a
 //! `FROM` alias — the TVF is a relation source, so joins / self-joins
 //! compose on its output.
+//!
+//! With a [`SearchReranker`] on the connection, `bm25_search` and
+//! `hybrid_search` are called for the reranker's pool and wrapped so the
+//! statement gets the `k` rows the reranker chooses (see [`super::rerank`]).
 
 use std::{
     collections::HashMap,
@@ -30,9 +34,13 @@ use datafusion::{
     error::{DataFusionError, Result as DfResult},
     execution::context::SessionContext,
     logical_expr::Expr,
+    prelude::lit,
 };
 
-use super::Connection;
+use super::{
+    Connection,
+    rerank::{RerankedSearch, SearchReranker},
+};
 #[cfg(feature = "graph-index")]
 use crate::supertable::query::exec::graph_exec::{GraphFunc, Traversal};
 use crate::{
@@ -40,7 +48,7 @@ use crate::{
     supertable::{
         handle::SupertableReader,
         query::exec::{
-            common::arg_to_string,
+            common::{arg_to_string, arg_to_usize},
             fts_exec::{BM25_PREFIX_UDTF, BM25_SEARCH_UDTF, Bm25PrefixFunc, Bm25SearchFunc},
             hybrid_exec::{HYBRID_SEARCH_UDTF, HybridSearchFunc},
             match_exec::{EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_UDTF, TokenMatchFunc},
@@ -48,6 +56,39 @@ use crate::{
         },
     },
 };
+
+/// Where `bm25_search(table, column, query, k[, mode])` carries its query
+/// text and its `k`, in the arguments after the table name.
+const BM25_QUERY_ARG: usize = 1;
+const BM25_K_ARG: usize = 2;
+/// Where `hybrid_search(table, text_col, q_text, vec_col, q_vec, k)` carries
+/// its text query and its `k`, in the arguments after the table name.
+const HYBRID_QUERY_ARG: usize = 1;
+const HYBRID_K_ARG: usize = 4;
+
+/// A ranked search's arguments widened to the reranker's pool: the query
+/// text and the statement's `k` read off `rest`, and `rest` with its `k`
+/// replaced by the pool. `None` when the arguments do not reach `k`, for
+/// the function's own count check to refuse.
+fn widened_for_rerank(
+    rest: &[Expr],
+    query_arg: usize,
+    k_arg: usize,
+    reranker: &dyn SearchReranker,
+    fn_name: &str,
+) -> DfResult<Option<(String, usize, Vec<Expr>)>> {
+    if rest.len() <= k_arg {
+        return Ok(None);
+    }
+    let query_text = arg_to_string(&rest[query_arg], &format!("{fn_name} query"))?;
+    let k = arg_to_usize(&rest[k_arg], &format!("{fn_name} k"))?;
+    let pool = reranker.pool(k).max(k);
+    let pool = i64::try_from(pool)
+        .map_err(|_| DataFusionError::Plan(format!("{fn_name}: the reranker's pool {pool} is too wide")))?;
+    let mut widened = rest.to_vec();
+    widened[k_arg] = lit(pool);
+    Ok(Some((query_text, k, widened)))
+}
 
 /// A resolved table's pinned snapshot: the reader the search kernels run
 /// against plus its scalar schema (the TVF's output columns).
@@ -67,6 +108,9 @@ struct TableResolver {
     /// `query_sql`, while resolution runs later on runtime threads where
     /// the scope's thread-local is invisible.
     op_stats: Option<Arc<OpStatsCollector>>,
+    /// The host's order on a ranked search's rows, when the connection
+    /// carries one at registration.
+    reranker: Option<Arc<dyn SearchReranker>>,
 }
 
 impl fmt::Debug for TableResolver {
@@ -76,11 +120,12 @@ impl fmt::Debug for TableResolver {
 }
 
 impl TableResolver {
-    fn new(conn: Connection) -> Self {
+    fn new(conn: Connection, reranker: Option<Arc<dyn SearchReranker>>) -> Self {
         Self {
             conn,
             cache: Mutex::new(HashMap::new()),
             op_stats: op_stats::current(),
+            reranker,
         }
     }
 
@@ -141,9 +186,14 @@ impl TableResolver {
 }
 
 /// Register the catalog search TVFs (table-name-first form) on `ctx`,
-/// resolving tables through `conn`.
-pub(crate) fn register_search_tvfs(ctx: &SessionContext, conn: Connection) {
-    let resolver = Arc::new(TableResolver::new(conn));
+/// resolving tables through `conn`, the ranked ones under `reranker`'s
+/// order when the connection carries one.
+pub(crate) fn register_search_tvfs(
+    ctx: &SessionContext,
+    conn: Connection,
+    reranker: Option<Arc<dyn SearchReranker>>,
+) {
+    let resolver = Arc::new(TableResolver::new(conn, reranker));
     ctx.register_udtf(
         BM25_SEARCH_UDTF,
         Arc::new(Bm25SearchCatalogFunc {
@@ -197,8 +247,8 @@ pub(crate) fn register_graph_tvfs(
     tables: Connection,
     edge_table: Option<String>,
 ) {
-    let graph = Arc::new(TableResolver::new(graph));
-    let tables = Arc::new(TableResolver::new(tables));
+    let graph = Arc::new(TableResolver::new(graph, None));
+    let tables = Arc::new(TableResolver::new(tables, None));
     for traversal in [Traversal::Walk, Traversal::Rank] {
         ctx.register_udtf(
             traversal.name(),
@@ -258,9 +308,27 @@ struct Bm25SearchCatalogFunc {
 impl TableFunctionImpl for Bm25SearchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let (t, rest) = self.resolver.split_leading(args.exprs(), "bm25_search")?;
-
-        Bm25SearchFunc::new(t.reader, t.scalar_schema)
-            .call_with_args(TableFunctionArgs::new(rest, args.session()))
+        let func = Bm25SearchFunc::new(t.reader, t.scalar_schema);
+        if let Some(reranker) = &self.resolver.reranker
+            && let Some((query_text, k, widened)) = widened_for_rerank(
+                rest,
+                BM25_QUERY_ARG,
+                BM25_K_ARG,
+                reranker.as_ref(),
+                "bm25_search",
+            )?
+        {
+            let table = arg_to_string(&args.exprs()[0], "bm25_search table")?;
+            let inner = func.call_with_args(TableFunctionArgs::new(&widened, args.session()))?;
+            return Ok(Arc::new(RerankedSearch {
+                inner,
+                reranker: Arc::clone(reranker),
+                table,
+                query_text,
+                k,
+            }));
+        }
+        func.call_with_args(TableFunctionArgs::new(rest, args.session()))
     }
 }
 
@@ -299,9 +367,27 @@ struct HybridSearchCatalogFunc {
 impl TableFunctionImpl for HybridSearchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let (t, rest) = self.resolver.split_leading(args.exprs(), "hybrid_search")?;
-
-        HybridSearchFunc::new(t.reader, t.scalar_schema)
-            .call_with_args(TableFunctionArgs::new(rest, args.session()))
+        let func = HybridSearchFunc::new(t.reader, t.scalar_schema);
+        if let Some(reranker) = &self.resolver.reranker
+            && let Some((query_text, k, widened)) = widened_for_rerank(
+                rest,
+                HYBRID_QUERY_ARG,
+                HYBRID_K_ARG,
+                reranker.as_ref(),
+                "hybrid_search",
+            )?
+        {
+            let table = arg_to_string(&args.exprs()[0], "hybrid_search table")?;
+            let inner = func.call_with_args(TableFunctionArgs::new(&widened, args.session()))?;
+            return Ok(Arc::new(RerankedSearch {
+                inner,
+                reranker: Arc::clone(reranker),
+                table,
+                query_text,
+                k,
+            }));
+        }
+        func.call_with_args(TableFunctionArgs::new(rest, args.session()))
     }
 }
 
