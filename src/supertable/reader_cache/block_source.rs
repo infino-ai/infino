@@ -37,12 +37,13 @@ use std::{
     process,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::{StreamExt, stream};
 use memmap2::Mmap;
 use roaring::RoaringBitmap;
 
@@ -94,8 +95,10 @@ pub(crate) struct BlockCachedSource {
     /// rounding each to a 512 KiB block over-fetches ~200× per read on a
     /// wide OR (the block size is tuned for vector's 0.25–2 MiB scans).
     /// Their warm locality comes from the background-fill mmap promotion,
-    /// not from this cache. Reads only partially overlapping the hole keep
-    /// block semantics.
+    /// not from this cache. So a read inside the hole never fills blocks on a
+    /// miss, but is served from disk when its blocks are there; only
+    /// [`Self::prefetch`] fills them. Reads only partially overlapping the
+    /// hole keep block semantics.
     passthrough: Option<(u64, u64)>,
     state: OnceLock<Option<BlockFile>>,
     /// Filled-block set. Guarded by a sync mutex; never held across await.
@@ -158,6 +161,79 @@ impl BlockCachedSource {
             Some((off, hole_len)) => start >= off && start + len <= off + hole_len,
             None => false,
         }
+    }
+
+    /// The blocks file for a read. A hole read only uses one that exists, since
+    /// reads never fill the hole.
+    fn block_file_for(&self, in_hole: bool) -> Option<&BlockFile> {
+        if in_hole {
+            self.state.get()?.as_ref()
+        } else {
+            self.block_file()
+        }
+    }
+
+    /// Fill every block of `[start, start + len)` ahead of reads, with up to
+    /// `streams` GETs of about `chunk_bytes` each in flight. Unlike a read, this
+    /// also fills the passthrough hole, so a scan of the whole hole is served
+    /// from disk. Stops quietly when the cache cannot take more blocks; later
+    /// reads then pass through as before.
+    pub(crate) async fn prefetch(
+        &self,
+        start: u64,
+        len: u64,
+        chunk_bytes: u64,
+        streams: usize,
+    ) -> Result<(), LazyByteSourceError> {
+        let Some(bf) = self.block_file() else {
+            return Ok(());
+        };
+        let end = start.saturating_add(len).min(bf.size);
+        if start >= end {
+            return Ok(());
+        }
+        let (b0, b1) = Self::block_span(start, end - start);
+        let per_chunk = (chunk_bytes / CACHE_BLOCK_BYTES).max(1) as u32;
+        let chunks = (b0..=b1)
+            .step_by(per_chunk as usize)
+            .map(|c0| (c0, c0.saturating_add(per_chunk - 1).min(b1)));
+        let filled_before = self.filled_bytes.load(Ordering::Acquire);
+        // On a stop, chunks not yet started are skipped, but the ones in flight
+        // finish: a fill dropped mid-GET would keep its budget reservation.
+        let stop = AtomicBool::new(false);
+        let mut fills = stream::iter(chunks)
+            .map(|(c0, c1)| {
+                let stop = &stop;
+                async move {
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(true);
+                    }
+                    self.fill_missing(bf, c0, c1, false).await
+                }
+            })
+            .buffer_unordered(streams.max(1));
+        let mut result = Ok(());
+        while let Some(filled) = fills.next().await {
+            match filled {
+                Ok(true) => {}
+                Ok(false) => stop.store(true, Ordering::Release),
+                Err(e) => {
+                    stop.store(true, Ordering::Release);
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
+                }
+            }
+        }
+        // Once for the whole prefetch rather than once per chunk, and only when
+        // something was filled.
+        if self.filled_bytes.load(Ordering::Acquire) != filled_before {
+            let snapshot = self.snapshot_index();
+            if bf.file.sync_data().is_ok() {
+                self.persist_idx(bf, &snapshot);
+            }
+        }
+        result
     }
 
     /// Whether `token` is this source's own identity token, compared by pointer. Lets the owning
@@ -376,12 +452,14 @@ impl BlockCachedSource {
     /// Fill every missing block covering the request, reserving budget per
     /// run and settling duplicate-fill accounting. Returns `false` if the
     /// read should degrade to passthrough (budget exhausted, entry replaced,
-    /// store gone, or local file I/O failed).
+    /// store gone, or local file I/O failed). `persist` writes the block index
+    /// after a fill; a prefetch writes it once at the end instead.
     async fn fill_missing(
         &self,
         bf: &BlockFile,
         b0: u32,
         b1: u32,
+        persist: bool,
     ) -> Result<bool, LazyByteSourceError> {
         let Some(store) = self.store.upgrade() else {
             return Ok(false);
@@ -425,7 +503,7 @@ impl BlockCachedSource {
                 store.release_block_bytes(run_len - newly);
             }
         }
-        if filled_any {
+        if filled_any && persist {
             let snapshot = self.snapshot_index();
             if bf.file.sync_data().is_ok() {
                 self.persist_idx(bf, &snapshot);
@@ -489,10 +567,8 @@ impl LazyByteSource for BlockCachedSource {
         if len == 0 {
             return Ok(Bytes::new());
         }
-        if self.in_passthrough(start, len) {
-            return self.inner.range(start, len).await;
-        }
-        let Some(bf) = self.block_file() else {
+        let in_hole = self.in_passthrough(start, len);
+        let Some(bf) = self.block_file_for(in_hole) else {
             return self.inner.range(start, len).await;
         };
         if start.saturating_add(len) > bf.size {
@@ -500,7 +576,9 @@ impl LazyByteSource for BlockCachedSource {
             return self.inner.range(start, len).await;
         }
         let (b0, b1) = Self::block_span(start, len);
-        if !self.all_filled(b0, b1) && !self.fill_missing(bf, b0, b1).await? {
+        // Missing blocks are fetched and kept, except in the hole, which reads
+        // never fill. Fetch uncached when they cannot be kept.
+        if !self.all_filled(b0, b1) && (in_hole || !self.fill_missing(bf, b0, b1, true).await?) {
             return self.inner.range(start, len).await;
         }
         match self.read_local(bf, start, len) {
@@ -513,10 +591,9 @@ impl LazyByteSource for BlockCachedSource {
         if len == 0 {
             return Some(Bytes::new());
         }
-        if self.in_passthrough(start, len) {
+        let Some(bf) = self.block_file_for(self.in_passthrough(start, len)) else {
             return self.inner.try_get_range_sync(start, len);
-        }
-        let bf = self.block_file()?;
+        };
         if start.saturating_add(len) > bf.size {
             return None;
         }
@@ -539,7 +616,7 @@ impl LazyByteSource for BlockCachedSource {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::{path::Path, sync::atomic::AtomicUsize};
 
     use tempfile::tempdir;
 
@@ -588,7 +665,7 @@ mod tests {
 
     /// A store whose budget admits everything; `noop_storage` is never hit
     /// because the block source's inner fake serves all reads.
-    fn test_store(dir: &std::path::Path, budget: u64) -> Arc<DiskCacheStore> {
+    fn test_store(dir: &Path, budget: u64) -> Arc<DiskCacheStore> {
         use std::{ops::Range, time::SystemTime};
 
         use object_store::MultipartUpload;
@@ -1067,5 +1144,159 @@ mod tests {
         assert_eq!(inner.calls(), 2, "uncached passthrough on both reads");
         assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 0);
         assert_eq!(store.stats().current_bytes, 0);
+    }
+
+    /// A source with a passthrough hole of `hole` over an `obj`-byte blob,
+    /// installed as current for a fresh uri.
+    fn holed_source(
+        dir: &Path,
+        store: &Arc<DiskCacheStore>,
+        obj: usize,
+        hole: (u64, u64),
+    ) -> (SuperfileUri, Arc<CountingSource>, Arc<BlockCachedSource>) {
+        let uri = SuperfileUri::new_v4();
+        let inner = Arc::new(CountingSource::new(obj));
+        let src = BlockCachedSource::new_with_accounting(
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(store),
+            uri,
+            dir.join("hole.blocks"),
+            true,
+            Some(hole),
+        );
+        store.install_block_entry_for_test(uri, Arc::clone(&src));
+        (uri, inner, src)
+    }
+
+    /// Hole reads stay exact passthrough until a prefetch fills the hole; then
+    /// they, and sync reads, come from disk with no more GETs.
+    #[tokio::test]
+    async fn prefetched_hole_is_served_from_disk() {
+        let b = CACHE_BLOCK_BYTES;
+        let obj = 16 * b as usize;
+        let hole = (2 * b + 100, 12 * b);
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = holed_source(dir.path(), &store, obj, hole);
+
+        // Before: every hole read is its own exact GET.
+        let read_start = 3 * b + 5;
+        let _ = src.range(read_start, 1000).await.expect("hole read");
+        let _ = src.range(read_start, 1000).await.expect("hole read again");
+        assert_eq!(inner.calls(), 2, "hole reads pass through");
+        assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 0);
+
+        // Blocks 2..=14 in 4-block chunks: 4 GETs.
+        src.prefetch(hole.0, hole.1, 4 * b, 2)
+            .await
+            .expect("prefetch");
+        assert_eq!(inner.calls(), 6, "one GET per prefetch chunk");
+        assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 13 * b);
+
+        let got = src.range(read_start, 1000).await.expect("hole read");
+        assert_eq!(
+            got,
+            inner
+                .blob
+                .slice(read_start as usize..read_start as usize + 1000)
+        );
+        let sync = src
+            .try_get_range_sync(read_start, 1000)
+            .expect("sync hole read from disk");
+        assert_eq!(sync, got);
+        assert_eq!(inner.calls(), 6, "prefetched hole reads need no GETs");
+
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// `prefetch_range` fills a lazy entry's hole through the store.
+    #[tokio::test]
+    async fn prefetch_range_fills_a_lazy_entry() {
+        let b = CACHE_BLOCK_BYTES;
+        let hole = (b, 4 * b);
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = holed_source(dir.path(), &store, 8 * b as usize, hole);
+
+        store
+            .prefetch_range(&uri, hole.0, hole.1)
+            .await
+            .expect("prefetch");
+        assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 4 * b);
+        let calls = inner.calls();
+        let _ = src.range(2 * b, 100).await.expect("hole read");
+        assert_eq!(inner.calls(), calls, "served from the prefetched blocks");
+
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A prefetch that runs out of budget stops without an error, leaves no
+    /// budget reserved for blocks it did not fill, and reads it did not cover
+    /// still pass through correctly.
+    #[tokio::test]
+    async fn prefetch_stops_when_the_budget_runs_out() {
+        let b = CACHE_BLOCK_BYTES;
+        let obj = 10 * b as usize;
+        let hole = (0, 10 * b);
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), 2 * b);
+        let (uri, inner, src) = holed_source(dir.path(), &store, obj, hole);
+
+        src.prefetch(hole.0, hole.1, b, 4)
+            .await
+            .expect("a budget stop is not an error");
+        let filled = src.filled_bytes_handle().load(Ordering::Acquire);
+        assert!(filled <= 2 * b);
+        assert_eq!(
+            store.stats().current_bytes,
+            filled,
+            "only filled blocks stay charged"
+        );
+
+        let late = 8 * b + 7;
+        let got = src.range(late, 100).await.expect("uncovered hole read");
+        assert_eq!(got, inner.blob.slice(late as usize..late as usize + 100));
+
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A prefetch that fills nothing does not rewrite the block index.
+    #[tokio::test]
+    async fn prefetch_of_filled_blocks_skips_the_index_write() {
+        let b = CACHE_BLOCK_BYTES;
+        let hole = (0, 4 * b);
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = holed_source(dir.path(), &store, 4 * b as usize, hole);
+
+        src.prefetch(hole.0, hole.1, b, 2)
+            .await
+            .expect("first prefetch");
+        let idx = src.idx_path();
+        assert!(idx.exists(), "first prefetch writes the index");
+        fs::remove_file(&idx).expect("remove index");
+
+        let calls = inner.calls();
+        src.prefetch(hole.0, hole.1, b, 2)
+            .await
+            .expect("second prefetch");
+        assert_eq!(inner.calls(), calls, "nothing left to fetch");
+        assert!(
+            !idx.exists(),
+            "nothing filled, so the index is not rewritten"
+        );
+
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Prefetching a uri with no lazy entry does nothing.
+    #[tokio::test]
+    async fn prefetch_range_skips_a_uri_that_is_not_open_lazily() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        store
+            .prefetch_range(&SuperfileUri::new_v4(), 0, CACHE_BLOCK_BYTES)
+            .await
+            .expect("no entry is not an error");
     }
 }

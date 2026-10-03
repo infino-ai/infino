@@ -9902,6 +9902,15 @@ async fn collect_and_build_term_index(
         let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)
             .await
             .map_err(|e| TermIndexError::Build(e.to_string()))?;
+        // The walk reads most of the FTS section, whose reads skip the block
+        // cache, so each would be its own GET. Fetch the section in bulk first.
+        // On failure the walk still works, read by read.
+        if let Some(cache) = disk_cache
+            && let Some((start, len)) = entry.subsection_offsets.as_ref().and_then(|o| o.fts)
+            && let Err(e) = cache.prefetch_range(&entry.uri, start, len).await
+        {
+            warn!("term index: fts prefetch failed for {}: {e}", entry.uri.0);
+        }
         let mut writer = term_index::ContributionWriter::create(
             scratch.path(),
             entry.superfile_id,
