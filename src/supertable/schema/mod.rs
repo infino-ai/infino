@@ -56,6 +56,21 @@ pub const DEFAULT_MAX_FIELDS: u32 = 10_000;
 /// How deep a document may nest before it is refused.
 pub const DEFAULT_MAX_DEPTH: u32 = 20;
 
+/// The most columns a table may be allowed to hold. A cap is what bounds
+/// the per-column cost of a commit — Parquet statistics, a manifest entry,
+/// an index region each — so the owner may raise their table's cap only up
+/// to here.
+pub const MAX_MAX_FIELDS: u32 = 100_000;
+
+/// The deepest nesting a table may be allowed to admit, bounding the
+/// mapper's recursion over a document.
+pub const MAX_MAX_DEPTH: u32 = 100;
+
+/// The most wildcards a template's path pattern may carry. Matching walks
+/// the pattern once per wildcard, so a bound here is what keeps a pattern
+/// from costing more than the path it matches.
+pub const MAX_TEMPLATE_WILDCARDS: usize = 8;
+
 /// Arrow field-metadata key under which a batch names the index a column
 /// it adds should carry, as the schema document spells an index. Read when
 /// the column joins the schema; ignored for a column the table has.

@@ -913,6 +913,7 @@ impl SupertableReader {
         let must_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(must_phrases);
         let should_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(should_phrases);
         let neg_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(negative_phrases);
+        let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column_owned);
 
         // Cross-segment threshold sharing: each unit reads the global
@@ -982,6 +983,11 @@ impl SupertableReader {
                     .unwrap_or_else(|| Arc::new(RoaringBitmap::new()))
             });
             async move {
+                // A file written before a rename labels the column as it was
+                // then, and its dictionary is keyed by that label; the id is
+                // what finds the column in either file.
+                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+
                 // This superfile's open-wave fetches (global stats): the
                 // cursor builds below serve the scored terms from the memo
                 // instead of re-reading what the df wave already fetched.
@@ -1340,6 +1346,7 @@ impl SupertableReader {
                 .filter(|e| !covered.contains(&e.superfile_id))
                 .collect();
         let kept_ids: HashSet<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
+        let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column.to_owned());
         let terms_arc: Arc<Vec<String>> = Arc::new(misses.clone());
         let units: Vec<(Arc<SuperfileEntry>, (Uuid, bool))> = presence
@@ -1361,6 +1368,11 @@ impl SupertableReader {
                 let terms_arc = Arc::clone(&terms_arc);
                 let op_stats = op_stats.clone();
                 async move {
+                    // A file written before a rename labels the column as it was
+                    // then, and its dictionary is keyed by that label; the id is
+                    // what finds the column in either file.
+                    let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+
                     let refs: Vec<&str> = terms_arc.iter().map(String::as_str).collect();
                     if full {
                         // Scoring superfile: fetch the scored terms outright
@@ -1488,6 +1500,8 @@ impl SupertableReader {
             })
             .collect();
 
+        let column_field_id = self.manifest().field_id(column);
+
         let column_arc = Arc::new(column_owned);
         let prefix_arc = Arc::new(prefix_owned);
         // No scope here: prefix search takes no pushed-down `WHERE` (the
@@ -1512,6 +1526,11 @@ impl SupertableReader {
             let reader_pool = Arc::clone(&reader_pool);
             let op_stats = op_stats.clone();
             async move {
+                // A file written before a rename labels the column as it was
+                // then, and its dictionary is keyed by that label; the id is
+                // what finds the column in either file.
+                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+
                 match range {
                     Some((start, end)) => {
                         let cell = {
@@ -1791,6 +1810,7 @@ impl SupertableReader {
                 (e, id)
             })
             .collect();
+        let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column.to_owned());
         let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
         let phrase_arc: Arc<Vec<Phrase<String>>> = Arc::new(match_set.phrases);
@@ -1806,6 +1826,11 @@ impl SupertableReader {
             let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
             async move {
+                // A file written before a rename labels the column as it was
+                // then, and its dictionary is keyed by that label; the id is
+                // what finds the column in either file.
+                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+
                 let memo = memo_from_locations(&r, &locations, suid).await;
                 let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                 // Any phrase atom (match or negated) takes the
@@ -1985,6 +2010,7 @@ impl SupertableReader {
             .map(String::as_str)
             .collect();
         let locations = self.index_locations(column, &all_terms, &kept).await;
+        let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column.to_owned());
         let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
         let phrase_arc: Arc<Vec<Phrase<String>>> = Arc::new(match_set.phrases);
@@ -2011,6 +2037,11 @@ impl SupertableReader {
                 let neg_ph_arc = Arc::clone(&neg_ph_arc);
                 let locations = Arc::clone(&locations);
                 async move {
+                    // A file written before a rename labels the column as it was
+                    // then, and its dictionary is keyed by that label; the id is
+                    // what finds the column in either file.
+                    let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+
                     let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                     // Tombstone bitmap for this superfile (None = no deletes).
                     let tomb = match tombstone_cache.as_ref() {
@@ -2191,6 +2222,7 @@ impl SupertableReader {
             }))
             .await;
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+        let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column.to_owned());
         let value_arc = Arc::new(value.to_owned());
         let tokens_arc = Arc::new(term_strings);
@@ -2206,6 +2238,11 @@ impl SupertableReader {
             let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
             async move {
+                // A file written before a rename labels the column as it was
+                // then, and its dictionary is keyed by that label; the id is
+                // what finds the column in either file.
+                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+
                 let candidates: Vec<u32> = if tokens_arc.is_empty() {
                     (0..r.n_docs() as u32).collect()
                 } else {

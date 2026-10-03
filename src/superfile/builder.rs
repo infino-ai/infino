@@ -556,10 +556,12 @@ pub struct BuilderOptions {
     /// The table schema version the superfile is written under, stamped
     /// in the footer as provenance.
     pub(crate) schema_id: u32,
-    /// The field id of each vector column, by name. Vector columns live in
-    /// the vector blob, not the Parquet body, so `schema` does not carry
-    /// their ids; the footer records them from here.
-    pub(crate) vector_field_ids: HashMap<String, FieldId>,
+    /// The field id of each column this builder's `schema` does not
+    /// carry, by name: vector columns (they live in the vector blob) and
+    /// index-only FTS columns (their text lives in no body at all). The
+    /// footer records their ids from here, so every column of a written
+    /// file is identified the same way.
+    pub(crate) field_ids_outside_schema: HashMap<String, FieldId>,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -651,16 +653,18 @@ impl BuilderOptions {
             vector_layout: VectorLayout::Ivf,
             fts_corpus_stats: HashMap::new(),
             schema_id: 1,
-            vector_field_ids: HashMap::new(),
+            field_ids_outside_schema: HashMap::new(),
         }
     }
 
-    /// Record the field id of each vector column, by name.
-    pub(crate) fn with_vector_field_ids(
+    /// Record the field id of each column the schema does not carry (see
+    /// [`BuilderOptions::field_ids_outside_schema`]). Called once per
+    /// builder; later calls replace the map.
+    pub(crate) fn with_field_ids_outside_schema(
         mut self,
         ids: impl IntoIterator<Item = (String, FieldId)>,
     ) -> Self {
-        self.vector_field_ids = ids.into_iter().collect();
+        self.field_ids_outside_schema = ids.into_iter().collect();
         self
     }
 
@@ -674,14 +678,18 @@ impl BuilderOptions {
         self
     }
 
-    /// The field id stamped on `column` in this builder's schema, if any.
-    fn field_id_of_column(&self, column: &str) -> Option<FieldId> {
-        self.vector_field_ids.get(column).copied().or_else(|| {
-            self.schema
-                .field_with_name(column)
-                .ok()
-                .and_then(field_id_of)
-        })
+    /// The field id of `column`: the one recorded for a column outside
+    /// the schema, else the one stamped on the schema's field.
+    pub(crate) fn field_id_of_column(&self, column: &str) -> Option<FieldId> {
+        self.field_ids_outside_schema
+            .get(column)
+            .copied()
+            .or_else(|| {
+                self.schema
+                    .field_with_name(column)
+                    .ok()
+                    .and_then(field_id_of)
+            })
     }
 
     /// Lower each FTS column's carried analysis revision to the lowest
@@ -838,11 +846,21 @@ impl BuilderOptions {
             (Vec::new(), VectorLayout::Ivf)
         };
 
-        let vector_field_ids: Vec<(String, FieldId)> = reader
+        // The ids of the columns `reader.schema()` does not carry: the
+        // vector columns, and the FTS columns whose text is not stored.
+        let outside_schema: Vec<(String, FieldId)> = reader
             .vec()
             .into_iter()
             .flat_map(|vec| vec.vector_columns_config())
             .filter_map(|v| Some((v.name.clone(), v.field_id?)))
+            .chain(
+                reader
+                    .fts()
+                    .into_iter()
+                    .flat_map(|fts| fts.fts_columns_config())
+                    .filter(|c| !c.stored)
+                    .filter_map(|c| Some((c.name.clone(), c.field_id?))),
+            )
             .collect();
         BuilderOptions::new(
             reader.schema().clone(),
@@ -851,7 +869,48 @@ impl BuilderOptions {
             vector_columns,
         )
         .with_vector_layout(vector_layout)
-        .with_vector_field_ids(vector_field_ids)
+        .with_field_ids_outside_schema(outside_schema)
+    }
+
+    /// These options as a merge's output shape: the body the inputs
+    /// actually carry. An index-only FTS column's text is in no file body,
+    /// so it is not a column a merge input can supply — its postings are
+    /// carried across prebuilt instead — while `schema` on the ingest path
+    /// stays the contract that the text must arrive to be indexed. The
+    /// column keeps its id here, so the merged file identifies it exactly
+    /// as its inputs did.
+    pub(crate) fn into_merge_source_shape(mut self) -> Self {
+        let index_only: Vec<&FtsConfig> = self
+            .fts_columns
+            .iter()
+            .filter(|c| !c.stored && self.schema.index_of(&c.column).is_ok())
+            .collect();
+        if index_only.is_empty() {
+            return self;
+        }
+        let mut ids: Vec<(String, FieldId)> = Vec::with_capacity(index_only.len());
+        for column in &index_only {
+            if let Ok(field) = self.schema.field_with_name(&column.column)
+                && let Some(id) = field_id_of(field)
+            {
+                ids.push((column.column.clone(), id));
+            }
+        }
+        let names: HashSet<&str> = index_only.iter().map(|c| c.column.as_str()).collect();
+        let fields: Vec<Arc<Field>> = self
+            .schema
+            .fields()
+            .iter()
+            .filter(|f| !names.contains(f.name().as_str()))
+            .cloned()
+            .collect();
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            self.schema.metadata().clone(),
+        ));
+        self.field_ids_outside_schema.extend(ids);
+        self.schema = schema;
+        self
     }
 
     /// Verify a merge input's per-column FTS configuration is
@@ -897,9 +956,17 @@ impl BuilderOptions {
             )));
         }
         for (own, other) in self.fts_columns.iter().zip(remote.iter()) {
-            if own.column != other.name {
+            // Columns are the same column when their ids agree; a label
+            // change is not a change of terms, so a renamed column's
+            // postings still carry. Files written before ids compare by
+            // name, which is what identified a column then.
+            let same_column = match (self.field_id_of_column(&own.column), other.field_id) {
+                (Some(own_id), Some(other_id)) => own_id == other_id,
+                _ => own.column == other.name,
+            };
+            if !same_column {
                 return Err(BuildError::FTSSchemaMismatch(format!(
-                    "mismatched column name. self {} vs other {}",
+                    "mismatched column. self {} vs other {}",
                     own.column, other.name
                 )));
             }
@@ -2076,6 +2143,30 @@ impl SuperfileBuilder {
     /// append tokenizes the ones still present — `index_fts_batch` skips
     /// any column absent from the schema, which is precisely the set the
     /// carry handled.
+    /// The output column, if any, whose postings this input holds and
+    /// which re-analysis cannot rebuild: one whose text is not stored, so
+    /// neither the batch nor the carry can supply its terms. A column the
+    /// input does not hold has nothing to lose, and a stored one is
+    /// rebuilt from its text.
+    fn unrebuildable_column(&self, reader: &SuperfileReader) -> Option<String> {
+        let held: Vec<&ColumnMeta> = reader
+            .fts()
+            .map(|fts| fts.fts_columns_config().collect())
+            .unwrap_or_default();
+        self.opts
+            .fts_columns
+            .iter()
+            .filter(|c| !c.stored)
+            .find(|c| {
+                let id = self.opts.field_id_of_column(&c.column);
+                held.iter().any(|other| match (id, other.field_id) {
+                    (Some(own), Some(other)) => own == other,
+                    _ => c.column == other.name,
+                })
+            })
+            .map(|c| c.column.clone())
+    }
+
     pub(crate) fn add_batch_from_reader_scoped(
         &mut self,
         reader: &SuperfileReader,
@@ -2090,6 +2181,16 @@ impl SuperfileBuilder {
                     .map(|f| f.fts_columns_config().collect::<Vec<_>>())
                     .as_deref(),
             )?;
+        } else if let Some(column) = self.unrebuildable_column(reader) {
+            // Re-analysis reads each column's text from the batch. An
+            // index-only column has none there — carrying its postings is
+            // what this scope already ruled out — so the output would be
+            // missing that column's terms with nothing to say so. Refuse
+            // instead: the text itself is the only source left.
+            return Err(BuildError::FTSSchemaMismatch(format!(
+                "column {column}: its postings cannot be carried from this file and its text is \
+                 not stored, so they cannot be rebuilt here; re-ingest the column's text"
+            )));
         }
         let record_batch = adapted_batch(reader, deleted_docs_bitmap.clone(), adapter, &self.opts)?;
 
@@ -3359,7 +3460,7 @@ pub(crate) fn merge_builder_opts(
         Some(v) if v.is_multi_cell() => VectorLayout::MultiCellIvf,
         _ => base.vector_layout,
     };
-    let mut opts = base.with_vector_layout(layout);
+    let mut opts = base.with_vector_layout(layout).into_merge_source_shape();
     for input in inputs {
         opts.lower_analysis_revision_to(&input.reader);
     }

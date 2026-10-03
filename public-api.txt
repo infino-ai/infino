@@ -355,6 +355,10 @@ impl core::panic::unwind_safe::UnwindSafe for infino::RerankCodec
 #[non_exhaustive] pub enum infino::SchemaError
 pub infino::SchemaError::BacksGlobalVectorIndex
 pub infino::SchemaError::BacksGlobalVectorIndex::column: alloc::string::String
+pub infino::SchemaError::CapExceeded
+pub infino::SchemaError::CapExceeded::cap: u32
+pub infino::SchemaError::CapExceeded::setting: alloc::string::String
+pub infino::SchemaError::CapExceeded::value: u32
 pub infino::SchemaError::ConversionInProgress
 pub infino::SchemaError::ConversionInProgress::column: alloc::string::String
 pub infino::SchemaError::DepthExceeded

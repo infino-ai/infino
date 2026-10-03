@@ -1287,19 +1287,29 @@ pub(crate) fn builder_options_for(
     options: &SupertableOptions,
 ) -> BuilderOptions {
     let vector_configs = schema.vector_configs();
-    let vector_field_ids: Vec<(String, FieldId)> = vector_configs
+    let fts_configs = schema.fts_configs();
+    // Vector columns live in the vector blob and index-only FTS columns in
+    // no body at all, so the builder's schema does not carry their ids.
+    let outside_schema: Vec<(String, FieldId)> = vector_configs
         .iter()
-        .filter_map(|vc| Some((vc.column.clone(), schema.id_of(&vc.column)?)))
+        .map(|vc| vc.column.as_str())
+        .chain(
+            fts_configs
+                .iter()
+                .filter(|fc| !fc.stored)
+                .map(|fc| fc.column.as_str()),
+        )
+        .filter_map(|column| Some((column.to_owned(), schema.id_of(column)?)))
         .collect();
     BuilderOptions::new(
         schema.scalar_schema(&options.id_column),
         options.id_column.clone(),
-        schema.fts_configs(),
+        fts_configs,
         vector_configs,
     )
     .with_vector_layout(options.vector_layout)
     .with_schema_id(schema.schema_id())
-    .with_vector_field_ids(vector_field_ids)
+    .with_field_ids_outside_schema(outside_schema)
 }
 
 impl SupertableOptions {
