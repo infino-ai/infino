@@ -19,14 +19,14 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow_array::{
-    ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeListArray, LargeStringArray, ListArray, RecordBatch,
-    RecordBatchOptions, StringArray, StringViewArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    ArrayRef, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeListArray, LargeStringArray,
+    ListArray, RecordBatch, RecordBatchOptions, StringArray, StringViewArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use chrono::DateTime;
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use serde_json::{Map, Value};
 
 use crate::supertable::schema::{
@@ -35,6 +35,8 @@ use crate::supertable::schema::{
 
 /// Integers above this magnitude are not exactly representable as `f64`.
 const F64_EXACT_INT_BOUND: i128 = 1 << 53;
+/// Milliseconds in a day, for `Date64`.
+const MILLIS_PER_DAY: i64 = 86_400_000;
 
 /// A value a document carries on one path, with arrays kept whole.
 #[derive(Debug, Clone)]
@@ -98,10 +100,52 @@ struct Column<'a> {
     path: String,
     /// One entry per row; `None` where the row lacks the path.
     cells: Vec<Option<Leaf<'a>>>,
-    /// The kind of the scalars seen, or of the list elements seen.
-    kind: Option<Kind>,
+    /// The distinct kinds of the scalars seen (or of the list elements
+    /// seen), in order of appearance.
+    kinds: Vec<Kind>,
     /// Whether any value was an array.
     list: bool,
+}
+
+impl Column<'_> {
+    /// Every scalar value the column carries, lists flattened.
+    fn values(&self) -> impl Iterator<Item = &Value> + '_ {
+        self.cells.iter().flatten().flat_map(|leaf| match leaf {
+            Leaf::Scalar(v) => vec![*v],
+            Leaf::List(vs) => vs.clone(),
+        })
+    }
+
+    /// The one kind the column's values share. Integers and floats are
+    /// numbers; strings and integers both name a point in time when the
+    /// column is a timestamp; anything else that mixes is refused — as a
+    /// mixed array on a list path, as a type disagreement otherwise.
+    fn settle_kind(&self, target: Option<&DataType>) -> Result<Kind, SchemaError> {
+        match self.kinds.as_slice() {
+            [] => Err(SchemaError::InvalidRow {
+                row: 0,
+                reason: format!("path `{}` has no values", self.path),
+            }),
+            [kind] => Ok(*kind),
+            [a, b] if a.join(*b).is_some() => Ok(a.join(*b).expect("joinable")),
+            kinds
+                if matches!(target, Some(DataType::Timestamp(_, _)))
+                    && kinds.iter().all(|k| matches!(k, Kind::Str | Kind::Int))
+                    && self.values().all(parses_as_time) =>
+            {
+                Ok(Kind::Str)
+            }
+            kinds if self.list => Err(SchemaError::MixedArray {
+                column: self.path.clone(),
+                types: kinds.iter().map(|k| k.inferred().to_string()).collect(),
+            }),
+            kinds => Err(SchemaError::TypeMismatch {
+                column: self.path.clone(),
+                frozen: kinds[0].inferred(),
+                offered: kinds[1].inferred(),
+            }),
+        }
+    }
 }
 
 /// Map `rows` to one batch under `schema`'s rules. Every row is a JSON
@@ -123,7 +167,7 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
                     columns.push(Column {
                         path: path.clone(),
                         cells: vec![None; rows.len()],
-                        kind: None,
+                        kinds: Vec::new(),
                         list: false,
                     });
                     by_path.insert(path, columns.len() - 1);
@@ -140,13 +184,13 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     for column in &columns {
         // A path that only ever carried empty arrays creates nothing.
-        let Some(kind) = column.kind else {
+        let Some(first_kind) = column.kinds.first().copied() else {
             continue;
         };
         let detected = if column.list {
             Detected::List
         } else {
-            kind.detected()
+            first_kind.detected()
         };
         let mut metadata = HashMap::new();
         let target = match schema.id_of(&column.path) {
@@ -166,6 +210,7 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
                 None => None,
             },
         };
+        let kind = column.settle_kind(target.as_ref())?;
         let data_type = resolve_type(column, kind, target.as_ref());
         let array = build_array(column, &data_type)?;
         fields.push(Field::new(&column.path, data_type, true).with_metadata(metadata));
@@ -182,14 +227,15 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
     })
 }
 
-/// Record one more value of a column: its kind must agree with what the
-/// column has seen (numbers may mix), or the batch is refused.
+/// Record one more value of a column: scalars and arrays never mix on one
+/// path, every value is a scalar JSON kind, and the kinds seen are kept for
+/// [`Column::settle_kind`] once the column's target type is known.
 fn observe<'a>(column: &mut Column<'a>, leaf: &Leaf<'a>) -> Result<(), SchemaError> {
     let (values, list): (Vec<&Value>, bool) = match leaf {
         Leaf::Scalar(v) => (vec![*v], false),
         Leaf::List(vs) => (vs.clone(), true),
     };
-    let seen_scalars = column.kind.is_some() && !column.list;
+    let seen_scalars = !column.kinds.is_empty() && !column.list;
     if (column.list && !list) || (seen_scalars && list) {
         return Err(SchemaError::MixedArray {
             column: column.path.clone(),
@@ -204,23 +250,9 @@ fn observe<'a>(column: &mut Column<'a>, leaf: &Leaf<'a>) -> Result<(), SchemaErr
             column: column.path.clone(),
             types: vec![json_kind_name(value).to_owned()],
         })?;
-        column.kind = Some(match column.kind {
-            None => kind,
-            Some(seen) => seen.join(kind).ok_or_else(|| {
-                if list {
-                    SchemaError::MixedArray {
-                        column: column.path.clone(),
-                        types: vec![seen.inferred().to_string(), kind.inferred().to_string()],
-                    }
-                } else {
-                    SchemaError::TypeMismatch {
-                        column: column.path.clone(),
-                        frozen: seen.inferred(),
-                        offered: kind.inferred(),
-                    }
-                }
-            })?,
-        });
+        if !column.kinds.contains(&kind) {
+            column.kinds.push(kind);
+        }
     }
     Ok(())
 }
@@ -345,12 +377,7 @@ fn resolve_type(column: &Column<'_>, kind: Kind, target: Option<&DataType>) -> D
         Some(other) if !column.list => Some(other),
         _ => None,
     };
-    let values = || {
-        column.cells.iter().flatten().flat_map(|leaf| match leaf {
-            Leaf::Scalar(v) => vec![*v],
-            Leaf::List(vs) => vs.clone(),
-        })
-    };
+    let values = || column.values();
     let element = match (kind, scalar_target) {
         (Kind::Int, Some(t)) if is_integer_type(t) && values().all(|v| int_fits(v, t)) => t.clone(),
         (Kind::Int, Some(DataType::Float64)) if values().all(int_exact_in_f64) => DataType::Float64,
@@ -361,6 +388,12 @@ fn resolve_type(column: &Column<'_>, kind: Kind, target: Option<&DataType>) -> D
             t.clone()
         }
         (Kind::Str, Some(t @ DataType::Timestamp(_, _))) if values().all(parses_as_time) => {
+            t.clone()
+        }
+        (Kind::Int, Some(t @ DataType::Timestamp(_, _))) => t.clone(),
+        (Kind::Str, Some(t @ (DataType::Date32 | DataType::Date64)))
+            if values().all(parses_as_date) =>
+        {
             t.clone()
         }
         (kind, _) => kind.inferred(),
@@ -423,10 +456,37 @@ fn float_exact_in_f32(value: &Value) -> bool {
     value.as_f64().is_some_and(|v| (v as f32) as f64 == v)
 }
 
+/// A string as a point in time: RFC 3339 with an offset, or a naive
+/// `YYYY-MM-DDTHH:MM:SS[.fff]` read as UTC. `None` for anything else.
+fn parse_time(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|t| t.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+                .ok()
+                .map(|t| t.and_utc())
+        })
+}
+
+/// Whether `value` names a point in time: a time string, or an integral
+/// epoch count.
 fn parses_as_time(value: &Value) -> bool {
-    value
-        .as_str()
-        .is_some_and(|s| DateTime::parse_from_rfc3339(s).is_ok())
+    as_i128(value).is_some() || value.as_str().is_some_and(|s| parse_time(s).is_some())
+}
+
+/// A string as a calendar day, `YYYY-MM-DD`.
+fn parse_date(s: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+}
+
+fn parses_as_date(value: &Value) -> bool {
+    value.as_str().is_some_and(|s| parse_date(s).is_some())
+}
+
+/// Days since the Unix epoch for `date`.
+fn epoch_days(date: NaiveDate) -> i32 {
+    (date - NaiveDate::from_ymd_opt(1970, 1, 1).expect("the epoch is a date")).num_days() as i32
 }
 
 /// `column`'s values as an array of `data_type`, null where a row lacks
@@ -573,11 +633,34 @@ fn build_scalar_array(
                 .map(|v| v.and_then(Value::as_str))
                 .collect::<Vec<_>>(),
         )),
+        DataType::Date32 => Arc::new(Date32Array::from(
+            values
+                .iter()
+                .map(|v| (*v)?.as_str().and_then(parse_date).map(epoch_days))
+                .collect::<Vec<_>>(),
+        )),
+        DataType::Date64 => Arc::new(Date64Array::from(
+            values
+                .iter()
+                .map(|v| {
+                    (*v)?
+                        .as_str()
+                        .and_then(parse_date)
+                        .map(|d| i64::from(epoch_days(d)) * MILLIS_PER_DAY)
+                })
+                .collect::<Vec<_>>(),
+        )),
         DataType::Timestamp(unit, tz) => {
+            // A string is a point in time; an integral literal is already an
+            // epoch count in the column's unit.
             let stamps: Vec<Option<i64>> = values
                 .iter()
                 .map(|v| {
-                    let t = DateTime::parse_from_rfc3339((*v)?.as_str()?).ok()?;
+                    let v = (*v)?;
+                    if let Some(n) = as_i128(v) {
+                        return i64::try_from(n).ok();
+                    }
+                    let t = parse_time(v.as_str()?)?;
                     match unit {
                         TimeUnit::Second => Some(t.timestamp()),
                         TimeUnit::Millisecond => Some(t.timestamp_millis()),
@@ -762,6 +845,39 @@ mod tests {
             rows_to_batch(&[json!([1, 2])], &t),
             Err(SchemaError::InvalidRow { row: 0, .. })
         ));
+    }
+
+    #[test]
+    fn temporal_columns_take_the_literals_a_document_can_carry() {
+        let t = table(vec![
+            ("at", DataType::Timestamp(TimeUnit::Millisecond, None)),
+            ("day", DataType::Date32),
+        ]);
+        let batch = rows_to_batch(
+            &[
+                json!({"at": "2026-09-22T10:00:00", "day": "2026-09-22"}),
+                json!({"at": "2026-09-22T10:00:00Z", "day": "2026-09-23"}),
+                json!({"at": 1_790_000_000_000_i64}),
+            ],
+            &t,
+        )
+        .expect("map");
+        assert_eq!(
+            types(&batch)["at"],
+            DataType::Timestamp(TimeUnit::Millisecond, None)
+        );
+        assert_eq!(types(&batch)["day"], DataType::Date32);
+        let at = col(&batch, "at").as_primitive::<arrow_array::types::TimestampMillisecondType>();
+        assert_eq!(at.value(0), at.value(1), "a naive time reads as UTC");
+        assert_eq!(at.value(2), 1_790_000_000_000);
+        let day = col(&batch, "day").as_primitive::<arrow_array::types::Date32Type>();
+        assert_eq!(day.value(1) - day.value(0), 1);
+        assert!(col(&batch, "day").is_null(2));
+        resolve_batch(&batch, &t, "_id").expect("stored");
+        // A string that is not a time stays a string, so the resolver refuses it.
+        let bad = rows_to_batch(&[json!({"at": "yesterday"})], &t).expect("map");
+        assert_eq!(types(&bad)["at"], DataType::LargeUtf8);
+        assert!(resolve_batch(&bad, &t, "_id").is_err());
     }
 
     #[test]
