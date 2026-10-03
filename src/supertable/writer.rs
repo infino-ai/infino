@@ -183,7 +183,7 @@ use crate::{
         reader_cache::{
             DiskCacheStore, ReadIntent, SuperfileReaderCache, disk::mmap_readonly_bytes,
         },
-        schema::{FieldId, PhysicalSchema},
+        schema::{FieldId, LegacyNames, PhysicalSchema},
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
         utils::vector_split::split_vectors,
         wal::{
@@ -196,7 +196,6 @@ use crate::{
             },
         },
     },
-    utils::terms::make_key,
 };
 
 /// Multipart chunk size for large superfile uploads.
@@ -3073,8 +3072,12 @@ pub(in crate::supertable) fn build_term_contribution(
     }
     let mut writer = term_index::ContributionWriter::create_in_scratch(superfile_id, id_min)
         .map_err(|e| BuildError::Store(e.to_string()))?;
-    bridge_sync_to_async(write_superfile_terms(reader, &mut writer))
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+    bridge_sync_to_async(write_superfile_terms(
+        reader,
+        &options.legacy_names(),
+        &mut writer,
+    ))
+    .map_err(|e| BuildError::Store(e.to_string()))?;
     writer
         .finish()
         .map(Some)
@@ -3082,25 +3085,34 @@ pub(in crate::supertable) fn build_term_contribution(
 }
 
 /// Walk every text column of `reader`'s dictionary and append each term's
-/// index facts to `writer`. Columns are visited in name order and a
+/// index facts to `writer`, keyed by the column's id (`legacy` names the id
+/// of a column written before ids existed; a column the table does not
+/// have contributes nothing). Columns are visited in key order and a
 /// dictionary yields its terms sorted, so the contribution is in the
 /// ascending key order the merge requires. A superfile with no text index
 /// contributes no terms but is still listed by the index.
 #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 async fn write_superfile_terms(
     reader: &SuperfileReader,
+    legacy: &LegacyNames,
     writer: &mut term_index::ContributionWriter,
 ) -> Result<(), TermIndexError> {
     let Some(fts) = reader.fts() else {
         return Ok(());
     };
-    let mut columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
+    let mut columns: Vec<(Vec<u8>, String, FieldId)> = fts
+        .fts_columns_config()
+        .filter_map(|c| {
+            let id = legacy.resolve_stored(c.field_id, &c.name)?;
+            Some((id.term_key(""), c.name.clone(), id))
+        })
+        .collect();
     columns.sort();
     let fst_bytes = fts
         .dict_bytes_async()
         .await
         .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
-    for column in &columns {
+    for (_, column, column_id) in &columns {
         let mut after: Option<Vec<u8>> = None;
         loop {
             let chunk = fts
@@ -3126,7 +3138,7 @@ async fn write_superfile_terms(
                     ),
                     None => (0, f32::INFINITY, term_index::Location::None),
                 };
-                writer.push(&make_key(column, term), df, bound, location)?;
+                writer.push(&column_id.term_key(term), df, bound, location)?;
             }
             let done = chunk.len() < TERM_INDEX_BATCH_TERMS;
             after = chunk.into_iter().last().map(|(term, _)| term);
@@ -9810,7 +9822,8 @@ pub(in crate::supertable) async fn stamp_term_stats(
             // optimize call and their reads bleed into whatever runs next
             // (they surfaced as phantom user-data GETs in cold measurements
             // that began while a fill was still draining).
-            let bytes = term_stats::build(&entries, |entry| {
+            let legacy = old.options.legacy_names();
+            let bytes = term_stats::build(&entries, &legacy, |entry| {
                 let store = Arc::clone(&store);
                 let disk_cache = disk_cache.clone();
                 let opt_storage = opt_storage.clone();
@@ -9878,6 +9891,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                 disk_cache.as_ref(),
                 opt_storage.as_ref(),
                 &entries,
+                &old.options.legacy_names(),
             )
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -9904,6 +9918,7 @@ async fn collect_and_build_term_index(
     disk_cache: Option<&Arc<DiskCacheStore>>,
     opt_storage: Option<&Arc<dyn StorageProvider>>,
     entries: &[Arc<SuperfileEntry>],
+    legacy: &LegacyNames,
 ) -> Result<term_index::Built, TermIndexError> {
     let scratch = tempfile::Builder::new()
         .prefix("infino-term-index-")
@@ -9918,7 +9933,7 @@ async fn collect_and_build_term_index(
             entry.superfile_id,
             entry.id_min,
         )?;
-        write_superfile_terms(&reader, &mut writer).await?;
+        write_superfile_terms(&reader, legacy, &mut writer).await?;
         contributions.push(writer.finish()?);
         drop(reader);
     }
