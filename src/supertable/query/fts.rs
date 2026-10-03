@@ -830,32 +830,33 @@ impl SupertableReader {
         }
         all_terms.sort_unstable();
         all_terms.dedup();
-        let ceilings: Option<HashMap<Uuid, f32>> = match (&term_index, bm25_params) {
-            (Some(index), None) => {
-                let terms: Vec<&str> = musts
-                    .iter()
-                    .chain(shoulds.iter())
-                    .map(String::as_str)
-                    .collect();
-                let phrases: Vec<Vec<&str>> = must_phrases
-                    .iter()
-                    .chain(should_phrases.iter())
-                    .map(|p| p.iter().map(String::as_str).collect())
-                    .collect();
-                let gidf = global_idf.clone();
-                let idf_used = move |term: &str, local: f32| {
-                    gidf.as_ref()
-                        .and_then(|m| m.get(term).copied())
-                        .unwrap_or(local)
-                };
-                index
-                    .query_ceilings(column, &terms, &phrases, &kept, &idf_used)
-                    .instrument(term_span.clone())
-                    .await
-                    .ok()
-            }
-            _ => None,
-        };
+        let ceilings: Option<HashMap<Uuid, f32>> =
+            match (&term_index, bm25_params, manifest.field_id(column)) {
+                (Some(index), None, Some(column_id)) => {
+                    let terms: Vec<&str> = musts
+                        .iter()
+                        .chain(shoulds.iter())
+                        .map(String::as_str)
+                        .collect();
+                    let phrases: Vec<Vec<&str>> = must_phrases
+                        .iter()
+                        .chain(should_phrases.iter())
+                        .map(|p| p.iter().map(String::as_str).collect())
+                        .collect();
+                    let gidf = global_idf.clone();
+                    let idf_used = move |term: &str, local: f32| {
+                        gidf.as_ref()
+                            .and_then(|m| m.get(term).copied())
+                            .unwrap_or(local)
+                    };
+                    index
+                        .query_ceilings(column, column_id, &terms, &phrases, &kept, &idf_used)
+                        .instrument(term_span.clone())
+                        .await
+                        .ok()
+                }
+                _ => None,
+            };
         if let Some(c) = &ceilings {
             let ceiling_of =
                 |e: &Arc<SuperfileEntry>| c.get(&e.superfile_id).copied().unwrap_or(f32::INFINITY);
@@ -2998,6 +2999,7 @@ mod tests {
     fn manifest_entry(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -5105,6 +5107,7 @@ mod tests {
         let id = Uuid::new_v4();
         // One large superfile, well above SUBRANGE_MIN_DOCS (50k).
         let big = Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,

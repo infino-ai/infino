@@ -57,6 +57,7 @@ use crate::{
     supertable::{
         manifest::{RoutingRef, SuperfileEntry, disk_cache::ManifestDiskCache, part::ContentHash},
         query::prune::PruneLeaf,
+        schema::FieldId,
     },
     utils::terms::make_key,
 };
@@ -470,6 +471,7 @@ impl TermIndex {
     pub(crate) async fn query_ceilings(
         &self,
         column: &str,
+        column_id: FieldId,
         terms: &[&str],
         phrases: &[Vec<&str>],
         entries: &[Arc<SuperfileEntry>],
@@ -480,7 +482,7 @@ impl TermIndex {
             .map(|e| {
                 let n = e
                     .fts_summary
-                    .get(column)
+                    .get(&column_id)
                     .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
                     .unwrap_or(e.n_docs);
                 (e.superfile_id, n)
@@ -1512,6 +1514,7 @@ mod tests {
         use crate::supertable::manifest::{SuperfileUri, VectorLayout};
 
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
@@ -1647,6 +1650,7 @@ mod tests {
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         let reader = st.reader().expect("reader");
+        let title = reader.manifest().field_id("title").expect("title id");
         let entries = reader.manifest().get_all_superfiles().to_vec();
         let ranges: Vec<(Uuid, i128, i128)> = entries
             .iter()
@@ -1666,7 +1670,7 @@ mod tests {
             .iter()
             .map(|e| {
                 e.fts_summary
-                    .get("title")
+                    .get(&title)
                     .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
                     .unwrap_or(e.n_docs)
             })
@@ -1703,7 +1707,9 @@ mod tests {
                     Bm25Stats::Global => global_idf[term],
                 };
                 let ceilings = rt
-                    .block_on(index.query_ceilings("title", terms, &phrases, &entries, &idf_used))
+                    .block_on(
+                        index.query_ceilings("title", title, terms, &phrases, &entries, &idf_used),
+                    )
                     .expect("ceilings");
                 let batches = reader
                     .bm25_search(
@@ -1753,6 +1759,7 @@ mod tests {
             .block_on(TermIndex::load(Arc::clone(&storage), None, &reference))
             .expect("load");
         let entry = Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: Uuid::from_u128(1),
@@ -1770,9 +1777,13 @@ mod tests {
         });
         let entries = vec![entry];
         let local = |_: &str, idf: f32| idf;
+        // A synthetic entry with no summary: any id for `title` reads the
+        // same, so the test's stable one is used.
+        let title = crate::test_helpers::fid("title");
         let ceilings = rt
             .block_on(index.query_ceilings(
                 "title",
+                title,
                 &[],
                 &[vec!["alpha", "shared"]],
                 &entries,
@@ -1781,7 +1792,7 @@ mod tests {
             .expect("ceilings");
         assert_eq!(ceilings[&Uuid::from_u128(1)], f32::INFINITY);
         let ceilings = rt
-            .block_on(index.query_ceilings("title", &["alpha"], &[], &entries, &local))
+            .block_on(index.query_ceilings("title", title, &["alpha"], &[], &entries, &local))
             .expect("ceilings");
         assert_eq!(ceilings[&Uuid::from_u128(1)], f32::INFINITY);
     }
@@ -2967,8 +2978,9 @@ mod tests {
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         let entries = manifest.get_all_superfiles();
+        let title = manifest.field_id("title").expect("title id");
         for e in entries {
-            let summary = e.fts_summary.get("title").expect("summary");
+            let summary = e.fts_summary.get(&title).expect("summary");
             assert!(
                 summary.term_bloom.is_none(),
                 "no per-superfile bloom is written"
@@ -2983,12 +2995,12 @@ mod tests {
             );
         }
         for part in manifest.get_all_list_entries() {
-            if let Some(agg) = part.fts_summary_agg.get("title") {
+            if let Some(agg) = part.fts_summary_agg.get(&title) {
                 assert!(agg.term_bloom.is_none(), "no per-part union bloom either");
             }
         }
         // The manifest-summary answer alone keeps everything (no information).
-        let all_kept = fts_bloom_skip(entries, "title", &["absent"], BoolMode::Or);
+        let all_kept = fts_bloom_skip(entries, title, &["absent"], BoolMode::Or);
         assert!(all_kept.iter().all(|k| *k));
         // The index makes it exact.
         let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3254,7 +3266,9 @@ mod tests {
             );
             for e in manifest.get_all_superfiles() {
                 assert!(
-                    e.fts_summary["title"].term_bloom.is_some(),
+                    e.fts_summary[&manifest.field_id("title").expect("title id")]
+                        .term_bloom
+                        .is_some(),
                     "old entries carry blooms"
                 );
             }

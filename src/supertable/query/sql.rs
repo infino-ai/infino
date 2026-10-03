@@ -415,9 +415,13 @@ impl SupertableReader {
             .create_physical_plan()
             .await
             .map_err(QueryError::DataFusion)?;
-        collect_plan_metered(&plan, task_ctx, op_stats)
+        let batches = collect_plan_metered(&plan, task_ctx, op_stats)
             .await
-            .map_err(QueryError::DataFusion)
+            .map_err(QueryError::DataFusion)?;
+        Ok(batches
+            .into_iter()
+            .map(crate::supertable::schema::strip_field_ids)
+            .collect())
     }
 
     /// Resolve a predicate to the matching `_id` values. Used by

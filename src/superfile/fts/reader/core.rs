@@ -59,6 +59,7 @@ use crate::{
         id_space::{DocMap, FtsDocId, RowId},
         lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
     },
+    supertable::schema::FieldId,
     utils::terms::{FstValue, TermDict, make_key},
 };
 
@@ -969,6 +970,7 @@ impl FtsReader {
             // then runs when the array is first read.
             let column = ColumnMeta {
                 name: col_cfg.name.clone(),
+                field_id: col_cfg.field_id.map(FieldId),
                 doc_lengths_range: doc_lengths_offset..array_end,
                 params,
                 positions: col_cfg.positions,

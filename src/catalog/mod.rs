@@ -1063,17 +1063,22 @@ impl Connection {
                 .instrument(detail_span!("sql.execute"))
                 .await
                 .map_err(|e| datafusion_error(&e))?;
-            if batches.is_empty() {
-                // An empty Vec carries no schema, so hand back one empty batch
-                // instead. Its schema comes from the physical plan, not the
-                // DataFrame: the scan types scalar strings as `Utf8View`, and
-                // `expand_views_at_output` undoes that during optimization,
-                // which the DataFrame's logical plan predates.
-                let output_schema: SchemaRef = plan.schema();
-                Ok(vec![RecordBatch::new_empty(output_schema)])
+            // An empty Vec carries no schema, so hand back one empty batch
+            // instead. Its schema comes from the physical plan, not the
+            // DataFrame: the scan types scalar strings as `Utf8View`, and
+            // `expand_views_at_output` undoes that during optimization,
+            // which the DataFrame's logical plan predates.
+            let batches = if batches.is_empty() {
+                vec![RecordBatch::new_empty(plan.schema())]
             } else {
-                Ok(batches)
-            }
+                batches
+            };
+            // Field ids are the engine's bookkeeping; a result carries the
+            // caller's columns.
+            Ok(batches
+                .into_iter()
+                .map(crate::supertable::schema::strip_field_ids)
+                .collect::<Vec<_>>())
         };
         // A query that names a `FROM` catalog table drives on that table's
         // runtime; otherwise the connection's own. The fallback still has to

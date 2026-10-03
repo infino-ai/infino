@@ -44,6 +44,7 @@ use crate::{
             part::{self, ContentHash, ManifestPart, PartId},
         },
         reader_cache::disk,
+        schema::{FieldId, LegacyNames},
     },
 };
 
@@ -138,7 +139,13 @@ fn encode_entries_with_mode(entries: &[Arc<SuperfileEntry>], mode: SummaryWireMo
 pub(crate) fn decode_entries(
     bytes: &[u8],
 ) -> Result<Vec<Arc<SuperfileEntry>>, SlowVectorStateError> {
-    let decoded = part::decode(bytes).map_err(|e| SlowVectorStateError::Parse(e.to_string()))?;
+    // A blob written before field ids keyed its vector summaries by column
+    // name; the hidden sibling has one vector column, whose id the user
+    // table's schema would resolve. Decoding with no names drops such a
+    // key, and the checkpoint is rebuilt from the user table on the next
+    // drain, so nothing is lost.
+    let decoded = part::decode(bytes, &LegacyNames::none())
+        .map_err(|e| SlowVectorStateError::Parse(e.to_string()))?;
     Ok(decoded.superfiles)
 }
 
@@ -276,7 +283,7 @@ pub(crate) fn compose_centroid_section(
                     continue;
                 }
                 let carried = previous
-                    .map(|section| section.read_cell(entry.superfile_id, column, cell.cell_id))
+                    .map(|section| section.read_cell(entry.superfile_id, *column, cell.cell_id))
                     .transpose()
                     .map_err(|e| {
                         SlowVectorStateError::Storage(format!("previous section read: {e}"))
@@ -323,7 +330,7 @@ pub(crate) fn section_len(entries: &[Arc<SuperfileEntry>]) -> usize {
 /// iteration both the section encoder and the consumer offset walk share.
 pub(crate) fn sorted_summaries(
     entry: &SuperfileEntry,
-) -> impl Iterator<Item = (&String, &VectorSummary)> {
+) -> impl Iterator<Item = (&FieldId, &VectorSummary)> {
     let mut summaries: Vec<_> = entry.vector_summary.iter().collect();
     summaries.sort_by(|a, b| a.0.cmp(b.0));
     summaries.into_iter()
@@ -345,7 +352,7 @@ struct SectionCell {
 pub(crate) struct CentroidSection {
     uri: String,
     spill: NamedTempFile,
-    cells: HashMap<(Uuid, String), Vec<SectionCell>>,
+    cells: HashMap<(Uuid, FieldId), Vec<SectionCell>>,
 }
 
 impl CentroidSection {
@@ -363,10 +370,10 @@ impl CentroidSection {
     pub(crate) fn read_cell_bytes(
         &self,
         superfile_id: Uuid,
-        column: &str,
+        column: FieldId,
         cell_id: Option<u32>,
     ) -> io::Result<Option<Vec<u8>>> {
-        let Some(cells) = self.cells.get(&(superfile_id, column.to_owned())) else {
+        let Some(cells) = self.cells.get(&(superfile_id, column)) else {
             return Ok(None);
         };
         let Some(cell) = cells.iter().find(|c| c.cell_id == cell_id) else {
@@ -385,7 +392,7 @@ impl CentroidSection {
     pub(crate) fn read_cell(
         &self,
         superfile_id: Uuid,
-        column: &str,
+        column: FieldId,
         cell_id: Option<u32>,
     ) -> io::Result<Option<Vec<f32>>> {
         Ok(self
@@ -445,7 +452,7 @@ pub(crate) async fn fetch_centroid_section(
         return Err(SlowVectorStateError::HashMismatch);
     }
 
-    let mut cells: HashMap<(Uuid, String), Vec<SectionCell>> = HashMap::new();
+    let mut cells: HashMap<(Uuid, FieldId), Vec<SectionCell>> = HashMap::new();
     let mut cursor = 0u64;
     for entry in entries {
         for (column, summary) in sorted_summaries(entry) {
@@ -459,7 +466,7 @@ pub(crate) async fn fetch_centroid_section(
                 });
                 cursor += cell.clusters.n_cent as u64 * cell.clusters.dim as u64 * 4;
             }
-            cells.insert((entry.superfile_id, column.clone()), list);
+            cells.insert((entry.superfile_id, *column), list);
         }
     }
     Ok(CentroidSection {
@@ -867,6 +874,7 @@ mod tests {
         storage::LocalFsStorageProvider,
         superfile::vector::{layout::VectorLayout, quant::BitQuantizer, rotation::RandomRotation},
         supertable::manifest::{CellVectorSummary, ClusterCentroids, SuperfileUri, VectorSummary},
+        test_helpers::fid,
     };
 
     /// Doc count for the first fixture entry; arbitrary but distinct from
@@ -878,6 +886,7 @@ mod tests {
     fn entry(n_docs: u64, cell: u32) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 3,
             superfile_id: id,
@@ -933,7 +942,7 @@ mod tests {
             ROUTING_FIXTURE_ROT_SEED,
         );
         e.vector_summary.insert(
-            "emb".into(),
+            fid("emb"),
             VectorSummary {
                 centroid: vec![0.5; ROUTING_FIXTURE_DIM],
                 cells: vec![CellVectorSummary {
@@ -1006,9 +1015,9 @@ mod tests {
             .await
             .expect("fetch section");
         for entry in &entries {
-            let cell = &entry.vector_summary["emb"].cells[0];
+            let cell = &entry.vector_summary[&fid("emb")].cells[0];
             let got = fetched
-                .read_cell(entry.superfile_id, "emb", cell.cell_id)
+                .read_cell(entry.superfile_id, fid("emb"), cell.cell_id)
                 .expect("spill read")
                 .expect("cell served");
             assert_eq!(got, cell.clusters.centroids, "fp32 must round-trip");
@@ -1016,7 +1025,7 @@ mod tests {
         // Unknown cells miss cleanly (caller falls back).
         assert!(
             fetched
-                .read_cell(entries[0].superfile_id, "emb", Some(999))
+                .read_cell(entries[0].superfile_id, fid("emb"), Some(999))
                 .expect("spill read")
                 .is_none()
         );
@@ -1152,7 +1161,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
         let entries = vec![entry_with_summary(FIRST_N_DOCS, 1)];
-        let expected_slab = entries[0].vector_summary["emb"].cells[0]
+        let expected_slab = entries[0].vector_summary[&fid("emb")].cells[0]
             .clusters
             .admit_codes_built()
             .expect("write-time slab")
@@ -1182,7 +1191,7 @@ mod tests {
             .expect("load blob");
         assert_eq!(loaded.len(), 1);
         assert_entries_match(&loaded[0], &entries[0]);
-        let clusters = &loaded[0].vector_summary["emb"].cells[0].clusters;
+        let clusters = &loaded[0].vector_summary[&fid("emb")].cells[0].clusters;
         assert!(
             !clusters.vectors_resident(),
             "state-blob entries land in the stripped shape"
@@ -1212,14 +1221,14 @@ mod tests {
             "checkpoint blob carries the visible entries"
         );
         assert!(
-            !state.entries[0].vector_summary["emb"].cells[0]
+            !state.entries[0].vector_summary[&fid("emb")].cells[0]
                 .clusters
                 .vectors_resident(),
             "visible checkpoint entries are stripped"
         );
         let pending_loaded = state.pending_drain.expect("pending state rides the blob");
         assert!(
-            pending_loaded.entries[0].vector_summary["emb"].cells[0]
+            pending_loaded.entries[0].vector_summary[&fid("emb")].cells[0]
                 .clusters
                 .vectors_resident(),
             "pending entries keep fp32 inline for drain resume"
@@ -1251,7 +1260,9 @@ mod tests {
         assert!(
             stripped
                 .iter()
-                .all(|e| !e.vector_summary["emb"].cells[0].clusters.vectors_resident()),
+                .all(|e| !e.vector_summary[&fid("emb")].cells[0]
+                    .clusters
+                    .vectors_resident()),
             "fixture must exercise the stripped path"
         );
         assert!(

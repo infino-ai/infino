@@ -183,6 +183,7 @@ use crate::{
         reader_cache::{
             DiskCacheStore, ReadIntent, SuperfileReaderCache, disk::mmap_readonly_bytes,
         },
+        schema::{FieldId, PhysicalSchema},
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
         utils::vector_split::split_vectors,
         wal::{
@@ -2415,7 +2416,7 @@ pub struct ShardOutput {
     /// aggregate kernels; types whose ordering isn't well-defined
     /// (FixedSizeList, struct, etc.) are absent and treated as
     /// "can't prune" by the skip planner.
-    scalar_stats: HashMap<String, ScalarStatsAgg>,
+    scalar_stats: HashMap<FieldId, ScalarStatsAgg>,
 }
 
 impl ShardOutput {
@@ -2424,7 +2425,7 @@ impl ShardOutput {
         n_docs: u64,
         id_min: i128,
         id_max: i128,
-        scalar_stats: HashMap<String, ScalarStatsAgg>,
+        scalar_stats: HashMap<FieldId, ScalarStatsAgg>,
     ) -> Self {
         Self {
             bytes,
@@ -2997,8 +2998,8 @@ impl PreparedSuperfile {
 pub(crate) fn build_fts_summary(
     reader: &SuperfileReader,
     options: &SupertableOptions,
-) -> HashMap<String, FtsSummaryAgg> {
-    let mut out: HashMap<String, FtsSummaryAgg> = HashMap::new();
+) -> HashMap<FieldId, FtsSummaryAgg> {
+    let mut out: HashMap<FieldId, FtsSummaryAgg> = HashMap::new();
     let Some(fts_reader) = reader.fts() else {
         return out;
     };
@@ -3029,8 +3030,11 @@ pub(crate) fn build_fts_summary(
         let length_stats = fts_reader
             .column_length_stats(&fc.column)
             .expect("column just registered in this superfile's FTS index");
+        let Some(id) = options.field_id(&fc.column) else {
+            continue;
+        };
         out.insert(
-            fc.column.clone(),
+            id,
             // A storage-backed table routes terms through the table-level
             // term index, which answers membership exactly for every
             // committed superfile (its postings publish in the same
@@ -3216,11 +3220,14 @@ pub(super) fn prepare_superfile_named(
 
     let fts_summary = build_fts_summary(&reader, &inner.options);
 
-    let mut vector_summary: HashMap<String, VectorSummary> = HashMap::new();
+    let mut vector_summary: HashMap<FieldId, VectorSummary> = HashMap::new();
     if let Some(vec_reader) = reader.vec() {
         for vc in &inner.options.vector_columns {
-            if let Some(summary) = build_column_vector_summary(vec_reader, vc) {
-                vector_summary.insert(vc.column.clone(), summary);
+            if let (Some(id), Some(summary)) = (
+                inner.options.field_id(&vc.column),
+                build_column_vector_summary(vec_reader, vc),
+            ) {
+                vector_summary.insert(id, summary);
             }
         }
     }
@@ -3250,6 +3257,7 @@ pub(super) fn prepare_superfile_named(
         superfile_id: uuid::Uuid::new_v4(),
         uri,
         stem: stem.map(str::to_owned),
+        physical_schema: Some(Arc::new(PhysicalSchema::of_reader(&reader))),
         n_docs: shard.n_docs,
         id_min: shard.id_min,
         id_max: shard.id_max,
@@ -3297,6 +3305,7 @@ fn finish_superfile_entry(
         superfile_id: old.superfile_id,
         uri: old.uri,
         stem: old.stem.clone(),
+        physical_schema: old.physical_schema.clone(),
         n_docs: old.n_docs,
         id_min: old.id_min,
         id_max: old.id_max,
@@ -5579,7 +5588,9 @@ fn cell_doc_counts_from_summary(
     superseded: Option<&BTreeSet<u32>>,
 ) -> Option<Vec<(u32, u32)>> {
     let column = vector_index_column(inner)?;
-    let summary = entry.vector_summary.get(&column)?;
+    let summary = entry
+        .vector_summary
+        .get(&inner.options.field_id(&column)?)?;
     if summary.cells.is_empty() {
         return None;
     }
@@ -6849,7 +6860,7 @@ fn build_shard_parquet_and_fts(
         i128,
         i128,
         u64,
-        HashMap<String, ScalarStatsAgg>,
+        HashMap<FieldId, ScalarStatsAgg>,
     ),
     BuildError,
 > {
@@ -11629,6 +11640,7 @@ mod tests {
         let uuid = Uuid::from_u128(UPLOAD_TEST_UUID_BASE + u128::from(shard_id));
         let uri = SuperfileUri(uuid);
         let entry = Arc::new(SuperfileEntry {
+            physical_schema: None,
             birth_version: 0,
             superfile_id: uuid,
             uri,
@@ -11659,6 +11671,7 @@ mod tests {
 
     fn fp_entry(id: u128) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             birth_version: 0,
             superfile_id: Uuid::from_u128(id),
             uri: SuperfileUri(Uuid::from_u128(id)),
@@ -13349,7 +13362,7 @@ mod tests {
         let seg = &r.manifest().superfiles[0];
         let fts = seg
             .fts_summary
-            .get("title")
+            .get(&r.manifest().field_id("title").expect("title id"))
             .expect("title FTS summary present");
 
         // Each doc's title is "doc <i> alpha"; tokenized with
@@ -13562,7 +13575,10 @@ mod tests {
         legacy.n_docs = 5;
         legacy.vector_summary.clear();
         legacy.vector_summary.insert(
-            column,
+            inner
+                .options
+                .field_id(&column)
+                .expect("hidden index column id"),
             VectorSummary {
                 centroid: vec![0.0; 16],
                 cells: vec![CellVectorSummary {
@@ -13607,7 +13623,7 @@ mod tests {
         let seg = &r.manifest().superfiles[0];
         let vs = seg
             .vector_summary
-            .get("emb")
+            .get(&r.manifest().field_id("emb").expect("emb id"))
             .expect("emb vector summary present");
         assert_eq!(vs.centroid.len(), dim);
         // Per-cluster centroids are staged into the manifest for
@@ -14142,11 +14158,16 @@ supertable:
         let rewritten = manifest
             .get_all_superfiles()
             .iter()
-            .find(|sf| sf.fts_summary["title"].length_stats.map(|s| s.total_tokens) == Some(3))
+            .find(|sf| {
+                sf.fts_summary[&manifest.field_id("title").expect("title")]
+                    .length_stats
+                    .map(|s| s.total_tokens)
+                    == Some(3)
+            })
             .cloned()
             .expect("the update's superfile carries its own totals");
         assert_eq!(
-            rewritten.fts_summary["title"].length_stats,
+            rewritten.fts_summary[&manifest.field_id("title").expect("title")].length_stats,
             Some(ColumnLengthStats {
                 total_tokens: 3,
                 n_scored_docs: 1,

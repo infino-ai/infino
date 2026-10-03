@@ -3,8 +3,8 @@
 
 //! In-memory manifest types: `ManifestSnapshot`, `SuperfileEntry`,
 //! `VectorSummary`. Per-column skip stats live on `SuperfileEntry` as
-//! `HashMap<String, ScalarStatsAgg>` (scalar) and
-//! `HashMap<String, FtsSummaryAgg>` (FTS).
+//! `HashMap<FieldId, ScalarStatsAgg>` (scalar) and
+//! `HashMap<FieldId, FtsSummaryAgg>` (FTS).
 //!
 //! `ManifestSnapshot` is the single immutable point-in-time view of which
 //! superfiles exist. `Supertable` holds the current manifest behind
@@ -70,7 +70,6 @@ use crate::{
     runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
     superfile::{
-        builder::VectorConfig,
         fts::reader::ColumnLengthStats,
         vector::{
             distance::{
@@ -101,6 +100,7 @@ use crate::{
             partition::{assign_partition, encode_partition_key},
         },
         query::{hierarchical_iter, prune::PruneLeaf},
+        schema::{FieldId, LegacyNames, PhysicalSchema},
         slow_vector_state,
     },
     utils::trace::record,
@@ -270,16 +270,23 @@ impl SuperfileList {
     /// every superfile's summary. `None` while any superfile's summary
     /// predates the totals: a partial sum would describe some other
     /// corpus, so the caller falls back rather than mixing.
+    /// The stable id of `column` in this snapshot's table, or `None` for a
+    /// name the table does not have (callers treat that as "no stats").
+    pub(crate) fn field_id(&self, column: &str) -> Option<FieldId> {
+        self.options.field_id(column)
+    }
+
     pub fn fts_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
-        Self::fts_length_stats_over(self.superfiles.iter(), column)
+        let id = self.field_id(column)?;
+        Self::fts_length_stats_over(self.superfiles.iter(), id)
     }
 
     fn fts_length_stats_over<'a>(
         superfiles: impl Iterator<Item = &'a Arc<SuperfileEntry>>,
-        column: &str,
+        column: FieldId,
     ) -> Option<ColumnLengthStats> {
         superfiles
-            .filter_map(|sf| sf.fts_summary.get(column))
+            .filter_map(|sf| sf.fts_summary.get(&column))
             .try_fold(ColumnLengthStats::default(), |acc, summary| {
                 ColumnLengthStats::fold(Some(acc), summary.length_stats)
             })
@@ -296,15 +303,18 @@ impl SuperfileList {
             .iter()
             .filter(|sf| !replaces.contains(&sf.superfile_id))
             .collect();
-        let columns: BTreeSet<&str> = kept
+        let columns: BTreeSet<FieldId> = kept
             .iter()
-            .flat_map(|sf| sf.fts_summary.keys().map(String::as_str))
+            .flat_map(|sf| sf.fts_summary.keys().copied())
             .collect();
         columns
             .into_iter()
-            .filter_map(|c| {
-                let stats = Self::fts_length_stats_over(kept.iter().copied(), c)?;
-                Some((c.to_owned(), stats))
+            .filter_map(|id| {
+                // The builder consumes corpus stats by column name; a column
+                // the table no longer has contributes nothing.
+                let name = self.options.table_schema.name_of(id)?;
+                let stats = Self::fts_length_stats_over(kept.iter().copied(), id)?;
+                Some((name.to_owned(), stats))
             })
             .collect()
     }
@@ -431,10 +441,12 @@ impl ManifestSnapshot {
             && let Some(list) = list
         {
             let manifest_cache = superfile_list.options.manifest_disk_cache.clone();
-            let loader = Arc::new(ManifestPartLoader::new_with_cache(
+            let loader = Arc::new(ManifestPartLoader::new_with_legacy_names(
                 Arc::clone(&storage),
                 &list,
                 manifest_cache,
+                false,
+                superfile_list.options.legacy_names(),
             ));
             Self {
                 superfile_list,
@@ -523,10 +535,12 @@ impl ManifestSnapshot {
             BTreeMap::new(),
         );
         let loader = options.storage.as_ref().map(|storage| {
-            Arc::new(ManifestPartLoader::new_with_cache(
+            Arc::new(ManifestPartLoader::new_with_legacy_names(
                 storage.clone(),
                 &list,
                 options.manifest_disk_cache.clone(),
+                false,
+                options.legacy_names(),
             ))
         });
         Self {
@@ -829,7 +843,6 @@ impl ManifestSnapshot {
             .await
             .map_err(ManifestLoadError::Storage)?;
         record("list_bytes", list_bytes.len() as u64);
-        let list = list::decode(&list_bytes).map_err(ManifestLoadError::ListParse)?;
 
         let options = if let Some(options) = options {
             options
@@ -841,6 +854,8 @@ impl ManifestSnapshot {
                 actual: "None options".to_string(),
             });
         };
+        let list = list::decode(&list_bytes, &options.legacy_names())
+            .map_err(ManifestLoadError::ListParse)?;
 
         // Verify the caller's options match the
         // manifest's stamped digest. The all-zero stored
@@ -859,11 +874,12 @@ impl ManifestSnapshot {
         //    loads each part's routing sibling (counts + 1-bit slab, no
         //    fp32) when the list stamps one — the user table's centroid
         //    payload stays in storage, mirroring the slow-blob sibling.
-        let loader = Arc::new(ManifestPartLoader::new_with_cache_and_mode(
+        let loader = Arc::new(ManifestPartLoader::new_with_legacy_names(
             Arc::clone(&storage),
             &list,
             options.manifest_disk_cache.clone(),
             options.summary_centroids_from_superfiles,
+            options.legacy_names(),
         ));
         let parts: DashMap<_, _> = DashMap::new();
         let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
@@ -1063,14 +1079,14 @@ impl ManifestSnapshot {
                 list.partition_strategy,
                 PartitionStrategy::VectorCell { .. }
             );
-            let vector_columns = options.vector_columns.clone();
+            let prewarm_options = Arc::clone(&options);
             let pool = Arc::clone(&options.reader_pool);
             let mut entries = all_superfiles;
             let prewarm = move || {
                 if strip {
-                    strip_summary_centroids(&mut entries, &vector_columns);
+                    strip_summary_centroids(&mut entries, &prewarm_options);
                 }
-                prewarm_summary_admit_slabs(&entries, &vector_columns, &pool);
+                prewarm_summary_admit_slabs(&entries, &prewarm_options, &pool);
                 entries
             };
             all_superfiles = match spawn_blocking(carry_span(prewarm)).await {
@@ -1212,7 +1228,7 @@ impl ManifestSnapshot {
                 // with no part pruner (`None`) imposes no constraint.
                 let mut kept: Option<HashSet<PartId>> = None;
                 for leaf in leaves {
-                    if let Some(part_ids) = leaf.keep_parts(list) {
+                    if let Some(part_ids) = leaf.keep_parts(list, &self.options) {
                         let set: HashSet<PartId> = part_ids.into_iter().collect();
                         kept = Some(match kept {
                             None => set,
@@ -2035,13 +2051,14 @@ impl ManifestSnapshot {
                         ),
                     });
                 }
-                let pk = assign_partition(e, &strategy)?;
+                let pk = assign_partition(e, &strategy, &opts)?;
                 let entry_birth_version = if preserve_birth_versions {
                     e.birth_version
                 } else {
                     birth_version
                 };
                 Ok(Arc::new(SuperfileEntry {
+                    physical_schema: None,
                     partition_key: encode_partition_key(&pk),
                     birth_version: entry_birth_version,
                     ..(**e).clone()
@@ -2341,10 +2358,12 @@ impl ManifestSnapshot {
             next_manifest_id_floor: self.superfile_list.next_manifest_id_floor,
         };
         let loader = opts.storage.as_ref().map(|storage| {
-            Arc::new(ManifestPartLoader::new_with_cache(
+            Arc::new(ManifestPartLoader::new_with_legacy_names(
                 storage.clone(),
                 &new_list,
                 opts.manifest_disk_cache.clone(),
+                false,
+                opts.legacy_names(),
             ))
         });
         // Inherit only the cached parts the new list still references —
@@ -2560,6 +2579,9 @@ pub struct ManifestPartLoader {
     /// the same reference reuses it; a commit that published a delta has a
     /// new root and loads that instead.
     term_index: tokio::sync::Mutex<Option<Arc<TermIndex>>>,
+    /// Resolves the column names a part written before field ids used as
+    /// summary keys.
+    legacy: Arc<LegacyNames>,
 }
 
 impl ManifestPartLoader {
@@ -2585,6 +2607,25 @@ impl ManifestPartLoader {
         manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
         prefer_routing: bool,
     ) -> Self {
+        Self::new_with_legacy_names(
+            storage,
+            list,
+            manifest_disk_cache,
+            prefer_routing,
+            LegacyNames::none(),
+        )
+    }
+
+    /// A loader that can also read parts written before field ids, whose
+    /// summary keys are column names `legacy` resolves. Every table with
+    /// user columns opens this way.
+    pub fn new_with_legacy_names(
+        storage: Arc<dyn StorageProvider>,
+        list: &Manifest,
+        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+        prefer_routing: bool,
+        legacy: LegacyNames,
+    ) -> Self {
         let mut idx = HashMap::with_capacity(list.parts.len());
         for entry in &list.parts {
             idx.insert(
@@ -2599,6 +2640,7 @@ impl ManifestPartLoader {
             prefer_routing,
             open_blob_budget: Arc::new(OpenBlobBudget::new(DEFAULT_OPEN_BLOB_BUDGET_BYTES)),
             term_index: tokio::sync::Mutex::new(None),
+            legacy: Arc::new(legacy),
         }
     }
 
@@ -2686,9 +2728,12 @@ impl ManifestPartLoader {
         {
             record("cache_hit", true);
             record("bytes", bytes.len() as u64);
-            let parsed =
-                decode_part_off_thread(Bytes::from(bytes), Arc::clone(&self.open_blob_budget))
-                    .await?;
+            let parsed = decode_part_off_thread(
+                Bytes::from(bytes),
+                Arc::clone(&self.open_blob_budget),
+                Arc::clone(&self.legacy),
+            )
+            .await?;
             return Ok(Arc::new(parsed));
         }
         record("cache_hit", false);
@@ -2707,6 +2752,7 @@ impl ManifestPartLoader {
             bytes.clone(),
             *expected_hash,
             Arc::clone(&self.open_blob_budget),
+            Arc::clone(&self.legacy),
         )
         .await?;
         // Populate the cache for next time (best-effort; the hash was
@@ -2727,7 +2773,7 @@ impl ManifestPartLoader {
 pub(crate) struct UserCentroidCache {
     pub(crate) manifest_id: u64,
     /// `(superfile_id, column)` → per-cell `(cell_id, fp32 centroids)`.
-    pub(crate) cells: HashMap<(Uuid, String), Vec<(Option<u32>, Arc<Vec<f32>>)>>,
+    pub(crate) cells: HashMap<(Uuid, FieldId), Vec<(Option<u32>, Arc<Vec<f32>>)>>,
 }
 
 impl UserCentroidCache {
@@ -2735,11 +2781,11 @@ impl UserCentroidCache {
     pub(crate) fn cell(
         &self,
         superfile_id: Uuid,
-        column: &str,
+        column: FieldId,
         cell_id: Option<u32>,
     ) -> Option<Arc<Vec<f32>>> {
         self.cells
-            .get(&(superfile_id, column.to_owned()))?
+            .get(&(superfile_id, column))?
             .iter()
             .find(|(id, _)| *id == cell_id)
             .map(|(_, fp32)| Arc::clone(fp32))
@@ -2748,13 +2794,11 @@ impl UserCentroidCache {
     /// Build from fully-loaded parts: every entry's summary cells that
     /// carry resident fp32.
     pub(crate) fn from_parts(manifest_id: u64, parts: &[Arc<ManifestPart>]) -> Self {
-        let mut cells: HashMap<(Uuid, String), Vec<(Option<u32>, Arc<Vec<f32>>)>> = HashMap::new();
+        let mut cells: HashMap<(Uuid, FieldId), Vec<(Option<u32>, Arc<Vec<f32>>)>> = HashMap::new();
         for part in parts {
             for entry in &part.superfiles {
                 for (column, summary) in &entry.vector_summary {
-                    let list = cells
-                        .entry((entry.superfile_id, column.clone()))
-                        .or_default();
+                    let list = cells.entry((entry.superfile_id, *column)).or_default();
                     for cell in &summary.cells {
                         if cell.clusters.vectors_resident() && cell.clusters.n_cent > 0 {
                             list.push((cell.cell_id, Arc::new(cell.clusters.centroids.clone())));
@@ -2780,9 +2824,10 @@ impl UserCentroidCache {
 async fn decode_part_off_thread(
     bytes: Bytes,
     budget: Arc<OpenBlobBudget>,
+    legacy: Arc<LegacyNames>,
 ) -> Result<ManifestPart, ManifestLoadError> {
     match spawn_blocking(carry_span(move || {
-        part::decode_with_blob_budget(&bytes, &budget)
+        part::decode_with_blob_budget(&bytes, &budget, &legacy)
     }))
     .await
     {
@@ -2808,6 +2853,7 @@ async fn verify_and_decode_part_off_thread(
     bytes: Bytes,
     expected_hash: ContentHash,
     budget: Arc<OpenBlobBudget>,
+    legacy: Arc<LegacyNames>,
 ) -> Result<ManifestPart, ManifestLoadError> {
     let verify_then_decode = move || {
         let actual_hash = ContentHash::of(&bytes);
@@ -2817,7 +2863,7 @@ async fn verify_and_decode_part_off_thread(
                 actual: actual_hash.to_hex(),
             });
         }
-        part::decode_with_blob_budget(&bytes, &budget).map_err(ManifestLoadError::from)
+        part::decode_with_blob_budget(&bytes, &budget, &legacy).map_err(ManifestLoadError::from)
     };
     match spawn_blocking(carry_span(verify_then_decode)).await {
         Ok(result) => result,
@@ -2919,6 +2965,11 @@ pub struct SuperfileEntry {
     /// key: the manifest is the one source of it, which is what keeps the
     /// writer's PUT key and GC's keep-set the same string.
     pub stem: Option<String>,
+    /// What the file physically holds (its stored columns with names, ids
+    /// and types), derived once when it was built. `None` on an entry
+    /// written before the field existed; such a file holds the creation
+    /// schema's columns under their creation names.
+    pub physical_schema: Option<Arc<PhysicalSchema>>,
     /// Row count.
     pub n_docs: u64,
     /// id-column min and max (the supertable-injected
@@ -2932,18 +2983,18 @@ pub struct SuperfileEntry {
     /// Per-scalar-column aggregate (min/max + null count, exact sum, HLL),
     /// keyed by column name, for skip pruning of SQL filters. An absent
     /// column means "no usable stats" (the pruner keeps the superfile).
-    pub scalar_stats: HashMap<String, ScalarStatsAgg>,
+    pub scalar_stats: HashMap<FieldId, ScalarStatsAgg>,
     /// Per-FTS-column term-presence bloom + lex range. The bloom
     /// drives exact-term skip; the term-range drives prefix-query
     /// skip via `[prefix, prefix_upper_bound)` overlap. Keyed by
     /// FTS column name. Same per-column [`FtsSummaryAgg`] shape the
     /// list-level aggregate uses; built per superfile via
     /// [`FtsSummaryAgg::from_superfile`].
-    pub fts_summary: HashMap<String, FtsSummaryAgg>,
+    pub fts_summary: HashMap<FieldId, FtsSummaryAgg>,
     /// Per-vector-column summary centroid + per-cluster IVF centroids,
     /// driving global cluster selection at query time. Keyed by vector
     /// column name.
-    pub vector_summary: HashMap<String, VectorSummary>,
+    pub vector_summary: HashMap<FieldId, VectorSummary>,
     /// Partition assignment, encoded opaquely per the strategy
     /// (time_range = 8-byte LE u64 bucket index; hash = 4-byte LE
     /// u32 bucket id; column_range = 2-byte LE u16 boundary index).
@@ -3703,19 +3754,20 @@ impl RabitqAdmitQuery {
 /// One shared rotation + sign quantizer per vector column, for
 /// hydration-time slab work over every summary instance.
 fn admit_encoders(
-    vector_columns: &[VectorConfig],
-) -> HashMap<&str, (RandomRotation, BitQuantizer, u64)> {
-    vector_columns
+    options: &SupertableOptions,
+) -> HashMap<FieldId, (RandomRotation, BitQuantizer, u64)> {
+    options
+        .vector_columns
         .iter()
-        .map(|vc| {
-            (
-                vc.column.as_str(),
+        .filter_map(|vc| {
+            Some((
+                options.field_id(&vc.column)?,
                 (
                     RandomRotation::new(vc.dim, vc.rot_seed),
                     BitQuantizer::new(vc.dim),
                     vc.rot_seed,
                 ),
-            )
+            ))
         })
         .collect()
 }
@@ -3727,11 +3779,8 @@ fn admit_encoders(
 /// previous snapshot or a loaded manifest part also references them) are
 /// skipped — they were either stripped by the earlier load or belong to
 /// maintenance state that needs fp32.
-fn strip_summary_centroids(
-    superfiles: &mut [Arc<SuperfileEntry>],
-    vector_columns: &[VectorConfig],
-) {
-    let encoders = admit_encoders(vector_columns);
+fn strip_summary_centroids(superfiles: &mut [Arc<SuperfileEntry>], options: &SupertableOptions) {
+    let encoders = admit_encoders(options);
     if encoders.is_empty() {
         return;
     }
@@ -3740,7 +3789,7 @@ fn strip_summary_centroids(
             continue;
         };
         for (column, summary) in entry.vector_summary.iter_mut() {
-            let Some((rotation, quant, rot_seed)) = encoders.get(column.as_str()) else {
+            let Some((rotation, quant, rot_seed)) = encoders.get(column) else {
                 continue;
             };
             for cell in &mut summary.cells {
@@ -3763,17 +3812,17 @@ fn strip_summary_centroids(
 /// or already-warm instances are `OnceLock` no-ops.
 fn prewarm_summary_admit_slabs(
     superfiles: &[Arc<SuperfileEntry>],
-    vector_columns: &[VectorConfig],
+    options: &SupertableOptions,
     pool: &ThreadPool,
 ) {
-    let encoders = admit_encoders(vector_columns);
+    let encoders = admit_encoders(options);
     if encoders.is_empty() {
         return;
     }
     pool.install(|| {
         superfiles.par_iter().for_each(|entry| {
             for (column, summary) in &entry.vector_summary {
-                let Some((rotation, quant, rot_seed)) = encoders.get(column.as_str()) else {
+                let Some((rotation, quant, rot_seed)) = encoders.get(column) else {
                     continue;
                 };
                 for cell in &summary.cells {
@@ -4338,11 +4387,14 @@ mod tests {
     use crate::{
         storage::LocalFsStorageProvider,
         superfile::{builder::FtsConfig, vector::distance::distance},
-        supertable::manifest::{
-            commit::{PartWriteResult, write_manifest_part},
-            list::{Manifest, PartitionStrategy},
+        supertable::{
+            manifest::{
+                commit::{PartWriteResult, write_manifest_part},
+                list::{Manifest, PartitionStrategy},
+            },
+            schema::LegacyNames,
         },
-        test_helpers::default_tokenizer,
+        test_helpers::{default_tokenizer, fid},
     };
 
     /// Deterministic synthetic fp32 centroids for cluster-scoring tests.
@@ -4715,6 +4767,7 @@ mod tests {
     fn superfile_entry_storage_path_carries_the_stem() {
         let uri = SuperfileUri::new_v4();
         let unnamed = SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
@@ -4733,6 +4786,7 @@ mod tests {
         assert_eq!(unnamed.storage_path(), uri.storage_path());
 
         let named = SuperfileEntry {
+            physical_schema: None,
             stem: Some("customers".into()),
             ..unnamed.clone()
         };
@@ -4939,6 +4993,7 @@ mod tests {
 
     fn seg_entry(uuid: Uuid, n_docs: u64) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: uuid,
@@ -5934,6 +5989,7 @@ mod tests {
     /// destined for `update()`, which derives and stamps the key itself.
     fn make_entry(docs: u64, pk: Vec<u8>, hint: Option<u32>) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: uuid::Uuid::new_v4(),
@@ -6458,7 +6514,7 @@ mod tests {
             ROUTING_TEST_ROT_SEED,
         );
         entry.vector_summary.insert(
-            "emb".into(),
+            fid("emb"),
             VectorSummary {
                 centroid: vec![0.5; ROUTING_TEST_DIM],
                 cells: vec![CellVectorSummary {
@@ -6500,7 +6556,7 @@ mod tests {
             m.superfiles
                 .iter()
                 .map(|e| {
-                    let clusters = &e.vector_summary["emb"].cells[0].clusters;
+                    let clusters = &e.vector_summary[&fid("emb")].cells[0].clusters;
                     assert!(clusters.admit_codes_built().is_some(), "slab always rides");
                     clusters.vectors_resident()
                 })
@@ -6638,7 +6694,7 @@ mod tests {
             m.superfiles
                 .iter()
                 .map(|e| {
-                    let clusters = &e.vector_summary["emb"].cells[0].clusters;
+                    let clusters = &e.vector_summary[&fid("emb")].cells[0].clusters;
                     (
                         clusters.vectors_resident(),
                         clusters.admit_codes_built().is_some(),
@@ -9230,6 +9286,7 @@ mod tests {
     async fn decode_part_off_thread_roundtrips_and_rejects_garbage() {
         let id = Uuid::new_v4();
         let seg = Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -9252,10 +9309,13 @@ mod tests {
         };
         let bytes = part::encode(&part);
 
-        let decoded =
-            decode_part_off_thread(Bytes::from(bytes), Arc::new(OpenBlobBudget::unlimited()))
-                .await
-                .expect("valid part decodes off-thread");
+        let decoded = decode_part_off_thread(
+            Bytes::from(bytes),
+            Arc::new(OpenBlobBudget::unlimited()),
+            Arc::new(LegacyNames::none()),
+        )
+        .await
+        .expect("valid part decodes off-thread");
         assert_eq!(decoded.part_id, part.part_id, "part_id round-trips");
         assert_eq!(decoded.superfiles.len(), 1);
         assert_eq!(decoded.superfiles[0].superfile_id, id);
@@ -9266,6 +9326,7 @@ mod tests {
         let err = decode_part_off_thread(
             Bytes::from_static(b"not-a-valid-part-blob"),
             Arc::new(OpenBlobBudget::unlimited()),
+            Arc::new(LegacyNames::none()),
         )
         .await
         .expect_err("garbage bytes must fail to decode");

@@ -68,9 +68,10 @@ use uuid::Uuid;
 
 use crate::supertable::{
     error::QueryError,
-    manifest::{SuperfileEntry, add_sum_arrays, list::ScalarValueCounts},
+    manifest::{ManifestSnapshot, SuperfileEntry, add_sum_arrays, list::ScalarValueCounts},
     options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
     query::provider::SupertableProvider,
+    schema::FieldId,
 };
 
 /// The covered/residual aggregate rewrite. Registered on the
@@ -163,16 +164,16 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         let Some(superfiles) = provider.manifest().complete_flat_superfiles() else {
             return Ok(None);
         };
-        if !superfiles
-            .iter()
-            .all(|entry| provider.entry_is_clean(entry) && has_required_stats(entry, &kinds))
-        {
+        let manifest = provider.manifest();
+        if !superfiles.iter().all(|entry| {
+            provider.entry_is_clean(entry) && has_required_stats(manifest, entry, &kinds)
+        }) {
             return Ok(None);
         }
         let covered: Vec<&Arc<SuperfileEntry>> = superfiles.iter().collect();
         let mut partials = Vec::with_capacity(kinds.len());
         for kind in &kinds {
-            let Some(partial) = accumulate_partial(kind, &covered) else {
+            let Some(partial) = accumulate_partial(manifest, kind, &covered) else {
                 return Ok(None);
             };
             partials.push(partial);
@@ -246,11 +247,11 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     let mut covered: Vec<&Arc<SuperfileEntry>> = Vec::new();
     let mut boundary: HashSet<Uuid> = HashSet::new();
     for entry in superfiles {
-        let class = classify(entry, id_column, &range);
+        let class = classify(manifest, entry, id_column, &range);
         match class {
             Class::Disjoint => {}
             Class::Covered => {
-                if provider.entry_is_clean(entry) && has_required_stats(entry, &kinds) {
+                if provider.entry_is_clean(entry) && has_required_stats(manifest, entry, &kinds) {
                     covered.push(entry);
                 } else {
                     boundary.insert(entry.superfile_id);
@@ -270,7 +271,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     // Accumulate the covered partials per aggregate output.
     let mut partials: Vec<Partial> = Vec::with_capacity(kinds.len());
     for kind in &kinds {
-        match accumulate_partial(kind, &covered) {
+        match accumulate_partial(manifest, kind, &covered) {
             Some(partial) => partials.push(partial),
             // A fold failure (overflow, type surprise) is always safe
             // to decline.
@@ -408,9 +409,10 @@ fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Op
     };
     if !superfiles.iter().all(|entry| {
         provider.entry_is_clean(entry)
-            && entry
-                .scalar_stats
-                .get(&group_column.name)
+            && provider
+                .manifest()
+                .field_id(&group_column.name)
+                .and_then(|id| entry.scalar_stats.get(&id))
                 .is_some_and(|stats| stats.null_count == Some(0))
     }) {
         return Ok(None);
@@ -482,7 +484,11 @@ enum Partial {
 
 /// Fold one aggregate's covered contribution from manifest stats.
 /// `None` = decline the rewrite (overflow / unexpected shape).
-fn accumulate_partial(kind: &AggKind, covered: &[&Arc<SuperfileEntry>]) -> Option<Partial> {
+fn accumulate_partial(
+    manifest: &ManifestSnapshot,
+    kind: &AggKind,
+    covered: &[&Arc<SuperfileEntry>],
+) -> Option<Partial> {
     match kind {
         AggKind::CountStar => {
             let mut total: i64 = 0;
@@ -491,20 +497,21 @@ fn accumulate_partial(kind: &AggKind, covered: &[&Arc<SuperfileEntry>]) -> Optio
             }
             Some(Partial::Count(total))
         }
-        AggKind::Sum(col) => Some(Partial::Sum(fold_sums(covered, col)?)),
+        AggKind::Sum(col) => Some(Partial::Sum(fold_sums(covered, manifest.field_id(col)?)?)),
         AggKind::Min(col) => {
-            let (min, _) = fold_bounds(covered, col)?;
+            let (min, _) = fold_bounds(covered, manifest.field_id(col)?)?;
             Some(Partial::Bound(min))
         }
         AggKind::Max(col) => {
-            let (_, max) = fold_bounds(covered, col)?;
+            let (_, max) = fold_bounds(covered, manifest.field_id(col)?)?;
             Some(Partial::Bound(max))
         }
         AggKind::Avg(col) => {
+            let col = manifest.field_id(col)?;
             let sum = fold_sums(covered, col)?;
             let mut count: i64 = 0;
             for entry in covered {
-                let nulls = entry.scalar_stats.get(col)?.null_count?;
+                let nulls = entry.scalar_stats.get(&col)?.null_count?;
                 let non_null = entry.n_docs.checked_sub(nulls)?;
                 count = count.checked_add(i64::try_from(non_null).ok()?)?;
             }
@@ -518,10 +525,10 @@ fn accumulate_partial(kind: &AggKind, covered: &[&Arc<SuperfileEntry>]) -> Optio
     }
 }
 
-fn fold_sums(covered: &[&Arc<SuperfileEntry>], col: &str) -> Option<ScalarValue> {
+fn fold_sums(covered: &[&Arc<SuperfileEntry>], col: FieldId) -> Option<ScalarValue> {
     let mut acc: Option<ArrayRef> = None;
     for entry in covered {
-        let part = entry.scalar_stats.get(col)?.sum.as_ref()?;
+        let part = entry.scalar_stats.get(&col)?.sum.as_ref()?;
         acc = Some(match acc {
             None => Arc::clone(part),
             Some(total) => add_sum_arrays(&total, part)?,
@@ -530,10 +537,13 @@ fn fold_sums(covered: &[&Arc<SuperfileEntry>], col: &str) -> Option<ScalarValue>
     ScalarValue::try_from_array(&acc?, 0).ok()
 }
 
-fn fold_bounds(covered: &[&Arc<SuperfileEntry>], col: &str) -> Option<(ScalarValue, ScalarValue)> {
+fn fold_bounds(
+    covered: &[&Arc<SuperfileEntry>],
+    col: FieldId,
+) -> Option<(ScalarValue, ScalarValue)> {
     let mut acc: Option<(ScalarValue, ScalarValue)> = None;
     for entry in covered {
-        let agg = entry.scalar_stats.get(col)?;
+        let agg = entry.scalar_stats.get(&col)?;
         let min = ScalarValue::try_from_array(&agg.min, 0).ok()?;
         let max = ScalarValue::try_from_array(&agg.max, 0).ok()?;
         if min.is_null() || max.is_null() {
@@ -776,18 +786,26 @@ fn collect_range_leaves(expr: &Expr, out: &mut Vec<(String, Operator, ScalarValu
 
 /// Classify one segment's `[seg_min, seg_max]` for `range.column`
 /// against the range. Missing bounds → `Boundary` (conservative).
-fn classify(entry: &SuperfileEntry, id_column: &str, range: &RangeFilter) -> Class {
+fn classify(
+    manifest: &ManifestSnapshot,
+    entry: &SuperfileEntry,
+    id_column: &str,
+    range: &RangeFilter,
+) -> Class {
     let bounds = if range.column == id_column {
         Some((
             ScalarValue::Decimal128(Some(entry.id_min), DECIMAL128_PRECISION, DECIMAL128_SCALE),
             ScalarValue::Decimal128(Some(entry.id_max), DECIMAL128_PRECISION, DECIMAL128_SCALE),
         ))
     } else {
-        entry.scalar_stats.get(&range.column).and_then(|agg| {
-            let mn = ScalarValue::try_from_array(&agg.min, 0).ok()?;
-            let mx = ScalarValue::try_from_array(&agg.max, 0).ok()?;
-            (!mn.is_null() && !mx.is_null()).then_some((mn, mx))
-        })
+        manifest
+            .field_id(&range.column)
+            .and_then(|id| entry.scalar_stats.get(&id))
+            .and_then(|agg| {
+                let mn = ScalarValue::try_from_array(&agg.min, 0).ok()?;
+                let mx = ScalarValue::try_from_array(&agg.max, 0).ok()?;
+                (!mn.is_null() && !mx.is_null()).then_some((mn, mx))
+            })
     };
     let Some((seg_min, seg_max)) = bounds else {
         return Class::Boundary;
@@ -841,15 +859,21 @@ fn classify(entry: &SuperfileEntry, id_column: &str, range: &RangeFilter) -> Cla
 
 /// Do the manifest stats cover everything `kinds` needs from a
 /// covered segment?
-fn has_required_stats(entry: &SuperfileEntry, kinds: &[AggKind]) -> bool {
+fn has_required_stats(
+    manifest: &ManifestSnapshot,
+    entry: &SuperfileEntry,
+    kinds: &[AggKind],
+) -> bool {
+    let stats = |col: &str| {
+        manifest
+            .field_id(col)
+            .and_then(|id| entry.scalar_stats.get(&id))
+    };
     kinds.iter().all(|kind| match kind {
         AggKind::CountStar => true,
-        AggKind::Sum(col) => entry.scalar_stats.get(col).is_some_and(|a| a.sum.is_some()),
-        AggKind::Min(col) | AggKind::Max(col) => entry.scalar_stats.contains_key(col),
-        AggKind::Avg(col) => entry
-            .scalar_stats
-            .get(col)
-            .is_some_and(|a| a.sum.is_some() && a.null_count.is_some()),
+        AggKind::Sum(col) => stats(col).is_some_and(|a| a.sum.is_some()),
+        AggKind::Min(col) | AggKind::Max(col) => stats(col).is_some(),
+        AggKind::Avg(col) => stats(col).is_some_and(|a| a.sum.is_some() && a.null_count.is_some()),
     })
 }
 
@@ -872,6 +896,7 @@ mod tests {
             superfile::vector::layout::VectorLayout, supertable::manifest::SuperfileEntry,
         };
         let entry = SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: uuid::Uuid::new_v4(),
@@ -898,17 +923,26 @@ mod tests {
             lo,
             hi,
         };
+        let manifest = ManifestSnapshot::empty(Arc::new(
+            crate::supertable::options::SupertableOptions::new(
+                Arc::new(arrow_schema::Schema::empty()),
+                vec![],
+                vec![],
+            )
+            .expect("options"),
+        ));
 
         assert!(matches!(
-            classify(&entry, "_id", &rf(Some(bound(25, true)), None)),
+            classify(&manifest, &entry, "_id", &rf(Some(bound(25, true)), None)),
             Class::Disjoint
         ));
         assert!(matches!(
-            classify(&entry, "_id", &rf(None, Some(bound(5, true)))),
+            classify(&manifest, &entry, "_id", &rf(None, Some(bound(5, true)))),
             Class::Disjoint
         ));
         assert!(matches!(
             classify(
+                &manifest,
                 &entry,
                 "_id",
                 &rf(Some(bound(0, true)), Some(bound(30, true)))
@@ -916,12 +950,13 @@ mod tests {
             Class::Covered
         ));
         assert!(matches!(
-            classify(&entry, "_id", &rf(Some(bound(15, true)), None)),
+            classify(&manifest, &entry, "_id", &rf(Some(bound(15, true)), None)),
             Class::Boundary
         ));
         // Unknown column with no scalar stats → boundary (can't prune).
         assert!(matches!(
             classify(
+                &manifest,
                 &entry,
                 "_id",
                 &RangeFilter {
