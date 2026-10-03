@@ -77,6 +77,8 @@ fn patch(fields: Vec<FieldPatch>) -> SchemaPatch {
     SchemaPatch {
         fields,
         max_fields: None,
+        max_depth: None,
+        templates: None,
     }
 }
 
@@ -330,6 +332,8 @@ fn the_read_document_applies_as_a_no_op_and_the_expected_id_guards_the_write() {
     let one = SchemaPatch {
         fields: vec![SchemaPatch::from(&doc).fields.remove(1)],
         max_fields: None,
+        max_depth: None,
+        templates: None,
     };
     assert_eq!(db.apply_schema(TABLE, &one, None).expect("subset"), doc);
 
@@ -358,6 +362,8 @@ fn the_read_document_applies_as_a_no_op_and_the_expected_id_guards_the_write() {
             &SchemaPatch {
                 fields: vec![],
                 max_fields: Some(3),
+                max_depth: None,
+                templates: None,
             },
             None,
         )
@@ -387,6 +393,8 @@ fn the_schema_write_creates_an_absent_table_and_create_table_refuses_a_present_o
                     add("score", DataType::Int64),
                 ],
                 max_fields: Some(50),
+                max_depth: None,
+                templates: None,
             },
             None,
         )

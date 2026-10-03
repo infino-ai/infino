@@ -35,3 +35,9 @@ connect_with	covered	(impl AsRef<str>, ConnectOptions) -> Result<Connection, Inf
 Connection::update_storage_credentials	exempt	Rotates an object-store credential in place; Rust-embedder API, not part of the language-binding operation surface
 Supertable::tokenize	exempt	How the index reads a text; Rust-embedder API for a caller judging its own texts against a column's terms, not a data operation the bindings wrap.
 Connection::apply_schema	exempt	the bindings fold the write into the `schema(name, patch, expected_schema_id)` overload; a second method would be a parallel API
+Supertable::append_rows	exempt	the bindings' append(rows) routes record input through it; their public shape is the one append
+
+Supertable::append_rows_named	exempt	the bindings' append_named(rows, source) routes record input through it; one public method per binding
+
+Supertable::update_rows	exempt	the bindings' update(predicate, rows) routes record input through it; their public shape is the one update
+

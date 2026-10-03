@@ -29,7 +29,7 @@ use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyList;
 
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
@@ -848,19 +848,21 @@ struct Table {
 #[pymethods]
 impl Table {
     /// Append data. Accepts a pyarrow `RecordBatch` or `Table`, a pandas
-    /// `DataFrame`, or a `list[dict]` (coerced to Arrow with the table's
-    /// declared schema). Durable when this returns — one `append` == one
-    /// commit == one sealed superfile, so batch rows per call.
+    /// `DataFrame`, or a `list[dict]`. Rows and frames go to the engine as
+    /// JSON documents: nested dicts flatten to dot paths, lists become list
+    /// columns, a key the table has not seen adds a column typed from its
+    /// values, and a value whose type disagrees with the column's is
+    /// refused. Durable when this returns — one `append` == one commit ==
+    /// one sealed superfile, so batch rows per call.
     fn append(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let declared = self.inner.schema();
-        let py_schema = declared.as_ref().to_pyarrow(py)?;
-        match coerce_to_record_batch(py, data, &py_schema)? {
+        match append_input(py, data)? {
             // Append commits a superfile to storage — release the GIL. The
             // engine brings the batch to the table's shape: a column it does
             // not have joins the schema, an absent nullable one is null-filled.
-            Some(batch) => py.detach(|| self.inner.append(&batch)).map_err(py_err),
+            AppendInput::Batch(batch) => py.detach(|| self.inner.append(&batch)).map_err(py_err),
+            AppendInput::Rows(rows) => py.detach(|| self.inner.append_rows(&rows)).map_err(py_err),
             // Empty input — nothing to append (no empty commit).
-            None => Ok(()),
+            AppendInput::Empty => Ok(()),
         }
     }
 
@@ -876,13 +878,14 @@ impl Table {
         data: &Bound<'_, PyAny>,
         source_name: &str,
     ) -> PyResult<()> {
-        let declared = self.inner.schema();
-        let py_schema = declared.as_ref().to_pyarrow(py)?;
-        match coerce_to_record_batch(py, data, &py_schema)? {
-            Some(batch) => py
+        match append_input(py, data)? {
+            AppendInput::Batch(batch) => py
                 .detach(|| self.inner.append_named(&batch, source_name))
                 .map_err(py_err),
-            None => Ok(()),
+            AppendInput::Rows(rows) => py
+                .detach(|| self.inner.append_rows_named(&rows, source_name))
+                .map_err(py_err),
+            AppendInput::Empty => Ok(()),
         }
     }
 
@@ -1245,18 +1248,18 @@ impl Table {
         predicate: &str,
         new_rows: &Bound<'_, PyAny>,
     ) -> PyResult<MutationStats> {
-        let declared = self.inner.schema();
-        let py_schema = declared.as_ref().to_pyarrow(py)?;
-        // Pass an empty batch through rather than short-circuiting like
+        // Empty input goes through rather than short-circuiting like
         // `append` does — we want the engine's cardinality check to run.
-        let rows = match coerce_to_record_batch(py, new_rows, &py_schema)? {
-            Some(batch) => batch,
-            None => RecordBatch::new_empty(declared),
-        };
+        let input = append_input(py, new_rows)?;
         // Parse and mutate both off the GIL — neither touches Python.
         let stats = py.detach(|| {
             let expr = self.parse_predicate(predicate)?;
-            self.inner.update(expr, &rows).map_err(py_err)
+            match input {
+                AppendInput::Batch(batch) => self.inner.update(expr, &batch),
+                AppendInput::Rows(rows) => self.inner.update_rows(expr, &rows),
+                AppendInput::Empty => self.inner.update_rows(expr, &[]),
+            }
+            .map_err(py_err)
         })?;
         Ok(MutationStats::from_core(&stats))
     }
@@ -1449,69 +1452,75 @@ fn parse_stats(stats: Option<&str>) -> PyResult<Bm25Stats> {
     }
 }
 
-/// Coerce append input — a pyarrow `RecordBatch` / `Table`, a pandas
-/// `DataFrame`, or a `list[dict]` — into a single `RecordBatch`. `schema`
-/// is the table's declared pyarrow `Schema`, used to type the `list` /
-/// `DataFrame` conversions so column types match. Returns `None` for
-/// empty input (so an empty append is a no-op, not an empty commit).
-fn coerce_to_record_batch(
-    py: Python<'_>,
-    data: &Bound<'_, PyAny>,
-    schema: &Bound<'_, PyAny>,
-) -> PyResult<Option<RecordBatch>> {
+/// What an append or update was given.
+enum AppendInput {
+    /// Arrow-typed input: a pyarrow `RecordBatch` or `Table`, as one batch.
+    Batch(RecordBatch),
+    /// Row input: a `list[dict]` or a pandas `DataFrame`, as JSON documents.
+    Rows(Vec<serde_json::Value>),
+    /// Nothing to write.
+    Empty,
+}
+
+/// Sort `data` into Arrow-typed or row input. Rows are serialised with
+/// Python's `json` module, so a Python `5` arrives as an integer literal
+/// and a `5.0` as a float literal, and the engine's number rule sees the
+/// literal the caller wrote.
+fn append_input(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<AppendInput> {
     let pa = py.import("pyarrow")?;
     let table_cls = pa.getattr("Table")?;
     let record_batch_cls = pa.getattr("RecordBatch")?;
 
-    // A single RecordBatch: convert directly.
     if data.is_instance(&record_batch_cls)? {
-        return Ok(Some(RecordBatch::from_pyarrow_bound(data)?));
+        let batch = RecordBatch::from_pyarrow_bound(data)?;
+        return Ok(if batch.num_rows() == 0 {
+            AppendInput::Empty
+        } else {
+            AppendInput::Batch(batch)
+        });
     }
-
-    // Normalize a Table / list[dict] / DataFrame to a pyarrow Table,
-    // typed by the table's own schema so column types line up.
-    let table = if data.is_instance(&table_cls)? {
+    if data.is_instance(&table_cls)? {
+        // Collapse the Table's chunks into a single RecordBatch — one append
+        // == one commit; chunk boundaries are a pyarrow detail.
+        let batches = data
+            .call_method0("combine_chunks")?
+            .call_method0("to_batches")?;
+        let batches = batches.cast::<PyList>()?;
+        let mut rust_batches = Vec::with_capacity(batches.len());
+        for batch in batches.iter() {
+            rust_batches.push(RecordBatch::from_pyarrow_bound(&batch)?);
+        }
+        return Ok(match rust_batches.len() {
+            0 => AppendInput::Empty,
+            1 => AppendInput::Batch(rust_batches.remove(0)),
+            _ => {
+                let merged_schema = rust_batches[0].schema();
+                AppendInput::Batch(
+                    concat_batches(&merged_schema, &rust_batches)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?,
+                )
+            }
+        });
+    }
+    // A list of dicts, or anything with `to_dict("records")` (a DataFrame).
+    let records = if data.is_instance_of::<PyList>() {
         data.clone()
-    } else if data.is_instance_of::<PyList>() {
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("schema", schema)?;
-        table_cls.call_method("from_pylist", (data,), Some(&kwargs))?
     } else {
-        // Assume a pandas DataFrame (or anything `from_pandas` accepts).
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("schema", schema)?;
-        kwargs.set_item("preserve_index", false)?;
-        table_cls.call_method("from_pandas", (data,), Some(&kwargs))?
+        data.call_method1("to_dict", ("records",))?
     };
-
-    // Collapse the Table's chunks into a single RecordBatch — one append
-    // is one commit / one sealed superfile.
-    let batches = table
-        .call_method0("combine_chunks")?
-        .call_method0("to_batches")?;
-    let batches = batches.cast::<PyList>()?;
-    if batches.is_empty() {
-        return Ok(None);
-    }
-    let mut rust_batches = Vec::with_capacity(batches.len());
-    for batch in batches.iter() {
-        rust_batches.push(RecordBatch::from_pyarrow_bound(&batch)?);
-    }
-    if rust_batches.len() == 1 {
-        Ok(rust_batches.into_iter().next())
+    let text: String = py
+        .import("json")?
+        .call_method1("dumps", (records,))?
+        .extract()?;
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&text).map_err(|e| PyValueError::new_err(format!("rows: {e}")))?;
+    Ok(if rows.is_empty() {
+        AppendInput::Empty
     } else {
-        let merged_schema = rust_batches[0].schema();
-        concat_batches(&merged_schema, &rust_batches)
-            .map(Some)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    }
+        AppendInput::Rows(rows)
+    })
 }
 
-// The compiled extension is `infino._infino`: the `python/infino/`
-// package re-exports it and carries the typing artifacts (`py.typed`,
-// stubs, `__version__`). Naming the module item `infino_ext` keeps it
-// from shadowing the `infino` crate inside this file; the init symbol is
-// `PyInit__infino`.
 #[pymodule]
 #[pyo3(name = "_infino")]
 fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {

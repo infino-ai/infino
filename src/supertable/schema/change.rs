@@ -16,8 +16,9 @@ use arrow_schema::DataType;
 use serde_json::{Map, Value};
 
 use super::{
-    ColumnIndex, FieldDef, FieldId, TableSchema,
+    ColumnIndex, FieldDef, FieldId, TableSchema, Template,
     error::SchemaError,
+    template_to_json, templates_from_json,
     types::{data_type_from_keys, type_keys},
 };
 
@@ -49,6 +50,10 @@ pub enum SchemaChange {
     SetNullable { id: FieldId },
     /// The field cap.
     SetMaxFields(u32),
+    /// The nesting cap for documents.
+    SetMaxDepth(u32),
+    /// The rules for columns documents add, replacing the current ones.
+    SetTemplates(Vec<Template>),
 }
 
 /// How a type change is executed.
@@ -129,6 +134,10 @@ pub struct SchemaPatch {
     pub fields: Vec<FieldPatch>,
     /// The field cap to set, when present.
     pub max_fields: Option<u32>,
+    /// The document nesting cap to set, when present.
+    pub max_depth: Option<u32>,
+    /// The templates to set, replacing the current ones, when present.
+    pub templates: Option<Vec<Template>>,
 }
 
 impl From<&TableSchema> for SchemaPatch {
@@ -148,6 +157,8 @@ impl From<&TableSchema> for SchemaPatch {
                 })
                 .collect(),
             max_fields: Some(schema.max_fields()),
+            max_depth: Some(schema.max_depth()),
+            templates: Some(schema.templates().to_vec()),
         }
     }
 }
@@ -171,15 +182,25 @@ impl SchemaPatch {
             })
             .transpose()?
             .unwrap_or_default();
-        let max_fields = doc
-            .get("max_fields")
-            .map(|v| {
-                v.as_u64()
-                    .and_then(|v| u32::try_from(v).ok())
-                    .ok_or_else(|| "max_fields is not a u32".to_string())
-            })
+        let cap = |key: &str| -> Result<Option<u32>, String> {
+            doc.get(key)
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|v| u32::try_from(v).ok())
+                        .ok_or_else(|| format!("{key} is not a u32"))
+                })
+                .transpose()
+        };
+        let templates = doc
+            .get("templates")
+            .map(|t| templates_from_json(Some(t)))
             .transpose()?;
-        Ok(Self { fields, max_fields })
+        Ok(Self {
+            fields,
+            max_fields: cap("max_fields")?,
+            max_depth: cap("max_depth")?,
+            templates,
+        })
     }
 
     /// The patch as JSON, in the document's spelling plus `dropped`.
@@ -212,6 +233,15 @@ impl SchemaPatch {
         doc.insert("fields".into(), Value::Array(fields));
         if let Some(cap) = self.max_fields {
             doc.insert("max_fields".into(), Value::from(cap));
+        }
+        if let Some(cap) = self.max_depth {
+            doc.insert("max_depth".into(), Value::from(cap));
+        }
+        if let Some(templates) = &self.templates {
+            doc.insert(
+                "templates".into(),
+                Value::Array(templates.iter().map(template_to_json).collect()),
+            );
         }
         Value::Object(doc)
     }
@@ -411,6 +441,16 @@ pub fn merge(
     {
         changes.push(SchemaChange::SetMaxFields(cap));
     }
+    if let Some(cap) = patch.max_depth
+        && cap != current.max_depth()
+    {
+        changes.push(SchemaChange::SetMaxDepth(cap));
+    }
+    if let Some(templates) = &patch.templates
+        && templates.as_slice() != current.templates()
+    {
+        changes.push(SchemaChange::SetTemplates(templates.clone()));
+    }
     Ok(changes)
 }
 
@@ -446,6 +486,9 @@ impl TableSchema {
                         current: self.fields.len() as u32,
                         fields: vec![name.clone()],
                     });
+                }
+                if let Some(index) = index {
+                    check_index_fits(name, index, data_type)?;
                 }
                 self.last_field_id += 1;
                 self.fields.push(FieldDef {
@@ -491,6 +534,8 @@ impl TableSchema {
             SchemaChange::SetNonNullable { id } => self.field_mut(*id)?.nullable = false,
             SchemaChange::SetNullable { id } => self.field_mut(*id)?.nullable = true,
             SchemaChange::SetMaxFields(cap) => self.max_fields = *cap,
+            SchemaChange::SetMaxDepth(cap) => self.max_depth = *cap,
+            SchemaChange::SetTemplates(templates) => self.templates = templates.clone(),
         }
         Ok(())
     }
@@ -526,6 +571,35 @@ impl TableSchema {
             .iter()
             .filter(|f| f.converting_from.is_some())
             .map(|f| f.id)
+    }
+}
+
+/// Whether `index` can be built on a new column of type `data_type`: a
+/// full-text index needs a string column, and a vector index is declared
+/// when the table is created, because the index's storage is laid out
+/// with the table.
+fn check_index_fits(
+    column: &str,
+    index: &ColumnIndex,
+    data_type: &DataType,
+) -> Result<(), SchemaError> {
+    match index {
+        ColumnIndex::Fts { .. }
+            if !matches!(
+                data_type,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            ) =>
+        {
+            Err(SchemaError::InvalidIndex {
+                column: column.to_owned(),
+                reason: format!("a full-text index needs a string column, not `{data_type}`"),
+            })
+        }
+        ColumnIndex::Fts { .. } => Ok(()),
+        ColumnIndex::Vector { .. } => Err(SchemaError::InvalidIndex {
+            column: column.to_owned(),
+            reason: "a vector index is declared when the table is created".to_owned(),
+        }),
     }
 }
 
@@ -588,11 +662,15 @@ mod tests {
         let full = SchemaPatch::from(&t);
         assert!(merge(&t, &full, ctx(false)).expect("merge").is_empty());
         let round = SchemaPatch::from_json(&t.to_json()).expect("the document is a patch");
+        assert_eq!(round.max_depth, Some(t.max_depth()));
+        assert_eq!(round.templates.as_deref(), Some(t.templates()));
         assert!(merge(&t, &round, ctx(false)).expect("merge").is_empty());
         for field in &full.fields {
             let one = SchemaPatch {
                 fields: vec![field.clone()],
                 max_fields: None,
+                max_depth: None,
+                templates: None,
             };
             assert!(
                 merge(&t, &one, ctx(false)).expect("merge").is_empty(),
@@ -619,6 +697,8 @@ mod tests {
                 },
             ],
             max_fields: Some(50),
+            max_depth: None,
+            templates: None,
         };
         let changes = merge(&t, &patch, ctx(false)).expect("merge");
         assert_eq!(
@@ -650,6 +730,8 @@ mod tests {
                 ..add("points", DataType::Int64)
             }],
             max_fields: None,
+            max_depth: None,
+            templates: None,
         };
         let dropped = next
             .apply(&merge(&next, &drop, ctx(false)).expect("merge"))
@@ -665,6 +747,8 @@ mod tests {
                     &SchemaPatch {
                         fields: vec![add("points", DataType::Int64)],
                         max_fields: None,
+                        max_depth: None,
+                        templates: None,
                     },
                     ctx(false),
                 )
@@ -683,6 +767,8 @@ mod tests {
                 ..add("x", DataType::Int64)
             }],
             max_fields: None,
+            max_depth: None,
+            templates: None,
         };
         assert!(matches!(
             merge(&t, &unknown, ctx(false)),
@@ -695,6 +781,8 @@ mod tests {
                 ..add("", DataType::Int64)
             }],
             max_fields: None,
+            max_depth: None,
+            templates: None,
         };
         assert!(
             matches!(merge(&t, &taken, ctx(false)), Err(SchemaError::NameTaken { name }) if name == "title")
@@ -702,6 +790,8 @@ mod tests {
         let id_col = SchemaPatch {
             fields: vec![add("_id", DataType::Int64)],
             max_fields: None,
+            max_depth: None,
+            templates: None,
         };
         assert!(matches!(
             merge(&t, &id_col, ctx(false)),
@@ -720,6 +810,8 @@ mod tests {
                 ..add("title", DataType::LargeUtf8)
             }],
             max_fields: None,
+            max_depth: None,
+            templates: None,
         };
         assert!(matches!(
             merge(&t, &analyzer, ctx(false)),
@@ -731,6 +823,8 @@ mod tests {
                 ..add("score", DataType::Int64)
             }],
             max_fields: None,
+            max_depth: None,
+            templates: None,
         };
         assert!(
             matches!(merge(&t, &tighten, ctx(false)), Err(SchemaError::NotEmpty { column }) if column == "score")
@@ -745,6 +839,8 @@ mod tests {
                 ..add("tag", DataType::Int64)
             }],
             max_fields: None,
+            max_depth: None,
+            templates: None,
         };
         assert!(matches!(
             merge(&t, &non_null_add, ctx(false)),
@@ -761,6 +857,8 @@ mod tests {
                 ..add("score", DataType::Int64)
             }],
             max_fields: None,
+            max_depth: None,
+            templates: None,
         };
         assert!(matches!(
             merge(&t, &drop_gvi, gvi),
@@ -819,6 +917,8 @@ mod tests {
         let retype = SchemaPatch {
             fields: vec![add("title", DataType::Int64)],
             max_fields: None,
+            max_depth: None,
+            templates: None,
         };
         let changes = merge(&t, &retype, ctx(false)).expect("merge");
         assert_eq!(
@@ -842,7 +942,9 @@ mod tests {
                 &flipped,
                 &SchemaPatch {
                     fields: vec![add("title", DataType::Float64)],
-                    max_fields: None
+                    max_fields: None,
+                    max_depth: None,
+                    templates: None
                 },
                 ctx(false)
             ),
@@ -855,6 +957,8 @@ mod tests {
             &SchemaPatch {
                 fields: vec![add("title", DataType::LargeUtf8)],
                 max_fields: None,
+                max_depth: None,
+                templates: None,
             },
             ctx(false),
         )
@@ -882,6 +986,8 @@ mod tests {
             &SchemaPatch {
                 fields: vec![add("score", DataType::Decimal128(38, 0))],
                 max_fields: None,
+                max_depth: None,
+                templates: None,
             },
             ctx(false),
         )
@@ -921,6 +1027,8 @@ mod tests {
                 },
             ],
             max_fields: Some(7),
+            max_depth: None,
+            templates: None,
         };
         let back = SchemaPatch::from_json(&patch.to_json()).expect("decode");
         assert_eq!(back, patch);

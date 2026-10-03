@@ -15,13 +15,34 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
 
-use super::{TableSchema, change::SchemaChange, error::SchemaError};
+use super::{
+    ColumnIndex, INDEX_META_KEY, TableSchema, change::SchemaChange, error::SchemaError,
+    index_from_json,
+};
 
 /// A column a batch adds to the table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AddColumn {
     pub name: String,
     pub data_type: DataType,
+    /// The index the batch asks for it, from the field's
+    /// [`INDEX_META_KEY`] metadata.
+    pub index: Option<ColumnIndex>,
+}
+
+/// The index a batch field asks its new column to carry, if it names one.
+fn requested_index(field: &Field) -> Result<Option<ColumnIndex>, SchemaError> {
+    let Some(text) = field.metadata().get(INDEX_META_KEY) else {
+        return Ok(None);
+    };
+    serde_json::from_str::<serde_json::Value>(text)
+        .map_err(|e| e.to_string())
+        .and_then(|json| index_from_json(&json))
+        .map(Some)
+        .map_err(|reason| SchemaError::InvalidIndex {
+            column: field.name().clone(),
+            reason,
+        })
 }
 
 /// A batch brought to the table's shape.
@@ -89,9 +110,13 @@ pub fn resolve_batch(
         added.push(AddColumn {
             name: field.name().clone(),
             data_type: field.data_type().clone(),
+            index: requested_index(field)?,
         });
         columns.push(Arc::clone(batch.column(i)));
-        fields.push(Field::new(field.name(), field.data_type().clone(), true));
+        fields.push(
+            Field::new(field.name(), field.data_type().clone(), true)
+                .with_metadata(field.metadata().clone()),
+        );
     }
     let current = schema.fields().len() as u32;
     if current + added.len() as u32 > schema.max_fields() {
@@ -149,6 +174,7 @@ pub fn union_schema<'a>(
                 None => added.push(AddColumn {
                     name: field.name().clone(),
                     data_type: field.data_type().clone(),
+                    index: requested_index(field)?,
                 }),
             }
         }
@@ -162,7 +188,7 @@ pub fn union_schema<'a>(
             name: a.name,
             data_type: a.data_type,
             nullable: true,
-            index: None,
+            index: a.index,
         })
         .collect();
     current.apply(&changes).map(Some)
@@ -253,7 +279,8 @@ mod tests {
             resolved.added,
             vec![AddColumn {
                 name: "tag".into(),
-                data_type: DataType::LargeUtf8
+                data_type: DataType::LargeUtf8,
+                index: None,
             }]
         );
         let names: Vec<String> = resolved

@@ -55,6 +55,8 @@ fn retype(name: &str, to: DataType) -> SchemaPatch {
             dropped: false,
         }],
         max_fields: None,
+        max_depth: None,
+        templates: None,
     }
 }
 
@@ -377,6 +379,8 @@ fn the_column_behind_the_vector_index_cannot_be_retyped_or_dropped() {
             ..retype("emb", DataType::LargeUtf8).fields.remove(0)
         }],
         max_fields: None,
+        max_depth: None,
+        templates: None,
     };
     let err = db
         .apply_schema(TABLE, &drop, None)

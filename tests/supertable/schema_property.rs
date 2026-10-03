@@ -365,6 +365,8 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
                 let patch = SchemaPatch {
                     fields: vec![field(name, kind)],
                     max_fields: None,
+                    max_depth: None,
+                    templates: None,
                 };
                 match oracle.by_name(name) {
                     Some(live) if live.kind != kind => {
@@ -391,6 +393,8 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
                         ..field(target, live.kind)
                     }],
                     max_fields: None,
+                    max_depth: None,
+                    templates: None,
                 };
                 let taken = from != to && oracle.by_name(target).is_some();
                 match db.apply_schema(TABLE, &patch, None) {
@@ -414,6 +418,8 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
                         ..field(&live.name, live.kind)
                     }],
                     max_fields: None,
+                    max_depth: None,
+                    templates: None,
                 };
                 db.apply_schema(TABLE, &patch, None).expect("drop");
                 oracle.live.retain(|c| c.id != live.id);

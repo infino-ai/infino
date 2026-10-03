@@ -1,6 +1,7 @@
 pub mod infino
 pub use infino::arrow_array
 pub use infino::arrow_schema
+pub use infino::serde_json
 pub enum infino::Bm25Stats
 pub infino::Bm25Stats::Global
 pub infino::Bm25Stats::PerSuperfile
@@ -364,6 +365,12 @@ pub infino::SchemaError::FieldCapExceeded::current: u32
 pub infino::SchemaError::FieldCapExceeded::fields: alloc::vec::Vec<alloc::string::String>
 pub infino::SchemaError::IdentityChange
 pub infino::SchemaError::IdentityChange::attribute: alloc::string::String
+pub infino::SchemaError::InvalidIndex
+pub infino::SchemaError::InvalidIndex::column: alloc::string::String
+pub infino::SchemaError::InvalidIndex::reason: alloc::string::String
+pub infino::SchemaError::InvalidRow
+pub infino::SchemaError::InvalidRow::reason: alloc::string::String
+pub infino::SchemaError::InvalidRow::row: usize
 pub infino::SchemaError::MissingColumn
 pub infino::SchemaError::MissingColumn::column: alloc::string::String
 pub infino::SchemaError::MixedArray
@@ -858,7 +865,9 @@ impl core::panic::unwind_safe::RefUnwindSafe for infino::ReindexReport
 impl core::panic::unwind_safe::UnwindSafe for infino::ReindexReport
 pub struct infino::SchemaPatch
 pub infino::SchemaPatch::fields: alloc::vec::Vec<infino::FieldPatch>
+pub infino::SchemaPatch::max_depth: core::option::Option<u32>
 pub infino::SchemaPatch::max_fields: core::option::Option<u32>
+pub infino::SchemaPatch::templates: core::option::Option<alloc::vec::Vec<infino::supertable::schema::Template>>
 impl infino::SchemaPatch
 pub fn infino::SchemaPatch::from_json(&serde_json::value::Value) -> core::result::Result<Self, alloc::string::String>
 pub fn infino::SchemaPatch::to_json(&self) -> serde_json::value::Value
@@ -909,6 +918,8 @@ pub struct infino::Supertable
 impl infino::Supertable
 pub fn infino::Supertable::append(&self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::append_named(&self, &arrow_array::record_batch::RecordBatch, &str) -> core::result::Result<(), infino::InfinoError>
+pub fn infino::Supertable::append_rows(&self, &[serde_json::value::Value]) -> core::result::Result<(), infino::InfinoError>
+pub fn infino::Supertable::append_rows_named(&self, &[serde_json::value::Value], &str) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::Bm25SearchOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::count(&self, &str, &str, infino::BoolMode) -> core::result::Result<u64, infino::InfinoError>
 pub fn infino::Supertable::delete(&self, datafusion_expr::expr::Expr) -> core::result::Result<infino::MutationStats, infino::InfinoError>
@@ -923,6 +934,7 @@ pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
 pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::tokenize(&self, &str, &str) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
 pub fn infino::Supertable::update(&self, datafusion_expr::expr::Expr, &arrow_array::record_batch::RecordBatch) -> core::result::Result<infino::MutationStats, infino::InfinoError>
+pub fn infino::Supertable::update_rows(&self, datafusion_expr::expr::Expr, &[serde_json::value::Value]) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, core::option::Option<infino::VectorFilter<'_>>, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl core::clone::Clone for infino::Supertable
 pub fn infino::Supertable::clone(&self) -> infino::Supertable
@@ -951,12 +963,15 @@ pub fn infino::TableSchema::fts_tokenizer_for(&self, &str) -> core::option::Opti
 pub fn infino::TableSchema::id_field(&str) -> alloc::sync::Arc<arrow_schema::field::Field>
 pub fn infino::TableSchema::id_of(&self, &str) -> core::option::Option<infino::FieldId>
 pub fn infino::TableSchema::last_field_id(&self) -> u32
+pub fn infino::TableSchema::max_depth(&self) -> u32
 pub fn infino::TableSchema::max_fields(&self) -> u32
 pub fn infino::TableSchema::name_of(&self, infino::FieldId) -> core::option::Option<&str>
 pub fn infino::TableSchema::scalar_schema(&self, &str) -> alloc::sync::Arc<arrow_schema::schema::Schema>
 pub fn infino::TableSchema::schema_id(&self) -> u32
 pub fn infino::TableSchema::stamp_field_ids(&self, &arrow_schema::schema::Schema, &str) -> alloc::sync::Arc<arrow_schema::schema::Schema>
 pub fn infino::TableSchema::stored_schema(&self, &str) -> alloc::sync::Arc<arrow_schema::schema::Schema>
+pub fn infino::TableSchema::template_for(&self, &str, infino::supertable::schema::Detected) -> core::option::Option<&infino::supertable::schema::Template>
+pub fn infino::TableSchema::templates(&self) -> &[infino::supertable::schema::Template]
 pub fn infino::TableSchema::to_json(&self) -> serde_json::value::Value
 pub fn infino::TableSchema::tombstoned(&self) -> &[infino::FieldId]
 pub fn infino::TableSchema::user_schema(&self) -> alloc::sync::Arc<arrow_schema::schema::Schema>

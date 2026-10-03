@@ -774,7 +774,12 @@ impl Supertable {
             .filter(|stem| superfiles.iter().all(|e| e.stem.as_deref() == Some(*stem)));
         let prepared_superfile = {
             let _span = detail_span!("prepare_merged_superfile").entered();
-            prepare_superfile_named(self.inner().as_ref(), shard, stem)?
+            prepare_superfile_named(
+                self.inner().as_ref(),
+                &self.inner().manifest.load(),
+                shard,
+                stem,
+            )?
         };
 
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)

@@ -119,6 +119,22 @@ pub enum SchemaError {
         /// The `schema_id` the table is at.
         current: u32,
     },
+    /// An index that cannot be built on the column it was given.
+    #[error("column `{column}` cannot carry that index: {reason}")]
+    InvalidIndex {
+        /// The column's name.
+        column: String,
+        /// Why the index does not fit.
+        reason: String,
+    },
+    /// A document that is not an object, or cannot be mapped to columns.
+    #[error("row {row} cannot be mapped: {reason}")]
+    InvalidRow {
+        /// The row's position in the request.
+        row: usize,
+        /// What was wrong with it.
+        reason: String,
+    },
     /// `create_table` on a name that exists.
     #[error("table `{name}` already exists")]
     TableExists {

@@ -48,6 +48,7 @@ use datafusion::{
     },
 };
 use futures::future::try_join_all;
+pub(crate) use index_spec::DEFAULT_ROT_SEED;
 pub use index_spec::{FtsField, IndexSpec};
 use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
@@ -778,6 +779,8 @@ impl Connection {
     ///         dropped: false,
     ///     }],
     ///     max_fields: None,
+    ///     max_depth: None,
+    ///     templates: None,
     /// };
     /// let doc = db.apply_schema("posts", &patch, None)?;
     /// assert_eq!(doc.schema_id(), 1);
