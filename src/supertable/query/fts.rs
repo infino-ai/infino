@@ -733,9 +733,13 @@ impl SupertableReader {
                 survivors = tracing::field::Empty,
             )
         });
-        let mut kept = select_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf))
-            .instrument(select_span.clone())
-            .await?;
+        let mut kept = select_fts_superfiles(
+            manifest.as_ref(),
+            slice::from_ref(&prune_leaf),
+            &column_owned,
+        )
+        .instrument(select_span.clone())
+        .await?;
         // A pushed-down `WHERE` narrows the search to the superfiles its
         // scope admits — the statistics survivors that still hold a
         // candidate row. The global-idf gather below still probes every
@@ -1337,7 +1341,7 @@ impl SupertableReader {
             mode: BoolMode::Or,
         };
         let presence: Vec<Arc<SuperfileEntry>> =
-            select_superfiles(manifest, slice::from_ref(&prune))
+            select_fts_superfiles(manifest, slice::from_ref(&prune), column)
                 .await?
                 .into_iter()
                 .filter(|e| !covered.contains(&e.superfile_id))
@@ -1472,12 +1476,13 @@ impl SupertableReader {
         // Superfile selection via the shared two-tier prune — the
         // single-`Prefix`-leaf case (part-level term-range skip →
         // lazy-load surviving parts → per-superfile term-range skip).
-        let kept = select_superfiles(
+        let kept = select_fts_superfiles(
             manifest.as_ref(),
             &[PruneLeaf::Prefix {
                 column: column_owned.clone(),
                 prefix: prefix_lower.as_bytes().to_vec(),
             }],
+            &column_owned,
         )
         .await?;
         if kept.is_empty() {
@@ -1729,8 +1734,12 @@ impl SupertableReader {
         };
         let prune_leaf =
             presence_leaf(column, &match_set.terms, &match_set.phrases, match_set.mode);
-        let kept =
-            select_superfiles(self.manifest().as_ref(), slice::from_ref(&prune_leaf)).await?;
+        let kept = select_fts_superfiles(
+            self.manifest().as_ref(),
+            slice::from_ref(&prune_leaf),
+            column,
+        )
+        .await?;
         Ok((match_set, negs, kept))
     }
 
@@ -2186,7 +2195,7 @@ impl SupertableReader {
                 survivors = tracing::field::Empty,
             )
         });
-        let kept = select_superfiles(manifest.as_ref(), &leaves)
+        let kept = select_fts_superfiles(manifest.as_ref(), &leaves, column)
             .instrument(select_span.clone())
             .await?;
         select_span.record("survivors", kept.len());
@@ -2475,6 +2484,23 @@ fn rows_as_local_ids(hits: Vec<(RowId, f32)>) -> Vec<(u32, f32)> {
 /// it as [`QueryError::InvalidQuery`] so the caller sees a bad-input
 /// error, not a storage/scan failure. Everything else is a genuine
 /// read error and stays [`QueryError::Parquet`].
+/// The superfiles a full-text query on `column` fans out to: the ones the
+/// prune `leaves` keep, minus any whose file does not hold the column —
+/// written before it was added — which contribute nothing rather than
+/// failing the query. A file written before field ids is taken to hold
+/// every column the table had then.
+async fn select_fts_superfiles(
+    manifest: &ManifestSnapshot,
+    leaves: &[PruneLeaf],
+    column: &str,
+) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
+    let mut kept = select_superfiles(manifest, leaves).await?;
+    if let Some(id) = manifest.field_id(column) {
+        kept.retain(|entry| entry.holds_fts_column(id));
+    }
+    Ok(kept)
+}
+
 fn fts_read_error(e: ReadError) -> QueryError {
     match &e {
         ReadError::Fts(fts)

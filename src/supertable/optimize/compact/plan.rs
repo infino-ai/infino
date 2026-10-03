@@ -46,6 +46,10 @@ pub struct SuperfileStats {
     /// never mix inputs from opposite sides of the hidden drain watermark
     /// (see [`split_stats_at_drain_watermark`]).
     pub birth_version: u64,
+    /// Whether the file holds some column in a type other than the
+    /// table's. Such a file is rewritten by the next compaction whatever
+    /// its size or fill, alone if need be, so a type change converges.
+    pub stale_type: bool,
 }
 
 impl SuperfileStats {
@@ -147,7 +151,7 @@ fn pack_partition(
     // re-compacting them gains nothing.
     let mut candidates: Vec<&SuperfileStats> = segs
         .into_iter()
-        .filter(|s| !s.sealed_by_other && s.size_bytes < target_bytes)
+        .filter(|s| !s.sealed_by_other && (s.size_bytes < target_bytes || s.stale_type))
         .collect();
 
     // Most-deleted first (reclaim space soonest), then smallest, then ID.
@@ -174,6 +178,9 @@ struct PendingJob {
     inputs: Vec<Uuid>,
     live_bytes: u64,
     raw_bytes: u64,
+    /// Whether an input holds a column in a type the table has moved on
+    /// from; the job then runs however small.
+    stale_type: bool,
 }
 
 impl PendingJob {
@@ -186,6 +193,7 @@ impl PendingJob {
         self.raw_bytes += s.size_bytes;
         self.inputs.push(s.superfile_id);
         self.live_bytes += s.live_bytes();
+        self.stale_type |= s.stale_type;
     }
 
     /// Emit a CompactionJob when the pending inputs clear either leg of the
@@ -202,7 +210,8 @@ impl PendingJob {
     ) {
         let size_ready = self.inputs.len() >= 2 && self.live_bytes >= min_output_bytes;
         let count_ready = self.inputs.len() >= min_superfiles_for_merge;
-        if size_ready || count_ready {
+        let converging = self.stale_type && !self.inputs.is_empty();
+        if size_ready || count_ready || converging {
             jobs.push(CompactionJob {
                 partition_key: key.to_vec(),
                 inputs: mem::take(&mut self.inputs),
@@ -241,6 +250,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
             tombstoned_docs: tombstoned,
             sealed_by_other: false,
             birth_version: 0,
+            stale_type: false,
         }
     }
 
@@ -482,6 +492,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
                 tombstoned_docs: n_docs * tombstone_pct / 100,
                 sealed_by_other,
                 birth_version,
+                stale_type: false,
             }
         }
     }
@@ -575,5 +586,56 @@ pub(in crate::supertable::optimize::compact) mod tests {
         // Reset to default after emit attempt.
         assert_eq!(p.inputs.len(), 0);
         assert_eq!(p.live_bytes, 0);
+    }
+    /// A file holding a column in a type the table has moved on from is a
+    /// compaction input whatever its size: alone, above the target, below
+    /// the fill floor. An ordinary file of the same shape stays out.
+    #[test]
+    fn a_stale_typed_file_is_rewritten_however_large_or_lonely() {
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 100,
+            min_fill_percent: 80,
+            min_superfiles_for_merge: 4,
+            ..CompactionSettings::default()
+        };
+        let mut lonely = seg(1, 10, 1_000, 0);
+        assert!(
+            select(&[lonely.clone()], &cfg).is_empty(),
+            "a small file alone waits"
+        );
+        lonely.stale_type = true;
+        let jobs = select(&[lonely.clone()], &cfg);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].inputs, vec![lonely.superfile_id]);
+
+        let mut huge = seg(2, 500, 1_000, 0);
+        assert!(
+            select(&[huge.clone()], &cfg).is_empty(),
+            "a target-sized file is left alone"
+        );
+        huge.stale_type = true;
+        let jobs = select(&[huge.clone()], &cfg);
+        assert_eq!(jobs.len(), 1, "unless its type is stale");
+        assert_eq!(jobs[0].inputs, vec![huge.superfile_id]);
+    }
+
+    /// A stale file packs with ordinary candidates of its partition; the
+    /// job it lands in runs even when it would otherwise be too small.
+    #[test]
+    fn a_stale_typed_file_packs_with_its_neighbours() {
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 100,
+            min_fill_percent: 80,
+            min_superfiles_for_merge: 4,
+            ..CompactionSettings::default()
+        };
+        let mut stale = seg(1, 10, 1_000, 0);
+        stale.stale_type = true;
+        let fresh = seg(2, 10, 1_000, 0);
+        let jobs = select(&[stale.clone(), fresh.clone()], &cfg);
+        assert_eq!(jobs.len(), 1);
+        let mut inputs = jobs[0].inputs.clone();
+        inputs.sort();
+        assert_eq!(inputs, vec![stale.superfile_id, fresh.superfile_id]);
     }
 }

@@ -508,7 +508,10 @@ async fn do_apply(
     let uri = SuperfileUri(preallocated_superfile_id);
     let entry = Arc::new(SuperfileEntry {
         stem: None,
-        physical_schema: Some(Arc::new(PhysicalSchema::of_reader(&reader))),
+        physical_schema: Some(Arc::new(PhysicalSchema::of_reader(
+            &reader,
+            &manifest.options.legacy_names(),
+        ))),
         // Stamped to the winning commit version later, in `ManifestSnapshot::update`.
         birth_version: 0,
         superfile_id: preallocated_superfile_id,

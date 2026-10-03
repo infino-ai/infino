@@ -85,7 +85,7 @@ use crate::{
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
-        schema::TableSchema,
+        schema::{FieldId, TableSchema},
         slow_vector_state::{CentroidSection, ResidentVectorIndex},
         wal::pipeline::DEFAULT_MAX_SEALED_RETRIES,
     },
@@ -1286,14 +1286,20 @@ pub(crate) fn builder_options_for(
     schema: &TableSchema,
     options: &SupertableOptions,
 ) -> BuilderOptions {
+    let vector_configs = schema.vector_configs();
+    let vector_field_ids: Vec<(String, FieldId)> = vector_configs
+        .iter()
+        .filter_map(|vc| Some((vc.column.clone(), schema.id_of(&vc.column)?)))
+        .collect();
     BuilderOptions::new(
         schema.scalar_schema(&options.id_column),
         options.id_column.clone(),
         schema.fts_configs(),
-        schema.vector_configs(),
+        vector_configs,
     )
     .with_vector_layout(options.vector_layout)
     .with_schema_id(schema.schema_id())
+    .with_vector_field_ids(vector_field_ids)
 }
 
 impl SupertableOptions {

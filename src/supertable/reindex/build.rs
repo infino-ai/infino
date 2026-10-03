@@ -11,18 +11,15 @@
 //! survivors, and the job runner carries their tombstones onto the output.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     io::{Error, Write},
     sync::Arc,
 };
 
-use roaring::RoaringBitmap;
-
 use crate::{
     superfile::{
-        builder::{CarryScope, SuperfileBuilder, merge_builder_opts},
+        builder::{BuilderOptions, CarryScope, MergeInput, SuperfileBuilder, merge_builder_opts},
         error::BuildError as SuperfileBuildError,
-        fts::reader::ColumnLengthStats,
         reader::SuperfileReader,
         stats::SuperfileStats,
     },
@@ -31,6 +28,7 @@ use crate::{
         manifest::SuperfileEntry,
         optimize::compact::{CompactionMerge, MergeInputs, SuperfileMerge},
         reindex::Repair,
+        schema::map::FileSchemaMap,
     },
 };
 
@@ -49,12 +47,19 @@ use crate::{
 fn carry_body<'a>(
     inputs: &'a MergeInputs<'a>,
 ) -> Option<(&'a Arc<SuperfileReader>, &'a Arc<SuperfileEntry>)> {
-    let ([(reader, deleted)], [entry]) = (inputs.readers, inputs.entries) else {
+    let ([input], [entry]) = (inputs.inputs, inputs.entries) else {
         return None;
     };
-    let carries_every_row = deleted.as_ref().is_none_or(|b| b.is_empty())
+    let carries_every_row = input.deleted.as_ref().is_none_or(|b| b.is_empty())
         && inputs.superseded.iter().all(BTreeSet::is_empty);
-    (carries_every_row && reader.is_fully_resident()).then_some((reader, entry))
+    // The body is copied verbatim, so it must already have the table's
+    // shape; a file that needs adapting goes through the merge instead.
+    let same_shape = input
+        .adapter
+        .as_ref()
+        .is_none_or(FileSchemaMap::is_identity);
+    (carries_every_row && same_shape && input.reader.is_fully_resident())
+        .then_some((&input.reader, entry))
 }
 
 /// The row count a carried body will hold, checked against the manifest.
@@ -96,14 +101,18 @@ impl SuperfileMerge for RepairMerge {
         output: &mut dyn Write,
     ) -> Result<SuperfileStats, BuildError> {
         match carry_body(&inputs) {
-            Some((reader, entry)) => {
-                repair_carrying_body_to(self.0, reader, entry, inputs.fts_corpus, output)
-            }
+            Some((reader, entry)) => repair_carrying_body_to(
+                self.0,
+                reader,
+                entry,
+                inputs.builder_options.clone(),
+                output,
+            ),
             // Restating compaction's merge here would be a second copy that
             // could drift from the one the table is actually compacted with.
             None => match self.0 {
                 Repair::Layout => CompactionMerge.build(inputs, output),
-                Repair::Terms => reanalyze_to(inputs.readers, inputs.fts_corpus, output),
+                Repair::Terms => reanalyze_to(inputs.inputs, inputs.builder_options, output),
             },
         }
     }
@@ -127,11 +136,11 @@ fn repair_carrying_body_to(
     repair: Repair,
     source: &Arc<SuperfileReader>,
     entry: &Arc<SuperfileEntry>,
-    fts_corpus: &HashMap<String, ColumnLengthStats>,
+    base: BuilderOptions,
     output: &mut dyn Write,
 ) -> Result<SuperfileStats, BuildError> {
-    let readers = [(Arc::clone(source), None)];
-    let opts = merge_builder_opts(&readers, fts_corpus)?;
+    let inputs = [MergeInput::same_shape(Arc::clone(source), None)];
+    let opts = merge_builder_opts(&inputs, base)?;
     let mut builder = SuperfileBuilder::new(match repair {
         Repair::Layout => opts,
         Repair::Terms => opts.reanalyze_stored_columns(),
@@ -163,18 +172,19 @@ fn repair_carrying_body_to(
 /// take this path, so a codec that does not round-trip exactly would move
 /// its vectors here.
 fn reanalyze_to<W: Write>(
-    readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-    fts_corpus: &HashMap<String, ColumnLengthStats>,
+    inputs: &[MergeInput],
+    base: BuilderOptions,
     output: W,
 ) -> Result<SuperfileStats, BuildError> {
-    let builder_opts = merge_builder_opts(readers, fts_corpus)?.reanalyze_stored_columns();
+    let builder_opts = merge_builder_opts(inputs, base)?.reanalyze_stored_columns();
     let mut builder = SuperfileBuilder::new(builder_opts)?;
 
-    let mut stats = Vec::with_capacity(readers.len());
-    for (reader, deleted) in readers {
+    let mut stats = Vec::with_capacity(inputs.len());
+    for input in inputs {
         stats.push(builder.add_batch_from_reader_scoped(
-            reader,
-            deleted.clone(),
+            &input.reader,
+            input.deleted.clone(),
+            input.adapter.as_ref(),
             CarryScope::UnstoredOnly,
         )?);
     }

@@ -110,7 +110,7 @@ use crate::{
             partition::{assign_partition, encode_partition_key},
         },
         query::{hierarchical_iter, prune::PruneLeaf},
-        schema::{FieldId, LegacyNames, PhysicalSchema, TableSchema},
+        schema::{FieldId, LegacyNames, PhysicalKind, PhysicalSchema, TableSchema},
         slow_vector_state,
     },
     utils::trace::record,
@@ -3059,6 +3059,31 @@ pub struct SuperfileEntry {
     /// total order that's safe to watermark on. `0` on entries from before
     /// the field existed (treated as the genesis version).
     pub birth_version: u64,
+}
+
+impl SuperfileEntry {
+    /// Whether this superfile holds the full-text column with id `id`, in
+    /// its Parquet body or its FTS blob. A file written before field ids
+    /// recorded no physical schema; it is taken to hold every column the
+    /// table had when it was written, which is every column that can be
+    /// asked of it.
+    pub(crate) fn holds_fts_column(&self, id: FieldId) -> bool {
+        self.physical_schema.as_ref().is_none_or(|ps| {
+            ps.column_by_id(id).is_some_and(|c| {
+                matches!(c.kind, PhysicalKind::Stored | PhysicalKind::FtsIndexOnly)
+            })
+        })
+    }
+
+    /// Whether this superfile holds the vector column with id `id` in its
+    /// vector blob; see [`Self::holds_fts_column`] for files without a
+    /// physical schema.
+    pub(crate) fn holds_vector_column(&self, id: FieldId) -> bool {
+        self.physical_schema.as_ref().is_none_or(|ps| {
+            ps.column_by_id(id)
+                .is_some_and(|c| c.kind == PhysicalKind::Vector)
+        })
+    }
 }
 
 impl SuperfileEntry {

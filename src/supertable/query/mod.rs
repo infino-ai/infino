@@ -29,6 +29,7 @@ pub mod hierarchical_iter;
 pub mod provider;
 pub mod prune;
 pub(crate) mod scalar_cache;
+pub(crate) mod schema_adapter;
 pub mod skip;
 pub mod sql;
 pub mod superfile_reader;

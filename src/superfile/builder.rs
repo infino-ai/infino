@@ -130,7 +130,7 @@ use crate::{
             rerank_codec::RerankCodec,
         },
     },
-    supertable::schema::{FieldId, field_id_of, with_field_id},
+    supertable::schema::{FieldId, field_id_of, map::FileSchemaMap, with_field_id},
     utils::{terms::validate_column_name, trace::detail_span},
 };
 
@@ -551,6 +551,10 @@ pub struct BuilderOptions {
     /// The table schema version the superfile is written under, stamped
     /// in the footer as provenance.
     pub(crate) schema_id: u32,
+    /// The field id of each vector column, by name. Vector columns live in
+    /// the vector blob, not the Parquet body, so `schema` does not carry
+    /// their ids; the footer records them from here.
+    pub(crate) vector_field_ids: HashMap<String, FieldId>,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -642,7 +646,17 @@ impl BuilderOptions {
             vector_layout: VectorLayout::Ivf,
             fts_corpus_stats: HashMap::new(),
             schema_id: 1,
+            vector_field_ids: HashMap::new(),
         }
+    }
+
+    /// Record the field id of each vector column, by name.
+    pub(crate) fn with_vector_field_ids(
+        mut self,
+        ids: impl IntoIterator<Item = (String, FieldId)>,
+    ) -> Self {
+        self.vector_field_ids = ids.into_iter().collect();
+        self
     }
 
     pub(crate) fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
@@ -657,10 +671,12 @@ impl BuilderOptions {
 
     /// The field id stamped on `column` in this builder's schema, if any.
     fn field_id_of_column(&self, column: &str) -> Option<FieldId> {
-        self.schema
-            .field_with_name(column)
-            .ok()
-            .and_then(field_id_of)
+        self.vector_field_ids.get(column).copied().or_else(|| {
+            self.schema
+                .field_with_name(column)
+                .ok()
+                .and_then(field_id_of)
+        })
     }
 
     /// Lower each FTS column's carried analysis revision to the lowest
@@ -817,6 +833,12 @@ impl BuilderOptions {
             (Vec::new(), VectorLayout::Ivf)
         };
 
+        let vector_field_ids: Vec<(String, FieldId)> = reader
+            .vec()
+            .into_iter()
+            .flat_map(|vec| vec.vector_columns_config())
+            .filter_map(|v| Some((v.name.clone(), v.field_id?)))
+            .collect();
         BuilderOptions::new(
             reader.schema().clone(),
             reader.id_column(),
@@ -824,6 +846,7 @@ impl BuilderOptions {
             vector_columns,
         )
         .with_vector_layout(vector_layout)
+        .with_vector_field_ids(vector_field_ids)
     }
 
     /// Verify a merge input's per-column FTS configuration is
@@ -889,60 +912,6 @@ impl BuilderOptions {
             }
         }
         Ok(())
-    }
-
-    fn check_mergeability(
-        &self,
-        remote_id_col: &str,
-        remote_schema: &Arc<Schema>,
-        remote_fts_columns: Option<Vec<&ColumnMeta>>,
-        remote_vector_columns: Option<Vec<&ColumnReader>>,
-    ) -> Result<bool, BuildError> {
-        if self.id_column != *remote_id_col {
-            return Err(BuildError::IdColumnMismatch(
-                self.id_column.clone(),
-                remote_id_col.to_string(),
-            ));
-        }
-
-        if !same_shape(&self.schema, remote_schema) {
-            return Err(BuildError::SchemaMismatch {
-                mine: self.schema.to_string(),
-                other: remote_schema.to_string(),
-            });
-        }
-
-        self.check_fts_carry_compat(remote_fts_columns.as_deref())?;
-
-        if let Some(remote_vector_columns) = remote_vector_columns {
-            let self_vec_columns = &self.vector_columns;
-            if self_vec_columns.len() != remote_vector_columns.len() {
-                return Err(BuildError::VectorSchemaMismatch(format!(
-                    "mismatched column len. self {} vs other {}",
-                    self_vec_columns.len(),
-                    remote_vector_columns.len()
-                )));
-            }
-
-            for (self_vec_column, remote_vector_column) in
-                self_vec_columns.iter().zip(remote_vector_columns.iter())
-            {
-                if self_vec_column.column != remote_vector_column.name {
-                    return Err(BuildError::VectorSchemaMismatch(format!(
-                        "mismatched column name. self {} vs other {}",
-                        self_vec_column.column, remote_vector_column.name
-                    )));
-                }
-                if self_vec_column.dim != remote_vector_column.dim {
-                    return Err(BuildError::VectorSchemaMismatch(format!(
-                        "mismatched column dim. self {} vs other {}",
-                        self_vec_column.dim, remote_vector_column.dim
-                    )));
-                }
-            }
-        }
-
-        Ok(true)
     }
 }
 
@@ -1595,7 +1564,11 @@ impl SuperfileBuilder {
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
-        let stats = Self::build_from_sq8_ivf_readers_to(readers, &HashMap::new(), &mut buf)?;
+        let inputs = same_shape_inputs(readers);
+        let base = BuilderOptions::new_from_reader(
+            &inputs.first().ok_or(BuildError::BatchReadError)?.reader,
+        );
+        let stats = Self::build_from_sq8_ivf_readers_to(&inputs, base, &mut buf)?;
         Ok((buf, stats))
     }
 
@@ -1604,14 +1577,14 @@ impl SuperfileBuilder {
     /// the merged superfile to `output` instead of returning a `Vec<u8>`, so
     /// the compaction caller can stream to a temp file.
     pub(crate) fn build_from_sq8_ivf_readers_to<W: Write>(
-        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-        fts_corpus: &HashMap<String, ColumnLengthStats>,
+        inputs: &[MergeInput],
+        base: BuilderOptions,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        let builder_opts = merge_builder_opts(readers, fts_corpus)?;
+        let builder_opts = merge_builder_opts(inputs, base)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
-        let (first, _) = readers.first().ok_or(BuildError::BatchReadError)?;
+        let first = &inputs.first().ok_or(BuildError::BatchReadError)?.reader;
         let vec_col = first
             .vec()
             .and_then(|v| v.vector_columns_config().next())
@@ -1621,22 +1594,17 @@ impl SuperfileBuilder {
         }
         let column = vec_col.name.clone();
 
-        let mut stats_collector = Vec::with_capacity(readers.len());
-        let mut merge_inputs: Vec<(&VectorReader, String, u32)> = Vec::with_capacity(readers.len());
+        let mut stats_collector = Vec::with_capacity(inputs.len());
+        let mut merge_inputs: Vec<(&VectorReader, String, u32)> = Vec::with_capacity(inputs.len());
         let mut local_base = 0u32;
 
-        for (idx, (reader, deleted)) in readers.iter().enumerate() {
+        for input in inputs {
+            let (reader, deleted) = (&input.reader, &input.deleted);
             // Compaction opens its inputs eagerly (see
             // `query::dispatch::open_compaction_input`), so `get_record_batch`
             // resolves off resident bytes. A lazy reader here is a caller bug,
             // not something to paper over — surface it with context.
-            let record_batch = reader.get_record_batch(deleted.clone()).map_err(|e| {
-                BuildError::Io(Error::other(format!(
-                    "sq8 merge input {idx}: read RecordBatch failed (n_docs={}, eager={}): {e}",
-                    reader.n_docs(),
-                    reader.parquet_bytes().is_some(),
-                )))
-            })?;
+            let record_batch = input.batch(&superfile_builder.opts)?;
             let stats = SuperfileStats::try_compute_from_record_batch(&record_batch)?;
             stats_collector.push(stats);
 
@@ -1678,10 +1646,14 @@ impl SuperfileBuilder {
         superseded_per_reader: &[BTreeSet<u32>],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
+        let inputs = same_shape_inputs(readers);
+        let base = BuilderOptions::new_from_reader(
+            &inputs.first().ok_or(BuildError::BatchReadError)?.reader,
+        );
         let stats = Self::build_from_multi_cell_sq8_ivf_readers_to(
-            readers,
+            &inputs,
             superseded_per_reader,
-            &HashMap::new(),
+            base,
             &mut buf,
         )?;
         Ok((buf, stats))
@@ -1691,12 +1663,12 @@ impl SuperfileBuilder {
     /// [`build_from_multi_cell_sq8_ivf_readers`](Self::build_from_multi_cell_sq8_ivf_readers):
     /// writes the merged superfile to `output` instead of returning a `Vec<u8>`.
     pub(crate) fn build_from_multi_cell_sq8_ivf_readers_to<W: Write>(
-        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        inputs: &[MergeInput],
         superseded_per_reader: &[BTreeSet<u32>],
-        fts_corpus: &HashMap<String, ColumnLengthStats>,
+        base: BuilderOptions,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        let builder_opts = merge_builder_opts(readers, fts_corpus)?;
+        let builder_opts = merge_builder_opts(inputs, base)?;
         if builder_opts.vector_layout != VectorLayout::MultiCellIvf {
             return Err(BuildError::VectorSchemaMismatch(
                 "build_from_multi_cell_sq8_ivf_readers requires multi-cell inputs".into(),
@@ -1711,18 +1683,15 @@ impl SuperfileBuilder {
             .ok_or(BuildError::VectorReadError)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
-        let any_tombstones = readers
+        let any_tombstones = inputs
             .iter()
-            .any(|(_, deleted)| deleted.as_ref().is_some_and(|b| !b.is_empty()));
+            .any(|input| input.deleted.as_ref().is_some_and(|b| !b.is_empty()));
 
-        let mut stats_collector = Vec::with_capacity(readers.len());
-        let mut scalar_batches = Vec::with_capacity(readers.len());
-        for (idx, (reader, deleted)) in readers.iter().enumerate() {
-            let record_batch = reader.get_record_batch(deleted.clone()).map_err(|e| {
-                BuildError::Io(Error::other(format!(
-                    "multi-cell merge input {idx}: read RecordBatch failed: {e}"
-                )))
-            })?;
+        let mut stats_collector = Vec::with_capacity(inputs.len());
+        let mut scalar_batches = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let reader = &input.reader;
+            let record_batch = input.batch(&superfile_builder.opts)?;
             stats_collector.push(SuperfileStats::try_compute_from_record_batch(
                 &record_batch,
             )?);
@@ -1753,7 +1722,8 @@ impl SuperfileBuilder {
             // rebuild time (see the build loop) so a merged cell is re-clustered
             // to the fine-run byte target rather than inheriting a source width.
             let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
-            for (reader_idx, (reader, deleted)) in readers.iter().enumerate() {
+            for (reader_idx, input) in inputs.iter().enumerate() {
+                let (reader, deleted) = (&input.reader, &input.deleted);
                 let v = reader.vec().ok_or(BuildError::VectorReadError)?;
                 let superseded = superseded_per_reader.get(reader_idx);
                 let mut file_doc_base = 0u32;
@@ -1808,8 +1778,8 @@ impl SuperfileBuilder {
             // its parsed merge input: fragments that agree on fine `n_cent`
             // byte-splice, disagreeing ones re-materialize from those sources.
             let mut by_cell: HashMap<u32, Vec<(usize, usize, Sq8IvfMergeInput)>> = HashMap::new();
-            for (reader_idx, (reader, _)) in readers.iter().enumerate() {
-                let v = reader.vec().ok_or(BuildError::VectorReadError)?;
+            for (reader_idx, input) in inputs.iter().enumerate() {
+                let v = input.reader.vec().ok_or(BuildError::VectorReadError)?;
                 let superseded = superseded_per_reader.get(reader_idx);
                 for (ci, &cell_id) in v.packed_cell_ids().iter().enumerate() {
                     if superseded.is_some_and(|s| s.contains(&cell_id)) {
@@ -1890,8 +1860,8 @@ impl SuperfileBuilder {
                 // merged row count — same path the tombstone branch uses.
                 let mut rows: Vec<MaterializedIvfRow> = Vec::new();
                 for (reader_idx, ci, _) in sources {
-                    let v = readers[reader_idx]
-                        .0
+                    let v = inputs[reader_idx]
+                        .reader
                         .vec()
                         .ok_or(BuildError::VectorReadError)?;
                     rows.extend(v.materialized_cell_rows_at(ci)?);
@@ -1966,7 +1936,8 @@ impl SuperfileBuilder {
                 .map_err(|_| BuildError::MissingIdColumn(id_column.clone()))?;
             let n_fts_columns = superfile_builder.opts.fts_columns.len();
             let mut out_lengths: Vec<Vec<u32>> = vec![vec![0; n_out]; n_fts_columns];
-            for (idx, (reader, deleted)) in readers.iter().enumerate() {
+            for (idx, input) in inputs.iter().enumerate() {
+                let (reader, deleted) = (&input.reader, &input.deleted);
                 let Some(fts) = reader.fts() else {
                     continue;
                 };
@@ -2076,7 +2047,7 @@ impl SuperfileBuilder {
         reader: &SuperfileReader,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<SuperfileStats, BuildError> {
-        self.add_batch_from_reader_scoped(reader, deleted_docs_bitmap, CarryScope::AllColumns)
+        self.add_batch_from_reader_scoped(reader, deleted_docs_bitmap, None, CarryScope::AllColumns)
     }
 
     /// As [`Self::add_batch_from_reader`], but `scope` decides which FTS
@@ -2092,21 +2063,16 @@ impl SuperfileBuilder {
         &mut self,
         reader: &SuperfileReader,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+        adapter: Option<&FileSchemaMap>,
         scope: CarryScope,
     ) -> Result<SuperfileStats, BuildError> {
-        self.opts.check_mergeability(
-            reader.id_column(),
-            reader.schema(),
+        self.opts.check_fts_carry_compat(
             reader
                 .fts()
-                .map(|f| f.fts_columns_config().collect::<Vec<_>>()),
-            reader
-                .vec()
-                .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
+                .map(|f| f.fts_columns_config().collect::<Vec<_>>())
+                .as_deref(),
         )?;
-        let record_batch = reader
-            .get_record_batch(deleted_docs_bitmap.clone())
-            .map_err(|_| BuildError::BatchReadError)?;
+        let record_batch = adapted_batch(reader, deleted_docs_bitmap.clone(), adapter, &self.opts)?;
 
         let superfile_stats = SuperfileStats::try_compute_from_record_batch(&record_batch)?;
 
@@ -2177,7 +2143,11 @@ impl SuperfileBuilder {
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
-        let stats = Self::build_from_readers_to(readers, &HashMap::new(), &mut buf)?;
+        let inputs = same_shape_inputs(readers);
+        let base = BuilderOptions::new_from_reader(
+            &inputs.first().ok_or(BuildError::BatchReadError)?.reader,
+        );
+        let stats = Self::build_from_readers_to(&inputs, base, &mut buf)?;
         Ok((buf, stats))
     }
 
@@ -2187,16 +2157,21 @@ impl SuperfileBuilder {
     /// to a temp file and never hold the merged superfile in RAM. Returns the
     /// merged [`SuperfileStats`].
     pub(crate) fn build_from_readers_to<W: Write>(
-        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-        fts_corpus: &HashMap<String, ColumnLengthStats>,
+        inputs: &[MergeInput],
+        base: BuilderOptions,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        let builder_opts = merge_builder_opts(readers, fts_corpus)?;
+        let builder_opts = merge_builder_opts(inputs, base)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
-        let mut stats_collector = Vec::with_capacity(readers.len());
-        for reader in readers {
-            let stats = superfile_builder.add_batch_from_reader(&reader.0, reader.1.clone())?;
+        let mut stats_collector = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let stats = superfile_builder.add_batch_from_reader_scoped(
+                &input.reader,
+                input.deleted.clone(),
+                input.adapter.as_ref(),
+                CarryScope::AllColumns,
+            )?;
             stats_collector.push(stats);
         }
 
@@ -2370,23 +2345,23 @@ impl SuperfileBuilder {
 
     test_visible! {
     fn build_from_readers_fts_merge_to<W: Write>(
-        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-        fts_corpus: &HashMap<String, ColumnLengthStats>,
+        inputs: &[MergeInput],
+        base: BuilderOptions,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        Self::fts_merge_to(readers, fts_corpus, output, PostingMerge::TermByTerm)
+        Self::fts_merge_to(inputs, base, output, PostingMerge::TermByTerm)
     }
     }
 
     /// [`Self::build_from_readers_fts_merge_to`] with the posting path
     /// chosen by `merge`.
     fn fts_merge_to<W: Write>(
-        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-        fts_corpus: &HashMap<String, ColumnLengthStats>,
+        inputs: &[MergeInput],
+        base: BuilderOptions,
         output: W,
         merge: PostingMerge,
     ) -> Result<SuperfileStats, BuildError> {
-        let builder_opts = merge_builder_opts(readers, fts_corpus)?;
+        let builder_opts = merge_builder_opts(inputs, base)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         // Encode the Parquet body incrementally: each input's surviving rows are
@@ -2406,7 +2381,7 @@ impl SuperfileBuilder {
             )?
         };
 
-        let mut stats_collector = Vec::with_capacity(readers.len());
+        let mut stats_collector = Vec::with_capacity(inputs.len());
         // Stream the stable-id sidecar from the merged rows as they are written
         // to the body, in the same order — so the compacted superfile resolves
         // `_id` from the sidecar just like a fresh build. `ids_ok` clears on the
@@ -2419,9 +2394,10 @@ impl SuperfileBuilder {
         // The output row every input document becomes, numbered once and
         // shared by the order and the carry below, so the two cannot
         // disagree about which document a posting belongs to.
-        let mut rows_of: Vec<Vec<Option<RowId>>> = Vec::with_capacity(readers.len());
+        let mut rows_of: Vec<Vec<Option<RowId>>> = Vec::with_capacity(inputs.len());
         let mut n_out_docs: u32 = 0;
-        for (reader, deleted) in readers {
+        for input in inputs {
+            let (reader, deleted) = (&input.reader, &input.deleted);
             let n_local = reader.fts().map_or(0, |f| f.n_docs());
             let (rows, kept) = survivor_rows(n_local, deleted.as_deref(), n_out_docs);
             n_out_docs += kept;
@@ -2431,7 +2407,13 @@ impl SuperfileBuilder {
         // `order[new_id]` is the row that doc id carries. `None` leaves
         // the blob in arrival order, exactly as before.
         let order = match superfile_builder.fts_builder.is_some() {
-            true => Self::merge_doc_order(readers, n_fts_columns, n_out_docs, &rows_of)?,
+            true => {
+                let readers: Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> = inputs
+                    .iter()
+                    .map(|input| (Arc::clone(&input.reader), input.deleted.clone()))
+                    .collect();
+                Self::merge_doc_order(&readers, n_fts_columns, n_out_docs, &rows_of)?
+            }
             false => None,
         };
         // The inverse, which is what the per-input remap needs: the doc
@@ -2470,23 +2452,16 @@ impl SuperfileBuilder {
             write_parquet = 0
         )
         .entered();
-        for (idx, (reader, deleted)) in readers.iter().enumerate() {
-            superfile_builder.opts.check_mergeability(
-                reader.id_column(),
-                reader.schema(),
+        for (idx, input) in inputs.iter().enumerate() {
+            let (reader, deleted) = (&input.reader, &input.deleted);
+            superfile_builder.opts.check_fts_carry_compat(
                 reader
                     .fts()
-                    .map(|f| f.fts_columns_config().collect::<Vec<_>>()),
-                reader
-                    .vec()
-                    .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
+                    .map(|f| f.fts_columns_config().collect::<Vec<_>>())
+                    .as_deref(),
             )?;
             let start = std::time::Instant::now();
-            let record_batch = reader.get_record_batch(deleted.clone()).map_err(|e| {
-                BuildError::Io(Error::other(format!(
-                    "fts merge input {idx}: read RecordBatch failed: {e}"
-                )))
-            })?;
+            let record_batch = input.batch(&superfile_builder.opts)?;
             timings.read_parquet += start.elapsed();
 
             let start = std::time::Instant::now();
@@ -2635,7 +2610,11 @@ impl SuperfileBuilder {
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
-        let stats = Self::build_from_readers_fts_merge_to(readers, &HashMap::new(), &mut buf)?;
+        let inputs = same_shape_inputs(readers);
+        let base = BuilderOptions::new_from_reader(
+            &inputs.first().ok_or(BuildError::BatchReadError)?.reader,
+        );
+        let stats = Self::build_from_readers_fts_merge_to(&inputs, base, &mut buf)?;
         Ok((buf, stats))
     }
 
@@ -3338,16 +3317,106 @@ fn fts_param_json(v: f32) -> String {
 /// A merge's output is only as re-analyzed as its oldest input, and
 /// `new_from_reader` can only see one — see
 /// [`BuilderOptions::lower_analysis_revision_to`].
+/// The options a merge of `inputs` builds its output with: `base` — the
+/// table's schema and index config, as the snapshot derives them — laid
+/// out as the inputs are (a merge of packed multi-cell files writes a
+/// packed file), with every text column's analysis revision lowered to the
+/// oldest among the inputs so carried postings stay honest.
 pub(crate) fn merge_builder_opts(
-    readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-    fts_corpus: &HashMap<String, ColumnLengthStats>,
+    inputs: &[MergeInput],
+    base: BuilderOptions,
 ) -> Result<BuilderOptions, BuildError> {
-    let (first, _) = readers.first().ok_or(BuildError::BatchReadError)?;
-    let mut opts = BuilderOptions::new_from_reader(first).with_fts_corpus_stats(fts_corpus.clone());
-    for (reader, _) in readers.iter().skip(1) {
-        opts.lower_analysis_revision_to(reader);
+    let first = inputs.first().ok_or(BuildError::BatchReadError)?;
+    let layout = match first.reader.vec() {
+        Some(v) if v.is_multi_cell() => VectorLayout::MultiCellIvf,
+        _ => base.vector_layout,
+    };
+    let mut opts = base.with_vector_layout(layout);
+    for input in inputs {
+        opts.lower_analysis_revision_to(&input.reader);
     }
     Ok(opts)
+}
+
+/// One input to a merge: the file, the rows left out of the output, and
+/// how the file's columns line up with the output's.
+pub struct MergeInput {
+    pub reader: Arc<SuperfileReader>,
+    pub deleted: Option<Arc<RoaringBitmap>>,
+    /// Resolves the output's columns in this file. `None` when the file
+    /// must already have the output's shape, which is the case for a
+    /// merge of files the same builder options wrote.
+    pub adapter: Option<FileSchemaMap>,
+}
+
+impl MergeInput {
+    /// An input that must already have the output's shape.
+    pub fn same_shape(reader: Arc<SuperfileReader>, deleted: Option<Arc<RoaringBitmap>>) -> Self {
+        Self {
+            reader,
+            deleted,
+            adapter: None,
+        }
+    }
+
+    /// The input's surviving rows in the output's scalar shape.
+    pub(crate) fn batch(&self, opts: &BuilderOptions) -> Result<RecordBatch, BuildError> {
+        adapted_batch(
+            &self.reader,
+            self.deleted.clone(),
+            self.adapter.as_ref(),
+            opts,
+        )
+    }
+}
+
+/// Inputs that must already have the output's shape, from the readers a
+/// merge of same-table files hands in.
+pub fn same_shape_inputs(
+    readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+) -> Vec<MergeInput> {
+    readers
+        .iter()
+        .map(|(reader, deleted)| MergeInput::same_shape(Arc::clone(reader), deleted.clone()))
+        .collect()
+}
+
+/// `reader`'s rows (minus `deleted`) reshaped to `opts.schema`: as read
+/// when the file already has that shape, else through `adapter`, which
+/// null-fills a column the file predates, casts one it holds in another
+/// type, and finds a renamed one by id. The id column is the table's
+/// identity and is matched by name: a file whose id column is named
+/// otherwise belongs to another table.
+fn adapted_batch(
+    reader: &SuperfileReader,
+    deleted: Option<Arc<RoaringBitmap>>,
+    adapter: Option<&FileSchemaMap>,
+    opts: &BuilderOptions,
+) -> Result<RecordBatch, BuildError> {
+    if reader.id_column() != opts.id_column {
+        return Err(BuildError::IdColumnMismatch(
+            opts.id_column.clone(),
+            reader.id_column().to_string(),
+        ));
+    }
+    let batch = reader
+        .get_record_batch(deleted)
+        .map_err(|_| BuildError::BatchReadError)?;
+    if same_shape(&batch.schema(), &opts.schema) {
+        return Ok(batch);
+    }
+    match adapter {
+        Some(map) => map
+            .adapt(&batch, &opts.schema)
+            .map_err(|e| BuildError::SchemaMismatch {
+                mine: opts.schema.to_string(),
+                other: format!("{} ({e})", batch.schema()),
+            }),
+        None => Err(BuildError::SchemaMismatch {
+            mine: opts.schema.to_string(),
+            other: batch.schema().to_string(),
+        }),
+    }
 }
 
 /// The per-column FTS config the footer carries. `field_id_of` supplies
@@ -5955,18 +6024,20 @@ mod tests {
     fn assert_merge_paths_write_same_bytes(
         inputs: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Vec<u8> {
+        let merge_inputs = same_shape_inputs(inputs);
+        let base = || BuilderOptions::new_from_reader(&merge_inputs[0].reader);
         let mut accumulator = Vec::new();
         SuperfileBuilder::fts_merge_to(
-            inputs,
-            &HashMap::new(),
+            &merge_inputs,
+            base(),
             &mut accumulator,
             PostingMerge::Accumulator,
         )
         .expect("accumulator merge");
         let mut sorted = Vec::new();
         SuperfileBuilder::fts_merge_to(
-            inputs,
-            &HashMap::new(),
+            &merge_inputs,
+            base(),
             &mut sorted,
             PostingMerge::TermByTerm,
         )
@@ -6217,10 +6288,12 @@ mod tests {
                 .build()
                 .expect("thread pool");
             let mut out = Vec::new();
+            let merge_inputs = same_shape_inputs(&inputs);
+            let base = BuilderOptions::new_from_reader(&merge_inputs[0].reader);
             pool.install(|| {
                 SuperfileBuilder::fts_merge_to(
-                    &inputs,
-                    &HashMap::new(),
+                    &merge_inputs,
+                    base,
                     &mut out,
                     PostingMerge::TermByTerm,
                 )

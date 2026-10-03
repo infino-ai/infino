@@ -123,6 +123,7 @@ use crate::{
             },
             fts::{memos_from_plan_locations, plan_locations_for},
             prune::{PruneLeaf, select_superfiles},
+            schema_adapter::TableExprAdapterFactory,
             skip::{ScalarOp, ScalarPredicate},
             superfile_reader::{OpenTierCounts, superfile_reader_tiered},
         },
@@ -1476,7 +1477,8 @@ impl TableProvider for SupertableProvider {
         state
             .runtime_env()
             .register_object_store(url.as_ref(), store);
-        let mut builder = FileScanConfigBuilder::new(url, Arc::new(source));
+        let mut builder = FileScanConfigBuilder::new(url, Arc::new(source))
+            .with_expr_adapter(Some(Arc::new(TableExprAdapterFactory::new(&self.manifest))));
         for file in files {
             builder = builder.with_file(file);
         }
