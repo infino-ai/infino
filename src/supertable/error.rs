@@ -19,7 +19,7 @@ use datafusion::error::DataFusionError;
 use thiserror::Error;
 
 use crate::{
-    storage::{StorageError, permission_denied_in_chain},
+    storage::{StorageError, error_chain, permission_denied_in_chain},
     superfile::error::{BuildError as SuperfileBuildError, FtsError, ReadError, VectorError},
     supertable::{ManifestLoadError, manifest::part},
 };
@@ -693,6 +693,7 @@ impl From<QueryError> for DataFusionError {
 /// | over the connection's memory budget | `OverBudget` |
 /// | an FTS query the column cannot answer: a phrase without positions, nothing positive to rank | `InvalidQuery`: the caller's |
 /// | the store refused our credentials | `PermissionDenied` |
+/// | a local doc id past the superfile's end: our bug, retrying cannot help | `Internal` |
 /// | anything else | `Parquet`: a read failed |
 impl From<ReadError> for QueryError {
     fn from(e: ReadError) -> Self {
@@ -709,6 +710,9 @@ impl From<ReadError> for QueryError {
         }
         if permission_denied_in_chain(&e) {
             return QueryError::PermissionDenied(e.to_string());
+        }
+        if matches!(e, ReadError::DocIdOutOfRange { .. }) {
+            return QueryError::Internal(e.to_string());
         }
         QueryError::Parquet(e.to_string())
     }
@@ -740,6 +744,14 @@ impl QueryError {
     pub(crate) fn over_budget(&self) -> Option<&str> {
         match self {
             QueryError::OverBudget(m) => Some(m),
+            // Ours, carried through the plan, or the plan's own memory pool.
+            QueryError::DataFusion(e) => error_chain(e)
+                .find_map(|link| link.downcast_ref::<QueryError>())
+                .and_then(QueryError::over_budget)
+                .or(match e.find_root() {
+                    DataFusionError::ResourcesExhausted(m) => Some(m.as_str()),
+                    _ => None,
+                }),
             _ => None,
         }
     }
@@ -752,6 +764,12 @@ impl QueryError {
             QueryError::DataFusion(e) => permission_denied_in_chain(e),
             _ => false,
         }
+    }
+
+    /// The tombstone cache failed to load a superfile's deletes; classified
+    /// like any storage failure, labelled so the message says where.
+    pub(crate) fn tombstone_cache(error: impl Error + 'static) -> Self {
+        QueryError::build(format!("tombstone cache: {error}"), &error)
     }
 
     /// Classify a storage-backed query failure whose source is about to be
@@ -799,6 +817,26 @@ mod tests {
             QueryError::from(ReadError::Fts(Box::new(FtsError::NegationOnly))),
             QueryError::InvalidQuery(_)
         ));
+        // A local doc id past the end is our bug: retrying the read cannot help.
+        assert!(matches!(
+            QueryError::from(ReadError::DocIdOutOfRange {
+                doc_id: 9,
+                n_docs: 4
+            }),
+            QueryError::Internal(_)
+        ));
+    }
+
+    /// A budget refusal that crossed DataFusion is still one.
+    #[test]
+    fn a_budget_refusal_inside_datafusion_is_still_over_budget() {
+        let refused = QueryError::DataFusion(DataFusionError::ResourcesExhausted("cap".into()));
+        assert_eq!(refused.over_budget(), Some("cap"));
+        let other = QueryError::DataFusion(DataFusionError::Execution("boom".into()));
+        assert_eq!(other.over_budget(), None);
+        let ours =
+            QueryError::DataFusion(DataFusionError::from(QueryError::OverBudget("ours".into())));
+        assert_eq!(ours.over_budget(), Some("ours"));
     }
 
     #[test]

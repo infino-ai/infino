@@ -119,9 +119,12 @@ impl TableResolver {
             .map_err(|e| open_table_error(name, e))?;
         // `reader()` applies the read-consistency freshness check itself (and,
         // under Strong, fails rather than serving a stale snapshot), so there
-        // is no separate `ensure_fresh` call here. A failure is a manifest
-        // load's, classified as one (a purged table resolves to `NotFound`).
-        let mut reader = table.reader().map_err(QueryError::ManifestLoad)?;
+        // is no separate `ensure_fresh` call here. A failure is classified
+        // like the open's, so a table purged in between is an unknown table
+        // here too, not a separate `NotFound`.
+        let mut reader = table
+            .reader()
+            .map_err(|e| open_table_error(name, InfinoError::from(e)))?;
         // The mint ran on a runtime thread where the scope's thread-local
         // is invisible; hand it the collector captured at registration.
         reader.op_stats = self.op_stats.clone();

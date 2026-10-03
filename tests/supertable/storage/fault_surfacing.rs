@@ -517,6 +517,57 @@ fn a_storage_fault_mid_query_surfaces_as_io_not_a_query_error() {
     assert!(faults.fired() >= 1, "the searches actually hit the fault");
 }
 
+/// The same mid-query read, refused for the credentials in use: the caller
+/// has to see `PermissionDenied` (fix the credentials), not a retryable `Io`.
+#[test]
+fn a_refused_credential_mid_query_surfaces_as_permission_denied() {
+    let (st, faults, _dir) = faulted_table();
+    drop(st);
+    let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+    let st = Supertable::open(default_supertable_options().with_storage(storage)).expect("open");
+
+    for op in [FaultOp::Get, FaultOp::GetRange, FaultOp::Head] {
+        faults.fail_with(FaultKind::PermissionDenied, op, "data/", FANOUT_FAULTS);
+    }
+    let projection = Some(&["title"][..]);
+    let searches = [
+        (
+            "bm25_search",
+            st.bm25_search("title", "alpha", FTS_TOP_K, Default::default(), projection),
+        ),
+        (
+            "token_match",
+            st.token_match("title", "alpha", BoolMode::Or, projection),
+        ),
+        (
+            "exact_match",
+            st.exact_match("title", "first commit alpha", projection),
+        ),
+    ];
+    for (search, result) in searches {
+        let err = result.expect_err("every read of the superfile is refused");
+        assert!(
+            matches!(err, InfinoError::PermissionDenied(_)),
+            "{search}: got {err:?}"
+        );
+    }
+    let reader = st.reader().expect("reader");
+    for sql in [
+        "SELECT title FROM supertable",
+        "SELECT title FROM bm25_search('title', 'alpha', 8)",
+    ] {
+        let err = InfinoError::from(
+            reader
+                .query_sql(sql)
+                .expect_err("every read of the superfile is refused"),
+        );
+        assert!(
+            matches!(err, InfinoError::PermissionDenied(_)),
+            "{sql}: got {err:?}"
+        );
+    }
+}
+
 /// Superfile bytes for the disk-cache cold-read test: four docs, two of
 /// which contain the probe term "special".
 fn fts_superfile_bytes() -> Bytes {

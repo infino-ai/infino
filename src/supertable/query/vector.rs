@@ -1899,7 +1899,7 @@ async fn read_ids_for_locals(
     }
     let batch = take_rows_byte_source(&reader, local_ids, &[id_column])
         .await
-        .map_err(|error| QueryError::Internal(error.to_string()))?;
+        .map_err(QueryError::DataFusion)?;
     id_values_from_batch(&batch)
 }
 
@@ -7057,7 +7057,7 @@ fn subtract_tombstones(
     if let Some(cache) = tombstone_cache {
         let deleted = cache
             .bitmap_for(entry.superfile_id, now)
-            .map_err(|e| QueryError::build(format!("tombstone cache: {e}"), &e))?;
+            .map_err(QueryError::tombstone_cache)?;
         if !deleted.is_empty() {
             *bm -= &*deleted;
         }

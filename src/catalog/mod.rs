@@ -71,7 +71,7 @@ use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
-    error::datafusion_error,
+    error::{datafusion_error, datafusion_planning_error},
     memory::ConnectionMemoryBudget,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::{
@@ -960,11 +960,11 @@ impl Connection {
         let statement = ctx
             .state()
             .sql_to_statement(sql, &Dialect::Generic)
-            .map_err(|e| datafusion_error(&e).with_context("query_sql", None))?;
+            .map_err(|e| datafusion_planning_error(&e).with_context("query_sql", None))?;
         let refs = ctx
             .state()
             .resolve_table_references(&statement)
-            .map_err(|e| datafusion_error(&e).with_context("query_sql", None))?;
+            .map_err(|e| datafusion_planning_error(&e).with_context("query_sql", None))?;
 
         let mut seen = HashSet::new();
         let mut handles: Vec<SupertableHandle> = Vec::new();
@@ -974,15 +974,16 @@ impl Connection {
                 continue;
             }
             match self.open_table_handle(&name) {
-                Ok(table) => {
-                    // Minting its reader can fail like any manifest load (a
-                    // storage fault, refused credentials, a table purged since
-                    // it was opened), and keeps that cause.
-                    table
-                        .register_into(&ctx, &name)
-                        .map_err(|e| InfinoError::from(e).with_context("query_sql", None))?;
-                    handles.push(table);
-                }
+                // Minting its reader can fail like any manifest load (a
+                // storage fault, refused credentials), and keeps that cause. A
+                // table purged since it was opened is skipped like a name that
+                // was never a table, so the planner reports it, as the search
+                // table functions do.
+                Ok(table) => match table.register_into(&ctx, &name).map_err(InfinoError::from) {
+                    Ok(_) => handles.push(table),
+                    Err(InfinoError::NotFound(_)) => {}
+                    Err(e) => return Err(e.with_context("query_sql", None)),
+                },
                 Err(InfinoError::NotFound(_)) => {}
                 Err(e) => return Err(e.with_context("query_sql", None)),
             }
@@ -1022,19 +1023,18 @@ impl Connection {
                         .state()
                         .create_logical_plan(&sql)
                         .await
-                        .map_err(|e| datafusion_error(&e).with_context("query_sql", None))?;
+                        .map_err(|e| datafusion_planning_error(&e))?;
 
                     read_only_sql_options().verify_plan(&plan).map_err(|e| {
                         InfinoError::Query(format!(
                             "query_sql is read-only; writes go through the table's append / update / delete API ({e})"
                         ))
-                        .with_context("query_sql", None)
                     })?;
 
                     let df = planner_ctx
                         .execute_logical_plan(plan)
                         .await
-                        .map_err(|e| datafusion_error(&e).with_context("query_sql", None))?;
+                        .map_err(|e| datafusion_error(&e))?;
 
                     // Execute through the physical plan (what `DataFrame::collect`
                     // does internally) so the plan handle survives execution and
@@ -1044,7 +1044,7 @@ impl Connection {
                     let plan = df
                         .create_physical_plan()
                         .await
-                        .map_err(|e| datafusion_error(&e).with_context("query_sql", None))?;
+                        .map_err(|e| datafusion_error(&e))?;
                     Ok::<_, InfinoError>((task_ctx, plan))
                 }
                 .instrument(detail_span!("sql.plan"))
@@ -1052,7 +1052,6 @@ impl Connection {
             let (task_ctx, plan) = Handle::current().spawn(planning).await.map_err(|join| {
                 // A panic while planning is the engine's fault, never the query's.
                 InfinoError::Backend(format!("planning task failed: {join}"))
-                    .with_context("query_sql", None)
             })??;
             // The shared meter-collect-harvest step: the root wrapper
             // meters the whole plan (aggregation, sort and join work sits
@@ -1063,7 +1062,7 @@ impl Connection {
             let batches = collect_plan_metered(&plan, task_ctx, &op_stats)
                 .instrument(detail_span!("sql.execute"))
                 .await
-                .map_err(|e| datafusion_error(&e).with_context("query_sql", None))?;
+                .map_err(|e| datafusion_error(&e))?;
             if batches.is_empty() {
                 // An empty Vec carries no schema, so hand back one empty batch
                 // instead. Its schema comes from the physical plan, not the
@@ -1079,7 +1078,8 @@ impl Connection {
         // A query that names a `FROM` catalog table drives on that table's
         // runtime; otherwise the connection's own. The fallback still has to
         // be multi-thread: a table-free query can be a search TVF, which
-        // fans out object-store reads under the hood.
+        // fans out object-store reads under the hood. Every error out of
+        // `drive` gets its `query_sql` context here, once.
         let result = match handles.first() {
             Some(table) => table
                 .block_on_query(drive)
@@ -4690,29 +4690,41 @@ mod tests {
     }
 
     #[test]
+    fn query_sql_reports_a_function_argument_rejected_at_planning_as_the_callers() {
+        // DataFusion rejects a bad function argument with an `Execution` error
+        // while it plans, before anything is read: the caller's mistake.
+        let conn = conn_with_docs();
+        let err = conn.query_sql("SELECT arrow_cast(title, 'NotAType') FROM docs");
+        assert!(matches!(err, Err(InfinoError::Query(_))), "got {err:?}");
+    }
+
+    #[test]
     fn query_sql_refuses_writes_the_planner_cannot_plan() {
         // Writes the planner cannot plan today.
         //  - they fail at planning, so they never execute either;
-        //  - the error is the planner's, not the read-only message: a plan
-        //    error, or a statement DataFusion does not implement (`ALTER`).
-        //    Either way the caller's, never an engine fault.
+        //  - the error is the planner's: a shape DataFusion does not
+        //    implement (`ALTER`, an `INSERT` inside a CTE or parentheses, a
+        //    second statement). `TRUNCATE` is the exception: it plans, and the
+        //    read-only check refuses it. Either way never an engine fault.
         // If a DataFusion upgrade learns to plan one, it becomes a DML or DDL node and the gate refuses it.
         let conn = conn_with_docs();
-        for sql in [
-            "ALTER TABLE docs ADD COLUMN y int",
-            "TRUNCATE TABLE docs",
-            "WITH t AS (SELECT 'x' AS title) INSERT INTO docs (title) SELECT title FROM t",
-            "(INSERT INTO docs VALUES (1, 'x'))",
-            "SELECT 1; DROP TABLE docs",
+        for (sql, unimplemented) in [
+            ("ALTER TABLE docs ADD COLUMN y int", true),
+            ("TRUNCATE TABLE docs", false),
+            (
+                "WITH t AS (SELECT 'x' AS title) INSERT INTO docs (title) SELECT title FROM t",
+                true,
+            ),
+            ("(INSERT INTO docs VALUES (1, 'x'))", true),
+            ("SELECT 1; DROP TABLE docs", true),
         ] {
             let err = conn.query_sql(sql);
-            assert!(
-                matches!(
-                    err,
-                    Err(InfinoError::Query(_) | InfinoError::Unsupported(_))
-                ),
-                "{sql:?}: got {err:?}"
-            );
+            let pinned = if unimplemented {
+                matches!(err, Err(InfinoError::Unsupported(_)))
+            } else {
+                matches!(err, Err(InfinoError::Query(_)))
+            };
+            assert!(pinned, "{sql:?}: got {err:?}");
         }
         assert_docs_intact(&conn);
     }

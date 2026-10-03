@@ -1288,7 +1288,7 @@ impl TableProvider for SupertableProvider {
                         let tombstones = match self.tombstone_cache.as_ref() {
                             Some(cache) => cache
                                 .bitmap_for(entry.superfile_id, now)
-                                .map_err(QueryError::store)?,
+                                .map_err(QueryError::tombstone_cache)?,
                             None => Arc::new(RoaringBitmap::new()),
                         };
 

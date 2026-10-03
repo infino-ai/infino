@@ -256,7 +256,7 @@ pub(crate) fn tombstone_deny_set(
 ) -> Result<Option<Arc<RoaringBitmap>>, QueryError> {
     let bitmap = cache
         .bitmap_for(superfile_id, now)
-        .map_err(|e| QueryError::build(format!("tombstone cache: {e}"), &e))?;
+        .map_err(QueryError::tombstone_cache)?;
     Ok((!bitmap.is_empty()).then_some(bitmap))
 }
 
@@ -402,7 +402,7 @@ pub(crate) async fn apply_resolved_tombstone_filter(
     };
     let bitmap = cache
         .bitmap_for(entry.superfile_id, now)
-        .map_err(|e| QueryError::build(format!("tombstone cache: {e}"), &e))?;
+        .map_err(QueryError::tombstone_cache)?;
     if bitmap.is_empty() {
         return Ok(());
     }

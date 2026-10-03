@@ -40,6 +40,17 @@ use crate::{
     },
 };
 
+/// The text DataFusion's parquet row filter wraps a pushed-down predicate's
+/// failure in: `Error evaluating filter predicate: {e:?}`, the predicate's
+/// own `DataFusionError` in `Debug` form inside an `ArrowError::ComputeError`.
+/// The type does not survive that hop, so this text is the one way to tell a
+/// predicate that failed on the caller's data from a scan that failed.
+const PUSHED_DOWN_PREDICATE_FAILED: &str = "Error evaluating filter predicate: ";
+
+/// How the wrapped error starts when an arrow kernel (a cast, a divide)
+/// rejected the caller's values, in that `Debug` form.
+const FAILED_ON_THE_DATA: &str = "ArrowError(";
+
 /// Coarse, stable error type returned by every public infino method.
 ///
 /// Each variant carries a human-readable message (the originating
@@ -200,17 +211,6 @@ impl From<QueryError> for InfinoError {
     }
 }
 
-/// The text DataFusion's parquet row filter wraps a pushed-down predicate's
-/// failure in: `Error evaluating filter predicate: {e:?}`, the predicate's
-/// own `DataFusionError` in `Debug` form inside an `ArrowError::ComputeError`.
-/// The type does not survive that hop, so this text is the one way to tell a
-/// predicate that failed on the caller's data from a scan that failed.
-const PUSHED_DOWN_PREDICATE_FAILED: &str = "Error evaluating filter predicate: ";
-
-/// How the wrapped error starts when an arrow kernel (a cast, a divide)
-/// rejected the caller's values, in that `Debug` form.
-const FAILED_ON_THE_DATA: &str = "ArrowError(";
-
 /// Map a failure DataFusion returned from planning or running a query to the
 /// public error. Our own errors cross a plan typed (see `From<QueryError> for
 /// DataFusionError`), so the cause decides:
@@ -227,15 +227,33 @@ const FAILED_ON_THE_DATA: &str = "ArrowError(";
 /// | `SQL`, `Plan`, `SchemaError`, `Configuration`, `ArrowError` | `Query`: the query or its data |
 /// | `External` holding someone else's error (a regex that does not parse) | `Query` |
 /// | a pushed-down predicate that failed on the data | `Query` |
+/// | `Execution` while turning SQL into a logical plan (see [`datafusion_planning_error`]) | `Query` |
 /// | anything else: `Execution`, `Internal`, a failed task | `Backend` |
 ///
 /// An `External` error at the root that is neither ours nor storage's comes
 /// from a DataFusion function rejecting its arguments, which only the caller
-/// wrote. DataFusion's own `Execution` errors are mixed (a bad `date_bin`
-/// argument next to a missing partition), so they count as ours until shown
-/// otherwise: a false `Backend` reads as an engine fault the caller can report,
-/// a false `Query` blames the caller and hides the bug.
+/// wrote. DataFusion's own `Execution` errors while a query runs are mixed (a
+/// value the caller's function cannot take next to a missing partition), so
+/// they count as ours until shown otherwise: a false `Backend` reads as an
+/// engine fault the caller can report, a false `Query` blames the caller and
+/// hides the bug.
 pub(crate) fn datafusion_error(e: &DataFusionError) -> InfinoError {
+    classify_datafusion_error(e, false)
+}
+
+/// [`datafusion_error`] for a failure turning SQL into a logical plan. No
+/// optimizer has run and no data has been scanned yet, so DataFusion's own
+/// `Execution` there is almost always a function rejecting the caller's
+/// arguments (`arrow_cast(x, 'NotAType')`), and is the caller's. Anything we
+/// read while planning (a search table function opening its table) fails with
+/// our own error, typed, and keeps its own answer. The cost: the few planner
+/// checks DataFusion raises as `Execution` for its own impossible states would
+/// read as `Query` here.
+pub(crate) fn datafusion_planning_error(e: &DataFusionError) -> InfinoError {
+    classify_datafusion_error(e, true)
+}
+
+fn classify_datafusion_error(e: &DataFusionError, planning: bool) -> InfinoError {
     if let Some(cause) = error_chain(e).find_map(|link| link.downcast_ref::<QueryError>()) {
         return InfinoError::from_query_ref(cause);
     }
@@ -261,6 +279,7 @@ pub(crate) fn datafusion_error(e: &DataFusionError) -> InfinoError {
             DataFusionError::ParquetError(_) if pushed_down_predicate_failed_on_the_data(e) => {
                 InfinoError::Query
             }
+            DataFusionError::Execution(_) if planning => InfinoError::Query,
             _ => InfinoError::Backend,
         }
     };
@@ -651,6 +670,31 @@ mod tests {
             InfinoError::from(QueryError::Store("s".into())).to_string(),
             "io: superfile store error during query: s"
         );
+    }
+
+    /// DataFusion's own `Execution` is the caller's only while planning; a
+    /// broken invariant and our own errors keep their answer either way.
+    #[test]
+    fn an_execution_error_is_the_callers_only_while_planning() {
+        let execution = DataFusionError::Execution("bad argument".into());
+        assert!(matches!(
+            datafusion_planning_error(&execution),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&execution),
+            InfinoError::Backend(_)
+        ));
+        let invariant = DataFusionError::Internal("bug".into());
+        assert!(matches!(
+            datafusion_planning_error(&invariant),
+            InfinoError::Backend(_)
+        ));
+        let ours = DataFusionError::from(QueryError::Internal("bug".into()));
+        assert!(matches!(
+            datafusion_planning_error(&ours),
+            InfinoError::Backend(_)
+        ));
     }
 
     /// A DataFusion failure maps by what caused it, not by DataFusion's own
