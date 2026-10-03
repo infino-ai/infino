@@ -207,8 +207,13 @@ impl DiskCacheStore {
     /// The whole-file entry's bytes for `uri` (see [`Self::whole_file_in_memory`]), as one source
     /// over the entire file. A block source the cache entry no longer points at reads through it
     /// instead of object storage.
+    ///
+    /// Only a fully resident reader counts: every byte in memory, no source behind it. A copy with
+    /// a vector hole serves the hole through a block source, possibly the very one asking, which
+    /// would then ask here again and never return.
     pub(crate) fn whole_file_source(&self, uri: &SuperfileUri) -> Option<Arc<dyn LazyByteSource>> {
         self.whole_file_in_memory(uri)
+            .filter(|entry| entry.reader.is_fully_resident())
             .map(|entry| entry.reader.byte_source())
     }
 

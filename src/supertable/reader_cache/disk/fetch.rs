@@ -1569,6 +1569,8 @@ impl LazyByteSource for HoleFallbackSource {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
+        fs,
         path::PathBuf,
         sync::{Arc, atomic::Ordering},
         time::Duration,
@@ -1590,13 +1592,16 @@ mod tests {
             reader_cache::{
                 block_source::{BlockCachedSource, CACHE_BLOCK_BYTES},
                 config::{ColdFetchMode, DiskCacheConfig},
-                disk::{fetch::*, test_support::*},
+                disk::{fetch::*, sources::mmap_readonly_with_handle, test_support::*},
             },
         },
     };
 
     /// Poll cadence while a test waits for a background fill to finish.
     const FILL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    /// How long a read that must finish gets before the test calls it stuck.
+    const READ_DEADLINE: Duration = Duration::from_secs(5);
 
     /// A store over recording storage holding one vector superfile, with a Warm open whose fill is
     /// parked at the only fill permit. Returns the held reader, the permit and the vector hole.
@@ -2990,11 +2995,11 @@ mod tests {
         assert_eq!(recording.n_ranges(), gets, "no read went to object storage");
     }
 
-    /// When the copy that replaced a source has a vector hole, a read of the hole through the
-    /// replaced source returns the real vector bytes: the copy serves its hole from its own block
-    /// cache, never the zeros on disk.
+    /// A copy with a vector hole is not used by a replaced source: its hole is zeros on disk. A
+    /// read of the hole through the replaced source goes to object storage and returns the real
+    /// vector bytes, never the zeros.
     #[tokio::test]
-    async fn a_replaced_source_reads_a_holed_copys_hole_as_real_bytes() {
+    async fn a_replaced_source_never_reads_a_holed_copys_zeros() {
         let (_dir, store) = test_store_with(|cfg| {
             cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
         });
@@ -3043,6 +3048,63 @@ mod tests {
             replaced.range(start, len).await.expect("read the hole") == want,
             "the hole reads as the real vector bytes"
         );
+    }
+
+    /// A holed copy's own block source that cannot fill (budget full, the file pinned so nothing
+    /// can be evicted) still finishes a read of the hole, from object storage. It must not ask the
+    /// cache for the whole file: the holed copy's hole fallback is this same source.
+    #[tokio::test]
+    async fn a_holed_copys_own_source_that_cannot_fill_still_finishes_a_read() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_vector_superfile_bytes();
+        put_superfile(&store, &uri, bytes.clone()).await;
+        let (hole_start, hole_len) = {
+            let reader = SuperfileReader::open(bytes.clone()).expect("open original");
+            vector_blob_range(&reader).expect("vector range")
+        };
+
+        // Nothing can be charged and nothing evicted, so the source can never fill a block.
+        store.budget_bytes.store(0, Ordering::Release);
+        store.set_pinned_fn(Arc::new(move || HashSet::from([uri])));
+
+        // The holed copy as a fill leaves it: the vector range zeroed on disk, served by `source`.
+        let mut holed = bytes.to_vec();
+        holed[hole_start as usize..(hole_start + hole_len) as usize].fill(0);
+        fs::create_dir_all(&store.config.cache_root).expect("cache root");
+        fs::write(store.hole_path(&uri), &holed).expect("holed copy");
+        let (mmap, local) = mmap_readonly_with_handle(&store.hole_path(&uri)).expect("mmap");
+        let inner: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
+            Arc::clone(&store.storage),
+            uri.storage_path(),
+            bytes.len() as u64,
+        ));
+        let source = BlockCachedSource::new_with_accounting(
+            inner,
+            Arc::downgrade(&store),
+            uri,
+            store.blocks_path(&uri),
+            true,
+            None,
+        );
+        let entry = store
+            .holed_mmap_entry(
+                mmap,
+                local,
+                (hole_start, hole_len),
+                Arc::clone(&source),
+                bytes.len() as u64,
+            )
+            .await
+            .expect("holed entry");
+        store.admit_entry(uri, entry);
+
+        let read = timeout(READ_DEADLINE, source.range(hole_start, hole_len))
+            .await
+            .expect("the read finishes")
+            .expect("read the hole");
+        let want = bytes.slice(hole_start as usize..(hole_start + hole_len) as usize);
+        assert!(read == want, "the hole reads as the real vector bytes");
     }
 
     #[tokio::test]

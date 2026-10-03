@@ -314,11 +314,10 @@ impl BlockCachedSource {
         (start.saturating_add(len) <= bf.size).then_some(bf)
     }
 
-    /// The cache's whole-file copy of this superfile, when it holds one. Every async read the
-    /// blocks cannot serve goes through it before object storage. Only a source that has been replaced
-    /// finds one (a live source's entry is lazy), so this is how a reader a query still holds
-    /// after a promotion stays off object storage. A copy with a vector hole serves the hole from
-    /// its own block cache, never from this source, so the read cannot loop back here.
+    /// The cache's fully resident copy of this superfile, when it holds one. Every async read the
+    /// blocks cannot serve goes through it before object storage, so a reader a query still holds
+    /// after a promotion stays off object storage. The copy is plain bytes, never another block
+    /// source, so the read cannot come back here.
     fn whole_file(&self) -> Option<Arc<dyn LazyByteSource>> {
         self.store.upgrade()?.whole_file_source(&self.uri)
     }
@@ -525,6 +524,7 @@ impl LazyByteSource for BlockCachedSource {
         }
     }
 
+    // No whole-file fallback here: a caller that gets `None` takes the async `range`, which has it.
     fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         if len == 0 {
             return Some(Bytes::new());
