@@ -1665,10 +1665,11 @@ pub(crate) fn train_global_centroids(
     n_cells: usize,
 ) -> Option<super::manifest::ClusterCentroids> {
     let vc = user_opts.vector_columns.first()?;
+    let vc_id = user_opts.field_id(&vc.column)?;
     let mut all_centroids = Vec::new();
     let mut dim = 0usize;
     for entry in manifest.superfiles.iter() {
-        let Some(vs) = entry.vector_summary.get(&vc.column) else {
+        let Some(vs) = entry.vector_summary.get(&vc_id) else {
             continue;
         };
         for cell in &vs.cells {
@@ -2510,6 +2511,7 @@ mod tests {
     fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -7664,7 +7666,7 @@ mod tests {
             assert!(
                 !entry
                     .vector_summary
-                    .get("emb")
+                    .get(&manifest.field_id("emb").expect("emb id"))
                     .map(|v| v.cells.iter().all(|cell| cell.clusters.is_empty()))
                     .unwrap_or(true),
                 "packed shard missing cluster summary"
@@ -7904,7 +7906,7 @@ mod tests {
             .flat_map(|entry| {
                 entry
                     .vector_summary
-                    .get("emb")
+                    .get(&manifest.field_id("emb").expect("emb id"))
                     .into_iter()
                     .flat_map(|summary| summary.cells.iter())
             })
@@ -8271,7 +8273,8 @@ mod tests {
         let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
         assert!(!manifest.superfiles.is_empty(), "drain built cell files");
         for entry in manifest.superfiles.iter() {
-            let vs = entry.vector_summary.get("emb").unwrap_or_else(|| {
+            let emb = manifest.field_id("emb").expect("emb id");
+            let vs = entry.vector_summary.get(&emb).unwrap_or_else(|| {
                 panic!(
                     "drain-built hidden superfile {} has NO vector_summary",
                     entry.superfile_id

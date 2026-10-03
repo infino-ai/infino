@@ -445,9 +445,13 @@ impl SupertableReader {
         op_stats: &Option<Arc<OpStatsCollector>>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
         let plan = df.create_physical_plan().await.map_err(plan_query_error)?;
-        collect_plan_metered(&plan, task_ctx, op_stats)
+        let batches = collect_plan_metered(&plan, task_ctx, op_stats)
             .await
-            .map_err(exec_query_error)
+            .map_err(exec_query_error)?;
+        Ok(batches
+            .into_iter()
+            .map(crate::supertable::schema::strip_field_ids)
+            .collect())
     }
 
     /// Resolve a predicate to the matching `_id` values. Used by

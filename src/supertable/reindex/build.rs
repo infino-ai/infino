@@ -238,6 +238,7 @@ mod tests {
 
         let id = Uuid::from_u128(1);
         let honest = Arc::new(SuperfileEntry {
+            physical_schema: None,
             superfile_id: id,
             uri: SuperfileUri(id),
             stem: None,
@@ -259,6 +260,7 @@ mod tests {
         );
 
         let drifted = Arc::new(SuperfileEntry {
+            physical_schema: None,
             n_docs: source.n_docs() + 1,
             ..(*honest).clone()
         });

@@ -13,17 +13,20 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::superfile::{
-    ReadError,
-    error::FtsError,
-    format::{CRC_BYTES, checksum::crc32c},
-    fts::{
-        analysis::{Base, Stemmer, Stopwords},
-        bm25,
-        reader::core::read_doc_length,
-        tokenize::Tokenizer,
+use crate::{
+    superfile::{
+        ReadError,
+        error::FtsError,
+        format::{CRC_BYTES, checksum::crc32c},
+        fts::{
+            analysis::{Base, Stemmer, Stopwords},
+            bm25,
+            reader::core::read_doc_length,
+            tokenize::Tokenizer,
+        },
+        lazy_source::Source,
     },
-    lazy_source::Source,
+    supertable::schema::FieldId,
 };
 
 /// Per-doc BM25 length normalizer, quantized to one byte per doc.
@@ -388,6 +391,8 @@ impl ColumnNorms {
 #[derive(Clone)]
 pub struct ColumnMeta {
     pub name: String,
+    /// The column's stable id, when the writer stamped one.
+    pub field_id: Option<FieldId>,
     pub doc_lengths_range: Range<usize>,
     /// The parameters this column is scored at: the declared pair, or an
     /// override's (see `FtsReader::with_bm25_override`).
@@ -638,6 +643,9 @@ impl ColumnMeta {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FtsColumnConfig {
     pub name: String,
+    /// The column's stable id, when the writer stamped one.
+    #[serde(default)]
+    pub field_id: Option<u32>,
     /// The column's analyzer name: `"ascii_lower"` or `"standard"`.
     /// Required — the builder has always emitted it, so a column entry
     /// without it is a malformed footer and open fails rather than

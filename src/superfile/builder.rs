@@ -130,6 +130,7 @@ use crate::{
             rerank_codec::RerankCodec,
         },
     },
+    supertable::schema::{FieldId, field_id_of, with_field_id},
     utils::{terms::validate_column_name, trace::detail_span},
 };
 
@@ -547,6 +548,9 @@ pub struct BuilderOptions {
     pub id_page_size_limit: usize,
     /// Embedded vector blob layout. Default IVF.
     pub(crate) vector_layout: VectorLayout,
+    /// The table schema version the superfile is written under, stamped
+    /// in the footer as provenance.
+    pub(crate) schema_id: u32,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -616,6 +620,15 @@ impl BuilderOptions {
         fts_columns: Vec<FtsConfig>,
         vector_columns: Vec<VectorConfig>,
     ) -> Self {
+        // A schema the caller never stamped (a standalone superfile, or a
+        // test) gets ids by position: the first field is the id column, the
+        // rest are `1..=n`. Stats and the footer are then keyed the same
+        // way for every superfile, whatever built it.
+        let schema = if schema.fields().iter().any(|f| field_id_of(f).is_some()) {
+            schema
+        } else {
+            stamp_ids_by_position(&schema)
+        };
         Self {
             schema,
             id_column: id_column.into(),
@@ -628,12 +641,26 @@ impl BuilderOptions {
             id_page_size_limit: DEFAULT_ID_PAGE_SIZE_LIMIT,
             vector_layout: VectorLayout::Ivf,
             fts_corpus_stats: HashMap::new(),
+            schema_id: 1,
         }
     }
 
     pub(crate) fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
         self.vector_layout = layout;
         self
+    }
+
+    pub(crate) fn with_schema_id(mut self, schema_id: u32) -> Self {
+        self.schema_id = schema_id;
+        self
+    }
+
+    /// The field id stamped on `column` in this builder's schema, if any.
+    fn field_id_of_column(&self, column: &str) -> Option<FieldId> {
+        self.schema
+            .field_with_name(column)
+            .ok()
+            .and_then(field_id_of)
     }
 
     /// Lower each FTS column's carried analysis revision to the lowest
@@ -878,7 +905,7 @@ impl BuilderOptions {
             ));
         }
 
-        if self.schema.fields() != remote_schema.fields() {
+        if !same_shape(&self.schema, remote_schema) {
             return Err(BuildError::SchemaMismatch {
                 mine: self.schema.to_string(),
                 other: remote_schema.to_string(),
@@ -1172,7 +1199,7 @@ impl SuperfileBuilder {
         vectors: &[&[f32]],
         index_fts: bool,
     ) -> Result<(), BuildError> {
-        if batch.schema().fields() != self.opts.schema.fields() {
+        if !same_shape(&batch.schema(), &self.opts.schema) {
             return Err(BuildError::BatchSchemaMismatch {
                 batch: batch.schema().to_string(),
                 builder: self.opts.schema.to_string(),
@@ -1235,7 +1262,7 @@ impl SuperfileBuilder {
     /// tokenizes, so feeding it rows without also carrying their postings
     /// under-indexes the file.
     pub(crate) fn add_batch_ids_only(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
-        if batch.schema().fields() != self.opts.schema.fields() {
+        if !same_shape(&batch.schema(), &self.opts.schema) {
             return Err(BuildError::BatchSchemaMismatch {
                 batch: batch.schema().to_string(),
                 builder: self.opts.schema.to_string(),
@@ -1258,6 +1285,12 @@ impl SuperfileBuilder {
                 .expect("projection indices are derived from the validated schema"),
             None => batch.clone(),
         };
+        // Rewrapped under the builder's own Parquet schema, which carries
+        // the field ids: the caller's batch was checked to have the same
+        // shape and need not carry any metadata of its own.
+        let stored =
+            RecordBatch::try_new(Arc::clone(&self.parquet_schema), stored.columns().to_vec())
+                .expect("same shape as the validated batch, differing only in field metadata");
         self.batches.push(stored);
     }
 
@@ -2956,19 +2989,20 @@ fn superfile_kvs(
         (kv::ID_COLUMN.into(), options.id_column.clone()),
         (kv::N_DOCS.into(), n_docs.to_string()),
         (kv::BUILDER.into(), crate::BUILDER_ID.to_string()),
+        (kv::SCHEMA_ID.into(), options.schema_id.to_string()),
     ];
     if !options.fts_columns.is_empty() {
         // Each column records its own analyzer name (per-field analysis);
         // `fts_tokenizers` is aligned 1:1 with `fts_columns`.
         kvs.push((
             kv::FTS_COLUMNS.into(),
-            fts_columns_json(&options.fts_columns),
+            fts_columns_json(&options.fts_columns, |c| options.field_id_of_column(c)),
         ));
     }
     if !options.vector_columns.is_empty() {
         kvs.push((
             kv::VEC_COLUMNS.into(),
-            vec_columns_json(&options.vector_columns),
+            vec_columns_json(&options.vector_columns, |c| options.field_id_of_column(c)),
         ));
         if options.vector_layout != VectorLayout::Ivf {
             kvs.push((
@@ -2984,6 +3018,32 @@ fn superfile_kvs(
         }
     }
     Ok(kvs)
+}
+
+/// Whether two schemas declare the same columns in the same order: name,
+/// type and nullability per field. Field metadata is not compared, because
+/// the field ids the builder stamps are its own bookkeeping, not part of
+/// the shape a caller's batch has to match.
+pub(crate) fn same_shape(a: &Schema, b: &Schema) -> bool {
+    a.fields().len() == b.fields().len()
+        && a.fields().iter().zip(b.fields().iter()).all(|(x, y)| {
+            x.name() == y.name()
+                && x.data_type() == y.data_type()
+                && x.is_nullable() == y.is_nullable()
+        })
+}
+
+/// `schema` with field ids assigned by position: the first field (the id
+/// column) gets [`FieldId::ID_COLUMN`], the rest `1..=n`. This is exactly the
+/// numbering a table created from the same user schema would mint.
+pub(crate) fn stamp_ids_by_position(schema: &Arc<Schema>) -> Arc<Schema> {
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| Arc::new(with_field_id(f, FieldId(i as u32))))
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 /// Rebuild a scalar `RecordBatch` whose rows follow `ordered_ids`.
@@ -3290,7 +3350,11 @@ pub(crate) fn merge_builder_opts(
     Ok(opts)
 }
 
-fn fts_columns_json(cols: &[FtsConfig]) -> String {
+/// The per-column FTS config the footer carries. `field_id_of` supplies
+/// each column's stable id; a column without one (a builder over a schema
+/// that was never stamped) is written without the key, which readers
+/// treat as "resolve by name".
+fn fts_columns_json(cols: &[FtsConfig], field_id_of: impl Fn(&str) -> Option<FieldId>) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
@@ -3298,7 +3362,12 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         }
         s.push_str(r#"{"name":""#);
         s.push_str(&escape_json(&c.column));
-        s.push_str(r#"","tokenizer":""#);
+        s.push('"');
+        if let Some(id) = field_id_of(&c.column) {
+            s.push_str(r#","field_id":"#);
+            s.push_str(&id.to_string());
+        }
+        s.push_str(r#","tokenizer":""#);
         s.push_str(&escape_json(&c.analyzer));
         s.push('"');
         // Always emitted — see the function docs.
@@ -3356,7 +3425,10 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
 /// The reader at open time parses this back for the column name, dim, rot_seed,
 /// and metric; the physical centroid count comes from each subsection's own
 /// on-disk directory, not from this record.
-fn vec_columns_json(cols: &[VectorConfig]) -> String {
+fn vec_columns_json(
+    cols: &[VectorConfig],
+    field_id_of: impl Fn(&str) -> Option<FieldId>,
+) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
@@ -3364,7 +3436,12 @@ fn vec_columns_json(cols: &[VectorConfig]) -> String {
         }
         s.push_str(r#"{"column":""#);
         s.push_str(&escape_json(&c.column));
-        s.push_str(r#"","dim":"#);
+        s.push('"');
+        if let Some(id) = field_id_of(&c.column) {
+            s.push_str(r#","field_id":"#);
+            s.push_str(&id.to_string());
+        }
+        s.push_str(r#","dim":"#);
         s.push_str(&c.dim.to_string());
         s.push_str(r#","rot_seed":"#);
         s.push_str(&c.rot_seed.to_string());
@@ -3699,6 +3776,96 @@ mod tests {
         assert!(!kv.contains_key("inf.vec.offset"));
     }
 
+    /// A schema stamped with field ids writes them into every place a
+    /// reader can resolve a column by identity: the Parquet field id (read
+    /// back as field metadata), the FTS column config, and the provenance
+    /// stamp of the table schema version.
+    #[test]
+    fn stamped_field_ids_round_trip_through_footer_and_schema() {
+        let user = schema_with_fts();
+        let stamped: Vec<Arc<Field>> = user
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == "title" {
+                    Arc::new(with_field_id(f, FieldId(7)))
+                } else {
+                    Arc::clone(f)
+                }
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(stamped));
+        let opts = BuilderOptions::new(
+            schema.clone(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        )
+        .with_schema_id(3);
+        let mut b = SuperfileBuilder::new(opts).expect("new builder");
+        b.add_batch(&batch_two_rows(&schema), &[])
+            .expect("add_batch");
+        let bytes = b.finish().expect("finish builder");
+
+        let kv = read_kv_metadata(&bytes).expect("read kv metadata");
+        assert_eq!(kv.get(kv::SCHEMA_ID).map(String::as_str), Some("3"));
+        let fts_json = kv.get(kv::FTS_COLUMNS).expect("fts columns kv");
+        assert!(
+            fts_json.contains(r#""name":"title","field_id":7,"#),
+            "field id rides next to the name: {fts_json}"
+        );
+
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+        let title = reader
+            .schema()
+            .field_with_name("title")
+            .expect("title field");
+        assert_eq!(field_id_of(title), Some(FieldId(7)));
+        let id_col = reader
+            .schema()
+            .field_with_name("doc_id")
+            .expect("id column");
+        assert_eq!(
+            field_id_of(id_col),
+            None,
+            "the id column carries no field id"
+        );
+    }
+
+    /// A schema without ids (a standalone superfile, or a test) gets them by
+    /// position, so the footer and the stored schema are keyed exactly as a
+    /// table created from the same columns would key them: the id column is
+    /// the reserved id, the user columns count from one.
+    #[test]
+    fn an_unstamped_schema_is_stamped_by_position() {
+        let mut b = SuperfileBuilder::new(opts_minimal()).expect("new SuperfileBuilder");
+        let schema = schema_with_fts();
+        b.add_batch(&batch_two_rows(&schema), &[])
+            .expect("add_batch");
+        let bytes = b.finish().expect("finish builder");
+        let kv = read_kv_metadata(&bytes).expect("read kv metadata");
+        assert!(
+            kv.get(kv::FTS_COLUMNS)
+                .expect("fts kv")
+                .contains(r#""name":"title","field_id":1,"#)
+        );
+        assert_eq!(kv.get(kv::SCHEMA_ID).map(String::as_str), Some("1"));
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+        let stored = reader.schema();
+        assert_eq!(
+            field_id_of(stored.field_with_name("doc_id").expect("id column")),
+            Some(FieldId::ID_COLUMN)
+        );
+        assert_eq!(
+            field_id_of(stored.field_with_name("title").expect("title")),
+            Some(FieldId(1))
+        );
+        assert_eq!(
+            field_id_of(stored.field_with_name("body").expect("body")),
+            Some(FieldId(2))
+        );
+    }
+
     #[test]
     fn finish_emits_kv_pointers_for_vectors() {
         let opts = BuilderOptions::new(
@@ -3733,13 +3900,16 @@ mod tests {
     /// unrecorded column with the revision its writer would have emitted.
     #[test]
     fn every_column_records_its_analysis_revision() {
-        let fresh = fts_columns_json(&[FtsConfig::new("title")]);
+        let fresh = fts_columns_json(&[FtsConfig::new("title")], |_| None);
         assert!(
             fresh.contains(r#""analysis_revision":1"#),
             "a freshly analyzed column records this engine's revision: {fresh}"
         );
 
-        let carried = fts_columns_json(&[FtsConfig::new("title").carried_analysis_revision(0)]);
+        let carried = fts_columns_json(
+            &[FtsConfig::new("title").carried_analysis_revision(0)],
+            |_| None,
+        );
         assert!(
             carried.contains(r#""analysis_revision":0"#),
             "a known-stale column records the zero rather than omitting it: {carried}"
@@ -3878,7 +4048,7 @@ mod tests {
     #[test]
     fn fts_columns_json_round_trip_shape() {
         let cols = vec![FtsConfig::new("title"), FtsConfig::new("body")];
-        let s = fts_columns_json(&cols);
+        let s = fts_columns_json(&cols, |_| None);
         assert!(s.starts_with('['));
         assert!(s.contains(r#""name":"title""#));
         assert!(s.contains(r#""name":"body""#));
@@ -3898,7 +4068,7 @@ mod tests {
             FtsConfig::new("title").positions(true),
             FtsConfig::new("body"),
         ];
-        let s = fts_columns_json(&cols);
+        let s = fts_columns_json(&cols, |_| None);
         assert!(
             s.contains(
                 r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true,"analysis_revision":1}"#
@@ -3922,7 +4092,7 @@ mod tests {
             FtsConfig::new("title").analyzer("standard"),
             FtsConfig::new("body").analyzer("ascii_lower"),
         ];
-        let s = fts_columns_json(&cols);
+        let s = fts_columns_json(&cols, |_| None);
         assert!(
             s.contains(
                 r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
@@ -3945,7 +4115,7 @@ mod tests {
             FtsConfig::new("title"),
             FtsConfig::new("body").stored(false),
         ];
-        let s = fts_columns_json(&cols);
+        let s = fts_columns_json(&cols, |_| None);
         assert!(
             s.contains(
                 r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
@@ -4271,7 +4441,7 @@ mod tests {
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }];
-        let s = vec_columns_json(&cols);
+        let s = vec_columns_json(&cols, |_| None);
         assert!(s.contains(r#""column":"emb""#));
         assert!(s.contains(r#""dim":384"#));
         assert!(
@@ -4330,15 +4500,15 @@ mod tests {
             "scalar_stats should have column entries"
         );
         assert!(
-            stats.scalar_stats.contains_key("doc_id"),
+            stats.scalar_stats.contains_key(&FieldId::ID_COLUMN),
             "scalar_stats should contain id_column"
         );
         assert!(
-            stats.scalar_stats.contains_key("title"),
+            stats.scalar_stats.contains_key(&FieldId(1)),
             "scalar_stats should contain FTS column"
         );
         assert!(
-            stats.scalar_stats.contains_key("body"),
+            stats.scalar_stats.contains_key(&FieldId(2)),
             "scalar_stats should contain body column"
         );
 
@@ -4346,7 +4516,7 @@ mod tests {
         // doc_id: IDs are [10, 11], so min=10, max=11
         let id_agg = stats
             .scalar_stats
-            .get("doc_id")
+            .get(&FieldId::ID_COLUMN)
             .expect("doc_id should have stats");
         let (id_min_arr, id_max_arr) = (&id_agg.min, &id_agg.max);
         let id_min = id_min_arr
@@ -4365,7 +4535,7 @@ mod tests {
         // title: ["hello world", "rust async"], so min="hello world", max="rust async"
         let title_agg = stats
             .scalar_stats
-            .get("title")
+            .get(&FieldId(1))
             .expect("title should have stats");
         let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
@@ -4387,7 +4557,7 @@ mod tests {
         // body: ["foo bar", "baz quux"], so min="baz quux", max="foo bar"
         let body_agg = stats
             .scalar_stats
-            .get("body")
+            .get(&FieldId(2))
             .expect("body should have stats");
         let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
@@ -4850,9 +5020,9 @@ mod tests {
         assert_eq!(stats.n_docs, 2);
         assert_eq!(stats.id_min, 10);
         assert_eq!(stats.id_max, 11);
-        assert!(stats.scalar_stats.contains_key("doc_id"));
-        assert!(stats.scalar_stats.contains_key("title"));
-        assert!(stats.scalar_stats.contains_key("body"));
+        assert!(stats.scalar_stats.contains_key(&FieldId::ID_COLUMN));
+        assert!(stats.scalar_stats.contains_key(&FieldId(1)));
+        assert!(stats.scalar_stats.contains_key(&FieldId(2)));
 
         // Verify data is preserved
         let merged_reader =
@@ -6639,7 +6809,10 @@ mod tests {
                 .expect("build_from_readers");
 
         // Verify doc_id min/max (10, 11)
-        let doc_id_agg = stats.scalar_stats.get("doc_id").expect("doc_id column");
+        let doc_id_agg = stats
+            .scalar_stats
+            .get(&FieldId::ID_COLUMN)
+            .expect("doc_id column");
         let (doc_id_min_arr, doc_id_max_arr) = (&doc_id_agg.min, &doc_id_agg.max);
         let doc_id_min = doc_id_min_arr
             .as_ref()
@@ -6657,7 +6830,7 @@ mod tests {
         assert_eq!(doc_id_max, 11, "doc_id max should be 11");
 
         // Verify title min/max (from batch_two_rows: ["hello world", "rust async"])
-        let title_agg = stats.scalar_stats.get("title").expect("title column");
+        let title_agg = stats.scalar_stats.get(&FieldId(1)).expect("title column");
         let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_ref()
@@ -6678,7 +6851,7 @@ mod tests {
         assert_eq!(title_max, "rust async", "title max should be 'rust async'");
 
         // Verify body min/max (from batch_two_rows: ["foo bar", "baz quux"])
-        let body_agg = stats.scalar_stats.get("body").expect("body column");
+        let body_agg = stats.scalar_stats.get(&FieldId(2)).expect("body column");
         let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_ref()
@@ -6735,7 +6908,10 @@ mod tests {
         .expect("build_from_readers");
 
         // Verify doc_id: min should be 10, max should be 21 (merged from both readers)
-        let doc_id_agg = stats.scalar_stats.get("doc_id").expect("doc_id column");
+        let doc_id_agg = stats
+            .scalar_stats
+            .get(&FieldId::ID_COLUMN)
+            .expect("doc_id column");
         let (doc_id_min_arr, doc_id_max_arr) = (&doc_id_agg.min, &doc_id_agg.max);
         let doc_id_min = doc_id_min_arr
             .as_ref()
@@ -6753,7 +6929,7 @@ mod tests {
         assert_eq!(doc_id_max, 21, "merged doc_id max should be 21");
 
         // Verify title: min should be "alpha", max should be "zeta" (lexicographically from both readers)
-        let title_agg = stats.scalar_stats.get("title").expect("title column");
+        let title_agg = stats.scalar_stats.get(&FieldId(1)).expect("title column");
         let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_ref()
@@ -6771,7 +6947,7 @@ mod tests {
         assert_eq!(title_max, "zeta", "merged title max should be 'zeta'");
 
         // Verify body: min should be "aaa", max should be "zzz" (lexicographically from both readers)
-        let body_agg = stats.scalar_stats.get("body").expect("body column");
+        let body_agg = stats.scalar_stats.get(&FieldId(2)).expect("body column");
         let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_ref()
@@ -6818,7 +6994,7 @@ mod tests {
                 .expect("build_from_readers");
 
         // Verify title min/max (values: ["zebra", "apple"] => min="apple", max="zebra")
-        let title_agg = stats.scalar_stats.get("title").expect("title column");
+        let title_agg = stats.scalar_stats.get(&FieldId(1)).expect("title column");
         let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_ref()
@@ -6836,7 +7012,7 @@ mod tests {
         assert_eq!(title_max, "zebra", "title max should be 'zebra'");
 
         // Verify body min/max (values: ["xyz", "abc"] => min="abc", max="xyz")
-        let body_agg = stats.scalar_stats.get("body").expect("body column");
+        let body_agg = stats.scalar_stats.get(&FieldId(2)).expect("body column");
         let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_ref()

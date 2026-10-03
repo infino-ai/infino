@@ -84,6 +84,7 @@ use crate::{
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::superfile_reader::superfile_reader,
         reader_cache::ReadIntent,
+        schema::{FieldId, PhysicalSchema},
         utils::vector_split::split_vectors,
         wal::{
             persistence::{Etag, WalStore, WalStoreError},
@@ -510,6 +511,7 @@ async fn do_apply(
     let uri = SuperfileUri(preallocated_superfile_id);
     let entry = Arc::new(SuperfileEntry {
         stem: None,
+        physical_schema: Some(Arc::new(PhysicalSchema::of_reader(&reader))),
         // Stamped to the winning commit version later, in `ManifestSnapshot::update`.
         birth_version: 0,
         superfile_id: preallocated_superfile_id,
@@ -662,14 +664,17 @@ fn prepend_id_column(
 fn build_vector_summary(
     reader: &SuperfileReader,
     options: &SupertableOptions,
-) -> HashMap<String, VectorSummary> {
-    let mut out: HashMap<String, VectorSummary> = HashMap::new();
+) -> HashMap<FieldId, VectorSummary> {
+    let mut out: HashMap<FieldId, VectorSummary> = HashMap::new();
     let Some(vec_reader) = reader.vec() else {
         return out;
     };
     for vc in &options.vector_columns {
-        if let Some(summary) = build_column_vector_summary(vec_reader, vc) {
-            out.insert(vc.column.clone(), summary);
+        if let (Some(id), Some(summary)) = (
+            options.field_id(&vc.column),
+            build_column_vector_summary(vec_reader, vc),
+        ) {
+            out.insert(id, summary);
         }
     }
     out

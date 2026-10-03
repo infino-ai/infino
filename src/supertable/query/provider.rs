@@ -128,6 +128,7 @@ use crate::{
             superfile_reader::{OpenTierCounts, superfile_reader_tiered},
         },
         reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
+        schema::FieldId,
         tombstones::SidecarCache,
     },
     utils::trace::{self, detail_span, tiered_span},
@@ -393,8 +394,9 @@ impl SupertableProvider {
             .complete_flat_superfiles()
             .and_then(|entries| {
                 let mut merged: Option<ScalarValueCounts> = None;
+                let id = self.manifest.field_id(column)?;
                 for entry in entries {
-                    let counts = entry.scalar_stats.get(column)?.value_counts.as_ref()?;
+                    let counts = entry.scalar_stats.get(&id)?.value_counts.as_ref()?;
                     merged = Some(match merged {
                         None => counts.clone(),
                         Some(current) => current.merged_with(counts)?,
@@ -717,25 +719,28 @@ impl SupertableProvider {
                     return stats;
                 }
                 let mut stats = ColumnStatistics::new_unknown();
+                let Some(column) = self.manifest.field_id(name) else {
+                    return stats;
+                };
                 // A range covering the column type's whole domain is
                 // withheld rather than reported — see `spans_full_domain`.
-                if let Some((min, max)) = scalar_min_max(entries, name)
+                if let Some((min, max)) = scalar_min_max(entries, column)
                     && !spans_full_domain(&min, &max)
                 {
                     stats.min_value = wrap(min);
                     stats.max_value = wrap(max);
                 }
-                if let Some(nulls) = scalar_null_count(entries, name) {
+                if let Some(nulls) = scalar_null_count(entries, column) {
                     stats.null_count = if clean {
                         Precision::Exact(nulls as usize)
                     } else {
                         Precision::Inexact(nulls as usize)
                     };
                 }
-                if let Some(sum) = scalar_sum(entries, name) {
+                if let Some(sum) = scalar_sum(entries, column) {
                     stats.sum_value = wrap(sum);
                 }
-                if let Some(distinct) = scalar_distinct(entries, name) {
+                if let Some(distinct) = scalar_distinct(entries, column) {
                     // A sketch estimate — never exact.
                     stats.distinct_count = Precision::Inexact(distinct);
                 }
@@ -765,18 +770,18 @@ fn id_min_max(entries: &[Arc<SuperfileEntry>]) -> Option<(ScalarValue, ScalarVal
 /// Total null count of column `name` across `entries`; `None` unless
 /// every entry carries the stat (a missing side makes the total
 /// unknowable).
-fn scalar_null_count(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<u64> {
+fn scalar_null_count(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<u64> {
     entries.iter().try_fold(0u64, |acc, entry| {
-        acc.checked_add(entry.scalar_stats.get(name)?.null_count?)
+        acc.checked_add(entry.scalar_stats.get(&column)?.null_count?)
     })
 }
 
 /// Exact sum of column `name` across `entries`; `None` unless every
 /// entry carries it and the fold doesn't overflow.
-fn scalar_sum(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<ScalarValue> {
+fn scalar_sum(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<ScalarValue> {
     let mut acc: Option<ArrayRef> = None;
     for entry in entries {
-        let part = entry.scalar_stats.get(name)?.sum.as_ref()?;
+        let part = entry.scalar_stats.get(&column)?.sum.as_ref()?;
         acc = Some(match acc {
             None => Arc::clone(part),
             Some(total) => add_sum_arrays(&total, part)?,
@@ -788,10 +793,10 @@ fn scalar_sum(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<ScalarValue
 /// HLL distinct-count estimate for column `name` across `entries`;
 /// `None` unless every entry carries a sketch. Sketch unions are
 /// exact, so the merged estimate has single-sketch accuracy.
-fn scalar_distinct(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<usize> {
+fn scalar_distinct(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<usize> {
     let mut merged: Option<HllSketch> = None;
     for entry in entries {
-        let sketch = HllSketch::from_bytes(entry.scalar_stats.get(name)?.hll.as_ref()?)?;
+        let sketch = HllSketch::from_bytes(entry.scalar_stats.get(&column)?.hll.as_ref()?)?;
         merged = Some(match merged {
             None => sketch,
             Some(mut acc) => {
@@ -805,11 +810,11 @@ fn scalar_distinct(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<usize>
 
 fn scalar_min_max(
     entries: &[Arc<SuperfileEntry>],
-    name: &str,
+    column: FieldId,
 ) -> Option<(ScalarValue, ScalarValue)> {
     let mut acc: Option<(ScalarValue, ScalarValue)> = None;
     for entry in entries {
-        let agg = entry.scalar_stats.get(name)?;
+        let agg = entry.scalar_stats.get(&column)?;
         let min = ScalarValue::try_from_array(&agg.min, 0).ok()?;
         let max = ScalarValue::try_from_array(&agg.max, 0).ok()?;
         if min.is_null() || max.is_null() {
@@ -1232,9 +1237,10 @@ impl TableProvider for SupertableProvider {
                                 .get(&prepared.path)
                                 .map(|m| Arc::clone(m.value()));
                             let full_walk_pays = |column: &str| {
-                                let terms = entry
-                                    .fts_summary
-                                    .get(column)
+                                let terms = self
+                                    .manifest
+                                    .field_id(column)
+                                    .and_then(|id| entry.fts_summary.get(&id))
                                     .map_or(0, |summary| summary.n_terms_distinct);
                                 let bytes = meta
                                     .as_ref()
@@ -2151,7 +2157,7 @@ mod tests {
             Supertable, SupertableOptions,
             manifest::{ScalarStatsAgg, SuperfileUri},
         },
-        test_helpers::default_tokenizer,
+        test_helpers::{default_tokenizer, fid},
     };
 
     /// Per-column tokenizer resolver for the pruning-walker tests: every
@@ -3163,8 +3169,9 @@ mod tests {
         let mn: ArrayRef = Arc::new(LargeStringArray::from(vec![min]));
         let mx: ArrayRef = Arc::new(LargeStringArray::from(vec![max]));
         let mut scalar_stats = HashMap::new();
-        scalar_stats.insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
+        scalar_stats.insert(fid(col), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
@@ -3190,21 +3197,24 @@ mod tests {
     fn scalar_statistics_helpers_return_none_when_stat_absent() {
         let entries = vec![entry_minmax_only("s", "alpha", "omega")];
         // Column present, but the additive stats are absent → None.
-        assert!(scalar_sum(&entries, "s").is_none(), "no sum stat → None");
         assert!(
-            scalar_distinct(&entries, "s").is_none(),
+            scalar_sum(&entries, fid("s")).is_none(),
+            "no sum stat → None"
+        );
+        assert!(
+            scalar_distinct(&entries, fid("s")).is_none(),
             "no hll stat → None"
         );
         assert!(
-            scalar_null_count(&entries, "s").is_none(),
+            scalar_null_count(&entries, fid("s")).is_none(),
             "no null_count stat → None"
         );
         // min/max IS present for the column.
-        assert!(scalar_min_max(&entries, "s").is_some());
+        assert!(scalar_min_max(&entries, fid("s")).is_some());
         // A column absent from every entry yields None for all helpers.
-        assert!(scalar_sum(&entries, "missing").is_none());
-        assert!(scalar_min_max(&entries, "missing").is_none());
-        assert!(scalar_null_count(&entries, "missing").is_none());
+        assert!(scalar_sum(&entries, fid("missing")).is_none());
+        assert!(scalar_min_max(&entries, fid("missing")).is_none());
+        assert!(scalar_null_count(&entries, fid("missing")).is_none());
     }
 
     /// `CachedMetadataReaderFactory`'s `Debug` reports the superfile

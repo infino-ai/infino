@@ -246,6 +246,7 @@ mod tests {
 
     fn entry() -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: TestUuid::new_v4(),

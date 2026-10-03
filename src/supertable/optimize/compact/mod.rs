@@ -875,6 +875,7 @@ impl Supertable {
                 term_contribution,
             }) => {
                 let merged_entry = Arc::new(SuperfileEntry {
+                    physical_schema: None,
                     // Carry the OLDEST input's birth_version so a merge of
                     // already-drained inputs stays <= the drain watermark
                     // (skipped, not re-drained). See the hidden-index
@@ -2061,6 +2062,7 @@ mod tests {
             .expect("one superfile")
             .clone();
         let output = Arc::new(SuperfileEntry {
+            physical_schema: None,
             superfile_id: Uuid::from_u128(0xFEED),
             ..(*input).clone()
         });
@@ -2151,6 +2153,7 @@ mod tests {
             .expect("one superfile")
             .clone();
         let output = Arc::new(SuperfileEntry {
+            physical_schema: None,
             superfile_id: Uuid::from_u128(0xFEED),
             ..(*input).clone()
         });
@@ -2662,7 +2665,13 @@ mod tests {
         let title_stats = merged_superfile
             .entry
             .scalar_stats
-            .get("title")
+            .get(
+                &st.reader()
+                    .expect("reader")
+                    .manifest()
+                    .field_id("title")
+                    .expect("title id"),
+            )
             .expect("merged entry should have title column stats");
 
         // Extract min and max string values from the arrays
@@ -3437,6 +3446,7 @@ mod tests {
         let first = Arc::clone(&current.get_all_superfiles()[0]);
         // `update` stamps the partition key, so the copy arrives unstamped.
         let again = Arc::new(SuperfileEntry {
+            physical_schema: None,
             partition_key: Vec::new(),
             ..(*first).clone()
         });
@@ -3868,7 +3878,7 @@ mod tests {
         // FTS bloom covers the unique first word from each of the 10 input batches
         let fts = sfs[0]
             .fts_summary
-            .get("title")
+            .get(&after.manifest().field_id("title").expect("title id"))
             .expect("fts summary present");
         for term in &[
             b"alpha" as &[u8],
@@ -4388,7 +4398,7 @@ mod tests {
 
         let fts = sfs[0]
             .fts_summary
-            .get("title")
+            .get(&r.manifest().field_id("title").expect("title id"))
             .expect("fts summary present");
         for term in &[
             b"alpha" as &[u8],

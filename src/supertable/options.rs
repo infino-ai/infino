@@ -76,6 +76,7 @@ use crate::{
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
+        schema::{FieldId, TableSchema},
         slow_vector_state::{CentroidSection, ResidentVectorIndex},
         wal::pipeline::DEFAULT_MAX_SEALED_RETRIES,
     },
@@ -308,6 +309,10 @@ pub struct SupertableOptions {
     /// Must NOT contain a field named [`Self::id_column`] — the
     /// supertable injects that column at append time.
     pub schema: Arc<Schema>,
+    /// Stable identity of every user column (see [`crate::supertable::schema`]).
+    /// Derived from `schema` at construction; the ids ride on the stored
+    /// Parquet schema, never on `schema` itself.
+    pub(crate) table_schema: Arc<TableSchema>,
     /// Name of the system-managed primary-key column the
     /// supertable injects on every `append()`. Defaults to
     /// `"_id"`; override via [`Self::with_id_column`] or by
@@ -774,8 +779,10 @@ impl SupertableOptions {
         let writer_pool = shared_writer_pool();
         let store: Arc<dyn SuperfileReaderCache> = Arc::new(InMemoryReaderCache::new());
 
+        let table_schema = Arc::new(TableSchema::from_user_schema(&schema));
         Ok(Self {
             schema,
+            table_schema,
             id_column,
             fts_columns,
             vector_columns,
@@ -839,7 +846,8 @@ impl SupertableOptions {
             false,
         ))];
         fields.extend(self.schema.fields().iter().cloned());
-        Arc::new(Schema::new(fields))
+        self.table_schema
+            .stamp_field_ids(&Schema::new(fields), &self.id_column)
     }
 
     /// Resolve the effective partition strategy for this
@@ -1328,6 +1336,7 @@ impl SupertableOptions {
             self.vector_columns.clone(),
         )
         .with_vector_layout(self.vector_layout)
+        .with_schema_id(self.table_schema.schema_id())
     }
 
     /// Effective scalar-only schema — the user's columns with
@@ -1365,7 +1374,8 @@ impl SupertableOptions {
                 .filter(|f| !vector_names.contains(f.name().as_str()))
                 .cloned(),
         );
-        Arc::new(Schema::new(kept))
+        self.table_schema
+            .stamp_field_ids(&Schema::new(kept), &self.id_column)
     }
 
     /// The readable (stored) schema — [`Self::scalar_schema`] minus
@@ -1393,6 +1403,27 @@ impl SupertableOptions {
             .cloned()
             .collect();
         Arc::new(Schema::new(kept))
+    }
+}
+
+impl SupertableOptions {
+    /// The stable id of `column`: a user column's id, or
+    /// [`FieldId::ID_COLUMN`] for the injected id column. `None` for a name
+    /// the table does not have.
+    pub(crate) fn field_id(&self, column: &str) -> Option<FieldId> {
+        if column == self.id_column {
+            Some(FieldId::ID_COLUMN)
+        } else {
+            self.table_schema.id_of(column)
+        }
+    }
+
+    /// The name resolver for parts and lists written before field ids.
+    pub(crate) fn legacy_names(&self) -> crate::supertable::schema::LegacyNames {
+        crate::supertable::schema::LegacyNames::new(
+            Arc::clone(&self.table_schema),
+            self.id_column.clone(),
+        )
     }
 }
 
@@ -1867,6 +1898,38 @@ supertable:
 
     /// Helper: a minimal valid options instance (no FTS / vector) for
     /// exercising the builder methods that don't touch the schema.
+    /// Field ids are a property of what the table stores, not of what the
+    /// caller declared: the stored schemas carry them in field metadata, in
+    /// declared order from 1, and the user-facing schema is returned exactly
+    /// as it was given.
+    #[test]
+    fn stored_schemas_carry_field_ids_and_the_user_schema_does_not() {
+        use crate::supertable::schema::{FieldId, field_id_of};
+        let opts = plain_opts();
+        for f in opts.user_schema().fields() {
+            assert_eq!(
+                field_id_of(f),
+                None,
+                "user schema is unstamped: {}",
+                f.name()
+            );
+        }
+        let scalar = opts.scalar_schema();
+        assert_eq!(field_id_of(scalar.field(0)), Some(FieldId::ID_COLUMN));
+        for (i, f) in scalar.fields().iter().skip(1).enumerate() {
+            assert_eq!(
+                field_id_of(f),
+                Some(FieldId(i as u32 + 1)),
+                "column {}",
+                f.name()
+            );
+        }
+        let effective = opts.effective_schema();
+        assert_eq!(field_id_of(effective.field(0)), Some(FieldId::ID_COLUMN));
+        assert_eq!(field_id_of(effective.field(1)), Some(FieldId(1)));
+        assert_eq!(opts.builder_options().schema_id, 1);
+    }
+
     fn plain_opts() -> SupertableOptions {
         let s = Arc::new(Schema::new(vec![Field::new(
             "category",
