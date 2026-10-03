@@ -317,15 +317,16 @@ enum CatalogStore {
 
 impl Connection {
     test_visible! {
-        /// Serve `table` of `graph` — an edge table `graph` has indexed with
-        /// `OptimizeOptions::with_adjacency` — to this connection's
-        /// [`query_sql`](Self::query_sql) as `graph_walk(seeds, hops, k)` and
-        /// `graph_rank(seeds, hops, k)`, with no table argument. The table
+        /// Serve `table` of `graph` — an edge table over this connection's
+        /// rows that `graph` has indexed with `OptimizeOptions::with_adjacency`
+        /// — to this connection's [`query_sql`](Self::query_sql) as
+        /// `graph_walk(table, seed_table, seed_ids, hops, k)` and
+        /// `graph_rank(...)`, with no edge-table argument. The edge table
         /// stays `graph`'s: it is not listed, opened or scanned here, and a
-        /// statement reaches it only through the two functions. How a
-        /// platform keeps a derived graph in a catalog of its own while
-        /// statements over the user's tables join to it. Attaching again
-        /// replaces the earlier graph.
+        /// statement reaches it only through the two functions, which return
+        /// rows of this connection's tables. How a platform keeps a derived
+        /// graph in a catalog of its own while statements over the user's
+        /// tables walk it. Attaching again replaces the earlier graph.
         #[cfg(feature = "graph-index")]
         fn attach_graph(&self, graph: Connection, table: &str) {
             *self
@@ -1029,9 +1030,9 @@ impl Connection {
                 .clone();
             match attached {
                 Some((graph, table)) => {
-                    search_tvf::register_graph_tvfs(&ctx, graph, Some(table));
+                    search_tvf::register_graph_tvfs(&ctx, graph, self.clone(), Some(table));
                 }
-                None => search_tvf::register_graph_tvfs(&ctx, self.clone(), None),
+                None => search_tvf::register_graph_tvfs(&ctx, self.clone(), self.clone(), None),
             }
         }
         trace::follow_spans_into_datafusion_tasks();

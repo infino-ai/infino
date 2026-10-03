@@ -968,14 +968,17 @@ impl GcSettings {
 }
 
 /// Which columns of an edge table carry the graph `optimize()` builds a
-/// resident adjacency index over: the `Int64` source and destination node
-/// columns, and the string column holding the source node's key.
+/// resident adjacency index over. A node is a row of some table — its
+/// table's name and its stable `_id` — so an edge is four columns: the
+/// source row's table (a string) and `_id` (the engine's `Decimal128` id
+/// type), and the destination row's.
 #[cfg(feature = "graph-index")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdjacencySpec {
-    pub(crate) src: String,
-    pub(crate) dst: String,
-    pub(crate) key: String,
+    pub(crate) src_table: String,
+    pub(crate) src_id: String,
+    pub(crate) dst_table: String,
+    pub(crate) dst_id: String,
 }
 
 /// Options for [`crate::Supertable::optimize`].
@@ -1006,20 +1009,28 @@ impl OptimizeOptions {
         }
     }
 
-    /// Treat the table's rows as a graph's edges — `src` and `dst` the
-    /// `Int64` node columns, `key` the string column with the source node's
-    /// key — and have `optimize()` build and publish the resident adjacency
-    /// index over them, in the lifecycle of the `hnsw` graph: one
-    /// content-addressed blob referenced from the manifest, memory-mapped
-    /// when the store is local, held resident once hydrated, kept by GC
-    /// while referenced, and rebuilt only when the rows changed. Behind the
-    /// `graph-index` feature, off the curated public surface.
+    /// Treat the table's rows as a graph's edges between rows — the source
+    /// row's table name and `_id` in `src_table` / `src_id`, the
+    /// destination's in `dst_table` / `dst_id` — and have `optimize()` build
+    /// and publish the resident adjacency index over them, in the lifecycle
+    /// of the `hnsw` graph: one content-addressed blob referenced from the
+    /// manifest, memory-mapped when the store is local, held resident once
+    /// hydrated, kept by GC while referenced, and rebuilt only when the rows
+    /// changed. Behind the `graph-index` feature, off the curated public
+    /// surface.
     #[cfg(feature = "graph-index")]
-    pub fn with_adjacency(mut self, src: &str, dst: &str, key: &str) -> Self {
+    pub fn with_adjacency(
+        mut self,
+        src_table: &str,
+        src_id: &str,
+        dst_table: &str,
+        dst_id: &str,
+    ) -> Self {
         self.adjacency = Some(AdjacencySpec {
-            src: src.to_string(),
-            dst: dst.to_string(),
-            key: key.to_string(),
+            src_table: src_table.to_string(),
+            src_id: src_id.to_string(),
+            dst_table: dst_table.to_string(),
+            dst_id: dst_id.to_string(),
         });
         self
     }

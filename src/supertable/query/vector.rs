@@ -1553,6 +1553,27 @@ async fn lookup_user_placements_by_id(
     user_row_ids: &[i128],
     op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Vec<(Arc<SuperfileEntry>, u32)>, QueryError> {
+    lookup_user_placements_by_id_opt(manifest, user_row_ids, op_stats)
+        .await?
+        .into_iter()
+        .enumerate()
+        .map(|(index, placement)| {
+            placement.ok_or_else(|| {
+                QueryError::Execute(format!("no user superfile owns id {}", user_row_ids[index]))
+            })
+        })
+        .collect()
+}
+
+/// [`lookup_user_placements_by_id`] for ids that may no longer be rows —
+/// `None` for one no live superfile owns. A graph walk reaches nodes by
+/// an edge table that can lag the rows it names; a row gone since the edge
+/// was written is skipped, not an error.
+pub(crate) async fn lookup_user_placements_by_id_opt(
+    manifest: &ManifestSnapshot,
+    user_row_ids: &[i128],
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<Vec<Option<(Arc<SuperfileEntry>, u32)>>, QueryError> {
     if user_row_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1668,15 +1689,7 @@ async fn lookup_user_placements_by_id(
         }
     }
 
-    placements
-        .into_iter()
-        .enumerate()
-        .map(|(index, placement)| {
-            placement.ok_or_else(|| {
-                QueryError::Execute(format!("no user superfile owns id {}", user_row_ids[index]))
-            })
-        })
-        .collect()
+    Ok(placements)
 }
 
 /// Extract the `_id` column (column 0, Decimal128) of `batch` as `Vec<i128>`.

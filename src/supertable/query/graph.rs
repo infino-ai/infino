@@ -9,9 +9,10 @@
 //! through the resident slot, which hydrates the published bundle once per
 //! generation (memory-mapped when the store is local, single-flight across
 //! concurrent first touches) and releases it when the manifest stops
-//! referencing it. Seeds are node ids — the edge table's `src` / `dst`
-//! values — and a hit carries the node's id and key, so the caller joins
-//! back to its rows by either.
+//! referencing it. A node is a row — a table's name and the row's stable
+//! `_id` — so seeds are rows and what a walk reaches are rows, which the
+//! SQL functions (`exec::graph_exec`) resolve to their columns as a search
+//! resolves its hits.
 
 use crate::supertable::{SupertableReader, error::QueryError};
 
@@ -25,74 +26,55 @@ pub const PAGERANK_RESTART: f64 = 0.15;
 /// the gap that separates a node from its neighbours in a ranking.
 pub const PAGERANK_ITERATIONS: usize = 50;
 
-/// One node a walk reached.
+/// One row a walk reached.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphHit {
-    /// The node's id: the edge table's `src` / `dst` value.
-    pub id: i64,
-    /// The node's readable key, as the edge table's key column spells it.
-    pub key: String,
+    /// The table the row belongs to.
+    pub table: String,
+    /// The row's stable `_id`.
+    pub id: i128,
     /// Fewest hops from a seed; the seeds are hop 0.
     pub hop: u32,
-    /// The node's personalized-PageRank score from [`SupertableReader::graph_rank`];
+    /// The row's personalized-PageRank score from [`SupertableReader::graph_rank`];
     /// 0 from a plain walk.
     pub score: f64,
 }
 
-/// What a traversal starts from: the nodes with these ids, or these keys.
-enum Seeds<'a> {
-    Ids(&'a [i64]),
-    Keys(&'a [&'a str]),
-}
-
 impl SupertableReader {
     test_visible! {
-        /// Every node within `hops` edges of the nodes with ids `seeds`,
-        /// nearest first, at most `limit`. Breadth-first, so each node is
-        /// reported once with the fewest hops it takes; a seed the index does
-        /// not hold is skipped. An error when the table has no published
-        /// adjacency index: `optimize()` with an adjacency spec builds one.
-        fn graph_walk(&self, seeds: &[i64], hops: u32, limit: usize) -> Result<Vec<GraphHit>, QueryError> {
-            self.traverse(Seeds::Ids(seeds), hops, limit, false)
+        /// Every row within `hops` edges of the rows `seeds` (each a table
+        /// name and an `_id`), nearest first, at most `limit`. Breadth-first,
+        /// so each row is reported once with the fewest hops it takes; a seed
+        /// the index does not hold is skipped. An error when the table has no
+        /// published adjacency index: `optimize()` with an adjacency spec
+        /// builds one.
+        fn graph_walk(&self, seeds: &[(&str, i128)], hops: u32, limit: usize) -> Result<Vec<GraphHit>, QueryError> {
+            self.block_on(self.traverse(seeds, hops, limit, false))
         }
     }
 
     test_visible! {
-        /// The nodes within `hops` of `seeds`, ranked by personalized PageRank
-        /// from the seeds over the subgraph those nodes span, at most `limit`,
-        /// highest score first (ties by fewer hops, then id). A node many short
-        /// paths from the seeds pass through scores high, so a hub's thousand
-        /// neighbours do not outrank the few nodes the seeds share.
-        fn graph_rank(&self, seeds: &[i64], hops: u32, limit: usize) -> Result<Vec<GraphHit>, QueryError> {
-            self.traverse(Seeds::Ids(seeds), hops, limit, true)
-        }
-    }
-
-    test_visible! {
-        /// [`Self::graph_walk`] from the nodes keyed `seeds` — what a SQL
-        /// statement seeds with, since it holds keys, not ids.
-        fn graph_walk_keys(&self, seeds: &[&str], hops: u32, limit: usize) -> Result<Vec<GraphHit>, QueryError> {
-            self.traverse(Seeds::Keys(seeds), hops, limit, false)
-        }
-    }
-
-    test_visible! {
-        /// [`Self::graph_rank`] from the nodes keyed `seeds`.
-        fn graph_rank_keys(&self, seeds: &[&str], hops: u32, limit: usize) -> Result<Vec<GraphHit>, QueryError> {
-            self.traverse(Seeds::Keys(seeds), hops, limit, true)
+        /// The rows within `hops` of `seeds`, ranked by personalized PageRank
+        /// from the seeds over the subgraph those rows span, at most `limit`,
+        /// highest score first (ties by fewer hops, then node). A row many
+        /// short paths from the seeds pass through scores high, so a hub's
+        /// thousand neighbours do not outrank the few rows the seeds share.
+        fn graph_rank(&self, seeds: &[(&str, i128)], hops: u32, limit: usize) -> Result<Vec<GraphHit>, QueryError> {
+            self.block_on(self.traverse(seeds, hops, limit, true))
         }
     }
 
     /// Walk (or, with `rank`, rank) from `seeds` over the resident adjacency
-    /// index, hydrating it through the resident slot first.
-    fn traverse(
+    /// index, hydrating it through the resident slot first. The async form
+    /// the SQL functions run inside a plan's `execute`.
+    pub(crate) async fn traverse(
         &self,
-        seeds: Seeds<'_>,
+        seeds: &[(&str, i128)],
         hops: u32,
         limit: usize,
         rank: bool,
     ) -> Result<Vec<GraphHit>, QueryError> {
-        let resident = self.block_on(self.resident_vector_index()).ok_or_else(|| {
+        let resident = self.resident_vector_index().await.ok_or_else(|| {
             QueryError::Execute("no adjacency index is published for this table".into())
         })?;
         let Some(index) = resident.data.as_ref().and_then(|kind| kind.adjacency()) else {
@@ -100,15 +82,18 @@ impl SupertableReader {
                 "the table's resident index is not an adjacency index".into(),
             ));
         };
-        let nodes: Vec<u32> = match seeds {
-            Seeds::Ids(ids) => ids.iter().filter_map(|&id| index.node_of(id)).collect(),
-            Seeds::Keys(keys) => index.nodes_of_keys(keys),
-        };
-        let hit = |node: u32, hop: u32, score: f64| GraphHit {
-            id: index.id(node),
-            key: index.key(node).to_string(),
-            hop,
-            score,
+        let nodes: Vec<u32> = seeds
+            .iter()
+            .filter_map(|&(table, id)| index.node_of(index.table_index(table)?, id))
+            .collect();
+        let hit = |node: u32, hop: u32, score: f64| {
+            let row = index.node(node);
+            GraphHit {
+                table: index.table_name(row.table).to_string(),
+                id: row.id,
+                hop,
+                score,
+            }
         };
         Ok(if rank {
             index
@@ -132,7 +117,7 @@ impl SupertableReader {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
+    use arrow_array::{Decimal128Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::TempDir;
 
@@ -140,38 +125,61 @@ mod tests {
         config::{CompactionSettings, OptimizeOptions},
         runtime_bridge::bridge_sync_to_async,
         storage::{LocalFsStorageProvider, StorageProvider},
-        supertable::{Supertable, options::SupertableOptions},
+        supertable::{
+            Supertable,
+            options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
+        },
     };
 
+    /// The one table every node of these fixtures is a row of.
+    const ROWS: &str = "rows";
     /// Leaves of the hub node in the ranking fixture.
-    const LEAVES: i64 = 20;
+    const LEAVES: i128 = 20;
     /// First leaf's id.
-    const FIRST_LEAF: i64 = 100;
+    const FIRST_LEAF: i128 = 100;
     /// How far the ranking's scores may sum away from one.
     const SCORE_TOLERANCE: f64 = 1e-6;
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
-            Field::new("src", DataType::Int64, false),
-            Field::new("dst", DataType::Int64, false),
-            Field::new("key", DataType::LargeUtf8, false),
+            Field::new("src_table", DataType::Utf8, false),
+            Field::new(
+                "src_id",
+                DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
+                false,
+            ),
+            Field::new("dst_table", DataType::Utf8, false),
+            Field::new(
+                "dst_id",
+                DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
+                false,
+            ),
         ]))
     }
 
-    /// Every edge of `edges` and its reverse, keyed `n<id>`.
-    fn batch(edges: &[(i64, i64)]) -> RecordBatch {
+    fn ids(values: Vec<i128>) -> Arc<Decimal128Array> {
+        Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
+                .expect("ids"),
+        )
+    }
+
+    /// Every edge of `edges` and its reverse, every node a row of [`ROWS`].
+    fn batch(edges: &[(i128, i128)]) -> RecordBatch {
         let (mut src, mut dst) = (Vec::new(), Vec::new());
         for &(s, d) in edges {
             src.extend([s, d]);
             dst.extend([d, s]);
         }
-        let keys: Vec<String> = src.iter().map(|s| format!("n{s}")).collect();
+        let tables = vec![ROWS; src.len()];
         RecordBatch::try_new(
             schema(),
             vec![
-                Arc::new(Int64Array::from(src)),
-                Arc::new(Int64Array::from(dst)),
-                Arc::new(LargeStringArray::from(keys)),
+                Arc::new(StringArray::from(tables.clone())),
+                ids(src),
+                Arc::new(StringArray::from(tables)),
+                ids(dst),
             ],
         )
         .expect("batch")
@@ -186,21 +194,26 @@ mod tests {
         (Supertable::create(options).expect("create"), storage)
     }
 
-    fn append(table: &Supertable, edges: &[(i64, i64)]) {
+    fn append(table: &Supertable, edges: &[(i128, i128)]) {
         let mut writer = table.writer().expect("writer");
         writer.append(&batch(edges)).expect("append");
         writer.commit().expect("commit");
     }
 
     fn indexed() -> OptimizeOptions {
-        OptimizeOptions::compact(CompactionSettings::default()).with_adjacency("src", "dst", "key")
+        OptimizeOptions::compact(CompactionSettings::default()).with_adjacency(
+            "src_table",
+            "src_id",
+            "dst_table",
+            "dst_id",
+        )
     }
 
-    fn walked(table: &Supertable, seed: i64, hops: u32) -> Vec<(i64, u32)> {
+    fn walked(table: &Supertable, seed: i128, hops: u32) -> Vec<(i128, u32)> {
         table
             .reader()
             .expect("reader")
-            .graph_walk(&[seed], hops, usize::MAX)
+            .graph_walk(&[(ROWS, seed)], hops, usize::MAX)
             .expect("walk")
             .into_iter()
             .map(|hit| (hit.id, hit.hop))
@@ -208,8 +221,8 @@ mod tests {
     }
 
     /// `optimize()` with the edge columns builds the adjacency, stamps it on
-    /// the manifest and the walk reads it: each node once at its fewest
-    /// hops, keys included. Optimizing again over the same rows publishes
+    /// the manifest and the walk reads it: each row once at its fewest hops,
+    /// its table named. Optimizing again over the same rows publishes
     /// nothing; an append republishes a new generation that holds the new
     /// edge, and gc keeps the generation the manifest references.
     #[test]
@@ -221,7 +234,7 @@ mod tests {
             table
                 .reader()
                 .expect("reader")
-                .graph_walk(&[1], 2, 10)
+                .graph_walk(&[(ROWS, 1)], 2, 10)
                 .is_err(),
             "no index before optimize"
         );
@@ -236,21 +249,17 @@ mod tests {
         assert_eq!(
             walked(&table, 1, 2),
             vec![(1, 0), (2, 1), (3, 2), (5, 2)],
-            "nearest first, each node once"
+            "nearest first, each row once"
         );
-        let hits = reader.graph_walk(&[1], 1, usize::MAX).expect("walk");
-        assert_eq!(hits[1].key, "n2");
-        let by_key: Vec<(i64, u32)> = reader
-            .graph_walk_keys(&["n1", "missing"], 1, usize::MAX)
-            .expect("walk by key")
-            .into_iter()
-            .map(|hit| (hit.id, hit.hop))
-            .collect();
+        let hits = reader
+            .graph_walk(&[(ROWS, 1), ("elsewhere", 1)], 1, usize::MAX)
+            .expect("walk");
         assert_eq!(
-            by_key,
-            vec![(1, 0), (2, 1)],
-            "seeded by key, an unknown key skipped"
+            hits.len(),
+            2,
+            "a seed of a table the graph has no row of is skipped"
         );
+        assert_eq!((hits[1].table.as_str(), hits[1].id), (ROWS, 2));
         assert_eq!(
             walked(&table, 1, 3).len(),
             5,
@@ -306,8 +315,9 @@ mod tests {
         append(&table, &edges);
         table.optimize(&indexed()).expect("optimize");
         let reader = table.reader().expect("reader");
-        let ranked = reader.graph_rank(&[1, 2], 2, usize::MAX).expect("rank");
-        let position = |id: i64| ranked.iter().position(|hit| hit.id == id).expect("ranked");
+        let seeds = [(ROWS, 1), (ROWS, 2)];
+        let ranked = reader.graph_rank(&seeds, 2, usize::MAX).expect("rank");
+        let position = |id: i128| ranked.iter().position(|hit| hit.id == id).expect("ranked");
         let best_leaf = (FIRST_LEAF..FIRST_LEAF + LEAVES)
             .map(position)
             .min()
@@ -318,6 +328,6 @@ mod tests {
             (total - 1.0).abs() < SCORE_TOLERANCE,
             "scores sum to one: {total}"
         );
-        assert_eq!(reader.graph_rank(&[1, 2], 2, 3).expect("rank").len(), 3);
+        assert_eq!(reader.graph_rank(&seeds, 2, 3).expect("rank").len(), 3);
     }
 }

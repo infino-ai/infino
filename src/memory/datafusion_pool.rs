@@ -140,6 +140,14 @@ pub(crate) fn budgeted_session_context(
     // converted, so SQL string results are always `LargeUtf8`, never a view.
     config.options_mut().optimizer.expand_views_at_output = true;
 
+    // A numeric literal past `u64` — every `_id`, a 128-bit decimal — would
+    // otherwise parse as an `f64` and lose its low digits silently, so
+    // `WHERE _id = 33037438924318263222187723849888` would compare against a
+    // different number and match nothing. With the flag, any literal `i64`
+    // and `u64` cannot hold parses as the decimal it is, exact; literals
+    // that fit still parse as integers.
+    config.options_mut().sql_parser.parse_float_as_decimal = true;
+
     // Skip DataFusion's partial (pre-)aggregation sooner on high-cardinality
     // GROUP BY (see PARTIAL_AGG_SKIP_PROBE_RATIO). Execution strategy only;
     // results are identical.

@@ -5,7 +5,7 @@
 //! counterpart of the `hnsw` build, in the same lifecycle: `optimize()`
 //! scans the edge rows once into per-node adjacency lists, lays them out as
 //! a single-level [`Hnsw`](crate::superfile::vector::hnsw::Hnsw) graph with
-//! the node ids and keys (`superfile::vector::adjacency`), publishes one
+//! each node's table and `_id` (`superfile::vector::adjacency`), publishes one
 //! content-addressed blob through the writer's resident-index publish, and
 //! stamps its reference on the manifest under the commit protocol every
 //! maintenance stamp shares. Hydration, memory-mapping, the resident slot
@@ -14,7 +14,7 @@
 
 use std::{sync::Arc, time::Instant};
 
-use arrow_array::{Array, Int64Array, LargeStringArray, StringArray, StringViewArray};
+use arrow_array::{Array, Decimal128Array, LargeStringArray, StringArray, StringViewArray};
 use tracing::debug;
 
 use super::{
@@ -30,32 +30,53 @@ use crate::{
     },
 };
 
-/// The strings of a key column, whichever string layout the scan produced.
-fn key_strings(column: &dyn Array) -> Option<Vec<Option<&str>>> {
+/// The strings of a table-name column, whichever string layout the scan
+/// produced.
+fn table_strings<'a>(
+    column: &'a dyn Array,
+    name: &str,
+) -> Result<Vec<Option<&'a str>>, BuildError> {
     let any = column.as_any();
     if let Some(a) = any.downcast_ref::<LargeStringArray>() {
-        Some(a.iter().collect())
+        Ok(a.iter().collect())
     } else if let Some(a) = any.downcast_ref::<StringArray>() {
-        Some(a.iter().collect())
+        Ok(a.iter().collect())
+    } else if let Some(a) = any.downcast_ref::<StringViewArray>() {
+        Ok(a.iter().collect())
     } else {
-        any.downcast_ref::<StringViewArray>()
-            .map(|a| a.iter().collect())
+        Err(BuildError::Store(format!(
+            "adjacency: {name} is not a string column"
+        )))
     }
 }
 
-/// Every edge of the table `reader` pins, as `(source, destination, source
-/// key)` in row order, gathered into adjacency lists: one SQL scan of the
-/// three columns `spec` names.
+/// An id column: the engine's `Decimal128` id type, as every `_id` is.
+fn id_values<'a>(column: &'a dyn Array, name: &str) -> Result<&'a Decimal128Array, BuildError> {
+    column
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| {
+            BuildError::Store(format!(
+                "adjacency: {name} is not the engine's Decimal128 id type"
+            ))
+        })
+}
+
+/// Every edge of the table `reader` pins, as `((source table, source id),
+/// (destination table, destination id))` in row order, gathered into
+/// adjacency lists: one SQL scan of the four columns `spec` names. A row
+/// with a null in any of them is no edge.
 async fn scan_edges(
     reader: &SupertableReader,
     spec: &AdjacencySpec,
 ) -> Result<AdjacencyBuild, BuildError> {
     let quote = |column: &str| format!("\"{}\"", column.replace('"', "\"\""));
     let sql = format!(
-        "SELECT {}, {}, {} FROM supertable",
-        quote(&spec.src),
-        quote(&spec.dst),
-        quote(&spec.key)
+        "SELECT {}, {}, {}, {} FROM supertable",
+        quote(&spec.src_table),
+        quote(&spec.src_id),
+        quote(&spec.dst_table),
+        quote(&spec.dst_id)
     );
     let ctx = reader
         .sql_session_context()
@@ -67,26 +88,20 @@ async fn scan_edges(
         .collect()
         .await
         .map_err(|e| BuildError::Store(format!("adjacency scan: {e}")))?;
-    let mut edges: Vec<(i64, i64, Option<&str>)> = Vec::new();
+    let mut edges: Vec<((&str, i128), (&str, i128))> = Vec::new();
     for batch in &batches {
-        let src = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| BuildError::Store(format!("adjacency: {} is not Int64", spec.src)))?;
-        let dst = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| BuildError::Store(format!("adjacency: {} is not Int64", spec.dst)))?;
-        let keys = key_strings(batch.column(2).as_ref()).ok_or_else(|| {
-            BuildError::Store(format!("adjacency: {} is not a string column", spec.key))
-        })?;
-        for (row, key) in keys.into_iter().enumerate() {
-            if src.is_null(row) || dst.is_null(row) {
+        let src_tables = table_strings(batch.column(0).as_ref(), &spec.src_table)?;
+        let src_ids = id_values(batch.column(1).as_ref(), &spec.src_id)?;
+        let dst_tables = table_strings(batch.column(2).as_ref(), &spec.dst_table)?;
+        let dst_ids = id_values(batch.column(3).as_ref(), &spec.dst_id)?;
+        for row in 0..batch.num_rows() {
+            let (Some(st), Some(dt)) = (src_tables[row], dst_tables[row]) else {
+                continue;
+            };
+            if src_ids.is_null(row) || dst_ids.is_null(row) {
                 continue;
             }
-            edges.push((src.value(row), dst.value(row), key));
+            edges.push(((st, src_ids.value(row)), (dt, dst_ids.value(row))));
         }
     }
     Ok(AdjacencyBuild::from_edges(edges.into_iter()))
