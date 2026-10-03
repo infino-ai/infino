@@ -373,32 +373,46 @@ function buildColumn(field: arrow.Field, rows: RowRecord[]): arrow.Vector {
   return arrow.vectorFromArray(values, field.type);
 }
 
-// Normalize append input -> IPC bytes. An array of objects, or an
-// apache-arrow Table / RecordBatch (normalized to rows via its own
-// `toArray()`/`toJSON()`); either way the columns are rebuilt in our arrow
-// instance from the declared schema. (We can't feed the consumer's Table
-// straight into our `tableToIPC` — a different module instance isn't
-// recognized.)
-function dataToIpc(data: AppendData, getSchema: () => arrow.Schema): Buffer {
-  if (Buffer.isBuffer(data)) return data;
-  if (data instanceof Uint8Array) return Buffer.from(data);
+// Append / update input, sorted by how it reaches the engine: Arrow-typed
+// data (an apache-arrow Table / RecordBatch, or IPC bytes) as a batch, and
+// records as JSON text, which the engine maps to columns itself (nested
+// objects flatten to dot paths, arrays become list columns, a new key adds
+// a column typed from its values). `JSON.stringify` is what keeps a JS `5`
+// an integer literal and a `5.5` a float literal on the way in.
+//
+// A consumer's Table may come from another apache-arrow module instance,
+// which our `tableToIPC` does not recognize, so it is rebuilt here under
+// its own schema (types translated into our instance) from its rows.
+type WriteInput = { ipc: Buffer } | { rows: string };
 
-  let rows: RowRecord[];
+// A `bigint` has no JSON form; it is written as the integer literal it is
+// (a tagged string in the replacer, unquoted afterwards), so it reaches the
+// engine exact and as an integer, never as a float or a string.
+const BIGINT_TAG = "@@infino-bigint@@:";
+function rowsToJson(rows: RowRecord[]): string {
+  const text = JSON.stringify(rows, (_key, value) =>
+    typeof value === "bigint" ? BIGINT_TAG + value.toString() : value,
+  );
+  return text.replace(/"@@infino-bigint@@:(-?\d+)"/g, "$1");
+}
+
+function writeInput(data: AppendData): WriteInput {
+  if (Buffer.isBuffer(data)) return { ipc: data };
+  if (data instanceof Uint8Array) return { ipc: Buffer.from(data) };
+  if (Array.isArray(data)) return { rows: rowsToJson(data) };
   const d = data as any;
-  if (Array.isArray(data)) {
-    rows = data as RowRecord[];
-  } else if (d && (Array.isArray(d.batches) || (d.schema && typeof d.numRows === "number"))) {
-    rows = Array.from(d).map((r: any) => r.toJSON() as RowRecord);
-  } else {
-    throw new TypeError(
-      "append: expected an array of objects, an apache-arrow Table / RecordBatch, or an Arrow IPC Buffer",
+  if (d && (Array.isArray(d.batches) || (d.schema && typeof d.numRows === "number"))) {
+    const rows = Array.from(d).map((r: any) => r.toJSON() as RowRecord);
+    const fields: arrow.Field[] = d.schema.fields.map(
+      (f: any) => new arrow.Field(f.name, nativeTypeFromForeign(f.type), f.nullable),
     );
+    const cols: Record<string, arrow.Vector> = {};
+    for (const field of fields) cols[field.name] = buildColumn(field, rows);
+    return { ipc: Buffer.from(arrow.tableToIPC(new arrow.Table(cols), STREAM)) };
   }
-
-  const schema = getSchema();
-  const cols: Record<string, arrow.Vector> = {};
-  for (const field of schema.fields) cols[field.name] = buildColumn(field, rows);
-  return Buffer.from(arrow.tableToIPC(new arrow.Table(cols), STREAM));
+  throw new TypeError(
+    "append: expected an array of objects, an apache-arrow Table / RecordBatch, or an Arrow IPC Buffer",
+  );
 }
 
 // A Decimal128 value renders as a 4×u32 little-endian array in records.
@@ -487,8 +501,8 @@ export class Table {
    * append == one commit.
    */
   append(data: AppendData): void {
-    const ipc = dataToIpc(data, () => this.schema());
-    guard(this.remote, () => this.inner.append(ipc));
+    const input = writeInput(data);
+    guard(this.remote, () => ("rows" in input ? this.inner.appendRows(input.rows) : this.inner.append(input.ipc)));
   }
 
   /**
@@ -500,8 +514,10 @@ export class Table {
    * a hosted table.
    */
   appendNamed(data: AppendData, sourceName: string): void {
-    const ipc = dataToIpc(data, () => this.schema());
-    guard(this.remote, () => this.inner.appendNamed(ipc, sourceName));
+    const input = writeInput(data);
+    guard(this.remote, () =>
+      "rows" in input ? this.inner.appendRowsNamed(input.rows, sourceName) : this.inner.appendNamed(input.ipc, sourceName),
+    );
   }
 
   /** Ranked BM25 search; rows as records (or an Arrow `Table`). `score` is a
@@ -564,8 +580,10 @@ export class Table {
    * `data` (same shapes as `append`), 1:1 — the matched count must equal the
    * replacement-row count. Requires durable storage (not `memory://`). */
   update(predicate: string, data: AppendData): MutationStats {
-    const ipc = dataToIpc(data, () => this.schema());
-    return guard(this.remote, () => this.inner.update(predicate, ipc));
+    const input = writeInput(data);
+    return guard(this.remote, () =>
+      "rows" in input ? this.inner.updateRows(predicate, input.rows) : this.inner.update(predicate, input.ipc),
+    );
   }
 
   /** Delete rows matching a SQL predicate (e.g. `"status = 'spam'"`).

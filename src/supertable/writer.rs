@@ -85,6 +85,7 @@ use futures::{
 use object_store::{MultipartUpload, PutPayload, UploadPart};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tempfile::NamedTempFile;
 use tokio::{
     sync::{
@@ -103,6 +104,7 @@ use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
+    dynamic::rows_to_batch,
     memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, run_on_pool},
     runtime_metrics::{
@@ -1029,6 +1031,37 @@ impl Supertable {
         w.commit()
             .map_err(|e| InfinoError::from(e).with_context("append_named", None))?;
         Ok(())
+    }
+
+    /// Append rows given as JSON documents: mapped to a batch under the
+    /// table's schema and templates, then appended like any batch.
+    pub fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
+        let batch = rows_to_batch(rows, &self.table_schema()).map_err(|e| {
+            InfinoError::from(BuildError::Schema(e)).with_context("append_rows", None)
+        })?;
+        self.append(&batch)
+    }
+
+    /// [`Self::append_rows`], naming the source the rows came from as
+    /// [`Self::append_named`] does.
+    pub fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
+        let batch = rows_to_batch(rows, &self.table_schema()).map_err(|e| {
+            InfinoError::from(BuildError::Schema(e)).with_context("append_rows_named", None)
+        })?;
+        self.append_named(&batch, source_name)
+    }
+
+    /// Replace the rows `predicate` matches with `rows`, mapped as
+    /// [`Self::append_rows`] maps them.
+    pub fn update_rows(
+        &self,
+        predicate: Expr,
+        rows: &[Value],
+    ) -> Result<MutationStats, InfinoError> {
+        let batch = rows_to_batch(rows, &self.table_schema()).map_err(|e| {
+            InfinoError::from(BuildError::Schema(e)).with_context("update_rows", None)
+        })?;
+        self.update(predicate, &batch)
     }
 
     /// The table's schema document as this handle last saw it.
@@ -2397,8 +2430,13 @@ impl SupertableWriter {
                 )?;
                 let build_elapsed = commit_t0.elapsed();
                 let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
-                let user_batch =
-                    prepare_user_superfile_batch(&self.inner, outputs, cell_hints, stem)?;
+                let user_batch = prepare_user_superfile_batch(
+                    &self.inner,
+                    &manifest,
+                    outputs,
+                    cell_hints,
+                    stem,
+                )?;
                 let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
                 let data_put_bytes: usize = user_batch
                     .pending_storage_writes
@@ -2563,7 +2601,8 @@ impl SupertableWriter {
             )
         })?;
         let superfiles = outputs.len();
-        let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints, stem)?;
+        let user_batch =
+            prepare_user_superfile_batch(&self.inner, &manifest, outputs, cell_hints, stem)?;
         // Same pre-move / post-Ok discipline as the vector arm above.
         let output_stats = self
             .op_stats
@@ -3413,7 +3452,7 @@ pub(super) fn prepare_superfile(
     inner: &SupertableInner,
     shard: ShardOutput,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
-    prepare_superfile_named(inner, shard, None)
+    prepare_superfile_named(inner, &inner.manifest.load(), shard, None)
 }
 
 /// [`prepare_superfile`] with the source stem the entry carries: `Some`
@@ -3422,6 +3461,7 @@ pub(super) fn prepare_superfile(
 /// label on the key, never a substitute for the uuid that keeps it unique.
 pub(super) fn prepare_superfile_named(
     inner: &SupertableInner,
+    manifest: &ManifestSnapshot,
     shard: ShardOutput,
     stem: Option<&str>,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
@@ -3458,9 +3498,11 @@ pub(super) fn prepare_superfile_named(
         SuperfileReader::open_with(shard.bytes.clone(), inner.options.superfile_open_options())
             .map_err(|e| BuildError::Store(format!("opening superfile for summary: {e}")))?;
 
-    let manifest = inner.manifest.load();
-    let fts_summary = build_fts_summary(&reader, &manifest);
-    let vector_summary = build_vector_summary(&reader, &manifest);
+    // `manifest` is the one the shard was built under — the commit's, which
+    // may carry columns and indexes the committed list does not have yet —
+    // so a column indexed from its first file is summarised from that file.
+    let fts_summary = build_fts_summary(&reader, manifest);
+    let vector_summary = build_vector_summary(&reader, manifest);
 
     // capture `(total_size, vec_off/len, fts_off/len)`
     // from the freshly-written bytes' parquet KV metadata. Caching
@@ -3507,12 +3549,8 @@ pub(super) fn prepare_superfile_named(
     });
 
     let storage_key = entry.storage_path();
-    let term_contribution = build_term_contribution(
-        &reader,
-        &inner.manifest.load(),
-        entry.superfile_id,
-        entry.id_min,
-    )?;
+    let term_contribution =
+        build_term_contribution(&reader, manifest, entry.superfile_id, entry.id_min)?;
     Ok(Some(PreparedSuperfile {
         entry,
         bytes_for_store: bytes_for_store.map(|b| (uri, b)),
@@ -3740,7 +3778,7 @@ pub(crate) fn commit_built_superfile(st: &Supertable, bytes: Bytes) -> Result<()
         });
     let scalar_stats = ScalarStatsAgg::from_batches(&batch.schema(), &[&batch]);
     let shard = ShardOutput::new_with_params(bytes, reader.n_docs(), id_min, id_max, scalar_stats);
-    let prepared = prepare_superfile_named(inner, shard, None)?
+    let prepared = prepare_superfile_named(inner, &inner.manifest.load(), shard, None)?
         .ok_or_else(|| BuildError::Store("built superfile holds no rows".into()))?;
     let publish = collect_prepared_superfiles(inner, vec![prepared])?;
     st.block_on_query(persist_superfile_publish_batch_async(
@@ -3777,6 +3815,7 @@ fn apply_pending_store_inserts(inner: &SupertableInner, inserts: Vec<(SuperfileU
 
 fn prepare_user_superfile_batch_in_scope(
     inner: &SupertableInner,
+    manifest: &ManifestSnapshot,
     outputs: Vec<ShardOutput>,
     hints: Vec<Option<u32>>,
     stem: Option<&str>,
@@ -3794,7 +3833,7 @@ fn prepare_user_superfile_batch_in_scope(
         .into_par_iter()
         .zip(hints.into_par_iter())
         .filter_map(
-            |(shard, hint)| match prepare_superfile_named(inner, shard, stem) {
+            |(shard, hint)| match prepare_superfile_named(inner, manifest, shard, stem) {
                 Ok(Some(p)) => {
                     Some(
                         finish_superfile_entry(p.entry, hint).map(|entry| PreparedSuperfile {
@@ -3819,6 +3858,7 @@ fn prepare_user_superfile_batch_in_scope(
 /// carries it, since they all come from that one source.
 fn prepare_user_superfile_batch(
     inner: &SupertableInner,
+    manifest: &ManifestSnapshot,
     outputs: Vec<ShardOutput>,
     hints: Vec<Option<u32>>,
     stem: Option<&str>,
@@ -3826,7 +3866,7 @@ fn prepare_user_superfile_batch(
     inner
         .options
         .writer_pool
-        .install(|| prepare_user_superfile_batch_in_scope(inner, outputs, hints, stem))
+        .install(|| prepare_user_superfile_batch_in_scope(inner, manifest, outputs, hints, stem))
 }
 
 async fn persist_superfile_publish_batch_async(
@@ -6920,7 +6960,7 @@ fn commit_shards_via_drain(
             let Some(output) = output else {
                 return Ok(None);
             };
-            let Some(prepared) = prepare_superfile_named(inner, output, stem)? else {
+            let Some(prepared) = prepare_superfile_named(inner, manifest, output, stem)? else {
                 return Ok(None);
             };
             let PreparedSuperfile {

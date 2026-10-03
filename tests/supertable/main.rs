@@ -42,6 +42,7 @@ mod compact_gc;
 mod corpus_shapes;
 mod disk_cache;
 mod drain_tombstones;
+mod dynamic_rows;
 mod gc_stale_snapshot;
 mod manifest;
 mod query;

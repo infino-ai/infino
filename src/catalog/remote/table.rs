@@ -22,8 +22,12 @@ use crate::{
     Bm25SearchOptions, Bm25Stats, BoolMode, GcError, GcReport, InfinoError, MutationStats,
     OptimizeError, OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
     catalog::table::Table,
+    dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
-    supertable::reindex::{PlannedRepair, ReindexReport, StalenessReport},
+    supertable::{
+        reindex::{PlannedRepair, ReindexReport, StalenessReport},
+        schema::TableSchema,
+    },
 };
 
 /// A hosted table handle. Holds its `RemoteCatalog`, the table name, and the
@@ -128,6 +132,29 @@ impl Table for RemoteTable {
             "append_named({source_name:?}) is not available on a hosted table: the append wire \
              carries no source name; use append"
         )))
+    }
+
+    /// Rows are mapped here against the Arrow schema the table was opened
+    /// with, and travel as a batch; the hosted side applies its own rules
+    /// to the batch.
+    fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
+        let batch = rows_to_batch(rows, &TableSchema::from_user_schema(&self.schema))
+            .map_err(|e| InfinoError::Schema(e.to_string()).with_context("append_rows", None))?;
+        self.append(&batch)
+    }
+
+    fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
+        let batch =
+            rows_to_batch(rows, &TableSchema::from_user_schema(&self.schema)).map_err(|e| {
+                InfinoError::Schema(e.to_string()).with_context("append_rows_named", None)
+            })?;
+        self.append_named(&batch, source_name)
+    }
+
+    fn update_rows(&self, predicate: Expr, rows: &[Value]) -> Result<MutationStats, InfinoError> {
+        let batch = rows_to_batch(rows, &TableSchema::from_user_schema(&self.schema))
+            .map_err(|e| InfinoError::Schema(e.to_string()).with_context("update_rows", None))?;
+        self.update(predicate, &batch)
     }
 
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError> {

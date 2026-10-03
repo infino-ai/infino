@@ -112,6 +112,8 @@ pub mod config;
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) mod config;
 
+pub(crate) mod dynamic;
+
 #[cfg(feature = "test-helpers")]
 pub mod storage;
 #[cfg(not(feature = "test-helpers"))]
@@ -177,6 +179,8 @@ pub use config::{
 };
 /// The single public error type for the curated API.
 pub use error::InfinoError;
+/// JSON documents for `append_rows` / `update_rows`; import as `infino::serde_json`.
+pub use serde_json;
 // `VectorSearchOptions` (probe width / rerank budget) is deliberately
 // NOT part of the public surface: serving is drain-calibrated, and
 // manual tuning is a test-and-bench-only instrument (recall sweeps,

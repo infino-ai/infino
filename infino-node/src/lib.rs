@@ -49,8 +49,8 @@ use datafusion::logical_expr::Expr;
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
     InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
-    RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions, Stemmer,
-    Stopwords, SchemaPatch,
+    RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions,
+    SchemaPatch, Stemmer, Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,6 +66,12 @@ use infino::{
 //
 // TODO: refine into distinct JS `Error` subclasses once the surface settles,
 // matching Python's `InfinoError` base + `ConnectionMemoryBudgetError`.
+/// The rows a JSON array text carries.
+fn parse_rows(rows_json: &str) -> Result<Vec<serde_json::Value>> {
+    serde_json::from_str::<Vec<serde_json::Value>>(rows_json)
+        .map_err(|e| Error::new(Status::InvalidArg, format!("rows: {e}")))
+}
+
 fn map_err(e: InfinoError) -> Error {
     match e {
         InfinoError::NotFound(m) => Error::new(Status::GenericFailure, format!("NotFound: {m}")),
@@ -996,7 +1002,8 @@ impl Connection {
         let doc = match patch_json {
             None => self.inner.schema(&name).map_err(map_err)?,
             Some(text) => {
-                let invalid = |e: String| Error::new(Status::InvalidArg, format!("schema patch: {e}"));
+                let invalid =
+                    |e: String| Error::new(Status::InvalidArg, format!("schema patch: {e}"));
                 let value: serde_json::Value =
                     serde_json::from_str(&text).map_err(|e| invalid(e.to_string()))?;
                 let patch = SchemaPatch::from_json(&value).map_err(invalid)?;
@@ -1056,6 +1063,42 @@ impl Table {
         self.inner
             .append(&self.merge_batches(batches)?)
             .map_err(map_err)
+    }
+
+    /// Append rows given as a JSON array of objects (the text the JS wrapper
+    /// produces with `JSON.stringify`): nested objects flatten to dot paths,
+    /// arrays become list columns, a key the table has not seen adds a
+    /// column typed from its values, and a value whose type disagrees with
+    /// the column's is refused.
+    #[napi]
+    pub fn append_rows(&self, rows_json: String) -> Result<()> {
+        let rows = parse_rows(&rows_json)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.inner.append_rows(&rows).map_err(map_err)
+    }
+
+    /// `appendRows`, naming the source the rows came from as `appendNamed`
+    /// does.
+    #[napi]
+    pub fn append_rows_named(&self, rows_json: String, source_name: String) -> Result<()> {
+        let rows = parse_rows(&rows_json)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .append_rows_named(&rows, &source_name)
+            .map_err(map_err)
+    }
+
+    /// `update` with the replacement rows as a JSON array of objects, mapped
+    /// as `appendRows` maps them.
+    #[napi]
+    pub fn update_rows(&self, predicate: String, rows_json: String) -> Result<MutationStats> {
+        let expr = self.parse_predicate(&predicate)?;
+        let rows = parse_rows(&rows_json)?;
+        Ok(self.inner.update_rows(expr, &rows).map_err(map_err)?.into())
     }
 
     /// `append`, naming the source the rows came from: the superfiles this

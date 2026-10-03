@@ -36,6 +36,7 @@ use serde_json::{Map, Value};
 use types::{data_type_from_keys, type_keys};
 
 use crate::{
+    catalog::DEFAULT_ROT_SEED,
     superfile::{
         builder::FtsConfig,
         fts::{
@@ -51,6 +52,14 @@ use crate::{
 /// How many fields a table may hold before an append or schema write
 /// that would add one is refused.
 pub const DEFAULT_MAX_FIELDS: u32 = 10_000;
+
+/// How deep a document may nest before it is refused.
+pub const DEFAULT_MAX_DEPTH: u32 = 20;
+
+/// Arrow field-metadata key under which a batch names the index a column
+/// it adds should carry, as the schema document spells an index. Read when
+/// the column joins the schema; ignored for a column the table has.
+pub const INDEX_META_KEY: &str = "infino:index";
 
 /// Precision of the id column's `Decimal128`: the most a `Decimal128` can
 /// carry, so every 128-bit id fits without truncation, Parquet annotates
@@ -130,6 +139,88 @@ pub enum ColumnIndex {
     },
 }
 
+/// The kind of JSON value a document carries on a path, as a template
+/// matches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detected {
+    /// `true` / `false`.
+    Boolean,
+    /// A number written without a fraction or an exponent.
+    Integer,
+    /// A number written with a fraction or an exponent.
+    Float,
+    /// A string.
+    String,
+    /// An array.
+    List,
+}
+
+impl Detected {
+    /// The name the document spells this kind as.
+    pub fn name(self) -> &'static str {
+        match self {
+            Detected::Boolean => "boolean",
+            Detected::Integer => "integer",
+            Detected::Float => "float",
+            Detected::String => "string",
+            Detected::List => "list",
+        }
+    }
+
+    /// The kind `name` spells.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "boolean" => Detected::Boolean,
+            "integer" => Detected::Integer,
+            "float" => Detected::Float,
+            "string" => Detected::String,
+            "list" => Detected::List,
+            _ => return None,
+        })
+    }
+}
+
+/// A rule that decides the type and index of a column a document adds:
+/// the first template whose kind and path pattern match the new path wins.
+/// Columns the table already has are not affected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Template {
+    /// A label for the owner; not interpreted.
+    pub name: String,
+    /// The value kind the rule applies to; `None` for any kind.
+    pub matches: Option<Detected>,
+    /// The path pattern, with `*` matching any run of characters
+    /// (`"user.*"`, `"*_id"`, `"*"`).
+    pub path: String,
+    /// The column type to use instead of the inferred one.
+    pub data_type: Option<DataType>,
+    /// The index the column gets.
+    pub index: Option<ColumnIndex>,
+}
+
+impl Template {
+    /// Whether this rule applies to a new column at `path` holding `kind`.
+    pub fn applies(&self, path: &str, kind: Detected) -> bool {
+        self.matches.is_none_or(|m| m == kind) && glob_matches(&self.path, path)
+    }
+}
+
+/// Whether `pattern`, in which `*` matches any run of characters, matches
+/// the whole of `text`.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == text,
+        Some((head, tail)) => {
+            text.starts_with(head)
+                && text[head.len()..]
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain(std::iter::once(text.len() - head.len()))
+                    .any(|i| glob_matches(tail, &text[head.len() + i..]))
+        }
+    }
+}
+
 /// One live user column: its identity, label, physical type and index.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldDef {
@@ -161,6 +252,10 @@ pub struct TableSchema {
     schema_id: u32,
     /// The most fields the table may hold.
     max_fields: u32,
+    /// How deep a document may nest.
+    max_depth: u32,
+    /// The rules for columns documents add, in order.
+    templates: Vec<Template>,
 }
 
 impl TableSchema {
@@ -195,6 +290,8 @@ impl TableSchema {
             last_field_id,
             schema_id: 1,
             max_fields: DEFAULT_MAX_FIELDS,
+            max_depth: DEFAULT_MAX_DEPTH,
+            templates: Vec::new(),
         }
     }
 
@@ -331,6 +428,22 @@ impl TableSchema {
         self.max_fields
     }
 
+    /// How deep a document may nest.
+    pub fn max_depth(&self) -> u32 {
+        self.max_depth
+    }
+
+    /// The rules for columns documents add, in order.
+    pub fn templates(&self) -> &[Template] {
+        &self.templates
+    }
+
+    /// The first template that applies to a new column at `path` holding
+    /// `kind`.
+    pub fn template_for(&self, path: &str, kind: Detected) -> Option<&Template> {
+        self.templates.iter().find(|t| t.applies(path, kind))
+    }
+
     /// The document as JSON: the fields with their ids, types and indexes,
     /// the tombstoned ids, the caps and the counters.
     pub fn to_json(&self) -> Value {
@@ -355,6 +468,11 @@ impl TableSchema {
         doc.insert("schema_id".into(), Value::from(self.schema_id));
         doc.insert("last_field_id".into(), Value::from(self.last_field_id));
         doc.insert("max_fields".into(), Value::from(self.max_fields));
+        doc.insert("max_depth".into(), Value::from(self.max_depth));
+        doc.insert(
+            "templates".into(),
+            Value::Array(self.templates.iter().map(template_to_json).collect()),
+        );
         doc.insert("fields".into(), Value::Array(fields));
         doc.insert(
             "tombstoned".into(),
@@ -382,6 +500,11 @@ impl TableSchema {
             None => DEFAULT_MAX_FIELDS,
             Some(_) => u32_of("max_fields")?,
         };
+        let max_depth = match doc.get("max_depth") {
+            None => DEFAULT_MAX_DEPTH,
+            Some(_) => u32_of("max_depth")?,
+        };
+        let templates = templates_from_json(doc.get("templates"))?;
         let fields = doc
             .get("fields")
             .and_then(Value::as_array)
@@ -410,6 +533,8 @@ impl TableSchema {
             last_field_id,
             schema_id,
             max_fields,
+            max_depth,
+            templates,
         })
     }
 
@@ -492,6 +617,61 @@ fn column_index(name: &str, fts: &[FtsConfig], vectors: &[VectorConfig]) -> Opti
         })
 }
 
+/// `template` as the document spells it.
+pub(crate) fn template_to_json(template: &Template) -> Value {
+    let mut out = match &template.data_type {
+        Some(dt) => type_keys(dt),
+        None => Map::new(),
+    };
+    out.insert("name".into(), Value::from(template.name.as_str()));
+    if let Some(kind) = template.matches {
+        out.insert("match".into(), Value::from(kind.name()));
+    }
+    out.insert("path".into(), Value::from(template.path.as_str()));
+    if let Some(index) = &template.index {
+        out.insert("index".into(), index_to_json(index));
+    }
+    Value::Object(out)
+}
+
+/// The templates `json` spells (an array of template objects), or none.
+pub(crate) fn templates_from_json(json: Option<&Value>) -> Result<Vec<Template>, String> {
+    let Some(json) = json else {
+        return Ok(Vec::new());
+    };
+    json.as_array()
+        .ok_or_else(|| "templates is not an array".to_string())?
+        .iter()
+        .map(template_from_json)
+        .collect()
+}
+
+fn template_from_json(json: &Value) -> Result<Template, String> {
+    let obj = json
+        .as_object()
+        .ok_or_else(|| "template is not an object".to_string())?;
+    let str_of = |key: &str| -> Option<&str> { obj.get(key).and_then(Value::as_str) };
+    let matches = match str_of("match") {
+        None => None,
+        Some(name) => Some(
+            Detected::from_name(name)
+                .ok_or_else(|| format!("template matches unknown kind '{name}'"))?,
+        ),
+    };
+    Ok(Template {
+        name: str_of("name").unwrap_or_default().to_owned(),
+        matches,
+        path: str_of("path")
+            .ok_or_else(|| "template has no path".to_string())?
+            .to_owned(),
+        data_type: obj
+            .contains_key("type")
+            .then(|| data_type_from_keys(obj))
+            .transpose()?,
+        index: obj.get("index").map(index_from_json).transpose()?,
+    })
+}
+
 pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
     let mut out = Map::new();
     match index {
@@ -542,26 +722,44 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
             .and_then(Value::as_str)
             .ok_or_else(|| format!("index has no {key}"))
     };
-    let bool_of = |key: &str| -> Result<bool, String> {
-        obj.get(key)
-            .and_then(Value::as_bool)
-            .ok_or_else(|| format!("index has no {key}"))
+    // Keys a document may leave out take the defaults a freshly declared
+    // index has, so a template or a hand-written patch can say just
+    // `{"kind": "fts"}`.
+    let bool_or = |key: &str, default: bool| -> Result<bool, String> {
+        match obj.get(key) {
+            None => Ok(default),
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| format!("index {key} is not a boolean")),
+        }
     };
-    let f32_of = |key: &str| -> Result<f32, String> {
-        obj.get(key)
-            .and_then(Value::as_f64)
-            .map(|v| v as f32)
-            .ok_or_else(|| format!("index has no {key}"))
+    let f32_or = |key: &str, default: f32| -> Result<f32, String> {
+        match obj.get(key) {
+            None => Ok(default),
+            Some(v) => v
+                .as_f64()
+                .map(|v| v as f32)
+                .ok_or_else(|| format!("index {key} is not a number")),
+        }
     };
     match str_of("kind")? {
-        "fts" => Ok(ColumnIndex::Fts {
-            analyzer: str_of("analyzer")?.to_owned(),
-            stopwords: named(obj, "stopwords", Stopwords::from_name)?.unwrap_or(Stopwords::None),
-            stemmer: named(obj, "stemmer", Stemmer::from_name)?.unwrap_or(Stemmer::None),
-            positions: bool_of("positions")?,
-            stored: bool_of("stored")?,
-            bm25: Bm25Params::new(f32_of("k1")?, f32_of("b")?),
-        }),
+        "fts" => {
+            let defaults = FtsConfig::new("");
+            Ok(ColumnIndex::Fts {
+                analyzer: str_of("analyzer")
+                    .map(str::to_owned)
+                    .unwrap_or(defaults.analyzer),
+                stopwords: named(obj, "stopwords", Stopwords::from_name)?
+                    .unwrap_or(defaults.stopwords),
+                stemmer: named(obj, "stemmer", Stemmer::from_name)?.unwrap_or(defaults.stemmer),
+                positions: bool_or("positions", defaults.positions)?,
+                stored: bool_or("stored", defaults.stored)?,
+                bm25: Bm25Params::new(
+                    f32_or("k1", defaults.bm25.k1)?,
+                    f32_or("b", defaults.bm25.b)?,
+                ),
+            })
+        }
         "vector" => Ok(ColumnIndex::Vector {
             metric: {
                 let name = str_of("metric")?;
@@ -570,14 +768,20 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
             },
             rot_seed: obj
                 .get("rot_seed")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| "index has no rot_seed".to_string())?,
-            rerank_codec: serde_json::from_value(
-                obj.get("rerank_codec")
-                    .cloned()
-                    .ok_or_else(|| "index has no rerank_codec".to_string())?,
-            )
-            .map_err(|e| format!("index rerank_codec: {e}"))?,
+                .map(|v| {
+                    v.as_u64()
+                        .ok_or_else(|| "index rot_seed is not a u64".to_string())
+                })
+                .transpose()?
+                .unwrap_or(DEFAULT_ROT_SEED),
+            rerank_codec: obj
+                .get("rerank_codec")
+                .map(|v| {
+                    serde_json::from_value(v.clone())
+                        .map_err(|e| format!("index rerank_codec: {e}"))
+                })
+                .transpose()?
+                .unwrap_or_default(),
         }),
         other => Err(format!("unknown index kind '{other}'")),
     }

@@ -18,7 +18,7 @@ use crate::superfile::{
 
 /// Default rotation-matrix RNG seed for vector columns. The seed only
 /// has to be stable for a given table; the public API does not vary it.
-const DEFAULT_ROT_SEED: u64 = 0x5EED_5EED_5EED_5EED;
+pub(crate) const DEFAULT_ROT_SEED: u64 = 0x5EED_5EED_5EED_5EED;
 
 /// A vector index declaration: column, dimensionality, and distance metric.
 #[derive(Debug, Clone)]

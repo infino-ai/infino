@@ -17,6 +17,7 @@ use std::{fmt, sync::Arc, time::Duration};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::prelude::Expr;
+use serde_json::Value;
 
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
@@ -37,7 +38,10 @@ pub(crate) trait Table: Send + Sync {
     fn schema(&self) -> SchemaRef;
     fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError>;
     fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError>;
+    fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError>;
+    fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError>;
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError>;
+    fn update_rows(&self, predicate: Expr, rows: &[Value]) -> Result<MutationStats, InfinoError>;
     fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError>;
     fn bm25_search(
         &self,
@@ -110,8 +114,17 @@ impl Table for SupertableHandle {
     fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
         SupertableHandle::append_named(self, batch, source_name)
     }
+    fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
+        SupertableHandle::append_rows(self, rows)
+    }
+    fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
+        SupertableHandle::append_rows_named(self, rows, source_name)
+    }
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError> {
         SupertableHandle::update(self, predicate, batch)
+    }
+    fn update_rows(&self, predicate: Expr, rows: &[Value]) -> Result<MutationStats, InfinoError> {
+        SupertableHandle::update_rows(self, predicate, rows)
     }
     fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
         SupertableHandle::delete(self, predicate)
@@ -263,6 +276,23 @@ impl Supertable {
         self.inner.append_named(batch, source_name)
     }
 
+    /// Append rows given as JSON documents. Each document is flattened to
+    /// dot paths and typed from its values: a path the table does not have
+    /// joins the schema, a nullable column a document omits is null, and a
+    /// value whose type disagrees with the column's is refused with the
+    /// same error an Arrow batch would get. Numbers are never parsed from
+    /// strings or truncated: an integral literal fits an integer or a
+    /// `Float64` column, a literal with a fraction fits only a float column.
+    pub fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
+        self.inner.append_rows(rows)
+    }
+
+    /// [`Self::append_rows`], naming the source the rows came from as
+    /// [`Self::append_named`] does.
+    pub fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
+        self.inner.append_rows_named(rows, source_name)
+    }
+
     /// Update rows matching `predicate` with values from `batch`.
     pub fn update(
         &self,
@@ -271,6 +301,17 @@ impl Supertable {
     ) -> Result<MutationStats, InfinoError> {
         ensure_expr_within_connective_cap(&predicate)?;
         self.inner.update(predicate, batch)
+    }
+
+    /// [`Self::update`] with the replacement rows given as JSON documents,
+    /// mapped as [`Self::append_rows`] maps them.
+    pub fn update_rows(
+        &self,
+        predicate: Expr,
+        rows: &[Value],
+    ) -> Result<MutationStats, InfinoError> {
+        ensure_expr_within_connective_cap(&predicate)?;
+        self.inner.update_rows(predicate, rows)
     }
 
     /// Delete rows matching `predicate`.
