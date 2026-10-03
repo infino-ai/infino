@@ -44,9 +44,7 @@ use crate::{
     runtime_bridge::{bridge_on_runtime, run_on_pool},
     runtime_metrics::rss::memory_budget,
     superfile::{
-        builder::SuperfileBuilder,
-        fts::reader::ColumnLengthStats,
-        reader::SuperfileReader,
+        builder::{BuilderOptions, MergeInput, SuperfileBuilder},
         stats::SuperfileStats as BuiltSuperfileStats,
         vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
     },
@@ -61,6 +59,7 @@ use crate::{
         opann::rerank_pool_hint,
         query::dispatch::open_compaction_input,
         reader_cache::disk::mmap_readonly_bytes,
+        schema::{PhysicalSchema, map::FileSchemaMap},
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
@@ -140,17 +139,20 @@ pub(crate) trait SuperfileMerge: Send + Sync {
 
 /// The opened inputs a [`SuperfileMerge`] builds from.
 pub(crate) struct MergeInputs<'a> {
-    /// Each input reader with the tombstones that apply to it.
-    pub(crate) readers: &'a [(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-    /// The manifest entries those readers were opened from, in the same
+    /// Each input file with the tombstones that apply to it and the map
+    /// from its columns to the table's.
+    pub(crate) inputs: &'a [MergeInput],
+    /// The manifest entries those inputs were opened from, in the same
     /// order. A build that carries rows unchanged takes its output stats
     /// from here rather than recomputing them from decoded rows.
     pub(crate) entries: &'a [Arc<SuperfileEntry>],
-    /// Per reader, the hidden-index cells its rows have been superseded in.
+    /// Per input, the hidden-index cells its rows have been superseded in.
     pub(crate) superseded: &'a [BTreeSet<u32>],
-    /// Table-wide document-length totals excluding the inputs, so the
-    /// output bakes the average an unfragmented table would have.
-    pub(crate) fts_corpus: &'a HashMap<String, ColumnLengthStats>,
+    /// The output's options: the table's schema and index config as the
+    /// snapshot derives them, carrying the table-wide document-length
+    /// totals excluding the inputs, so the output bakes the average an
+    /// unfragmented table would have.
+    pub(crate) builder_options: BuilderOptions,
 }
 
 /// What compaction does: splice or carry, never re-tokenize.
@@ -167,12 +169,12 @@ impl SuperfileMerge for CompactionMerge {
         output: &mut dyn Write,
     ) -> Result<BuiltSuperfileStats, BuildError> {
         let MergeInputs {
-            readers,
+            inputs,
             superseded,
-            fts_corpus,
+            builder_options,
             ..
         } = inputs;
-        let first_vec = readers.first().and_then(|(reader, _)| reader.vec());
+        let first_vec = inputs.first().and_then(|input| input.reader.vec());
         let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
         let sq8_merge = first_vec.and_then(|v| {
             v.vector_columns_config()
@@ -181,20 +183,23 @@ impl SuperfileMerge for CompactionMerge {
         });
         let stats = if multi_cell && sq8_merge == Some(true) {
             SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
-                readers, superseded, fts_corpus, output,
+                inputs,
+                superseded,
+                builder_options,
+                output,
             )?
         } else if sq8_merge == Some(true) {
-            SuperfileBuilder::build_from_sq8_ivf_readers_to(readers, fts_corpus, output)?
+            SuperfileBuilder::build_from_sq8_ivf_readers_to(inputs, builder_options, output)?
         } else if first_vec.is_none() {
             // FTS/scalar inputs (no vector index): carry each input's
             // already-built posting lists across instead of re-tokenizing
             // the whole corpus.
-            SuperfileBuilder::build_from_readers_fts_merge_to(readers, fts_corpus, output)?
+            SuperfileBuilder::build_from_readers_fts_merge_to(inputs, builder_options, output)?
         } else {
             // A vector index is present but not IVF-mergeable (e.g. an fp32
             // rerank codec); this path re-encodes both the FTS and the
             // vectors from the decoded rows.
-            SuperfileBuilder::build_from_readers_to(readers, fts_corpus, output)?
+            SuperfileBuilder::build_from_readers_to(inputs, builder_options, output)?
         };
         Ok(stats)
     }
@@ -425,6 +430,7 @@ impl Supertable {
         let now = Utc::now();
         let stale_seal_timeout = Duration::from_millis(cfg.stale_seal_timeout_ms);
         let listed = manifest.get_all_superfiles();
+        let schema = manifest.table_schema();
         let stats: Vec<SuperfileStats> = listed_once(listed, |entry| entry.superfile_id)
             .map(|entry| {
                 let (bitmap, seal) = sidecar_map
@@ -447,6 +453,13 @@ impl Supertable {
                     tombstoned_docs,
                     sealed_by_other,
                     birth_version: entry.birth_version,
+                    // A file without a recorded physical schema predates
+                    // field ids; it holds every column in the type the
+                    // table had then, which is the type it has now.
+                    stale_type: entry.physical_schema.as_ref().is_some_and(|physical| {
+                        FileSchemaMap::new(&schema, &manifest.options.id_column, physical)
+                            .has_stale_type()
+                    }),
                 }
             })
             .collect();
@@ -652,7 +665,13 @@ impl Supertable {
         let carries_rows = merge.preserves_tombstones();
 
         let superseded_map = manifest.get_superseded_cells();
-        let mut readers_with_tombstones = Vec::with_capacity(readers.len());
+        // Every input reads through its own map to the table's columns: a
+        // file written before a column, in another type, or under another
+        // name is adapted as it is merged, so the output always has the
+        // table's current shape.
+        let table = manifest.table_schema();
+        let legacy = manifest.options.legacy_names();
+        let mut inputs = Vec::with_capacity(readers.len());
         let mut superseded_per_reader = Vec::with_capacity(readers.len());
         for (_idx, superfile_id, reader) in readers {
             let bitmap = match carries_rows {
@@ -666,7 +685,16 @@ impl Supertable {
                 .cloned()
                 .unwrap_or_default();
             superseded_per_reader.push(superseded);
-            readers_with_tombstones.push((reader.clone(), bitmap));
+            let adapter = FileSchemaMap::new(
+                &table,
+                &manifest.options.id_column,
+                &PhysicalSchema::of_reader(&reader, &legacy),
+            );
+            inputs.push(MergeInput {
+                reader,
+                deleted: bitmap,
+                adapter: Some(adapter),
+            });
         }
 
         // The merged file replaces its inputs, so it bakes the table-wide
@@ -674,7 +702,9 @@ impl Supertable {
         // its own documents — the same statistic a fresh append bakes, and
         // what lets a compacted table score like an unfragmented one.
         let replaced: HashSet<Uuid> = superfiles.iter().map(|e| e.superfile_id).collect();
-        let fts_corpus = manifest.fts_corpus_stats(&replaced);
+        let builder_options = manifest
+            .builder_options()
+            .with_fts_corpus_stats(manifest.fts_corpus_stats(&replaced));
         // The build is long, synchronous CPU work, so it runs on the
         // maintenance pool rather than the thread driving this future.
         // `run_on_pool` needs a `'static` closure, so everything it reads —
@@ -697,10 +727,10 @@ impl Supertable {
                     let mut writer = BufWriter::new(output.as_file_mut());
                     let stats = merge.build(
                         MergeInputs {
-                            readers: &readers_with_tombstones,
+                            inputs: &inputs,
                             entries: &entries,
                             superseded: &superseded_per_reader,
-                            fts_corpus: &fts_corpus,
+                            builder_options,
                         },
                         &mut writer,
                     )?;
@@ -875,7 +905,6 @@ impl Supertable {
                 term_contribution,
             }) => {
                 let merged_entry = Arc::new(SuperfileEntry {
-                    physical_schema: None,
                     // Carry the OLDEST input's birth_version so a merge of
                     // already-drained inputs stays <= the drain watermark
                     // (skipped, not re-drained). See the hidden-index

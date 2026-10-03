@@ -46,6 +46,7 @@
 
 use std::{cmp::Ordering, sync::Arc};
 
+use arrow_schema::DataType;
 use datafusion::scalar::ScalarValue;
 
 use crate::{
@@ -364,14 +365,10 @@ pub(crate) fn scalar_value_may_match(
     if min.is_null() || max.is_null() {
         return true;
     }
-    // Coerce the query literal to the stored stat type so a
-    // Utf8-literal-vs-LargeUtf8-stat (or differing int width)
-    // mismatch doesn't degrade to "incomparable → keep" and lose
-    // pruning power.
-    let v = match value.cast_to(&min.data_type()) {
-        Ok(v) if !v.is_null() => v,
-        _ => return true,
+    let Some((v, min, max)) = comparable(value, min, max) else {
+        return true;
     };
+    let (min, max) = (&min, &max);
     let cmp_v_min = v.partial_cmp(min);
     let cmp_v_max = v.partial_cmp(max);
     match op {
@@ -396,6 +393,98 @@ pub(crate) fn scalar_value_may_match(
         ScalarOp::GtEq => !matches!(cmp_v_max, Some(Ordering::Greater)),
     }
 }
+
+/// The literal and the bounds brought into one type for comparison, or
+/// `None` when they cannot be compared exactly, in which case the file is
+/// kept. Same type: as they are. Same family (the integer, float, decimal,
+/// string or binary types): all three promoted to the family's widest
+/// type, and only when every promotion is exact — an `Int64` bound above
+/// 2^53 does not survive a trip through `Float64`, and comparing it there
+/// could prune a file that holds the value. Any other pair — the
+/// lexicographic bounds of a string column against a number, say — says
+/// nothing about the column's range in the literal's type, so it is never
+/// compared.
+fn comparable(
+    value: &ScalarValue,
+    min: &ScalarValue,
+    max: &ScalarValue,
+) -> Option<(ScalarValue, ScalarValue, ScalarValue)> {
+    if value.is_null() {
+        return None;
+    }
+    let (stat_type, literal_type) = (min.data_type(), value.data_type());
+    if stat_type == literal_type {
+        return Some((value.clone(), min.clone(), max.clone()));
+    }
+    let target = promotion_target(&stat_type, &literal_type)?;
+    Some((
+        exact_cast(value, &target)?,
+        exact_cast(min, &target)?,
+        exact_cast(max, &target)?,
+    ))
+}
+
+/// Which family a type belongs to, for promotion.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypeFamily {
+    Integer,
+    Float,
+    Decimal,
+    String,
+    Binary,
+}
+
+fn type_family(data_type: &DataType) -> Option<TypeFamily> {
+    Some(match data_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => TypeFamily::Integer,
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => TypeFamily::Float,
+        DataType::Decimal128(..) | DataType::Decimal256(..) => TypeFamily::Decimal,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => TypeFamily::String,
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => TypeFamily::Binary,
+        _ => return None,
+    })
+}
+
+/// The type two values of related types are compared in: the widest of
+/// their families. `None` when the families differ or either has none.
+fn promotion_target(a: &DataType, b: &DataType) -> Option<DataType> {
+    let (fa, fb) = (type_family(a)?, type_family(b)?);
+    Some(match (fa, fb) {
+        (TypeFamily::String, TypeFamily::String) => DataType::LargeUtf8,
+        (TypeFamily::Binary, TypeFamily::Binary) => DataType::LargeBinary,
+        (TypeFamily::Float, TypeFamily::Float | TypeFamily::Integer | TypeFamily::Decimal)
+        | (TypeFamily::Integer | TypeFamily::Decimal, TypeFamily::Float) => DataType::Float64,
+        (TypeFamily::Decimal, TypeFamily::Decimal | TypeFamily::Integer)
+        | (TypeFamily::Integer, TypeFamily::Decimal) => {
+            let scale = |dt: &DataType| match dt {
+                DataType::Decimal128(_, s) | DataType::Decimal256(_, s) => *s,
+                _ => 0,
+            };
+            DataType::Decimal256(DECIMAL256_MAX_PRECISION, scale(a).max(scale(b)))
+        }
+        (TypeFamily::Integer, TypeFamily::Integer) => DataType::Int64,
+        _ => return None,
+    })
+}
+
+/// `value` in `target`, only when the round trip back to its own type
+/// returns it unchanged.
+fn exact_cast(value: &ScalarValue, target: &DataType) -> Option<ScalarValue> {
+    let promoted = value.cast_to(target).ok().filter(|v| !v.is_null())?;
+    let back = promoted.cast_to(&value.data_type()).ok()?;
+    (&back == value).then_some(promoted)
+}
+
+/// The widest decimal precision, so a promoted decimal comparison loses
+/// no digits.
+const DECIMAL256_MAX_PRECISION: u8 = 76;
 
 #[cfg(test)]
 mod tests {
@@ -971,5 +1060,97 @@ mod tests {
             &pairs(&[pred("x", ScalarOp::NotEq, ScalarValue::Int64(Some(5)))]),
         );
         assert_eq!(mask, vec![false, true]);
+    }
+    /// Bounds and literal in the same numeric family compare in the
+    /// family's widest type, exactly: a fractional literal against integer
+    /// bounds prunes when no integer in the bounds can satisfy it and keeps
+    /// the file when one can, which a cast of the literal toward the
+    /// integer type got wrong by truncating.
+    #[test]
+    fn a_float_literal_against_integer_bounds_compares_exactly() {
+        let (min, max) = (ScalarValue::Int64(Some(5)), ScalarValue::Int64(Some(5)));
+        let lit = ScalarValue::Float64(Some(5.5));
+        assert!(!scalar_value_may_match(&min, &max, ScalarOp::Eq, &lit));
+        assert!(scalar_value_may_match(&min, &max, ScalarOp::NotEq, &lit));
+        assert!(
+            scalar_value_may_match(&min, &max, ScalarOp::Lt, &lit),
+            "5 < 5.5"
+        );
+        assert!(scalar_value_may_match(&min, &max, ScalarOp::LtEq, &lit));
+        assert!(
+            !scalar_value_may_match(&min, &max, ScalarOp::Gt, &lit),
+            "5 > 5.5 is false"
+        );
+        assert!(!scalar_value_may_match(&min, &max, ScalarOp::GtEq, &lit));
+
+        // A narrower integer type on the file's side promotes the same way.
+        let (min32, max32) = (ScalarValue::Int32(Some(1)), ScalarValue::Int32(Some(9)));
+        assert!(scalar_value_may_match(
+            &min32,
+            &max32,
+            ScalarOp::Eq,
+            &ScalarValue::Int64(Some(4))
+        ));
+        assert!(!scalar_value_may_match(
+            &min32,
+            &max32,
+            ScalarOp::Eq,
+            &ScalarValue::Int64(Some(40))
+        ));
+    }
+
+    /// A promotion that is not exact keeps the file: an `Int64` bound above
+    /// 2^53 does not survive `Float64`, so it is never compared there.
+    #[test]
+    fn an_inexact_promotion_keeps_the_file() {
+        let big = (1i64 << 53) + 1;
+        let (min, max) = (ScalarValue::Int64(Some(big)), ScalarValue::Int64(Some(big)));
+        let lit = ScalarValue::Float64(Some(1.0));
+        assert!(scalar_value_may_match(&min, &max, ScalarOp::Eq, &lit));
+        assert!(scalar_value_may_match(&min, &max, ScalarOp::Lt, &lit));
+    }
+
+    /// Bounds of another type family say nothing about the literal's range:
+    /// the file is kept whatever the operator. Within the string family a
+    /// narrow literal still compares against wide bounds.
+    #[test]
+    fn a_type_family_mismatch_keeps_the_file_and_string_widths_still_compare() {
+        let (min, max) = (
+            ScalarValue::LargeUtf8(Some("apple".into())),
+            ScalarValue::LargeUtf8(Some("pear".into())),
+        );
+        for op in [ScalarOp::Eq, ScalarOp::Lt, ScalarOp::Gt, ScalarOp::NotEq] {
+            assert!(scalar_value_may_match(
+                &min,
+                &max,
+                op,
+                &ScalarValue::Int64(Some(7))
+            ));
+        }
+        assert!(scalar_value_may_match(
+            &min,
+            &max,
+            ScalarOp::Eq,
+            &ScalarValue::Utf8(Some("kiwi".into()))
+        ));
+        assert!(!scalar_value_may_match(
+            &min,
+            &max,
+            ScalarOp::Eq,
+            &ScalarValue::Utf8(Some("zebra".into()))
+        ));
+        let (imin, imax) = (ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(2)));
+        assert!(scalar_value_may_match(
+            &imin,
+            &imax,
+            ScalarOp::Eq,
+            &ScalarValue::Utf8(Some("1".into()))
+        ));
+        assert!(!scalar_value_may_match(
+            &imin,
+            &imax,
+            ScalarOp::Eq,
+            &ScalarValue::Int64(Some(3))
+        ));
     }
 }

@@ -3284,7 +3284,10 @@ pub(super) fn prepare_superfile_named(
         superfile_id: uuid::Uuid::new_v4(),
         uri,
         stem: stem.map(str::to_owned),
-        physical_schema: Some(Arc::new(PhysicalSchema::of_reader(&reader))),
+        physical_schema: Some(Arc::new(PhysicalSchema::of_reader(
+            &reader,
+            &manifest.options.legacy_names(),
+        ))),
         n_docs: shard.n_docs,
         id_min: shard.id_min,
         id_max: shard.id_max,
@@ -3510,6 +3513,40 @@ const UPDATE_PLANNED_DATA_OBJECTS: u64 = 1;
 /// split decides them. Callers compute this before the batch moves into
 /// the publish future and flush it only after the commit returns Ok, so a
 /// failed or retried publish never counts.
+/// Commit `bytes`, a superfile built outside the writer, as one new entry
+/// of `st`. Lets a test place files written under earlier shapes of the
+/// table's schema — fewer columns, other names, other types — into a
+/// table, which in production only a sequence of schema changes does.
+#[cfg(test)]
+pub(crate) fn commit_built_superfile(st: &Supertable, bytes: Bytes) -> Result<(), BuildError> {
+    let inner = st.inner();
+    let reader = SuperfileReader::open(bytes.clone())
+        .map_err(|e| BuildError::Store(format!("opening built superfile: {e}")))?;
+    let batch = reader
+        .get_record_batch(None)
+        .map_err(|e| BuildError::Store(format!("reading built superfile: {e}")))?;
+    let ids = batch
+        .column_by_name(reader.id_column())
+        .and_then(|c| c.as_any().downcast_ref::<Decimal128Array>())
+        .ok_or_else(|| BuildError::Store("built superfile has no id column".into()))?;
+    let (id_min, id_max) = ids
+        .values()
+        .iter()
+        .fold((i128::MAX, i128::MIN), |(lo, hi), &v| {
+            (lo.min(v), hi.max(v))
+        });
+    let scalar_stats = ScalarStatsAgg::from_batches(&batch.schema(), &[&batch]);
+    let shard = ShardOutput::new_with_params(bytes, reader.n_docs(), id_min, id_max, scalar_stats);
+    let prepared = prepare_superfile_named(inner, shard, None)?
+        .ok_or_else(|| BuildError::Store("built superfile holds no rows".into()))?;
+    let publish = collect_prepared_superfiles(inner, vec![prepared])?;
+    st.block_on_query(persist_superfile_publish_batch_async(
+        inner,
+        publish,
+        CommitListMetadata::empty(),
+    ))
+}
+
 fn commit_output_stats(batch: &SuperfilePublishBatch) -> (u64, u64, u64) {
     let superfiles = batch.new_entries.len() as u64;
     let bytes: u64 = batch

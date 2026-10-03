@@ -646,7 +646,13 @@ fn eligible_summary<'e>(
     column: &str,
     column_id: Option<FieldId>,
     query_dim: usize,
-) -> Result<&'e VectorSummary, QueryError> {
+) -> Result<Option<&'e VectorSummary>, QueryError> {
+    // A file written before the column existed holds no vectors for it
+    // and contributes nothing; a file that declares the column and has no
+    // summary is a malformed build.
+    if column_id.is_some_and(|id| !entry.holds_vector_column(id)) {
+        return Ok(None);
+    }
     match column_id.and_then(|id| entry.vector_summary.get(&id)) {
         Some(vs) if !vs.cells.is_empty() => {
             for cell in &vs.cells {
@@ -658,7 +664,7 @@ fn eligible_summary<'e>(
                     )));
                 }
             }
-            Ok(vs)
+            Ok(Some(vs))
         }
         Some(_) => Err(QueryError::Internal(format!(
             "superfile {} has no cluster centroids in its vector summary for \
@@ -700,7 +706,9 @@ fn estimate_admit_ranking(
     };
     let mut cell_best: HashMap<u32, f32> = HashMap::new();
     for entry in superfiles.iter().filter(|e| eligible(e)) {
-        let vs = eligible_summary(entry, column, column_id, query_len)?;
+        let Some(vs) = eligible_summary(entry, column, column_id, query_len)? else {
+            continue;
+        };
         for cell in &vs.cells {
             let Some(cell_id) = cell.cell_id else {
                 continue;
@@ -770,7 +778,9 @@ fn score_fine_candidates(
         if !eligible(entry) {
             continue;
         }
-        let vs = eligible_summary(entry, column, column_id, query.len())?;
+        let Some(vs) = eligible_summary(entry, column, column_id, query.len())? else {
+            continue;
+        };
         let mut flat_base = 0u32;
         for cell in &vs.cells {
             // Flat cluster ids must stay identical whether or not a cell is

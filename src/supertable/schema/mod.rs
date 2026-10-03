@@ -20,6 +20,10 @@
 //! [`TableSchema::from_json`] are its one spelling, written into the
 //! manifest list and returned to a caller that asks for the schema.
 
+pub mod cast;
+#[cfg(test)]
+mod generations;
+pub mod map;
 pub mod types;
 
 use std::{collections::HashMap, fmt, sync::Arc};
@@ -881,9 +885,32 @@ pub struct PhysicalColumn {
     pub id: Option<FieldId>,
     /// The column's type as the file declares it.
     pub data_type: DataType,
+    /// Where the file holds the column.
+    pub kind: PhysicalKind,
 }
 
+/// Where a superfile physically holds a column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalKind {
+    /// In the Parquet body (and, for an indexed text column, in the FTS
+    /// blob as well).
+    Stored,
+    /// Only in the FTS blob: an index-only text column.
+    FtsIndexOnly,
+    /// Only in the vector blob.
+    Vector,
+}
+
+/// Field-metadata key the physical schema's IPC form carries a non-stored
+/// column's kind under; a stored column carries none.
+const PHYSICAL_KIND_META_KEY: &str = "infino:physical";
+
 impl PhysicalSchema {
+    /// A physical schema of exactly `columns`, in file order.
+    pub fn new(columns: Vec<PhysicalColumn>) -> Self {
+        Self { columns }
+    }
+
     /// The physical schema a stored Arrow schema (a superfile's
     /// `ARROW:schema`, or the builder's schema that wrote it) describes.
     pub fn of_stored_schema(schema: &Schema) -> Self {
@@ -895,9 +922,20 @@ impl PhysicalSchema {
                     name: f.name().clone(),
                     id: field_id_of(f),
                     data_type: f.data_type().clone(),
+                    kind: PhysicalKind::Stored,
                 })
                 .collect(),
         }
+    }
+
+    /// The column with field id `id`, if the file holds one.
+    pub fn column_by_id(&self, id: FieldId) -> Option<&PhysicalColumn> {
+        self.columns.iter().find(|c| c.id == Some(id))
+    }
+
+    /// The column named `name`, if the file holds one.
+    pub fn column_by_name(&self, name: &str) -> Option<&PhysicalColumn> {
+        self.columns.iter().find(|c| c.name == name)
     }
 
     /// The stored columns in file order.
@@ -910,7 +948,7 @@ impl PhysicalSchema {
     /// in the blobs rather than the Parquet body. The one place a file's
     /// physical schema is derived; the builder calls it on the file it just
     /// wrote and stamps the result on the manifest entry.
-    pub fn of_reader(reader: &crate::superfile::SuperfileReader) -> Self {
+    pub fn of_reader(reader: &crate::superfile::SuperfileReader, legacy: &LegacyNames) -> Self {
         let mut columns = Self::of_stored_schema(reader.schema()).columns;
         if let Some(fts) = reader.fts() {
             for meta in fts.fts_columns_config() {
@@ -919,6 +957,7 @@ impl PhysicalSchema {
                         name: meta.name.clone(),
                         id: meta.field_id,
                         data_type: DataType::LargeUtf8,
+                        kind: PhysicalKind::FtsIndexOnly,
                     });
                 }
             }
@@ -932,10 +971,24 @@ impl PhysicalSchema {
                         Arc::new(Field::new("item", DataType::Float32, false)),
                         col.dim as i32,
                     ),
+                    kind: PhysicalKind::Vector,
                 });
             }
         }
-        Self { columns }
+        Self { columns }.resolved(legacy)
+    }
+
+    /// This schema with every column that carries no id given the id its
+    /// name resolves to through `legacy`: a file written before ids names
+    /// its columns by their creation names, and once resolved here the
+    /// manifest entry carries ids for it like any other file's.
+    pub fn resolved(mut self, legacy: &LegacyNames) -> Self {
+        for column in &mut self.columns {
+            if column.id.is_none() {
+                column.id = legacy.resolve(&column.name);
+            }
+        }
+        self
     }
 
     /// Arrow IPC bytes of the stored schema this describes, the form the
@@ -945,11 +998,21 @@ impl PhysicalSchema {
             .columns
             .iter()
             .map(|c| {
-                let f = Field::new(&c.name, c.data_type.clone(), true);
-                Arc::new(match c.id {
-                    Some(id) => with_field_id(&f, id),
-                    None => f,
-                })
+                let mut f = Field::new(&c.name, c.data_type.clone(), true);
+                if let Some(id) = c.id {
+                    f = with_field_id(&f, id);
+                }
+                let kind = match c.kind {
+                    PhysicalKind::Stored => None,
+                    PhysicalKind::FtsIndexOnly => Some("fts"),
+                    PhysicalKind::Vector => Some("vector"),
+                };
+                if let Some(kind) = kind {
+                    let mut metadata = f.metadata().clone();
+                    metadata.insert(PHYSICAL_KIND_META_KEY.to_string(), kind.to_string());
+                    f = f.with_metadata(metadata);
+                }
+                Arc::new(f)
             })
             .collect();
         let schema = Schema::new(fields);
@@ -966,7 +1029,22 @@ impl PhysicalSchema {
     pub fn from_ipc(bytes: &[u8]) -> Result<Self, String> {
         let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
             .map_err(|e| format!("physical schema IPC: {e}"))?;
-        Ok(Self::of_stored_schema(&reader.schema()))
+        let mut physical = Self::of_stored_schema(&reader.schema());
+        for (column, field) in physical.columns.iter_mut().zip(reader.schema().fields()) {
+            column.kind = match field
+                .metadata()
+                .get(PHYSICAL_KIND_META_KEY)
+                .map(String::as_str)
+            {
+                None => PhysicalKind::Stored,
+                Some("fts") => PhysicalKind::FtsIndexOnly,
+                Some("vector") => PhysicalKind::Vector,
+                Some(other) => {
+                    return Err(format!("physical schema: unknown column kind '{other}'"));
+                }
+            };
+        }
+        Ok(physical)
     }
 }
 
