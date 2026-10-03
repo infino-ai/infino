@@ -77,7 +77,7 @@ use crate::{
     },
     supertable::{
         error::QueryError,
-        handle::SupertableReader,
+        handle::{SupertableReader, WeakReader},
         manifest::{ManifestSnapshot, SuperfileUri},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
@@ -152,6 +152,18 @@ fn over_fetch_ceiling(k: usize, total: usize) -> usize {
         .clamp(OVER_FETCH_MIN_CEILING, OVER_FETCH_MAX_HITS)
         .max(k)
         .min(total)
+}
+
+/// The reader a search table function captured, still alive when the query
+/// runs. The function holds it weakly; finding it gone means the table handle
+/// was dropped under a running plan, which is ours, not the query's.
+pub(crate) fn live_reader(reader: &WeakReader, function: &str) -> DfResult<Arc<SupertableReader>> {
+    reader.upgrade().ok_or_else(|| {
+        QueryError::Internal(format!(
+            "{function}: supertable consumer dropped before execution"
+        ))
+        .into()
+    })
 }
 
 /// Give one search table-function call a scan name of its own, so
@@ -230,25 +242,6 @@ impl TableProvider for CallScopedTable {
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
         self.inner.supports_filters_pushdown(filters)
-    }
-}
-
-/// Map a search TVF's `QueryError` into a DataFusion error at the
-/// execution-node boundary.
-///
-/// The kNN runs off-SQL (in a custom `ExecutionPlan`), so its error must cross
-/// back into DataFusion to bubble up through `collect()`. A connection-memory
-/// budget refusal has to re-enter as `ResourcesExhausted`, the same channel
-/// DataFusion's own memory pool uses, so the SQL error classifier routes it to
-/// `InfinoError::OverBudget` rather than flattening it to a generic query
-/// error. Every other failure is a plain execution error.
-///
-/// Shared by the `vector_search` and `hybrid_search` nodes; without it a hybrid
-/// query would flatten the budget refusal that the plain vector query preserves.
-pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
-    match e.over_budget() {
-        Some(msg) => DataFusionError::ResourcesExhausted(msg.to_string()),
-        None => DataFusionError::Execution(e.to_string()),
     }
 }
 
@@ -383,11 +376,11 @@ pub(crate) async fn resolve_hits_named(
     // entry points via [`validate_projection`]; this call is the one source of
     // truth so the two never drift.
     let indices = validate_projection(projection, id_column.as_str(), &output_schema)?;
-    // Past name resolution, any failure is a store/decode fault reading the
-    // projected columns — not the caller's mistake.
+    // Past name resolution, a failure is ours reading the projected columns;
+    // keep it typed so a storage fault or budget refusal keeps its class.
     resolve_hits(reader, hits, &scalar_schema, &output_schema, Some(&indices))
         .await
-        .map_err(|e| QueryError::Store(e.to_string()))
+        .map_err(QueryError::DataFusion)
 }
 
 /// Resolve each projected column name to its index in the search output
@@ -627,7 +620,7 @@ where
     Fut: Future<Output = Result<Vec<SuperfileHit>, QueryError>>,
 {
     let Some(predicate) = predicate else {
-        let hits = search(k).await.map_err(search_query_df_error)?;
+        let hits = search(k).await?;
         return resolve_hits(reader, &hits, scalar_schema, output_schema, projection).await;
     };
     let requested: Vec<usize> = match projection {
@@ -646,7 +639,7 @@ where
     let decoded_schema = Arc::new(
         output_schema
             .project(&decoded)
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+            .map_err(QueryError::internal)?,
     );
     let bound = predicate.bind(&decoded_schema)?;
     let requested_positions: Vec<usize> = (0..requested.len()).collect();
@@ -654,12 +647,11 @@ where
     let ceiling = over_fetch_ceiling(k, total);
     let mut want = k.min(ceiling);
     loop {
-        let hits = search(want).await.map_err(search_query_df_error)?;
+        let hits = search(want).await?;
         let batch =
             resolve_hits(reader, &hits, scalar_schema, output_schema, Some(&decoded)).await?;
         let mask = bound.mask(&batch)?;
-        let kept = filter_record_batch(&batch, &mask)
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let kept = filter_record_batch(&batch, &mask).map_err(QueryError::internal)?;
         // The ceiling is the only stopping condition other than finding `k`.
         // Nothing observable here distinguishes a kernel that is out of
         // candidates from one whose hits were thinned after it ran: tombstones
@@ -673,7 +665,7 @@ where
             return kept
                 .slice(0, rows)
                 .project(&requested_positions)
-                .map_err(|e| DataFusionError::Execution(e.to_string()));
+                .map_err(|e| QueryError::internal(e).into());
         }
         want = want.saturating_mul(OVER_FETCH_GROWTH).min(ceiling);
     }
@@ -721,7 +713,7 @@ pub(crate) async fn resolve_hits(
         Some(indices) => Arc::new(
             output_schema
                 .project(indices)
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+                .map_err(QueryError::internal)?,
         ),
         None => Arc::clone(output_schema),
     };
@@ -773,7 +765,7 @@ pub(crate) async fn resolve_hits(
             .collect();
         let other_batch = resolve_columns(reader, hits, &other).await?;
         let id_batch = resolve_ids_arithmetic(reader, hits).ok_or_else(|| {
-            DataFusionError::Execution(
+            QueryError::Internal(
                 "resolve_hits: hit set missing stable _id and span arithmetic \
                  (cell-packed hits must carry stable_id from the search wave)"
                     .into(),
@@ -791,7 +783,7 @@ pub(crate) async fn resolve_hits(
         columns.extend(other_batch.columns().iter().map(Arc::clone));
         Some(
             RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+                .map_err(QueryError::internal)?,
         )
     } else {
         Some(resolve_columns(reader, hits, &needed).await?)
@@ -809,10 +801,7 @@ pub(crate) async fn resolve_hits(
             let rb = resolved
                 .as_ref()
                 .expect("a scalar column is projected => columns resolved");
-            let idx = rb
-                .schema()
-                .index_of(name)
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            let idx = rb.schema().index_of(name).map_err(QueryError::internal)?;
             columns.push(Arc::clone(rb.column(idx)));
         }
     }
@@ -825,7 +814,7 @@ pub(crate) async fn resolve_hits(
         columns,
         &RecordBatchOptions::new().with_row_count(Some(hits.len())),
     )
-    .map_err(|e| DataFusionError::Execution(e.to_string()))
+    .map_err(|e| QueryError::internal(e).into())
 }
 
 /// Hit → stable-`_id` translation by manifest arithmetic — the
@@ -873,7 +862,11 @@ fn resolve_ids_arithmetic(
         .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
     {
         Ok(a) => a,
-        Err(e) => return Some(Err(DataFusionError::Execution(e.to_string()))),
+        Err(e) => {
+            return Some(Err(DataFusionError::from(QueryError::Internal(
+                e.to_string(),
+            ))));
+        }
     };
     let schema = Arc::new(Schema::new(vec![Field::new(
         reader.options().id_column.clone(),
@@ -882,7 +875,7 @@ fn resolve_ids_arithmetic(
     )]));
     Some(
         RecordBatch::try_new(schema, vec![Arc::new(array) as ArrayRef])
-            .map_err(|e| DataFusionError::Execution(e.to_string())),
+            .map_err(|e| QueryError::internal(e).into()),
     )
 }
 
@@ -917,7 +910,7 @@ pub(crate) async fn stamp_stable_ids(
         .as_any()
         .downcast_ref::<Decimal128Array>()
         .ok_or_else(|| {
-            DataFusionError::Execution("stamp_stable_ids: _id column not Decimal128".into())
+            QueryError::Internal("stamp_stable_ids: _id column not Decimal128".into())
         })?;
     for (hit, id) in hits.iter_mut().zip(ids.values()) {
         hit.stable_id = Some(*id);
@@ -939,7 +932,7 @@ pub(crate) fn id_score_batch(
 ) -> DfResult<RecordBatch> {
     let id_array = Decimal128Array::from_iter_values(ids.iter().copied())
         .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        .map_err(QueryError::internal)?;
     let score_array = Float32Array::from_iter_values(scores.iter().copied());
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -956,7 +949,7 @@ pub(crate) fn id_score_batch(
             Arc::new(score_array) as ArrayRef,
         ],
     )
-    .map_err(|e| DataFusionError::Execution(e.to_string()))
+    .map_err(|e| QueryError::internal(e).into())
 }
 
 /// Read `names` (scalar columns) at the `hits`' `(superfile,
@@ -1015,9 +1008,9 @@ async fn resolve_columns(
         let entry = manifest
             .lookup_superfile_entry(uri)
             .await
-            .map_err(|error| DataFusionError::Execution(error.to_string()))?
+            .map_err(QueryError::ManifestLoad)?
             .ok_or_else(|| {
-                DataFusionError::Execution(format!(
+                QueryError::Internal(format!(
                     "resolve_hits: superfile {uri:?} missing from manifest"
                 ))
             })?;
@@ -1032,7 +1025,7 @@ async fn resolve_columns(
         )
         .await
         .map(|reader| (index, reader))
-        .map_err(|error| DataFusionError::Execution(error.to_string()))
+        .map_err(|error| DataFusionError::from(QueryError::store(error)))
     }))
     .await?;
 
@@ -1090,8 +1083,8 @@ async fn resolve_columns(
             },
         )
         .await
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?
-        .map_err(|e| DataFusionError::Execution(e.to_string()))
+        .map_err(QueryError::internal)?
+        .map_err(|e| QueryError::from(e).into())
     };
 
     let cold_wave = try_join_all(cold_units.into_iter().map(|(i, rd, locals)| async move {
@@ -1129,7 +1122,7 @@ async fn resolve_columns(
     }
     let batches: Vec<&RecordBatch> = per_superfile.iter().collect();
     interleave_record_batch(&batches, &placement)
-        .map_err(|error| DataFusionError::Execution(error.to_string()))
+        .map_err(|error| QueryError::internal(error).into())
 }
 
 /// Parquet async reader backed by the `SuperfileReader`'s existing byte source.
@@ -1212,8 +1205,8 @@ pub(crate) async fn take_rows(
         },
     )
     .await
-    .map_err(|e| DataFusionError::Execution(e.to_string()))?
-    .map_err(|e| DataFusionError::Execution(e.to_string()))
+    .map_err(QueryError::internal)?
+    .map_err(|e| DataFusionError::from(QueryError::from(e)))
 }
 
 /// Stream projected rows through a reader's cache-aware byte source.
@@ -1231,7 +1224,7 @@ pub(crate) async fn take_rows_byte_source(
     let metadata = reader
         .parquet_metadata_with_page_index()
         .await
-        .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+        .map_err(QueryError::from)?;
     let input = ByteSourceAsyncReader {
         source: Source::Lazy(reader.byte_source()),
         metadata,
@@ -1284,7 +1277,7 @@ where
     for &name in names {
         let idx = file_schema
             .index_of(name)
-            .map_err(|_| DataFusionError::Execution(format!("unknown column {name}")))?;
+            .map_err(|_| QueryError::Internal(format!("unknown column {name}")))?;
         col_indices.push(idx);
         out_fields.push(file_schema.field(idx).clone());
     }
@@ -1295,9 +1288,9 @@ where
     }
     for &d in local_doc_ids {
         if u64::from(d) >= n_docs {
-            return Err(DataFusionError::Execution(format!(
+            return Err(DataFusionError::from(QueryError::Internal(format!(
                 "doc id {d} out of range (n_docs={n_docs})"
-            )));
+            ))));
         }
     }
 
@@ -1309,23 +1302,19 @@ where
 
     let builder = ParquetRecordBatchStreamBuilder::new(input)
         .await
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        .map_err(QueryError::store)?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices.iter().copied());
     let stream = builder
         .with_projection(mask)
         .with_row_selection(selection)
         .build()
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-    let batches: Vec<RecordBatch> = stream
-        .try_collect()
-        .await
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        .map_err(QueryError::store)?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(QueryError::store)?;
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(out_schema));
     }
     let read_schema = batches[0].schema();
-    let selected = concat_batches(&read_schema, &batches)
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let selected = concat_batches(&read_schema, &batches).map_err(QueryError::internal)?;
 
     // Rank back into the caller's (possibly duplicated) order.
     let indices = rank_back_indices(local_doc_ids, &sorted);
@@ -1336,13 +1325,10 @@ where
         let idx = selected
             .schema()
             .index_of(name)
-            .map_err(|_| DataFusionError::Execution(format!("unknown column {name}")))?;
-        columns.push(
-            take(selected.column(idx), &indices, None)
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?,
-        );
+            .map_err(|_| QueryError::Internal(format!("unknown column {name}")))?;
+        columns.push(take(selected.column(idx), &indices, None).map_err(QueryError::internal)?);
     }
-    RecordBatch::try_new(out_schema, columns).map_err(|e| DataFusionError::Execution(e.to_string()))
+    RecordBatch::try_new(out_schema, columns).map_err(|e| QueryError::internal(e).into())
 }
 
 /// Extract a string literal argument (a column name, query text, ...).
@@ -1476,21 +1462,6 @@ mod tests {
             "emb"
         );
         assert!(arg_to_string(&lit(3_i64), "column").is_err());
-    }
-
-    #[test]
-    fn search_query_df_error_maps_over_budget_to_resources_exhausted() {
-        // Pins the boundary contract both search nodes depend on: a budget
-        // refusal maps to ResourcesExhausted (the shape the SQL classifier
-        // routes back to OverBudget), any other failure to Execution.
-        assert!(matches!(
-            search_query_df_error(QueryError::OverBudget("vector search, over".into())),
-            DataFusionError::ResourcesExhausted(_)
-        ));
-        assert!(matches!(
-            search_query_df_error(QueryError::Plan("boom".into())),
-            DataFusionError::Execution(_)
-        ));
     }
 
     #[test]

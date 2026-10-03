@@ -108,6 +108,16 @@ test("local openTable of a missing table throws the addon error with no status",
   assert.match(e.message, /^NotFound: /);
 });
 
+test("local unimplemented SQL throws an Unsupported error", () => {
+  // Valid SQL the engine does not implement: not a bad argument
+  // (InvalidArg), and prefixed so a caller can tell it apart.
+  const db = connect("memory://");
+  db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  const e = throws(() => db.querySql("ALTER TABLE docs ADD COLUMN y int"));
+  assert.equal(e.code, "GenericFailure");
+  assert.match(e.message, /^Unsupported: /);
+});
+
 test("local query failures are untouched", () => {
   const db = connect("memory://");
   const e = throws(() => db.querySql("definitely not sql"));

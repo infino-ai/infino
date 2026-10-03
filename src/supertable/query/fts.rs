@@ -120,7 +120,6 @@ use crate::{
     superfile::{
         SuperfileReader,
         builder::FtsConfig,
-        error::{FtsError, ReadError},
         fts::{
             bm25,
             bm25::Bm25Params,
@@ -1039,8 +1038,7 @@ impl SupertableReader {
                                         global_idf.as_deref(),
                                         memo.as_deref(),
                                     )
-                                    .await
-                                    .map_err(fts_read_error)?;
+                                    .await?;
                                 // Flushed inside the OnceCell init so slices
                                 // sharing this superfile's cursor set count
                                 // its posting bytes exactly once.
@@ -1048,7 +1046,7 @@ impl SupertableReader {
                                     stats.add_fts_postings_bytes(set.postings_bytes());
                                     stats.add_planned_read_ranges(set.planned_ranges());
                                 }
-                                Ok(Arc::new(set))
+                                Ok::<_, QueryError>(Arc::new(set))
                             })
                             .await?;
                         // Heavy kernels go to the reader pool; trivial ones
@@ -1075,8 +1073,7 @@ impl SupertableReader {
                                 },
                             )
                             .await
-                            .map_err(|e| QueryError::Internal(e.to_string()))?
-                            .map_err(fts_read_error)?
+                            .map_err(|e| QueryError::Internal(e.to_string()))??
                         } else {
                             op_stats::timed_kernel(&op_stats, || {
                                 r.bm25_search_or_range_prebuilt(
@@ -1087,8 +1084,7 @@ impl SupertableReader {
                                     floor,
                                     bm25_params,
                                 )
-                            })
-                            .map_err(fts_read_error)?
+                            })?
                         }
                     }
                     None => {
@@ -1115,8 +1111,7 @@ impl SupertableReader {
                                 floor,
                                 bm25_params,
                             )
-                            .await
-                            .map_err(fts_read_error)?;
+                            .await?;
                         if let Some(stats) = &op_stats {
                             stats.add_fts_postings_bytes(prep.postings_bytes());
                             stats.add_planned_read_ranges(prep.planned_ranges());
@@ -1137,7 +1132,7 @@ impl SupertableReader {
                             // ids, and everything downstream reads them
                             // as rows.
                             prep @ PreparedClauses::Done { .. } => {
-                                r.run_prepared(prep, bm25_params).map_err(fts_read_error)?
+                                r.run_prepared(prep, bm25_params)?
                             }
                             // Gate on posting mass, not term count: this
                             // scan isn't sliced, so a rare-term query
@@ -1156,13 +1151,11 @@ impl SupertableReader {
                                     },
                                 )
                                 .await
-                                .map_err(|e| QueryError::Internal(e.to_string()))?
-                                .map_err(fts_read_error)?
+                                .map_err(|e| QueryError::Internal(e.to_string()))??
                             }
                             prep => op_stats::timed_kernel(&op_stats, || {
                                 r.run_prepared(prep, bm25_params)
-                            })
-                            .map_err(fts_read_error)?,
+                            })?,
                         }
                     }
                 };
@@ -1281,7 +1274,7 @@ impl SupertableReader {
             let live: HashSet<Uuid> = manifest
                 .get_all_superfiles_loaded()
                 .await
-                .map_err(|e| QueryError::Store(e.to_string()))?
+                .map_err(QueryError::ManifestLoad)?
                 .iter()
                 .map(|e| e.superfile_id)
                 .collect();
@@ -1367,20 +1360,14 @@ impl SupertableReader {
                         // reads — and hand them back through the memo. The
                         // walk wave flushes this work when it builds the
                         // cursors, so nothing is flushed here.
-                        let memo = r
-                            .fetch_scored_terms(&column_arc, &refs)
-                            .await
-                            .map_err(fts_read_error)?;
+                        let memo = r.fetch_scored_terms(&column_arc, &refs).await?;
                         let dfs: Vec<u64> = refs.iter().map(|t| memo.df(t)).collect();
                         Ok::<_, QueryError>((suid, dfs, Some(Arc::new(memo))))
                     } else {
                         // Residual superfile (contains a scored term, pruned
                         // from scoring): df only, from the dictionary value
                         // + header hint — no postings body.
-                        let (dfs, work) = r
-                            .term_dfs(&column_arc, &refs)
-                            .await
-                            .map_err(fts_read_error)?;
+                        let (dfs, work) = r.term_dfs(&column_arc, &refs).await?;
                         if let Some(stats) = &op_stats {
                             stats.add_fts_postings_bytes(work.postings_bytes);
                             stats.add_planned_read_ranges(work.planned_ranges);
@@ -1531,8 +1518,7 @@ impl SupertableReader {
                                         &prefix_arc,
                                         Some(&reader_pool),
                                     )
-                                    .await
-                                    .map_err(fts_read_error)?;
+                                    .await?;
                                 // Flushed inside the OnceCell init so slices
                                 // sharing this superfile's expansion count
                                 // its posting work exactly once — the same
@@ -1541,7 +1527,7 @@ impl SupertableReader {
                                     stats.add_fts_postings_bytes(set.postings_bytes());
                                     stats.add_planned_read_ranges(set.planned_ranges());
                                 }
-                                Ok(Arc::new(set))
+                                Ok::<_, QueryError>(Arc::new(set))
                             })
                             .await?;
                         if set.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
@@ -1572,7 +1558,7 @@ impl SupertableReader {
                             )
                             .await
                             .map_err(|e| QueryError::Internal(e.to_string()))?
-                            .map_err(fts_read_error)
+                            .map_err(QueryError::from)
                             .map(rows_as_local_ids)
                         } else {
                             op_stats::timed_kernel(&op_stats, || {
@@ -1585,15 +1571,14 @@ impl SupertableReader {
                                     None,
                                 )
                             })
-                            .map_err(fts_read_error)
+                            .map_err(QueryError::from)
                             .map(rows_as_local_ids)
                         }
                     }
                     None => {
                         let (hits, work) = r
                             .bm25_search_prefix(&column_arc, &prefix_arc, k, Some(&reader_pool))
-                            .await
-                            .map_err(fts_read_error)?;
+                            .await?;
                         if let Some(stats) = &op_stats {
                             stats.add_fts_postings_bytes(work.postings_bytes);
                             stats.add_planned_read_ranges(work.planned_ranges);
@@ -1814,14 +1799,14 @@ impl SupertableReader {
                 // phrase-aware walk; plain-token queries keep the
                 // optimized token_match path unchanged.
                 let (docs, mut work) = match phrase_involved {
-                    true => r
-                        .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
-                        .await
-                        .map_err(fts_read_error)?,
-                    false => r
-                        .token_match_prefetched(&column_arc, &refs, match_mode, memo.as_deref())
-                        .await
-                        .map_err(fts_read_error)?,
+                    true => {
+                        r.atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
+                            .await?
+                    }
+                    false => {
+                        r.token_match_prefetched(&column_arc, &refs, match_mode, memo.as_deref())
+                            .await?
+                    }
                 };
                 // Drop any positive match that also carries a negated
                 // atom (union of the negatives). The df / count fast
@@ -1830,19 +1815,19 @@ impl SupertableReader {
                 let docs = if has_negatives {
                     let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
                     let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
-                        true => r
-                            .token_match_prefetched(
+                        true => {
+                            r.token_match_prefetched(
                                 &column_arc,
                                 &neg_refs,
                                 BoolMode::Or,
                                 memo.as_deref(),
                             )
-                            .await
-                            .map_err(fts_read_error)?,
-                        false => r
-                            .atoms_match_ids(&column_arc, &neg_refs, &neg_ph_arc, BoolMode::Or)
-                            .await
-                            .map_err(fts_read_error)?,
+                            .await?
+                        }
+                        false => {
+                            r.atoms_match_ids(&column_arc, &neg_refs, &neg_ph_arc, BoolMode::Or)
+                                .await?
+                        }
                     };
                     work.merge(neg_work);
                     let excluded: RoaringBitmap = neg_docs.into_iter().map(RowId::get).collect();
@@ -2031,41 +2016,41 @@ impl SupertableReader {
                     // takes the skip-based counting path below instead.
                     if tomb.is_some() {
                         let (docs, mut work) = match phrase_involved {
-                            true => r
-                                .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
-                                .await
-                                .map_err(fts_read_error)?,
-                            false => r
-                                .token_match_prefetched(
+                            true => {
+                                r.atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
+                                    .await?
+                            }
+                            false => {
+                                r.token_match_prefetched(
                                     &column_arc,
                                     &refs,
                                     match_mode,
                                     memo.as_deref(),
                                 )
-                                .await
-                                .map_err(fts_read_error)?,
+                                .await?
+                            }
                         };
                         let excluded: RoaringBitmap = if has_negatives {
                             let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
                             let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
-                                true => r
-                                    .token_match_prefetched(
+                                true => {
+                                    r.token_match_prefetched(
                                         &column_arc,
                                         &neg_refs,
                                         BoolMode::Or,
                                         memo.as_deref(),
                                     )
-                                    .await
-                                    .map_err(fts_read_error)?,
-                                false => r
-                                    .atoms_match_ids(
+                                    .await?
+                                }
+                                false => {
+                                    r.atoms_match_ids(
                                         &column_arc,
                                         &neg_refs,
                                         &neg_ph_arc,
                                         BoolMode::Or,
                                     )
-                                    .await
-                                    .map_err(fts_read_error)?,
+                                    .await?
+                                }
                             };
                             work.merge(neg_work);
                             neg_docs.into_iter().map(RowId::get).collect()
@@ -2102,17 +2087,13 @@ impl SupertableReader {
                             &neg_refs,
                             &neg_ph_arc,
                         )
-                        .await
-                        .map_err(fts_read_error)?
+                        .await?
                     } else if single_term {
                         // A single token resolves O(1) from the stored df.
-                        r.term_df(&column_arc, &term_arc[0])
-                            .await
-                            .map_err(fts_read_error)?
+                        r.term_df(&column_arc, &term_arc[0]).await?
                     } else if phrase_involved {
                         r.atoms_match_count(&column_arc, &refs, &phrase_arc, match_mode, &[], &[])
-                            .await
-                            .map_err(fts_read_error)?
+                            .await?
                     } else {
                         // Multi-token AND/OR tallies through the counting sink.
                         r.token_match_count_prefetched(
@@ -2121,8 +2102,7 @@ impl SupertableReader {
                             match_mode,
                             memo.as_deref(),
                         )
-                        .await
-                        .map_err(fts_read_error)?
+                        .await?
                     };
                     if let Some(stats) = &op_stats {
                         stats.add_fts_postings_bytes(work.postings_bytes);
@@ -2217,8 +2197,7 @@ impl SupertableReader {
                     let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                     let (docs, work) = r
                         .token_match_prefetched(&column_arc, &refs, BoolMode::And, memo.as_deref())
-                        .await
-                        .map_err(fts_read_error)?;
+                        .await?;
                     // The prune pass's posting walk. The verify pass's own
                     // decode is folded into `rows_materialized` below; its
                     // byte and range legs are deliberately unpriced — both
@@ -2244,7 +2223,7 @@ impl SupertableReader {
                     if r.can_take_by_local_doc_ids() {
                         r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
                             .map(Some)
-                            .map_err(|e| QueryError::Parquet(e.to_string()))
+                            .map_err(QueryError::from)
                     } else {
                         Ok(None)
                     }
@@ -2260,7 +2239,7 @@ impl SupertableReader {
                     // below is charged on both arms.
                     None => take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
                         .await
-                        .map_err(|e| QueryError::Internal(e.to_string()))?,
+                        .map_err(QueryError::DataFusion)?,
                 };
                 // The verify decode materialized one row per candidate,
                 // on either arm. Folding it here rather than per-arm keeps
@@ -2460,26 +2439,6 @@ const SUBRANGE_MIN_DOCS: u32 = 50_000;
 /// that shape.
 fn rows_as_local_ids(hits: Vec<(RowId, f32)>) -> Vec<(u32, f32)> {
     hits.into_iter().map(|(row, s)| (row.get(), s)).collect()
-}
-
-/// Map a per-superfile FTS read error to the query-layer error. A
-/// phrase query against a column indexed without positions, or a query
-/// with no positive clause to rank, is a malformed *request* — surface
-/// it as [`QueryError::InvalidQuery`] so the caller sees a bad-input
-/// error, not a storage/scan failure. Everything else is a genuine
-/// read error and stays [`QueryError::Parquet`].
-fn fts_read_error(e: ReadError) -> QueryError {
-    match &e {
-        ReadError::Fts(fts)
-            if matches!(
-                fts.as_ref(),
-                FtsError::PositionsUnavailable { .. } | FtsError::NegationOnly
-            ) =>
-        {
-            QueryError::InvalidQuery(e.to_string())
-        }
-        _ => QueryError::Parquet(e.to_string()),
-    }
 }
 
 /// Minimum query term count that makes OR sub-range fan-out eligible.

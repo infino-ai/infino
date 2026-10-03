@@ -37,7 +37,6 @@ use dashmap::DashMap;
 use datafusion::{
     common::tree_node::{TreeNode, TreeNodeRecursion},
     config::Dialect,
-    error::DataFusionError,
     execution::context::SQLOptions,
     logical_expr::{BinaryExpr, Operator},
     prelude::Expr,
@@ -72,6 +71,7 @@ use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
+    error::datafusion_error,
     memory::ConnectionMemoryBudget,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::{
@@ -949,9 +949,10 @@ impl Connection {
         // Gate SQL heap on the connection budget: DataFusion allocates the
         // working set (sort / aggregate / join), so its pool is the gate. The
         // same constructor as a table reader's, so covered aggregates are
-        // answered from manifest statistics here too.
+        // answered from manifest statistics here too. A session built from
+        // our own budget config failing is ours, not the query's.
         let ctx = sql_session_context(&self.inner.connection_memory_budget)
-            .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
+            .map_err(|e| InfinoError::Backend(e.to_string()).with_context("query_sql", None))?;
 
         // Resolve the relations the query names and register each that is a
         // catalog table. Unknown names (CTEs, search TVFs, aliases) are
@@ -959,11 +960,11 @@ impl Connection {
         let statement = ctx
             .state()
             .sql_to_statement(sql, &Dialect::Generic)
-            .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
+            .map_err(|e| datafusion_error(&e).with_context("query_sql", None))?;
         let refs = ctx
             .state()
             .resolve_table_references(&statement)
-            .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
+            .map_err(|e| datafusion_error(&e).with_context("query_sql", None))?;
 
         let mut seen = HashSet::new();
         let mut handles: Vec<SupertableHandle> = Vec::new();
@@ -974,9 +975,12 @@ impl Connection {
             }
             match self.open_table_handle(&name) {
                 Ok(table) => {
-                    table.register_into(&ctx, &name).map_err(|e| {
-                        InfinoError::Query(e.to_string()).with_context("query_sql", None)
-                    })?;
+                    // Minting its reader can fail like any manifest load (a
+                    // storage fault, refused credentials, a table purged since
+                    // it was opened), and keeps that cause.
+                    table
+                        .register_into(&ctx, &name)
+                        .map_err(|e| InfinoError::from(e).with_context("query_sql", None))?;
                     handles.push(table);
                 }
                 Err(InfinoError::NotFound(_)) => {}
@@ -1018,9 +1022,7 @@ impl Connection {
                         .state()
                         .create_logical_plan(&sql)
                         .await
-                        .map_err(|e| {
-                            InfinoError::Query(e.to_string()).with_context("query_sql", None)
-                        })?;
+                        .map_err(|e| datafusion_error(&e).with_context("query_sql", None))?;
 
                     read_only_sql_options().verify_plan(&plan).map_err(|e| {
                         InfinoError::Query(format!(
@@ -1029,9 +1031,10 @@ impl Connection {
                         .with_context("query_sql", None)
                     })?;
 
-                    let df = planner_ctx.execute_logical_plan(plan).await.map_err(|e| {
-                        InfinoError::Query(e.to_string()).with_context("query_sql", None)
-                    })?;
+                    let df = planner_ctx
+                        .execute_logical_plan(plan)
+                        .await
+                        .map_err(|e| datafusion_error(&e).with_context("query_sql", None))?;
 
                     // Execute through the physical plan (what `DataFrame::collect`
                     // does internally) so the plan handle survives execution and
@@ -1041,7 +1044,7 @@ impl Connection {
                     let plan = df
                         .create_physical_plan()
                         .await
-                        .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
+                        .map_err(|e| datafusion_error(&e).with_context("query_sql", None))?;
                     Ok::<_, InfinoError>((task_ctx, plan))
                 }
                 .instrument(detail_span!("sql.plan"))
@@ -1060,7 +1063,7 @@ impl Connection {
             let batches = collect_plan_metered(&plan, task_ctx, &op_stats)
                 .instrument(detail_span!("sql.execute"))
                 .await
-                .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
+                .map_err(|e| datafusion_error(&e).with_context("query_sql", None))?;
             if batches.is_empty() {
                 // An empty Vec carries no schema, so hand back one empty batch
                 // instead. Its schema comes from the physical plan, not the
@@ -1222,20 +1225,6 @@ fn build_options(
     // Set last so no builder step can reset the shared connection budget.
     opts.connection_memory_budget = connection_memory_budget;
     Ok(opts)
-}
-
-/// Map a SQL execution error to the public error: a budget exhaustion becomes
-/// [`InfinoError::OverBudget`], anything else a generic query error.
-///
-/// Classified by the error's root, not its outer variant: an operator may wrap
-/// a refusal in context of its own (an external sort reports "Not enough memory
-/// to continue external sort" around the pool's refusal), and a wrapped
-/// refusal is still a budget refusal.
-fn sql_exec_error(e: DataFusionError) -> InfinoError {
-    match e.find_root() {
-        DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg.clone()),
-        _ => InfinoError::Query(e.to_string()),
-    }
 }
 
 /// Construct the storage provider for `backend` (None for `memory://`).
@@ -1476,6 +1465,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
+        error::DataFusionError,
         logical_expr::LogicalPlan,
         prelude::{SessionContext, col, lit},
     };
@@ -3839,15 +3829,17 @@ mod tests {
     }
 
     #[test]
-    fn sql_exec_error_classifies_a_wrapped_refusal_by_its_root() {
+    fn a_wrapped_refusal_is_classified_by_its_root() {
         let wrapped = DataFusionError::ResourcesExhausted("over".into()).context("sorting");
         assert!(matches!(
-            sql_exec_error(wrapped),
+            datafusion_error(&wrapped),
             InfinoError::OverBudget(msg) if msg == "over"
         ));
+        // DataFusion's own `Execution` counts as ours until shown otherwise:
+        // see `datafusion_error`.
         assert!(matches!(
-            sql_exec_error(DataFusionError::Execution("boom".into())),
-            InfinoError::Query(_)
+            datafusion_error(&DataFusionError::Execution("boom".into())),
+            InfinoError::Backend(_)
         ));
     }
 
@@ -4664,11 +4656,46 @@ mod tests {
         );
     }
 
+    /// A filter that fails on the table's own values is the caller's mistake,
+    /// even though DataFusion pushes it into the parquet scan, which hands the
+    /// failure back as text. The message check pins that text: if a DataFusion
+    /// upgrade rewords it, this fails instead of the error silently turning
+    /// into an engine fault.
+    #[test]
+    fn query_sql_reports_a_filter_that_fails_on_the_data_as_the_callers() {
+        let conn = conn_with_docs();
+        let err = conn.query_sql("SELECT title FROM docs WHERE CAST(title AS BIGINT) = 1");
+        assert!(
+            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("Error evaluating filter predicate")),
+            "got {err:?}"
+        );
+        // A regex the caller wrote that does not parse: DataFusion returns the
+        // regex crate's error, and it is still the caller's.
+        let err = conn.query_sql("SELECT title FROM docs WHERE title ~ '('");
+        assert!(matches!(err, Err(InfinoError::Query(_))), "got {err:?}");
+    }
+
+    /// Valid SQL the engine does not implement is neither the caller's mistake
+    /// nor an engine fault: `Unsupported`, so a client can tell "rewrite this"
+    /// from "this query is wrong".
+    #[test]
+    fn query_sql_reports_unimplemented_sql_as_unsupported() {
+        let conn = conn_with_docs();
+        let err = conn.query_sql("ALTER TABLE docs ADD COLUMN y int");
+        assert!(
+            matches!(&err, Err(InfinoError::Unsupported(msg)) if msg.contains("not implemented")),
+            "got {err:?}"
+        );
+        assert_docs_intact(&conn);
+    }
+
     #[test]
     fn query_sql_refuses_writes_the_planner_cannot_plan() {
         // Writes the planner cannot plan today.
         //  - they fail at planning, so they never execute either;
-        //  - the error is the planner's, not the read-only message.
+        //  - the error is the planner's, not the read-only message: a plan
+        //    error, or a statement DataFusion does not implement (`ALTER`).
+        //    Either way the caller's, never an engine fault.
         // If a DataFusion upgrade learns to plan one, it becomes a DML or DDL node and the gate refuses it.
         let conn = conn_with_docs();
         for sql in [
@@ -4680,7 +4707,10 @@ mod tests {
         ] {
             let err = conn.query_sql(sql);
             assert!(
-                matches!(err, Err(InfinoError::Query(_))),
+                matches!(
+                    err,
+                    Err(InfinoError::Query(_) | InfinoError::Unsupported(_))
+                ),
                 "{sql:?}: got {err:?}"
             );
         }

@@ -105,7 +105,7 @@ use uuid::Uuid;
 use crate::{
     runtime_metrics::op_stats,
     superfile::{
-        ReadError, SuperfileReader,
+        SuperfileReader,
         fts::{
             reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
@@ -113,6 +113,7 @@ use crate::{
     },
     supertable::{
         SuperfileEntry, SupertableOptions,
+        error::QueryError,
         manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
@@ -415,9 +416,7 @@ impl SupertableProvider {
     // survivor entries; `scan` is what opens and reads them.
     async fn select_survivors(&self, filters: &[Expr]) -> DfResult<Vec<Arc<SuperfileEntry>>> {
         let leaves = prune_leaves_for_filters(&self.manifest.options, &self.schema, filters);
-        let mut survivors = select_superfiles(self.manifest.as_ref(), &leaves)
-            .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let mut survivors = select_superfiles(self.manifest.as_ref(), &leaves).await?;
 
         // Covered/residual residual scans read only their boundary
         // superfiles; everything else was answered from statistics.
@@ -512,7 +511,7 @@ impl SupertableProvider {
                 .reader
                 .contains_rows(column, &needles, Some(pool), Some(budget))
                 .await
-                .map_err(scan_read_df_error)?;
+                .map_err(QueryError::from)?;
             // One result per needle, or the zip below would pair needles
             // with another needle's rows.
             if rows.len() != needles.len() {
@@ -601,7 +600,7 @@ impl SupertableProvider {
                     ReadIntent::Warm,
                 )
                 .await
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                .map_err(QueryError::store)?;
                 let path = ObjPath::from(entry.storage_path());
                 let source = reader.byte_source();
                 let size = source.size();
@@ -614,7 +613,7 @@ impl SupertableProvider {
                 let parquet_meta = reader
                     .parquet_metadata_with_page_index()
                     .await
-                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                    .map_err(QueryError::from)?;
                 let row_counts: Arc<[u32]> = parquet_meta
                     .row_groups()
                     .iter()
@@ -863,17 +862,6 @@ fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
         && max.distance(min).map(|d| d as u64) == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
 }
 
-/// A superfile read error inside the scan as DataFusion's: a budget refusal
-/// as `ResourcesExhausted`, the channel the memory pool refuses through, so
-/// the SQL error classifiers surface it as `OverBudget`; anything else as an
-/// execution error.
-fn scan_read_df_error(e: ReadError) -> DataFusionError {
-    match e.over_budget() {
-        Some(msg) => DataFusionError::ResourcesExhausted(msg.to_owned()),
-        None => DataFusionError::Execution(e.to_string()),
-    }
-}
-
 /// A scan's exact conjuncts ([`SupertableProvider::exact_filter`]),
 /// compiled once per scan together with the check their doubtful rows get.
 struct ExactCheck {
@@ -903,8 +891,12 @@ impl ExactCheck {
         let pushed = PushedPredicate::compile(filters, schema).ok_or_else(|| {
             DataFusionError::Internal("an exact filter does not compile over its table".into())
         })?;
-        let bound_schema = Arc::new(schema.project(pushed.columns())?);
-        let predicate = pushed.bind(&bound_schema)?;
+        let bound_schema = Arc::new(
+            schema
+                .project(pushed.columns())
+                .map_err(QueryError::internal)?,
+        );
+        let predicate = pushed.bind(&bound_schema).map_err(QueryError::internal)?;
         let columns = bound_schema
             .fields()
             .iter()
@@ -1083,7 +1075,10 @@ impl TableProvider for SupertableProvider {
         // one.
         if survivors.is_empty() {
             let projected = match projection {
-                Some(indices) => Arc::new(self.schema.project(indices)?),
+                // DataFusion projects only columns this table has.
+                Some(indices) => {
+                    Arc::new(self.schema.project(indices).map_err(QueryError::internal)?)
+                }
                 None => Arc::clone(&self.schema),
             };
             return Ok(Arc::new(EmptyExec::new(projected)));
@@ -1249,7 +1244,7 @@ impl TableProvider for SupertableProvider {
                                     Some(reader_pool),
                                 )
                                 .await
-                                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                                .map_err(QueryError::from)?;
                             predicate_work.merge(expand_work);
                             expanded = plan;
                             &expanded
@@ -1263,7 +1258,7 @@ impl TableProvider for SupertableProvider {
                         let (est, est_work) = plan
                             .estimate(prepared.reader.as_ref(), Some(reader_pool))
                             .await
-                            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                            .map_err(QueryError::from)?;
                         predicate_work.merge(est_work);
                         let gate = ((prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION)
                             as u64)
@@ -1282,7 +1277,7 @@ impl TableProvider for SupertableProvider {
                             let (bitmap, eval_work) = plan
                                 .evaluate(prepared.reader.as_ref(), Some(reader_pool), &memos)
                                 .await
-                                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                                .map_err(QueryError::from)?;
                             predicate_work.merge(eval_work);
                             bitmap
                         };
@@ -1291,11 +1286,9 @@ impl TableProvider for SupertableProvider {
                         // overlay); the batch prefetch above already resolved
                         // them, so this is a cache read.
                         let tombstones = match self.tombstone_cache.as_ref() {
-                            Some(cache) => {
-                                cache.bitmap_for(entry.superfile_id, now).map_err(|e| {
-                                    DataFusionError::Execution(format!("tombstone cache: {e}"))
-                                })?
-                            }
+                            Some(cache) => cache
+                                .bitmap_for(entry.superfile_id, now)
+                                .map_err(QueryError::store)?,
                             None => Arc::new(RoaringBitmap::new()),
                         };
 
@@ -1600,7 +1593,7 @@ fn tombstone_access_plan_from_counts(
 /// batching and the resident-bytes unit tests.
 fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone())
-        .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {e}")))?;
+        .map_err(|e| QueryError::Internal(format!("parquet metadata: {e}")))?;
     Ok(builder
         .metadata()
         .row_groups()

@@ -21,9 +21,15 @@
 //! via [`InfinoError::with_context`]. Structured payload / `source()`
 //! chaining can follow in later PRs.
 
+use std::{error::Error, io};
+
+use arrow_schema::ArrowError;
+use datafusion::error::DataFusionError;
+use object_store::Error as ObjectStoreError;
+
 use crate::{
-    storage::StorageError,
-    superfile::{BuildError as SuperfileBuildError, ReadError as SuperfileReadError},
+    storage::{StorageError, error_chain, permission_denied_in_chain},
+    superfile::BuildError as SuperfileBuildError,
     supertable::{
         error::{
             BuildError as SupertableBuildError, CommitError as SupertableCommitError, OpenError,
@@ -69,7 +75,8 @@ pub enum InfinoError {
 
     /// The query or search is wrong: it does not parse or plan, names a
     /// column or function that does not exist, or fails on the caller's own
-    /// data (a bad cast). A failure inside the engine is `Io` or `Backend`.
+    /// data (a bad cast). A failure inside the engine is `Io` or `Backend`;
+    /// valid SQL the engine does not implement is `Unsupported`.
     #[error("query: {0}")]
     Query(String),
 
@@ -106,6 +113,11 @@ pub enum InfinoError {
     /// An invalid or conflicting configuration was supplied.
     #[error("config: {0}")]
     Config(String),
+
+    /// The query is valid but uses something the engine does not support
+    /// yet, such as a SQL feature DataFusion does not implement.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 impl InfinoError {
@@ -134,7 +146,24 @@ impl InfinoError {
             Self::Conflict(m) => Self::Conflict(format!("{prefix}: {m}")),
             Self::Backend(m) => Self::Backend(format!("{prefix}: {m}")),
             Self::Config(m) => Self::Config(format!("{prefix}: {m}")),
+            Self::Unsupported(m) => Self::Unsupported(format!("{prefix}: {m}")),
         }
+    }
+
+    /// [`From<QueryError>`] for a query error held by reference, as one found
+    /// inside a DataFusion error is. The match names every variant, so a new
+    /// one has to choose its public variant rather than fall into `Query`.
+    fn from_query_ref(e: &QueryError) -> Self {
+        let variant = match e {
+            QueryError::DataFusion(df) => return datafusion_error(df),
+            QueryError::InvalidQuery(_) => InfinoError::Query,
+            QueryError::Store(_) | QueryError::Parquet(_) => InfinoError::Io,
+            QueryError::ManifestLoad(load) => manifest_load_variant(load),
+            QueryError::Internal(_) => InfinoError::Backend,
+            QueryError::OverBudget(_) => InfinoError::OverBudget,
+            QueryError::PermissionDenied(_) => InfinoError::PermissionDenied,
+        };
+        variant(e.to_string())
     }
 }
 
@@ -159,29 +188,112 @@ impl From<StorageError> for InfinoError {
 ///
 /// | `QueryError` | public | why |
 /// |---|---|---|
-/// | `InvalidQuery`, `Plan` | `Query` | the request itself is wrong |
-/// | `DataFusion` | `Query` | cause not told apart yet; see the variant |
+/// | `InvalidQuery` | `Query` | the request itself is wrong |
+/// | `DataFusion` | by its cause | see [`datafusion_error`] |
 /// | `Store`, `Parquet` | `Io` | a read failed; retrying can succeed |
 /// | `ManifestLoad` | as a [`ManifestLoadError`] would | same failure, same answer |
 /// | `Internal` | `Backend` | the engine broke its own invariant: a bug |
 /// | `OverBudget`, `PermissionDenied` | the same names | |
-///
-/// The match names every variant, so a new one has to choose its public
-/// variant rather than fall into `Query`.
 impl From<QueryError> for InfinoError {
     fn from(e: QueryError) -> Self {
-        let variant = match &e {
-            QueryError::InvalidQuery(_) | QueryError::Plan(_) | QueryError::DataFusion(_) => {
+        InfinoError::from_query_ref(&e)
+    }
+}
+
+/// The text DataFusion's parquet row filter wraps a pushed-down predicate's
+/// failure in: `Error evaluating filter predicate: {e:?}`, the predicate's
+/// own `DataFusionError` in `Debug` form inside an `ArrowError::ComputeError`.
+/// The type does not survive that hop, so this text is the one way to tell a
+/// predicate that failed on the caller's data from a scan that failed.
+const PUSHED_DOWN_PREDICATE_FAILED: &str = "Error evaluating filter predicate: ";
+
+/// How the wrapped error starts when an arrow kernel (a cast, a divide)
+/// rejected the caller's values, in that `Debug` form.
+const FAILED_ON_THE_DATA: &str = "ArrowError(";
+
+/// Map a failure DataFusion returned from planning or running a query to the
+/// public error. Our own errors cross a plan typed (see `From<QueryError> for
+/// DataFusionError`), so the cause decides:
+///
+/// Checked in this order, the first match deciding:
+///
+/// | found | public |
+/// |---|---|
+/// | our [`QueryError`] anywhere in the chain | its own mapping and message |
+/// | `ResourcesExhausted` at the root, however wrapped | `OverBudget`, the pool's message |
+/// | refused credentials | `PermissionDenied` |
+/// | a read that failed: storage, object store or io, in the chain | `Io` |
+/// | `NotImplemented` | `Unsupported` |
+/// | `SQL`, `Plan`, `SchemaError`, `Configuration`, `ArrowError` | `Query`: the query or its data |
+/// | `External` holding someone else's error (a regex that does not parse) | `Query` |
+/// | a pushed-down predicate that failed on the data | `Query` |
+/// | anything else: `Execution`, `Internal`, a failed task | `Backend` |
+///
+/// An `External` error at the root that is neither ours nor storage's comes
+/// from a DataFusion function rejecting its arguments, which only the caller
+/// wrote. DataFusion's own `Execution` errors are mixed (a bad `date_bin`
+/// argument next to a missing partition), so they count as ours until shown
+/// otherwise: a false `Backend` reads as an engine fault the caller can report,
+/// a false `Query` blames the caller and hides the bug.
+pub(crate) fn datafusion_error(e: &DataFusionError) -> InfinoError {
+    if let Some(cause) = error_chain(e).find_map(|link| link.downcast_ref::<QueryError>()) {
+        return InfinoError::from_query_ref(cause);
+    }
+    // A budget refusal keeps the pool's own message, however an operator
+    // wrapped it (an external sort adds "Not enough memory to continue").
+    if let DataFusionError::ResourcesExhausted(msg) = e.find_root() {
+        return InfinoError::OverBudget(msg.clone());
+    }
+    let variant = if permission_denied_in_chain(e) {
+        InfinoError::PermissionDenied
+    } else if error_chain(e).any(is_failed_read) {
+        InfinoError::Io
+    } else {
+        // Nothing of ours or the store's under it: DataFusion's own variant.
+        match e.find_root() {
+            DataFusionError::NotImplemented(_) => InfinoError::Unsupported,
+            DataFusionError::SQL(..)
+            | DataFusionError::Plan(_)
+            | DataFusionError::SchemaError(..)
+            | DataFusionError::Configuration(_)
+            | DataFusionError::ArrowError(..)
+            | DataFusionError::External(_) => InfinoError::Query,
+            DataFusionError::ParquetError(_) if pushed_down_predicate_failed_on_the_data(e) => {
                 InfinoError::Query
             }
-            QueryError::Store(_) | QueryError::Parquet(_) => InfinoError::Io,
-            QueryError::ManifestLoad(load) => manifest_load_variant(load),
-            QueryError::Internal(_) => InfinoError::Backend,
-            QueryError::OverBudget(_) => InfinoError::OverBudget,
-            QueryError::PermissionDenied(_) => InfinoError::PermissionDenied,
-        };
-        variant(e.to_string())
+            _ => InfinoError::Backend,
+        }
+    };
+    variant(e.to_string())
+}
+
+/// Whether `link` is a read that failed: a storage, object store or io error.
+/// A store saying it cannot do an operation at all (not implemented, not
+/// supported) is not one: no retry changes that answer, and a scan only asks
+/// a store for what it serves, so reaching one is our bug.
+fn is_failed_read(link: &(dyn Error + 'static)) -> bool {
+    if let Some(store) = link.downcast_ref::<ObjectStoreError>() {
+        return !matches!(
+            store,
+            ObjectStoreError::NotImplemented { .. } | ObjectStoreError::NotSupported { .. }
+        );
     }
+    link.is::<StorageError>() || link.is::<io::Error>()
+}
+
+/// True when a parquet scan failed because a predicate pushed into it
+/// rejected the caller's values, not because the read or the engine failed.
+/// See [`PUSHED_DOWN_PREDICATE_FAILED`].
+fn pushed_down_predicate_failed_on_the_data(e: &DataFusionError) -> bool {
+    error_chain(e).any(|link| {
+        matches!(
+            link.downcast_ref::<ArrowError>(),
+            Some(ArrowError::ComputeError(message))
+                if message
+                    .strip_prefix(PUSHED_DOWN_PREDICATE_FAILED)
+                    .is_some_and(|inner| inner.starts_with(FAILED_ON_THE_DATA))
+        )
+    })
 }
 
 impl From<ManifestLoadError> for InfinoError {
@@ -209,15 +321,6 @@ fn manifest_load_variant(e: &ManifestLoadError) -> fn(String) -> InfinoError {
         // copy of the data) rather than treat it as a hard backend fault.
         ManifestLoadError::Storage(_) => InfinoError::Io,
         _ => InfinoError::Backend,
-    }
-}
-
-impl From<SuperfileReadError> for InfinoError {
-    fn from(e: SuperfileReadError) -> Self {
-        if let Some(msg) = e.over_budget() {
-            return InfinoError::OverBudget(msg.to_string());
-        }
-        InfinoError::Query(e.to_string())
     }
 }
 
@@ -335,6 +438,7 @@ impl From<MutationCommitError> for InfinoError {
 
 #[cfg(test)]
 mod tests {
+    use parquet::errors::ParquetError;
     use uuid::Uuid;
 
     use super::*;
@@ -407,19 +511,15 @@ mod tests {
     }
 
     #[test]
-    fn from_query_read_and_build_errors() {
+    fn from_query_and_build_errors() {
         assert!(matches!(
-            InfinoError::from(QueryError::Plan("p".into())),
+            InfinoError::from(QueryError::InvalidQuery("p".into())),
             InfinoError::Query(_)
         ));
         // A budget refusal keeps its own variant rather than collapsing to Query.
         assert!(matches!(
             InfinoError::from(QueryError::OverBudget("b".into())),
             InfinoError::OverBudget(_)
-        ));
-        assert!(matches!(
-            InfinoError::from(SuperfileReadError::MissingKv("k")),
-            InfinoError::Query(_)
         ));
         assert!(matches!(
             InfinoError::from(SuperfileBuildError::MissingIdColumn("c".into())),
@@ -513,7 +613,7 @@ mod tests {
             InfinoError::Query(_)
         ));
         assert!(matches!(
-            InfinoError::from(QueryError::Plan("p".into())),
+            InfinoError::from(QueryError::InvalidQuery("p".into())),
             InfinoError::Query(_)
         ));
         // A read failed: retrying can succeed.
@@ -541,11 +641,6 @@ mod tests {
             InfinoError::from(QueryError::Internal("_id column missing".into())),
             InfinoError::Backend(_)
         ));
-        // A DataFusion run failure may be the caller's data: it stays `Query`.
-        assert!(matches!(
-            InfinoError::from(QueryError::DataFusion("Cast error".into())),
-            InfinoError::Query(_)
-        ));
         // The budget refusal keeps its own, already labelled message.
         assert_eq!(
             InfinoError::from(QueryError::OverBudget("during scan, over".into())).to_string(),
@@ -556,6 +651,150 @@ mod tests {
             InfinoError::from(QueryError::Store("s".into())).to_string(),
             "io: superfile store error during query: s"
         );
+    }
+
+    /// A DataFusion failure maps by what caused it, not by DataFusion's own
+    /// variant alone: our errors cross a plan typed and keep their answer.
+    #[test]
+    fn a_datafusion_failure_maps_by_its_cause() {
+        let ours = |e: QueryError| DataFusionError::from(e);
+        // Our own error inside the plan decides, with its own message.
+        let err = datafusion_error(&ours(QueryError::Store("bucket timed out".into())));
+        assert!(
+            matches!(&err, InfinoError::Io(m) if m == "superfile store error during query: bucket timed out"),
+            "{err:?}"
+        );
+        assert!(matches!(
+            datafusion_error(&ours(QueryError::InvalidQuery("no full-text index".into()))),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&ours(QueryError::Internal("_id column missing".into()))),
+            InfinoError::Backend(_)
+        ));
+        // Wrapped by DataFusion on the way out, it still decides.
+        assert!(matches!(
+            datafusion_error(&ours(QueryError::Store("s".into())).context("scan")),
+            InfinoError::Io(_)
+        ));
+        // Storage under DataFusion's own variants is a failed read.
+        assert!(matches!(
+            datafusion_error(&DataFusionError::IoError(io::Error::other("reset"))),
+            InfinoError::Io(_)
+        ));
+        // DataFusion's own classes.
+        let plan = |m: &str| DataFusionError::Plan(m.into());
+        assert!(matches!(
+            datafusion_error(&plan("No field named ghost")),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ArrowError(
+                Box::new(ArrowError::DivideByZero),
+                None
+            )),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ResourcesExhausted("spill".into())),
+            InfinoError::OverBudget(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&DataFusionError::NotImplemented("LATERAL".into())),
+            InfinoError::Unsupported(_)
+        ));
+        // Mixed or ours: counted as ours, so it is logged and looked at.
+        for e in [
+            DataFusionError::Execution("Partition 3 not found".into()),
+            DataFusionError::Internal("bug".into()),
+        ] {
+            assert!(
+                matches!(datafusion_error(&e), InfinoError::Backend(_)),
+                "{e:?}"
+            );
+        }
+    }
+
+    /// The chain branches: refused credentials, a failed read, a store that
+    /// cannot do an operation at all, our error under arrow and parquet
+    /// wrappers, and another crate's error a DataFusion function returned.
+    #[test]
+    fn a_datafusion_failure_is_classified_through_its_whole_chain() {
+        let external = |e: Box<dyn Error + Send + Sync>| DataFusionError::External(e);
+        assert!(matches!(
+            datafusion_error(&external(Box::new(StorageError::PermissionDenied {
+                uri: "u".into()
+            }))),
+            InfinoError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ObjectStore(Box::new(
+                ObjectStoreError::Generic {
+                    store: "s3",
+                    source: "connection reset".into(),
+                }
+            ))),
+            InfinoError::Io(_)
+        ));
+        // A store refusing an operation outright is not a read that failed.
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ObjectStore(Box::new(
+                ObjectStoreError::NotImplemented {
+                    operation: "put".into(),
+                    implementer: "store".into(),
+                }
+            ))),
+            InfinoError::Backend(_)
+        ));
+        // Our error still decides under arrow's and parquet's own wrappers.
+        let ours = || Box::new(QueryError::Store("s".into()));
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ArrowError(
+                Box::new(ArrowError::ExternalError(ours())),
+                None
+            )),
+            InfinoError::Io(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ParquetError(Box::new(
+                ParquetError::External(ours())
+            ))),
+            InfinoError::Io(_)
+        ));
+        // Another crate's error, returned by a DataFusion function rejecting
+        // the caller's argument (an invalid regex), is the caller's.
+        assert!(matches!(
+            datafusion_error(&external("regex parse error".into())),
+            InfinoError::Query(_)
+        ));
+    }
+
+    /// A predicate DataFusion pushed into the parquet scan comes back as text.
+    /// One that failed on the caller's values is theirs; any other is ours.
+    #[test]
+    fn a_pushed_down_predicate_that_failed_on_the_data_is_the_callers() {
+        let pushed_down = |inner: &str| {
+            DataFusionError::ParquetError(Box::new(ParquetError::External(Box::new(
+                ArrowError::ComputeError(format!("{PUSHED_DOWN_PREDICATE_FAILED}{inner}")),
+            ))))
+        };
+        assert!(matches!(
+            datafusion_error(&pushed_down(
+                r#"ArrowError(CastError("Cannot cast string 'alpha'"), None)"#
+            )),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&pushed_down(r#"Execution("Partition 3 not found")"#)),
+            InfinoError::Backend(_)
+        ));
+        // A parquet failure that is not a predicate is a corrupt or unread file.
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ParquetError(Box::new(
+                ParquetError::General("bad footer".into())
+            ))),
+            InfinoError::Backend(_)
+        ));
     }
 
     /// Another writer holding the table's writer slot is the same retryable
@@ -731,7 +970,9 @@ mod tests {
     #[test]
     fn from_mutation_error_maps_each_arm() {
         assert!(matches!(
-            InfinoError::from(MutationError::PredicateEval(QueryError::Plan("p".into()))),
+            InfinoError::from(MutationError::PredicateEval(QueryError::InvalidQuery(
+                "p".into()
+            ))),
             InfinoError::Query(_)
         ));
         assert!(matches!(

@@ -72,7 +72,6 @@ use crate::utils::trace::OpOrigin;
 use crate::{
     memory::{ConnectionMemoryBudget, budgeted_session_context},
     runtime_metrics::op_stats::{self, OpStatsCollector},
-    storage::permission_denied_in_chain,
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
@@ -176,37 +175,6 @@ pub(crate) fn sql_session_context(
     Ok(ctx)
 }
 
-/// Classify a SQL execution error: budget exhaustion -> [`QueryError::OverBudget`]
-/// (the catalog surfaces it as `InfinoError::OverBudget`), refused credentials
-/// -> [`QueryError::PermissionDenied`], else an execute error.
-///
-/// The credential check reads the error's source chain rather than its message:
-/// a scan failure reaches DataFusion wrapped, and the underlying storage error
-/// is still typed inside it. The budget check reads the root for the same
-/// reason: an external sort wraps the pool's refusal in context of its own.
-fn exec_query_error(e: DataFusionError) -> QueryError {
-    if let DataFusionError::ResourcesExhausted(msg) = e.find_root() {
-        return QueryError::OverBudget(msg.clone());
-    }
-    match e {
-        other if permission_denied_in_chain(&other) => {
-            QueryError::PermissionDenied(other.to_string())
-        }
-        other => QueryError::DataFusion(other.to_string()),
-    }
-}
-
-/// Classify a physical-planning error: budget exhaustion ->
-/// [`QueryError::OverBudget`], else a plan error. Building the plan runs the
-/// provider's scan, and an exact `ILIKE` charges its postings and bitsets to
-/// the connection budget there, so a refusal can come out of planning.
-fn plan_query_error(e: DataFusionError) -> QueryError {
-    match e.find_root() {
-        DataFusionError::ResourcesExhausted(msg) => QueryError::OverBudget(msg.clone()),
-        _ => QueryError::Plan(e.to_string()),
-    }
-}
-
 impl SupertableReader {
     fn cached_sql_logical_plan(&self, sql: &str) -> Option<LogicalPlan> {
         let guard = self
@@ -307,12 +275,9 @@ impl SupertableReader {
                 Some(plan) => ctx
                     .execute_logical_plan(plan)
                     .await
-                    .map_err(|e| QueryError::Plan(e.to_string()))?,
+                    .map_err(QueryError::DataFusion)?,
                 None => {
-                    let df = ctx
-                        .sql(&sql)
-                        .await
-                        .map_err(|e| QueryError::Plan(e.to_string()))?;
+                    let df = ctx.sql(&sql).await.map_err(QueryError::DataFusion)?;
                     let plan = df.logical_plan().clone();
                     if cacheable_scalar_plan(&plan) {
                         cache_reader.cache_sql_logical_plan(sql.clone(), plan);
@@ -419,10 +384,12 @@ impl SupertableReader {
 
         // Gate SQL heap on the connection budget (shared across contexts, so
         // this reader's SQL counts against the same ceiling as the rest).
+        // A session built from our own budget config failing is ours.
         let ctx = sql_session_context(&self.options().connection_memory_budget)
-            .map_err(|e| QueryError::Plan(e.to_string()))?;
+            .map_err(QueryError::internal)?;
+        // Registering the table we just built is ours to get right.
         ctx.register_table(TABLE_NAME, Arc::new(provider))
-            .map_err(|e| QueryError::Plan(e.to_string()))?;
+            .map_err(QueryError::internal)?;
 
         // Search TVFs (vector kNN, BM25 FTS, hybrid RRF) bound to
         // the pinned snapshot. They lower to custom `ExecutionPlan`
@@ -444,10 +411,13 @@ impl SupertableReader {
         task_ctx: Arc<TaskContext>,
         op_stats: &Option<Arc<OpStatsCollector>>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
-        let plan = df.create_physical_plan().await.map_err(plan_query_error)?;
+        let plan = df
+            .create_physical_plan()
+            .await
+            .map_err(QueryError::DataFusion)?;
         collect_plan_metered(&plan, task_ctx, op_stats)
             .await
-            .map_err(exec_query_error)
+            .map_err(QueryError::DataFusion)
     }
 
     /// Resolve a predicate to the matching `_id` values. Used by
@@ -492,11 +462,11 @@ impl SupertableReader {
                     let df = ctx
                         .table(TABLE_NAME)
                         .await
-                        .map_err(|e| QueryError::Plan(e.to_string()))?
+                        .map_err(QueryError::DataFusion)?
                         .filter(expr)
-                        .map_err(|e| QueryError::Plan(e.to_string()))?
+                        .map_err(QueryError::DataFusion)?
                         .select_columns(&[id_column.as_str()])
-                        .map_err(|e| QueryError::Plan(e.to_string()))?;
+                        .map_err(QueryError::DataFusion)?;
                     // Same three steps as `query_sql`, and for the same reason:
                     // this scan's rows are real decoded rows. Collecting the
                     // DataFrame directly reported CPU, page bytes and ranges for a
@@ -543,8 +513,9 @@ impl Supertable {
             disk_cache,
             reader.tombstone_cache.clone(),
         );
+        // Registering the table we just built is ours to get right.
         ctx.register_table(name, Arc::new(provider))
-            .map_err(|e| QueryError::Plan(e.to_string()))?;
+            .map_err(QueryError::internal)?;
         Ok(reader)
     }
 }
@@ -592,6 +563,7 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use crate::{
+        InfinoError,
         memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
@@ -601,7 +573,6 @@ mod tests {
         },
         supertable::{
             Supertable, SupertableOptions,
-            error::QueryError,
             query::{candidate::LIKE_MAX_TERMS, sql::build_sql_schemas},
         },
     };
@@ -1212,7 +1183,10 @@ mod tests {
             .query_sql("SELECT category, COUNT(*) FROM supertable GROUP BY category")
             .expect_err("0-byte gate refuses the aggregate");
 
-        assert!(matches!(err, QueryError::OverBudget(_)), "got {err:?}");
+        assert!(
+            matches!(InfinoError::from(err), InfinoError::OverBudget(_)),
+            "the budget refusal survives the SQL path"
+        );
     }
 
     #[test]
@@ -1229,8 +1203,9 @@ mod tests {
             .expect("reader")
             .query_sql("SELECT title FROM supertable WHERE title ILIKE '%bbc%'")
             .expect_err("a 0-byte gate refuses the exact path");
+        let err = InfinoError::from(err);
         assert!(
-            matches!(&err, QueryError::OverBudget(msg) if msg.contains("exact ILIKE")),
+            matches!(&err, InfinoError::OverBudget(msg) if msg.contains("exact ILIKE")),
             "got {err:?}"
         );
     }
@@ -1254,7 +1229,8 @@ mod tests {
             .query_sql("SELECT category FROM supertable ORDER BY category")
             .expect_err("0-byte gate refuses the sort");
 
-        assert!(matches!(err, QueryError::OverBudget(_)), "got {err:?}");
+        let err = InfinoError::from(err);
+        assert!(matches!(err, InfinoError::OverBudget(_)), "got {err:?}");
     }
 
     #[test]
@@ -2799,8 +2775,8 @@ mod tests {
             .query_sql("SELECT NOT_A_REAL_FN(*) FROM supertable")
             .expect_err("expected a plan error");
         assert!(
-            matches!(err, QueryError::Plan(_)),
-            "expected Plan variant; got {err:?}"
+            matches!(InfinoError::from(err), InfinoError::Query(_)),
+            "an unknown function is the caller's mistake"
         );
     }
 
@@ -2905,8 +2881,8 @@ mod tests {
             .query_sql("SELECT emb FROM supertable")
             .expect_err("vector column should not be in the SQL schema");
         assert!(
-            matches!(err, QueryError::Plan(_)),
-            "expected Plan variant; got {err:?}"
+            matches!(InfinoError::from(err), InfinoError::Query(_)),
+            "a column SQL does not expose is the caller's mistake"
         );
     }
 }

@@ -111,7 +111,7 @@ async fn open_reader_tiered(
         intent,
     )
     .await
-    .map_err(|e| QueryError::build(e.to_string(), &e))
+    .map_err(QueryError::store)
 }
 
 /// Verify that each configured vector column is present in this superfile and
@@ -203,7 +203,7 @@ pub(crate) async fn open_compaction_input(
                     Arc::clone(storage),
                 )
                 .await
-                .map_err(|e| QueryError::build(e.to_string(), &e));
+                .map_err(QueryError::store);
             // Fully-resident only: a promoted hybrid reader exposes parquet
             // bytes but leaves the vector blob sparse, and the Sq8 merge
             // below reads real vector bytes synchronously.
@@ -216,12 +216,8 @@ pub(crate) async fn open_compaction_input(
         // Compaction needs synchronous Parquet/id-column access; if the hidden
         // table was opened without a disk cache, force an eager open here.
         let path = entry.storage_path();
-        let (bytes, _) = storage
-            .get(&path)
-            .await
-            .map_err(|e| QueryError::build(e.to_string(), &e))?;
-        let reader =
-            SuperfileReader::open(bytes).map_err(|e| QueryError::build(e.to_string(), &e))?;
+        let (bytes, _) = storage.get(&path).await.map_err(QueryError::store)?;
+        let reader = SuperfileReader::open(bytes)?;
         return Ok(Arc::new(reader));
     }
     // Compaction is not a query modality; allow fill so inputs can promote.
@@ -375,7 +371,7 @@ pub(crate) async fn attach_stable_ids_to_hits(
     // dominated large-k scored latency on real corpora.
     stamp_stable_ids(table_reader, hits)
         .await
-        .map_err(|e| QueryError::Internal(e.to_string()))?;
+        .map_err(QueryError::DataFusion)?;
     if let Some(missing) = hits.iter().find(|h| h.stable_id.is_none()) {
         return Err(QueryError::Internal(format!(
             "hit {:?}/{} missing stable _id after search-wave stamping",
@@ -416,7 +412,7 @@ pub(crate) async fn apply_resolved_tombstone_filter(
         let (batch, decode_ns) = op_stats::timed_section(|| {
             reader
                 .take_by_local_doc_ids(&locals, &[id_column])
-                .map_err(|e| QueryError::Internal(e.to_string()))
+                .map_err(QueryError::from)
         });
         if let Some(stats) = op_stats {
             stats.add_kernel_cpu_ns(decode_ns);
@@ -445,7 +441,7 @@ pub(crate) async fn apply_resolved_tombstone_filter(
             &[id_column],
         )
         .await
-        .map_err(|e| QueryError::Internal(e.to_string()))?
+        .map_err(QueryError::DataFusion)?
     };
     let ids = batch
         .column(0)
@@ -478,7 +474,7 @@ async fn stable_ids_for_tagged_hits(
         && let Some(ids) = v
             .inline_stable_ids_for_locals_async(locals)
             .await
-            .map_err(|e| QueryError::Internal(e.to_string()))?
+            .map_err(QueryError::from)?
     {
         return Ok(Some(ids));
     }
@@ -494,7 +490,7 @@ async fn stable_ids_for_tagged_hits(
     let id_column = reader.id_column();
     let batch = reader
         .take_by_local_doc_ids(locals, &[id_column])
-        .map_err(|e| QueryError::Internal(e.to_string()))?;
+        .map_err(QueryError::from)?;
     let array = batch
         .column(0)
         .as_any()

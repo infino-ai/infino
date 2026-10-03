@@ -92,8 +92,8 @@ use crate::{
             exec::{
                 common::{
                     PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
-                    fill_top_k, output_schema_with_score, resolve_hits_named, scope_to_call,
-                    search_query_df_error, traced_tvf,
+                    fill_top_k, live_reader, output_schema_with_score, resolve_hits_named,
+                    scope_to_call, traced_tvf,
                 },
                 vector_exec::arg_to_query_vector,
             },
@@ -354,7 +354,7 @@ impl Supertable {
                 }
                 .instrument(detail_span!("search.resolve", hits = hits.len())),
             )
-            .map_err(|e| InfinoError::Query(e.to_string()).with_context("hybrid_search", None))?;
+            .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;
         close_out.finish(batch.num_rows() as u64);
         Ok(vec![batch])
     }
@@ -396,11 +396,7 @@ impl TableFunctionImpl for HybridSearchFunc {
         let vec_col = arg_to_string(&args[2], "hybrid_search vec_col")?;
         let q_vec = arg_to_query_vector(&args[3])?;
         let k = arg_to_usize(&args[4], "hybrid_search k")?;
-        let reader = self.reader.upgrade().ok_or_else(|| {
-            DataFusionError::Execution(
-                "hybrid_search: supertable consumer dropped before execution".into(),
-            )
-        })?;
+        let reader = live_reader(&self.reader, "hybrid_search")?;
         scope_to_call(
             HYBRID_SEARCH_UDTF,
             Arc::new(HybridSearchTable {
@@ -541,7 +537,7 @@ impl HybridSearchExec {
             Some(indices) => Arc::new(
                 output_schema
                     .project(indices)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+                    .map_err(QueryError::internal)?,
             ),
             None => Arc::clone(&output_schema),
         };
@@ -644,12 +640,7 @@ impl ExecutionPlan for HybridSearchExec {
                 true => None,
                 false => {
                     let plan = candidate_plan_for_filters(reader.manifest(), &filters);
-                    Some(
-                        reader
-                            .candidate_scope(&filters, &plan)
-                            .await
-                            .map_err(search_query_df_error)?,
-                    )
+                    Some(reader.candidate_scope(&filters, &plan).await?)
                 }
             };
             let predicate = PushedPredicate::compile(&filters, &output_schema);

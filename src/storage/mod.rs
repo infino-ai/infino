@@ -30,7 +30,9 @@
 //! specifically, re-reads the pointer to capture the winner's
 //! state, and retries the commit on top of it.
 
-use std::{fmt, ops::Range, path::PathBuf, sync::Arc, time::SystemTime};
+use std::{
+    error::Error as StdError, fmt, io, iter, ops::Range, path::PathBuf, sync::Arc, time::SystemTime,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -157,10 +159,27 @@ impl StorageError {
 /// *before* it is flattened, so the classification stays typed rather than
 /// matching on message text. Every link in the chain must declare its
 /// `#[source]` / `#[from]` for the walk to reach the bottom.
-pub(crate) fn permission_denied_in_chain(e: &(dyn std::error::Error + 'static)) -> bool {
-    std::iter::successors(Some(e), |e| e.source()).any(|link| {
+pub(crate) fn permission_denied_in_chain(e: &(dyn StdError + 'static)) -> bool {
+    error_chain(e).any(|link| {
         link.downcast_ref::<StorageError>()
             .is_some_and(StorageError::is_permission_denied)
+    })
+}
+
+/// `e` and every error under it, outermost first, for classifying an error by
+/// what caused it.
+///
+/// Steps into an [`io::Error`] by hand: its `source()` returns the source of
+/// the error it wraps, not that error itself, so a storage error carried in an
+/// `io::Error` (as a superfile read carries one) would otherwise be skipped.
+pub(crate) fn error_chain<'a>(
+    e: &'a (dyn StdError + 'static),
+) -> impl Iterator<Item = &'a (dyn StdError + 'static)> {
+    iter::successors(Some(e), |&link| match link.downcast_ref::<io::Error>() {
+        Some(wrapper) => wrapper
+            .get_ref()
+            .map(|inner| inner as &(dyn StdError + 'static)),
+        None => link.source(),
     })
 }
 

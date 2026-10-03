@@ -59,13 +59,14 @@ use futures::stream;
 use crate::{
     superfile::reader::VectorSearchOptions,
     supertable::{
+        error::QueryError,
         handle::{SupertableReader, WeakReader},
         query::{
             candidate::CandidatePlan,
             exec::common::{
                 PushedPredicate, SCORE_COLUMN, arg_to_string, arg_to_usize,
-                candidate_plan_for_filters, fill_top_k, output_schema_with_score, resolve_hits,
-                scope_to_call, search_query_df_error, traced_tvf,
+                candidate_plan_for_filters, fill_top_k, live_reader, output_schema_with_score,
+                resolve_hits, scope_to_call, traced_tvf,
             },
             vector::{free_column_slot, hits_id_score_batch, user_placement_for_scalar_resolve},
         },
@@ -127,11 +128,7 @@ impl TableFunctionImpl for VectorSearchFunc {
         let column = arg_to_string(&args[0], "column")?;
         let query = arg_to_query_vector(&args[1])?;
         let k = arg_to_usize(&args[2], "k")?;
-        let reader = self.reader.upgrade().ok_or_else(|| {
-            DataFusionError::Execution(
-                "vector_search: supertable consumer dropped before execution".into(),
-            )
-        })?;
+        let reader = live_reader(&self.reader, "vector_search")?;
         scope_to_call(
             VECTOR_SEARCH_UDTF,
             Arc::new(VectorSearchTable {
@@ -273,7 +270,7 @@ impl VectorSearchExec {
             Some(indices) => Arc::new(
                 output_schema
                     .project(indices)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+                    .map_err(QueryError::internal)?,
             ),
             None => Arc::clone(&output_schema),
         };
@@ -432,7 +429,7 @@ impl ExecutionPlan for VectorSearchExec {
                                 .await?
                         }
                     };
-                    Ok(hits)
+                    Ok::<_, QueryError>(hits)
                 }
             };
             // Same stamp guard as the hybrid exec path: unstamped hits fall
@@ -442,16 +439,13 @@ impl ExecutionPlan for VectorSearchExec {
             if filters.is_empty()
                 && let Some(indices) = id_score_projection
             {
-                let hits = search(k).await.map_err(search_query_df_error)?;
+                let hits = search(k).await?;
                 if hits.iter().all(|hit| hit.stable_id.is_some()) {
-                    return hits_id_score_batch(&reader, &hits)
-                        .map_err(|e| DataFusionError::Execution(e.to_string()))?
+                    return hits_id_score_batch(&reader, &hits)?
                         .project(&indices)
-                        .map_err(|e| DataFusionError::Execution(e.to_string()));
+                        .map_err(|e| QueryError::internal(e).into());
                 }
-                let hits = user_placement_for_scalar_resolve(&reader, &hits)
-                    .await
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                let hits = user_placement_for_scalar_resolve(&reader, &hits).await?;
                 return resolve_hits(
                     &reader,
                     &hits,

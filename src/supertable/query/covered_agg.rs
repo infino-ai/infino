@@ -67,6 +67,7 @@ use datafusion::{
 use uuid::Uuid;
 
 use crate::supertable::{
+    error::QueryError,
     manifest::{SuperfileEntry, add_sum_arrays, list::ScalarValueCounts},
     options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
     query::provider::SupertableProvider,
@@ -95,7 +96,10 @@ impl OptimizerRule for CoveredAggregateRewrite {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> DfResult<Transformed<LogicalPlan>> {
-        match try_rewrite(&plan)? {
+        // `try_rewrite` declines with `None`. An error is a failure building
+        // our replacement from the manifest's own statistics: ours, never the
+        // query's, so it crosses DataFusion as an engine fault.
+        match try_rewrite(&plan).map_err(QueryError::internal)? {
             Some(rewritten) => Ok(Transformed::yes(rewritten)),
             None => Ok(Transformed::no(plan)),
         }

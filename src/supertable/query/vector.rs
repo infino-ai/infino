@@ -99,7 +99,6 @@ use crate::{
     storage::io_counters,
     superfile::{
         SuperfileReader,
-        error::ReadError,
         fts::reader::BoolMode,
         id_space::RowId,
         vector::{
@@ -1050,10 +1049,7 @@ fn centroid_router_walk(
             continue;
         };
         let sfid = sf.superfile_id;
-        for (flat, mut vec) in vr
-            .global_fine_cluster_vectors(column, section, sfid)
-            .map_err(|e| QueryError::Internal(e.to_string()))?
-        {
+        for (flat, mut vec) in vr.global_fine_cluster_vectors(column, section, sfid)? {
             gfc_prepare_for_metric(metric, &mut vec);
             vecs.push(vec);
             node_map.push((si, flat));
@@ -1497,16 +1493,6 @@ fn fine_first_cell_selection(fine_ranked: &[(u32, f32)], grid_top: Option<u32>) 
     cells
 }
 
-/// Map a per-superfile vector-search error to a query error. A budget refusal
-/// keeps its own variant (found via `ReadError::over_budget`) so it surfaces as
-/// the public `InfinoError::OverBudget`; anything else is a generic query error.
-fn vector_read_query_error(e: ReadError) -> QueryError {
-    if let Some(msg) = e.over_budget() {
-        return QueryError::OverBudget(msg.to_string());
-    }
-    QueryError::Parquet(e.to_string())
-}
-
 /// An optional text-predicate filter for vector kNN search. When
 /// supplied, kNN is ranked only among rows matching the predicate
 /// (pushdown, not post-filter). Built from an FTS-indexed column, a
@@ -1801,9 +1787,7 @@ pub(crate) async fn stable_ids_by_local_for_routing(
     }
     let id_column = reader.id_column();
     if reader.parquet_bytes().is_some() {
-        let batch = reader
-            .take_by_local_doc_ids(&locals, &[id_column])
-            .map_err(|e| QueryError::Internal(e.to_string()))?;
+        let batch = reader.take_by_local_doc_ids(&locals, &[id_column])?;
         return id_values_from_batch(&batch);
     }
     read_ids_for_locals(manifest, entry, &locals, id_column, true, op_stats).await
@@ -1879,10 +1863,7 @@ async fn read_ids_for_locals(
         }
         // Cold path: fetch the inline region async when present but not resident.
         if let Some(v) = reader.vec()
-            && let Some(ids) = v
-                .inline_stable_ids_for_locals_async(local_ids)
-                .await
-                .map_err(|e| QueryError::Internal(e.to_string()))?
+            && let Some(ids) = v.inline_stable_ids_for_locals_async(local_ids).await?
         {
             if let Some(stats) = op_stats {
                 stats.add_planned_read_ranges(1);
@@ -1904,7 +1885,7 @@ async fn read_ids_for_locals(
                     op_stats::timed_section(|| {
                         reader
                             .take_by_local_doc_ids(&locals, &[id_column.as_str()])
-                            .map_err(|e| QueryError::Internal(e.to_string()))
+                            .map_err(QueryError::from)
                     })
                 },
             )
@@ -4290,8 +4271,7 @@ impl SupertableReader {
                         Some(pool),
                         Some(budget),
                     )
-                    .await
-                    .map_err(|e| QueryError::Internal(e.to_string()))?;
+                    .await?;
                 Ok::<_, QueryError>((si, scan))
             });
         }
@@ -4345,8 +4325,7 @@ impl SupertableReader {
                 let reader = readers[si].as_ref();
                 let (hits, rerank_ns) = reader
                     .vector_rerank_selected(column, query, k, selected, None)
-                    .await
-                    .map_err(|e| QueryError::Internal(e.to_string()))?;
+                    .await?;
                 if let Some(stats) = &self.op_stats {
                     stats.add_kernel_cpu_ns(rerank_ns);
                 }
@@ -5587,8 +5566,7 @@ impl SupertableReader {
                                 pool,
                                 budget,
                             )
-                            .await
-                            .map_err(vector_read_query_error)?;
+                            .await?;
                         fold_probe_work(&op_stats, &scan.work());
                         max_replica_overhead
                             .fetch_max(replica_overhead as u64, atomic::Ordering::Relaxed);
@@ -5604,8 +5582,7 @@ impl SupertableReader {
                             .vector_search_clusters_filtered(
                                 &column, &query, k_fetch, &ids, options, bitmap, deny, pool, budget,
                             )
-                            .await
-                            .map_err(vector_read_query_error)?;
+                            .await?;
                         fold_probe_work(&op_stats, &tally);
                         hits
                     };
@@ -5847,8 +5824,7 @@ impl SupertableReader {
                                 selected,
                                 Some(reader_pool),
                             )
-                            .await
-                            .map_err(vector_read_query_error)?;
+                            .await?;
                         if let Some(stats) = &op_stats {
                             stats.add_kernel_cpu_ns(rerank_kernel_ns);
                         }
@@ -6030,7 +6006,7 @@ impl SupertableReader {
                 let (docs, work) = r
                     .token_match_prefetched(&filter_col_arc, &refs, mode, memo.as_deref())
                     .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                    .map_err(QueryError::from)?;
                 // The predicate-resolution leg of filtered vector search
                 // is FTS work like any other; flush it per superfile.
                 if let Some(stats) = &op_stats {
@@ -6711,7 +6687,7 @@ impl SupertableReader {
                 let (bitmap, work) = plan
                     .evaluate(r.as_ref(), Some(&reader_pool), &memos)
                     .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                    .map_err(QueryError::from)?;
                 // The SQL predicate's posting walks, summed across the
                 // plan tree — the pushdown leg of the vector TVF.
                 if let Some(stats) = &op_stats {
@@ -7523,7 +7499,6 @@ mod tests {
         gfc_unit_normalize, hidden_hits_user_ids, id_score_projection_indices,
         is_hidden_vector_manifest, law_floor_serve_selection, postings_by_cell_from_summaries,
         rerank_mult_from_law, score_fine_candidates, select_global_shortlist, union_cell_selection,
-        vector_read_query_error,
     };
     use crate::{
         BoolMode, InfinoError,
@@ -8371,9 +8346,15 @@ mod tests {
         // routes all the way to the public `InfinoError::OverBudget` and isn't
         // flattened to a generic query error.
         let read_err = ReadError::Vector(Box::new(VectorError::OverBudget("gate".into())));
-        let q = vector_read_query_error(read_err);
+        let q = QueryError::from(read_err);
 
         assert!(matches!(q, QueryError::OverBudget(_)), "got {q:?}");
+        // The scan returns the vector reader's own error, unwrapped: the same
+        // refusal must survive that path too, not read as an engine fault.
+        assert!(matches!(
+            QueryError::from(VectorError::OverBudget("gate".into())),
+            QueryError::OverBudget(_)
+        ));
         assert!(matches!(
             InfinoError::from(QueryError::OverBudget("x".into())),
             InfinoError::OverBudget(_)
@@ -8381,7 +8362,7 @@ mod tests {
 
         // A non-budget read error stays a generic query error.
         assert!(matches!(
-            vector_read_query_error(ReadError::MissingKv("k")),
+            QueryError::from(ReadError::MissingKv("k")),
             QueryError::Parquet(_)
         ));
     }

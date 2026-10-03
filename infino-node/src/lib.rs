@@ -92,6 +92,12 @@ fn map_err(e: InfinoError) -> Error {
         InfinoError::Conflict(m) => {
             Error::new(Status::GenericFailure, format!("ConflictError: {m}"))
         }
+        // A valid query using something the engine does not support yet.
+        // Prefixed with the variant name, as `NotFound:` is, so a caller can
+        // tell it apart from a malformed query.
+        InfinoError::Unsupported(m) => {
+            Error::new(Status::GenericFailure, format!("Unsupported: {m}"))
+        }
         // `InfinoError` is `#[non_exhaustive]`: future variants fall back
         // to a generic runtime error carrying the message.
         other => Error::new(Status::GenericFailure, other.to_string()),

@@ -61,10 +61,11 @@ use datafusion::{
 use crate::{
     superfile::fts::reader::{Bm25SearchOptions, BoolMode},
     supertable::{
+        error::QueryError,
         handle::{SupertableReader, WeakReader},
         query::exec::common::{
             PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters, fill_top_k,
-            output_schema_with_score, scope_to_call, search_query_df_error, traced_tvf,
+            live_reader, output_schema_with_score, scope_to_call, traced_tvf,
         },
     },
     utils::trace::detail_span,
@@ -150,11 +151,7 @@ impl TableFunctionImpl for Bm25SearchFunc {
             Some(expr) => arg_to_bool_mode(expr)?,
             None => BoolMode::Or,
         };
-        let reader = self.reader.upgrade().ok_or_else(|| {
-            DataFusionError::Execution(
-                "bm25_search: supertable consumer dropped before execution".into(),
-            )
-        })?;
+        let reader = live_reader(&self.reader, "bm25_search")?;
         scope_to_call(
             BM25_SEARCH_UDTF,
             Arc::new(Bm25Table {
@@ -203,11 +200,7 @@ impl TableFunctionImpl for Bm25PrefixFunc {
         let column = arg_to_string(&args[0], "bm25_search_prefix column")?;
         let prefix = arg_to_string(&args[1], "bm25_search_prefix prefix")?;
         let k = arg_to_usize(&args[2], "bm25_search_prefix k")?;
-        let reader = self.reader.upgrade().ok_or_else(|| {
-            DataFusionError::Execution(
-                "bm25_search_prefix: supertable consumer dropped before execution".into(),
-            )
-        })?;
+        let reader = live_reader(&self.reader, "bm25_search_prefix")?;
 
         scope_to_call(
             BM25_PREFIX_UDTF,
@@ -321,7 +314,7 @@ impl Bm25Exec {
             Some(indices) => Arc::new(
                 output_schema
                     .project(indices)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+                    .map_err(QueryError::internal)?,
             ),
             None => Arc::clone(&output_schema),
         };
@@ -423,12 +416,7 @@ impl ExecutionPlan for Bm25Exec {
             let scope = match &query {
                 Bm25Query::Terms { .. } if !filters.is_empty() => {
                     let plan = candidate_plan_for_filters(reader.manifest(), &filters);
-                    Some(
-                        reader
-                            .candidate_scope(&filters, &plan)
-                            .await
-                            .map_err(search_query_df_error)?,
-                    )
+                    Some(reader.candidate_scope(&filters, &plan).await?)
                 }
                 Bm25Query::Terms { .. } | Bm25Query::Prefix { .. } => None,
             };
@@ -1119,7 +1107,7 @@ mod tests {
     #[test]
     fn bm25_search_tvf_arity_error() {
         let st = demo_corpus();
-        // 2 args (missing k) → planning error, surfaced as QueryError::Plan.
+        // 2 args (missing k) → a planning error, the caller's mistake.
         assert!(
             st.reader()
                 .expect("reader")

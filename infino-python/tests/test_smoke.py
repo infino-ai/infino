@@ -253,6 +253,15 @@ def test_bm25_params_must_be_passed_together():
         db.create_table("half", _title_schema(), infino.IndexSpec().fts("title", k1=1.6))
 
 
+def test_unimplemented_sql_raises_not_implemented_error():
+    # Valid SQL the engine does not implement raises NotImplementedError (a
+    # RuntimeError subclass), not the ValueError a malformed query gets.
+    db = infino.connect("memory://")
+    db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    with pytest.raises(NotImplementedError):
+        db.query_sql("ALTER TABLE docs ADD COLUMN y int")
+
+
 def test_bm25_params_out_of_range_is_rejected():
     # Same bounds as the Rust surface: k1 > 0, b in [0, 1].
     db = infino.connect("memory://")
