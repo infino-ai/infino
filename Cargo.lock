@@ -2374,7 +2374,7 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.8.10"
+version = "0.9.0"
 dependencies = [
  "apache-avro",
  "arc-swap",
