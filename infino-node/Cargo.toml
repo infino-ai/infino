@@ -39,6 +39,9 @@ arrow-schema = "58"
 # infino's datafusion version so the `Expr` type unifies with the core
 # signatures; feature unification reuses infino's already-compiled datafusion.
 datafusion = "54"
+# The schema document crosses as JSON text (`JSON.parse` on the JS side), so
+# one codec serves the JS object and the engine's document.
+serde_json = "1"
 
 [build-dependencies]
 napi-build = "2"

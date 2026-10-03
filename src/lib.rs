@@ -191,12 +191,17 @@ pub use superfile::{
         bm25::Bm25Params,
         reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
     },
-    vector::distance::Metric,
+    vector::{distance::Metric, rerank_codec::RerankCodec},
 };
 pub use supertable::{
     Consistency, GcError, GcReport, MutationStats, OptimizeError, ReindexError,
     query::vector::VectorFilter,
     reindex::{PlannedRepair, ReindexReport, StalenessReport},
+    schema::{
+        ColumnIndex, FieldDef, FieldId, TableSchema,
+        change::{FieldPatch, SchemaPatch},
+        error::SchemaError,
+    },
 };
 
 /// Convenience builders for test fixtures. Visible to:

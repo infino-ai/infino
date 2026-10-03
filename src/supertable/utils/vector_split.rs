@@ -10,16 +10,12 @@
 //!
 //! ## What gets validated at split time
 //!
-//! Schema-static checks live in `SupertableOptions::new` — types,
-//! dims, name uniqueness, etc. The runtime checks here are the ones
-//! that depend on the data of a specific `RecordBatch`:
-//!
-//! 1. Input batch's schema field-by-field equals the supertable's
-//!    declared schema (every append must match what
-//!    `Supertable::create` declared).
-//! 2. Each vector column's underlying `FixedSizeListArray` has no
-//!    null entries — null vectors aren't permitted, since the IVF
-//!    index has no notion of "skip this row's vector".
+//! The batch has already been brought to the table's shape by the
+//! schema resolver; the checks here are the ones that depend on the
+//! vector data of a specific `RecordBatch`: every declared vector
+//! column is present as a `FixedSizeList<Float32>` of the declared
+//! dimension, and has no null entries — null vectors aren't permitted,
+//! since the IVF index has no notion of "skip this row's vector".
 //!
 //! ## Zero-copy
 //!
@@ -32,36 +28,24 @@
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 
-use crate::{
-    supertable::{error::BuildError, manifest::ManifestSnapshot},
-    utils::schema,
-};
+use crate::supertable::{error::BuildError, manifest::ManifestSnapshot};
 
 /// Maximum number of null row offsets collected into a
 /// `VectorColumnHasNulls` error. Bounds the error payload so a batch
 /// that is null-heavy doesn't produce an unbounded diagnostic list.
 const MAX_NULL_OFFSETS_IN_ERROR: usize = 5;
 
-/// Split vector columns out of `batch`. Returns a `RecordBatch` of
-/// scalar-only columns (matching the table's scalar schema) plus a
-/// `Vec<&[f32]>` parallel to `options.vector_columns` — one slice
-/// per declared vector column, in declaration order.
+/// Split vector columns out of `batch`. Returns a `RecordBatch` of the
+/// non-vector columns in the batch's order plus a `Vec<&[f32]>` parallel
+/// to the table's vector columns — one slice per declared vector column,
+/// in declaration order.
 ///
 /// See module docs for what's validated here vs at options time.
 pub(crate) fn split_vectors<'a>(
     batch: &'a RecordBatch,
     manifest: &ManifestSnapshot,
 ) -> Result<(RecordBatch, Vec<&'a [f32]>), BuildError> {
-    // 1. The input batch's schema must match the supertable's
-    //    declared schema. We don't allow per-batch schema drift
-    //    (per non-goal "Schema evolution"). Equality is by
-    //    structural comparison.
-    let user_schema = manifest.user_schema();
-    if !schema::compare_schema(&batch.schema(), &user_schema) {
-        return Err(BuildError::BatchSchemaMismatch);
-    }
-
-    // 2. Pull each vector column out, validate FixedSizeList shape +
+    // 1. Pull each vector column out, validate FixedSizeList shape +
     //    no-nulls, view the inner Float32Array as &[f32].
     let configs = manifest.vector_configs();
     let mut vectors: Vec<&'a [f32]> = Vec::with_capacity(configs.len());
@@ -135,28 +119,19 @@ pub(crate) fn split_vectors<'a>(
         vectors.push(inner.values());
     }
 
-    // 3. Project scalar-only RecordBatch by dropping vector columns.
-    //    project_by_name preserves field order from the projection
-    //    list, so collect the kept names in their original schema
-    //    order.
-    let scalar_field_names: Vec<&str> = user_schema
+    // 2. The scalar batch: every column that is not a vector column, in
+    //    the batch's order.
+    let scalar_indices: Vec<usize> = batch
+        .schema()
         .fields()
         .iter()
-        .filter(|f| !configs.iter().any(|vc| vc.column == *f.name()))
-        .map(|f| f.name().as_str())
+        .enumerate()
+        .filter(|(_, f)| !configs.iter().any(|vc| vc.column == *f.name()))
+        .map(|(i, _)| i)
         .collect();
     let scalar_batch = batch
-        .project(
-            &scalar_field_names
-                .iter()
-                .map(|n| {
-                    batch.schema().index_of(n).expect(
-                        "invariant: name from the table schema is in batch.schema (checked above)",
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|_| BuildError::BatchSchemaMismatch)?;
+        .project(&scalar_indices)
+        .expect("indices were enumerated from this batch's schema");
 
     Ok((scalar_batch, vectors))
 }
@@ -291,24 +266,25 @@ mod tests {
     }
 
     #[test]
-    fn split_rejects_batch_with_wrong_schema() {
+    fn split_rejects_batch_without_the_vector_column() {
         let dim = 16;
         let schema = schema_id_title_emb(dim);
         let opts = SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
             .expect("valid options");
 
-        // Build a batch with a different schema (no `title` column).
         let other_schema = Arc::new(Schema::new(vec![Field::new(
-            "emb",
-            fixed_list_f32(dim),
+            "title",
+            DataType::LargeUtf8,
             false,
         )]));
-        let fsl = build_fsl(vec![0.0; 2 * dim], dim);
-        let other_batch =
-            RecordBatch::try_new(other_schema, vec![Arc::new(fsl)]).expect("build batch");
+        let other_batch = RecordBatch::try_new(
+            other_schema,
+            vec![Arc::new(LargeStringArray::from(vec!["a", "b"]))],
+        )
+        .expect("build batch");
 
         let err = split_vectors(&other_batch, &snapshot(opts)).expect_err("expected error");
-        assert!(matches!(err, BuildError::BatchSchemaMismatch));
+        assert!(matches!(err, BuildError::VectorColumnMissing { column } if column == "emb"));
     }
 
     #[test]

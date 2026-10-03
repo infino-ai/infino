@@ -37,6 +37,7 @@ use crate::{
         },
         manifest::ManifestLoadError,
         mutations::{CommitError as MutationCommitError, MutationError},
+        schema::error::SchemaError,
     },
 };
 
@@ -366,6 +367,12 @@ impl From<SupertableBuildError> for InfinoError {
         if matches!(e, SupertableBuildError::TableGone) {
             return InfinoError::NotFound(e.to_string());
         }
+        if matches!(
+            e,
+            SupertableBuildError::Schema(SchemaError::TableExists { .. })
+        ) {
+            return InfinoError::AlreadyExists(e.to_string());
+        }
         // A bad analyzer name is a configuration mistake, not a schema
         // shape problem — surface it as the same class a bad connect
         // option gets.
@@ -421,7 +428,6 @@ impl From<MutationError> for InfinoError {
             MutationError::Storage(s) => InfinoError::from(s),
             MutationError::CardinalityMismatch { .. }
             | MutationError::MatchCountExceedsCap { .. } => InfinoError::Cardinality(msg),
-            MutationError::SchemaMismatch(_) => InfinoError::Schema(msg),
             // Classifies exactly as the same rows would through `append`.
             MutationError::InvalidNewRows(b) => InfinoError::from(b),
             // Matches the read path: a purged table's name resolves to nothing.
@@ -450,6 +456,12 @@ impl From<MutationCommitError> for InfinoError {
             MutationCommitError::AppendFlush(SupertableBuildError::TableGone)
         ) {
             return InfinoError::NotFound(e.to_string());
+        }
+        // A buffer the table's schema refuses at commit (a peer froze a
+        // column in another type first) classifies as the same batch would
+        // through a synchronous append.
+        if let MutationCommitError::AppendFlush(SupertableBuildError::Schema(schema)) = &e {
+            return InfinoError::from(SupertableBuildError::Schema(schema.clone()));
         }
         InfinoError::Backend(e.to_string())
     }
@@ -1035,10 +1047,6 @@ mod tests {
         assert!(matches!(
             InfinoError::from(MutationError::MatchCountExceedsCap { matched: 9, cap: 5 }),
             InfinoError::Cardinality(_)
-        ));
-        assert!(matches!(
-            InfinoError::from(MutationError::SchemaMismatch("s".into())),
-            InfinoError::Schema(_)
         ));
         assert!(matches!(
             InfinoError::from(MutationError::NoStorageAttached),

@@ -62,7 +62,7 @@ use std::{
 };
 
 use arrow::ipc::reader::StreamReader;
-use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
+use arrow_array::RecordBatch;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use roaring::RoaringBitmap;
@@ -74,7 +74,7 @@ use crate::{
     config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
     runtime_bridge::{bridge_sync_to_async, run_on_pool},
     runtime_metrics::op_stats::{OpStatsCollector, timed_kernel},
-    storage::StorageError,
+    storage::{StorageError, StorageProvider},
     superfile::{ReadError, SuperfileReader, builder::SuperfileBuilder},
     supertable::{
         ManifestSnapshot,
@@ -83,7 +83,11 @@ use crate::{
         manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri},
         query::superfile_reader::superfile_reader,
         reader_cache::ReadIntent,
-        schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, PhysicalSchema},
+        schema::{
+            PhysicalSchema,
+            error::SchemaError,
+            resolve::{conform, resolve_batch, union_schema},
+        },
         utils::vector_split::split_vectors,
         wal::{
             persistence::{Etag, WalStore, WalStoreError},
@@ -96,8 +100,8 @@ use crate::{
         writer::{
             CommitListMetadata, build_fts_summary, build_packed_update_superfile,
             build_subsection_offsets, build_term_contribution, build_vector_summary,
-            owned_vector_arrays, persist_commit, read_vector_layout_from_bytes,
-            stamp_tombstone_seqs,
+            builder_options_of, owned_vector_arrays, persist_commit, read_vector_layout_from_bytes,
+            stamp_tombstone_seqs, with_id_column,
         },
     },
 };
@@ -396,20 +400,103 @@ async fn do_apply(
             expected: user_batch.num_rows() as u32,
         });
     }
-    // Split scalars from vectors once; downstream consumes both
-    // halves. `split_vectors` runs the schema-equality check +
-    // per-vector null sweep, so this is the single validation
-    // gate for the append batch.
-    //
-    // Vector slices are zero-copy views into `user_batch`'s
-    // buffers; we hold `user_batch` alive across the
-    // `builder.add_batch` call below.
-    let manifest = inner.manifest.load();
+    let attempts = inner.options.max_commit_retries.max(1);
+    let mut attempt = 0;
+    let (uri, bytes) = loop {
+        match append_replacement_rows(
+            inner,
+            Arc::clone(&storage),
+            &user_batch,
+            &flat_ids,
+            preallocated_superfile_id,
+            &op_stats,
+        )
+        .await
+        {
+            Err(AppendPhaseError::ManifestCommit(e))
+                if matches!(*e, ManifestCommitError::SchemaMoved { .. })
+                    && attempt + 1 < attempts =>
+            {
+                attempt += 1;
+                warn!(error = %e, "schema moved under the update's append; rebuilding against the current one");
+            }
+            other => break other?,
+        }
+    };
+
+    // Warm the in-memory reader cache with the freshly-published
+    // bytes so this process's later reads (queries, tombstone
+    // resolves) don't take the cold-fetch round-trip back to
+    // storage. Mirrors the synchronous writer's pattern in
+    // `commit`; a failure here is non-fatal because the bytes
+    // are durable in storage and a subsequent read can refetch
+    // them.
+    let _ = inner.options.store.insert(uri, bytes);
+
+    // ---- Step 7: Advance WAL state to Appended ----
+    advance_to_appended_if_needed(wal_store, wal_doc, wal_etag).await
+}
+
+/// Flatten a `Vec<IdSpan>` into the implied sequence of `i128`
+/// ids in order. Total cost is O(n) in the flattened count;
+/// allocated once per append-phase invocation.
+///
+/// Uses `extend(Range)` rather than a `push` loop: `Vec::extend`
+/// specializes on `TrustedLen` iterators (which `Range<i128>` is),
+/// emitting one bulk copy instead of N bounds-checked pushes —
+/// ~6× faster at the 1M-id scale a delete/update batch can hit.
+fn flatten_spans(spans: &[IdSpan]) -> Vec<i128> {
+    let total: usize = spans.iter().map(|s| s.len() as usize).sum();
+    let mut out = Vec::with_capacity(total);
+    for span in spans {
+        out.extend(span.first.0..=span.last.0);
+    }
+    out
+}
+
+/// Decode the WAL's IPC sidecar back to the user-shape
+/// `RecordBatch`. The sidecar contains exactly one batch (the
+/// `new_rows` argument the caller passed to `update()`); we read
+/// the first and verify there isn't a second.
+/// Build and commit the superfile carrying `user_batch` under `ids`. The
+/// rows were resolved when the update was buffered; the table may have
+/// moved since, so they are resolved again against the current schema and
+/// the superfile lands with the schema it was built under or not at all —
+/// a commit the schema moved under is refused, and the caller rebuilds.
+async fn append_replacement_rows(
+    inner: &Arc<SupertableInner>,
+    storage: Arc<dyn StorageProvider>,
+    user_batch: &RecordBatch,
+    flat_ids: &[i128],
+    preallocated_superfile_id: Uuid,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<(SuperfileUri, Bytes), AppendPhaseError> {
+    let base = inner.manifest.load_full();
+    let built_against = base.table_schema().schema_id();
+    let id_column = inner.options.id_column.as_str();
+    let schema_error = |e: SchemaError| AppendPhaseError::SuperfileBuild {
+        message: e.to_string(),
+    };
+    let rows = resolve_batch(user_batch, &base.table_schema(), id_column)
+        .map_err(schema_error)?
+        .batch;
+    let schema_change = union_schema(&base.table_schema(), [&rows], id_column)
+        .map_err(schema_error)?
+        .map(Arc::new);
+    let manifest = match &schema_change {
+        Some(schema) => Arc::new(base.with_schema(Arc::clone(schema))),
+        None => base,
+    };
+    // Vector slices are zero-copy views into `rows`' buffers, alive across
+    // the `builder.add_batch` call below.
     let (scalar_no_id, vector_slices) =
-        split_vectors(&user_batch, &manifest).map_err(|e| AppendPhaseError::SuperfileBuild {
+        split_vectors(&rows, &manifest).map_err(|e| AppendPhaseError::SuperfileBuild {
             message: format!("vector_split: {e}"),
         })?;
-    let scalar_with_id = prepend_id_column(&scalar_no_id, &flat_ids, &manifest)?;
+    let scalar_with_id = conform(
+        &with_id_column(&scalar_no_id, flat_ids.to_vec(), id_column),
+        &manifest.scalar_schema(),
+    );
 
     // ---- Step 4: Build the superfile bytes ----
     //
@@ -432,12 +519,13 @@ async fn do_apply(
     // brackets each shard on its own pool worker — bracketing the pool
     // closure as well would count that CPU twice.
     let bytes = if manifest.vector_configs().is_empty() {
-        timed_kernel(&op_stats, || {
-            let mut builder = SuperfileBuilder::new(inner.builder_options()).map_err(|e| {
-                AppendPhaseError::SuperfileBuild {
-                    message: format!("builder construction: {e}"),
-                }
-            })?;
+        timed_kernel(op_stats, || {
+            let mut builder =
+                SuperfileBuilder::new(builder_options_of(&manifest)).map_err(|e| {
+                    AppendPhaseError::SuperfileBuild {
+                        message: format!("builder construction: {e}"),
+                    }
+                })?;
             builder
                 .add_batch(&scalar_with_id, &vector_slices)
                 .map_err(|e| AppendPhaseError::SuperfileBuild {
@@ -451,18 +539,27 @@ async fn do_apply(
             Ok::<_, AppendPhaseError>(Bytes::from(raw))
         })?
     } else {
-        let vectors = owned_vector_arrays(&user_batch, &manifest).map_err(|e| {
+        let vectors = owned_vector_arrays(&rows, &manifest).map_err(|e| {
             AppendPhaseError::SuperfileBuild {
                 message: format!("vector handles: {e}"),
             }
         })?;
         let pool_inner = Arc::clone(inner);
+        let pool_manifest = Arc::clone(&manifest);
         let pool_batch = scalar_with_id.clone();
         let pool_stats = op_stats.clone();
         run_on_pool(
             Some(&inner.options.writer_pool),
             "update packed superfile build",
-            move || build_packed_update_superfile(&pool_inner, pool_batch, vectors, &pool_stats),
+            move || {
+                build_packed_update_superfile(
+                    &pool_inner,
+                    &pool_manifest,
+                    pool_batch,
+                    vectors,
+                    &pool_stats,
+                )
+            },
         )
         .await
         .map_err(|e| AppendPhaseError::SuperfileBuild {
@@ -559,45 +656,17 @@ async fn do_apply(
         &[],
         vec![(storage_key, bytes.clone())],
         Vec::new(),
-        CommitListMetadata::empty(),
+        CommitListMetadata {
+            schema: schema_change,
+            expected_schema_id: Some(built_against),
+            ..CommitListMetadata::empty()
+        },
         term_contribution.into_iter().collect(),
     )
     .map_err(|e| AppendPhaseError::ManifestCommit(Box::new(e)))?;
-
-    // Warm the in-memory reader cache with the freshly-published
-    // bytes so this process's later reads (queries, tombstone
-    // resolves) don't take the cold-fetch round-trip back to
-    // storage. Mirrors the synchronous writer's pattern in
-    // `commit`; a failure here is non-fatal because the bytes
-    // are durable in storage and a subsequent read can refetch
-    // them.
-    let _ = inner.options.store.insert(uri, bytes);
-
-    // ---- Step 7: Advance WAL state to Appended ----
-    advance_to_appended_if_needed(wal_store, wal_doc, wal_etag).await
+    Ok((uri, bytes))
 }
 
-/// Flatten a `Vec<IdSpan>` into the implied sequence of `i128`
-/// ids in order. Total cost is O(n) in the flattened count;
-/// allocated once per append-phase invocation.
-///
-/// Uses `extend(Range)` rather than a `push` loop: `Vec::extend`
-/// specializes on `TrustedLen` iterators (which `Range<i128>` is),
-/// emitting one bulk copy instead of N bounds-checked pushes —
-/// ~6× faster at the 1M-id scale a delete/update batch can hit.
-fn flatten_spans(spans: &[IdSpan]) -> Vec<i128> {
-    let total: usize = spans.iter().map(|s| s.len() as usize).sum();
-    let mut out = Vec::with_capacity(total);
-    for span in spans {
-        out.extend(span.first.0..=span.last.0);
-    }
-    out
-}
-
-/// Decode the WAL's IPC sidecar back to the user-shape
-/// `RecordBatch`. The sidecar contains exactly one batch (the
-/// `new_rows` argument the caller passed to `update()`); we read
-/// the first and verify there isn't a second.
 fn decode_ipc_batch(
     ipc_bytes: &Bytes,
     wal_doc: &WalStateDoc,
@@ -625,37 +694,6 @@ fn decode_ipc_batch(
         });
     }
     Ok(batch)
-}
-
-/// Construct a new `RecordBatch` matching the supertable's
-/// `scalar_schema()` shape — `_id` column prepended, followed by
-/// `scalar_no_id`'s columns (the scalar-only output of
-/// `split_vectors`). Vector columns are NOT in this batch; they
-/// get passed alongside to `SuperfileBuilder::add_batch`.
-///
-/// Caller must have already run `split_vectors` for schema +
-/// null validation — this function trusts its input.
-fn prepend_id_column(
-    scalar_no_id: &RecordBatch,
-    flat_ids: &[i128],
-    manifest: &ManifestSnapshot,
-) -> Result<RecordBatch, AppendPhaseError> {
-    let id_values: Vec<i128> = flat_ids.to_vec();
-    let id_array = Decimal128Array::from(id_values)
-        .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
-        .map_err(|e| AppendPhaseError::SuperfileBuild {
-            message: format!("Decimal128 precision/scale: {e}"),
-        })?;
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(scalar_no_id.num_columns() + 1);
-    columns.push(Arc::new(id_array));
-    columns.extend(scalar_no_id.columns().iter().cloned());
-
-    RecordBatch::try_new(manifest.scalar_schema(), columns).map_err(|e| {
-        AppendPhaseError::SuperfileBuild {
-            message: format!("RecordBatch::try_new with _id prepended: {e}"),
-        }
-    })
 }
 
 // ============================================================
@@ -1820,6 +1858,7 @@ mod tests {
                 outcome: TombstoneOutcome::Pending,
                 tombstoned_in_superfile: None,
             }],
+            schema_id: None,
         };
         let etag = wal_store.create(&wal_doc).await.expect("wal create");
         (dir, supertable, wal_store, wal_doc, etag)
@@ -1981,6 +2020,7 @@ mod tests {
             target_ids: (0..n).map(|i| RowId(1000 + i as i128)).collect(),
             new_row_count: Some(n),
             new_row_content_hash: Some(content_hash),
+            schema_id: None,
             preallocated_superfile_id: Some(superfile_id),
             minted_id_spans: vec![IdSpan {
                 first: RowId(minted_first),
@@ -2226,6 +2266,7 @@ mod tests {
                 outcome: TombstoneOutcome::Pending,
                 tombstoned_in_superfile: None,
             }],
+            schema_id: None,
         };
         let etag = ws.create(&wal_doc).await.expect("create");
         let err = run_append_phase(&st, &ws, &wal_doc, &etag, None)
@@ -2326,6 +2367,7 @@ mod tests {
                 outcome: TombstoneOutcome::Pending,
                 tombstoned_in_superfile: None,
             }],
+            schema_id: None,
         };
         let etag = ws.create(&wal_doc).await.expect("create");
         let err = run_append_phase(&st, &ws, &wal_doc, &etag, None)
@@ -2602,6 +2644,7 @@ mod tests {
                     tombstoned_in_superfile: None,
                 })
                 .collect(),
+            schema_id: None,
         };
         let etag = ws.create(&wal_doc).await.expect("wal create");
         (wal_doc, etag)
@@ -2704,6 +2747,7 @@ mod tests {
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
             tombstone_progress: Vec::new(),
+            schema_id: None,
         }
     }
 
@@ -2867,6 +2911,7 @@ mod tests {
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
             tombstone_progress: Vec::new(),
+            schema_id: None,
         };
 
         let granted = granted_lease_span(&doc).expect("leased doc has a span");
@@ -2913,6 +2958,7 @@ mod tests {
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
             tombstone_progress: Vec::new(),
+            schema_id: None,
         };
         assert!(granted_lease_span(&doc).is_none());
         renew_lease(&mut doc, None, Utc::now());

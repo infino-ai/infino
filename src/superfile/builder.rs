@@ -3402,6 +3402,20 @@ fn adapted_batch(
     let batch = reader
         .get_record_batch(deleted)
         .map_err(|_| BuildError::BatchReadError)?;
+    // The adapter decides by id. A name the file shares with the table can
+    // belong to a column that was dropped and added again under a new id,
+    // whose old values must not ride through under the new column, so the
+    // shape check alone admits a batch only when there is no adapter to ask.
+    if let Some(map) = adapter
+        && !map.is_identity()
+    {
+        return map
+            .adapt(&batch, &opts.schema)
+            .map_err(|e| BuildError::SchemaMismatch {
+                mine: opts.schema.to_string(),
+                other: format!("{} ({e})", batch.schema()),
+            });
+    }
     if same_shape(&batch.schema(), &opts.schema) {
         return Ok(batch);
     }

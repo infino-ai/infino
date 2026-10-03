@@ -147,6 +147,7 @@ async fn seed_partial_state(
         preallocated_superfile_id: None,
         minted_id_spans: Vec::new(),
         tombstone_progress: progress,
+        schema_id: None,
     };
     ws.create(&wal).await.expect("seed wal");
     wal_id

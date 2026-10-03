@@ -12,6 +12,7 @@ Connection::drop_table	covered	(&self, &str, bool) -> Result<(), InfinoError>
 Connection::list_tables	covered	(&self) -> Result<Vec<String>, InfinoError>
 Connection::open_table	covered	(&self, &str) -> Result<Supertable, InfinoError>
 Connection::query_sql	covered	(&self, &str) -> Result<Vec<RecordBatch>, InfinoError>
+Connection::schema	covered	(&self, &str) -> Result<TableSchema, InfinoError>
 Supertable::append	covered	(&self, &RecordBatch) -> Result<(), InfinoError>
 Supertable::append_named	covered	(&self, &RecordBatch, &str) -> Result<(), InfinoError>
 Supertable::bm25_search	covered	(&self, &str, &str, usize, Bm25SearchOptions, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
@@ -33,3 +34,4 @@ connect_with	covered	(impl AsRef<str>, ConnectOptions) -> Result<Connection, Inf
 
 Connection::update_storage_credentials	exempt	Rotates an object-store credential in place; Rust-embedder API, not part of the language-binding operation surface
 Supertable::tokenize	exempt	How the index reads a text; Rust-embedder API for a caller judging its own texts against a column's terms, not a data operation the bindings wrap.
+Connection::apply_schema	exempt	the bindings fold the write into the `schema(name, patch, expected_schema_id)` overload; a second method would be a parallel API
