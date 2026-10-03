@@ -329,10 +329,11 @@ async fn parts_holding_routed_superfiles(
     index: &TermIndex,
     list: &Manifest,
     leaves: &[PruneLeaf],
+    options: &SupertableOptions,
 ) -> Option<HashSet<PartId>> {
     let mut kept: Option<HashSet<PartId>> = None;
     for leaf in leaves {
-        let Some(routed) = index.route_leaf(leaf).await else {
+        let Some(routed) = index.route_leaf(leaf, options).await else {
             continue;
         };
         let mut id_mins: Vec<i128> = routed
@@ -1244,7 +1245,7 @@ impl ManifestSnapshot {
                 if list.term_index_complete
                     && let Some(index) = self.term_index().await
                     && let Some(routed) =
-                        parts_holding_routed_superfiles(&index, list, leaves).await
+                        parts_holding_routed_superfiles(&index, list, leaves, &self.options).await
                 {
                     kept = Some(match kept {
                         None => routed,

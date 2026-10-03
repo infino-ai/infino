@@ -18,6 +18,8 @@ use std::{collections::HashMap, fmt, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema};
 
+use crate::utils::terms::make_key;
+
 /// Arrow field-metadata key parquet-rs maps to the Parquet `field_id`.
 /// Equal to `parquet::arrow::PARQUET_FIELD_ID_META_KEY`; spelled out so
 /// the schema module does not depend on the parquet crate.
@@ -37,6 +39,15 @@ impl FieldId {
     /// Reserved key under which a manifest part's aggregate carries the
     /// birth-version range of its superfiles. Not a column.
     pub const BIRTH_VERSION: FieldId = FieldId(u32::MAX);
+
+    /// The key a table-level term artifact (the term index, the term-stats
+    /// sidecar) files `term` of this column under: the id in decimal, then
+    /// the same separator and term bytes as a superfile's own dictionary
+    /// key, so one encoding serves both tiers and a rename changes nothing
+    /// at the table level.
+    pub fn term_key(self, term: &str) -> Vec<u8> {
+        make_key(&self.to_string(), term)
+    }
 }
 
 impl fmt::Display for FieldId {
@@ -402,6 +413,13 @@ impl LegacyNames {
             Arc::new(TableSchema::from_user_schema(&Schema::empty())),
             "_id",
         )
+    }
+
+    /// The id of a column a superfile stores: the id its writer stamped when
+    /// there is one, else the name resolved as a column written before ids
+    /// existed.
+    pub fn resolve_stored(&self, stamped: Option<FieldId>, name: &str) -> Option<FieldId> {
+        stamped.or_else(|| self.resolve(name))
     }
 
     /// The id a stored column name resolves to, or `None` for a name the

@@ -212,12 +212,13 @@ async fn with_routing(
     superfiles: &[Arc<SuperfileEntry>],
     index: Option<&TermIndex>,
     leaf: &PruneLeaf,
+    options: &SupertableOptions,
     fallback: Vec<bool>,
 ) -> Vec<bool> {
     let Some(index) = index else {
         return fallback;
     };
-    let Some(routed) = index.route_leaf(leaf).await else {
+    let Some(routed) = index.route_leaf(leaf, options).await else {
         return fallback;
     };
     superfiles
@@ -289,7 +290,14 @@ pub(crate) async fn select_superfiles(
                 let summaries = fts_bloom_skip(&superfiles, column_id, &refs, *mode);
                 and_into(
                     &mut mask,
-                    &with_routing(&superfiles, term_index.as_deref(), leaf, summaries).await,
+                    &with_routing(
+                        &superfiles,
+                        term_index.as_deref(),
+                        leaf,
+                        &manifest.options,
+                        summaries,
+                    )
+                    .await,
                 );
             }
             PruneLeaf::Prefix { column, prefix } => {
@@ -299,7 +307,14 @@ pub(crate) async fn select_superfiles(
                 let summaries = fts_prefix_skip(&superfiles, column_id, prefix);
                 and_into(
                     &mut mask,
-                    &with_routing(&superfiles, term_index.as_deref(), leaf, summaries).await,
+                    &with_routing(
+                        &superfiles,
+                        term_index.as_deref(),
+                        leaf,
+                        &manifest.options,
+                        summaries,
+                    )
+                    .await,
                 );
             }
             PruneLeaf::ScalarValueSet { column, values } => {

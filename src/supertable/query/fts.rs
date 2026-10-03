@@ -464,12 +464,12 @@ pub(crate) async fn index_locations_for(
     kept: &[Arc<SuperfileEntry>],
 ) -> IndexLocations {
     let owned: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
-    let by_superfile = match manifest.term_index().await {
-        Some(index) => match index.locations(column, terms, kept).await {
+    let by_superfile = match (manifest.field_id(column), manifest.term_index().await) {
+        (Some(column), Some(index)) => match index.locations(column, terms, kept).await {
             Ok(map) => map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
             Err(_) => HashMap::new(),
         },
-        None => HashMap::new(),
+        _ => HashMap::new(),
     };
     Arc::new(LocatedTerms {
         terms: owned,
@@ -850,7 +850,7 @@ impl SupertableReader {
                             .unwrap_or(local)
                     };
                     index
-                        .query_ceilings(column, column_id, &terms, &phrases, &kept, &idf_used)
+                        .query_ceilings(column_id, &terms, &phrases, &kept, &idf_used)
                         .instrument(term_span.clone())
                         .await
                         .ok()
@@ -1261,6 +1261,9 @@ impl SupertableReader {
         if misses.is_empty() {
             return Ok((map, None));
         }
+        let column_id = manifest
+            .field_id(column)
+            .ok_or_else(|| QueryError::InvalidQuery(format!("unknown column '{column}'")))?;
 
         // A complete term index already holds every term's gross df in
         // every live superfile — the same numbers a superfile's dictionary
@@ -1281,7 +1284,7 @@ impl SupertableReader {
                 .collect();
             let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(misses.len());
             for t in &misses {
-                let postings = index.postings(column, t).await.map_err(|e| {
+                let postings = index.postings(column_id, t).await.map_err(|e| {
                     QueryError::Store(format!("term index unreadable for global stats: {e}"))
                 })?;
                 let df: u64 = postings
@@ -1397,7 +1400,7 @@ impl SupertableReader {
             // the wave above summed only the uncovered tail. df can't
             // exceed the collection size; clamp so idf's df <= n_docs
             // invariant holds under gross-vs-live counts.
-            let sidecar_df = sidecar.as_ref().map_or(0, |s| s.df(column, t));
+            let sidecar_df = sidecar.as_ref().map_or(0, |s| s.df(column_id, t));
             let df = (global_df[i] + sidecar_df).min(global_n);
             let idf = bm25::idf(global_n, df);
             map.insert(t.clone(), idf);
@@ -1907,7 +1910,10 @@ impl SupertableReader {
         }
 
         let term = match_set.terms.first()?;
-        let postings = index.postings(column, term).await.ok()?;
+        let postings = index
+            .postings(manifest.field_id(column)?, term)
+            .await
+            .ok()?;
         let wanted: HashSet<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
         let mut total: u64 = 0;
         for posting in postings.iter() {
