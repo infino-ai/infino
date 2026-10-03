@@ -16,7 +16,8 @@ use arrow_schema::DataType;
 use serde_json::{Map, Value};
 
 use super::{
-    ColumnIndex, FieldDef, FieldId, TableSchema, Template,
+    ColumnIndex, FieldDef, FieldId, MAX_MAX_DEPTH, MAX_MAX_FIELDS, MAX_TEMPLATE_WILDCARDS,
+    TableSchema, Template,
     error::SchemaError,
     template_to_json, templates_from_json,
     types::{data_type_from_keys, type_keys},
@@ -533,9 +534,25 @@ impl TableSchema {
             }
             SchemaChange::SetNonNullable { id } => self.field_mut(*id)?.nullable = false,
             SchemaChange::SetNullable { id } => self.field_mut(*id)?.nullable = true,
-            SchemaChange::SetMaxFields(cap) => self.max_fields = *cap,
-            SchemaChange::SetMaxDepth(cap) => self.max_depth = *cap,
-            SchemaChange::SetTemplates(templates) => self.templates = templates.clone(),
+            SchemaChange::SetMaxFields(cap) => {
+                self.max_fields = check_cap("max_fields", *cap, MAX_MAX_FIELDS)?;
+            }
+            SchemaChange::SetMaxDepth(cap) => {
+                self.max_depth = check_cap("max_depth", *cap, MAX_MAX_DEPTH)?;
+            }
+            SchemaChange::SetTemplates(templates) => {
+                for template in templates {
+                    let wildcards = template.path.matches('*').count();
+                    if wildcards > MAX_TEMPLATE_WILDCARDS {
+                        return Err(SchemaError::CapExceeded {
+                            setting: format!("wildcards in template `{}`", template.name),
+                            value: wildcards as u32,
+                            cap: MAX_TEMPLATE_WILDCARDS as u32,
+                        });
+                    }
+                }
+                self.templates = templates.clone();
+            }
         }
         Ok(())
     }
@@ -572,6 +589,21 @@ impl TableSchema {
             .filter(|f| f.converting_from.is_some())
             .map(|f| f.id)
     }
+}
+
+/// `value` if it is within `cap`, else the refusal naming both. A cap the
+/// owner sets is itself capped: these bound what one commit can cost, so
+/// raising one past what the engine can carry would remove the bound
+/// rather than widen it.
+fn check_cap(setting: &str, value: u32, cap: u32) -> Result<u32, SchemaError> {
+    if value > cap {
+        return Err(SchemaError::CapExceeded {
+            setting: setting.to_owned(),
+            value,
+            cap,
+        });
+    }
+    Ok(value)
 }
 
 /// Whether `index` can be built on a new column of type `data_type`: a

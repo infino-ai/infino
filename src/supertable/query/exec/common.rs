@@ -1004,10 +1004,11 @@ async fn resolve_columns(
     let legacy = manifest.options.legacy_names();
     let out_schema = hit_output_schema(&manifest.stored_schema(), names)?;
     let decoded_cache = reader.decoded_scalar_cache();
+    let schema_id = manifest.table_schema().schema_id();
     let mut slots: Vec<Option<RecordBatch>> = vec![None; seg_order.len()];
     let mut misses = Vec::new();
     for (index, (&uri, locals)) in seg_order.iter().zip(&seg_locals).enumerate() {
-        if let Some(batch) = decoded_cache.get(uri, locals, names) {
+        if let Some(batch) = decoded_cache.get(uri, schema_id, locals, names) {
             slots[index] = Some(batch);
         } else {
             misses.push((index, uri));
@@ -1145,7 +1146,13 @@ async fn resolve_columns(
         .map(|(item, _)| item)
         .chain(cold_done?)
     {
-        decoded_cache.insert(seg_order[i], &seg_locals[i], names, batch.clone());
+        decoded_cache.insert(
+            seg_order[i],
+            schema_id,
+            &seg_locals[i],
+            names,
+            batch.clone(),
+        );
         slots[i] = Some(batch);
     }
     let per_superfile: Vec<RecordBatch> = slots

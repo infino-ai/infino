@@ -69,6 +69,16 @@ pub enum SchemaError {
         /// The field that nests past it.
         path: String,
     },
+    /// A setting was given a value beyond what the engine admits.
+    #[error("`{setting}` cannot be {value}; the most this engine admits is {cap}")]
+    CapExceeded {
+        /// What was being set.
+        setting: String,
+        /// The value submitted.
+        value: u32,
+        /// The largest value admitted.
+        cap: u32,
+    },
     /// A new column was submitted without a type.
     #[error("column `{column}` is new and needs a type")]
     TypeRequired {

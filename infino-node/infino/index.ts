@@ -385,15 +385,18 @@ function buildColumn(field: arrow.Field, rows: RowRecord[]): arrow.Vector {
 // its own schema (types translated into our instance) from its rows.
 type WriteInput = { ipc: Buffer } | { rows: string };
 
-// A `bigint` has no JSON form; it is written as the integer literal it is
-// (a tagged string in the replacer, unquoted afterwards), so it reaches the
-// engine exact and as an integer, never as a float or a string.
-const BIGINT_TAG = "@@infino-bigint@@:";
+// A `bigint` has no JSON form, so it travels as a one-key object the
+// replacer alone can produce and is then spliced back to the integer
+// literal it is — exact, and an integer rather than a float or a string.
+// A string in the data cannot be mistaken for one: `JSON.stringify`
+// escapes the quotes of a user's string, and the pattern below matches
+// only unescaped ones.
+const BIGINT_KEY = "$infino$bigint";
 function rowsToJson(rows: RowRecord[]): string {
   const text = JSON.stringify(rows, (_key, value) =>
-    typeof value === "bigint" ? BIGINT_TAG + value.toString() : value,
+    typeof value === "bigint" ? { [BIGINT_KEY]: value.toString() } : value,
   );
-  return text.replace(/"@@infino-bigint@@:(-?\d+)"/g, "$1");
+  return text.replace(/\{"\$infino\$bigint":"(-?\d+)"\}/g, "$1");
 }
 
 function writeInput(data: AppendData): WriteInput {

@@ -76,7 +76,7 @@ use crate::{
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
         },
     },
-    supertable::query::provider::tombstone_access_plan,
+    supertable::{query::provider::tombstone_access_plan, schema::FieldId},
     utils::terms::FstValue,
 };
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
@@ -685,6 +685,32 @@ impl SuperfileReader {
     }
 
     /// FTS column names in declaration order, or empty.
+    /// The name this file knows the column `id` by, for a caller holding
+    /// the table's current name for it. A file written before a rename
+    /// carries the old label in its FTS and vector blobs, which key their
+    /// columns by name; the id is what identifies the column across both.
+    /// Falls back to `name` for a file written before ids, whose labels
+    /// were the table's at the time.
+    pub(crate) fn column_alias<'a>(&'a self, id: Option<FieldId>, name: &'a str) -> &'a str {
+        let Some(id) = id else {
+            return name;
+        };
+        let fts = self
+            .fts()
+            .into_iter()
+            .flat_map(|fts| fts.fts_columns_config())
+            .find(|c| c.field_id == Some(id))
+            .map(|c| c.name.as_str());
+        fts.or_else(|| {
+            self.vec()
+                .into_iter()
+                .flat_map(|vec| vec.vector_columns_config())
+                .find(|c| c.field_id == Some(id))
+                .map(|c| c.name.as_str())
+        })
+        .unwrap_or(name)
+    }
+
     pub fn fts_columns(&self) -> Vec<&str> {
         match &self.fts {
             Some(r) => r.fts_columns().collect(),

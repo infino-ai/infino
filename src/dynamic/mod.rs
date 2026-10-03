@@ -175,6 +175,15 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
                 }
             };
             let column = &mut columns[index];
+            if column.cells[row].is_some() {
+                // Two keys of one document flattened to one path — a
+                // literal `a.b` beside a nested `a: {b: …}`. Keeping
+                // either would drop the other silently.
+                return Err(SchemaError::InvalidRow {
+                    row,
+                    reason: format!("two keys flatten to the same path `{}`", column.path),
+                });
+            }
             observe(column, &leaf)?;
             column.cells[row] = Some(leaf);
         }

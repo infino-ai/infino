@@ -667,7 +667,7 @@ fn vector_table(dir: &TempDir) -> Supertable {
             vec![FtsConfig::new("title")],
             vec![VectorConfig::new("emb".into(), DIM, 7, Metric::L2Sq)],
         )
-        .with_vector_field_ids([("emb".to_string(), EMB)]),
+        .with_field_ids_outside_schema([("emb".to_string(), EMB)]),
     )
     .expect("builder");
     with_vectors
