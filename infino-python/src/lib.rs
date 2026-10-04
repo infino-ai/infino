@@ -527,6 +527,7 @@ impl Connection {
     /// Run SQL across the catalog's tables; returns a pyarrow `Table`.
     /// Search is available in SQL via the TVFs, e.g.
     /// `SELECT _id, score FROM bm25_search('docs', 'body', 'q', 10)`.
+    /// Read-only, one statement per call: a write raises `ValueError`.
     fn query_sql<'py>(&self, py: Python<'py>, sql: &str) -> PyResult<Bound<'py, PyAny>> {
         let batches = py.detach(|| self.inner.query_sql(sql)).map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
