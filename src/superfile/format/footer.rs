@@ -127,12 +127,11 @@ pub enum FooterError {
     Io(#[from] io::Error),
     #[error("malformed parquet: {0}")]
     Malformed(&'static str),
-    /// surfaces a `LazyByteSource` failure during
-    /// async-tail footer reading. The string carries the upstream
-    /// `LazyByteSourceError`'s `Display` so the chain is visible
-    /// even after the layer translation.
+    /// A `LazyByteSource` failure while reading the footer (its tail, or a
+    /// range inside it), kept typed so a storage error under it stays
+    /// reachable.
     #[error("lazy source: {0}")]
-    LazySource(String),
+    LazySource(#[from] LazyByteSourceError),
 }
 
 /// The encoded Parquet body — column chunks + row groups, with the
@@ -556,10 +555,7 @@ pub async fn read_parquet_metadata_lazy(
     // `tail` impl reduces to `size() + range(size - n, n)`,
     // which is exactly what this function used to do
     // explicitly — so no extra work on the warm path.
-    let (tail, total) = source
-        .tail(tail_speculative_bytes)
-        .await
-        .map_err(footer_lazy_err)?;
+    let (tail, total) = source.tail(tail_speculative_bytes).await?;
     if total < PARQUET_MIN_FILE_BYTES as u64 {
         return Err(FooterError::Malformed("not a Parquet file (too short)"));
     }
@@ -586,8 +582,7 @@ pub async fn read_parquet_metadata_lazy(
     } else {
         source
             .range(footer_start_abs as u64, footer_len as u64)
-            .await
-            .map_err(footer_lazy_err)?
+            .await?
     };
     debug_assert_eq!(footer_start_abs + footer_len, footer_end_abs as usize);
 
@@ -619,14 +614,6 @@ pub fn extract_kv_map(metadata: &ParquetMetaData) -> Result<KvMap, FooterError> 
         }
     }
     Ok(out)
-}
-
-/// Translate a `LazyByteSourceError` to a `FooterError` for the
-/// async-tail readers. Storage failures become `Parquet`-shaped
-/// errors via the existing `Malformed` channel — the variant
-/// shape exists for both signal and source-chain preservation.
-fn footer_lazy_err(e: LazyByteSourceError) -> FooterError {
-    FooterError::LazySource(e.to_string())
 }
 
 #[cfg(test)]

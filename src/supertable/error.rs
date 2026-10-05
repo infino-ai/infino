@@ -789,7 +789,38 @@ mod tests {
     use std::io;
 
     use super::*;
-    use crate::supertable::reader_cache::disk::DiskCacheError;
+    use crate::{superfile::LazyByteSourceError, supertable::reader_cache::disk::DiskCacheError};
+
+    /// A range fetch inside the FTS or vector reader keeps its kind through
+    /// the reader's error: refused credentials are found under it, and any
+    /// other range-fetch failure is a read that failed.
+    #[test]
+    fn a_range_fetch_inside_a_reader_is_classified_by_its_kind() {
+        let refused =
+            || LazyByteSourceError::Storage(StorageError::PermissionDenied { uri: "u".into() });
+        let fts = |source| QueryError::from(ReadError::Fts(Box::new(FtsError::LazySource(source))));
+        assert!(matches!(fts(refused()), QueryError::PermissionDenied(_)));
+        assert!(matches!(
+            QueryError::from(VectorError::LazySource(refused())),
+            QueryError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            QueryError::from(VectorError::LazySource(LazyByteSourceError::ShortRead {
+                start: 0,
+                requested: 8,
+                got: 4,
+            })),
+            QueryError::Parquet(_)
+        ));
+        assert!(matches!(
+            fts(LazyByteSourceError::OutOfBounds {
+                start: 9,
+                len: 1,
+                size: 4,
+            }),
+            QueryError::Parquet(_)
+        ));
+    }
 
     /// A superfile read carries its storage error inside an `io::Error`, whose
     /// `source()` skips the error it wraps. Refused credentials must still be

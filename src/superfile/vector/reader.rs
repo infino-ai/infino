@@ -459,14 +459,7 @@ impl VectorReader {
             )));
         }
 
-        let header_bytes = source
-            .range(0, OUTER_HEADER_SIZE as u64)
-            .await
-            .map_err(|e| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
-                    "lazy open: outer header fetch: {e}"
-                )))
-            })?;
+        let header_bytes = source.range(0, OUTER_HEADER_SIZE as u64).await?;
         if &header_bytes[0..MAGIC_BYTES] != format::vec::OUTER_MAGIC {
             return Err(VectorError::Read(ReadError::BadMagic {
                 section: "vector",
@@ -500,12 +493,7 @@ impl VectorReader {
 
         let dir_prefetch = source
             .range(dir_offset as u64, (dir_end - dir_offset) as u64)
-            .await
-            .map_err(|e| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
-                    "lazy open: directory fetch: {e}"
-                )))
-            })?;
+            .await?;
 
         // Validate directory CRC against the prefetched bytes
         // before walking subsection metadata. A directory-CRC
@@ -586,12 +574,7 @@ impl VectorReader {
                 async move {
                     let bytes = source
                         .range(subsection_off as u64, SUB_HEADER_SIZE as u64)
-                        .await
-                        .map_err(|e| {
-                            VectorError::Read(ReadError::MalformedVersion(format!(
-                                "lazy open: subsection {i} sub-header fetch: {e}"
-                            )))
-                        })?;
+                        .await?;
                     Ok::<_, VectorError>((i, subsection_off, bytes))
                 }
             }));
@@ -1508,11 +1491,7 @@ impl VectorReader {
         // CRC-on: one full-blob GET so sync CRC verification can
         // `fetch_sync` contiguous ranges (PrefetchedSource does not stitch).
         if opts.verify_crc {
-            let full = source.range(0, blob_size as u64).await.map_err(|e| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
-                    "lazy multi-cell: full-blob CRC fetch: {e}"
-                )))
-            })?;
+            let full = source.range(0, blob_size as u64).await?;
             let mut overlay = PrefetchedSource::new(Arc::clone(&source));
             overlay.install(0, full);
             return Self::open_multi_cell_with_source(
@@ -1525,12 +1504,7 @@ impl VectorReader {
 
         let dir_prefetch = source
             .range(dir_offset as u64, (dir_end - dir_offset) as u64)
-            .await
-            .map_err(|e| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
-                    "lazy multi-cell: directory fetch: {e}"
-                )))
-            })?;
+            .await?;
         let dir_bytes_slice = &dir_prefetch[0..dir_size];
         let dir_crc_expected = read_u32_le(&dir_prefetch[dir_size..dir_size + format::CRC_BYTES]);
         if dir_crc_expected != crc32c(dir_bytes_slice) {
@@ -1580,14 +1554,7 @@ impl VectorReader {
                     "multi-cell subsection {i} too short ({subsection_len} bytes)"
                 ))));
             }
-            let sub_hdr_bytes = source
-                .range(subsection_off, SUB_HEADER_SIZE as u64)
-                .await
-                .map_err(|e| {
-                    VectorError::Read(ReadError::MalformedVersion(format!(
-                        "lazy multi-cell: sub-header {i}: {e}"
-                    )))
-                })?;
+            let sub_hdr_bytes = source.range(subsection_off, SUB_HEADER_SIZE as u64).await?;
             overlay.install(subsection_off, sub_hdr_bytes.clone());
             let centroids_off = read_u64_le(
                 &sub_hdr_bytes[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES],
@@ -1611,12 +1578,7 @@ impl VectorReader {
             if idx_len > 0 {
                 let idx_bytes = source
                     .range(subsection_off + cluster_idx_off, idx_len)
-                    .await
-                    .map_err(|e| {
-                        VectorError::Read(ReadError::MalformedVersion(format!(
-                            "lazy multi-cell: cluster index {i}: {e}"
-                        )))
-                    })?;
+                    .await?;
                 overlay.install(subsection_off + cluster_idx_off, idx_bytes);
             }
         }
@@ -1931,9 +1893,10 @@ impl VectorReader {
                 continue;
             }
             let cell_id = self.cell_ids.get(ci).copied();
+            // A read of the local spill file, not of the superfile's source.
             let Some(bytes) = section
                 .read_cell_bytes(superfile_id, column, cell_id)
-                .map_err(|e| VectorError::LazySource(e.to_string()))?
+                .map_err(ReadError::Io)?
             else {
                 continue;
             };
@@ -2496,11 +2459,7 @@ impl VectorReader {
             }
             let fetched = try_join_all(requests.into_iter().map(
                 |(cell_idx, range, positions)| async move {
-                    let region = self
-                        .source
-                        .range_async(range)
-                        .await
-                        .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                    let region = self.source.range_async(range).await?;
                     Ok::<_, VectorError>((cell_idx, positions, region))
                 },
             ))
@@ -2534,11 +2493,7 @@ impl VectorReader {
         let Some(range) = col.stable_ids_region_range() else {
             return Ok(None);
         };
-        let region = self
-            .source
-            .range_async(range)
-            .await
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let region = self.source.range_async(range).await?;
         let mut out = Vec::with_capacity(locals.len());
         for &local in locals {
             let p = (local as usize) * format::vec::STABLE_ID_BYTES;
@@ -2810,11 +2765,7 @@ impl VectorReader {
             let Some(range) = col.stable_ids_region_range() else {
                 return Ok(None);
             };
-            let region = self
-                .source
-                .range_async(range)
-                .await
-                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            let region = self.source.range_async(range).await?;
             // Exact-size check: a truncated region would silently yield fewer
             // ids than rows (partial mapping); trailing bytes mean the offsets
             // are wrong. Both are corruption — fail fast.
@@ -3114,10 +3065,7 @@ impl VectorReader {
         let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
         let idx_start = sub_start + col.cluster_idx_off;
         let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-        let centroid_idx_region = self
-            .source
-            .get_range(centroids_start..idx_end)
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let centroid_idx_region = self.source.get_range(centroids_start..idx_end)?;
         let centroids = centroid_idx_region.slice(0..centroids_end - centroids_start);
         let cluster_idx =
             centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
@@ -3189,10 +3137,7 @@ impl VectorReader {
         let (cluster_blocks, lazy_sq8_meta_bytes) = if let Some(prefix_blocks) = prefix_blocks_sync
         {
             let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
-                let mut fetched = self
-                    .source
-                    .get_ranges_parallel(&[range])
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let mut fetched = self.source.get_ranges_parallel(&[range])?;
                 fetched.pop()
             } else {
                 None
@@ -3207,8 +3152,7 @@ impl VectorReader {
                 &self.source,
                 &cluster_prefix_ranges,
                 &extras,
-            )
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            )?;
             (blocks, extra_bytes.pop())
         };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
@@ -3252,10 +3196,7 @@ impl VectorReader {
         // wave; warm ranges resolve sync/zero-copy, so this is a cheap
         // sort.
         let survivor_full_rows = match survivor_full_ranges {
-            Some(ranges) => Some(
-                get_survivor_ranges_coalesced(&self.source, &ranges)
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?,
-            ),
+            Some(ranges) => Some(get_survivor_ranges_coalesced(&self.source, &ranges)?),
             None => None,
         };
 
@@ -3322,11 +3263,7 @@ impl VectorReader {
         let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
         let idx_start = sub_start + col.cluster_idx_off;
         let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-        let centroid_idx_region = self
-            .source
-            .range_async(centroids_start..idx_end)
-            .await
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let centroid_idx_region = self.source.range_async(centroids_start..idx_end).await?;
         let centroids = centroid_idx_region.slice(0..centroids_end - centroids_start);
         let cluster_idx =
             centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
@@ -3420,11 +3357,7 @@ impl VectorReader {
         let sub_start = col.subsection_range.start;
         let idx_start = sub_start + col.cluster_idx_off;
         let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-        let cluster_idx = self
-            .source
-            .range_async(idx_start..idx_end)
-            .await
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let cluster_idx = self.source.range_async(idx_start..idx_end).await?;
         let (q_rot, rot_ns) = timed_section(|| {
             let mut q_rot = vec![0f32; col.dim];
             col.rot.apply(query, &mut q_rot);
@@ -3600,11 +3533,7 @@ impl VectorReader {
                 let sub_start = col.subsection_range.start;
                 let idx_start = sub_start + col.cluster_idx_off;
                 let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-                let cluster_idx = self
-                    .source
-                    .range_async(idx_start..idx_end)
-                    .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let cluster_idx = self.source.range_async(idx_start..idx_end).await?;
                 let ctx = ProbeCtx {
                     q_rot: q_rot_shared,
                     k,
@@ -3843,11 +3772,7 @@ impl VectorReader {
                 let sub_start = col.subsection_range.start;
                 let idx_start = sub_start + col.cluster_idx_off;
                 let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-                let cluster_idx = self
-                    .source
-                    .range_async(idx_start..idx_end)
-                    .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let cluster_idx = self.source.range_async(idx_start..idx_end).await?;
                 let cb = col.quant.code_bytes();
                 // Per-cell metadata assembly: a pass over this cell's chosen
                 // clusters, on the worker that probes it. Scales with probe
@@ -4035,11 +3960,7 @@ impl VectorReader {
                 let sub_start = col.subsection_range.start;
                 let idx_start = sub_start + col.cluster_idx_off;
                 let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-                let cluster_idx = self
-                    .source
-                    .range_async(idx_start..idx_end)
-                    .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let cluster_idx = self.source.range_async(idx_start..idx_end).await?;
                 // Distinct probed clusters -> (off, cnt), for survivor
                 // row addressing.
                 let mut extent_by_cid: HashMap<u32, (u32, u32)> = HashMap::new();
@@ -4076,11 +3997,7 @@ impl VectorReader {
                     });
                 }
                 let meta_bytes = if let Some(range) = lazy_sq8_meta_range(col) {
-                    let mut fetched = self
-                        .source
-                        .get_ranges_parallel_async(&[range])
-                        .await
-                        .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                    let mut fetched = self.source.get_ranges_parallel_async(&[range]).await?;
                     fetched.pop()
                 } else {
                     None
@@ -4152,9 +4069,7 @@ impl VectorReader {
                         });
                         (rows?, ns)
                     }
-                    None => get_survivor_ranges_coalesced_async(&self.source, &ranges)
-                        .await
-                        .map_err(|e| VectorError::LazySource(e.to_string()))?,
+                    None => get_survivor_ranges_coalesced_async(&self.source, &ranges).await?,
                 };
 
                 if let Some(t0) = survivor_t0 {
@@ -4272,11 +4187,7 @@ impl VectorReader {
                 // below (no round-trip), so there is nothing to coalesce and
                 // we avoid touching the unneeded rerank bytes.
                 let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
-                    let mut fetched = self
-                        .source
-                        .get_ranges_parallel_async(&[range])
-                        .await
-                        .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                    let mut fetched = self.source.get_ranges_parallel_async(&[range]).await?;
                     fetched.pop()
                 } else {
                     None
@@ -4328,8 +4239,7 @@ impl VectorReader {
                     &cluster_full_ranges,
                     &extras,
                 )
-                .await
-                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                .await?;
                 let meta = meta_slot.map(|i| extra_bytes[i].clone());
                 if let Some(bytes) = region_slot.map(|i| extra_bytes[i].clone())
                     && let Ok(mut slot) = self.cold_stable_id_region.lock()
@@ -4388,9 +4298,8 @@ impl VectorReader {
         let survivor_t0 = io_counters::phase_start();
         let survivor_full_rows = match survivor_full_ranges {
             Some(ranges) => {
-                let (rows, gather_ns) = get_survivor_ranges_coalesced_async(&self.source, &ranges)
-                    .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let (rows, gather_ns) =
+                    get_survivor_ranges_coalesced_async(&self.source, &ranges).await?;
                 tally.kernel_cpu_ns += gather_ns;
                 Some(rows)
             }
@@ -4449,10 +4358,7 @@ impl VectorReader {
         let sub_start = col.subsection_range.start;
         let idx_start = sub_start + col.cluster_idx_off;
         let idx_end = idx_start + (col.n_cent as usize) * 8;
-        let cluster_idx = self
-            .source
-            .get_range(idx_start..idx_end)
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let cluster_idx = self.source.get_range(idx_start..idx_end)?;
 
         let cb = col.quant.code_bytes();
         let per_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
@@ -4475,10 +4381,7 @@ impl VectorReader {
         }
 
         // Fetch all cluster blocks
-        let cluster_blocks = self
-            .source
-            .get_ranges_parallel(&cluster_ranges)
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let cluster_blocks = self.source.get_ranges_parallel(&cluster_ranges)?;
 
         // Allocate output vector with doc_id -> vector mapping
         let mut result: Vec<Option<Vec<f32>>> = vec![None; col.n_docs as usize];
@@ -5657,7 +5560,6 @@ fn fetch_lazy_cluster_meta(
     ),
     VectorError,
 > {
-    let map_lazy = |e: LazyByteSourceError| VectorError::LazySource(e.to_string());
     let mut clusters: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
     clusters.sort_unstable();
     clusters.dedup();
@@ -5671,7 +5573,7 @@ fn fetch_lazy_cluster_meta(
         ranges.push(scale_start..scale_start + cluster_meta_len);
         ranges.push(offset_start..offset_start + cluster_meta_len);
     }
-    let bytes = source.get_ranges_parallel(&ranges).map_err(map_lazy)?;
+    let bytes = source.get_ranges_parallel(&ranges)?;
     let mut scale_offset_by_cluster: HashMap<u32, (Vec<f32>, Vec<f32>)> =
         HashMap::with_capacity(clusters.len());
     for (idx, &cluster_id) in clusters.iter().enumerate() {
@@ -5704,7 +5606,7 @@ fn fetch_lazy_cluster_meta(
                 start..start + (hi - lo + 1) as usize * 4
             })
             .collect();
-        let norm_bytes = source.get_ranges_parallel(&norm_ranges).map_err(map_lazy)?;
+        let norm_bytes = source.get_ranges_parallel(&norm_ranges)?;
         let mut out = HashMap::new();
         for ((_, lo, hi), bytes) in span_items.into_iter().zip(norm_bytes) {
             let vals = parse_f32_le_vec(&bytes);
@@ -5731,7 +5633,6 @@ async fn rerank_candidates_from_blocks(
     k: usize,
 ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
     let stride = col.rerank_codec.per_vector_bytes(col.dim);
-    let map_lazy = |e: LazyByteSourceError| VectorError::LazySource(e.to_string());
     // Bracketed on-CPU ns of the scoring sections below (fetches excluded).
     let mut kernel_ns = 0u64;
     let reranked: Vec<(u32, f32)> = match col.rerank_codec {
@@ -5811,9 +5712,8 @@ async fn rerank_candidates_from_blocks(
                         NormLookup::Raw(meta_bytes.clone())
                     } else if let Some(norms_abs_off) = norms_abs_off {
                         let range = *norms_abs_off..*norms_abs_off + col.n_docs as usize * 4;
-                        let mut fetched = source
-                            .get_ranges_parallel(std::slice::from_ref(&range))
-                            .map_err(map_lazy)?;
+                        let mut fetched =
+                            source.get_ranges_parallel(std::slice::from_ref(&range))?;
                         NormLookup::Raw(fetched.swap_remove(0))
                     } else {
                         NormLookup::Absent
@@ -11858,9 +11758,9 @@ mod tests {
         );
     }
 
-    /// A failure on the outer-header fetch during `open_lazy` maps to a
-    /// `MalformedVersion` read error (the open path stringifies the
-    /// lazy error into its own structural-decode error).
+    /// A failure on the outer-header fetch during `open_lazy` aborts open
+    /// with the fetch's own error, kept typed: a failed read, not a
+    /// malformed file.
     #[tokio::test]
     async fn open_lazy_header_fetch_failure_errors() {
         let (blob, json, _) = build_search_corpus();
@@ -11874,14 +11774,14 @@ mod tests {
         .await
         .expect_err("header fetch failure must abort open_lazy");
         assert!(
-            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
-            "expected MalformedVersion, got {err:?}"
+            matches!(err, VectorError::LazySource(_)),
+            "expected the fetch's own error, got {err:?}"
         );
     }
 
     /// A failure on the directory fetch (the second `range()` wave)
-    /// during `open_lazy` also aborts open with a `MalformedVersion`
-    /// read error, exercising the directory-fetch error arm.
+    /// during `open_lazy` also aborts open with the fetch's own error,
+    /// exercising the directory-fetch error arm.
     #[tokio::test]
     async fn open_lazy_directory_fetch_failure_errors() {
         let (blob, json, _) = build_search_corpus();
@@ -11895,14 +11795,14 @@ mod tests {
         .await
         .expect_err("directory fetch failure must abort open_lazy");
         assert!(
-            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
-            "expected MalformedVersion, got {err:?}"
+            matches!(err, VectorError::LazySource(_)),
+            "expected the fetch's own error, got {err:?}"
         );
     }
 
     /// A failure on the subsection-header fetch wave (third `range()`
-    /// onward) during `open_lazy` aborts open with a `MalformedVersion`
-    /// read error, exercising the subheader-fetch error arm.
+    /// onward) during `open_lazy` aborts open with the fetch's own error,
+    /// exercising the subheader-fetch error arm.
     #[tokio::test]
     async fn open_lazy_subheader_fetch_failure_errors() {
         let (blob, json, _) = build_search_corpus();
@@ -11916,8 +11816,8 @@ mod tests {
         .await
         .expect_err("subheader fetch failure must abort open_lazy");
         assert!(
-            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
-            "expected MalformedVersion, got {err:?}"
+            matches!(err, VectorError::LazySource(_)),
+            "expected the fetch's own error, got {err:?}"
         );
     }
 

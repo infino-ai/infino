@@ -596,7 +596,7 @@ impl FtsReader {
         // query's reads form -- the same bytes then arrive as two
         // requests instead of one.
         let header_fetch = format::fts::HEADER_SIZE_V2.min(fts_blob_len);
-        let header = fetch_lazy_range(source.as_ref(), 0..header_fetch, "fts header").await?;
+        let header = fetch_lazy_range(source.as_ref(), 0..header_fetch).await?;
         if header.len() < FTS_HEADER_SIZE {
             return Err(FtsError::Read(ReadError::MissingKv("fts header")));
         }
@@ -644,12 +644,8 @@ impl FtsReader {
         let dir_end = doc_lengths_table_offset
             .saturating_add(dir_len)
             .min(fts_blob_len);
-        let directory = fetch_lazy_range(
-            source.as_ref(),
-            doc_lengths_table_offset..dir_end,
-            "fts/doc_lengths_dir",
-        )
-        .await?;
+        let directory =
+            fetch_lazy_range(source.as_ref(), doc_lengths_table_offset..dir_end).await?;
         let mut overlay = PrefetchedSource::new(Arc::clone(&source));
         overlay.install(0, header);
         overlay.install(doc_lengths_table_offset as u64, directory);
@@ -670,7 +666,7 @@ impl FtsReader {
         if source_len < FTS_HEADER_SIZE {
             return Err(FtsError::Read(ReadError::MissingKv("fts header")));
         }
-        let header = fetch_source_range(&source, 0..FTS_HEADER_SIZE, "fts header")?;
+        let header = source.get_range(0..FTS_HEADER_SIZE)?;
 
         // Magic check.
         if &header[0..MAGIC_BYTES] != format::fts::MAGIC {
@@ -737,11 +733,7 @@ impl FtsReader {
         // the lazy path it resolves from the prefetch overlay.
         let positions_offset: Option<usize> = match positional_blob {
             true => {
-                let ext = fetch_source_range(
-                    &source,
-                    FTS_HEADER_SIZE..format::fts::HEADER_SIZE_V2,
-                    "fts header ext",
-                )?;
+                let ext = source.get_range(FTS_HEADER_SIZE..format::fts::HEADER_SIZE_V2)?;
                 Some(read_u64_le(&ext[0..U64_BYTES]) as usize)
             }
             false => None,
@@ -805,13 +797,10 @@ impl FtsReader {
 
         // Verify FST CRC32C (4 bytes after fst body).
         if opts.verify_crc {
-            let fst_crc_bytes = fetch_source_range(
-                &source,
-                postings_offset.saturating_sub(4)..postings_offset,
-                "fts/dict crc",
-            )?;
+            let fst_crc_bytes =
+                source.get_range(postings_offset.saturating_sub(4)..postings_offset)?;
             let fst_crc_expected = read_u32_le(&fst_crc_bytes);
-            let fst_bytes = fetch_source_range(&source, fst_range.clone(), "fts/dict")?;
+            let fst_bytes = source.get_range(fst_range.clone())?;
             let fst_crc_actual = crc32c(&fst_bytes);
             if fst_crc_expected != fst_crc_actual {
                 return Err(FtsError::Read(ReadError::ChecksumMismatch {
@@ -824,11 +813,9 @@ impl FtsReader {
         // Verify postings region CRC32C.
         if opts.verify_crc {
             let postings_crc_pos = postings_end.saturating_sub(4);
-            let postings_crc_bytes =
-                fetch_source_range(&source, postings_crc_pos..postings_end, "fts/postings crc")?;
+            let postings_crc_bytes = source.get_range(postings_crc_pos..postings_end)?;
             let postings_crc_expected = read_u32_le(&postings_crc_bytes);
-            let postings_bytes =
-                fetch_source_range(&source, postings_range.clone(), "fts/postings")?;
+            let postings_bytes = source.get_range(postings_range.clone())?;
             let postings_crc_actual = crc32c(&postings_bytes);
             if postings_crc_expected != postings_crc_actual {
                 return Err(FtsError::Read(ReadError::ChecksumMismatch {
@@ -846,9 +833,9 @@ impl FtsReader {
             // doc-lengths directory only on a blob with no doc-id map;
             // with one, the map sits between them.
             let crc_pos = regions_end.saturating_sub(4);
-            let crc_bytes = fetch_source_range(&source, crc_pos..regions_end, "fts/positions crc")?;
+            let crc_bytes = source.get_range(crc_pos..regions_end)?;
             let crc_expected = read_u32_le(&crc_bytes);
-            let pos_bytes = fetch_source_range(&source, pos_range.clone(), "fts/positions")?;
+            let pos_bytes = source.get_range(pos_range.clone())?;
             let crc_actual = crc32c(&pos_bytes);
             if crc_expected != crc_actual {
                 return Err(FtsError::Read(ReadError::ChecksumMismatch {
@@ -878,7 +865,7 @@ impl FtsReader {
         // array fetched below — falls inside the
         // `[doc_lengths_table_offset..fts_blob_len]` tail that
         // `open_lazy` already fetched in one GET and installed in the
-        // overlay, so these `fetch_source_range` calls resolve from the
+        // overlay, so these `get_range` calls resolve from the
         // overlay with **no** per-column GETs. On the eager path the
         // whole subsection is in memory, so they are zero-copy slices.
         let dir_size = n_columns * DOC_LENGTHS_ENTRY_SIZE;
@@ -888,11 +875,7 @@ impl FtsReader {
                 "doc-lengths directory runs past blob end".into(),
             )));
         }
-        let dir_region = fetch_source_range(
-            &source,
-            doc_lengths_table_offset..dir_end + 4,
-            "fts/doc_lengths_dir",
-        )?;
+        let dir_region = source.get_range(doc_lengths_table_offset..dir_end + 4)?;
         let dir_bytes = &dir_region[..dir_size];
         if opts.verify_crc {
             let dir_crc_expected = read_u32_le(&dir_region[dir_size..dir_size + 4]);
@@ -989,11 +972,7 @@ impl FtsReader {
                 view_norms: Arc::new(OnceLock::new()),
             };
             if opts.verify_crc {
-                let array = fetch_source_range(
-                    &source,
-                    doc_lengths_offset..array_end + 4,
-                    "fts/doc_lengths_array",
-                )?;
+                let array = source.get_range(doc_lengths_offset..array_end + 4)?;
                 column.check_array_crc(&array)?;
             }
             columns.push(column);
@@ -1016,13 +995,9 @@ impl FtsReader {
                          below the doc-lengths directory at {doc_lengths_table_offset}"
                     ))));
                 }
-                let body = fetch_source_range(&source, mo..body_end, "fts/doc-map")?;
+                let body = source.get_range(mo..body_end)?;
                 if opts.verify_crc {
-                    let crc_bytes = fetch_source_range(
-                        &source,
-                        body_end..body_end + format::CRC_BYTES,
-                        "fts/doc-map crc",
-                    )?;
+                    let crc_bytes = source.get_range(body_end..body_end + format::CRC_BYTES)?;
                     if read_u32_le(&crc_bytes) != crc32c(&body) {
                         return Err(FtsError::Read(ReadError::ChecksumMismatch {
                             section: "fts/doc-map",
@@ -1130,7 +1105,9 @@ impl FtsReader {
     }
 
     pub(crate) fn dict_bytes(&self) -> Result<Bytes, FtsError> {
-        fetch_source_range(&self.source, self.fst_range.clone(), "fts/dict")
+        self.source
+            .get_range(self.fst_range.clone())
+            .map_err(FtsError::LazySource)
     }
 
     /// Most postings the term at `value` holds: exact for a long term,
@@ -1144,8 +1121,7 @@ impl FtsReader {
             } => {
                 let start =
                     self.postings_range.start + metadata_offset as usize + term_meta::DF_OFF;
-                let df =
-                    fetch_source_range(&self.source, start..start + U32_BYTES, "fts/merge df")?;
+                let df = self.source.get_range(start..start + U32_BYTES)?;
                 Ok(read_u32_le(&df))
             }
         }
@@ -1185,15 +1161,7 @@ impl FtsReader {
         // range is the open path's, bounded against the blob there; a source
         // that answers short errors (`ShortRead`) rather than handing up a
         // truncated buffer, so the slice below is within what came back.
-        let array = self
-            .source
-            .range_async(col.array_with_crc_range())
-            .await
-            .map_err(|e| {
-                FtsError::Read(ReadError::MalformedVersion(format!(
-                    "fts/doc_lengths_array range fetch failed: {e}"
-                )))
-            })?;
+        let array = self.source.range_async(col.array_with_crc_range()).await?;
         col.check_array_crc(&array)?;
         let norms = col.norms_from_array(&array[..col.array_len()]);
         // A concurrent prewarm may have won; either set is the same table.
@@ -1209,11 +1177,7 @@ impl FtsReader {
         self.source
             .range_async(self.fst_range.clone())
             .await
-            .map_err(|e| {
-                FtsError::Read(ReadError::MalformedVersion(format!(
-                    "fts/dict range fetch failed: {e}"
-                )))
-            })
+            .map_err(FtsError::LazySource)
     }
 
     /// Fetch the complete byte range of each requested term — metadata
@@ -1305,12 +1269,7 @@ impl FtsReader {
         let fetched = self
             .source
             .get_ranges_parallel_async(plan.fetch_ranges())
-            .await
-            .map_err(|e| {
-                FtsError::Read(ReadError::MalformedVersion(format!(
-                    "fts/postings term body range fetch failed: {e}"
-                )))
-            })?;
+            .await?;
         Ok(plan.restore(&fetched))
     }
 
@@ -1346,11 +1305,7 @@ impl FtsReader {
         self.source
             .get_ranges_parallel_async(&ranges)
             .await
-            .map_err(|e| {
-                FtsError::Read(ReadError::MalformedVersion(format!(
-                    "fts/positions term range fetch failed: {e}"
-                )))
-            })
+            .map_err(FtsError::LazySource)
     }
 
     /// Build one [`AnyCursor`] per requested atom, preserving input
@@ -1636,19 +1591,11 @@ impl FtsReader {
                     let postings_length = match postings_length_hint {
                         Some(len) => len as usize,
                         None => {
-                            let header = fetch_source_range(
-                                &self.source,
-                                start..start + TERM_META_SIZE,
-                                "fts/merge header",
-                            )?;
+                            let header = self.source.get_range(start..start + TERM_META_SIZE)?;
                             header_postings_length(header.as_ref())?
                         }
                     };
-                    let term_bytes = fetch_source_range(
-                        &self.source,
-                        start..start + postings_length,
-                        "fts/merge postings",
-                    )?;
+                    let term_bytes = self.source.get_range(start..start + postings_length)?;
 
                     if short {
                         // Short-form term: the whole list is the body; its
@@ -1714,11 +1661,7 @@ impl FtsReader {
                         })?;
                         let pstart = region.start + meta.positions_offset as usize;
                         let pend = pstart + meta.positions_length as usize;
-                        Some(fetch_source_range(
-                            &self.source,
-                            pstart..pend,
-                            "fts/merge positions",
-                        )?)
+                        Some(self.source.get_range(pstart..pend)?)
                     } else {
                         None
                     };
@@ -1795,7 +1738,7 @@ impl FtsReader {
     pub(crate) fn read_doc_lengths(&self, column_id: u32) -> Result<Vec<u32>, FtsError> {
         let n = self.n_docs as usize;
         let range = self.columns[column_id as usize].doc_lengths_range.clone();
-        let bytes = fetch_source_range(&self.source, range, "fts/merge doc_lengths")?;
+        let bytes = self.source.get_range(range)?;
         let region = bytes.as_ref();
         let width = self.doc_length_bytes;
         if region.len() < n * width {
@@ -1923,31 +1866,14 @@ pub(super) fn top_k(scores: FxHashMap<RowId, f32>, k: usize) -> Vec<(RowId, f32)
     drain_top_k_desc(heap)
 }
 
-pub(super) fn fetch_source_range(
-    source: &Source,
-    range: Range<usize>,
-    what: &str,
-) -> Result<Bytes, FtsError> {
-    source.get_range(range).map_err(|e| {
-        FtsError::Read(ReadError::MalformedVersion(format!(
-            "{what} lazy source range fetch failed: {e}"
-        )))
-    })
-}
-
 async fn fetch_lazy_range(
     source: &dyn LazyByteSource,
     range: Range<usize>,
-    what: &str,
 ) -> Result<Bytes, FtsError> {
     source
         .range(range.start as u64, range.len() as u64)
         .await
-        .map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "{what} lazy source range fetch failed: {e}"
-            )))
-        })
+        .map_err(FtsError::LazySource)
 }
 
 #[inline]
