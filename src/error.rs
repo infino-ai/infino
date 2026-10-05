@@ -23,7 +23,6 @@
 
 use std::{error::Error, io};
 
-use arrow_schema::ArrowError;
 use datafusion::error::DataFusionError;
 use object_store::Error as ObjectStoreError;
 
@@ -39,17 +38,6 @@ use crate::{
         mutations::{CommitError as MutationCommitError, MutationError},
     },
 };
-
-/// The text DataFusion's parquet row filter wraps a pushed-down predicate's
-/// failure in: `Error evaluating filter predicate: {e:?}`, the predicate's
-/// own `DataFusionError` in `Debug` form inside an `ArrowError::ComputeError`.
-/// The type does not survive that hop, so this text is the one way to tell a
-/// predicate that failed on the caller's data from a scan that failed.
-const PUSHED_DOWN_PREDICATE_FAILED: &str = "Error evaluating filter predicate: ";
-
-/// How the wrapped error starts when an arrow kernel (a cast, a divide)
-/// rejected the caller's values, in that `Debug` form.
-const FAILED_ON_THE_DATA: &str = "ArrowError(";
 
 /// Coarse, stable error type returned by every public infino method.
 ///
@@ -276,9 +264,6 @@ fn classify_datafusion_error(e: &DataFusionError, planning: bool) -> InfinoError
             | DataFusionError::Configuration(_)
             | DataFusionError::ArrowError(..)
             | DataFusionError::External(_) => InfinoError::Query,
-            DataFusionError::ParquetError(_) if pushed_down_predicate_failed_on_the_data(e) => {
-                InfinoError::Query
-            }
             DataFusionError::Execution(_) if planning => InfinoError::Query,
             _ => InfinoError::Backend,
         }
@@ -298,21 +283,6 @@ fn is_failed_read(link: &(dyn Error + 'static)) -> bool {
         );
     }
     link.is::<StorageError>() || link.is::<io::Error>()
-}
-
-/// True when a parquet scan failed because a predicate pushed into it
-/// rejected the caller's values, not because the read or the engine failed.
-/// See [`PUSHED_DOWN_PREDICATE_FAILED`].
-fn pushed_down_predicate_failed_on_the_data(e: &DataFusionError) -> bool {
-    error_chain(e).any(|link| {
-        matches!(
-            link.downcast_ref::<ArrowError>(),
-            Some(ArrowError::ComputeError(message))
-                if message
-                    .strip_prefix(PUSHED_DOWN_PREDICATE_FAILED)
-                    .is_some_and(|inner| inner.starts_with(FAILED_ON_THE_DATA))
-        )
-    })
 }
 
 impl From<ManifestLoadError> for InfinoError {
@@ -526,6 +496,7 @@ impl From<MutationCommitError> for InfinoError {
 
 #[cfg(test)]
 mod tests {
+    use arrow_schema::ArrowError;
     use parquet::errors::ParquetError;
     use uuid::Uuid;
 
@@ -980,26 +951,10 @@ mod tests {
         ));
     }
 
-    /// A predicate DataFusion pushed into the parquet scan comes back as text.
-    /// One that failed on the caller's values is theirs; any other is ours.
+    /// A parquet failure is a corrupt or unread file: the engine's, not the
+    /// caller's. Predicates never run inside the scan, so none can fail there.
     #[test]
-    fn a_pushed_down_predicate_that_failed_on_the_data_is_the_callers() {
-        let pushed_down = |inner: &str| {
-            DataFusionError::ParquetError(Box::new(ParquetError::External(Box::new(
-                ArrowError::ComputeError(format!("{PUSHED_DOWN_PREDICATE_FAILED}{inner}")),
-            ))))
-        };
-        assert!(matches!(
-            datafusion_error(&pushed_down(
-                r#"ArrowError(CastError("Cannot cast string 'alpha'"), None)"#
-            )),
-            InfinoError::Query(_)
-        ));
-        assert!(matches!(
-            datafusion_error(&pushed_down(r#"Execution("Partition 3 not found")"#)),
-            InfinoError::Backend(_)
-        ));
-        // A parquet failure that is not a predicate is a corrupt or unread file.
+    fn a_parquet_failure_is_the_engines() {
         assert!(matches!(
             datafusion_error(&DataFusionError::ParquetError(Box::new(
                 ParquetError::General("bad footer".into())
