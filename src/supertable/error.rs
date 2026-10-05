@@ -35,6 +35,13 @@ pub enum BuildError {
     #[error("no documents to build")]
     NoDocsToBuild,
 
+    #[error(
+        "hydrate requires a SQL-only table with no index; this table declares \
+         {fts} full-text and {vector} vector column(s). Use `append` for an \
+         indexed table."
+    )]
+    HydrateRequiresNoIndex { fts: usize, vector: usize },
+
     #[error("schema is missing the declared id_column {0:?}")]
     MissingIdColumn(String),
 

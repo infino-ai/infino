@@ -47,16 +47,24 @@ use crate::{
 };
 
 /// Bulk-load `user_batches` (schema == the table's user schema, i.e. WITHOUT
-/// the `_id` column) into `handle` as a small, bounded number of superfiles,
-/// committed in one bulk commit. Returns the total number of rows committed.
+/// the `_id` column) into `handle` as a small, bounded number of no-blob
+/// superfiles. Returns the total number of rows committed.
 ///
 /// Input batches are coalesced into `~target_rows`-row chunks; each chunk
 /// becomes exactly one superfile. The `_id` column is minted per row from the
 /// handle's id generator and prepended, matching the append path, so the rows
 /// are indistinguishable from appended ones once committed.
 ///
-/// No optimize or GC pass runs: the coalescing is done up front, so there is
-/// nothing left to merge afterward.
+/// SQL-only: the table must declare no full-text and no vector columns. Hydrate
+/// writes empty index blobs, so a hydrated table is not searchable by BM25 or
+/// vector; calling it on an indexed table would silently commit unsearchable
+/// rows, so it is rejected up front with [`BuildError::HydrateRequiresNoIndex`].
+///
+/// No optimize or GC pass runs. **Not atomic:** the superfiles are committed per
+/// wave (to keep memory bounded), so a mid-load failure leaves the already-
+/// committed waves in the table. A hydrate is meant for a fresh table; recover a
+/// failed one by dropping the table and re-hydrating, not by re-calling hydrate
+/// on the partially-loaded table (that would re-mint ids and duplicate rows).
 pub(crate) fn hydrate_from_batches(
     handle: &Supertable,
     user_batches: impl IntoIterator<Item = RecordBatch>,
@@ -64,6 +72,15 @@ pub(crate) fn hydrate_from_batches(
 ) -> Result<usize, BuildError> {
     let inner = handle.inner();
     let scalar_schema = inner.options.scalar_schema();
+
+    // SQL-only precondition. An indexed table hydrated here would get empty FTS
+    // and vector blobs and its rows would be invisible to BM25 and vector search
+    // with no error, so reject it rather than silently drop the index.
+    let fts = inner.options.fts_columns.len();
+    let vector = inner.options.vector_columns.len();
+    if fts != 0 || vector != 0 {
+        return Err(BuildError::HydrateRequiresNoIndex { fts, vector });
+    }
 
     // No-blob builder options: same scalar schema, id column, compression,
     // row-group size and id-page limit as a normal build (inherited via
@@ -108,29 +125,41 @@ pub(crate) fn hydrate_from_batches(
         max_bytes: chunk_byte_cap,
     };
 
-    // Build and commit in bounded waves. Each wave builds `wave_width` superfiles
-    // in parallel, commits them, and frees their bytes before the next wave starts.
-    // Committing per wave (rather than once at the end) keeps only one wave's
-    // superfiles resident; holding the whole table was the original OOM. A fresh
-    // load has no concurrent readers, so partial visibility between waves is fine.
-    // Each commit reuses the append path's prepare + persist primitives, so the
-    // manifest entries are built exactly as a normal commit's.
+    // Build and commit in bounded waves. Each wave builds its chunks in parallel,
+    // commits them, and frees their bytes before the next wave starts. Committing
+    // per wave (rather than once at the end) keeps only one wave's superfiles
+    // resident; holding the whole table was the original OOM. A fresh load has no
+    // concurrent readers, so partial visibility between waves is fine. Each commit
+    // reuses the append path's prepare + persist primitives, so the manifest
+    // entries are built exactly as a normal commit's.
+    //
+    // A wave grows chunk by chunk until its summed per-slot footprint would exceed
+    // the budget, or it reaches one chunk per core. Accumulating by measured bytes
+    // (not a count derived from the first chunk) keeps the wave inside the budget
+    // even when later chunks are larger than the first. `chunks` can't peek, so a
+    // chunk that doesn't fit the current wave is held in `carry` and starts the
+    // next one. The first chunk always joins its wave, even if it alone exceeds the
+    // budget (there is nothing smaller to build), so progress is guaranteed.
+    let slot_bytes =
+        |chunk: &[RecordBatch]| (chunk_arrow_bytes(chunk) * SLOT_NUMER / SLOT_DENOM).max(1);
     let mut total_rows: u64 = 0;
     let mut n_superfiles: usize = 0;
-    while let Some(first) = chunks.next() {
-        // Size this wave from the first chunk's real Arrow footprint against the
-        // budget (`None` budget => one chunk at a time).
-        let per_slot = (chunk_arrow_bytes(&first) * SLOT_NUMER / SLOT_DENOM).max(1);
-        let wave_width = build_budget
-            .map(|b| (b / per_slot).clamp(1, cores) as usize)
-            .unwrap_or(1);
-
-        let mut wave: Vec<Vec<RecordBatch>> = Vec::with_capacity(wave_width);
-        wave.push(first);
-        while wave.len() < wave_width {
-            match chunks.next() {
-                Some(c) => wave.push(c),
-                None => break,
+    let mut carry: Option<Vec<RecordBatch>> = None;
+    while let Some(first) = carry.take().or_else(|| chunks.next()) {
+        let mut wave_bytes = slot_bytes(&first);
+        let mut wave: Vec<Vec<RecordBatch>> = vec![first];
+        // Grow the wave only when the budget is known; `None` (can't measure
+        // memory) stays at one chunk at a time.
+        if let Some(budget) = build_budget {
+            while (wave.len() as u64) < cores {
+                let Some(next) = chunks.next() else { break };
+                let next_bytes = slot_bytes(&next);
+                if wave_bytes + next_bytes > budget {
+                    carry = Some(next);
+                    break;
+                }
+                wave_bytes += next_bytes;
+                wave.push(next);
             }
         }
 
@@ -513,6 +542,34 @@ mod tests {
         let none =
             hydrate_from_batches(&hydrated, empty, HYDRATE_TARGET_ROWS).expect("hydrate empty");
         assert_eq!(none, 0, "empty input commits nothing");
+    }
+
+    /// Hydrate on an indexed table is rejected, not silently run with the index
+    /// dropped: a table with an FTS (or vector) column would otherwise commit rows
+    /// that BM25/vector search can never find.
+    #[test]
+    fn hydrate_rejects_indexed_table() {
+        use crate::supertable::error::BuildError;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("body", DataType::LargeUtf8, false),
+        ]));
+        let dir = TempDir::new().expect("tempdir");
+        let db = connect(dir.path().join("db").to_str().expect("utf-8 path")).expect("connect");
+        db.create_table("docs", Arc::clone(&schema), IndexSpec::new().fts("body"))
+            .expect("create_table");
+        let table = db.open_table_handle("docs").expect("core handle");
+
+        let err = hydrate_from_batches(&table, Vec::<RecordBatch>::new(), 1_000)
+            .expect_err("hydrate on an FTS table must error");
+        assert!(
+            matches!(
+                err,
+                BuildError::HydrateRequiresNoIndex { fts: 1, vector: 0 }
+            ),
+            "expected HydrateRequiresNoIndex, got {err:?}"
+        );
     }
 
     /// Nulls must round-trip through the id-prepend, the build, the scalar-stats
