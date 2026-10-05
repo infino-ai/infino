@@ -156,8 +156,6 @@ impl<'a> Column<'a> {
     }
 }
 
-/// Map `rows` to one batch under `schema`'s rules. Every row is a JSON
-/// object; see the module docs for how paths are typed.
 /// The live column a flattened `path` nests under, if any: `a.b.c` checks
 /// `a` and `a.b`. Documents flatten, so such a path cannot fill the column
 /// it nests under.
@@ -174,6 +172,8 @@ fn live_prefix_of(path: &str, schema: &TableSchema) -> Option<String> {
     None
 }
 
+/// Map `rows` to one batch under `schema`'s rules. Every row is a JSON
+/// object; see the module docs for how paths are typed.
 pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch, SchemaError> {
     let mut columns: Vec<Column<'_>> = Vec::new();
     let mut by_path: HashMap<String, usize> = HashMap::new();

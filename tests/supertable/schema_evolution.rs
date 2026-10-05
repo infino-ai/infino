@@ -15,8 +15,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
-    CompactionSettings, Connection, FieldId, FieldPatch, IndexSpec, InfinoError, OptimizeOptions,
-    SchemaError, SchemaPatch, TableSchema, connect,
+    Bm25Params, ColumnIndex, CompactionSettings, Connection, FieldId, FieldPatch, IndexSpec,
+    InfinoError, OptimizeOptions, SchemaError, SchemaPatch, Stemmer, Stopwords, TableSchema,
+    connect, serde_json,
 };
 use tempfile::TempDir;
 
@@ -701,4 +702,253 @@ fn compaction_merges_the_generations_growth_leaves_behind() {
         .bm25_search("title", "b", 10, Default::default(), None)
         .expect("search");
     assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+}
+
+/// The whole life of a schema-optional table, in the order a caller meets
+/// it: a table with no columns at all, grown by the documents it is given,
+/// then changed deliberately through schema writes, with every refusal
+/// along the way checked for the reason it gives rather than merely for
+/// failing.
+#[test]
+fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
+    let db = connect("memory://").expect("connect");
+
+    // ---- 1. A table with no columns -------------------------------------
+    // The schema write creates an absent table, so a caller with nothing to
+    // declare declares nothing.
+    let empty = db
+        .apply_schema(TABLE, &SchemaPatch::new(vec![]), None)
+        .expect("a table may start with no columns");
+    assert!(names(&empty).is_empty(), "no columns yet");
+    assert_eq!(empty.schema_id(), 1);
+    assert_eq!(db.list_tables().expect("tables"), vec![TABLE.to_string()]);
+
+    let docs = db.open_table(TABLE).expect("open");
+
+    // ---- 2. The documents define the columns -----------------------------
+    docs.append_rows(&[
+        serde_json::json!({"title": "first", "views": 10, "ratio": 1.5, "live": true}),
+        serde_json::json!({"title": "second", "views": 20}),
+    ])
+    .expect("the first documents define the table");
+
+    let grown = db.schema(TABLE).expect("schema");
+    let by_name = |doc: &TableSchema, name: &str| {
+        doc.fields()
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.data_type.clone())
+    };
+    assert_eq!(by_name(&grown, "title"), Some(DataType::LargeUtf8));
+    assert_eq!(by_name(&grown, "views"), Some(DataType::Int64));
+    assert_eq!(by_name(&grown, "ratio"), Some(DataType::Float64));
+    assert_eq!(by_name(&grown, "live"), Some(DataType::Boolean));
+    // Ids are minted as the mapper walks the document, and a JSON object's
+    // keys arrive sorted, so one document's new columns are numbered
+    // alphabetically rather than in the order they were written. Ids are
+    // opaque identity, so the order is not a promise to a caller; it is
+    // pinned here because a change to it would change which id a rename or
+    // a drop addresses.
+    assert_eq!(
+        names(&grown),
+        vec![
+            ("live", FieldId(1)),
+            ("ratio", FieldId(2)),
+            ("title", FieldId(3)),
+            ("views", FieldId(4)),
+        ]
+    );
+    let id_of = |doc: &TableSchema, name: &str| {
+        doc.fields()
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.id)
+            .expect("a live column")
+    };
+    // A row that omitted a column reads null there, not a default.
+    assert_eq!(
+        rows(&db, "SELECT title, views, ratio FROM docs ORDER BY title"),
+        vec!["first|10|1.5", "second|20|null"]
+    );
+
+    // ---- 3. The columns are frozen once seen -----------------------------
+    let err = docs
+        .append_rows(&[serde_json::json!({"title": "third", "views": "many"})])
+        .expect_err("a string does not belong in an integer column");
+    assert!(
+        matches!(
+            &err,
+            InfinoError::Schema(SchemaError::TypeMismatch { column, .. }) if column == "views"
+        ),
+        "{err:?}"
+    );
+    // The refusal is whole-batch: nothing of that append landed.
+    assert_eq!(rows(&db, "SELECT title FROM docs").len(), 2);
+
+    // A float where the column is an integer is refused on the same rule.
+    let err = docs
+        .append_rows(&[serde_json::json!({"title": "third", "views": 1.5})])
+        .expect_err("nor does a float");
+    assert!(
+        matches!(&err, InfinoError::Schema(SchemaError::TypeMismatch { .. })),
+        "{err:?}"
+    );
+
+    // ---- 4. Adding a field by hand, with a full-text index ---------------
+    // An index may be declared when the column is added.
+    let with_body = db
+        .apply_schema(
+            TABLE,
+            &SchemaPatch::new(vec![
+                FieldPatch::named("body")
+                    .with_type(DataType::LargeUtf8)
+                    .with_index(ColumnIndex::Fts {
+                        analyzer: "standard".into(),
+                        stopwords: Stopwords::None,
+                        stemmer: Stemmer::None,
+                        positions: false,
+                        stored: true,
+                        bm25: Bm25Params::default(),
+                    }),
+            ]),
+            Some(grown.schema_id()),
+        )
+        .expect("a new column may carry an index");
+    assert_eq!(by_name(&with_body, "body"), Some(DataType::LargeUtf8));
+    assert_eq!(with_body.schema_id(), grown.schema_id() + 1);
+
+    docs.append_rows(&[serde_json::json!({"title": "third", "body": "the quick fox"})])
+        .expect("append into the indexed column");
+    let hits = docs
+        .bm25_search("body", "fox", 10, Default::default(), None)
+        .expect("the new column is searchable");
+    assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    // ---- 5. An index cannot be added to a column that already exists -----
+    // The index is part of a column's identity: it is fixed when the column
+    // is created, so `title` cannot be made full-text after the fact.
+    let err = db
+        .apply_schema(
+            TABLE,
+            &SchemaPatch::new(vec![
+                FieldPatch::named("title")
+                    .with_id(id_of(&with_body, "title"))
+                    .with_index(ColumnIndex::Fts {
+                        analyzer: "standard".into(),
+                        stopwords: Stopwords::None,
+                        stemmer: Stemmer::None,
+                        positions: false,
+                        stored: true,
+                        bm25: Bm25Params::default(),
+                    }),
+            ]),
+            None,
+        )
+        .expect_err("an index is identity, not a setting");
+    assert!(
+        matches!(
+            &err,
+            InfinoError::Schema(SchemaError::IdentityChange { attribute })
+                if attribute.contains("title")
+        ),
+        "{err:?}"
+    );
+
+    // ---- 6. Rename by id, and drop -------------------------------------
+    let renamed = db
+        .apply_schema(
+            TABLE,
+            &SchemaPatch::new(vec![
+                FieldPatch::named("impressions").with_id(id_of(&with_body, "views")),
+            ]),
+            None,
+        )
+        .expect("rename by id");
+    assert_eq!(by_name(&renamed, "impressions"), Some(DataType::Int64));
+    assert_eq!(by_name(&renamed, "views"), None, "the old label is gone");
+    // The rows written under the old label are still there.
+    assert_eq!(
+        rows(&db, "SELECT impressions FROM docs ORDER BY impressions"),
+        vec!["10", "20", "null"]
+    );
+
+    let dropped = db
+        .apply_schema(
+            TABLE,
+            &SchemaPatch::new(vec![FieldPatch::named("live").dropped()]),
+            None,
+        )
+        .expect("drop a column");
+    assert_eq!(by_name(&dropped, "live"), None);
+    assert_eq!(
+        dropped.tombstoned(),
+        &[id_of(&grown, "live")],
+        "the id is retired"
+    );
+
+    // A dropped id is never reused: the next column minted takes a new one.
+    let after_drop = db
+        .apply_schema(
+            TABLE,
+            &SchemaPatch::new(vec![
+                FieldPatch::named("tag").with_type(DataType::LargeUtf8),
+            ]),
+            None,
+        )
+        .expect("add after a drop");
+    let tag_id = after_drop
+        .fields()
+        .iter()
+        .find(|f| f.name == "tag")
+        .map(|f| f.id)
+        .expect("tag");
+    assert!(
+        tag_id > FieldId(5) && !after_drop.tombstoned().contains(&tag_id),
+        "a retired id is not handed out again: {tag_id:?}"
+    );
+
+    // ---- 7. The expected-id guard ---------------------------------------
+    let stale = after_drop.schema_id() - 1;
+    let err = db
+        .apply_schema(
+            TABLE,
+            &SchemaPatch::new(vec![FieldPatch::named("late").with_type(DataType::Int64)]),
+            Some(stale),
+        )
+        .expect_err("the schema has moved since that id");
+    assert!(
+        matches!(
+            &err,
+            InfinoError::Conflict(_) | InfinoError::Schema(SchemaError::SchemaConflict { .. })
+        ),
+        "{err:?}"
+    );
+
+    // ---- 8. The document read back applies as a no-op ---------------------
+    let doc = db.schema(TABLE).expect("schema");
+    let again = db
+        .apply_schema(
+            TABLE,
+            &SchemaPatch::from_json(&doc.to_json()).expect("the document is a patch"),
+            None,
+        )
+        .expect("a document read back changes nothing");
+    assert_eq!(
+        again.schema_id(),
+        doc.schema_id(),
+        "a patch that changes nothing commits nothing"
+    );
+
+    // ---- 9. Everything still reads ---------------------------------------
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT title, impressions, body FROM docs ORDER BY title"
+        ),
+        vec![
+            "first|10|null",
+            "second|20|null",
+            "third|null|the quick fox"
+        ]
+    );
 }
