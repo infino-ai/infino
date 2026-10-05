@@ -960,6 +960,15 @@ impl BuilderOptions {
             // change is not a change of terms, so a renamed column's
             // postings still carry. Files written before ids compare by
             // name, which is what identified a column then.
+            //
+            // That name is matched against the table's live columns, so it
+            // carries the limitation `LegacyNames` documents: a name the
+            // table has since given to a different column matches here, and
+            // the retired column's postings carry into the new one. It is
+            // confined to files that predate ids and clears once compaction
+            // rewrites them. The scalar path next door decides by id for
+            // exactly this reason; this one cannot, because a file that
+            // predates ids has no id to decide with.
             let same_column = match (self.field_id_of_column(&own.column), other.field_id) {
                 (Some(own_id), Some(other_id)) => own_id == other_id,
                 _ => own.column == other.name,
