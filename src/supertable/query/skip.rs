@@ -664,7 +664,7 @@ mod tests {
 
         // An id the creation schema never minted stands for a column added
         // later; nothing in the table's files can be holding it.
-        let added = FieldId(u32::from(created.0) + 1);
+        let added = FieldId(created.0 + 1);
         assert!(
             !ColumnTypeGuard::new(&manifest, added).in_every_file(),
             "a column added later is absent from the files before it"
