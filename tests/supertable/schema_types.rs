@@ -47,19 +47,7 @@ fn ints(values: Vec<Option<i64>>) -> ArrayRef {
 }
 
 fn retype(name: &str, to: DataType) -> SchemaPatch {
-    SchemaPatch {
-        fields: vec![FieldPatch {
-            id: None,
-            name: name.into(),
-            data_type: Some(to),
-            nullable: None,
-            index: None,
-            dropped: false,
-        }],
-        max_fields: None,
-        max_depth: None,
-        templates: None,
-    }
+    SchemaPatch::new(vec![FieldPatch::named(name).with_type(to)])
 }
 
 fn compact() -> OptimizeOptions {
@@ -381,15 +369,12 @@ fn the_column_behind_the_vector_index_cannot_be_retyped_or_dropped() {
         ),
         "{err}"
     );
-    let drop = SchemaPatch {
-        fields: vec![FieldPatch {
-            dropped: true,
-            ..retype("emb", DataType::LargeUtf8).fields.remove(0)
-        }],
-        max_fields: None,
-        max_depth: None,
-        templates: None,
-    };
+    let drop = SchemaPatch::new(vec![
+        retype("emb", DataType::LargeUtf8)
+            .fields
+            .remove(0)
+            .dropped(),
+    ]);
     let err = db
         .apply_schema(TABLE, &drop, None)
         .expect_err("nor dropped");
@@ -479,15 +464,12 @@ fn an_index_only_column_keeps_its_postings_through_a_rename() {
     table.append(&generation("alpha")).expect("append");
     db.apply_schema(
         TABLE,
-        &SchemaPatch {
-            fields: vec![FieldPatch {
-                id: Some(FieldId(1)),
-                ..retype("body", DataType::LargeUtf8).fields.remove(0)
-            }],
-            max_fields: None,
-            max_depth: None,
-            templates: None,
-        },
+        &SchemaPatch::new(vec![
+            retype("body", DataType::LargeUtf8)
+                .fields
+                .remove(0)
+                .with_id(FieldId(1)),
+        ]),
         None,
     )
     .expect("rename the index-only column");
@@ -555,15 +537,12 @@ fn a_renamed_full_text_column_answers_every_query_shape() {
         .expect("append under the old name");
     db.apply_schema(
         TABLE,
-        &SchemaPatch {
-            fields: vec![FieldPatch {
-                id: Some(FieldId(1)),
-                ..retype("body", DataType::LargeUtf8).fields.remove(0)
-            }],
-            max_fields: None,
-            max_depth: None,
-            templates: None,
-        },
+        &SchemaPatch::new(vec![
+            retype("body", DataType::LargeUtf8)
+                .fields
+                .remove(0)
+                .with_id(FieldId(1)),
+        ]),
         None,
     )
     .expect("rename");
@@ -651,15 +630,12 @@ fn a_query_after_a_schema_change_does_not_serve_the_previous_generation() {
     // and the old generation.
     db.apply_schema(
         TABLE,
-        &SchemaPatch {
-            fields: vec![FieldPatch {
-                id: Some(FieldId(1)),
-                ..retype("count", DataType::Int64).fields.remove(0)
-            }],
-            max_fields: None,
-            max_depth: None,
-            templates: None,
-        },
+        &SchemaPatch::new(vec![
+            retype("count", DataType::Int64)
+                .fields
+                .remove(0)
+                .with_id(FieldId(1)),
+        ]),
         None,
     )
     .expect("rename");
@@ -675,11 +651,11 @@ fn the_caps_are_themselves_capped_and_a_template_pattern_is_bounded() {
         IndexSpec::new(),
     )
     .expect("create");
-    let caps = |max_fields: Option<u32>, max_depth: Option<u32>| SchemaPatch {
-        fields: vec![],
-        max_fields,
-        max_depth,
-        templates: None,
+    let caps = |max_fields: Option<u32>, max_depth: Option<u32>| {
+        let mut patch = SchemaPatch::new(vec![]);
+        patch.max_fields = max_fields;
+        patch.max_depth = max_depth;
+        patch
     };
     let err = db
         .apply_schema(TABLE, &caps(Some(u32::MAX), None), None)
@@ -798,19 +774,7 @@ fn a_renamed_vector_column_answers_search_over_the_old_files() {
 
     db.apply_schema(
         TABLE,
-        &SchemaPatch {
-            fields: vec![FieldPatch {
-                id: Some(FieldId(1)),
-                name: "embedding".into(),
-                data_type: None,
-                nullable: None,
-                index: None,
-                dropped: false,
-            }],
-            max_fields: None,
-            max_depth: None,
-            templates: None,
-        },
+        &SchemaPatch::new(vec![FieldPatch::named("embedding").with_id(FieldId(1))]),
         None,
     )
     .expect("rename the vector column");
@@ -866,22 +830,9 @@ fn a_fixed_size_type_needs_a_positive_size() {
     let err = db
         .apply_schema(
             TABLE,
-            &SchemaPatch {
-                fields: vec![FieldPatch {
-                    id: None,
-                    name: "bad".into(),
-                    data_type: Some(DataType::FixedSizeList(
-                        Arc::new(Field::new("item", DataType::Float32, true)),
-                        -1,
-                    )),
-                    nullable: None,
-                    index: None,
-                    dropped: false,
-                }],
-                max_fields: None,
-                max_depth: None,
-                templates: None,
-            },
+            &SchemaPatch::new(vec![FieldPatch::named("bad").with_type(
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), -1),
+            )]),
             None,
         )
         .expect_err("a negative fixed-size list size is refused");

@@ -297,14 +297,7 @@ fn check(db: &Connection, table: &Supertable, oracle: &Oracle) -> Result<(), Tes
 }
 
 fn field(name: &str, kind: Kind) -> FieldPatch {
-    FieldPatch {
-        id: None,
-        name: name.into(),
-        data_type: Some(kind.data_type()),
-        nullable: None,
-        index: None,
-        dropped: false,
-    }
+    FieldPatch::named(name).with_type(kind.data_type())
 }
 
 fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
@@ -362,12 +355,7 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
             }
             Op::Add { col } => {
                 let (name, kind) = POOL[col];
-                let patch = SchemaPatch {
-                    fields: vec![field(name, kind)],
-                    max_fields: None,
-                    max_depth: None,
-                    templates: None,
-                };
+                let patch = SchemaPatch::new(vec![field(name, kind)]);
                 match oracle.by_name(name) {
                     Some(live) if live.kind != kind => {
                         // The write would retype the column; outside this
@@ -387,15 +375,7 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
                     continue;
                 };
                 let target = POOL[to].0;
-                let patch = SchemaPatch {
-                    fields: vec![FieldPatch {
-                        id: Some(live.id),
-                        ..field(target, live.kind)
-                    }],
-                    max_fields: None,
-                    max_depth: None,
-                    templates: None,
-                };
+                let patch = SchemaPatch::new(vec![field(target, live.kind).with_id(live.id)]);
                 let taken = from != to && oracle.by_name(target).is_some();
                 match db.apply_schema(TABLE, &patch, None) {
                     Ok(_) => {
@@ -412,15 +392,7 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
                 let Some(live) = oracle.by_name(POOL[col].0).cloned() else {
                     continue;
                 };
-                let patch = SchemaPatch {
-                    fields: vec![FieldPatch {
-                        dropped: true,
-                        ..field(&live.name, live.kind)
-                    }],
-                    max_fields: None,
-                    max_depth: None,
-                    templates: None,
-                };
+                let patch = SchemaPatch::new(vec![field(&live.name, live.kind).dropped()]);
                 db.apply_schema(TABLE, &patch, None).expect("drop");
                 oracle.live.retain(|c| c.id != live.id);
             }

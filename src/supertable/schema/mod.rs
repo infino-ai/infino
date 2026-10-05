@@ -125,7 +125,10 @@ impl fmt::Display for FieldId {
 /// The index a column carries. Part of the column's definition: the
 /// analyzer chain and the vector metric are fixed when the index is
 /// created, so they live with the field rather than in a parallel list.
+/// `#[non_exhaustive]`: the engine intends to grow the set of index kinds,
+/// and a new one must not break a caller's `match`.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ColumnIndex {
     /// A full-text index over a string column.
     Fts {
@@ -237,7 +240,11 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
 }
 
 /// One live user column: its identity, label, physical type and index.
+///
+/// Handed out by [`TableSchema::fields`]. `#[non_exhaustive]`, so a column
+/// can gain an attribute without breaking a caller that reads one.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FieldDef {
     /// Stable identity; never changes once minted.
     pub id: FieldId,

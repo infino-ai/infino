@@ -235,19 +235,7 @@ fn every_refusal_names_the_schema_write_that_admits_the_rows() {
     );
     db.apply_schema(
         TABLE,
-        &SchemaPatch {
-            fields: vec![FieldPatch {
-                id: None,
-                name: "n".into(),
-                data_type: Some(DataType::Float64),
-                nullable: None,
-                index: None,
-                dropped: false,
-            }],
-            max_fields: None,
-            max_depth: None,
-            templates: None,
-        },
+        &SchemaPatch::new(vec![FieldPatch::named("n").with_type(DataType::Float64)]),
         None,
     )
     .expect("retype");
@@ -265,11 +253,11 @@ fn every_refusal_names_the_schema_write_that_admits_the_rows() {
     );
 
     // Caps refuse the document whole, and raising the cap admits it.
-    let caps = |max_fields: Option<u32>, max_depth: Option<u32>| SchemaPatch {
-        fields: vec![],
-        max_fields,
-        max_depth,
-        templates: None,
+    let caps = |max_fields: Option<u32>, max_depth: Option<u32>| {
+        let mut patch = SchemaPatch::new(vec![]);
+        patch.max_fields = max_fields;
+        patch.max_depth = max_depth;
+        patch
     };
     db.apply_schema(TABLE, &caps(Some(3), None), None)
         .expect("cap");

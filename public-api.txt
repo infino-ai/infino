@@ -70,7 +70,7 @@ impl core::marker::Unpin for infino::ColdFetchMode
 impl core::marker::UnsafeUnpin for infino::ColdFetchMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
-pub enum infino::ColumnIndex
+#[non_exhaustive] pub enum infino::ColumnIndex
 pub infino::ColumnIndex::Fts
 pub infino::ColumnIndex::Fts::analyzer: alloc::string::String
 pub infino::ColumnIndex::Fts::bm25: infino::Bm25Params
@@ -300,7 +300,7 @@ impl core::marker::Unpin for infino::ReindexTarget
 impl core::marker::UnsafeUnpin for infino::ReindexTarget
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ReindexTarget
 impl core::panic::unwind_safe::UnwindSafe for infino::ReindexTarget
-pub enum infino::RerankCodec
+#[non_exhaustive] pub enum infino::RerankCodec
 pub infino::RerankCodec::Fp32
 pub infino::RerankCodec::RabitqOnly
 pub infino::RerankCodec::Sq16
@@ -309,7 +309,6 @@ pub infino::RerankCodec::Sq8FixedResidual
 pub infino::RerankCodec::Sq8Residual
 impl infino::RerankCodec
 pub const fn infino::RerankCodec::name(self) -> &'static str
-pub const fn infino::RerankCodec::recommended_rerank_mult_floor(self, usize) -> core::option::Option<usize>
 pub const fn infino::RerankCodec::supports_metric(self, infino::Metric) -> bool
 impl core::clone::Clone for infino::RerankCodec
 pub fn infino::RerankCodec::clone(&self) -> Self
@@ -596,7 +595,7 @@ impl core::marker::Unpin for infino::Connection
 impl core::marker::UnsafeUnpin for infino::Connection
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::Connection
 impl !core::panic::unwind_safe::UnwindSafe for infino::Connection
-pub struct infino::FieldDef
+#[non_exhaustive] pub struct infino::FieldDef
 pub infino::FieldDef::converting_from: core::option::Option<arrow_schema::datatype::DataType>
 pub infino::FieldDef::data_type: arrow_schema::datatype::DataType
 pub infino::FieldDef::id: infino::FieldId
@@ -645,17 +644,26 @@ impl core::marker::Unpin for infino::FieldId
 impl core::marker::UnsafeUnpin for infino::FieldId
 impl core::panic::unwind_safe::RefUnwindSafe for infino::FieldId
 impl core::panic::unwind_safe::UnwindSafe for infino::FieldId
-pub struct infino::FieldPatch
+#[non_exhaustive] pub struct infino::FieldPatch
 pub infino::FieldPatch::data_type: core::option::Option<arrow_schema::datatype::DataType>
 pub infino::FieldPatch::dropped: bool
 pub infino::FieldPatch::id: core::option::Option<infino::FieldId>
 pub infino::FieldPatch::index: core::option::Option<infino::ColumnIndex>
 pub infino::FieldPatch::name: alloc::string::String
 pub infino::FieldPatch::nullable: core::option::Option<bool>
+impl infino::FieldPatch
+pub fn infino::FieldPatch::dropped(self) -> Self
+pub fn infino::FieldPatch::named(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn infino::FieldPatch::with_id(self, infino::FieldId) -> Self
+pub fn infino::FieldPatch::with_index(self, infino::ColumnIndex) -> Self
+pub fn infino::FieldPatch::with_nullable(self, bool) -> Self
+pub fn infino::FieldPatch::with_type(self, arrow_schema::datatype::DataType) -> Self
 impl core::clone::Clone for infino::FieldPatch
 pub fn infino::FieldPatch::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::FieldPatch
 pub fn infino::FieldPatch::eq(&self, &Self) -> bool
+impl core::default::Default for infino::FieldPatch
+pub fn infino::FieldPatch::default() -> Self
 impl core::fmt::Debug for infino::FieldPatch
 pub fn infino::FieldPatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for infino::FieldPatch
@@ -859,7 +867,7 @@ impl core::marker::Unpin for infino::ReindexReport
 impl core::marker::UnsafeUnpin for infino::ReindexReport
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ReindexReport
 impl core::panic::unwind_safe::UnwindSafe for infino::ReindexReport
-pub struct infino::SchemaPatch
+#[non_exhaustive] pub struct infino::SchemaPatch
 pub infino::SchemaPatch::fields: alloc::vec::Vec<infino::FieldPatch>
 pub infino::SchemaPatch::max_depth: core::option::Option<u32>
 pub infino::SchemaPatch::max_fields: core::option::Option<u32>
@@ -867,6 +875,10 @@ pub infino::SchemaPatch::templates: core::option::Option<alloc::vec::Vec<infino:
 impl infino::SchemaPatch
 pub fn infino::SchemaPatch::from_json(&serde_json::value::Value) -> core::result::Result<Self, alloc::string::String>
 pub fn infino::SchemaPatch::to_json(&self) -> serde_json::value::Value
+impl infino::SchemaPatch
+pub fn infino::SchemaPatch::new(alloc::vec::Vec<infino::FieldPatch>) -> Self
+pub fn infino::SchemaPatch::with_max_depth(self, u32) -> Self
+pub fn infino::SchemaPatch::with_max_fields(self, u32) -> Self
 impl core::clone::Clone for infino::SchemaPatch
 pub fn infino::SchemaPatch::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::SchemaPatch

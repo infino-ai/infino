@@ -63,23 +63,11 @@ fn ints(values: Vec<Option<i64>>) -> ArrayRef {
 }
 
 fn add(name: &str, data_type: DataType) -> FieldPatch {
-    FieldPatch {
-        id: None,
-        name: name.into(),
-        data_type: Some(data_type),
-        nullable: None,
-        index: None,
-        dropped: false,
-    }
+    FieldPatch::named(name).with_type(data_type)
 }
 
 fn patch(fields: Vec<FieldPatch>) -> SchemaPatch {
-    SchemaPatch {
-        fields,
-        max_fields: None,
-        max_depth: None,
-        templates: None,
-    }
+    SchemaPatch::new(fields)
 }
 
 /// `sql`'s rows as strings, one per row, cells joined by `|`, sorted.
@@ -264,10 +252,7 @@ fn a_retype_commits_the_rows_the_writer_is_holding_before_it_lands() {
     // and dropping the writer would discard them.
     let doc = writer
         .apply_schema(
-            &patch(vec![FieldPatch {
-                id: Some(FieldId(2)),
-                ..add("score", DataType::LargeUtf8)
-            }]),
+            &patch(vec![add("score", DataType::LargeUtf8).with_id(FieldId(2))]),
             None,
         )
         .expect("retype score");
@@ -297,10 +282,7 @@ fn a_rename_follows_the_rows_the_writer_is_holding_instead_of_minting_a_second_c
         .expect("append under the old name");
     let doc = writer
         .apply_schema(
-            &patch(vec![FieldPatch {
-                id: Some(FieldId(2)),
-                ..add("points", DataType::Int64)
-            }]),
+            &patch(vec![add("points", DataType::Int64).with_id(FieldId(2))]),
             None,
         )
         .expect("rename score to points");
@@ -352,11 +334,11 @@ fn a_column_cannot_stop_admitting_nulls_over_rows_a_peer_committed() {
     let err = stale
         .apply_schema(
             TABLE,
-            &patch(vec![FieldPatch {
-                id: Some(FieldId(2)),
-                nullable: Some(false),
-                ..add("score", DataType::Int64)
-            }]),
+            &patch(vec![
+                add("score", DataType::Int64)
+                    .with_id(FieldId(2))
+                    .with_nullable(false),
+            ]),
             Some(doc.schema_id()),
         )
         .expect_err("score cannot stop admitting nulls over a committed null");
@@ -407,10 +389,7 @@ fn the_schema_write_adds_renames_and_drops_and_reads_follow() {
     let renamed = db
         .apply_schema(
             TABLE,
-            &patch(vec![FieldPatch {
-                id: Some(FieldId(2)),
-                ..add("points", DataType::Int64)
-            }]),
+            &patch(vec![add("points", DataType::Int64).with_id(FieldId(2))]),
             None,
         )
         .expect("rename score");
@@ -427,10 +406,7 @@ fn the_schema_write_adds_renames_and_drops_and_reads_follow() {
     let dropped = db
         .apply_schema(
             TABLE,
-            &patch(vec![FieldPatch {
-                dropped: true,
-                ..add("tag", DataType::LargeUtf8)
-            }]),
+            &patch(vec![add("tag", DataType::LargeUtf8).dropped()]),
             None,
         )
         .expect("drop tag");
@@ -460,12 +436,7 @@ fn the_read_document_applies_as_a_no_op_and_the_expected_id_guards_the_write() {
         .apply_schema(TABLE, &SchemaPatch::from(&doc), None)
         .expect("no-op");
     assert_eq!(same, doc);
-    let one = SchemaPatch {
-        fields: vec![SchemaPatch::from(&doc).fields.remove(1)],
-        max_fields: None,
-        max_depth: None,
-        templates: None,
-    };
+    let one = SchemaPatch::new(vec![SchemaPatch::from(&doc).fields.remove(1)]);
     assert_eq!(db.apply_schema(TABLE, &one, None).expect("subset"), doc);
 
     let err = db
@@ -488,16 +459,7 @@ fn the_read_document_applies_as_a_no_op_and_the_expected_id_guards_the_write() {
     assert_eq!(next.schema_id(), doc.schema_id() + 1);
 
     let capped = db
-        .apply_schema(
-            TABLE,
-            &SchemaPatch {
-                fields: vec![],
-                max_fields: Some(3),
-                max_depth: None,
-                templates: None,
-            },
-            None,
-        )
+        .apply_schema(TABLE, &SchemaPatch::new(vec![]).with_max_fields(3), None)
         .expect("set the cap");
     assert_eq!(capped.max_fields(), 3);
     let err = db
@@ -518,18 +480,11 @@ fn the_schema_write_creates_an_absent_table_and_create_table_refuses_a_present_o
     let doc = db
         .apply_schema(
             TABLE,
-            &SchemaPatch {
-                fields: vec![
-                    FieldPatch {
-                        nullable: Some(false),
-                        ..add("title", DataType::LargeUtf8)
-                    },
-                    add("score", DataType::Int64),
-                ],
-                max_fields: Some(50),
-                max_depth: None,
-                templates: None,
-            },
+            &SchemaPatch::new(vec![
+                add("title", DataType::LargeUtf8).with_nullable(false),
+                add("score", DataType::Int64),
+            ])
+            .with_max_fields(50),
             None,
         )
         .expect("create through the schema write");
@@ -551,14 +506,7 @@ fn the_schema_write_creates_an_absent_table_and_create_table_refuses_a_present_o
         .expect_err("an expectation against a table that is not there");
     assert!(matches!(err, InfinoError::Conflict(_)), "{err}");
     let err = db
-        .apply_schema(
-            "absent",
-            &patch(vec![FieldPatch {
-                data_type: None,
-                ..add("x", DataType::Null)
-            }]),
-            None,
-        )
+        .apply_schema("absent", &patch(vec![FieldPatch::named("x")]), None)
         .expect_err("a new table's columns need types");
     assert!(
         matches!(&err, InfinoError::Schema(SchemaError::TypeRequired { .. })),
@@ -716,10 +664,7 @@ fn compaction_merges_the_generations_growth_leaves_behind() {
     .expect("generation two");
     db.apply_schema(
         TABLE,
-        &patch(vec![FieldPatch {
-            id: Some(FieldId(2)),
-            ..add("points", DataType::Int64)
-        }]),
+        &patch(vec![add("points", DataType::Int64).with_id(FieldId(2))]),
         None,
     )
     .expect("rename");

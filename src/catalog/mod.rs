@@ -769,19 +769,11 @@ impl Connection {
     /// # use infino::arrow_schema::DataType;
     /// # use infino::{connect, FieldPatch, SchemaPatch};
     /// # let db = connect("memory://")?;
-    /// let patch = SchemaPatch {
-    ///     fields: vec![FieldPatch {
-    ///         id: None,
-    ///         name: "body".into(),
-    ///         data_type: Some(DataType::LargeUtf8),
-    ///         nullable: Some(false),
-    ///         index: None,
-    ///         dropped: false,
-    ///     }],
-    ///     max_fields: None,
-    ///     max_depth: None,
-    ///     templates: None,
-    /// };
+    /// let patch = SchemaPatch::new(vec![
+    ///     FieldPatch::named("body")
+    ///         .with_type(DataType::LargeUtf8)
+    ///         .with_nullable(false),
+    /// ]);
     /// let doc = db.apply_schema("posts", &patch, None)?;
     /// assert_eq!(doc.schema_id(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())

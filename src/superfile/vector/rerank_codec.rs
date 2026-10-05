@@ -75,16 +75,19 @@ use crate::superfile::{
 /// rerank-floor calibration table in
 /// [`RerankCodec::recommended_rerank_mult_floor`]. Set at 384 to
 /// match the dominant embedding-model bucket (e5, MiniLM, etc.).
+#[cfg(test)]
 const LOW_DIM_RERANK_FLOOR_THRESHOLD: usize = 384;
 
 /// Recommended floor on `rerank_mult` for `Fp32` columns at
 /// `dim ≤ 384`.
+#[cfg(test)]
 const FP32_LOW_DIM_RERANK_FLOOR: usize = 20;
 
 /// Recommended floor on `rerank_mult` for `Fp32` columns at
 /// `dim > 384`. Higher dim widens the gap between the 1-bit
 /// shortlist score and the true distance; more candidates are
 /// needed to recover the same recall.
+#[cfg(test)]
 const FP32_HIGH_DIM_RERANK_FLOOR: usize = 50;
 
 /// Recommended floor on `rerank_mult` for `Sq8Residual` columns at
@@ -92,12 +95,14 @@ const FP32_HIGH_DIM_RERANK_FLOOR: usize = 50;
 /// candidates than fp32 to
 /// recover equivalent recall because the dequant noise floor is
 /// higher.
+#[cfg(test)]
 const SQ8_LOW_DIM_RERANK_FLOOR: usize = 50;
 
 /// Recommended floor on `rerank_mult` for `Sq8Residual` columns at
 /// `dim > 384`. See [`SQ8_LOW_DIM_RERANK_FLOOR`] and
 /// [`FP32_HIGH_DIM_RERANK_FLOOR`] for the underlying
 /// calibration rationale.
+#[cfg(test)]
 const SQ8_HIGH_DIM_RERANK_FLOOR: usize = 100;
 
 /// Absolute offset for the portable cosine-only Sq8 grid.
@@ -123,8 +128,11 @@ pub(crate) const SQ16_FIXED_SCALE: f32 = 2.0 / SQ16_CODE_MAX;
 /// region.
 ///
 /// See the module docs for the on-disk discriminator + lifecycle.
+/// `#[non_exhaustive]`: codecs are added over time, and a new one must not
+/// break a caller's `match`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RerankCodec {
     /// fp32 little-endian, `dim` contiguous f32s per vector.
     /// The rerank distance kernel reads it via
@@ -428,13 +436,16 @@ impl RerankCodec {
     ///
     /// Sq8Residual needs more candidates to recover fp32-equivalent
     /// recall because the first-pass dequant noise floor is higher
-    /// than fp32. The bench harness uses this as the calibration-grid
-    /// lower bound; direct `search(.., rerank_mult)` callers are
-    /// unaffected.
+    /// than fp32.
     ///
     /// Numbers calibrated against FAISS-doc peer benchmarks.
+    ///
+    /// Nothing in the engine or the bench harness reads this today; it is
+    /// kept as the recorded calibration and asserted by its own test, so it
+    /// is compiled only under test rather than shipped as API.
+    #[cfg(test)]
     #[inline]
-    pub const fn recommended_rerank_mult_floor(self, dim: usize) -> Option<usize> {
+    pub(crate) const fn recommended_rerank_mult_floor(self, dim: usize) -> Option<usize> {
         let high_dim = dim > LOW_DIM_RERANK_FLOOR_THRESHOLD;
         match self {
             // `Sq16`/`Sq16Adaptive` are ~16-bit clean, so their rerank floor

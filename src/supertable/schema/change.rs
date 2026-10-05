@@ -110,7 +110,12 @@ pub fn classify_type_change(from: &DataType, to: &DataType) -> TypeChange {
 }
 
 /// One field of a [`SchemaPatch`].
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Build it with [`FieldPatch::named`] and the `with_*` setters rather than
+/// a struct literal: the type is `#[non_exhaustive]` so it can grow a field
+/// without breaking callers.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct FieldPatch {
     /// Set to address a live column by identity (the one way to rename).
     pub id: Option<FieldId>,
@@ -129,7 +134,12 @@ pub struct FieldPatch {
 }
 
 /// What a caller writes: fields to add or change, and the cap.
+///
+/// Build it with [`SchemaPatch::new`] and the `with_*` setters rather than a
+/// struct literal: the type is `#[non_exhaustive]` so it can grow a field
+/// without breaking callers.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct SchemaPatch {
     /// The columns to add or change. A live column not listed is untouched.
     pub fields: Vec<FieldPatch>,
@@ -139,6 +149,70 @@ pub struct SchemaPatch {
     pub max_depth: Option<u32>,
     /// The templates to set, replacing the current ones, when present.
     pub templates: Option<Vec<Template>>,
+}
+
+impl FieldPatch {
+    /// A patch for the column called `name`: the one to add, or the live one
+    /// to change. Add [`Self::with_id`] to address a live column by identity
+    /// instead, which is the one way to rename it.
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Address the live column with this id, so `name` renames it.
+    pub fn with_id(mut self, id: FieldId) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    /// The column's type: required for a new column, a change for a live one.
+    pub fn with_type(mut self, data_type: DataType) -> Self {
+        self.data_type = Some(data_type);
+        self
+    }
+
+    /// Whether the column admits nulls.
+    pub fn with_nullable(mut self, nullable: bool) -> Self {
+        self.nullable = Some(nullable);
+        self
+    }
+
+    /// The index a new column carries.
+    pub fn with_index(mut self, index: ColumnIndex) -> Self {
+        self.index = Some(index);
+        self
+    }
+
+    /// Retire the column.
+    pub fn dropped(mut self) -> Self {
+        self.dropped = true;
+        self
+    }
+}
+
+impl SchemaPatch {
+    /// A patch over `fields`, changing no cap.
+    pub fn new(fields: Vec<FieldPatch>) -> Self {
+        Self {
+            fields,
+            ..Self::default()
+        }
+    }
+
+    /// Set the field cap.
+    pub fn with_max_fields(mut self, max_fields: u32) -> Self {
+        self.max_fields = Some(max_fields);
+        self
+    }
+
+    /// Set the document nesting cap.
+    pub fn with_max_depth(mut self, max_depth: u32) -> Self {
+        self.max_depth = Some(max_depth);
+        self
+    }
 }
 
 impl From<&TableSchema> for SchemaPatch {
