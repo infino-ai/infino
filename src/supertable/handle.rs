@@ -2467,6 +2467,7 @@ mod tests {
             opann::MODALITY_MIN_CELL_DOCS,
             options::Consistency,
             query::dispatch::open_reader,
+            schema::LegacyNames,
         },
         test_helpers::default_tokenizer,
     };
@@ -5333,6 +5334,7 @@ mod tests {
                 hidden_storage.as_ref(),
                 uri,
                 &hash,
+                &LegacyNames::none(),
             ))
             .expect("slow state loads");
         assert!(
@@ -5561,6 +5563,7 @@ mod tests {
                 hidden_storage.as_ref(),
                 uri,
                 &hash,
+                &LegacyNames::none(),
             ))
             .expect("slow state loads");
         assert!(

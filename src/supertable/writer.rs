@@ -4195,9 +4195,14 @@ async fn load_drain_remote_checkpoint(
         .storage
         .as_ref()
         .ok_or_else(|| BuildError::Store("drain checkpoint requires storage".into()))?;
-    let state = slow_vector_state::load_full_state(storage.as_ref(), uri, &hash)
-        .await
-        .map_err(|error| BuildError::Store(format!("drain slow-CAS load: {error}")))?;
+    let state = slow_vector_state::load_full_state(
+        storage.as_ref(),
+        uri,
+        &hash,
+        &inner.options.legacy_names(),
+    )
+    .await
+    .map_err(|error| BuildError::Store(format!("drain slow-CAS load: {error}")))?;
     let Some(pending) = state.pending_drain else {
         return Ok(None);
     };
@@ -7736,8 +7741,13 @@ async fn pin_uploaded_superfiles(
         if let (Some((uri, hash)), Some(storage)) = (
             manifest.slow_vector_state_blob(),
             inner.options.storage.as_ref(),
-        ) && let Ok(state) =
-            slow_vector_state::load_full_state(storage.as_ref(), uri, &hash).await
+        ) && let Ok(state) = slow_vector_state::load_full_state(
+            storage.as_ref(),
+            uri,
+            &hash,
+            &inner.options.legacy_names(),
+        )
+        .await
             && let Some(pending) = state.pending_drain
             && pending_metadata_schema(&pending.metadata) == Some(DRAIN_CHECKPOINT_SCHEMA)
         {

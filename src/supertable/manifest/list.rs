@@ -1920,7 +1920,14 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
         .map(entry_to_dto)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ManifestDto {
-        format_version: l.format_version.clone(),
+        // Stamped at the one wire exit, whatever the decoded list carried, so
+        // no construction site can write id-keyed aggregates under the older
+        // name-keyed major. A maintenance publish (term stats, term index, a
+        // schema stamp) clones a decoded list and edits it in place; carrying
+        // its version forward would label new content with the old major, and
+        // the next decode would resolve id keys as column names and silently
+        // drop every aggregate. Mirrors `part::encode_with_mode`.
+        format_version: FORMAT_VERSION.to_owned(),
         manifest_id: l.manifest_id,
         options_hash: encode_hash(&l.options_hash),
         schema: l.schema.as_ref().map_or(Value::Null, |s| s.to_json()),
@@ -3806,11 +3813,21 @@ mod tests {
         assert_eq!(bytes_a, bytes_b, "byte-equal JSON for byte-equal input");
     }
 
+    /// Rewrite the stamped version in encoded list bytes. `encode` always
+    /// stamps the current version, so a test that needs another one patches
+    /// the wire bytes rather than the struct.
+    fn restamped(list: &Manifest, version: &str) -> Vec<u8> {
+        let bytes = encode(list).expect("encode");
+        let text = String::from_utf8(bytes).expect("utf8");
+        let from = format!("\"format_version\": \"{FORMAT_VERSION}\"");
+        let to = format!("\"format_version\": \"{version}\"");
+        assert!(text.contains(&from), "encode stamps {FORMAT_VERSION}");
+        text.replacen(&from, &to, 1).into_bytes()
+    }
+
     #[test]
     fn incompatible_major_version_rejected() {
-        let mut list = empty_list();
-        list.format_version = "3.0".into();
-        let bytes = encode(&list).expect("encode");
+        let bytes = restamped(&empty_list(), "3.0");
         let err = decode(&bytes, &LegacyNames::none()).expect_err("major 3 must reject");
         assert!(
             matches!(err, ListParseError::IncompatibleMajorVersion { .. }),
@@ -3820,11 +3837,26 @@ mod tests {
 
     #[test]
     fn minor_version_compatible() {
-        let mut list = empty_list();
-        list.format_version = "1.99".into();
-        let bytes = encode(&list).expect("encode");
+        let bytes = restamped(&empty_list(), "1.99");
         let decoded = decode(&bytes, &LegacyNames::none()).expect("minor 99 must accept");
         assert_eq!(decoded.format_version, "1.99");
+    }
+
+    /// A list decoded from the name-keyed major and re-encoded must come back
+    /// at the id-keyed major, because the encoder always writes id keys. The
+    /// maintenance publishes (term stats, term index, a schema stamp) clone a
+    /// decoded list and edit it, so this is the shape they take.
+    #[test]
+    fn a_re_encoded_legacy_list_carries_the_current_major() {
+        let bytes = restamped(&empty_list(), "1.0");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode the old major");
+        assert_eq!(decoded.format_version, "1.0", "decode keeps what it read");
+        let round = encode(&decoded).expect("re-encode");
+        let again = decode(&round, &LegacyNames::none()).expect("decode the re-encode");
+        assert_eq!(
+            again.format_version, FORMAT_VERSION,
+            "a re-encode stamps the major its own keys are written in"
+        );
     }
 
     #[test]

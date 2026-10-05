@@ -285,14 +285,19 @@ async fn live_set(
         // on that URI (missing, corrupt, or hash-mismatched bytes) — surface
         // it through the existing `Storage` variant rather than a dedicated
         // public error variant.
-        let state = slow_vector_state::load_full_state(storage.as_ref(), uri, &hash)
-            .await
-            .map_err(|error| {
-                GcError::Storage(StorageError::Permanent {
-                    uri: uri.to_string(),
-                    source: Box::new(error),
-                })
-            })?;
+        let state = slow_vector_state::load_full_state(
+            storage.as_ref(),
+            uri,
+            &hash,
+            &manifest.options.legacy_names(),
+        )
+        .await
+        .map_err(|error| {
+            GcError::Storage(StorageError::Permanent {
+                uri: uri.to_string(),
+                source: Box::new(error),
+            })
+        })?;
         if let Some(pending) = state.pending_drain {
             uris.extend(pending.entries.iter().map(|entry| entry.storage_path()));
         }

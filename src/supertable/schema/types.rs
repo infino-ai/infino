@@ -110,10 +110,18 @@ pub fn data_type_from_keys(keys: &Map<String, Value>) -> Result<DataType, String
         field_from_keys(item).map(Arc::new)
     };
     let dim = |keys: &Map<String, Value>| -> Result<i32, String> {
-        keys.get("dim")
+        let dim = keys
+            .get("dim")
             .and_then(Value::as_i64)
             .and_then(|d| i32::try_from(d).ok())
-            .ok_or_else(|| format!("{tag} type has no dim"))
+            .ok_or_else(|| format!("{tag} type has no dim"))?;
+        // Arrow sizes a fixed-size list's child as `dim * rows`, so a
+        // negative dim overflows that multiplication the first time a row
+        // is null-filled. Refuse it where the number is still the user's.
+        if dim <= 0 {
+            return Err(format!("{tag} type needs a positive dim, not {dim}"));
+        }
+        Ok(dim)
     };
     Ok(match tag {
         "vector" => {
@@ -168,12 +176,19 @@ pub fn data_type_from_keys(keys: &Map<String, Value>) -> Result<DataType, String
             let (precision, scale) = decimal_from_keys(keys)?;
             DataType::Decimal256(precision, scale)
         }
-        "fixed_size_binary" => DataType::FixedSizeBinary(
-            keys.get("width")
+        "fixed_size_binary" => {
+            let width = keys
+                .get("width")
                 .and_then(Value::as_i64)
                 .and_then(|w| i32::try_from(w).ok())
-                .ok_or_else(|| "fixed_size_binary type has no width".to_string())?,
-        ),
+                .ok_or_else(|| "fixed_size_binary type has no width".to_string())?;
+            if width <= 0 {
+                return Err(format!(
+                    "fixed_size_binary type needs a positive width, not {width}"
+                ));
+            }
+            DataType::FixedSizeBinary(width)
+        }
         ARROW_FALLBACK => {
             let ipc = keys
                 .get("ipc")

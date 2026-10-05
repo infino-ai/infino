@@ -812,3 +812,81 @@ fn a_renamed_vector_column_answers_search_over_the_old_files() {
         .expect("the file labels the column as it was, the id finds it");
     assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), K);
 }
+
+/// A fixed-size type carries a size Arrow multiplies by the row count to size
+/// the child buffer. A negative one overflows that multiplication the first
+/// time a column is null-filled, which aborts the writer rather than failing
+/// the call, so the size is refused where it is still the caller's number.
+#[test]
+fn a_fixed_size_type_needs_a_positive_size() {
+    let db = connect("memory://").expect("connect");
+    db.create_table(
+        TABLE,
+        Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            true,
+        )])),
+        IndexSpec::new(),
+    )
+    .expect("create");
+
+    for (type_keys, what) in [
+        (serde_json::json!({"type": "vector", "dim": -1}), "dim"),
+        (serde_json::json!({"type": "vector", "dim": 0}), "dim"),
+        (
+            serde_json::json!({"type": "fixed_size_binary", "width": -8}),
+            "width",
+        ),
+    ] {
+        let mut field = type_keys.as_object().expect("object").clone();
+        field.insert("name".into(), serde_json::json!("bad"));
+        let patch = SchemaPatch::from_json(&serde_json::json!({
+            "fields": [serde_json::Value::Object(field)]
+        }));
+        // Refused at the JSON boundary, where the error can still name the
+        // key the caller wrote.
+        let err = patch.expect_err(&format!("a non-positive {what} is refused"));
+        assert!(
+            err.contains(what) && err.contains("positive"),
+            "{what}: {err}"
+        );
+    }
+
+    // The same refusal through the Rust API, which does not go through JSON.
+    let err = db
+        .apply_schema(
+            TABLE,
+            &SchemaPatch {
+                fields: vec![FieldPatch {
+                    id: None,
+                    name: "bad".into(),
+                    data_type: Some(DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        -1,
+                    )),
+                    nullable: None,
+                    index: None,
+                    dropped: false,
+                }],
+                max_fields: None,
+                max_depth: None,
+                templates: None,
+            },
+            None,
+        )
+        .expect_err("a negative fixed-size list size is refused");
+    assert!(
+        matches!(&err, InfinoError::Schema(m) if m.contains("positive")),
+        "{err:?}"
+    );
+
+    // And the table still appends, rather than aborting on the next null fill.
+    db.open_table(TABLE)
+        .expect("open")
+        .append(&batch(vec![(
+            "title",
+            Arc::new(LargeStringArray::from(vec!["a"])) as ArrayRef,
+        )]))
+        .expect("append after the refusal");
+}

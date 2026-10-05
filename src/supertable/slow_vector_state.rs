@@ -135,17 +135,18 @@ fn encode_entries_with_mode(entries: &[Arc<SuperfileEntry>], mode: SummaryWireMo
     part::encode_with_mode(&synthetic, mode)
 }
 
-/// Decode a blob written by [`encode_entries`].
+/// Decode a blob written by [`encode_entries`]. `legacy` resolves the column
+/// names a blob written before field ids keyed its vector summaries by: this
+/// blob IS the serving membership until the next drain republishes it, so
+/// dropping a name-keyed summary here would leave every vector query on an
+/// upgraded table failing on an entry with no summary, not merely rebuild
+/// something later.
 pub(crate) fn decode_entries(
     bytes: &[u8],
+    legacy: &LegacyNames,
 ) -> Result<Vec<Arc<SuperfileEntry>>, SlowVectorStateError> {
-    // A blob written before field ids keyed its vector summaries by column
-    // name; the hidden sibling has one vector column, whose id the user
-    // table's schema would resolve. Decoding with no names drops such a
-    // key, and the checkpoint is rebuilt from the user table on the next
-    // drain, so nothing is lost.
-    let decoded = part::decode(bytes, &LegacyNames::none())
-        .map_err(|e| SlowVectorStateError::Parse(e.to_string()))?;
+    let decoded =
+        part::decode(bytes, legacy).map_err(|e| SlowVectorStateError::Parse(e.to_string()))?;
     Ok(decoded.superfiles)
 }
 
@@ -171,10 +172,13 @@ fn encode_checkpoint_state(
     bytes
 }
 
-pub(crate) fn decode_state(bytes: &[u8]) -> Result<SlowVectorState, SlowVectorStateError> {
+pub(crate) fn decode_state(
+    bytes: &[u8],
+    legacy: &LegacyNames,
+) -> Result<SlowVectorState, SlowVectorStateError> {
     if !bytes.starts_with(CHECKPOINT_MAGIC) {
         return Ok(SlowVectorState {
-            entries: decode_entries(bytes)?,
+            entries: decode_entries(bytes, legacy)?,
             pending_drain: None,
         });
     }
@@ -213,10 +217,10 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<SlowVectorState, SlowVectorSt
         ));
     }
     Ok(SlowVectorState {
-        entries: decode_entries(&bytes[CHECKPOINT_HEADER_BYTES..visible_end])?,
+        entries: decode_entries(&bytes[CHECKPOINT_HEADER_BYTES..visible_end], legacy)?,
         pending_drain: Some(PendingDrainState {
             metadata: bytes[visible_end..metadata_end].to_vec(),
-            entries: decode_entries(&bytes[metadata_end..pending_end])?,
+            entries: decode_entries(&bytes[metadata_end..pending_end], legacy)?,
         }),
     })
 }
@@ -790,17 +794,22 @@ pub(crate) async fn load_state(
     storage: &dyn StorageProvider,
     uri: &str,
     expected: &ContentHash,
+    legacy: &LegacyNames,
 ) -> Result<Vec<Arc<SuperfileEntry>>, SlowVectorStateError> {
-    Ok(load_full_state(storage, uri, expected).await?.entries)
+    Ok(load_full_state(storage, uri, expected, legacy)
+        .await?
+        .entries)
 }
 
 pub(crate) async fn load_full_state(
     storage: &dyn StorageProvider,
     uri: &str,
     expected: &ContentHash,
+    legacy: &LegacyNames,
 ) -> Result<SlowVectorState, SlowVectorStateError> {
     let bytes = fetch_blob_striped(storage, uri, STRIPED_FETCH_CHUNK_BYTES).await?;
     let expected = *expected;
+    let legacy = legacy.clone();
     // blake3 over the whole blob plus the Avro parse is a CPU wave
     // (multi-GiB at 100M docs); run it on the blocking pool so the
     // runtime keeps driving I/O instead of stalling behind the decode.
@@ -808,7 +817,7 @@ pub(crate) async fn load_full_state(
         if ContentHash::of(bytes.as_ref()) != expected {
             return Err(SlowVectorStateError::HashMismatch);
         }
-        decode_state(bytes.as_ref())
+        decode_state(bytes.as_ref(), &legacy)
     }))
     .await
     {
@@ -969,7 +978,7 @@ mod tests {
     fn entries_roundtrip_and_deterministic() {
         let entries = vec![entry(FIRST_N_DOCS, 0), entry(SECOND_N_DOCS, 5)];
         let bytes = encode_entries(&entries);
-        let decoded = decode_entries(&bytes).expect("decode");
+        let decoded = decode_entries(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.len(), entries.len());
         for (d, e) in decoded.iter().zip(entries.iter()) {
             assert_entries_match(d, e);
@@ -986,7 +995,7 @@ mod tests {
 
     #[test]
     fn decode_garbage_is_parse_error() {
-        let err = decode_entries(&[0u8; 16]).expect_err("garbage");
+        let err = decode_entries(&[0u8; 16], &LegacyNames::none()).expect_err("garbage");
         assert!(matches!(err, SlowVectorStateError::Parse(_)), "{err:?}");
     }
 
@@ -1040,7 +1049,8 @@ mod tests {
             entries: pending_entries.clone(),
         };
         let bytes = encode_checkpoint_state(&visible, &pending);
-        let decoded = decode_state(&bytes).expect("decode checkpoint envelope");
+        let decoded =
+            decode_state(&bytes, &LegacyNames::none()).expect("decode checkpoint envelope");
         assert_eq!(decoded.entries.len(), 1);
         assert_entries_match(&decoded.entries[0], &visible[0]);
         let decoded_pending = decoded.pending_drain.expect("pending drain");
@@ -1134,19 +1144,26 @@ mod tests {
         assert_eq!(hash, republished.content_hash);
         assert_eq!(published.centroids, republished.centroids);
 
-        let loaded = load_state(&storage, &uri, &hash).await.expect("load");
+        let loaded = load_state(&storage, &uri, &hash, &LegacyNames::none())
+            .await
+            .expect("load");
         assert_eq!(loaded.len(), 1);
         assert_entries_match(&loaded[0], &entries[0]);
 
         let wrong = ContentHash::of(b"wrong");
-        let err = load_state(&storage, &uri, &wrong)
+        let err = load_state(&storage, &uri, &wrong, &LegacyNames::none())
             .await
             .expect_err("hash mismatch");
         assert!(matches!(err, SlowVectorStateError::HashMismatch), "{err:?}");
 
-        let missing = load_state(&storage, "slow-vector-state/absent.bin", &hash)
-            .await
-            .expect_err("missing object");
+        let missing = load_state(
+            &storage,
+            "slow-vector-state/absent.bin",
+            &hash,
+            &LegacyNames::none(),
+        )
+        .await
+        .expect_err("missing object");
         assert!(
             matches!(missing, SlowVectorStateError::Storage(_)),
             "{missing:?}"
@@ -1186,9 +1203,14 @@ mod tests {
         );
         assert!(blob_len > 0, "state blob must be non-empty");
 
-        let loaded = load_state(&storage, &published.uri, &published.content_hash)
-            .await
-            .expect("load blob");
+        let loaded = load_state(
+            &storage,
+            &published.uri,
+            &published.content_hash,
+            &LegacyNames::none(),
+        )
+        .await
+        .expect("load blob");
         assert_eq!(loaded.len(), 1);
         assert_entries_match(&loaded[0], &entries[0]);
         let clusters = &loaded[0].vector_summary[&fid("emb")].cells[0].clusters;
@@ -1212,9 +1234,14 @@ mod tests {
         let checkpoint = write_state_with_pending_drain(&storage, &entries, &pending, None)
             .await
             .expect("checkpoint write");
-        let state = load_full_state(&storage, &checkpoint.uri, &checkpoint.content_hash)
-            .await
-            .expect("load checkpoint");
+        let state = load_full_state(
+            &storage,
+            &checkpoint.uri,
+            &checkpoint.content_hash,
+            &LegacyNames::none(),
+        )
+        .await
+        .expect("load checkpoint");
         assert_eq!(
             state.entries.len(),
             entries.len(),
@@ -1254,9 +1281,14 @@ mod tests {
 
         // Round-trip the entries through the routing wire — the stripped
         // shape a writer's hydrated manifest carries at republish time.
-        let stripped = load_state(&storage, &published.uri, &published.content_hash)
-            .await
-            .expect("hydrate stripped");
+        let stripped = load_state(
+            &storage,
+            &published.uri,
+            &published.content_hash,
+            &LegacyNames::none(),
+        )
+        .await
+        .expect("hydrate stripped");
         assert!(
             stripped
                 .iter()

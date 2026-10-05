@@ -488,6 +488,7 @@ impl TableSchema {
                         fields: vec![name.clone()],
                     });
                 }
+                check_type_buildable(name, data_type)?;
                 if let Some(index) = index {
                     check_index_fits(name, index, data_type)?;
                 }
@@ -516,11 +517,15 @@ impl TableSchema {
                 self.field_mut(*id)?.name = to.clone();
             }
             SchemaChange::WidenColumn { id, to } => {
+                let name = self.field_mut(*id)?.name.clone();
+                check_type_buildable(&name, to)?;
                 let field = self.field_mut(*id)?;
                 field.data_type = to.clone();
                 field.index = index_after_retype(field.index.take(), to);
             }
             SchemaChange::RewriteColumn { id, to } => {
+                let name = self.field_mut(*id)?.name.clone();
+                check_type_buildable(&name, to)?;
                 let field = self.field_mut(*id)?;
                 if field.converting_from.is_some() && field.converting_from.as_ref() != Some(to) {
                     return Err(SchemaError::ConversionInProgress {
@@ -610,6 +615,46 @@ fn check_cap(setting: &str, value: u32, cap: u32) -> Result<u32, SchemaError> {
 /// full-text index needs a string column, and a vector index is declared
 /// when the table is created, because the index's storage is laid out
 /// with the table.
+/// Refuse a type the engine cannot build an array from. Arrow sizes a
+/// fixed-size list's child buffer as `size * rows`, so a negative size
+/// overflows that multiplication the first time a column is null-filled,
+/// which aborts the writer rather than failing the call. The check is
+/// recursive: a negative size is just as fatal nested inside a list or a
+/// struct as it is at the top.
+fn check_type_buildable(column: &str, data_type: &DataType) -> Result<(), SchemaError> {
+    let invalid = |reason: String| {
+        Err(SchemaError::InvalidType {
+            column: column.to_owned(),
+            reason,
+        })
+    };
+    match data_type {
+        DataType::FixedSizeList(item, size) => {
+            if *size <= 0 {
+                return invalid(format!(
+                    "a fixed-size list needs a positive size, not {size}"
+                ));
+            }
+            check_type_buildable(column, item.data_type())
+        }
+        DataType::FixedSizeBinary(width) => {
+            if *width <= 0 {
+                return invalid(format!(
+                    "fixed-size binary needs a positive width, not {width}"
+                ));
+            }
+            Ok(())
+        }
+        DataType::List(item) | DataType::LargeList(item) => {
+            check_type_buildable(column, item.data_type())
+        }
+        DataType::Struct(fields) => fields
+            .iter()
+            .try_for_each(|f| check_type_buildable(column, f.data_type())),
+        _ => Ok(()),
+    }
+}
+
 fn check_index_fits(
     column: &str,
     index: &ColumnIndex,

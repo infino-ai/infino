@@ -79,6 +79,15 @@ pub enum SchemaError {
         /// The largest value admitted.
         cap: u32,
     },
+    /// A submitted type carries a parameter the engine cannot build an
+    /// array from, such as a negative vector dimension.
+    #[error("column `{column}` has an unusable type: {reason}")]
+    InvalidType {
+        /// The column's name.
+        column: String,
+        /// What is wrong with the type.
+        reason: String,
+    },
     /// A new column was submitted without a type.
     #[error("column `{column}` is new and needs a type")]
     TypeRequired {

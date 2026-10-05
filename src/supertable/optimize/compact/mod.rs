@@ -769,12 +769,11 @@ impl Supertable {
             .filter(|stem| superfiles.iter().all(|e| e.stem.as_deref() == Some(*stem)));
         let prepared_superfile = {
             let _span = detail_span!("prepare_merged_superfile").entered();
-            prepare_superfile_named(
-                self.inner().as_ref(),
-                &self.inner().manifest.load(),
-                shard,
-                stem,
-            )?
+            // The snapshot the merged bytes were built from, not a fresh
+            // load. A merge runs for minutes, so a schema change can land
+            // while it does; deriving the entry's summaries from a newer
+            // snapshot would key them to columns the output does not hold.
+            prepare_superfile_named(self.inner().as_ref(), &manifest, shard, stem)?
         };
 
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)

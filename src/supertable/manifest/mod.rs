@@ -1014,9 +1014,14 @@ impl ManifestSnapshot {
                     // (counts + 1-bit admit slab, no fp32 — GiBs → MiBs at
                     // 100M docs) and EVERYONE hydrates from it; exact
                     // centroid scores come from the section.
-                    let entries = slow_vector_state::load_state(storage.as_ref(), uri, &hash)
-                        .await
-                        .map_err(|e| ManifestLoadError::SlowStateHydration(e.to_string()))?;
+                    let entries = slow_vector_state::load_state(
+                        storage.as_ref(),
+                        uri,
+                        &hash,
+                        &options.legacy_names(),
+                    )
+                    .await
+                    .map_err(|e| ManifestLoadError::SlowStateHydration(e.to_string()))?;
                     if let Some(expected) = expected_n_superfiles
                         && entries.len() as u64 != expected
                     {
