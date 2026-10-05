@@ -885,3 +885,42 @@ fn the_caps_are_themselves_capped() {
     db.apply_schema(TABLE, &caps(Some(50_000), Some(40)), None)
         .expect("a cap within what the engine carries");
 }
+
+/// Reading the document back and applying it must change nothing, which is
+/// what `apply_schema` promises. A vector column's `rot_seed` is a u64 whose
+/// default sits far above the 2^53 a JSON number carries exactly, so the
+/// document spells it as a decimal string: a consumer that reads numbers as
+/// doubles would otherwise round it, and a rounded seed is an identity
+/// change the merge refuses.
+#[test]
+fn a_vector_table_s_document_reads_back_as_a_no_op() {
+    let (_dir, db, _t) = storage_table(
+        Arc::new(Schema::new(vec![Field::new(
+            "emb",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 16),
+            true,
+        )])),
+        IndexSpec::new().vector("emb", VECTOR_DIM, Metric::Cosine),
+    );
+
+    let doc = db.schema(TABLE).expect("schema");
+    let json = doc.to_json();
+    let seed = json["fields"]
+        .as_array()
+        .expect("fields")
+        .iter()
+        .find(|f| f["name"] == "emb")
+        .and_then(|f| f["index"]["rot_seed"].as_str())
+        .expect("rot_seed is a string");
+    assert!(
+        seed.parse::<u64>().expect("a u64") > (1u64 << 53),
+        "the default seed is past what a JSON number holds exactly: {seed}"
+    );
+
+    // The document is its own patch, and applying it commits nothing.
+    let patch = SchemaPatch::from_json(&json).expect("the document is a patch");
+    let after = db
+        .apply_schema(TABLE, &patch, None)
+        .expect("a document read back applies as a no-op");
+    assert_eq!(after.schema_id(), doc.schema_id(), "nothing was committed");
+}

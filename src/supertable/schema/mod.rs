@@ -565,7 +565,14 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
         } => {
             out.insert("kind".into(), Value::from("vector"));
             out.insert("metric".into(), Value::from(metric.name()));
-            out.insert("rot_seed".into(), Value::from(*rot_seed));
+            // A decimal string, not a JSON number: `rot_seed` is a u64 and
+            // the default sits far above the 2^53 a JSON number carries
+            // exactly, so a consumer that reads numbers as doubles (any
+            // JavaScript one) would round it and hand back a different seed
+            // than it was given. Round-tripping the document has to be a
+            // no-op, and a rounded seed is an identity change the merge
+            // rightly refuses.
+            out.insert("rot_seed".into(), Value::from(rot_seed.to_string()));
             out.insert(
                 "rerank_codec".into(),
                 serde_json::to_value(rerank_codec).expect("codec name"),
@@ -630,9 +637,15 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
             },
             rot_seed: obj
                 .get("rot_seed")
-                .map(|v| {
-                    v.as_u64()
-                        .ok_or_else(|| "index rot_seed is not a u64".to_string())
+                .map(|v| match v {
+                    // Written as a string; a number is still read, so a
+                    // hand-written patch can use whichever is natural.
+                    Value::String(text) => text
+                        .parse::<u64>()
+                        .map_err(|_| format!("index rot_seed '{text}' is not a u64")),
+                    other => other
+                        .as_u64()
+                        .ok_or_else(|| "index rot_seed is not a u64".to_string()),
                 })
                 .transpose()?
                 .unwrap_or(DEFAULT_ROT_SEED),

@@ -8,7 +8,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { connect, IndexSpec } from "../infino/index.js";
-import { Schema, Field, LargeUtf8, Int64, Table, tableToIPC, vectorFromArray } from "apache-arrow";
+import { Schema, Field, LargeUtf8, Int64, FixedSizeList, Float32, Table, tableToIPC, vectorFromArray } from "apache-arrow";
 
 const titleSchema = () => new Schema([new Field("title", new LargeUtf8(), false)]);
 const names = (doc) => doc.fields.map((f) => [f.name, f.id]);
@@ -77,4 +77,31 @@ test("the schema write creates an absent table", () => {
   assert.equal(doc.max_fields, 50);
   assert.deepEqual(db.listTables(), ["fresh"]);
   assert.throws(() => db.createTable("fresh", titleSchema(), new IndexSpec()), /AlreadyExists/);
+});
+
+// A vector column's `rot_seed` is a u64 whose default is far past the 2^53 a
+// JavaScript number holds exactly. The document spells it as a decimal
+// string: as a number, `JSON.parse` would round it, and handing the rounded
+// value back would read as an attempt to change the column's identity, which
+// the engine refuses. No test created a vector column before, so the loss
+// went unnoticed on this side.
+test("a vector table's document reads back as a no-op", () => {
+  const db = connect("memory://");
+  const schema = new Schema([
+    new Field("emb", new FixedSizeList(16, new Field("item", new Float32(), true)), true),
+  ]);
+  db.createTable("vecs", schema, new IndexSpec().vector("emb", 16, "cosine"));
+
+  const doc = db.schema("vecs");
+  const emb = doc.fields.find((f) => f.name === "emb");
+  assert.equal(typeof emb.index.rot_seed, "string", "the seed crosses as a string");
+  assert.ok(
+    BigInt(emb.index.rot_seed) > BigInt(Number.MAX_SAFE_INTEGER),
+    `the default seed is past MAX_SAFE_INTEGER: ${emb.index.rot_seed}`,
+  );
+
+  // The document is its own patch; applying it changes nothing.
+  const after = db.schema("vecs", doc);
+  assert.equal(after.schema_id, doc.schema_id);
+  assert.equal(after.fields.find((f) => f.name === "emb").index.rot_seed, emb.index.rot_seed);
 });
