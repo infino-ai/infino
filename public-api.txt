@@ -617,7 +617,6 @@ pub struct infino::FieldId(pub u32)
 impl infino::FieldId
 pub const infino::FieldId::BIRTH_VERSION: infino::FieldId
 pub const infino::FieldId::ID_COLUMN: infino::FieldId
-pub fn infino::FieldId::term_key(self, &str) -> alloc::vec::Vec<u8>
 impl core::clone::Clone for infino::FieldId
 pub fn infino::FieldId::clone(&self) -> Self
 impl core::cmp::Eq for infino::FieldId
@@ -942,26 +941,15 @@ impl !core::panic::unwind_safe::RefUnwindSafe for infino::Supertable
 impl !core::panic::unwind_safe::UnwindSafe for infino::Supertable
 pub struct infino::TableSchema
 impl infino::TableSchema
-pub fn infino::TableSchema::converting(&self) -> impl core::iter::traits::iterator::Iterator<Item = infino::FieldId> + '_
-pub fn infino::TableSchema::with_conversions_cleared(&self, &[infino::FieldId]) -> core::option::Option<infino::TableSchema>
-impl infino::TableSchema
-pub fn infino::TableSchema::effective_schema(&self, &str) -> alloc::rcs::arc::Arc<arrow_schema::schema::Schema>
 pub fn infino::TableSchema::fields(&self) -> &[infino::FieldDef]
 pub fn infino::TableSchema::from_json(&serde_json::value::Value) -> core::result::Result<Self, alloc::string::String>
-pub fn infino::TableSchema::from_user_schema(&arrow_schema::schema::Schema) -> Self
-pub fn infino::TableSchema::id_field(&str) -> alloc::rcs::arc::Arc<arrow_schema::field::Field>
 pub fn infino::TableSchema::id_of(&self, &str) -> core::option::Option<infino::FieldId>
-pub fn infino::TableSchema::last_field_id(&self) -> u32
 pub fn infino::TableSchema::max_depth(&self) -> u32
 pub fn infino::TableSchema::max_fields(&self) -> u32
 pub fn infino::TableSchema::name_of(&self, infino::FieldId) -> core::option::Option<&str>
-pub fn infino::TableSchema::scalar_schema(&self, &str) -> alloc::rcs::arc::Arc<arrow_schema::schema::Schema>
 pub fn infino::TableSchema::schema_id(&self) -> u32
-pub fn infino::TableSchema::stamp_field_ids(&self, &arrow_schema::schema::Schema, &str) -> alloc::rcs::arc::Arc<arrow_schema::schema::Schema>
-pub fn infino::TableSchema::stored_schema(&self, &str) -> alloc::rcs::arc::Arc<arrow_schema::schema::Schema>
 pub fn infino::TableSchema::to_json(&self) -> serde_json::value::Value
 pub fn infino::TableSchema::tombstoned(&self) -> &[infino::FieldId]
-pub fn infino::TableSchema::user_schema(&self) -> alloc::rcs::arc::Arc<arrow_schema::schema::Schema>
 impl core::clone::Clone for infino::TableSchema
 pub fn infino::TableSchema::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::TableSchema

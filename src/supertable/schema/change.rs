@@ -572,7 +572,7 @@ impl TableSchema {
     /// The document with the conversions of the columns in `ids` complete:
     /// their old types are forgotten. `None` when none of them was
     /// converting.
-    pub fn with_conversions_cleared(&self, ids: &[FieldId]) -> Option<TableSchema> {
+    pub(crate) fn with_conversions_cleared(&self, ids: &[FieldId]) -> Option<TableSchema> {
         let mut next = self.clone();
         let mut cleared = false;
         for f in next.fields.iter_mut() {
@@ -588,7 +588,7 @@ impl TableSchema {
     }
 
     /// The columns whose conversion is outstanding.
-    pub fn converting(&self) -> impl Iterator<Item = FieldId> + '_ {
+    pub(crate) fn converting(&self) -> impl Iterator<Item = FieldId> + '_ {
         self.fields
             .iter()
             .filter(|f| f.converting_from.is_some())

@@ -111,7 +111,7 @@ impl FieldId {
     /// the same separator and term bytes as a superfile's own dictionary
     /// key, so one encoding serves both tiers and a rename changes nothing
     /// at the table level.
-    pub fn term_key(self, term: &str) -> Vec<u8> {
+    pub(crate) fn term_key(self, term: &str) -> Vec<u8> {
         make_key(&self.to_string(), term)
     }
 }
@@ -276,7 +276,7 @@ pub struct TableSchema {
 impl TableSchema {
     /// The schema of a table created from `user`: ids `1..=n` in declared
     /// order, `schema_id` 1, no indexes.
-    pub fn from_user_schema(user: &Schema) -> Self {
+    pub(crate) fn from_user_schema(user: &Schema) -> Self {
         Self::from_options(user, &[], &[])
     }
 
@@ -311,7 +311,7 @@ impl TableSchema {
     }
 
     /// The user schema: every live column in declared order, unstamped.
-    pub fn user_schema(&self) -> Arc<Schema> {
+    pub(crate) fn user_schema(&self) -> Arc<Schema> {
         Arc::new(Schema::new(
             self.fields
                 .iter()
@@ -321,7 +321,7 @@ impl TableSchema {
     }
 
     /// The id column's field, which every stored schema starts with.
-    pub fn id_field(id_column: &str) -> Arc<Field> {
+    pub(crate) fn id_field(id_column: &str) -> Arc<Field> {
         Arc::new(Field::new(
             id_column,
             DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
@@ -331,14 +331,15 @@ impl TableSchema {
 
     /// The id column followed by every live column, stamped with ids: the
     /// shape of a batch after the id column is attached.
-    pub fn effective_schema(&self, id_column: &str) -> Arc<Schema> {
+    #[cfg(test)]
+    pub(crate) fn effective_schema(&self, id_column: &str) -> Arc<Schema> {
         self.stored_fields(id_column, |_| true)
     }
 
     /// The id column followed by every live column the Parquet body may
     /// hold, stamped with ids. A vector-indexed column lives in the vector
     /// blob, never in Parquet.
-    pub fn scalar_schema(&self, id_column: &str) -> Arc<Schema> {
+    pub(crate) fn scalar_schema(&self, id_column: &str) -> Arc<Schema> {
         self.stored_fields(id_column, |f| {
             !matches!(f.index, Some(ColumnIndex::Vector { .. }))
         })
@@ -346,7 +347,7 @@ impl TableSchema {
 
     /// [`Self::scalar_schema`] without the index-only full-text columns:
     /// exactly the columns a superfile's Parquet body holds.
-    pub fn stored_schema(&self, id_column: &str) -> Arc<Schema> {
+    pub(crate) fn stored_schema(&self, id_column: &str) -> Arc<Schema> {
         self.stored_fields(id_column, |f| match &f.index {
             Some(ColumnIndex::Vector { .. }) => false,
             Some(ColumnIndex::Fts { stored, .. }) => *stored,
@@ -568,7 +569,8 @@ impl TableSchema {
     }
 
     /// The highest id ever minted, live or tombstoned.
-    pub fn last_field_id(&self) -> u32 {
+    #[cfg(test)]
+    pub(crate) fn last_field_id(&self) -> u32 {
         self.last_field_id
     }
 
@@ -594,7 +596,7 @@ impl TableSchema {
     /// `FIELD_ID_META_KEY`: a live column gets its id, the field named
     /// `id_column` gets [`FieldId::ID_COLUMN`], and a field that is neither
     /// is left as it is. Existing metadata on a field is kept.
-    pub fn stamp_field_ids(&self, stored: &Schema, id_column: &str) -> Arc<Schema> {
+    pub(crate) fn stamp_field_ids(&self, stored: &Schema, id_column: &str) -> Arc<Schema> {
         let fields: Vec<Arc<Field>> = stored
             .fields()
             .iter()
