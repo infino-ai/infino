@@ -71,7 +71,7 @@ fn column(db: &Connection, column: &str) -> Vec<String> {
 
 fn schema_error(result: Result<(), InfinoError>, expected: &str) {
     match result {
-        Err(InfinoError::Schema(m)) if m.contains(expected) => {}
+        Err(InfinoError::Schema(e)) if e.to_string().contains(expected) => {}
         other => panic!("expected a schema error mentioning {expected:?}, got {other:?}"),
     }
 }

@@ -147,7 +147,7 @@ pub infino::InfinoError::NotFound(alloc::string::String)
 pub infino::InfinoError::OverBudget(alloc::string::String)
 pub infino::InfinoError::PermissionDenied(alloc::string::String)
 pub infino::InfinoError::Query(alloc::string::String)
-pub infino::InfinoError::Schema(alloc::string::String)
+pub infino::InfinoError::Schema(infino::SchemaError)
 pub infino::InfinoError::Unsupported(alloc::string::String)
 impl core::error::Error for infino::InfinoError
 impl core::fmt::Debug for infino::InfinoError
@@ -349,12 +349,16 @@ pub infino::SchemaError::ConversionInProgress::column: alloc::string::String
 pub infino::SchemaError::DepthExceeded
 pub infino::SchemaError::DepthExceeded::cap: u32
 pub infino::SchemaError::DepthExceeded::path: alloc::string::String
+pub infino::SchemaError::DuplicateColumn
+pub infino::SchemaError::DuplicateColumn::name: alloc::string::String
 pub infino::SchemaError::FieldCapExceeded
 pub infino::SchemaError::FieldCapExceeded::cap: u32
 pub infino::SchemaError::FieldCapExceeded::current: u32
 pub infino::SchemaError::FieldCapExceeded::fields: alloc::vec::Vec<alloc::string::String>
 pub infino::SchemaError::IdentityChange
 pub infino::SchemaError::IdentityChange::attribute: alloc::string::String
+pub infino::SchemaError::Invalid
+pub infino::SchemaError::Invalid::reason: alloc::string::String
 pub infino::SchemaError::InvalidIndex
 pub infino::SchemaError::InvalidIndex::column: alloc::string::String
 pub infino::SchemaError::InvalidIndex::reason: alloc::string::String

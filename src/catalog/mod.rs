@@ -1495,12 +1495,9 @@ fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), Infino
     let mut indexes = IndexSpec::new();
     for field in patch.fields.iter().filter(|f| !f.dropped) {
         let data_type = field.data_type.clone().ok_or_else(|| {
-            InfinoError::Schema(
-                SchemaError::TypeRequired {
-                    column: field.name.clone(),
-                }
-                .to_string(),
-            )
+            InfinoError::Schema(SchemaError::TypeRequired {
+                column: field.name.clone(),
+            })
         })?;
         match &field.index {
             Some(ColumnIndex::Fts {
@@ -1523,10 +1520,10 @@ fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), Infino
             }
             Some(ColumnIndex::Vector { metric, .. }) => {
                 let DataType::FixedSizeList(_, dim) = &data_type else {
-                    return Err(InfinoError::Schema(format!(
-                        "column `{}` carries a vector index but is not a vector type",
-                        field.name
-                    )));
+                    return Err(InfinoError::Schema(SchemaError::InvalidIndex {
+                        column: field.name.clone(),
+                        reason: "a vector index needs a vector column".to_owned(),
+                    }));
                 };
                 indexes = indexes.vector(field.name.clone(), *dim as usize, *metric);
             }
@@ -1555,10 +1552,9 @@ fn validate_schema(schema: &SchemaRef) -> Result<(), InfinoError> {
     let mut seen = HashSet::new();
     for field in schema.fields() {
         if !seen.insert(field.name().as_str()) {
-            return Err(InfinoError::Schema(format!(
-                "duplicate column name: {}",
-                field.name()
-            )));
+            return Err(InfinoError::Schema(SchemaError::DuplicateColumn {
+                name: field.name().clone(),
+            }));
         }
     }
     Ok(())

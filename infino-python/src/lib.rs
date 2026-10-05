@@ -92,10 +92,12 @@ fn py_err(e: CoreError) -> PyErr {
     match e {
         CoreError::NotFound(m) => PyKeyError::new_err(m),
         CoreError::AlreadyExists(m)
-        | CoreError::Schema(m)
         | CoreError::Cardinality(m)
         | CoreError::Config(m)
         | CoreError::Query(m) => PyValueError::new_err(m),
+        // The schema cause is typed on the Rust side; Python gets its
+        // message, which names the column, cap or version at fault.
+        CoreError::Schema(e) => PyValueError::new_err(e.to_string()),
         CoreError::Io(m) | CoreError::Backend(m) => PyRuntimeError::new_err(m),
         // A connection-memory-budget refusal: recoverable, so raise the typed
         // ConnectionMemoryBudgetError the caller can catch and back off on.

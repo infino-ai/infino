@@ -81,7 +81,10 @@ fn map_err(e: InfinoError) -> Error {
         InfinoError::AlreadyExists(m) => {
             Error::new(Status::InvalidArg, format!("AlreadyExists: {m}"))
         }
-        InfinoError::Schema(m) | InfinoError::Cardinality(m) | InfinoError::Query(m) => {
+        // The schema cause is typed on the Rust side; JS gets its message,
+        // which names the column, cap or version at fault.
+        InfinoError::Schema(e) => Error::new(Status::InvalidArg, e.to_string()),
+        InfinoError::Cardinality(m) | InfinoError::Query(m) => {
             Error::new(Status::InvalidArg, m)
         }
         InfinoError::Io(m) | InfinoError::Backend(m) => Error::new(Status::GenericFailure, m),

@@ -16,7 +16,7 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
     CompactionSettings, Connection, FieldId, FieldPatch, IndexSpec, InfinoError, OptimizeOptions,
-    SchemaPatch, TableSchema, connect,
+    SchemaError, SchemaPatch, TableSchema, connect,
 };
 use tempfile::TempDir;
 
@@ -172,7 +172,7 @@ fn an_absent_nullable_column_is_null_filled_and_a_missing_required_one_refused()
         .append(&batch(vec![("score", ints(vec![Some(1)]))]))
         .expect_err("title is required");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("title") && m.contains("not nullable")),
+        matches!(&err, InfinoError::Schema(SchemaError::MissingColumn { column }) if column == "title"),
         "{err}"
     );
     let err = docs
@@ -182,7 +182,10 @@ fn an_absent_nullable_column_is_null_filled_and_a_missing_required_one_refused()
         )]))
         .expect_err("a null in a required column");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("null")),
+        matches!(
+            &err,
+            InfinoError::Schema(SchemaError::NullInNonNullable { .. })
+        ),
         "{err}"
     );
     assert_eq!(db.schema(TABLE).expect("schema").schema_id(), 1);
@@ -201,7 +204,7 @@ fn a_type_that_disagrees_with_the_frozen_one_is_refused() {
         ]))
         .expect_err("score is frozen at Int64");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("score") && m.contains("Int64") && m.contains("Utf8")),
+        matches!(&err, InfinoError::Schema(SchemaError::TypeMismatch { column, .. }) if column == "score"),
         "{err}"
     );
 }
@@ -358,7 +361,7 @@ fn a_column_cannot_stop_admitting_nulls_over_rows_a_peer_committed() {
         )
         .expect_err("score cannot stop admitting nulls over a committed null");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("score") && m.contains("rows")),
+        matches!(&err, InfinoError::Schema(SchemaError::NotEmpty { column }) if column == "score"),
         "{err}"
     );
 
@@ -501,7 +504,10 @@ fn the_read_document_applies_as_a_no_op_and_the_expected_id_guards_the_write() {
         .apply_schema(TABLE, &patch(vec![add("more", DataType::Int64)]), None)
         .expect_err("over the cap");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("cap")),
+        matches!(
+            &err,
+            InfinoError::Schema(SchemaError::FieldCapExceeded { .. })
+        ),
         "{err}"
     );
 }
@@ -555,7 +561,7 @@ fn the_schema_write_creates_an_absent_table_and_create_table_refuses_a_present_o
         )
         .expect_err("a new table's columns need types");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("needs a type")),
+        matches!(&err, InfinoError::Schema(SchemaError::TypeRequired { .. })),
         "{err}"
     );
 }
@@ -671,7 +677,7 @@ fn two_writers_adding_different_columns_both_land() {
         ]))
         .expect_err("z is frozen at Int64 by the winner");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("z")),
+        matches!(&err, InfinoError::Schema(SchemaError::TypeMismatch { column, .. }) if column == "z"),
         "{err}"
     );
     let fresh = connect(path).expect("connect");

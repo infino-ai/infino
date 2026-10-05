@@ -139,21 +139,19 @@ impl Table for RemoteTable {
     /// to the batch.
     fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
         let batch = rows_to_batch(rows, &TableSchema::from_user_schema(&self.schema))
-            .map_err(|e| InfinoError::Schema(e.to_string()).with_context("append_rows", None))?;
+            .map_err(|e| InfinoError::Schema(e).with_context("append_rows", None))?;
         self.append(&batch)
     }
 
     fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
-        let batch =
-            rows_to_batch(rows, &TableSchema::from_user_schema(&self.schema)).map_err(|e| {
-                InfinoError::Schema(e.to_string()).with_context("append_rows_named", None)
-            })?;
+        let batch = rows_to_batch(rows, &TableSchema::from_user_schema(&self.schema))
+            .map_err(|e| InfinoError::Schema(e).with_context("append_rows_named", None))?;
         self.append_named(&batch, source_name)
     }
 
     fn update_rows(&self, predicate: Expr, rows: &[Value]) -> Result<MutationStats, InfinoError> {
         let batch = rows_to_batch(rows, &TableSchema::from_user_schema(&self.schema))
-            .map_err(|e| InfinoError::Schema(e.to_string()).with_context("update_rows", None))?;
+            .map_err(|e| InfinoError::Schema(e).with_context("update_rows", None))?;
         self.update(predicate, &batch)
     }
 

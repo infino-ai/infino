@@ -94,6 +94,23 @@ pub enum SchemaError {
         /// The column's name.
         column: String,
     },
+    /// Two columns of a submitted Arrow schema carry the same name.
+    #[error("duplicate column name: {name}")]
+    DuplicateColumn {
+        /// The repeated name.
+        name: String,
+    },
+
+    /// A schema problem the engine does not classify further. The reason is
+    /// the originating error's own message. New causes earn their own
+    /// variant over time; matching this one means "schema problem, details
+    /// only in the text".
+    #[error("{reason}")]
+    Invalid {
+        /// What went wrong.
+        reason: String,
+    },
+
     /// A submitted name collides with a live column.
     #[error("the name `{name}` is taken by a live column")]
     NameTaken {

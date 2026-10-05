@@ -68,9 +68,15 @@ pub enum InfinoError {
     #[error("already exists: {0}")]
     AlreadyExists(String),
 
-    /// Schema or column validation failed.
+    /// Schema or column validation failed: a row that does not fit the
+    /// table's schema, or a schema write the table refused.
+    ///
+    /// The cause is carried typed, so a caller can tell a field-cap breach
+    /// from a compare-and-set conflict from a type mismatch and answer each
+    /// differently, instead of matching on the message text. Causes the
+    /// engine does not classify further arrive as [`SchemaError::Invalid`].
     #[error("schema: {0}")]
-    Schema(String),
+    Schema(SchemaError),
 
     /// A predicate matched a different row count than required, or
     /// exceeded the mutation cap.
@@ -149,7 +155,11 @@ impl InfinoError {
         match self {
             Self::NotFound(m) => Self::NotFound(format!("{prefix}: {m}")),
             Self::AlreadyExists(m) => Self::AlreadyExists(format!("{prefix}: {m}")),
-            Self::Schema(m) => Self::Schema(format!("{prefix}: {m}")),
+            // The only variant carrying a typed cause rather than a message.
+            // Prefixing would mean flattening it back to text, which is the
+            // thing this variant exists to avoid, so it passes through: the
+            // schema error names its own column or cap already.
+            Self::Schema(e) => Self::Schema(e),
             Self::Cardinality(m) => Self::Cardinality(format!("{prefix}: {m}")),
             Self::Io(m) => Self::Io(format!("{prefix}: {m}")),
             Self::PermissionDenied(m) => Self::PermissionDenied(format!("{prefix}: {m}")),
@@ -346,7 +356,9 @@ fn manifest_load_variant(e: &ManifestLoadError) -> fn(String) -> InfinoError {
 
 impl From<SuperfileBuildError> for InfinoError {
     fn from(e: SuperfileBuildError) -> Self {
-        InfinoError::Schema(e.to_string())
+        InfinoError::Schema(SchemaError::Invalid {
+            reason: e.to_string(),
+        })
     }
 }
 
@@ -379,7 +391,14 @@ impl From<SupertableBuildError> for InfinoError {
         if matches!(e, SupertableBuildError::UnknownAnalyzer { .. }) {
             return InfinoError::Config(e.to_string());
         }
-        InfinoError::Schema(e.to_string())
+        match e {
+            // The cause is already classified; hand it to the caller whole
+            // rather than flattening it into its own message.
+            SupertableBuildError::Schema(schema) => InfinoError::Schema(schema),
+            other => InfinoError::Schema(SchemaError::Invalid {
+                reason: other.to_string(),
+            }),
+        }
     }
 }
 
@@ -491,7 +510,10 @@ mod tests {
             InfinoError::AlreadyExists("t".into()).to_string(),
             "already exists: t"
         );
-        assert_eq!(InfinoError::Schema("t".into()).to_string(), "schema: t");
+        assert_eq!(
+            InfinoError::Schema(SchemaError::Invalid { reason: "t".into() }).to_string(),
+            "schema: t"
+        );
         assert_eq!(
             InfinoError::Cardinality("t".into()).to_string(),
             "cardinality: t"

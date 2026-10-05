@@ -15,7 +15,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
     CompactionSettings, Connection, FieldId, FieldPatch, IndexSpec, InfinoError, Metric,
-    OptimizeOptions, SchemaPatch, connect,
+    OptimizeOptions, SchemaError, SchemaPatch, connect,
 };
 use tempfile::TempDir;
 
@@ -163,7 +163,7 @@ fn a_widening_is_metadata_and_the_files_catch_up_on_optimize() {
         )]))
         .expect_err("the frozen type is now Int64");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("Int64")),
+        matches!(&err, InfinoError::Schema(SchemaError::TypeMismatch { .. })),
         "{err}"
     );
     table
@@ -215,7 +215,7 @@ fn a_rewrite_flips_at_once_and_compaction_converts_the_files() {
         .append(&batch(vec![("s", strings(vec![Some("4")]))]))
         .expect_err("strings are refused from the flip");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("Int64")),
+        matches!(&err, InfinoError::Schema(SchemaError::TypeMismatch { .. })),
         "{err}"
     );
     table
@@ -231,7 +231,10 @@ fn a_rewrite_flips_at_once_and_compaction_converts_the_files() {
         .apply_schema(TABLE, &retype("s", DataType::Float64), None)
         .expect_err("a second change while converting");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("converting")),
+        matches!(
+            &err,
+            InfinoError::Schema(SchemaError::ConversionInProgress { .. })
+        ),
         "{err}"
     );
 
@@ -372,7 +375,10 @@ fn the_column_behind_the_vector_index_cannot_be_retyped_or_dropped() {
         .apply_schema(TABLE, &retype("emb", DataType::LargeUtf8), None)
         .expect_err("the vector index is built on it");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("vector index")),
+        matches!(
+            &err,
+            InfinoError::Schema(SchemaError::BacksGlobalVectorIndex { .. })
+        ),
         "{err}"
     );
     let drop = SchemaPatch {
@@ -388,7 +394,10 @@ fn the_column_behind_the_vector_index_cannot_be_retyped_or_dropped() {
         .apply_schema(TABLE, &drop, None)
         .expect_err("nor dropped");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("vector index")),
+        matches!(
+            &err,
+            InfinoError::Schema(SchemaError::BacksGlobalVectorIndex { .. })
+        ),
         "{err}"
     );
 }
@@ -676,14 +685,14 @@ fn the_caps_are_themselves_capped_and_a_template_pattern_is_bounded() {
         .apply_schema(TABLE, &caps(Some(u32::MAX), None), None)
         .expect_err("a cap that removes the bound");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("max_fields")),
+        matches!(&err, InfinoError::Schema(SchemaError::CapExceeded { setting, .. }) if setting == "max_fields"),
         "{err}"
     );
     let err = db
         .apply_schema(TABLE, &caps(None, Some(10_000)), None)
         .expect_err("nor a depth that removes it");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("max_depth")),
+        matches!(&err, InfinoError::Schema(SchemaError::CapExceeded { setting, .. }) if setting == "max_depth"),
         "{err}"
     );
     db.apply_schema(TABLE, &caps(Some(50_000), Some(40)), None)
@@ -696,7 +705,7 @@ fn the_caps_are_themselves_capped_and_a_template_pattern_is_bounded() {
         .apply_schema(TABLE, &SchemaPatch::from_json(&wild).expect("patch"), None)
         .expect_err("a pattern that costs more than the path it matches");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("wildcards")),
+        matches!(&err, InfinoError::Schema(SchemaError::CapExceeded { setting, .. }) if setting.contains("wildcards")),
         "{err}"
     );
 }
@@ -877,7 +886,7 @@ fn a_fixed_size_type_needs_a_positive_size() {
         )
         .expect_err("a negative fixed-size list size is refused");
     assert!(
-        matches!(&err, InfinoError::Schema(m) if m.contains("positive")),
+        matches!(&err, InfinoError::Schema(SchemaError::InvalidType { .. })),
         "{err:?}"
     );
 
