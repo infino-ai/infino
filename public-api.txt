@@ -384,6 +384,8 @@ pub infino::SchemaError::NotEmpty
 pub infino::SchemaError::NotEmpty::column: alloc::string::String
 pub infino::SchemaError::NullInNonNullable
 pub infino::SchemaError::NullInNonNullable::column: alloc::string::String
+pub infino::SchemaError::PathCollision
+pub infino::SchemaError::PathCollision::path: alloc::string::String
 pub infino::SchemaError::PathShadowsColumn
 pub infino::SchemaError::PathShadowsColumn::column: alloc::string::String
 pub infino::SchemaError::PathShadowsColumn::path: alloc::string::String

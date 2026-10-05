@@ -190,7 +190,14 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
             reason: "a row is a JSON object".to_owned(),
         })?;
         let mut leaves = Vec::new();
-        flatten(object, "", 1, schema.max_depth(), &mut leaves)?;
+        flatten(
+            object,
+            "",
+            1,
+            schema.max_depth(),
+            schema.max_fields(),
+            &mut leaves,
+        )?;
         for (path, leaf) in leaves {
             let index = match by_path.get(&path) {
                 Some(&i) => i,
@@ -341,6 +348,7 @@ fn flatten<'a>(
     prefix: &str,
     depth: u32,
     max_depth: u32,
+    max_fields: u32,
     out: &mut Vec<(String, Leaf<'a>)>,
 ) -> Result<(), SchemaError> {
     for (key, value) in object {
@@ -358,7 +366,7 @@ fn flatten<'a>(
                         path,
                     });
                 }
-                flatten(inner, &path, depth + 1, max_depth, out)?;
+                flatten(inner, &path, depth + 1, max_depth, max_fields, out)?;
             }
             Value::Array(items) => {
                 if items.is_empty() {
@@ -373,6 +381,11 @@ fn flatten<'a>(
                     // lists disagree about what a position means as soon as
                     // two elements carried different keys.
                     let mut per_path: Vec<(String, Vec<Option<&'a Value>>)> = Vec::new();
+                    // Paths are looked up once per leaf per element, so the
+                    // lookup is indexed rather than scanned: an array whose
+                    // elements each carry their own key would otherwise
+                    // compare every path against every other one.
+                    let mut index_of: HashMap<String, usize> = HashMap::new();
                     for (element, item) in items.iter().enumerate() {
                         let mut leaves = Vec::new();
                         let inner = item.as_object().expect("every item is an object");
@@ -382,8 +395,7 @@ fn flatten<'a>(
                                 path,
                             });
                         }
-                        flatten(inner, &path, depth + 1, max_depth, &mut leaves)?;
-                        let before: Vec<usize> = per_path.iter().map(|(_, v)| v.len()).collect();
+                        flatten(inner, &path, depth + 1, max_depth, max_fields, &mut leaves)?;
                         for (leaf_path, leaf) in leaves {
                             let values = match leaf {
                                 Leaf::Scalar(v) => vec![Some(v)],
@@ -398,19 +410,50 @@ fn flatten<'a>(
                                     return Err(SchemaError::NestedArray { path: leaf_path });
                                 }
                             };
-                            match per_path.iter_mut().find(|(p, _)| *p == leaf_path) {
-                                Some((_, all)) => all.extend(values),
+                            match index_of.get(&leaf_path) {
+                                Some(&i) => {
+                                    let all = &mut per_path[i].1;
+                                    // The same invariant from the other side:
+                                    // this element has already given this
+                                    // path a value, so a second key of it
+                                    // reached the same path. Taking both
+                                    // would slide this leaf one position
+                                    // ahead of its siblings for the whole
+                                    // rest of the array.
+                                    if all.len() != element {
+                                        return Err(SchemaError::PathCollision { path: leaf_path });
+                                    }
+                                    all.extend(values);
+                                }
                                 None => {
+                                    // Each distinct leaf path is a column the
+                                    // table would have to grow, so the field
+                                    // cap bounds them here, while the array
+                                    // is being laid out. Checked only after,
+                                    // an array whose elements each carry
+                                    // their own key would first allocate one
+                                    // position per element for every one of
+                                    // them.
+                                    if per_path.len() as u32 >= max_fields {
+                                        return Err(SchemaError::FieldCapExceeded {
+                                            cap: max_fields,
+                                            current: per_path.len() as u32,
+                                            fields: vec![leaf_path],
+                                        });
+                                    }
                                     // A path first seen on a later element
                                     // is null in the elements before it.
                                     let mut all = vec![None; element];
                                     all.extend(values);
+                                    index_of.insert(leaf_path.clone(), per_path.len());
                                     per_path.push((leaf_path, all));
                                 }
                             }
                         }
-                        for ((_, all), filled) in per_path.iter_mut().zip(before) {
-                            if all.len() == filled {
+                        // Every leaf takes this element's position, null
+                        // where the element carried nothing for it.
+                        for (_, all) in per_path.iter_mut() {
+                            if all.len() == element {
                                 all.push(None);
                             }
                         }
@@ -1232,5 +1275,55 @@ mod tests {
         assert_eq!(b.len(), 2);
         assert!(b.is_null(0));
         assert_eq!(b.value(1), 9);
+    }
+
+    /// Two keys of one element reaching the same path is the same
+    /// misalignment a nested array would cause, from the other side: the
+    /// leaf would take two positions for one element and name a different
+    /// element from its siblings for the whole rest of the array. The
+    /// document-level collision is already refused; this one has to be too.
+    #[test]
+    fn two_keys_of_one_element_reaching_one_path_are_refused() {
+        let t = table(vec![]);
+        let err = rows_to_batch(
+            &[json!({"xs": [{"a": {"b": 1}, "a.b": 2, "c": 3}, {"c": 4}]})],
+            &t,
+        )
+        .expect_err("a literal `a.b` beside a nested `a: {b: ..}` in one element");
+        assert!(
+            matches!(&err, SchemaError::PathCollision { path } if path == "xs.a.b"),
+            "{err:?}"
+        );
+    }
+
+    /// An array of objects whose elements each carry their own key asks for
+    /// one column per element, and every column holds one position per
+    /// element. Counted only after the array is laid out, that is the
+    /// element count squared in cells before anything refuses it; the cap
+    /// has to bound the paths while they are being discovered.
+    #[test]
+    fn the_field_cap_bounds_an_array_of_objects_as_it_is_laid_out() {
+        let mut doc = table(vec![]).to_json();
+        doc["max_fields"] = json!(3);
+        let t = TableSchema::from_json(&doc).expect("schema");
+
+        let elements: Vec<Value> = (0..64).map(|i| json!({format!("k{i}"): i})).collect();
+        let err = rows_to_batch(&[json!({"xs": elements})], &t)
+            .expect_err("64 distinct keys cannot fit a cap of 3");
+        // The refusal names the one path that broke the cap, which is what
+        // says it came while the array was being laid out. Counted after,
+        // it would name all 64 — and would have allocated a position per
+        // element for each of them first.
+        assert!(
+            matches!(
+                &err,
+                SchemaError::FieldCapExceeded { cap: 3, current: 3, fields } if fields.len() == 1
+            ),
+            "{err:?}"
+        );
+
+        // An array that stays within the cap is unaffected.
+        let ok: Vec<Value> = (0..64).map(|i| json!({"k": i})).collect();
+        rows_to_batch(&[json!({"xs": ok})], &t).expect("one path, many elements");
     }
 }

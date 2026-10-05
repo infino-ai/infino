@@ -150,6 +150,20 @@ pub enum SchemaError {
         path: String,
     },
 
+    /// Two keys of one element of an array of objects flatten to the same
+    /// path. The leaves of an array of objects line up one position per
+    /// element; giving one leaf two values for a single element slides it
+    /// out of step with its siblings, so every later position in it names a
+    /// different element than it does in them.
+    #[error(
+        "two keys of one element flatten to the same path `{path}`, which \
+         has only one position per element to hold them"
+    )]
+    PathCollision {
+        /// The flattened path both keys reached.
+        path: String,
+    },
+
     /// Two columns of a submitted Arrow schema carry the same name.
     #[error("duplicate column name: {name}")]
     DuplicateColumn {
