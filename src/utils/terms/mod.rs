@@ -256,6 +256,9 @@ pub(crate) struct TermBlockWriter<W: Write> {
     in_block: usize,
     /// `(first key, byte offset)` of every finished block.
     index: Vec<(Vec<u8>, u64)>,
+    /// Total length of the keys in `index`, kept so [`Self::encoded_len`]
+    /// is constant-time.
+    index_key_bytes: usize,
     n_terms: u64,
 }
 
@@ -270,8 +273,24 @@ impl<W: Write> TermBlockWriter<W> {
             prev_offset: 0,
             in_block: 0,
             index: Vec::new(),
+            index_key_bytes: 0,
             n_terms: 0,
         }
+    }
+
+    /// Bytes [`Self::finish`] would write if called now: the blocks so far,
+    /// the open one, and the index and footer covering them.
+    pub(crate) fn encoded_len(&self) -> usize {
+        let (open_blocks, open_key) = match self.in_block {
+            0 => (0, 0),
+            _ => (1, self.block_first_key.len()),
+        };
+        self.written as usize
+            + self.block.len()
+            + self.index_key_bytes
+            + open_key
+            + (self.index.len() + open_blocks) * INDEX_ENTRY_BYTES
+            + TERM_BLOCKS_FOOTER_BYTES
     }
 
     /// Append one term. Keys must arrive strictly ascending.
@@ -334,6 +353,7 @@ impl<W: Write> TermBlockWriter<W> {
         if self.in_block == 0 {
             return Ok(());
         }
+        self.index_key_bytes += self.block_first_key.len();
         self.index
             .push((take(&mut self.block_first_key), self.written));
         self.out.write_all(&self.block)?;
