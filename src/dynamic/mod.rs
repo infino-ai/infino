@@ -858,11 +858,8 @@ mod tests {
     #[test]
     fn an_integer_a_float_column_cannot_hold_is_refused() {
         let big = (1i64 << 53) + 1;
-        let err = rows_to_batch(
-            &[json!({"n": big}), json!({"n": 1.5})],
-            &table(Vec::new()),
-        )
-        .expect_err("the integer would be rounded");
+        let err = rows_to_batch(&[json!({"n": big}), json!({"n": 1.5})], &table(Vec::new()))
+            .expect_err("the integer would be rounded");
         assert!(
             matches!(
                 &err,
@@ -891,11 +888,8 @@ mod tests {
     /// An integer inside f64's exact range still joins a float column.
     #[test]
     fn an_exact_integer_still_joins_a_float_column() {
-        let batch = rows_to_batch(
-            &[json!({"n": 3}), json!({"n": 1.5})],
-            &table(Vec::new()),
-        )
-        .expect("an exact integer is fine beside a float");
+        let batch = rows_to_batch(&[json!({"n": 3}), json!({"n": 1.5})], &table(Vec::new()))
+            .expect("an exact integer is fine beside a float");
         assert_eq!(types(&batch)["n"], DataType::Float64);
     }
 
@@ -1200,4 +1194,3 @@ mod tests {
         assert_eq!(b.value(1), 9);
     }
 }
-
