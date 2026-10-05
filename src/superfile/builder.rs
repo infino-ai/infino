@@ -2763,22 +2763,15 @@ impl SuperfileBuilder {
         Ok((buf, stats))
     }
 
-    /// Hydrate: build ONE no-blob superfile straight from Arrow batches whose
-    /// `_id` column is already prepended at index 0, streaming each batch
-    /// through [`ParquetBodyEncoder`] so the whole corpus is never held in RAM.
+    /// Hydrate: build one no-blob superfile straight from Arrow batches whose
+    /// `_id` column is already prepended at index 0. Each batch is streamed
+    /// through [`ParquetBodyEncoder`] and dropped, so peak memory is one batch
+    /// plus the running row-group, independent of the superfile size (unlike
+    /// [`finish`](Self::finish), which buffers every batch and encodes at the end).
     ///
-    /// This is the contrast to [`finish`](Self::finish), which buffers every
-    /// `add_batch` into `self.batches` and encodes the lot at the end (the
-    /// cost that makes a single large superfile slow to build). Here each batch
-    /// is written to the Parquet body and dropped, so peak memory is one batch
-    /// plus the running row-group, independent of the superfile size.
-    ///
-    /// `opts` must carry empty FTS and vector columns (no-blob). The assembled
-    /// superfile is streamed to `output`; the returned [`ParquetLayout`] gives
-    /// its size and blob offsets for manifest metadata.
-    ///
-    /// Isolated hydrate path: nothing in the normal append or compaction flow
-    /// calls this, so it cannot change existing ingest behaviour.
+    /// `opts` must carry empty FTS and vector columns (no-blob). The superfile is
+    /// streamed to `output`; the returned [`ParquetLayout`] gives its size and
+    /// blob offsets for manifest metadata.
     pub(crate) fn build_no_blob_from_batches_to<W: Write>(
         opts: BuilderOptions,
         batches: &[RecordBatch],

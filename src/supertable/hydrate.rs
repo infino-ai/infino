@@ -1,26 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Hydrate: a bulk-load path that writes a batch stream straight into a few
-//! big superfiles and publishes them in ONE commit.
+//! Hydrate: bulk-load a batch stream straight into a few big no-blob
+//! superfiles, SQL-only.
 //!
-//! The ordinary [`append`](crate::supertable::handle::Supertable::append)
-//! path builds one superfile per `append` call and leans on `optimize` + `gc`
-//! to coalesce the many small files that results in. For data already in
-//! columnar form and queried with SQL only, that is pure overhead: there is no
-//! text to score and no vector to search, so the per-call files and the
-//! compaction pass that merges them buy nothing.
-//!
-//! [`hydrate_from_batches`] skips both. It coalesces the input batches into
-//! `~target_rows`-row chunks, streams each chunk through
-//! [`SuperfileBuilder::build_no_blob_from_batches_to`] into one no-blob
-//! superfile, and publishes the whole set through the same tested prepare +
-//! commit primitives the append path's `commit` uses — so the resulting
-//! manifest entries are built exactly as a normal commit's are, only coalesced
-//! and without an optimize pass.
-//!
-//! Isolated path: nothing in the append, update, or compaction flow calls into
-//! this module, so it cannot change existing ingest behaviour.
+//! `append` builds one superfile per call and relies on `optimize` + `gc` to
+//! merge them. For data already in columnar form and queried with SQL only,
+//! the index builds and that merge pass are wasted. [`hydrate_from_batches`]
+//! coalesces the batches into `~target_rows`-row chunks, builds each as a
+//! no-blob superfile, and commits them through the same primitives `append`'s
+//! commit uses, with no optimize or GC.
 
 use std::sync::Arc;
 
@@ -46,25 +35,16 @@ use crate::{
     },
 };
 
-/// Bulk-load `user_batches` (schema == the table's user schema, i.e. WITHOUT
-/// the `_id` column) into `handle` as a small, bounded number of no-blob
-/// superfiles. Returns the total number of rows committed.
+/// Bulk-load `user_batches` (the user schema, no `_id`) into `handle` as a few
+/// no-blob superfiles and return the rows committed. Batches are coalesced into
+/// `~target_rows`-row chunks, one superfile each; `_id` is minted and prepended
+/// per row exactly as `append` does. No optimize or GC.
 ///
-/// Input batches are coalesced into `~target_rows`-row chunks; each chunk
-/// becomes exactly one superfile. The `_id` column is minted per row from the
-/// handle's id generator and prepended, matching the append path, so the rows
-/// are indistinguishable from appended ones once committed.
-///
-/// SQL-only: the table must declare no full-text and no vector columns. Hydrate
-/// writes empty index blobs, so a hydrated table is not searchable by BM25 or
-/// vector; calling it on an indexed table would silently commit unsearchable
-/// rows, so it is rejected up front with [`BuildError::HydrateRequiresNoIndex`].
-///
-/// No optimize or GC pass runs. **Not atomic:** the superfiles are committed per
-/// wave (to keep memory bounded), so a mid-load failure leaves the already-
-/// committed waves in the table. A hydrate is meant for a fresh table; recover a
-/// failed one by dropping the table and re-hydrating, not by re-calling hydrate
-/// on the partially-loaded table (that would re-mint ids and duplicate rows).
+/// - SQL-only: rejects a table with FTS or vector columns, since hydrate writes
+///   empty index blobs and those rows would never be found by search.
+/// - Not atomic: superfiles commit per wave, so a failure part way leaves the
+///   committed waves in place. Recover by dropping the table and re-hydrating,
+///   not by re-calling hydrate (that re-mints ids and duplicates rows).
 pub(crate) fn hydrate_from_batches(
     handle: &Supertable,
     user_batches: impl IntoIterator<Item = RecordBatch>,
@@ -73,48 +53,42 @@ pub(crate) fn hydrate_from_batches(
     let inner = handle.inner();
     let scalar_schema = inner.options.scalar_schema();
 
-    // SQL-only precondition. An indexed table hydrated here would get empty FTS
-    // and vector blobs and its rows would be invisible to BM25 and vector search
-    // with no error, so reject it rather than silently drop the index.
+    // Reject an indexed table: hydrate writes empty FTS/vector blobs, so its
+    // rows would be invisible to search. Fail loudly, don't drop the index.
     let fts = inner.options.fts_columns.len();
     let vector = inner.options.vector_columns.len();
     if fts != 0 || vector != 0 {
         return Err(BuildError::HydrateRequiresNoIndex { fts, vector });
     }
 
-    // No-blob builder options: same scalar schema, id column, compression,
-    // row-group size and id-page limit as a normal build (inherited via
-    // `builder_options`), but with FTS and vector columns cleared so each build
-    // writes a pure Parquet body and emits empty index blobs.
+    // No-blob build options: same as a normal build, but with the FTS and vector
+    // columns cleared so each superfile is a plain Parquet body, empty blobs.
     let mut base_opts = inner.options.builder_options();
     base_opts.fts_columns = Vec::new();
     base_opts.vector_columns = Vec::new();
 
-    // Adaptive sizing. Both the wave width (superfiles built at once) and the
-    // chunk size are derived from what THIS process actually has, so one binary
-    // runs safely from a 2 GiB container to a 192-core box without OOMing or
-    // leaving cores idle. Build on the reader pool: the work is CPU (Parquet
-    // encode), and its thread count already honours a cgroup CPU quota.
-    let build_pool = &inner.options.reader_pool;
-    let cores = build_pool.current_num_threads().max(1) as u64;
-
-    // Budget = 40% of the memory available to this process (the cgroup limit when
-    // hosted, host MemAvailable on bare metal), leaving headroom for the wave being
-    // committed, the caller's decode, and allocator slack. `None` = we can't measure
-    // it, so fall back to one chunk at a time with no byte cap.
+    // Adaptive sizing: one binary from a 2 GiB container to a 192-core box, no
+    // OOM, no idle cores. How many superfiles build at once, and how big each
+    // chunk is, both come from what the process actually has:
+    //
+    //   budget   = 40% of available memory    (cgroup limit, or host MemAvailable)
+    //   per_slot = chunk bytes * 1.3          (raw chunk + its compressed output)
+    //   wave     = as many chunks as fit the budget, capped at one per core
+    //   cap      = budget / 1.3               (so one chunk always fits a slot)
+    //
+    // The cap makes `target_rows` a max: a big box hits the row target first, a
+    // starved box hits the byte cap first and builds smaller chunks. `None`
+    // budget (can't measure memory) means one chunk at a time, no cap.
+    //
+    // Build runs on the reader pool: the work is CPU (Parquet encode), and its
+    // thread count already follows a cgroup CPU quota.
     const BUDGET_NUMER: u64 = 2;
     const BUDGET_DENOM: u64 = 5; // 40%
-    // A build slot holds the raw Arrow chunk plus a growing *compressed* output and
-    // encode scratch: ~1.3x the chunk, not a second full copy.
     const SLOT_NUMER: u64 = 13;
     const SLOT_DENOM: u64 = 10; // 1.3x
+    let build_pool = &inner.options.reader_pool;
+    let cores = build_pool.current_num_threads().max(1) as u64;
     let build_budget = available_memory_bytes().map(|a| a / BUDGET_DENOM * BUDGET_NUMER);
-
-    // Cap one chunk's Arrow bytes so a single slot always fits the budget
-    // (per_slot = chunk*1.3 <= budget, hence wave_width >= 1). This turns
-    // `target_rows` into a MAX hint: a big box hits the row target first (the cap
-    // sits far above it); a memory-starved box hits the byte cap first and shrinks
-    // chunks instead of OOMing, with no caller/harness change.
     let chunk_byte_cap = build_budget
         .map(|b| (b * SLOT_DENOM / SLOT_NUMER).max(1))
         .unwrap_or(u64::MAX);
@@ -125,21 +99,9 @@ pub(crate) fn hydrate_from_batches(
         max_bytes: chunk_byte_cap,
     };
 
-    // Build and commit in bounded waves. Each wave builds its chunks in parallel,
-    // commits them, and frees their bytes before the next wave starts. Committing
-    // per wave (rather than once at the end) keeps only one wave's superfiles
-    // resident; holding the whole table was the original OOM. A fresh load has no
-    // concurrent readers, so partial visibility between waves is fine. Each commit
-    // reuses the append path's prepare + persist primitives, so the manifest
-    // entries are built exactly as a normal commit's.
-    //
-    // A wave grows chunk by chunk until its summed per-slot footprint would exceed
-    // the budget, or it reaches one chunk per core. Accumulating by measured bytes
-    // (not a count derived from the first chunk) keeps the wave inside the budget
-    // even when later chunks are larger than the first. `chunks` can't peek, so a
-    // chunk that doesn't fit the current wave is held in `carry` and starts the
-    // next one. The first chunk always joins its wave, even if it alone exceeds the
-    // budget (there is nothing smaller to build), so progress is guaranteed.
+    // Build each wave in parallel, commit it, free its bytes, then the next.
+    // Committing per wave (not once at the end) keeps only one wave resident. A
+    // fresh load has no readers, so partial visibility between waves is fine.
     let slot_bytes =
         |chunk: &[RecordBatch]| (chunk_arrow_bytes(chunk) * SLOT_NUMER / SLOT_DENOM).max(1);
     let mut total_rows: u64 = 0;
@@ -148,8 +110,9 @@ pub(crate) fn hydrate_from_batches(
     while let Some(first) = carry.take().or_else(|| chunks.next()) {
         let mut wave_bytes = slot_bytes(&first);
         let mut wave: Vec<Vec<RecordBatch>> = vec![first];
-        // Grow the wave only when the budget is known; `None` (can't measure
-        // memory) stays at one chunk at a time.
+        // Add chunks while they fit the budget, up to one per core. A chunk that
+        // doesn't fit is held in `carry` for the next wave (`chunks` can't peek).
+        // The first chunk always goes in, even if it alone is over budget.
         if let Some(budget) = build_budget {
             while (wave.len() as u64) < cores {
                 let Some(next) = chunks.next() else { break };
@@ -205,16 +168,14 @@ fn chunk_arrow_bytes(chunk: &[RecordBatch]) -> u64 {
         .max(1)
 }
 
-/// Build ONE no-blob superfile from a coalesced chunk of user batches: mint and
-/// prepend the `_id` column exactly as the append path does, stream the chunk
-/// through [`SuperfileBuilder::build_no_blob_from_batches_to`], and wrap the
-/// bytes with the manifest metadata a publish needs. Returns `None` for an empty
-/// chunk (nothing to publish).
+/// Build one no-blob superfile from a coalesced chunk: mint and prepend `_id`
+/// (as `append` does), stream through
+/// [`SuperfileBuilder::build_no_blob_from_batches_to`], and wrap the bytes with
+/// the manifest metadata a publish needs. `None` for an empty chunk.
 ///
-/// Runs on many rayon workers at once. The id generator is the only shared state,
-/// so we reserve the chunk's whole id range under ONE short lock and build the
-/// Arrow arrays afterwards, outside the lock, so the workers do not serialize on
-/// the generator while allocating.
+/// This runs on many rayon workers at once, and the id generator is the only
+/// shared state. So reserve the chunk's whole id range under one short lock, then
+/// build the arrays outside it, so the workers don't serialize on the generator.
 fn build_hydrate_shard(
     inner: &SupertableInner,
     base_opts: &BuilderOptions,
@@ -225,9 +186,8 @@ fn build_hydrate_shard(
     if n_docs == 0 {
         return Ok(None);
     }
-    // The builder's own doc counter is `u32`, so a chunk whose rows overflow `u32`
-    // could not be built regardless; reserving that many ids is the first thing to
-    // fail, with a clear message.
+    // A superfile's doc counter is `u32`, so a chunk with more rows than that
+    // can't be built; fail here, at the id reservation, with a clear message.
     let n_ids: u32 = n_docs
         .try_into()
         .expect("chunk row count exceeds u32; a superfile cannot hold this many rows");
@@ -265,9 +225,8 @@ fn build_hydrate_shard(
         );
     }
 
-    // Stream the id-prepended batches into one no-blob superfile. Pre-size the
-    // sink to the raw Arrow bytes: the compressed output is smaller, so this is an
-    // upper bound that avoids reallocation during the encode.
+    // Stream into one no-blob superfile. Size the sink to the raw Arrow bytes:
+    // the compressed output is smaller, so this just avoids reallocating mid-encode.
     let mut bytes: Vec<u8> = Vec::with_capacity(chunk_arrow_bytes(user_chunk) as usize);
     SuperfileBuilder::build_no_blob_from_batches_to(base_opts.clone(), &ided, &mut bytes)?;
 
@@ -284,13 +243,10 @@ fn build_hydrate_shard(
     )))
 }
 
-/// Groups a lazily-consumed `RecordBatch` stream into chunks, cutting each chunk
-/// at whichever bound is reached first: `target` rows or `max_bytes` Arrow bytes,
-/// and skipping empty batches. The byte bound is what lets the loader shrink
-/// chunks under memory pressure; set `max_bytes = u64::MAX` to bound by rows only.
-/// A single batch larger than `max_bytes` still forms its own chunk, so the input
-/// batch size is the floor. Owned `Vec`s are yielded so rayon workers can build
-/// whole chunks in parallel.
+/// Groups a `RecordBatch` stream into chunks, cutting at whichever comes first:
+/// `target` rows or `max_bytes` Arrow bytes (use `u64::MAX` for rows only). Empty
+/// batches are skipped. A batch bigger than `max_bytes` is its own chunk, so the
+/// input batch size is the floor. Yields owned `Vec`s for rayon to build.
 struct CoalesceChunks<I> {
     inner: I,
     target: usize,
@@ -353,9 +309,8 @@ mod tests {
         RecordBatch::try_new(user_schema(), vec![Arc::new(n), Arc::new(s)]).expect("valid batch")
     }
 
-    /// The byte cap cuts a chunk before the row target when the accumulated Arrow
-    /// bytes reach it, and `u64::MAX` reverts to pure row-count grouping — in both
-    /// cases every input row survives.
+    /// The byte cap cuts a chunk before the row target when the Arrow bytes reach
+    /// it; `u64::MAX` groups by rows only. Either way, every input row survives.
     #[test]
     fn coalesce_cuts_on_byte_cap() {
         use crate::supertable::hydrate::CoalesceChunks;
@@ -494,7 +449,7 @@ mod tests {
 
         // (B) Hydrate: same rows, coalesced into ~HYDRATE_TARGET_ROWS chunks.
         // Reach the engine's core table handle (what `hydrate_from_batches`
-        // operates on) through the catalog — the same shared handle `query_sql`
+        // operates on) through the catalog: the same shared handle `query_sql`
         // reads, so the commit is visible to queries.
         db.create_table("hydrated", user_schema(), IndexSpec::new())
             .expect("create_table (hydrate)");

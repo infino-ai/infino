@@ -3550,13 +3550,11 @@ pub(super) fn prepare_superfile_named(
     let bytes_for_cache =
         (cache_attached && inner.options.prepopulate_cache_on_commit).then(|| shard.bytes.clone());
 
-    // No-blob fast path: a superfile from a table with no FTS and no vector
-    // columns has empty fts/vector summaries and no term contribution, so
-    // opening the just-written bytes only to recompute those empties is a full
-    // re-read of what we just built — pure waste (the dominant extra I/O on the
-    // hydrate commit). Build the entry straight from the shard's in-memory stats
-    // plus the footer offsets read from the bytes. Byte-identical result to the
-    // general path below for a no-blob superfile; blob tables fall through.
+    // No-blob fast path: with no FTS and no vector columns the general path below
+    // opens the just-written bytes only to rebuild empty summaries. Skip that and
+    // build the entry from the shard's in-memory stats plus the footer offsets.
+    // Same entry as the general path for a no-blob superfile; indexed tables fall
+    // through.
     if inner.options.fts_columns.is_empty() && inner.options.vector_columns.is_empty() {
         let entry = Arc::new(SuperfileEntry {
             birth_version: 0,

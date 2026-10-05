@@ -3,14 +3,9 @@
 
 //! Integration coverage for the public [`Supertable::hydrate`] bulk-load path.
 //!
-//! The regular write API builds one superfile per `append` and leans on the
-//! optimizer and GC to settle them. For data already in Parquet and queried
-//! with SQL only, that is waste: no text to score, no vector to search.
-//! `hydrate` coalesces a batch stream straight into a few no-blob superfiles in
-//! one commit, with no optimize and no GC. These tests drive that public method
-//! from a real Parquet file on disk and prove (1) the hydrated table answers SQL
-//! correctly, and (2) it answers identically to a table built the regular way
-//! (append, then optimize + gc) over the same rows.
+//! These drive the public method from a real Parquet file on disk and check two
+//! things: the hydrated table answers SQL correctly, and it answers identically
+//! to a table built the regular way (append, then optimize + gc).
 
 #![deny(clippy::unwrap_used)]
 
