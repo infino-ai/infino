@@ -812,9 +812,21 @@ impl Connection {
                 let (schema, indexes) = seed_from_patch(patch)
                     .map_err(|e| e.with_context("apply_schema", Some(name)))?;
                 self.create_table(name, schema, indexes)?;
-                // The seed carries the columns; the cap and anything else the
-                // patch sets lands by the same merge an existing table takes.
-                self.open_table_handle(name)?
+                // The seed carried every column the patch lists, with its
+                // type, nullability and index, and `create_table` minted the
+                // ids. Replaying the field entries over that would address
+                // columns by the ids they had wherever the patch came from,
+                // which are not the ids just minted: a document read from a
+                // table that had ever dropped a column names an id the seed
+                // never mints, and the replay fails on a table it has just
+                // created. Only what the seed cannot carry is replayed.
+                let settings = SchemaPatch {
+                    fields: Vec::new(),
+                    max_fields: patch.max_fields,
+                    max_depth: patch.max_depth,
+                };
+                let handle = self.open_table_handle(name)?;
+                return Ok((*handle.apply_schema(&settings, None)?).clone());
             }
             Err(e) => return Err(e),
         };

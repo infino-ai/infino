@@ -1047,3 +1047,54 @@ fn a_full_text_index_is_refused_on_a_string_type_it_cannot_be_built_over() {
     docs.append_rows(&[serde_json::json!({"title": "still writable"})])
         .expect("append after the refusal");
 }
+
+/// Reading one table's document and writing it to a name that does not
+/// exist yet is the clone path. The seed creates the table and mints its
+/// own ids, so the patch's ids are the source table's, not the new one's:
+/// a source that ever dropped a column has a live id the seed never mints,
+/// and replaying the fields over the seed failed on the table it had just
+/// created, leaving it behind and failing identically on every retry.
+#[test]
+fn a_document_from_a_table_that_dropped_a_column_clones() {
+    let db = connect("memory://").expect("connect");
+    db.create_table(TABLE, title_score_schema(), IndexSpec::new().fts("title"))
+        .expect("create");
+
+    // Drop `score`, so the live ids are 1 and 3 rather than 1 and 2.
+    let source = db
+        .apply_schema(
+            TABLE,
+            &SchemaPatch::new(vec![FieldPatch::named("extra").with_type(DataType::Int64)]),
+            None,
+        )
+        .expect("add a third column");
+    let source = db
+        .apply_schema(
+            TABLE,
+            &SchemaPatch::new(vec![FieldPatch::named("score").dropped()]),
+            Some(source.schema_id()),
+        )
+        .expect("drop the middle column");
+    let live: Vec<FieldId> = source.fields().iter().map(|f| f.id).collect();
+    assert_eq!(live.len(), 2, "two columns remain");
+    assert!(
+        live.contains(&FieldId(3)),
+        "a live id is past what a fresh table of two columns would mint: {live:?}"
+    );
+
+    // The document, replayed onto a name that does not exist.
+    let cloned = db
+        .apply_schema("clone", &SchemaPatch::from(&source), None)
+        .expect("a document clones onto an absent table");
+    assert_eq!(
+        cloned.fields().iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        source.fields().iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        "the same columns, by name"
+    );
+
+    // And the clone is a working table.
+    db.open_table("clone")
+        .expect("open")
+        .append_rows(&[serde_json::json!({"title": "a", "extra": 1})])
+        .expect("append into the clone");
+}
