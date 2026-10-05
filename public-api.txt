@@ -118,6 +118,31 @@ impl core::marker::Unpin for infino::Consistency
 impl core::marker::UnsafeUnpin for infino::Consistency
 impl core::panic::unwind_safe::RefUnwindSafe for infino::Consistency
 impl core::panic::unwind_safe::UnwindSafe for infino::Consistency
+#[non_exhaustive] pub enum infino::Detected
+pub infino::Detected::Boolean
+pub infino::Detected::Float
+pub infino::Detected::Integer
+pub infino::Detected::List
+pub infino::Detected::String
+impl infino::Detected
+pub fn infino::Detected::from_name(&str) -> core::option::Option<Self>
+pub fn infino::Detected::name(self) -> &'static str
+impl core::clone::Clone for infino::Detected
+pub fn infino::Detected::clone(&self) -> Self
+impl core::cmp::Eq for infino::Detected
+impl core::cmp::PartialEq for infino::Detected
+pub fn infino::Detected::eq(&self, &Self) -> bool
+impl core::fmt::Debug for infino::Detected
+pub fn infino::Detected::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::Detected
+impl core::marker::StructuralPartialEq for infino::Detected
+impl core::marker::Freeze for infino::Detected
+impl core::marker::Send for infino::Detected
+impl core::marker::Sync for infino::Detected
+impl core::marker::Unpin for infino::Detected
+impl core::marker::UnsafeUnpin for infino::Detected
+impl core::panic::unwind_safe::RefUnwindSafe for infino::Detected
+impl core::panic::unwind_safe::UnwindSafe for infino::Detected
 pub enum infino::GcError
 pub infino::GcError::NoStorage
 pub infino::GcError::Storage(infino::storage::StorageError)
@@ -873,7 +898,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::ReindexReport
 pub infino::SchemaPatch::fields: alloc::vec::Vec<infino::FieldPatch>
 pub infino::SchemaPatch::max_depth: core::option::Option<u32>
 pub infino::SchemaPatch::max_fields: core::option::Option<u32>
-pub infino::SchemaPatch::templates: core::option::Option<alloc::vec::Vec<infino::supertable::schema::Template>>
+pub infino::SchemaPatch::templates: core::option::Option<alloc::vec::Vec<infino::Template>>
 impl infino::SchemaPatch
 pub fn infino::SchemaPatch::from_json(&serde_json::value::Value) -> core::result::Result<Self, alloc::string::String>
 pub fn infino::SchemaPatch::to_json(&self) -> serde_json::value::Value
@@ -881,6 +906,7 @@ impl infino::SchemaPatch
 pub fn infino::SchemaPatch::new(alloc::vec::Vec<infino::FieldPatch>) -> Self
 pub fn infino::SchemaPatch::with_max_depth(self, u32) -> Self
 pub fn infino::SchemaPatch::with_max_fields(self, u32) -> Self
+pub fn infino::SchemaPatch::with_templates(self, alloc::vec::Vec<infino::Template>) -> Self
 impl core::clone::Clone for infino::SchemaPatch
 pub fn infino::SchemaPatch::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::SchemaPatch
@@ -984,6 +1010,34 @@ impl core::marker::Unpin for infino::TableSchema
 impl core::marker::UnsafeUnpin for infino::TableSchema
 impl core::panic::unwind_safe::RefUnwindSafe for infino::TableSchema
 impl core::panic::unwind_safe::UnwindSafe for infino::TableSchema
+#[non_exhaustive] pub struct infino::Template
+pub infino::Template::data_type: core::option::Option<arrow_schema::datatype::DataType>
+pub infino::Template::index: core::option::Option<infino::ColumnIndex>
+pub infino::Template::matches: core::option::Option<infino::Detected>
+pub infino::Template::name: alloc::string::String
+pub infino::Template::path: alloc::string::String
+impl infino::Template
+pub fn infino::Template::applies(&self, &str, infino::Detected) -> bool
+pub fn infino::Template::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn infino::Template::with_index(self, infino::ColumnIndex) -> Self
+pub fn infino::Template::with_matches(self, infino::Detected) -> Self
+pub fn infino::Template::with_type(self, arrow_schema::datatype::DataType) -> Self
+impl core::clone::Clone for infino::Template
+pub fn infino::Template::clone(&self) -> Self
+impl core::cmp::PartialEq for infino::Template
+pub fn infino::Template::eq(&self, &Self) -> bool
+impl core::default::Default for infino::Template
+pub fn infino::Template::default() -> Self
+impl core::fmt::Debug for infino::Template
+pub fn infino::Template::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::Template
+impl core::marker::Freeze for infino::Template
+impl core::marker::Send for infino::Template
+impl core::marker::Sync for infino::Template
+impl core::marker::Unpin for infino::Template
+impl core::marker::UnsafeUnpin for infino::Template
+impl core::panic::unwind_safe::RefUnwindSafe for infino::Template
+impl core::panic::unwind_safe::UnwindSafe for infino::Template
 pub struct infino::VectorFilter<'a>
 pub infino::VectorFilter::column: &'a str
 pub infino::VectorFilter::mode: infino::BoolMode

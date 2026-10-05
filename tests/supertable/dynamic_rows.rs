@@ -12,7 +12,8 @@ use arrow_array::{Array, Float64Array, Int64Array, LargeStringArray, ListArray};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Connection, FieldPatch, IndexSpec, InfinoError, SchemaError, SchemaPatch, connect,
+    Connection, Detected, FieldPatch, IndexSpec, InfinoError, SchemaError, SchemaPatch, Template,
+    connect,
     serde_json::{self, Value, json},
 };
 use tempfile::TempDir;
@@ -440,4 +441,47 @@ fn an_array_inside_an_array_of_objects_is_refused() {
         "xs": [{"a": 1}, {"a": 2, "b": 3}]
     })])
     .expect("scalar leaves are positional");
+}
+
+/// Templates are declarable from Rust, not only through JSON: `Template`
+/// and `Detected` are part of the surface, so a caller can build the rule
+/// that decides what a new column becomes and hand it to `apply_schema`.
+#[test]
+fn a_template_is_declarable_through_the_typed_api() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new())
+        .expect("create");
+
+    db.apply_schema(
+        TABLE,
+        &SchemaPatch::new(vec![]).with_templates(vec![
+            Template::new("counts", "n_*")
+                .with_matches(Detected::Integer)
+                .with_type(DataType::Float64),
+        ]),
+        None,
+    )
+    .expect("declare the template");
+
+    docs.append_rows(&[json!({"title": "a", "n_views": 10, "other": 10})])
+        .expect("append");
+
+    let doc = db.schema(TABLE).expect("schema");
+    let typed = |name: &str| {
+        doc.fields()
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.data_type.clone())
+    };
+    assert_eq!(
+        typed("n_views"),
+        Some(DataType::Float64),
+        "the template decided the matching path"
+    );
+    assert_eq!(
+        typed("other"),
+        Some(DataType::Int64),
+        "a path the pattern misses keeps the inferred type"
+    );
 }

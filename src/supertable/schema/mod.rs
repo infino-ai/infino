@@ -159,7 +159,11 @@ pub enum ColumnIndex {
 
 /// The kind of JSON value a document carries on a path, as a template
 /// matches it.
+/// `#[non_exhaustive]`: a document may learn to carry a kind the mapper
+/// does not distinguish today, and a new one must not break a caller's
+/// `match`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Detected {
     /// `true` / `false`.
     Boolean,
@@ -201,7 +205,11 @@ impl Detected {
 /// A rule that decides the type and index of a column a document adds:
 /// the first template whose kind and path pattern match the new path wins.
 /// Columns the table already has are not affected.
-#[derive(Debug, Clone, PartialEq)]
+/// Build one with [`Template::new`] and the `with_*` setters rather than a
+/// struct literal: the type is `#[non_exhaustive]` so it can grow a rule
+/// without breaking callers.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct Template {
     /// A label for the owner; not interpreted.
     pub name: String,
@@ -217,6 +225,35 @@ pub struct Template {
 }
 
 impl Template {
+    /// A rule called `name` over the paths matching `path`, applying to any
+    /// kind and leaving the inferred type and no index unless the `with_*`
+    /// setters say otherwise.
+    pub fn new(name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            path: path.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Restrict the rule to one value kind.
+    pub fn with_matches(mut self, kind: Detected) -> Self {
+        self.matches = Some(kind);
+        self
+    }
+
+    /// The column type to use instead of the inferred one.
+    pub fn with_type(mut self, data_type: DataType) -> Self {
+        self.data_type = Some(data_type);
+        self
+    }
+
+    /// The index the column gets.
+    pub fn with_index(mut self, index: ColumnIndex) -> Self {
+        self.index = Some(index);
+        self
+    }
+
     /// Whether this rule applies to a new column at `path` holding `kind`.
     pub fn applies(&self, path: &str, kind: Detected) -> bool {
         self.matches.is_none_or(|m| m == kind) && glob_matches(&self.path, path)

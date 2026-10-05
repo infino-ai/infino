@@ -213,6 +213,12 @@ impl SchemaPatch {
         self.max_depth = Some(max_depth);
         self
     }
+
+    /// Replace the templates that decide what a new column becomes.
+    pub fn with_templates(mut self, templates: Vec<Template>) -> Self {
+        self.templates = Some(templates);
+        self
+    }
 }
 
 impl From<&TableSchema> for SchemaPatch {
