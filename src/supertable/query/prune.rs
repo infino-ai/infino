@@ -203,12 +203,30 @@ fn agg_minmax(agg: &ScalarStatsAgg) -> Option<(ScalarValue, ScalarValue)> {
 }
 
 // Part-tier `IS [NOT] NULL` prune; the superfile-tier sibling lives in `skip`.
+//
+// `IS NULL` prunes here only for a column no file can predate. A part's
+// aggregate folds only the files that hold the column: one written before
+// the column was added contributes no entry at all, rather than
+// contributing its rows as nulls. So a part holding one old file beside one
+// new file with every value set aggregates to `null_count: Some(0)`, and
+// pruning on that drops the old file, whose rows read null and should have
+// come back. For a column declared at creation no file predates it, the
+// fold covers every file, and the prune is sound. Otherwise the part is
+// kept and the superfile tier decides file by file, which it can do because
+// it sees which files carry the column.
+//
+// `IS NOT NULL` is safe and still prunes: a file that does not hold the
+// column has no non-null value to contribute, so an aggregate over the files
+// that do hold it answers the question for the whole part.
 fn null_check_keep_parts(
     list: &Manifest,
     column: FieldId,
     guard: &ColumnTypeGuard,
     want_null: bool,
 ) -> Vec<PartId> {
+    if want_null && !guard.in_every_file() {
+        return list.parts.iter().map(|entry| entry.part_id).collect();
+    }
     keep_parts_where_agg(list, column, guard, |agg| {
         null_check_may_match(agg, want_null)
     })

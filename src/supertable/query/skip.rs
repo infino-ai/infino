@@ -347,6 +347,11 @@ pub(crate) struct ColumnTypeGuard {
     current: Option<Resolution>,
     /// Whether the table is converting this column from an older type.
     converting: bool,
+    /// Whether every file in the table must hold this column, which is true
+    /// only of a column declared when the table was created: ids are minted
+    /// in order and never reused, so a column added later is absent from
+    /// every file written before it.
+    in_every_file: bool,
 }
 
 impl ColumnTypeGuard {
@@ -363,6 +368,14 @@ impl ColumnTypeGuard {
                 physical: None,
             }),
             converting: field.is_some_and(|f| f.converting_from.is_some()),
+            // The creation schema, which is never mutated: a column in it
+            // predates every file.
+            in_every_file: manifest
+                .options
+                .table_schema
+                .fields()
+                .iter()
+                .any(|f| f.id == column),
         }
     }
 
@@ -377,6 +390,14 @@ impl ColumnTypeGuard {
     /// new, and one pair of bounds cannot describe both.
     pub(crate) fn aggregates_mix_types(&self) -> bool {
         self.converting
+    }
+
+    /// Whether every file holds this column, so an aggregate folded over
+    /// the files that carry it describes the whole part. False for a column
+    /// added after the table was created: the files that predate it
+    /// contribute no entry to the fold, and their rows read null.
+    pub(crate) fn in_every_file(&self) -> bool {
+        self.in_every_file
     }
 
     /// Whether `entry`'s statistics for the column are in a type the table
@@ -625,6 +646,29 @@ mod tests {
         Arc::new(
             SupertableOptions::new(schema, vec![FtsConfig::new("title")], vec![]).expect("opts"),
         )
+    }
+
+    /// A column declared when the table was created is in every file, so a
+    /// part aggregate folded over the files that carry it covers them all.
+    /// A column added later is not: the files written before it contribute
+    /// no entry to that fold while their rows read null, which is why the
+    /// part-tier `IS NULL` prune stands down for one.
+    #[test]
+    fn the_guard_knows_which_columns_no_file_can_predate() {
+        let manifest = ManifestSnapshot::empty(opts_simple());
+        let created = manifest.field_id("title").expect("the creation column");
+        assert!(
+            ColumnTypeGuard::new(&manifest, created).in_every_file(),
+            "a column declared at creation predates no file"
+        );
+
+        // An id the creation schema never minted stands for a column added
+        // later; nothing in the table's files can be holding it.
+        let added = FieldId(u32::from(created.0) + 1);
+        assert!(
+            !ColumnTypeGuard::new(&manifest, added).in_every_file(),
+            "a column added later is absent from the files before it"
+        );
     }
 
     fn opts_with_vector() -> Arc<SupertableOptions> {
