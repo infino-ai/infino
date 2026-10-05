@@ -1038,6 +1038,7 @@ impl Connection {
     /// the JS side reads with `tableFromIPC`. Search is available in SQL
     /// via the TVFs, e.g.
     /// `SELECT _id, score FROM bm25_search('docs', 'body', 'q', 10)`.
+    /// Read-only, one statement per call: a write throws `InvalidArg`.
     #[napi]
     pub fn query_sql(&self, sql: String) -> Result<Buffer> {
         let batches = self.inner.query_sql(&sql).map_err(map_err)?;

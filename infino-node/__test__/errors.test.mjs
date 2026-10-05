@@ -109,13 +109,19 @@ test("local openTable of a missing table throws the addon error with no status",
 });
 
 test("local unimplemented SQL throws an Unsupported error", () => {
-  // Valid SQL the engine does not implement: not a bad argument
-  // (InvalidArg), and prefixed so a caller can tell it apart.
+  // A valid read the engine does not implement: not a bad argument
+  // (InvalidArg), and prefixed so a caller can tell it apart. A write is a
+  // bad argument, refused as read-only.
   const db = connect("memory://");
   db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
-  const e = throws(() => db.querySql("ALTER TABLE docs ADD COLUMN y int"));
+  const e = throws(() =>
+    db.querySql("SELECT title FROM docs ORDER BY title FETCH FIRST 1 ROWS WITH TIES"),
+  );
   assert.equal(e.code, "GenericFailure");
   assert.match(e.message, /^Unsupported: /);
+  const write = throws(() => db.querySql("ALTER TABLE docs ADD COLUMN y int"));
+  assert.equal(write.code, "InvalidArg");
+  assert.match(write.message, /read-only/);
 });
 
 test("local query failures are untouched", () => {

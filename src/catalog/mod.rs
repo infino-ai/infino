@@ -24,6 +24,7 @@ mod uri;
 
 use std::{
     collections::{HashMap, HashSet},
+    ops::ControlFlow,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
@@ -36,14 +37,17 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dashmap::DashMap;
 use datafusion::{
     common::tree_node::{TreeNode, TreeNodeRecursion},
-    config::Dialect,
-    execution::context::SQLOptions,
+    execution::{context::SQLOptions, session_state::SessionState},
     logical_expr::{BinaryExpr, Operator},
     prelude::Expr,
-    sql::sqlparser::{
-        dialect::GenericDialect,
-        keywords::Keyword,
-        tokenizer::{Token, Tokenizer as SqlTokenizer},
+    sql::{
+        parser::{DFParserBuilder, Statement as DFStatement},
+        sqlparser::{
+            ast::{Statement as SqlStatement, visit_statements},
+            dialect::GenericDialect,
+            keywords::Keyword,
+            tokenizer::{Token, Tokenizer as SqlTokenizer},
+        },
     },
 };
 use futures::future::try_join_all;
@@ -66,6 +70,10 @@ pub(crate) const MAX_PREDICATE_CONNECTIVES: usize = 1024;
 /// Fewest bytes one connective can occupy in SQL text; text shorter than
 /// `MIN_BYTES_PER_CONNECTIVE * MAX_PREDICATE_CONNECTIVES` cannot reach the cap and skips the scan.
 const MIN_BYTES_PER_CONNECTIVE: usize = 3;
+
+/// What `query_sql` answers a write with, from either read-only check.
+const READ_ONLY_REFUSAL: &str =
+    "query_sql is read-only; writes go through the table's append / update / delete API";
 
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
@@ -986,6 +994,10 @@ impl Connection {
     /// DataFusion session, so cross-table joins and aggregations work.
     /// Returns the collected result batches.
     ///
+    /// Read-only, and one statement per call: a query, `EXPLAIN` or
+    /// `DESCRIBE`. A write of any kind is refused with [`InfinoError::Query`];
+    /// writes go through a table's `append`, `update` and `delete`.
+    ///
     /// ```
     /// # use std::sync::Arc;
     /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
@@ -1043,15 +1055,16 @@ impl Connection {
         let ctx = sql_session_context(&self.inner.connection_memory_budget)
             .map_err(|e| InfinoError::Backend(e.to_string()).with_context("query_sql", None))?;
 
+        // One snapshot of the session for parsing and table lookup; planning
+        // takes a fresh one later, after the tables are registered.
+        let state = ctx.state();
+        let statement =
+            read_only_statement(&state, sql).map_err(|e| e.with_context("query_sql", None))?;
+
         // Resolve the relations the query names and register each that is a
         // catalog table. Unknown names (CTEs, search TVFs, aliases) are
         // skipped — the planner resolves those by other means or errors.
-        let statement = ctx
-            .state()
-            .sql_to_statement(sql, &Dialect::Generic)
-            .map_err(|e| datafusion_planning_error(&e).with_context("query_sql", None))?;
-        let refs = ctx
-            .state()
+        let refs = state
             .resolve_table_references(&statement)
             .map_err(|e| datafusion_planning_error(&e).with_context("query_sql", None))?;
 
@@ -1084,7 +1097,6 @@ impl Connection {
         search_tvf::register_search_tvfs(&ctx, self.clone());
         trace::follow_spans_into_datafusion_tasks();
 
-        let sql = sql.to_owned();
         // Caller-thread pickup, same as reader mint: the drive future may
         // poll on runtime threads where the scope's slot is invisible.
         let op_stats = op_stats::current();
@@ -1102,42 +1114,40 @@ impl Connection {
             // span on its own: instrument it, or the spans it creates start
             // a trace of their own and the plan phase vanishes from this one.
             let planning = async move {
-                    // Plan, check, execute. `SessionContext::sql` would run a DDL or session
-                    // statement while producing the DataFrame, so the read-only check sits between
-                    // planning and execution. It runs on the planned tree, so spelling is
-                    // irrelevant: `SELECT ... INTO` is a CREATE TABLE, and an INSERT behind a
-                    // comment or an EXPLAIN is the same DML node. Planning has no side effects; a
-                    // refused statement has touched nothing.
-                    let plan = planner_ctx
-                        .state()
-                        .create_logical_plan(&sql)
-                        .await
-                        .map_err(|e| datafusion_planning_error(&e))?;
+                // Plan the statement already parsed and checked, check the plan, execute.
+                // `SessionContext::sql` would run a DDL or session statement while producing
+                // the DataFrame, so the second read-only check sits between planning and
+                // execution. It runs on the planned tree and catches what the statement does
+                // not show: `SELECT ... INTO` reads like a query and plans to a CREATE TABLE.
+                // Planning has no side effects; a refused statement has touched nothing.
+                let plan = planner_ctx
+                    .state()
+                    .statement_to_plan(statement)
+                    .await
+                    .map_err(|e| datafusion_planning_error(&e))?;
 
-                    read_only_sql_options().verify_plan(&plan).map_err(|e| {
-                        InfinoError::Query(format!(
-                            "query_sql is read-only; writes go through the table's append / update / delete API ({e})"
-                        ))
-                    })?;
+                read_only_sql_options()
+                    .verify_plan(&plan)
+                    .map_err(|e| InfinoError::Query(format!("{READ_ONLY_REFUSAL} ({e})")))?;
 
-                    let df = planner_ctx
-                        .execute_logical_plan(plan)
-                        .await
-                        .map_err(|e| datafusion_error(&e))?;
+                let df = planner_ctx
+                    .execute_logical_plan(plan)
+                    .await
+                    .map_err(|e| datafusion_error(&e))?;
 
-                    // Execute through the physical plan (what `DataFrame::collect`
-                    // does internally) so the plan handle survives execution and
-                    // DataFusion's own operator metrics — elapsed compute, scan
-                    // output rows — can be folded into the per-query stats.
-                    let task_ctx = planner_ctx.task_ctx();
-                    let plan = df
-                        .create_physical_plan()
-                        .await
-                        .map_err(|e| datafusion_error(&e))?;
-                    Ok::<_, InfinoError>((task_ctx, plan))
-                }
-                .instrument(detail_span!("sql.plan"))
-                .in_current_span();
+                // Execute through the physical plan (what `DataFrame::collect`
+                // does internally) so the plan handle survives execution and
+                // DataFusion's own operator metrics — elapsed compute, scan
+                // output rows — can be folded into the per-query stats.
+                let task_ctx = planner_ctx.task_ctx();
+                let plan = df
+                    .create_physical_plan()
+                    .await
+                    .map_err(|e| datafusion_error(&e))?;
+                Ok::<_, InfinoError>((task_ctx, plan))
+            }
+            .instrument(detail_span!("sql.plan"))
+            .in_current_span();
             let (task_ctx, plan) = Handle::current().spawn(planning).await.map_err(|join| {
                 // A panic while planning is the engine's fault, never the query's.
                 InfinoError::Backend(format!("planning task failed: {join}"))
@@ -1195,9 +1205,93 @@ impl Connection {
     }
 }
 
-/// `query_sql`'s read-only policy: refuse every plan node that acts on data, schema, or session
-/// state (DDL, DML and `COPY`, session statements such as `SET`). **The check is on the planned
-/// tree, so whatever the planner turns into a write is refused, however it was spelled.**
+/// Parse `sql` into the one statement `query_sql` runs, refusing a write before it is planned.
+///
+/// ```text
+///  sql ──► parse ──► one statement? ──no──► Query: "runs exactly one SQL statement"
+///                          │
+///                      reads only? ──no──► Query: read-only refusal
+///                          │
+///                   planned once from this statement, then the plan is checked again
+/// ```
+///
+/// Checking the statement, not only the plan, is what refuses a write DataFusion cannot plan
+/// (`ALTER TABLE`, an `INSERT` inside a CTE): planning fails on those before the plan check
+/// runs, and they would otherwise read as SQL a later version might support.
+fn read_only_statement(state: &SessionState, sql: &str) -> Result<DFStatement, InfinoError> {
+    let recursion_limit = state.config().options().sql_parser.recursion_limit;
+
+    let mut statements = DFParserBuilder::new(sql)
+        .with_dialect(&GenericDialect {})
+        .with_recursion_limit(recursion_limit)
+        .build()
+        .and_then(|mut parser| parser.parse_statements())
+        .map_err(|e| datafusion_planning_error(&e))?;
+
+    let (Some(statement), true) = (statements.pop_front(), statements.is_empty()) else {
+        return Err(InfinoError::Query(
+            "query_sql runs exactly one SQL statement".to_string(),
+        ));
+    };
+
+    if !reads_only(&statement) {
+        return Err(InfinoError::Query(READ_ONLY_REFUSAL.to_string()));
+    }
+
+    Ok(statement)
+}
+
+/// Whether `statement`, and every statement nested in it, only reads: an `INSERT` can hide in a
+/// CTE, in parentheses or under an `EXPLAIN`. An allowlist, so a statement kind nobody listed is
+/// refused rather than run.
+fn reads_only(statement: &DFStatement) -> bool {
+    match statement {
+        DFStatement::Statement(statement) => visit_statements(statement.as_ref(), |nested| {
+            if is_read(nested) {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        })
+        .is_continue(),
+
+        DFStatement::Explain(explain) => reads_only(&explain.statement),
+
+        _ => false,
+    }
+}
+
+/// The statements that change nothing: a query, and the ones that describe (`EXPLAIN`,
+/// `DESCRIBE`, every `SHOW` form). Listing a read DataFusion cannot plan is deliberate: the
+/// planner then reports it as unsupported, not as a write. A statement nested in one of these is
+/// checked on its own.
+fn is_read(statement: &SqlStatement) -> bool {
+    matches!(
+        statement,
+        SqlStatement::Query(_)
+            | SqlStatement::Explain { .. }
+            | SqlStatement::ExplainTable { .. }
+            | SqlStatement::ShowCatalogs { .. }
+            | SqlStatement::ShowCharset(_)
+            | SqlStatement::ShowCollation { .. }
+            | SqlStatement::ShowColumns { .. }
+            | SqlStatement::ShowCreate { .. }
+            | SqlStatement::ShowDatabases { .. }
+            | SqlStatement::ShowFunctions { .. }
+            | SqlStatement::ShowObjects(_)
+            | SqlStatement::ShowProcessList { .. }
+            | SqlStatement::ShowSchemas { .. }
+            | SqlStatement::ShowStatus { .. }
+            | SqlStatement::ShowTables { .. }
+            | SqlStatement::ShowVariable { .. }
+            | SqlStatement::ShowVariables { .. }
+            | SqlStatement::ShowViews { .. }
+    )
+}
+
+/// `query_sql`'s second read-only check: refuse every plan node that acts on data, schema, or
+/// session state (DDL, DML and `COPY`, session statements such as `SET`). **The check is on the
+/// planned tree, so whatever the planner turns into a write is refused, however it was spelled.**
 fn read_only_sql_options() -> SQLOptions {
     SQLOptions::new()
         .with_allow_ddl(false)
@@ -4789,7 +4883,8 @@ mod tests {
         //  - DDL, DML, COPY and session statements each plan to a side-effecting node.
         //  - `SELECT INTO` plans to CREATE TABLE; a comment or an EXPLAIN in front of an INSERT
         //    leaves the same DML node underneath.
-        //  - all are refused between planning and execution.
+        //  - all are refused before they run: by the statement check, or for `SELECT INTO`,
+        //    which reads like a query, by the plan check after planning.
         // Afterwards the catalog and the table are exactly as created.
         let conn = conn_with_docs();
         for sql in [
@@ -4843,18 +4938,26 @@ mod tests {
         assert!(matches!(err, Err(InfinoError::Query(_))), "got {err:?}");
     }
 
-    /// Valid SQL the engine does not implement is neither the caller's mistake
-    /// nor an engine fault: `Unsupported`, so a client can tell "rewrite this"
-    /// from "this query is wrong".
+    /// A valid read the engine does not implement is neither the caller's
+    /// mistake nor an engine fault: `Unsupported`, so a client can tell "rewrite
+    /// this" from "this query is wrong". A write is never this: it is refused as
+    /// one before planning, whether or not DataFusion could plan it.
     #[test]
-    fn query_sql_reports_unimplemented_sql_as_unsupported() {
+    fn query_sql_reports_an_unimplemented_read_as_unsupported() {
         let conn = conn_with_docs();
-        let err = conn.query_sql("ALTER TABLE docs ADD COLUMN y int");
-        assert!(
-            matches!(&err, Err(InfinoError::Unsupported(msg)) if msg.contains("not implemented")),
-            "got {err:?}"
-        );
-        assert_docs_intact(&conn);
+        for sql in [
+            "SELECT title FROM docs ORDER BY title FETCH FIRST 1 ROWS WITH TIES",
+            // `SHOW` forms DataFusion does not plan: reads, so unsupported, not refused.
+            "SHOW SCHEMAS",
+            "SHOW DATABASES",
+            "SHOW VIEWS",
+        ] {
+            let err = conn.query_sql(sql);
+            assert!(
+                matches!(&err, Err(InfinoError::Unsupported(msg)) if msg.contains("not implemented")),
+                "{sql:?}: got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -4867,33 +4970,38 @@ mod tests {
     }
 
     #[test]
-    fn query_sql_refuses_writes_the_planner_cannot_plan() {
-        // Writes the planner cannot plan today.
-        //  - they fail at planning, so they never execute either;
-        //  - the error is the planner's: a shape DataFusion does not
-        //    implement (`ALTER`, an `INSERT` inside a CTE or parentheses, a
-        //    second statement). `TRUNCATE` is the exception: it plans, and the
-        //    read-only check refuses it. Either way never an engine fault.
-        // If a DataFusion upgrade learns to plan one, it becomes a DML or DDL node and the gate refuses it.
+    fn query_sql_refuses_a_write_from_its_statement_before_planning() {
+        // Writes DataFusion cannot plan, or plans only to refuse: the statement
+        // check refuses each before planning, with the same answer as a
+        // plannable write, so none reads as SQL a later version might run.
         let conn = conn_with_docs();
-        for (sql, unimplemented) in [
-            ("ALTER TABLE docs ADD COLUMN y int", true),
-            ("TRUNCATE TABLE docs", false),
-            (
-                "WITH t AS (SELECT 'x' AS title) INSERT INTO docs (title) SELECT title FROM t",
-                true,
-            ),
-            ("(INSERT INTO docs VALUES (1, 'x'))", true),
-            ("SELECT 1; DROP TABLE docs", true),
+        for sql in [
+            "ALTER TABLE docs ADD COLUMN y int",
+            "TRUNCATE TABLE docs",
+            "WITH t AS (SELECT 'x' AS title) INSERT INTO docs (title) SELECT title FROM t",
+            "(INSERT INTO docs VALUES (1, 'x'))",
+            "WITH t AS (INSERT INTO docs VALUES (1, 'x') RETURNING title) SELECT * FROM t",
+            "EXPLAIN WITH t AS (SELECT 'x' AS title) INSERT INTO docs (title) SELECT title FROM t",
         ] {
-            let err = conn.query_sql(sql);
-            let pinned = if unimplemented {
-                matches!(err, Err(InfinoError::Unsupported(_)))
-            } else {
-                matches!(err, Err(InfinoError::Query(_)))
-            };
-            assert!(pinned, "{sql:?}: got {err:?}");
+            assert_refused_as_write(&conn, sql);
         }
+        assert_docs_intact(&conn);
+    }
+
+    #[test]
+    fn query_sql_runs_exactly_one_statement() {
+        // A second statement, or none, is the caller's mistake, however
+        // harmless each one is; a trailing semicolon is still one statement.
+        let conn = conn_with_docs();
+        for sql in ["SELECT 1; DROP TABLE docs", "SELECT 1; SELECT 2", ""] {
+            let err = conn.query_sql(sql);
+            assert!(
+                matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("exactly one SQL statement")),
+                "{sql:?}: got {err:?}"
+            );
+        }
+        conn.query_sql("SELECT 1;")
+            .expect("one statement with a trailing semicolon");
         assert_docs_intact(&conn);
     }
 
@@ -4917,9 +5025,28 @@ mod tests {
             "EXPLAIN SELECT title FROM docs",
             "WITH ranked AS (SELECT title, ROW_NUMBER() OVER (ORDER BY title) AS rn, COUNT(*) OVER () AS total FROM docs), top AS (SELECT title, rn FROM ranked WHERE rn <= 10 OR total < 100) SELECT title FROM top WHERE rn > 0 AND title <> '' ORDER BY rn",
             "SELECT title, SUM(CHAR_LENGTH(title)) OVER (ORDER BY title ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS w FROM docs ORDER BY title LIMIT 5",
+            "DESCRIBE docs",
+            // Parsed as sqlparser's own `EXPLAIN`, not DataFusion's.
+            "DESCRIBE SELECT title FROM docs",
+            "EXPLAIN ANALYZE SELECT title FROM docs",
         ] {
             conn.query_sql(sql)
                 .unwrap_or_else(|e| panic!("{sql:?} should be allowed: {e}"));
+        }
+        // `SHOW` reads too. `query_sql` does not enable `information_schema`,
+        // so these fail, but as reads: never refused as a write.
+        for sql in [
+            "SHOW TABLES",
+            "SHOW COLUMNS FROM docs",
+            "SHOW CREATE TABLE docs",
+            "SHOW FUNCTIONS",
+            "SHOW datafusion.execution.batch_size",
+        ] {
+            let err = conn.query_sql(sql);
+            assert!(
+                matches!(&err, Err(InfinoError::Query(msg)) if !msg.contains("read-only")),
+                "{sql:?}: got {err:?}"
+            );
         }
     }
 
