@@ -2835,15 +2835,12 @@ impl SuperfileBuilder {
         let fts_builder = self.fts_builder.take();
         let mut kvs = superfile_kvs(&self.opts, n_docs, None)?;
         // Every `inf.vec.*` key describes the blob being carried, including
-        // the multi-cell directory this build has no cells to regenerate —
-        // except where the blob sits, which the splice records for this file.
+        // the multi-cell directory this build has no cells to regenerate.
         kvs.retain(|(k, _)| !k.starts_with("inf.vec."));
         kvs.extend(
             src_kv
                 .iter()
-                .filter(|(k, _)| {
-                    k.starts_with("inf.vec.") && !kv::REGION_KEYS.contains(&k.as_str())
-                })
+                .filter(|(k, _)| k.starts_with("inf.vec."))
                 .map(|(k, v)| (k.clone(), v.clone())),
         );
         if !ids_bytes.is_empty() {

@@ -638,56 +638,6 @@ mod v6_with_vectors {
 /// it here is what stops the default being quietly relaxed into "a recent
 /// container implies recent terms", which would leave the tables this
 /// migration exists for silently unrepaired.
-/// A table 0.9.0's reindex repaired: real bytes from the release whose
-/// reindex stored its input's vector region keys ahead of each output's
-/// own.
-mod v7_reindexed_vectors {
-    use super::*;
-
-    const SHAPE: &str = "v7_reindexed_vectors";
-
-    #[test]
-    fn opens_and_ranks() {
-        assert_opens_and_ranks(SHAPE);
-    }
-
-    /// Pinned in the negative, as the tokenization defect is for the
-    /// other shapes: a repair test against this fixture proves nothing
-    /// unless the fixture actually carries the stale copy.
-    #[test]
-    fn stores_a_stale_vector_region_ahead_of_the_right_one() {
-        let Some(root) = corpus_dir(SHAPE) else {
-            return;
-        };
-        let paths = superfile_paths(&root);
-        assert!(!paths.is_empty(), "{SHAPE}: no superfiles");
-        for path in paths {
-            let bytes = Bytes::from(fs::read(&path).expect("read superfile"));
-            let kvs = raw_footer_kvs(&bytes);
-            let stored: Vec<&str> = kvs
-                .iter()
-                .filter(|(k, _)| k == kv::VEC_OFFSET)
-                .map(|(_, v)| v.as_str())
-                .collect();
-            assert_eq!(
-                stored.len(),
-                2,
-                "{}: expected a stale and a current inf.vec.offset, got {stored:?}",
-                path.display()
-            );
-            let (fts_at, fts_len) = first_region(&kvs, kv::FTS_OFFSET, kv::FTS_LENGTH)
-                .unwrap_or_else(|| panic!("{}: no FTS region", path.display()));
-            let current = (fts_at + fts_len).to_string();
-            assert!(
-                stored[0] != current && stored[1] == current,
-                "{}: expected the stale copy first and the vector blob's real \
-                 offset {current} last, got {stored:?}",
-                path.display()
-            );
-        }
-    }
-}
-
 mod v6_positional {
     use super::*;
 
@@ -740,6 +690,78 @@ mod v6_positional {
 /// it is already unreachable code. The bytes stay checked in as the v1
 /// format fixture, and this pins the boundary so that a change making
 /// these tables openable is a deliberate one.
+/// A table 0.9.0's reindex repaired: real bytes from the release whose
+/// reindex stored its input's vector region keys ahead of each output's
+/// own.
+mod v7_reindexed_vectors {
+    use super::*;
+
+    const SHAPE: &str = "v7_reindexed_vectors";
+
+    /// Every file is at the blob version the 0.9.0 reindex writes, and the
+    /// corpus is whole. Not `assert_shape`: these files were re-analyzed,
+    /// so they record an analysis revision, which that check forbids for
+    /// the migration sources it exists to pin.
+    #[test]
+    fn carries_its_format_shape() {
+        let Some(root) = corpus_dir(SHAPE) else {
+            return;
+        };
+        let headers = blob_headers(&root);
+        assert!(!headers.is_empty(), "{SHAPE}: no superfiles");
+        let total: usize = headers.iter().map(|h| h.n_docs as usize).sum();
+        assert_eq!(total, N_DOCS as usize, "{SHAPE}: document count drifted");
+        for (i, h) in headers.iter().enumerate() {
+            assert_eq!(
+                h.version, VERSION_V7,
+                "{SHAPE}: superfile {i} carries blob version {}",
+                h.version
+            );
+        }
+    }
+
+    #[test]
+    fn opens_and_ranks() {
+        assert_opens_and_ranks(SHAPE);
+    }
+
+    /// Pinned in the negative, as the tokenization defect is for the
+    /// other shapes: a repair test against this fixture proves nothing
+    /// unless the fixture actually carries the stale copy.
+    #[test]
+    fn stores_a_stale_vector_region_ahead_of_the_right_one() {
+        let Some(root) = corpus_dir(SHAPE) else {
+            return;
+        };
+        let paths = superfile_paths(&root);
+        assert!(!paths.is_empty(), "{SHAPE}: no superfiles");
+        for path in paths {
+            let bytes = Bytes::from(fs::read(&path).expect("read superfile"));
+            let kvs = raw_footer_kvs(&bytes);
+            let stored: Vec<&str> = kvs
+                .iter()
+                .filter(|(k, _)| k == kv::VEC_OFFSET)
+                .map(|(_, v)| v.as_str())
+                .collect();
+            assert_eq!(
+                stored.len(),
+                2,
+                "{}: expected a stale and a current inf.vec.offset, got {stored:?}",
+                path.display()
+            );
+            let (fts_at, fts_len) = first_region(&kvs, kv::FTS_OFFSET, kv::FTS_LENGTH)
+                .unwrap_or_else(|| panic!("{}: no FTS region", path.display()));
+            let current = (fts_at + fts_len).to_string();
+            assert!(
+                stored[0] != current && stored[1] == current,
+                "{}: expected the stale copy first and the vector blob's real \
+                 offset {current} last, got {stored:?}",
+                path.display()
+            );
+        }
+    }
+}
+
 mod v1_positionless {
     use super::*;
 

@@ -29,7 +29,7 @@ use crate::{
     config::{self, ReindexMode, ReindexOptions, ReindexTarget, SuperfileIndex},
     runtime_bridge::bridge_on_runtime,
     superfile::{
-        format::footer::{BlobRegion, declared_regions, resolved_regions},
+        format::footer::{BlobRegion, has_duplicated_region_key, resolved_regions},
         fts::{
             analysis::{UNKNOWN_ANALYSIS_REVISION, analysis_revision_written_by},
             reader::{FtsStaleness, StaleColumn},
@@ -171,25 +171,27 @@ impl StaleSuperfile {
 /// a reader that keeps the first.
 fn footer_state(reader: &SuperfileReader, offsets: Option<&SubsectionOffsets>) -> FooterState {
     let metadata = reader.parquet_metadata();
-    let Some(resolved) = resolved_regions(metadata) else {
+    // A reindex input is always opened whole; one that is not cannot be
+    // checked against its bytes, so it is left alone like any other doubt.
+    let (Some(resolved), Some(bytes)) = (resolved_regions(metadata), reader.whole_file_bytes())
+    else {
         return FooterState::Inconsistent;
     };
-    let file_len = reader
-        .whole_file_bytes()
-        .map(|bytes| bytes.len() as u64)
-        .or(offsets.map(|o| o.total_size));
     // An older manifest may record no region; only a recorded one can
     // disagree.
     let agrees = |manifest: Option<BlobRegion>, footer: Option<BlobRegion>| {
         manifest.is_none_or(|m| Some(m) == footer)
     };
-    let in_file = file_len.is_none_or(|n| resolved.fit_within(n));
+    let in_file = resolved.fit_within(bytes.len() as u64);
     let matches_manifest =
         offsets.is_none_or(|o| agrees(o.fts, resolved.fts) && agrees(o.vec, resolved.vec));
-    match (in_file && matches_manifest, declared_regions(metadata)) {
+    match (
+        in_file && matches_manifest,
+        has_duplicated_region_key(metadata),
+    ) {
         (false, _) => FooterState::Inconsistent,
-        (true, None) => FooterState::DuplicatedKeys,
-        (true, Some(_)) => FooterState::Sound,
+        (true, true) => FooterState::DuplicatedKeys,
+        (true, false) => FooterState::Sound,
     }
 }
 
@@ -792,15 +794,20 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
-    use std::slice;
+    use std::{fs, slice};
 
+    use bytes::Bytes;
     use datafusion::prelude::{col, lit};
     use tempfile::TempDir;
 
     use super::*;
     use crate::{
         Bm25SearchOptions,
-        superfile::fts::reader::StaleColumn,
+        storage::StorageProvider,
+        superfile::{
+            format::{footer::with_forged_footer_kv, kv},
+            fts::reader::StaleColumn,
+        },
         supertable::{
             Supertable,
             writer::{CommitListMetadata, build_subsection_offsets, persist_commit_async},
@@ -1106,6 +1113,18 @@ mod tests {
         }
     }
 
+    /// The bytes of the fixture's first superfile.
+    fn first_fixture_superfile(table: &Supertable, storage: &Arc<dyn StorageProvider>) -> Bytes {
+        let manifest = table.reader().expect("reader").manifest().clone();
+        let entries = table
+            .block_on_query(manifest.get_all_superfiles_loaded())
+            .expect("load entries");
+        let (bytes, _) = table
+            .block_on_query(storage.get(&entries[0].storage_path()))
+            .expect("read superfile");
+        bytes
+    }
+
     /// A footer is judged on the copy of each key this engine reads: sound
     /// when the manifest records the same regions, inconsistent the moment
     /// it records one elsewhere — whichever side is wrong.
@@ -1114,13 +1133,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         copy_dir_recursive(&old_format_fts_fixture(), dir.path());
         let (storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
-        let manifest = table.reader().expect("reader").manifest().clone();
-        let entries = table
-            .block_on_query(manifest.get_all_superfiles_loaded())
-            .expect("load entries");
-        let (bytes, _) = table
-            .block_on_query(storage.get(&entries[0].storage_path()))
-            .expect("read superfile");
+        let bytes = first_fixture_superfile(&table, &storage);
         let offsets = build_subsection_offsets(&bytes).expect("subsection offsets");
         let reader = SuperfileReader::open(bytes).expect("open superfile");
 
@@ -1135,6 +1148,98 @@ mod tests {
         assert_eq!(
             footer_state(&reader, Some(&elsewhere)),
             FooterState::Inconsistent
+        );
+    }
+
+    /// A stale copy of a region key ahead of the real one, the shape a
+    /// carried rewrite once left, is a duplicate a rewrite can repair: the
+    /// copy this engine reads still matches the file and the manifest.
+    #[test]
+    fn a_stale_region_copy_ahead_of_the_real_one_is_a_duplicate() {
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+        let (storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+        let bytes = first_fixture_superfile(&table, &storage);
+        let offsets = build_subsection_offsets(&bytes).expect("subsection offsets");
+        let (at, _) = offsets.fts.expect("the fixture has an FTS region");
+
+        let stale = (at + 1).to_string();
+        let forged = with_forged_footer_kv(&bytes, &[(kv::FTS_OFFSET, &stale)]);
+        let reader = SuperfileReader::open(forged).expect("the last copy still opens");
+        assert_eq!(
+            footer_state(&reader, Some(&offsets)),
+            FooterState::DuplicatedKeys
+        );
+    }
+
+    /// A duplicated region key on a table that is otherwise current is
+    /// found and repaired: the footer is the only reason the file is
+    /// rewritten, and the rewrite stores each key once.
+    #[test]
+    fn a_reindex_repairs_a_duplicated_region_key() {
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+        let (_storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+        table
+            .reindex(&ReindexOptions::default())
+            .expect("bring the fixture current");
+        let survivors = hits(&table, "shared");
+
+        // Plant the stale copy on one file of the now-current table.
+        let manifest = table.reader().expect("reader").manifest().clone();
+        let entries = table
+            .block_on_query(manifest.get_all_superfiles_loaded())
+            .expect("load entries");
+        let path = dir.path().join(entries[0].storage_path());
+        let bytes = fs::read(&path).expect("read superfile");
+        let offsets = build_subsection_offsets(&Bytes::from(bytes.clone())).expect("offsets");
+        let (at, _) = offsets.fts.expect("an FTS region");
+        let stale = (at + 1).to_string();
+        fs::write(
+            &path,
+            with_forged_footer_kv(&bytes, &[(kv::FTS_OFFSET, &stale)]),
+        )
+        .expect("write forged superfile");
+        drop(table);
+        let (storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+
+        let before = table
+            .index_staleness(&ReindexOptions::default())
+            .expect("assess");
+        assert_eq!(before.needing_rewrite, 1, "{before:?}");
+        assert_eq!(before.awaiting_reanalysis, 0, "{before:?}");
+        assert!(before.inconsistent_footers.is_empty(), "{before:?}");
+
+        let report = table
+            .reindex(&ReindexOptions::default())
+            .expect("repair the footer");
+        assert_eq!(report.rewritten, 1, "{report:?}");
+        for entry in table
+            .block_on_query(
+                table
+                    .reader()
+                    .expect("reader")
+                    .manifest()
+                    .get_all_superfiles_loaded(),
+            )
+            .expect("load entries")
+        {
+            let (bytes, _) = table
+                .block_on_query(storage.get(&entry.storage_path()))
+                .expect("read superfile");
+            let reader = SuperfileReader::open(bytes).expect("open superfile");
+            assert!(
+                !has_duplicated_region_key(reader.parquet_metadata()),
+                "{}: footer still stores a region key twice",
+                entry.storage_path()
+            );
+        }
+        assert_eq!(hits(&table, "shared"), survivors, "the repair moved rows");
+        assert!(
+            table
+                .index_staleness(&ReindexOptions::default())
+                .expect("assess the repaired table")
+                .is_current()
         );
     }
 

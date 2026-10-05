@@ -629,16 +629,16 @@ pub fn extract_kv_map(metadata: &ParquetMetaData) -> Result<KvMap, FooterError> 
 /// A blob's `(offset, length)` within its superfile.
 pub(crate) type BlobRegion = (u64, u64);
 
-/// The blob regions a superfile's footer declares.
+/// Where a superfile's footer places each of its blobs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DeclaredRegions {
+pub(crate) struct BlobRegions {
     pub(crate) fts: Option<BlobRegion>,
     pub(crate) vec: Option<BlobRegion>,
     pub(crate) ids: Option<BlobRegion>,
 }
 
-impl DeclaredRegions {
-    /// Whether every declared region ends inside a `file_len`-byte file.
+impl BlobRegions {
+    /// Whether every region ends inside a `file_len`-byte file.
     pub(crate) fn fit_within(&self, file_len: u64) -> bool {
         [self.fts, self.vec, self.ids]
             .into_iter()
@@ -647,40 +647,31 @@ impl DeclaredRegions {
     }
 }
 
-/// The blob regions `metadata` declares, or `None` when a region key is
-/// stored more than once, is not a `u64`, or has no partner.
+/// Whether `metadata` stores any region key more than once.
 ///
-/// Reads the key list as stored rather than through [`extract_kv_map`],
+/// Counts the key list as stored rather than through [`extract_kv_map`],
 /// which keeps a key's last copy and so cannot see a stale duplicate.
-pub(crate) fn declared_regions(metadata: &ParquetMetaData) -> Option<DeclaredRegions> {
+pub(crate) fn has_duplicated_region_key(metadata: &ParquetMetaData) -> bool {
     let kvs = metadata
         .file_metadata()
         .key_value_metadata()
         .map_or(&[][..], Vec::as_slice);
-    regions_from(|key| {
-        let mut stored = kvs.iter().filter(|entry| entry.key == key);
-        match (stored.next(), stored.next()) {
-            (None, _) => Some(None),
-            (Some(entry), None) => entry.value.as_deref()?.parse().ok().map(Some),
-            (Some(_), Some(_)) => None,
-        }
-    })
+    kv::REGION_KEYS
+        .iter()
+        .any(|key| kvs.iter().filter(|entry| entry.key == *key).count() > 1)
 }
 
 /// The blob regions this engine's reader resolves from `metadata`, which
 /// keeps the last copy of a repeated key; `None` when a region key is not
 /// a `u64` or has no partner.
-pub(crate) fn resolved_regions(metadata: &ParquetMetaData) -> Option<DeclaredRegions> {
+pub(crate) fn resolved_regions(metadata: &ParquetMetaData) -> Option<BlobRegions> {
     let kv_map = extract_kv_map(metadata).ok()?;
-    regions_from(|key| match kv_map.get(key) {
-        None => Some(None),
-        Some(value) => value.parse().ok().map(Some),
-    })
-}
-
-/// Pairs each blob's offset and length key through `value`, whose outer
-/// `None` marks a malformed key and inner `None` an absent one.
-fn regions_from(value: impl Fn(&str) -> Option<Option<u64>>) -> Option<DeclaredRegions> {
+    // Outer `None` is a malformed key; inner `None` an absent one.
+    let value = |key: &str| -> Option<Option<u64>> {
+        kv_map
+            .get(key)
+            .map_or(Some(None), |v| v.parse().ok().map(Some))
+    };
     let region = |offset: &str, length: &str| -> Option<Option<BlobRegion>> {
         match (value(offset)?, value(length)?) {
             (Some(at), Some(len)) => Some(Some((at, len))),
@@ -688,7 +679,7 @@ fn regions_from(value: impl Fn(&str) -> Option<Option<u64>>) -> Option<DeclaredR
             _ => None,
         }
     };
-    Some(DeclaredRegions {
+    Some(BlobRegions {
         fts: region(kv::FTS_OFFSET, kv::FTS_LENGTH)?,
         vec: region(kv::VEC_OFFSET, kv::VEC_LENGTH)?,
         ids: region(kv::IDS_OFFSET, kv::IDS_LENGTH)?,
@@ -725,13 +716,49 @@ pub(crate) fn with_appended_kv(
     metadata: &ParquetMetaData,
     extra: &[(&str, &str)],
 ) -> ParquetMetaData {
+    let mut kvs = stored_kvs(metadata);
+    kvs.extend(key_values(extra));
+    with_kv_list(metadata, kvs)
+}
+
+/// Test-only: `bytes` with `extra` written ahead of its footer's own keys,
+/// verbatim — where a carried rewrite left its stale copies, and the
+/// malformed footers [`splice_carried_body_to`] refuses to write.
+#[cfg(test)]
+pub(crate) fn with_forged_footer_kv(bytes: &[u8], extra: &[(&str, &str)]) -> Bytes {
+    let (start, metadata) = split_footer(bytes);
+    let mut kvs = key_values(extra);
+    kvs.extend(stored_kvs(&metadata));
+    let mut out = bytes[..start].to_vec();
+    ParquetMetaDataWriter::new(&mut out, &with_kv_list(&metadata, kvs))
+        .finish()
+        .expect("write forged footer");
+    Bytes::from(out)
+}
+
+/// Test-only: the footer's key-value list as stored.
+#[cfg(test)]
+fn stored_kvs(metadata: &ParquetMetaData) -> Vec<KeyValue> {
+    metadata
+        .file_metadata()
+        .key_value_metadata()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Test-only: `pairs` as footer key-value entries.
+#[cfg(test)]
+fn key_values(pairs: &[(&str, &str)]) -> Vec<KeyValue> {
+    pairs
+        .iter()
+        .map(|(k, v)| KeyValue::new(k.to_string(), Some(v.to_string())))
+        .collect()
+}
+
+/// Test-only: `metadata` with its key-value list replaced by `kvs`.
+#[cfg(test)]
+fn with_kv_list(metadata: &ParquetMetaData, kvs: Vec<KeyValue>) -> ParquetMetaData {
     let fm = metadata.file_metadata();
-    let mut kvs = fm.key_value_metadata().cloned().unwrap_or_default();
-    kvs.extend(
-        extra
-            .iter()
-            .map(|(k, v)| KeyValue::new(k.to_string(), Some(v.to_string()))),
-    );
     let fm = FileMetaData::new(
         fm.version(),
         fm.num_rows(),
@@ -743,19 +770,6 @@ pub(crate) fn with_appended_kv(
     ParquetMetaDataBuilder::new(fm)
         .set_row_groups(metadata.row_groups().to_vec())
         .build()
-}
-
-/// Test-only: `bytes` with `extra` appended to its footer verbatim — the
-/// malformed footers [`splice_carried_body_to`] refuses to write, for
-/// tests of how a reader rejects them.
-#[cfg(test)]
-pub(crate) fn with_forged_footer_kv(bytes: &[u8], extra: &[(&str, &str)]) -> Bytes {
-    let (start, metadata) = split_footer(bytes);
-    let mut out = bytes[..start].to_vec();
-    ParquetMetaDataWriter::new(&mut out, &with_appended_kv(&metadata, extra))
-        .finish()
-        .expect("write forged footer");
-    Bytes::from(out)
 }
 
 #[cfg(test)]
@@ -951,23 +965,25 @@ mod tests {
                 "{key} kept the caller's value"
             );
         }
-        let declared = declared_regions(&footer_metadata(&parts.bytes)).expect("well-formed");
-        assert_eq!(declared.fts, Some((parts.fts_offset, parts.fts_length)));
-        assert_eq!(declared.vec, Some((parts.vec_offset, parts.vec_length)));
-        assert!(declared.fit_within(parts.bytes.len() as u64));
+        let metadata = footer_metadata(&parts.bytes);
+        assert!(!has_duplicated_region_key(&metadata));
+        let resolved = resolved_regions(&metadata).expect("well-formed");
+        assert_eq!(resolved.fts, Some((parts.fts_offset, parts.fts_length)));
+        assert_eq!(resolved.vec, Some((parts.vec_offset, parts.vec_length)));
+        assert!(resolved.fit_within(parts.bytes.len() as u64));
     }
 
-    /// A region key stored twice is malformed: which copy a reader
-    /// resolves depends on the reader.
+    /// A region key stored twice is found by counting the stored list:
+    /// which copy a reader resolves depends on the reader.
     #[test]
-    fn a_duplicated_region_key_is_not_a_declared_region() {
+    fn a_duplicated_region_key_is_counted_as_stored() {
         let parts = write_with_both_blobs(&[]);
         let metadata = footer_metadata(&parts.bytes);
-        assert!(declared_regions(&metadata).is_some());
+        assert!(!has_duplicated_region_key(&metadata));
 
         let stale_offset = (parts.vec_offset + 1).to_string();
         let duplicated = with_appended_kv(&metadata, &[(kv::VEC_OFFSET, &stale_offset)]);
-        assert_eq!(declared_regions(&duplicated), None);
+        assert!(has_duplicated_region_key(&duplicated));
 
         // This engine's reader still resolves one: the last copy.
         let resolved = resolved_regions(&duplicated).expect("last copy resolves");
@@ -975,19 +991,19 @@ mod tests {
     }
 
     /// An offset without its length, or a value that is not a number,
-    /// declares no region a reader could use.
+    /// resolves to no region a reader could use.
     #[test]
-    fn a_partial_or_unparsable_region_is_not_a_declared_region() {
+    fn a_partial_or_unparsable_region_does_not_resolve() {
         // Written without an ids sidecar, so `inf.ids.*` is free to plant.
         let metadata = footer_metadata(&write_with_both_blobs(&[]).bytes);
         let no_length = with_appended_kv(&metadata, &[(kv::IDS_OFFSET, "0")]);
-        assert_eq!(declared_regions(&no_length), None);
+        assert_eq!(resolved_regions(&no_length), None);
 
         let unparsable = with_appended_kv(
             &metadata,
             &[(kv::IDS_OFFSET, "0"), (kv::IDS_LENGTH, "not a number")],
         );
-        assert_eq!(declared_regions(&unparsable), None);
+        assert_eq!(resolved_regions(&unparsable), None);
     }
 
     /// A region ending past the file does not fit it; one ending exactly at
@@ -995,17 +1011,17 @@ mod tests {
     #[test]
     fn a_region_past_the_end_of_the_file_does_not_fit() {
         const FILE_LEN: u64 = 100;
-        let at_end = DeclaredRegions {
+        let at_end = BlobRegions {
             vec: Some((90, 10)),
             ..Default::default()
         };
         assert!(at_end.fit_within(FILE_LEN));
-        let past_end = DeclaredRegions {
+        let past_end = BlobRegions {
             vec: Some((90, 11)),
             ..Default::default()
         };
         assert!(!past_end.fit_within(FILE_LEN));
-        let overflowing = DeclaredRegions {
+        let overflowing = BlobRegions {
             fts: Some((u64::MAX, 1)),
             ..Default::default()
         };

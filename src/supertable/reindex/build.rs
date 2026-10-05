@@ -211,16 +211,16 @@ mod tests {
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
             reader::SuperfileReader,
-            vector::{distance::normalize, layout::VectorLayout},
+            vector::layout::VectorLayout,
         },
         supertable::manifest::SuperfileUri,
-        test_helpers::{decimal128_id_field, decimal128_ids, default_vector_config},
+        test_helpers::{
+            decimal128_id_field, decimal128_ids, default_vector_config, distinct_unit_vectors,
+        },
     };
 
     /// Rows in the vector-bearing fixture.
     const VECTOR_ROWS: usize = 4;
-    /// Dimension `default_vector_config` declares.
-    const VECTOR_DIM: usize = 16;
     /// Rotation seed for the fixture's vector column.
     const VECTOR_ROT_SEED: u64 = 7;
 
@@ -296,20 +296,15 @@ mod tests {
             decimal128_id_field("doc_id"),
             Field::new("title", DataType::LargeUtf8, false),
         ]));
+        let vector = default_vector_config("emb", VECTOR_ROT_SEED);
+        let flat = distinct_unit_vectors(VECTOR_ROWS, vector.dim, VECTOR_ROT_SEED);
         let opts = BuilderOptions::new(
             schema.clone(),
             "doc_id",
             vec![FtsConfig::new("title")],
-            vec![default_vector_config("emb", VECTOR_ROT_SEED)],
+            vec![vector],
         );
         let mut b = SuperfileBuilder::new(opts).expect("new builder");
-        let mut flat = Vec::<f32>::new();
-        for i in 0..VECTOR_ROWS {
-            let mut v = vec![0.0f32; VECTOR_DIM];
-            v[i % VECTOR_DIM] = 1.0;
-            normalize(&mut v);
-            flat.extend_from_slice(&v);
-        }
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
