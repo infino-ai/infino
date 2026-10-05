@@ -23,10 +23,10 @@
 //!      superfiles' Parquet bytes are exposed to a DataFusion
 //!      `ParquetSource` via an in-memory object store. DataFusion's
 //!      own filter pushdown hands the `FilterExec` predicate to that
-//!      source, where `PruningPredicate` prunes row groups and pages;
-//!      when the index could not bound the rows, [`scan`] also turns
-//!      on Parquet row filters so the same predicate decodes the
-//!      filter columns first and only surviving rows materialize.
+//!      source, where `PruningPredicate` prunes row groups and pages.
+//!      A predicate the index could not bound is evaluated by
+//!      DataFusion's `FilterExec` above the scan, never as a Parquet
+//!      row filter inside it.
 //!      We deliberately do **not** reimplement this commodity layer.
 //!
 //! Correctness is independent of either tier: every pushed filter
@@ -1164,10 +1164,6 @@ impl TableProvider for SupertableProvider {
             prepared: Arc<PreparedScanFile>,
             candidates: Option<RoaringBitmap>,
             tombstones: Arc<RoaringBitmap>,
-            /// This superfile's plan came out `Unbounded` — the whole plan
-            /// is, or a `LIKE` token found no bound in its dictionary —
-            /// and no exact conjunct bounds it either.
-            unbounded: bool,
             /// The pushdown predicate's df probes, dictionary walks and
             /// posting walks on this superfile.
             predicate_work: MatchWork,
@@ -1251,10 +1247,6 @@ impl TableProvider for SupertableProvider {
                         } else {
                             candidate_plan
                         };
-                        // An exact conjunct bounds the rows even when the
-                        // bounded ones cannot.
-                        let unbounded =
-                            matches!(plan, CandidatePlan::Unbounded) && exact_check.is_none();
                         let (est, est_work) = plan
                             .estimate(prepared.reader.as_ref(), Some(reader_pool))
                             .await
@@ -1324,7 +1316,6 @@ impl TableProvider for SupertableProvider {
                             prepared,
                             candidates,
                             tombstones,
-                            unbounded,
                             predicate_work,
                         })
                     }
@@ -1339,10 +1330,6 @@ impl TableProvider for SupertableProvider {
         ))
         .await?;
 
-        // Whether some superfile's plan came out `Unbounded`. Decides
-        // whether DataFusion's row filter is attached below; a superfile
-        // the selectivity gate sends to a scan is not counted (see there).
-        let any_plan_unbounded = superfiles.iter().any(|seg| seg.unbounded);
         // The pushdown predicates' df probes, dictionary walks and posting
         // walks, flushed through the same collector that meters this
         // scan's pages — once the fan-out is in, so the tallies land in
@@ -1385,55 +1372,33 @@ impl TableProvider for SupertableProvider {
             files.push(file);
         }
 
-        // Tier 2 - DataFusion-owned row-group / page pruning + row-level
-        // filter pushdown, used **only when the index could not bound the
-        // rows** of some superfile: an `Unbounded` candidate plan, or a
-        // `LIKE` token that found no bound in that superfile's dictionary.
-        // In that fallback the predicate becomes a Parquet `RowFilter`
-        // (`with_pushdown_filters`) so the predicate columns are decoded
-        // first and only surviving rows materialize.
-        //
-        // The predicate itself is not attached here. Every filter but an
-        // exact one is reported `Inexact`, so DataFusion keeps a
-        // `FilterExec` above the scan for those (an exact filter bounds
-        // every superfile's rows, so a scan holding one never turns row
-        // filters on), and its physical filter-pushdown rule then offers that
-        // node's predicate to the source: with row filters enabled the
-        // source accepts it once and the `FilterExec` is dropped; with them
-        // disabled the source still keeps it for statistics pruning and the
-        // node stays. Attaching our own copy of the same conjunction as
-        // well made the row filter `p AND p` — a second evaluation of the
-        // predicate over every row the first pass kept, which on a dense
-        // predicate is most of them.
-        //
-        // When the index *did* bound the rows, the per-superfile access plan
-        // already selects exactly the candidate rows and the `FilterExec`
-        // verifies the exact predicate over that tiny set, so row filters
-        // stay off. A superfile the selectivity gate sent to a scan
-        // deliberately gets none either: the gate fires when the predicate
-        // matches most rows, and a row filter that keeps most rows only adds
-        // its own decode pass on top of the scan — measured on the 1M-row
-        // SQL bench, `bucket IN (all)` and a majority `category` aggregate
-        // ran 1.6–3× slower with it attached.
-        // A scan with no filters at all also lowers to `Unbounded`; it has
-        // no predicate to filter rows by and gets no row filter — otherwise
-        // DataFusion's post-optimization dynamic filters (TopK, join probe
-        // side, aggregate) would start running as Parquet row filters on
-        // filter-less scans, a change nothing has measured.
-        let row_filter = !filters.is_empty() && any_plan_unbounded;
-
         // Only push the LIMIT into the scan when there are no filters:
         // with an `Inexact` filter re-applied above, a scan-level limit
-        // could stop before enough matching rows are produced. With no
-        // filters, DataFusion's own limit and a scan-level limit agree.
+        // could stop before enough matching rows are produced, and an exact
+        // filter's scan needs its row selections intact (see the meter
+        // below). With no filters, DataFusion's own limit and a scan-level
+        // limit agree.
         let effective_limit = if filters.is_empty() { limit } else { None };
 
+        // Tier 2 - DataFusion's row-group and page pruning. Where a `WHERE`
+        // predicate is evaluated, by path:
+        //
+        //   index bounds the rows             index cannot bound the rows
+        //   (FTS column: =, IN, LIKE)         (scalar column, range, NOT)
+        //            │                                   │
+        //   access plan selects the           scan decodes every row the
+        //   candidate rows                    statistics could not prune
+        //            │                                   │
+        //            └───── FilterExec verifies the ─────┘
+        //                   predicate on both
+        //
+        // No predicate is attached to the source. DataFusion hands it the
+        // `FilterExec` predicate for statistics pruning only; it never runs as
+        // a Parquet row filter (`pushdown_filters` is pinned off on the SQL
+        // session). A row filter pays only when a predicate keeps a handful
+        // of rows. On one that keeps a few percent of rows spread over every
+        // row group it skips no page and costs a multiple of the plain scan.
         let mut source = ParquetSource::new(Arc::clone(&self.schema));
-        if row_filter {
-            source = source
-                .with_pushdown_filters(true)
-                .with_reorder_filters(true);
-        }
         // Serve DataFusion's opener the index-complete footers the
         // readers already parsed — without this the opener re-reads +
         // re-parses every superfile's footer on every query (~half the

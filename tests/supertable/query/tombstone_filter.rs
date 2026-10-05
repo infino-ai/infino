@@ -82,6 +82,8 @@ const LIMIT_FIXTURE_ROWS: usize = 60_000;
 const LIMIT_FIXTURE_TITLE_LEN: usize = 128;
 /// `LIMIT` small enough that one fully matching row group satisfies it.
 const LIMIT_FIXTURE_FETCH: usize = 3;
+/// Seed of the LCG that draws the `LIMIT` fixture's titles.
+const LIMIT_FIXTURE_SEED: u64 = 7;
 /// Multiplier of the LCG that draws the `LIMIT` fixture's titles.
 const TITLE_LCG_MULT: u64 = 6_364_136_223_846_793_005;
 /// Alphabet the `LIMIT` fixture's titles are drawn from: one token per
@@ -328,48 +330,100 @@ fn physical_plan(st: &Supertable, sql: &str) -> String {
     panic!("no physical plan in EXPLAIN output");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sql_limit_under_a_row_filter_keeps_deleted_rows_out() {
-    // A predicate the index cannot bound (`_id > 0`) runs as a Parquet row
-    // filter with the `FilterExec` folded into the scan, so nothing above
-    // the scan would hold a `LIMIT`'s fetch — and a scan-level limit lets
-    // the Parquet opener's limit pruning replace the tombstone row
-    // selection with whole row groups the predicate's statistics prove
-    // fully matching, handing back deleted rows. The provider's meter
-    // refuses the fetch, a limit node stays above the scan, and the
-    // deleted first row stays out of the first three.
+/// The `LIMIT` fixture: one committed batch of pseudo-random titles on
+/// local storage, with the first title deleted. Returns the tempdir guard,
+/// the table and the deleted title.
+fn limit_fixture() -> (TempDir, Supertable, String) {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
         .expect("create");
 
-    let titles = pseudo_random_titles(LIMIT_FIXTURE_ROWS, 7);
+    let titles = pseudo_random_titles(LIMIT_FIXTURE_ROWS, LIMIT_FIXTURE_SEED);
     let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(&refs)).expect("append");
     w.commit().expect("commit");
     drop(w);
 
-    let deleted = titles[0].as_str();
-    let stats = st.delete(col("title").eq(lit(deleted))).expect("delete");
+    let deleted = titles[0].clone();
+    let stats = st
+        .delete(col("title").eq(lit(deleted.as_str())))
+        .expect("delete");
     assert_eq!(stats.n_tombstoned(), 1);
+    (dir, st, deleted)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sql_limit_over_an_unbounded_predicate_keeps_deleted_rows_out() {
+    // `_id > 0 LIMIT 3` on a table whose first row is deleted.
+    //  - the index cannot bound `_id`, so a `FilterExec` above the scan
+    //    evaluates the predicate and carries the fetch.
+    //  - a limit inside the scan would let the Parquet opener's limit pruning
+    //    swap the tombstone row selection for whole row groups the statistics
+    //    prove fully matching, and the deleted row would come back.
+    // This test pins the plan shape and that the deleted row stays out.
+    let (_dir, st, deleted) = limit_fixture();
 
     let sql = format!("SELECT title FROM supertable WHERE _id > 0 LIMIT {LIMIT_FIXTURE_FETCH}");
     let got = title_values(&st.reader().expect("reader").query_sql(&sql).expect("sql"));
     assert_eq!(got.len(), LIMIT_FIXTURE_FETCH);
     assert!(
-        !got.iter().any(|t| t == deleted),
+        !got.contains(&deleted),
         "the deleted row came back under LIMIT: {got:?}"
     );
 
-    // The shape that makes the check above load-bearing: byte-range
-    // partitions (no repartition node between the limit and the scan), the
-    // filter folded into the scan as a row filter, and the fetch held
-    // above the scan rather than inside it.
+    // The shape that makes the check above load-bearing: byte-range partitions
+    // (no repartition node between the limit and the scan), the fetch on the
+    // `FilterExec`, no limit in the scan.
+    let plan = physical_plan(&st, &sql);
+    assert!(!plan.contains("RepartitionExec"), "{plan}");
+    let filter = plan
+        .lines()
+        .find(|l| l.contains("FilterExec"))
+        .expect("a FilterExec in the physical plan");
+    assert!(
+        filter.contains(&format!("fetch={LIMIT_FIXTURE_FETCH}")),
+        "{filter}"
+    );
+    let scan = plan
+        .lines()
+        .find(|l| l.contains("DataSourceExec"))
+        .expect("a DataSourceExec in the physical plan");
+    assert!(!scan.contains("limit="), "{scan}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sql_limit_over_an_exact_filter_keeps_deleted_rows_out() {
+    // `title ILIKE '%c%' LIMIT 3`, an exact filter: the term dictionary answers
+    // it in full, so the plan has no `FilterExec`.
+    //  - nothing above the scan would hold the fetch, so DataFusion would push
+    //    it into the scan, where limit pruning could return the deleted row.
+    //  - the provider's meter refuses the fetch; it stays on the node above.
+    // This test pins the fetch above the scan and the deleted row out.
+    let (_dir, st, deleted) = limit_fixture();
+
+    // A letter from the deleted title, so the deleted row is a match.
+    let letter = deleted.chars().next().expect("non-empty title");
+    let sql = format!(
+        "SELECT title FROM supertable WHERE title ILIKE '%{letter}%' LIMIT {LIMIT_FIXTURE_FETCH}"
+    );
+    let got = title_values(&st.reader().expect("reader").query_sql(&sql).expect("sql"));
+    assert_eq!(got.len(), LIMIT_FIXTURE_FETCH);
+    assert!(
+        !got.contains(&deleted),
+        "the deleted row came back under LIMIT: {got:?}"
+    );
+
     let plan = physical_plan(&st, &sql);
     assert!(!plan.contains("RepartitionExec"), "{plan}");
     assert!(!plan.contains("FilterExec"), "{plan}");
+    // The fetch is above the scan; the scan has none.
+    assert!(
+        plan.contains(&format!("fetch={LIMIT_FIXTURE_FETCH}")),
+        "{plan}"
+    );
     let scan = plan
         .lines()
         .find(|l| l.contains("DataSourceExec"))
