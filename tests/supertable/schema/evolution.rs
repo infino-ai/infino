@@ -1000,3 +1000,50 @@ fn a_search_projecting_only_a_newer_column_reads_it_as_null() {
         }
     }
 }
+
+/// The engine builds a full-text index over `LargeUtf8` and over no other
+/// string type. A schema write asking for one over `Utf8` therefore has to
+/// be refused where it is written: accepted, it would be the appends after
+/// it that fail, and only another schema write could undo that.
+#[test]
+fn a_full_text_index_is_refused_on_a_string_type_it_cannot_be_built_over() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
+        .expect("create");
+
+    let fts = || ColumnIndex::Fts {
+        analyzer: "standard".into(),
+        stopwords: Stopwords::None,
+        stemmer: Stemmer::None,
+        positions: false,
+        stored: true,
+        bm25: Bm25Params::default(),
+    };
+
+    for unsupported in [DataType::Utf8, DataType::Utf8View] {
+        let err = db
+            .apply_schema(
+                TABLE,
+                &SchemaPatch::new(vec![
+                    FieldPatch::named("body")
+                        .with_type(unsupported.clone())
+                        .with_index(fts()),
+                ]),
+                None,
+            )
+            .expect_err("a full-text index the builder cannot build is refused");
+        assert!(
+            matches!(
+                &err,
+                InfinoError::Schema(SchemaError::InvalidIndex { column, .. }) if column == "body"
+            ),
+            "{unsupported}: {err:?}"
+        );
+    }
+
+    // And the table still appends, which is what the refusal protects: an
+    // accepted index the builder refuses fails every append after it.
+    docs.append_rows(&[serde_json::json!({"title": "still writable"})])
+        .expect("append after the refusal");
+}

@@ -708,15 +708,14 @@ fn check_index_fits(
     data_type: &DataType,
 ) -> Result<(), SchemaError> {
     match index {
-        ColumnIndex::Fts { .. }
-            if !matches!(
-                data_type,
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-            ) =>
-        {
+        // `LargeUtf8` and nothing else: the superfile builder refuses to
+        // build a full-text index over any other string type. Admitting one
+        // here would accept the schema write and then fail every append
+        // after it, with no way back except another schema write.
+        ColumnIndex::Fts { .. } if !matches!(data_type, DataType::LargeUtf8) => {
             Err(SchemaError::InvalidIndex {
                 column: column.to_owned(),
-                reason: format!("a full-text index needs a string column, not `{data_type}`"),
+                reason: format!("a full-text index needs a `LargeUtf8` column, not `{data_type}`"),
             })
         }
         ColumnIndex::Fts { .. } => Ok(()),
@@ -728,17 +727,13 @@ fn check_index_fits(
 }
 
 /// The index a column keeps after its type changes to `to`: a full-text
-/// index survives a string-to-string change, nothing else does.
+/// index survives a change to the one string type it can be built over,
+/// and nothing else keeps it. A retype to another string type drops it on
+/// the same rule as a retype to an integer — the builder cannot index the
+/// result, so keeping the index would wedge the next append.
 fn index_after_retype(index: Option<ColumnIndex>, to: &DataType) -> Option<ColumnIndex> {
     match index {
-        Some(ColumnIndex::Fts { .. })
-            if matches!(
-                to,
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-            ) =>
-        {
-            index
-        }
+        Some(ColumnIndex::Fts { .. }) if matches!(to, DataType::LargeUtf8) => index,
         _ => None,
     }
 }
