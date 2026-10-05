@@ -1137,10 +1137,26 @@ impl PhysicalSchema {
 }
 
 /// Resolves the column *names* that parts and lists written before field
-/// ids existed use as summary keys. Such a table could never have renamed
-/// a column, so a stored name is the creation name, which is the current
-/// name; the id column and the birth-version aggregate key are the two
-/// names that are not user columns.
+/// ids existed use as summary keys, against the table's live columns. The
+/// id column and the birth-version aggregate key are the two names that
+/// are not user columns.
+///
+/// Known limitation: a stored name is matched against the columns the
+/// table has *now*, so a schema change that moves a name changes what a
+/// file written before ids resolves to. Two cases, both confined to such
+/// files:
+///
+/// - Renaming a column leaves its old name resolving to nothing, so the
+///   rows of a file that predates ids read null under the new name.
+/// - Dropping a column and giving its name to a new one resolves that
+///   file's column to the new id, so the dropped column's values read as
+///   the new column's.
+///
+/// Both clear once compaction has rewritten every file that predates ids,
+/// since a rewritten file carries ids and is resolved by id. Closing them
+/// outright needs a retired name to carry the id it belonged to, so a
+/// stored name resolves to the column that wrote it rather than to
+/// whatever holds the name today.
 #[derive(Debug, Clone)]
 pub struct LegacyNames {
     schema: Arc<TableSchema>,
