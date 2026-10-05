@@ -5397,6 +5397,22 @@ mod tests {
             }
             self.inner.put_atomic(uri, bytes).await
         }
+        async fn put_overwrite(
+            &self,
+            uri: &str,
+            bytes: bytes::Bytes,
+        ) -> Result<(), crate::storage::StorageError> {
+            if self
+                .fail_data_puts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && uri.contains("data/")
+            {
+                return Err(crate::storage::StorageError::NotFound {
+                    uri: format!("injected data PUT failure: {uri}"),
+                });
+            }
+            self.inner.put_overwrite(uri, bytes).await
+        }
         async fn put_if_match(
             &self,
             uri: &str,
@@ -8878,6 +8894,10 @@ mod tests {
             self.inner.put_atomic(uri, bytes).await
         }
 
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+
         async fn put_if_match(
             &self,
             uri: &str,
@@ -9053,6 +9073,10 @@ mod tests {
             bytes: Bytes,
         ) -> Result<Option<String>, StorageError> {
             self.inner.put_atomic(uri, bytes).await
+        }
+
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
         }
         async fn put_if_match(
             &self,

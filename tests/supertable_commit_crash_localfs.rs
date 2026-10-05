@@ -259,6 +259,15 @@ impl StorageProvider for CrashStorage {
         self.maybe_abort(uri, armed_at_start, is_match, result.is_ok());
         result
     }
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        // Armed the same way as `put_atomic`: the superfile write goes
+        // through here now, and the crash contract covers it.
+        let armed_at_start = self.armed.load(Ordering::SeqCst);
+        let is_match = self.uri_matches(uri);
+        let result = self.inner.put_overwrite(uri, bytes).await;
+        self.maybe_abort(uri, armed_at_start, is_match, result.is_ok());
+        result
+    }
     async fn put_if_match(
         &self,
         uri: &str,

@@ -10993,9 +10993,18 @@ pub async fn write_superfile_list(
 
 /// PUT one new superfile's bytes at `storage_key` — the entry's
 /// `storage_path()`, which is where every reader and GC's keep-set will
-/// look for them. Create-only: the key carries a fresh uuid, so an
-/// existing object can only be our own earlier attempt with identical
-/// bytes, and `PreconditionFailed` is success.
+/// look for them.
+///
+/// Overwriting, not create-only. Most keys here carry a fresh uuid, but the
+/// update path pre-allocates one in its WAL record and keeps it across a
+/// rebuild, so a retry can arrive at the same key with *different* bytes:
+/// the first attempt resolved its rows against one schema, and the attempt
+/// that lands resolved them against the winner's. Treating "already there"
+/// as success published a manifest entry whose physical schema, statistics
+/// and term-index offsets described bytes that were never stored. Nothing
+/// references the earlier attempt — its commit never won the pointer swap —
+/// so replacing it is safe, and it is what WAL recovery needs when it
+/// replays a record whose first attempt died after the write.
 async fn put_new_superfile_bytes(
     storage: &Arc<dyn StorageProvider>,
     multipart_threshold: u64,
@@ -11006,12 +11015,9 @@ async fn put_new_superfile_bytes(
     let result = if (bytes.len() as u64) >= multipart_threshold {
         put_superfile_multipart(storage.as_ref(), &path, bytes).await
     } else {
-        storage.put_atomic(&path, bytes).await.map(|_| ())
+        storage.put_overwrite(&path, bytes).await
     };
-    match result {
-        Ok(()) | Err(StorageError::PreconditionFailed { .. }) => Ok(()),
-        Err(error) => Err(SupertableCommitError::from(error)),
-    }
+    result.map_err(SupertableCommitError::from)
 }
 
 async fn write_superfile_list_with_threshold(
@@ -11653,14 +11659,10 @@ async fn put_superfile_multipart(
     path: &str,
     bytes: Bytes,
 ) -> Result<(), StorageError> {
-    // Same-bytes retry skip. Failures other than NotFound
-    // propagate so we don't paper over a degraded backend.
-    match storage.head(path).await {
-        Ok(_) => return Err(StorageError::PreconditionFailed { uri: path.into() }),
-        Err(StorageError::NotFound { .. }) => {}
-        Err(e) => return Err(e),
-    }
-
+    // No existence check: a multipart upload replaces whatever is at the
+    // key, which is what a rebuilt attempt at a pre-allocated id needs. See
+    // `put_new_superfile_bytes` for why an existing object here is always a
+    // superseded attempt that nothing references.
     let mut upload = storage.put_multipart(path).await?;
     let total = bytes.len();
     let part_concurrency = commit_write_concurrency().get();

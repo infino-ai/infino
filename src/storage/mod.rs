@@ -497,6 +497,15 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     /// absent" on the subsequent [`put_if_match`].
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError>;
 
+    /// Unconditional write — replaces the object if it is already there.
+    ///
+    /// For bytes whose key is derived rather than freshly minted, so a
+    /// retry can legitimately arrive with different content at the same
+    /// key. [`put_atomic`](Self::put_atomic) is the default; reach for this
+    /// only where an existing object is known to be a superseded attempt
+    /// that nothing references.
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError>;
+
     /// Conditional write — succeeds only if the target's
     /// current ETag matches `expected_etag`.
     ///
@@ -690,6 +699,10 @@ impl StorageProvider for PrefixedStorageProvider {
         bytes: bytes::Bytes,
     ) -> Result<Option<String>, StorageError> {
         self.inner.put_atomic(&self.prefixed(uri), bytes).await
+    }
+
+    async fn put_overwrite(&self, uri: &str, bytes: bytes::Bytes) -> Result<(), StorageError> {
+        self.inner.put_overwrite(&self.prefixed(uri), bytes).await
     }
 
     async fn put_if_match(
@@ -904,6 +917,11 @@ mod tests {
                 Some(b) => Ok(b.slice(range.start as usize..range.end as usize)),
                 None => Err(not_found(uri)),
             }
+        }
+
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.objects.lock().expect("lock").insert(uri.into(), bytes);
+            Ok(())
         }
 
         async fn put_atomic(

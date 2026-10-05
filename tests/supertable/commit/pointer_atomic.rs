@@ -484,6 +484,14 @@ impl StorageProvider for BarrierMockStorage {
         Ok(Some("mock-etag".into()))
     }
 
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        let prior = self.put_calls.fetch_add(1, Ordering::AcqRel);
+        if prior < PARALLEL_PUT_COUNT_BEFORE_POINTER {
+            self.barrier.wait().await;
+        }
+        self.objects.lock().await.insert(uri.into(), bytes);
+        Ok(())
+    }
     async fn put_if_match(
         &self,
         uri: &str,

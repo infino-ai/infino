@@ -5381,6 +5381,10 @@ mod tests {
                 Err(permanent(uri, "put_atomic unimplemented for mock"))
             }
 
+            async fn put_overwrite(&self, uri: &str, _bytes: Bytes) -> Result<(), StorageError> {
+                Err(permanent(uri, "put_overwrite unimplemented for mock"))
+            }
+
             async fn put_if_match(
                 &self,
                 uri: &str,
