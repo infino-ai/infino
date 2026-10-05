@@ -1047,7 +1047,7 @@ impl Supertable {
     }
 
     /// Append rows given as JSON documents: mapped to a batch under the
-    /// table's schema and templates, then appended like any batch.
+    /// table's schema, then appended like any batch.
     pub fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
         let batch = rows_to_batch(rows, &self.table_schema()).map_err(|e| {
             InfinoError::from(BuildError::Schema(e)).with_context("append_rows", None)

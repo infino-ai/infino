@@ -2124,7 +2124,6 @@ mod tests {
             }],
             max_fields: None,
             max_depth: None,
-            templates: None,
         }
     }
 

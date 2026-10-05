@@ -642,50 +642,6 @@ fn a_query_after_a_schema_change_does_not_serve_the_previous_generation() {
     assert_eq!(column(&db, "count"), vec!["1", "2"]);
 }
 
-#[test]
-fn the_caps_are_themselves_capped_and_a_template_pattern_is_bounded() {
-    let db = connect("memory://").expect("connect");
-    db.create_table(
-        TABLE,
-        Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)])),
-        IndexSpec::new(),
-    )
-    .expect("create");
-    let caps = |max_fields: Option<u32>, max_depth: Option<u32>| {
-        let mut patch = SchemaPatch::new(vec![]);
-        patch.max_fields = max_fields;
-        patch.max_depth = max_depth;
-        patch
-    };
-    let err = db
-        .apply_schema(TABLE, &caps(Some(u32::MAX), None), None)
-        .expect_err("a cap that removes the bound");
-    assert!(
-        matches!(&err, InfinoError::Schema(SchemaError::CapExceeded { setting, .. }) if setting == "max_fields"),
-        "{err}"
-    );
-    let err = db
-        .apply_schema(TABLE, &caps(None, Some(10_000)), None)
-        .expect_err("nor a depth that removes it");
-    assert!(
-        matches!(&err, InfinoError::Schema(SchemaError::CapExceeded { setting, .. }) if setting == "max_depth"),
-        "{err}"
-    );
-    db.apply_schema(TABLE, &caps(Some(50_000), Some(40)), None)
-        .expect("a cap within what the engine carries");
-
-    let wild = serde_json::json!({
-        "templates": [{"name": "wild", "path": "*".repeat(50), "type": "i64"}]
-    });
-    let err = db
-        .apply_schema(TABLE, &SchemaPatch::from_json(&wild).expect("patch"), None)
-        .expect_err("a pattern that costs more than the path it matches");
-    assert!(
-        matches!(&err, InfinoError::Schema(SchemaError::CapExceeded { setting, .. }) if setting.contains("wildcards")),
-        "{err}"
-    );
-}
-
 /// How many rows `sql` returns.
 fn row_count(db: &Connection, sql: &str) -> usize {
     db.query_sql(sql)
@@ -892,4 +848,40 @@ fn an_aggregate_is_not_answered_from_a_column_s_abandoned_bounds() {
     assert_eq!(scalar(&db, "SELECT MIN(n) FROM t"), 7);
     assert_eq!(scalar(&db, "SELECT MAX(n) FROM t"), 10);
     assert_eq!(scalar(&db, "SELECT SUM(n) FROM t"), 17);
+}
+
+/// The caps a table may set are themselves capped: a schema write cannot
+/// raise `max_fields` or `max_depth` past what the engine carries, which is
+/// what keeps a document from costing more than the engine can hold.
+#[test]
+fn the_caps_are_themselves_capped() {
+    let db = connect("memory://").expect("connect");
+    db.create_table(
+        TABLE,
+        Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)])),
+        IndexSpec::new(),
+    )
+    .expect("create");
+    let caps = |max_fields: Option<u32>, max_depth: Option<u32>| {
+        let mut patch = SchemaPatch::new(vec![]);
+        patch.max_fields = max_fields;
+        patch.max_depth = max_depth;
+        patch
+    };
+    let err = db
+        .apply_schema(TABLE, &caps(Some(u32::MAX), None), None)
+        .expect_err("a cap that removes the bound");
+    assert!(
+        matches!(&err, InfinoError::Schema(SchemaError::CapExceeded { setting, .. }) if setting == "max_fields"),
+        "{err}"
+    );
+    let err = db
+        .apply_schema(TABLE, &caps(None, Some(10_000)), None)
+        .expect_err("nor a depth that removes it");
+    assert!(
+        matches!(&err, InfinoError::Schema(SchemaError::CapExceeded { setting, .. }) if setting == "max_depth"),
+        "{err}"
+    );
+    db.apply_schema(TABLE, &caps(Some(50_000), Some(40)), None)
+        .expect("a cap within what the engine carries");
 }

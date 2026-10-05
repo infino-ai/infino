@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! Rows as JSON documents: the mapper gives each path one type under the
-//! number rule, templates decide what a new path becomes, the caps refuse a
+//! number rule, the caps refuse a
 //! document whole, and every refusal names the schema write that lets the
 //! same rows in.
 
@@ -12,8 +12,7 @@ use arrow_array::{Array, Float64Array, Int64Array, LargeStringArray, ListArray};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Connection, Detected, FieldPatch, IndexSpec, InfinoError, SchemaError, SchemaPatch, Template,
-    connect,
+    Connection, FieldPatch, IndexSpec, InfinoError, SchemaError, SchemaPatch, connect,
     serde_json::{self, Value, json},
 };
 use tempfile::TempDir;
@@ -290,51 +289,6 @@ fn every_refusal_names_the_schema_write_that_admits_the_rows() {
 }
 
 #[test]
-fn templates_decide_what_a_new_path_becomes() {
-    let db = connect("memory://").expect("connect");
-    let docs = db
-        .create_table(TABLE, title_schema(), IndexSpec::new())
-        .expect("create");
-    let templates = serde_json::from_value(json!({
-        "templates": [
-            {"name": "prices", "match": "integer", "path": "*_price", "type": "f64"},
-            {"name": "text", "match": "string", "path": "body", "index": {"kind": "fts"}},
-            {"name": "when", "path": "*_at", "type": "timestamp_us", "tz": "UTC"}
-        ]
-    }))
-    .expect("json");
-    let patch = SchemaPatch::from_json(&templates).expect("patch");
-    let doc = db.apply_schema(TABLE, &patch, None).expect("templates");
-    assert_eq!(doc.templates().len(), 3);
-
-    docs.append_rows(&[json!({
-        "title": "t",
-        "list_price": 5,
-        "body": "the quick brown fox",
-        "created_at": "2026-10-03T12:00:00Z"
-    })])
-    .expect("append");
-    let doc = db.schema(TABLE).expect("schema");
-    let field = |name: &str| doc.fields().iter().find(|f| f.name == name).expect(name);
-    assert_eq!(field("list_price").data_type, DataType::Float64);
-    assert!(field("body").index.is_some(), "the template's index");
-    assert!(matches!(
-        field("created_at").data_type,
-        DataType::Timestamp(_, _)
-    ));
-    let hits = docs
-        .bm25_search("body", "fox", 10, Default::default(), None)
-        .expect("the new column is searchable from its first file");
-    assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-    docs.append_rows(&[json!({"title": "u", "body": "a lazy dog"})])
-        .expect("append");
-    let hits = docs
-        .bm25_search("body", "dog", 10, Default::default(), None)
-        .expect("search");
-    assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-}
-
-#[test]
 fn update_rows_obey_the_same_rules() {
     let dir = TempDir::new().expect("tempdir");
     let db = connect(dir.path().to_str().expect("utf8")).expect("connect");
@@ -441,47 +395,4 @@ fn an_array_inside_an_array_of_objects_is_refused() {
         "xs": [{"a": 1}, {"a": 2, "b": 3}]
     })])
     .expect("scalar leaves are positional");
-}
-
-/// Templates are declarable from Rust, not only through JSON: `Template`
-/// and `Detected` are part of the surface, so a caller can build the rule
-/// that decides what a new column becomes and hand it to `apply_schema`.
-#[test]
-fn a_template_is_declarable_through_the_typed_api() {
-    let db = connect("memory://").expect("connect");
-    let docs = db
-        .create_table(TABLE, title_schema(), IndexSpec::new())
-        .expect("create");
-
-    db.apply_schema(
-        TABLE,
-        &SchemaPatch::new(vec![]).with_templates(vec![
-            Template::new("counts", "n_*")
-                .with_matches(Detected::Integer)
-                .with_type(DataType::Float64),
-        ]),
-        None,
-    )
-    .expect("declare the template");
-
-    docs.append_rows(&[json!({"title": "a", "n_views": 10, "other": 10})])
-        .expect("append");
-
-    let doc = db.schema(TABLE).expect("schema");
-    let typed = |name: &str| {
-        doc.fields()
-            .iter()
-            .find(|f| f.name == name)
-            .map(|f| f.data_type.clone())
-    };
-    assert_eq!(
-        typed("n_views"),
-        Some(DataType::Float64),
-        "the template decided the matching path"
-    );
-    assert_eq!(
-        typed("other"),
-        Some(DataType::Int64),
-        "a path the pattern misses keeps the inferred type"
-    );
 }

@@ -66,11 +66,6 @@ pub const MAX_MAX_FIELDS: u32 = 100_000;
 /// mapper's recursion over a document.
 pub const MAX_MAX_DEPTH: u32 = 100;
 
-/// The most wildcards a template's path pattern may carry. Matching walks
-/// the pattern once per wildcard, so a bound here is what keeps a pattern
-/// from costing more than the path it matches.
-pub const MAX_TEMPLATE_WILDCARDS: usize = 8;
-
 /// Arrow field-metadata key under which a batch names the index a column
 /// it adds should carry, as the schema document spells an index. Read when
 /// the column joins the schema; ignored for a column the table has.
@@ -157,125 +152,6 @@ pub enum ColumnIndex {
     },
 }
 
-/// The kind of JSON value a document carries on a path, as a template
-/// matches it.
-/// `#[non_exhaustive]`: a document may learn to carry a kind the mapper
-/// does not distinguish today, and a new one must not break a caller's
-/// `match`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Detected {
-    /// `true` / `false`.
-    Boolean,
-    /// A number written without a fraction or an exponent.
-    Integer,
-    /// A number written with a fraction or an exponent.
-    Float,
-    /// A string.
-    String,
-    /// An array.
-    List,
-}
-
-impl Detected {
-    /// The name the document spells this kind as.
-    pub fn name(self) -> &'static str {
-        match self {
-            Detected::Boolean => "boolean",
-            Detected::Integer => "integer",
-            Detected::Float => "float",
-            Detected::String => "string",
-            Detected::List => "list",
-        }
-    }
-
-    /// The kind `name` spells.
-    pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "boolean" => Detected::Boolean,
-            "integer" => Detected::Integer,
-            "float" => Detected::Float,
-            "string" => Detected::String,
-            "list" => Detected::List,
-            _ => return None,
-        })
-    }
-}
-
-/// A rule that decides the type and index of a column a document adds:
-/// the first template whose kind and path pattern match the new path wins.
-/// Columns the table already has are not affected.
-/// Build one with [`Template::new`] and the `with_*` setters rather than a
-/// struct literal: the type is `#[non_exhaustive]` so it can grow a rule
-/// without breaking callers.
-#[derive(Debug, Clone, PartialEq, Default)]
-#[non_exhaustive]
-pub struct Template {
-    /// A label for the owner; not interpreted.
-    pub name: String,
-    /// The value kind the rule applies to; `None` for any kind.
-    pub matches: Option<Detected>,
-    /// The path pattern, with `*` matching any run of characters
-    /// (`"user.*"`, `"*_id"`, `"*"`).
-    pub path: String,
-    /// The column type to use instead of the inferred one.
-    pub data_type: Option<DataType>,
-    /// The index the column gets.
-    pub index: Option<ColumnIndex>,
-}
-
-impl Template {
-    /// A rule called `name` over the paths matching `path`, applying to any
-    /// kind and leaving the inferred type and no index unless the `with_*`
-    /// setters say otherwise.
-    pub fn new(name: impl Into<String>, path: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            path: path.into(),
-            ..Self::default()
-        }
-    }
-
-    /// Restrict the rule to one value kind.
-    pub fn with_matches(mut self, kind: Detected) -> Self {
-        self.matches = Some(kind);
-        self
-    }
-
-    /// The column type to use instead of the inferred one.
-    pub fn with_type(mut self, data_type: DataType) -> Self {
-        self.data_type = Some(data_type);
-        self
-    }
-
-    /// The index the column gets.
-    pub fn with_index(mut self, index: ColumnIndex) -> Self {
-        self.index = Some(index);
-        self
-    }
-
-    /// Whether this rule applies to a new column at `path` holding `kind`.
-    pub fn applies(&self, path: &str, kind: Detected) -> bool {
-        self.matches.is_none_or(|m| m == kind) && glob_matches(&self.path, path)
-    }
-}
-
-/// Whether `pattern`, in which `*` matches any run of characters, matches
-/// the whole of `text`.
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    match pattern.split_once('*') {
-        None => pattern == text,
-        Some((head, tail)) => {
-            text.starts_with(head)
-                && text[head.len()..]
-                    .char_indices()
-                    .map(|(i, _)| i)
-                    .chain(std::iter::once(text.len() - head.len()))
-                    .any(|i| glob_matches(tail, &text[head.len() + i..]))
-        }
-    }
-}
-
 /// One live user column: its identity, label, physical type and index.
 ///
 /// Handed out by [`TableSchema::fields`]. `#[non_exhaustive]`, so a column
@@ -313,8 +189,6 @@ pub struct TableSchema {
     max_fields: u32,
     /// How deep a document may nest.
     max_depth: u32,
-    /// The rules for columns documents add, in order.
-    templates: Vec<Template>,
 }
 
 impl TableSchema {
@@ -350,7 +224,6 @@ impl TableSchema {
             schema_id: 1,
             max_fields: DEFAULT_MAX_FIELDS,
             max_depth: DEFAULT_MAX_DEPTH,
-            templates: Vec::new(),
         }
     }
 
@@ -493,21 +366,6 @@ impl TableSchema {
         self.max_depth
     }
 
-    test_visible! {
-        /// The rules for columns documents add, in order. `Template` is
-        /// internal, so this stays off the shipped surface and is reachable
-        /// only from the integration tests.
-        fn templates(&self) -> &[Template] {
-            &self.templates
-        }
-    }
-
-    /// The first template that applies to a new column at `path` holding
-    /// `kind`.
-    pub(crate) fn template_for(&self, path: &str, kind: Detected) -> Option<&Template> {
-        self.templates.iter().find(|t| t.applies(path, kind))
-    }
-
     /// The document as JSON: the fields with their ids, types and indexes,
     /// the tombstoned ids, the caps and the counters.
     pub fn to_json(&self) -> Value {
@@ -533,10 +391,6 @@ impl TableSchema {
         doc.insert("last_field_id".into(), Value::from(self.last_field_id));
         doc.insert("max_fields".into(), Value::from(self.max_fields));
         doc.insert("max_depth".into(), Value::from(self.max_depth));
-        doc.insert(
-            "templates".into(),
-            Value::Array(self.templates.iter().map(template_to_json).collect()),
-        );
         doc.insert("fields".into(), Value::Array(fields));
         doc.insert(
             "tombstoned".into(),
@@ -568,7 +422,6 @@ impl TableSchema {
             None => DEFAULT_MAX_DEPTH,
             Some(_) => u32_of("max_depth")?,
         };
-        let templates = templates_from_json(doc.get("templates"))?;
         let fields = doc
             .get("fields")
             .and_then(Value::as_array)
@@ -598,7 +451,6 @@ impl TableSchema {
             schema_id,
             max_fields,
             max_depth,
-            templates,
         })
     }
 
@@ -682,61 +534,6 @@ fn column_index(name: &str, fts: &[FtsConfig], vectors: &[VectorConfig]) -> Opti
         })
 }
 
-/// `template` as the document spells it.
-pub(crate) fn template_to_json(template: &Template) -> Value {
-    let mut out = match &template.data_type {
-        Some(dt) => type_keys(dt),
-        None => Map::new(),
-    };
-    out.insert("name".into(), Value::from(template.name.as_str()));
-    if let Some(kind) = template.matches {
-        out.insert("match".into(), Value::from(kind.name()));
-    }
-    out.insert("path".into(), Value::from(template.path.as_str()));
-    if let Some(index) = &template.index {
-        out.insert("index".into(), index_to_json(index));
-    }
-    Value::Object(out)
-}
-
-/// The templates `json` spells (an array of template objects), or none.
-pub(crate) fn templates_from_json(json: Option<&Value>) -> Result<Vec<Template>, String> {
-    let Some(json) = json else {
-        return Ok(Vec::new());
-    };
-    json.as_array()
-        .ok_or_else(|| "templates is not an array".to_string())?
-        .iter()
-        .map(template_from_json)
-        .collect()
-}
-
-fn template_from_json(json: &Value) -> Result<Template, String> {
-    let obj = json
-        .as_object()
-        .ok_or_else(|| "template is not an object".to_string())?;
-    let str_of = |key: &str| -> Option<&str> { obj.get(key).and_then(Value::as_str) };
-    let matches = match str_of("match") {
-        None => None,
-        Some(name) => Some(
-            Detected::from_name(name)
-                .ok_or_else(|| format!("template matches unknown kind '{name}'"))?,
-        ),
-    };
-    Ok(Template {
-        name: str_of("name").unwrap_or_default().to_owned(),
-        matches,
-        path: str_of("path")
-            .ok_or_else(|| "template has no path".to_string())?
-            .to_owned(),
-        data_type: obj
-            .contains_key("type")
-            .then(|| data_type_from_keys(obj))
-            .transpose()?,
-        index: obj.get("index").map(index_from_json).transpose()?,
-    })
-}
-
 pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
     let mut out = Map::new();
     match index {
@@ -788,7 +585,7 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
             .ok_or_else(|| format!("index has no {key}"))
     };
     // Keys a document may leave out take the defaults a freshly declared
-    // index has, so a template or a hand-written patch can say just
+    // index has, so a hand-written patch can say just
     // `{"kind": "fts"}`.
     let bool_or = |key: &str, default: bool| -> Result<bool, String> {
         match obj.get(key) {

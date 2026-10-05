@@ -206,7 +206,7 @@ pub use supertable::{
     query::vector::VectorFilter,
     reindex::{PlannedRepair, ReindexReport, StalenessReport},
     schema::{
-        ColumnIndex, Detected, FieldDef, FieldId, TableSchema, Template,
+        ColumnIndex, FieldDef, FieldId, TableSchema,
         change::{FieldPatch, SchemaPatch},
         error::SchemaError,
     },

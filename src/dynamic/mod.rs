@@ -10,12 +10,6 @@
 //! (an integral number on a `Float64` path is a float, a string on a
 //! `Utf8` path is `Utf8`), so a batch that disagrees with the schema is
 //! refused by the same resolver an Arrow producer meets, with the same
-//! error. A template decides the type and index of a path the table does
-//! not have yet. JSON `null` and `[]` create nothing, and an array of
-//! objects becomes one list per leaf path, every one as long as the array,
-//! so a position names the same element in all of them. Columns come out in
-//! key order, which is sorted, so a batch's shape does not depend on the
-//! order a producer wrote its keys in.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -31,9 +25,7 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use serde_json::{Map, Value};
 
-use crate::supertable::schema::{
-    Detected, INDEX_META_KEY, TableSchema, error::SchemaError, index_to_json,
-};
+use crate::supertable::schema::{TableSchema, error::SchemaError};
 
 /// Integers above this magnitude are not exactly representable as `f64`.
 const F64_EXACT_INT_BOUND: i128 = 1 << 53;
@@ -66,15 +58,6 @@ impl Kind {
             Value::Number(_) => Some(Kind::Int),
             Value::String(_) => Some(Kind::Str),
             _ => None,
-        }
-    }
-
-    fn detected(self) -> Detected {
-        match self {
-            Kind::Bool => Detected::Boolean,
-            Kind::Int => Detected::Integer,
-            Kind::Float => Detected::Float,
-            Kind::Str => Detected::String,
         }
     }
 
@@ -237,32 +220,19 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     for column in &columns {
         // A path that only ever carried empty arrays creates nothing.
-        let Some(first_kind) = column.kinds.first().copied() else {
+        if column.kinds.is_empty() {
             continue;
-        };
-        let detected = if column.list {
-            Detected::List
-        } else {
-            first_kind.detected()
-        };
-        let mut metadata = HashMap::new();
-        let target = match schema.id_of(&column.path) {
-            Some(id) => schema
+        }
+        let metadata = HashMap::new();
+        // A path the table already has is written in that column's type; a
+        // path it does not is inferred from the values.
+        let target = schema.id_of(&column.path).and_then(|id| {
+            schema
                 .fields()
                 .iter()
                 .find(|f| f.id == id)
-                .map(|f| f.data_type.clone()),
-            None => match schema.template_for(&column.path, detected) {
-                Some(template) => {
-                    if let Some(index) = &template.index {
-                        metadata
-                            .insert(INDEX_META_KEY.to_owned(), index_to_json(index).to_string());
-                    }
-                    template.data_type.clone()
-                }
-                None => None,
-            },
-        };
+                .map(|f| f.data_type.clone())
+        });
         let kind = column.settle_kind(target.as_ref())?;
         let data_type = resolve_type(column, kind, target.as_ref());
         let array = build_array(column, rows.len(), &data_type)?;
@@ -432,7 +402,7 @@ fn flatten<'a>(
     Ok(())
 }
 
-/// The Arrow type for `column`: `target` (the table's or a template's
+/// The Arrow type for `column`: `target` (the table's
 /// type) when the values are exactly representable in it, else the type
 /// `kind` infers. Only the ambiguity a JSON literal leaves is resolved
 /// here; a disagreement is left for the resolver to refuse.
@@ -809,7 +779,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::supertable::schema::{ColumnIndex, Template, resolve::resolve_batch};
+    use crate::supertable::schema::resolve::resolve_batch;
 
     fn table(fields: Vec<(&str, DataType)>) -> TableSchema {
         TableSchema::from_user_schema(&Schema::new(
@@ -1005,136 +975,6 @@ mod tests {
         assert_eq!(empty.num_columns(), 0);
         assert_eq!(empty.num_rows(), 2);
     }
-
-    #[test]
-    fn templates_pin_types_and_attach_indexes_to_new_paths_only() {
-        let mut doc = table(vec![("price", DataType::Int64)]).to_json();
-        doc["templates"] = json!([
-            {"name": "prices", "match": "integer", "path": "*_price", "type": "f64"},
-            {"name": "text", "match": "string", "path": "body*", "index": {"kind": "fts"}},
-            {"name": "when", "path": "*_at", "type": "timestamp_us", "tz": "UTC"},
-        ]);
-        let t = TableSchema::from_json(&doc).expect("schema");
-        assert_eq!(t.templates().len(), 3);
-        assert_eq!(t.templates()[0].data_type, Some(DataType::Float64));
-        assert_eq!(t.templates()[0].matches, Some(Detected::Integer));
-        assert_eq!(
-            t.template_for("list_price", Detected::Integer)
-                .map(|t| t.name.as_str()),
-            Some("prices")
-        );
-        assert_eq!(
-            t.templates()[1].index,
-            Some(ColumnIndex::Fts {
-                analyzer: "standard".into(),
-                stopwords: Default::default(),
-                stemmer: Default::default(),
-                positions: false,
-                stored: true,
-                bm25: crate::superfile::fts::bm25::Bm25Params::STANDARD,
-            })
-        );
-        let batch = rows_to_batch(
-            &[json!({
-                "list_price": 5,
-                "price": 7,
-                "body": "hello",
-                "created_at": "2026-10-03T12:00:00Z",
-                "updated_at": "not a time"
-            })],
-            &t,
-        )
-        .expect("map");
-        let f = batch.schema();
-        let field = |name: &str| f.field_with_name(name).expect("field");
-        assert_eq!(
-            field("list_price").data_type(),
-            &DataType::Float64,
-            "pinned by template"
-        );
-        assert_eq!(
-            field("price").data_type(),
-            &DataType::Int64,
-            "the live column's type wins"
-        );
-        assert!(field("body").metadata().contains_key(INDEX_META_KEY));
-        assert_eq!(
-            field("created_at").data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-        );
-        assert_eq!(
-            field("updated_at").data_type(),
-            &DataType::LargeUtf8,
-            "a string that is not a time stays a string, and the resolver decides"
-        );
-        let resolved = resolve_batch(&batch, &t, "_id").expect("resolve");
-        let body = resolved
-            .added
-            .iter()
-            .find(|a| a.name == "body")
-            .expect("body");
-        assert!(matches!(body.index, Some(ColumnIndex::Fts { .. })));
-        // The first matching template wins, and a template only applies to
-        // the kind it names.
-        assert_eq!(
-            t.template_for("body_text", Detected::String)
-                .map(|t| t.name.as_str()),
-            Some("text")
-        );
-        assert!(t.template_for("body_text", Detected::Integer).is_none());
-        assert_eq!(
-            t.template_for("x_at", Detected::Integer)
-                .map(|t| t.name.as_str()),
-            Some("when")
-        );
-
-        // A vector template: a numeric list of the declared length maps to
-        // the vector type; another length does not.
-        let mut doc = table(vec![]).to_json();
-        doc["templates"] =
-            json!([{"name": "vec", "match": "list", "path": "emb", "type": "vector", "dim": 2}]);
-        let t = TableSchema::from_json(&doc).expect("schema");
-        let batch = rows_to_batch(&[json!({"emb": [0.5, 1.5]})], &t).expect("map");
-        assert!(matches!(
-            types(&batch)["emb"],
-            DataType::FixedSizeList(_, 2)
-        ));
-        let batch = rows_to_batch(&[json!({"emb": [0.5, 1.5, 2.5]})], &t).expect("map");
-        assert!(matches!(types(&batch)["emb"], DataType::List(_)));
-    }
-
-    #[test]
-    fn a_template_whose_index_does_not_fit_is_refused_when_the_column_joins() {
-        let mut doc = table(vec![]).to_json();
-        doc["templates"] = json!([{"name": "bad", "path": "n", "index": {"kind": "fts"}}]);
-        let t = TableSchema::from_json(&doc).expect("schema");
-        let batch = rows_to_batch(&[json!({"n": 1})], &t).expect("map");
-        let resolved = resolve_batch(&batch, &t, "_id").expect("resolve");
-        let changes: Vec<_> = resolved
-            .added
-            .into_iter()
-            .map(
-                |a| crate::supertable::schema::change::SchemaChange::AddColumn {
-                    name: a.name,
-                    data_type: a.data_type,
-                    nullable: true,
-                    index: a.index,
-                },
-            )
-            .collect();
-        assert!(matches!(
-            t.apply(&changes),
-            Err(SchemaError::InvalidIndex { column, .. }) if column == "n"
-        ));
-        let _ = Template {
-            name: String::new(),
-            matches: None,
-            path: String::new(),
-            data_type: None,
-            index: None,
-        };
-    }
-
     #[test]
     fn a_literal_a_narrow_column_cannot_hold_keeps_its_own_type() {
         // A narrow type is chosen only when every value fits it, so a
