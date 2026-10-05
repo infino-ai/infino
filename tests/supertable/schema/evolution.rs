@@ -952,3 +952,51 @@ fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
         ]
     );
 }
+
+/// A projection that names only columns the hit's file predates resolves to
+/// no stored column in that file, so the read returns no columns at all. It
+/// must still report how many rows it covered, because that count is what
+/// the caller null-fills from: a batch carrying neither columns nor a stated
+/// row count cannot say. Mixed projections never hit this; an all-missing
+/// one failed the whole search.
+#[test]
+fn a_search_projecting_only_a_newer_column_reads_it_as_null() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(vec![Field::new(
+                "body",
+                DataType::LargeUtf8,
+                true,
+            )])),
+            IndexSpec::new().fts("body"),
+        )
+        .expect("create");
+
+    // This file predates `title` entirely.
+    docs.append_rows(&[serde_json::json!({"body": "the quick fox"})])
+        .expect("append");
+
+    db.apply_schema(
+        TABLE,
+        &SchemaPatch::new(vec![FieldPatch::named("title").with_type(DataType::LargeUtf8)]),
+        None,
+    )
+    .expect("add a column the written file cannot hold");
+
+    let hits = docs
+        .bm25_search("body", "fox", 10, Default::default(), Some(&["title"]))
+        .expect("a projection of only the newer column still reads");
+    assert_eq!(
+        hits.iter().map(|b| b.num_rows()).sum::<usize>(),
+        1,
+        "the hit is returned"
+    );
+    for b in &hits {
+        let column = b.column_by_name("title").expect("the projected column");
+        for row in 0..b.num_rows() {
+            assert!(column.is_null(row), "a column the file predates reads null");
+        }
+    }
+}

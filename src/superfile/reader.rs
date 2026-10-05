@@ -31,7 +31,8 @@ use std::{
 
 use arrow::compute::{concat_batches, take};
 use arrow_array::{
-    Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchReader, UInt32Array,
+    Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchOptions,
+    RecordBatchReader, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
@@ -1120,7 +1121,17 @@ impl SuperfileReader {
                 .map_err(|e| ReadError::Columnar(e.to_string()))?;
             columns.push(taken);
         }
-        RecordBatch::try_new(out_schema, columns).map_err(|e| ReadError::Columnar(e.to_string()))
+        // The row count is carried explicitly rather than inferred from the
+        // columns: a projection can legitimately resolve to no columns at
+        // all — a caller naming only columns this file predates — and a
+        // batch with neither columns nor a stated row count cannot say how
+        // many rows it has. The caller null-fills from this count.
+        RecordBatch::try_new_with_options(
+            out_schema,
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(local_doc_ids.len())),
+        )
+        .map_err(|e| ReadError::Columnar(e.to_string()))
     }
 
     /// Build the `_id` column for `local_doc_ids` (in caller order) from the
