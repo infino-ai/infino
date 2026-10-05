@@ -110,3 +110,26 @@ def test_declared_columns_keep_the_types_json_cannot_carry():
     # rather than quietly changing it.
     with pytest.raises(ValueError, match="(?i)data loss|truncat"):
         t.append([{"title": "d", "price": decimal.Decimal("1.234"), "payload": b"\x01"}])
+
+
+def test_a_missing_float_appends_as_null():
+    """A float column with a gap is the ordinary way to meet NaN, and `NaN` is
+    not JSON. The document path has to hand those rows to the typed route
+    rather than serialize something the engine cannot parse back."""
+    db = infino.connect("memory://")
+    t = db.create_table(
+        "docs",
+        pa.schema(
+            [
+                pa.field("title", pa.large_utf8(), nullable=False),
+                pa.field("score", pa.float64(), nullable=True),
+            ]
+        ),
+        infino.IndexSpec(),
+    )
+
+    t.append([{"title": "a", "score": 1.0}, {"title": "b", "score": float("nan")}])
+    rows = db.query_sql("SELECT title, score FROM docs ORDER BY _id").to_pylist()
+    assert [r["title"] for r in rows] == ["a", "b"]
+    assert rows[0]["score"] == 1.0
+    assert rows[1]["score"] is None or rows[1]["score"] != rows[1]["score"]

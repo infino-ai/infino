@@ -1544,7 +1544,18 @@ fn append_input(
     } else {
         data.clone()
     };
-    match py.import("json")?.call_method1("dumps", (&records,)) {
+    // `allow_nan=False` matters as much as the arms above: left at its
+    // default, `dumps` happily writes a bare `NaN`, which is not JSON and
+    // which the engine's parser then rejects — and because `dumps` itself
+    // succeeded, the typed-batch fallback never ran. A missing float in a
+    // frame is the ordinary way to meet one. Refusing it here sends those
+    // rows down the pyarrow route, which writes them as nulls.
+    let dump_kwargs = PyDict::new(py);
+    dump_kwargs.set_item("allow_nan", false)?;
+    match py
+        .import("json")?
+        .call_method("dumps", (&records,), Some(&dump_kwargs))
+    {
         Ok(text) => {
             let text: String = text.extract()?;
             let rows: Vec<serde_json::Value> = serde_json::from_str(&text)
