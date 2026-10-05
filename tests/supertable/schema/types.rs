@@ -50,6 +50,18 @@ fn retype(name: &str, to: DataType) -> SchemaPatch {
     SchemaPatch::new(vec![FieldPatch::named(name).with_type(to)])
 }
 
+/// The single integer `sql` returns.
+fn count(db: &Connection, sql: &str) -> i64 {
+    let batches = db.query_sql(sql).expect("query");
+    let batch = batches.iter().find(|b| b.num_rows() > 0).expect("a row");
+    batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("an integer column")
+        .value(0)
+}
+
 fn compact() -> OptimizeOptions {
     OptimizeOptions::compact(CompactionSettings {
         target_superfile_size_mb: COMPACT_TARGET_MB,
@@ -848,6 +860,94 @@ fn an_aggregate_is_not_answered_from_a_column_s_abandoned_bounds() {
     assert_eq!(scalar(&db, "SELECT MIN(n) FROM t"), 7);
     assert_eq!(scalar(&db, "SELECT MAX(n) FROM t"), 10);
     assert_eq!(scalar(&db, "SELECT SUM(n) FROM t"), 17);
+}
+
+/// The same abandoned values also reach the covered-aggregate path through
+/// the manifest's exact per-column frequency table, which both a filtered
+/// `COUNT(*)` and a `GROUP BY` are answered from. A bound pushed down as
+/// `Int64(7)` is cast into the recorded `LargeUtf8` and compared
+/// lexicographically, where `"10" < "7"`, so a count folded from the table
+/// drops a row the scan keeps.
+#[test]
+fn a_filtered_count_is_not_answered_from_abandoned_value_counts() {
+    let db = connect("memory://").expect("connect");
+    let t = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(vec![Field::new(
+                "n",
+                DataType::LargeUtf8,
+                true,
+            )])),
+            IndexSpec::new(),
+        )
+        .expect("create");
+    t.append(&batch(vec![("n", strings(vec![Some("7"), Some("10")]))]))
+        .expect("append");
+
+    db.apply_schema(TABLE, &retype("n", DataType::Int64), None)
+        .expect("retype to integers");
+
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM t WHERE n >= 7"), 2);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM t WHERE n < 10"), 1);
+}
+
+/// A `GROUP BY` folded from the same table groups by the recorded value, so
+/// two strings that are one integer stay two rows, and a value that does not
+/// parse becomes a null key. The scan reads one group of two.
+#[test]
+fn a_grouped_count_is_not_answered_from_abandoned_value_counts() {
+    let db = connect("memory://").expect("connect");
+    let t = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(vec![Field::new(
+                "grade",
+                DataType::LargeUtf8,
+                true,
+            )])),
+            IndexSpec::new(),
+        )
+        .expect("create");
+    t.append(&batch(vec![(
+        "grade",
+        strings(vec![Some("007"), Some("7")]),
+    )]))
+    .expect("append");
+
+    db.apply_schema(TABLE, &retype("grade", DataType::Int64), None)
+        .expect("retype to integers");
+
+    let batches = db
+        .query_sql("SELECT grade, COUNT(*) FROM t GROUP BY grade")
+        .expect("query");
+    let mut groups: Vec<(Option<i64>, i64)> = Vec::new();
+    for b in &batches {
+        let keys = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("the group key reads as the column's current type")
+            .clone();
+        let counts = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("a count column")
+            .clone();
+        for row in 0..b.num_rows() {
+            groups.push((
+                (!keys.is_null(row)).then(|| keys.value(row)),
+                counts.value(row),
+            ));
+        }
+    }
+    groups.sort();
+    assert_eq!(
+        groups,
+        vec![(Some(7), 2)],
+        "both rows are the integer 7 and belong to one group"
+    );
 }
 
 /// The caps a table may set are themselves capped: a schema write cannot

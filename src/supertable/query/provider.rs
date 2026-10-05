@@ -396,6 +396,20 @@ impl SupertableProvider {
             .and_then(|entries| {
                 let mut merged: Option<ScalarValueCounts> = None;
                 let id = self.manifest.field_id(column)?;
+                // Value counts are value-derived, so they only describe the
+                // type the table reads the column as today. After a retype
+                // the recorded values are the old type's: a string column
+                // holding "7" and "10" counts those strings, and a bound
+                // pushed down as `Int64(7)` is cast into the stat's type and
+                // compared lexicographically, so `>= 7` keeps "7" and drops
+                // "10". Report nothing rather than something false; the scan
+                // derives the answer from the data, and compaction
+                // re-derives the statistics in the new type.
+                let guard = ColumnTypeGuard::new(&self.manifest, id);
+                if guard.aggregates_mix_types() || entries.iter().any(|e| guard.stats_are_stale(e))
+                {
+                    return None;
+                }
                 for entry in entries {
                     let counts = entry.scalar_stats.get(&id)?.value_counts.as_ref()?;
                     merged = Some(match merged {
