@@ -102,8 +102,12 @@ impl Kind {
 /// What the mapper knows about one path across the batch.
 struct Column<'a> {
     path: String,
-    /// One entry per row; `None` where the row lacks the path.
-    cells: Vec<Option<Leaf<'a>>>,
+    /// `(row, leaf)` for the rows that carry this path, in ascending row
+    /// order. Sparse on purpose: a dense cell per row per column makes the
+    /// memory the product of the two, so a body of many rows each carrying
+    /// a different key costs rows x columns cells to hold a handful of
+    /// values. The field cap bounds the columns, not that product.
+    cells: Vec<(usize, Leaf<'a>)>,
     /// The distinct kinds of the scalars seen (or of the list elements
     /// seen), in order of appearance.
     kinds: Vec<Kind>,
@@ -111,13 +115,30 @@ struct Column<'a> {
     list: bool,
 }
 
-impl Column<'_> {
+impl<'a> Column<'a> {
+    /// The column over `rows` rows: the leaf each row carries, `None` where
+    /// it carries none. One pass over the sparse cells, no materialised
+    /// dense vector.
+    fn by_row(&self, rows: usize) -> impl Iterator<Item = Option<&Leaf<'a>>> + '_ {
+        let mut next = 0usize;
+        (0..rows).map(move |row| match self.cells.get(next) {
+            Some((at, leaf)) if *at == row => {
+                next += 1;
+                Some(leaf)
+            }
+            _ => None,
+        })
+    }
+
     /// Every scalar value the column carries, lists flattened.
     fn values(&self) -> impl Iterator<Item = &Value> + '_ {
-        self.cells.iter().flatten().flat_map(|leaf| match leaf {
-            Leaf::Scalar(v) => vec![*v],
-            Leaf::List(vs) => vs.iter().flatten().copied().collect(),
-        })
+        self.cells
+            .iter()
+            .map(|(_, leaf)| leaf)
+            .flat_map(|leaf| match leaf {
+                Leaf::Scalar(v) => vec![*v],
+                Leaf::List(vs) => vs.iter().flatten().copied().collect(),
+            })
     }
 
     /// The one kind the column's values share. Integers and floats are
@@ -187,7 +208,7 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
                     }
                     columns.push(Column {
                         path: path.clone(),
-                        cells: vec![None; rows.len()],
+                        cells: Vec::new(),
                         kinds: Vec::new(),
                         list: false,
                     });
@@ -196,7 +217,9 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
                 }
             };
             let column = &mut columns[index];
-            if column.cells[row].is_some() {
+            // Cells land in row order, so a repeat of this row is the last
+            // one pushed.
+            if column.cells.last().is_some_and(|(at, _)| *at == row) {
                 // Two keys of one document flattened to one path — a
                 // literal `a.b` beside a nested `a: {b: …}`. Keeping
                 // either would drop the other silently.
@@ -206,7 +229,7 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
                 });
             }
             observe(column, &leaf)?;
-            column.cells[row] = Some(leaf);
+            column.cells.push((row, leaf));
         }
     }
 
@@ -242,7 +265,7 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
         };
         let kind = column.settle_kind(target.as_ref())?;
         let data_type = resolve_type(column, kind, target.as_ref());
-        let array = build_array(column, &data_type)?;
+        let array = build_array(column, rows.len(), &data_type)?;
         fields.push(Field::new(&column.path, data_type, true).with_metadata(metadata));
         arrays.push(array);
     }
@@ -351,7 +374,16 @@ fn flatten<'a>(
                         for (leaf_path, leaf) in leaves {
                             let values = match leaf {
                                 Leaf::Scalar(v) => vec![Some(v)],
-                                Leaf::List(vs) => vs,
+                                // One position per element is the invariant
+                                // that lets a position name the same element
+                                // in every leaf. A nested array wants several
+                                // positions for one element, which would make
+                                // the leaves disagree about what a position
+                                // means, so it is refused rather than stored
+                                // misaligned.
+                                Leaf::List(_) => {
+                                    return Err(SchemaError::NestedArray { path: leaf_path });
+                                }
                             };
                             match per_path.iter_mut().find(|(p, _)| *p == leaf_path) {
                                 Some((_, all)) => all.extend(values),
@@ -412,10 +444,14 @@ fn resolve_type(column: &Column<'_>, kind: Kind, target: Option<&DataType>) -> D
         Some(DataType::FixedSizeList(item, dim)) if column.list => {
             let fits = matches!(kind, Kind::Int | Kind::Float)
                 && item.data_type() == &DataType::Float32
-                && column.cells.iter().flatten().all(|leaf| match leaf {
-                    Leaf::List(values) => values.len() == *dim as usize,
-                    Leaf::Scalar(_) => false,
-                })
+                && column
+                    .cells
+                    .iter()
+                    .map(|(_, leaf)| leaf)
+                    .all(|leaf| match leaf {
+                        Leaf::List(values) => values.len() == *dim as usize,
+                        Leaf::Scalar(_) => false,
+                    })
                 && column.values().all(float_in_f32_range);
             if fits {
                 return DataType::FixedSizeList(Arc::clone(item), *dim);
@@ -558,14 +594,18 @@ fn epoch_days(date: NaiveDate) -> i32 {
 /// `column`'s values as an array of `data_type`, null where a row lacks
 /// the path. The type was chosen from these values, so every one of them
 /// fits.
-fn build_array(column: &Column<'_>, data_type: &DataType) -> Result<ArrayRef, SchemaError> {
+fn build_array(
+    column: &Column<'_>,
+    rows: usize,
+    data_type: &DataType,
+) -> Result<ArrayRef, SchemaError> {
     match data_type {
         DataType::List(item) | DataType::LargeList(item) => {
-            let mut offsets: Vec<usize> = Vec::with_capacity(column.cells.len() + 1);
-            let mut nulls = Vec::with_capacity(column.cells.len());
+            let mut offsets: Vec<usize> = Vec::with_capacity(rows + 1);
+            let mut nulls = Vec::with_capacity(rows);
             let mut flat: Vec<Option<&Value>> = Vec::new();
             offsets.push(0);
-            for cell in &column.cells {
+            for cell in column.by_row(rows) {
                 match cell {
                     Some(Leaf::List(values)) => {
                         flat.extend(values.iter().copied());
@@ -602,8 +642,8 @@ fn build_array(column: &Column<'_>, data_type: &DataType) -> Result<ArrayRef, Sc
         }
         DataType::FixedSizeList(item, dim) => {
             let mut flat: Vec<Option<&Value>> = Vec::new();
-            let mut nulls = Vec::with_capacity(column.cells.len());
-            for cell in &column.cells {
+            let mut nulls = Vec::with_capacity(rows);
+            for cell in column.by_row(rows) {
                 match cell {
                     Some(Leaf::List(values)) => {
                         flat.extend(values.iter().copied());
@@ -625,8 +665,7 @@ fn build_array(column: &Column<'_>, data_type: &DataType) -> Result<ArrayRef, Sc
         }
         scalar => {
             let values: Vec<Option<&Value>> = column
-                .cells
-                .iter()
+                .by_row(rows)
                 .map(|cell| match cell {
                     Some(Leaf::Scalar(v)) => Some(*v),
                     _ => None,

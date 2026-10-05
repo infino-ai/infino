@@ -374,6 +374,8 @@ pub infino::SchemaError::MixedArray::column: alloc::string::String
 pub infino::SchemaError::MixedArray::types: alloc::vec::Vec<alloc::string::String>
 pub infino::SchemaError::NameTaken
 pub infino::SchemaError::NameTaken::name: alloc::string::String
+pub infino::SchemaError::NestedArray
+pub infino::SchemaError::NestedArray::path: alloc::string::String
 pub infino::SchemaError::NotEmpty
 pub infino::SchemaError::NotEmpty::column: alloc::string::String
 pub infino::SchemaError::NullInNonNullable

@@ -94,6 +94,20 @@ pub enum SchemaError {
         /// The column's name.
         column: String,
     },
+    /// An element of an array of objects carries an array of its own. The
+    /// leaves of an array of objects line up one position per element, so
+    /// that reading one position across them reads one element; a nested
+    /// array needs more than one position and would slide the leaves out of
+    /// step with each other.
+    #[error(
+        "field `{path}` is an array inside an array of objects, which has no \
+         single position per element to hold it"
+    )]
+    NestedArray {
+        /// The flattened path of the offending leaf.
+        path: String,
+    },
+
     /// Two columns of a submitted Arrow schema carry the same name.
     #[error("duplicate column name: {name}")]
     DuplicateColumn {

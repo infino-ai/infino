@@ -12,7 +12,7 @@ use arrow_array::{Array, Float64Array, Int64Array, LargeStringArray, ListArray};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Connection, FieldPatch, IndexSpec, InfinoError, SchemaPatch, connect,
+    Connection, FieldPatch, IndexSpec, InfinoError, SchemaError, SchemaPatch, connect,
     serde_json::{self, Value, json},
 };
 use tempfile::TempDir;
@@ -363,4 +363,81 @@ fn update_rows_obey_the_same_rules() {
         )
         .expect_err("a frozen type");
     assert!(matches!(err, InfinoError::Schema(_)), "{err}");
+}
+
+/// A body where every row carries a different key is the worst case for the
+/// mapper: the field cap bounds how many columns it may discover, but the
+/// cells are the product of columns and rows, which the cap never sees. A
+/// dense cell per row per column made 2,000 small documents allocate four
+/// million cells to hold two thousand values. The cells are sparse, so the
+/// cost follows the values present, and the batch is still correct: one
+/// column per key, each with exactly one non-null row.
+#[test]
+fn a_body_of_distinct_keys_costs_its_values_not_rows_times_columns() {
+    const ROWS: usize = 2_000;
+
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new())
+        .expect("create");
+
+    let rows: Vec<Value> = (0..ROWS)
+        .map(|i| json!({ "title": "t", format!("k{i}"): i as i64 }))
+        .collect();
+    docs.append_rows(&rows).expect("append a sparse body");
+
+    let doc = db.schema(TABLE).expect("schema");
+    assert_eq!(
+        doc.fields().len(),
+        ROWS + 1,
+        "one column per key, plus title"
+    );
+
+    // Every key landed on its own row and nowhere else.
+    for probe in [0usize, ROWS / 2, ROWS - 1] {
+        let batches = db
+            .query_sql(&format!(
+                "SELECT COUNT(\"k{probe}\") AS present FROM {TABLE}"
+            ))
+            .expect("query");
+        let present: i64 = batches
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+            .map(|a| a.value(0))
+            .expect("a count");
+        assert_eq!(present, 1, "k{probe} is set on exactly one row");
+    }
+}
+
+/// The leaves of an array of objects line up one position per element, so
+/// that reading one position across them reads one element. A leaf that is
+/// itself an array wants several positions for one element: it used to be
+/// stored anyway, leaving `xs.a` two long and `xs.t` three long with no
+/// error, so position 1 held element 1's `a` beside element 0's second tag.
+/// The shape is refused instead.
+#[test]
+fn an_array_inside_an_array_of_objects_is_refused() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new())
+        .expect("create");
+
+    let err = docs
+        .append_rows(&[json!({
+            "title": "a",
+            "xs": [{"a": 1, "t": ["p", "q"]}, {"a": 2, "t": ["r"]}]
+        })])
+        .expect_err("a nested array has no single position per element");
+    assert!(
+        matches!(&err, InfinoError::Schema(SchemaError::NestedArray { path }) if path == "xs.t"),
+        "{err:?}"
+    );
+
+    // The scalar leaves of an array of objects still line up.
+    docs.append_rows(&[json!({
+        "title": "b",
+        "xs": [{"a": 1}, {"a": 2, "b": 3}]
+    })])
+    .expect("scalar leaves are positional");
 }
