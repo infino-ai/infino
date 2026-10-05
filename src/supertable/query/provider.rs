@@ -112,7 +112,7 @@ use crate::{
         },
     },
     supertable::{
-        SuperfileEntry, SupertableOptions,
+        SuperfileEntry,
         error::QueryError,
         manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
         query::{

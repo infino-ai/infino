@@ -4204,9 +4204,6 @@ impl SupertableReader {
         fanout: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
-        let metric = column_metric(&manifest.vector_configs(), column).ok_or_else(|| {
-            QueryError::Internal(format!("global-fine: unknown vector column `{column}`"))
-        })?;
         // A file written before a rename labels its vector blob with the name
         // the column had then; the id is what finds the column in either file.
         let column_field_id = manifest.field_id(column);
@@ -4477,7 +4474,7 @@ impl SupertableReader {
             Some(graph) => graph,
             None => {
                 let column_id = manifest.field_id(column).ok_or_else(|| {
-                    QueryError::Execute(format!("unknown vector column `{column}`"))
+                    QueryError::Internal(format!("unknown vector column `{column}`"))
                 })?;
                 build_centroid_router(superfiles, readers, column, column_id, section, dim, metric)?
             }
@@ -4613,10 +4610,7 @@ impl SupertableReader {
         // it later at the grid lookup, and a wrong length would surface deep in
         // the probe as if the stored index were at fault.
         let vector_configs = manifest.vector_configs();
-        let Some(vector_config) = vector_configs
-            .iter()
-            .find(|vc| vc.column == column)
-        else {
+        let Some(vector_config) = vector_configs.iter().find(|vc| vc.column == column) else {
             return Err(QueryError::InvalidQuery(format!(
                 "unknown vector column `{column}`"
             )));

@@ -574,7 +574,6 @@ mod tests {
         },
         supertable::{
             Supertable, SupertableOptions,
-            error::QueryError,
             manifest::ManifestSnapshot,
             query::{candidate::LIKE_MAX_TERMS, sql::build_sql_schemas},
         },
