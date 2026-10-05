@@ -850,3 +850,46 @@ fn a_fixed_size_type_needs_a_positive_size() {
         )]))
         .expect("append after the refusal");
 }
+
+/// A retyped column's recorded bounds describe the type the table has left,
+/// and they do not survive the cast: `"7"` and `"10"` as strings order the
+/// other way round from 7 and 10 as integers. An aggregate answered from
+/// those bounds returns a MIN above its own MAX, so the covered path must
+/// stand down until compaction re-derives the statistics.
+#[test]
+fn an_aggregate_is_not_answered_from_a_column_s_abandoned_bounds() {
+    let db = connect("memory://").expect("connect");
+    let t = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(vec![Field::new(
+                "n",
+                DataType::LargeUtf8,
+                true,
+            )])),
+            IndexSpec::new(),
+        )
+        .expect("create");
+    t.append(&batch(vec![("n", strings(vec![Some("7"), Some("10")]))]))
+        .expect("append");
+
+    db.apply_schema(TABLE, &retype("n", DataType::Int64), None)
+        .expect("retype to integers");
+
+    /// The single integer `sql` returns.
+    fn scalar(db: &Connection, sql: &str) -> i64 {
+        let batches = db.query_sql(sql).expect("query");
+        let batch = batches.iter().find(|b| b.num_rows() > 0).expect("a row");
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("an integer column")
+            .value(0)
+    }
+
+    assert_eq!(column(&db, "n"), vec!["7", "10"], "the rows cast cleanly");
+    assert_eq!(scalar(&db, "SELECT MIN(n) FROM t"), 7);
+    assert_eq!(scalar(&db, "SELECT MAX(n) FROM t"), 10);
+    assert_eq!(scalar(&db, "SELECT SUM(n) FROM t"), 17);
+}

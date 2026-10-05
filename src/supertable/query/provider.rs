@@ -125,7 +125,7 @@ use crate::{
             fts::{memos_from_plan_locations, plan_locations_for},
             prune::{PruneLeaf, select_superfiles},
             schema_adapter::TableExprAdapterFactory,
-            skip::{ScalarOp, ScalarPredicate},
+            skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
             superfile_reader::{OpenTierCounts, superfile_reader_tiered},
         },
         reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
@@ -721,6 +721,20 @@ impl SupertableProvider {
                 let Some(column) = self.manifest.field_id(name) else {
                     return stats;
                 };
+                // Every statistic below is value-derived, so each is only
+                // true while it describes the type the table reads the
+                // column as today. After a retype the recorded bounds are
+                // the old type's and do not survive the cast — a string
+                // column holding "7" and "10" records min "10", max "7" —
+                // and a sum or null count is no better. Report nothing
+                // rather than something false; the scan derives the answer
+                // from the data, and compaction re-derives the statistics
+                // in the new type when it rewrites the file.
+                let guard = ColumnTypeGuard::new(&self.manifest, column);
+                if guard.aggregates_mix_types() || entries.iter().any(|e| guard.stats_are_stale(e))
+                {
+                    return stats;
+                }
                 // A range covering the column type's whole domain is
                 // withheld rather than reported — see `spans_full_domain`.
                 if let Some((min, max)) = scalar_min_max(entries, column)

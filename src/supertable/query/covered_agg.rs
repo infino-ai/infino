@@ -69,7 +69,7 @@ use uuid::Uuid;
 use crate::supertable::{
     error::QueryError,
     manifest::{ManifestSnapshot, SuperfileEntry, add_sum_arrays, list::ScalarValueCounts},
-    query::provider::SupertableProvider,
+    query::{provider::SupertableProvider, skip::ColumnTypeGuard},
     schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
 };
 
@@ -858,21 +858,36 @@ fn classify(
 
 /// Do the manifest stats cover everything `kinds` needs from a
 /// covered segment?
+///
+/// A statistic is only usable when it was recorded in the type the table
+/// reads the column as today. After a retype the recorded bounds describe
+/// the old type, and they do not survive the cast: a `LargeUtf8` column
+/// holding "7" and "10" records min "10" and max "7" lexicographically, so
+/// answering `MAX` from them after a change to `Int64` returns 7 and `MIN`
+/// returns 10 — wrong, and wrong in opposite directions. A sum or a null
+/// count recorded in the old type is no better. So a file whose statistics
+/// have gone stale, or a column mid-conversion whose files disagree, falls
+/// back to the scan, which reads the data through the cast and derives the
+/// answer afresh. Compaction re-derives the statistics in the new type when
+/// it rewrites the file, and the covered path picks up again.
 fn has_required_stats(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     kinds: &[AggKind],
 ) -> bool {
-    let stats = |col: &str| {
-        manifest
-            .field_id(col)
-            .and_then(|id| entry.scalar_stats.get(&id))
+    let usable = |col: &str| {
+        let id = manifest.field_id(col)?;
+        let guard = ColumnTypeGuard::new(manifest, id);
+        if guard.aggregates_mix_types() || guard.stats_are_stale(entry) {
+            return None;
+        }
+        entry.scalar_stats.get(&id)
     };
     kinds.iter().all(|kind| match kind {
         AggKind::CountStar => true,
-        AggKind::Sum(col) => stats(col).is_some_and(|a| a.sum.is_some()),
-        AggKind::Min(col) | AggKind::Max(col) => stats(col).is_some(),
-        AggKind::Avg(col) => stats(col).is_some_and(|a| a.sum.is_some() && a.null_count.is_some()),
+        AggKind::Sum(col) => usable(col).is_some_and(|a| a.sum.is_some()),
+        AggKind::Min(col) | AggKind::Max(col) => usable(col).is_some(),
+        AggKind::Avg(col) => usable(col).is_some_and(|a| a.sum.is_some() && a.null_count.is_some()),
     })
 }
 
