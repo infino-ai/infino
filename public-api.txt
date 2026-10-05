@@ -6,14 +6,14 @@ pub enum infino::Bm25Stats
 pub infino::Bm25Stats::Global
 pub infino::Bm25Stats::PerSuperfile
 impl core::clone::Clone for infino::Bm25Stats
-pub fn infino::Bm25Stats::clone(&self) -> infino::Bm25Stats
+pub fn infino::Bm25Stats::clone(&self) -> Self
 impl core::cmp::Eq for infino::Bm25Stats
 impl core::cmp::PartialEq for infino::Bm25Stats
-pub fn infino::Bm25Stats::eq(&self, &infino::Bm25Stats) -> bool
+pub fn infino::Bm25Stats::eq(&self, &Self) -> bool
 impl core::convert::From<&str> for infino::Bm25Stats
 pub fn infino::Bm25Stats::from(&str) -> Self
 impl core::default::Default for infino::Bm25Stats
-pub fn infino::Bm25Stats::default() -> infino::Bm25Stats
+pub fn infino::Bm25Stats::default() -> Self
 impl core::fmt::Debug for infino::Bm25Stats
 pub fn infino::Bm25Stats::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::Bm25Stats
@@ -29,14 +29,14 @@ pub enum infino::BoolMode
 pub infino::BoolMode::And
 pub infino::BoolMode::Or
 impl core::clone::Clone for infino::BoolMode
-pub fn infino::BoolMode::clone(&self) -> infino::BoolMode
+pub fn infino::BoolMode::clone(&self) -> Self
 impl core::cmp::Eq for infino::BoolMode
 impl core::cmp::PartialEq for infino::BoolMode
-pub fn infino::BoolMode::eq(&self, &infino::BoolMode) -> bool
+pub fn infino::BoolMode::eq(&self, &Self) -> bool
 impl core::convert::From<&str> for infino::BoolMode
 pub fn infino::BoolMode::from(&str) -> Self
 impl core::default::Default for infino::BoolMode
-pub fn infino::BoolMode::default() -> infino::BoolMode
+pub fn infino::BoolMode::default() -> Self
 impl core::fmt::Debug for infino::BoolMode
 pub fn infino::BoolMode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::BoolMode
@@ -53,12 +53,12 @@ pub infino::ColdFetchMode::HybridWithPrefetch
 pub infino::ColdFetchMode::LazyForegroundWithBackgroundFill
 pub infino::ColdFetchMode::RangeOnly
 impl core::clone::Clone for infino::ColdFetchMode
-pub fn infino::ColdFetchMode::clone(&self) -> infino::ColdFetchMode
+pub fn infino::ColdFetchMode::clone(&self) -> Self
 impl core::cmp::Eq for infino::ColdFetchMode
 impl core::cmp::PartialEq for infino::ColdFetchMode
-pub fn infino::ColdFetchMode::eq(&self, &infino::ColdFetchMode) -> bool
+pub fn infino::ColdFetchMode::eq(&self, &Self) -> bool
 impl core::default::Default for infino::ColdFetchMode
-pub fn infino::ColdFetchMode::default() -> infino::ColdFetchMode
+pub fn infino::ColdFetchMode::default() -> Self
 impl core::fmt::Debug for infino::ColdFetchMode
 pub fn infino::ColdFetchMode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::ColdFetchMode
@@ -83,9 +83,9 @@ pub infino::ColumnIndex::Vector::metric: infino::Metric
 pub infino::ColumnIndex::Vector::rerank_codec: infino::RerankCodec
 pub infino::ColumnIndex::Vector::rot_seed: u64
 impl core::clone::Clone for infino::ColumnIndex
-pub fn infino::ColumnIndex::clone(&self) -> infino::ColumnIndex
+pub fn infino::ColumnIndex::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::ColumnIndex
-pub fn infino::ColumnIndex::eq(&self, &infino::ColumnIndex) -> bool
+pub fn infino::ColumnIndex::eq(&self, &Self) -> bool
 impl core::fmt::Debug for infino::ColumnIndex
 pub fn infino::ColumnIndex::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for infino::ColumnIndex
@@ -101,10 +101,10 @@ pub infino::Consistency::BoundedStaleness(core::time::Duration)
 pub infino::Consistency::Snapshot
 pub infino::Consistency::Strong
 impl core::clone::Clone for infino::Consistency
-pub fn infino::Consistency::clone(&self) -> infino::Consistency
+pub fn infino::Consistency::clone(&self) -> Self
 impl core::cmp::Eq for infino::Consistency
 impl core::cmp::PartialEq for infino::Consistency
-pub fn infino::Consistency::eq(&self, &infino::Consistency) -> bool
+pub fn infino::Consistency::eq(&self, &Self) -> bool
 impl core::default::Default for infino::Consistency
 pub fn infino::Consistency::default() -> Self
 impl core::fmt::Debug for infino::Consistency
@@ -169,10 +169,10 @@ impl infino::Metric
 pub fn infino::Metric::from_name(&str) -> core::option::Option<Self>
 pub fn infino::Metric::name(self) -> &'static str
 impl core::clone::Clone for infino::Metric
-pub fn infino::Metric::clone(&self) -> infino::Metric
+pub fn infino::Metric::clone(&self) -> Self
 impl core::cmp::Eq for infino::Metric
 impl core::cmp::PartialEq for infino::Metric
-pub fn infino::Metric::eq(&self, &infino::Metric) -> bool
+pub fn infino::Metric::eq(&self, &Self) -> bool
 impl core::fmt::Debug for infino::Metric
 pub fn infino::Metric::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::Metric
@@ -218,12 +218,12 @@ pub infino::RecalibratePolicy::Auto
 pub infino::RecalibratePolicy::Force
 pub infino::RecalibratePolicy::Skip
 impl core::clone::Clone for infino::RecalibratePolicy
-pub fn infino::RecalibratePolicy::clone(&self) -> infino::RecalibratePolicy
+pub fn infino::RecalibratePolicy::clone(&self) -> Self
 impl core::cmp::Eq for infino::RecalibratePolicy
 impl core::cmp::PartialEq for infino::RecalibratePolicy
-pub fn infino::RecalibratePolicy::eq(&self, &infino::RecalibratePolicy) -> bool
+pub fn infino::RecalibratePolicy::eq(&self, &Self) -> bool
 impl core::default::Default for infino::RecalibratePolicy
-pub fn infino::RecalibratePolicy::default() -> infino::RecalibratePolicy
+pub fn infino::RecalibratePolicy::default() -> Self
 impl core::fmt::Debug for infino::RecalibratePolicy
 pub fn infino::RecalibratePolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::RecalibratePolicy
@@ -263,12 +263,12 @@ pub infino::ReindexMode::Auto
 pub infino::ReindexMode::Reanalyze
 pub infino::ReindexMode::Rewrite
 impl core::clone::Clone for infino::ReindexMode
-pub fn infino::ReindexMode::clone(&self) -> infino::ReindexMode
+pub fn infino::ReindexMode::clone(&self) -> Self
 impl core::cmp::Eq for infino::ReindexMode
 impl core::cmp::PartialEq for infino::ReindexMode
-pub fn infino::ReindexMode::eq(&self, &infino::ReindexMode) -> bool
+pub fn infino::ReindexMode::eq(&self, &Self) -> bool
 impl core::default::Default for infino::ReindexMode
-pub fn infino::ReindexMode::default() -> infino::ReindexMode
+pub fn infino::ReindexMode::default() -> Self
 impl core::fmt::Debug for infino::ReindexMode
 pub fn infino::ReindexMode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::ReindexMode
@@ -283,10 +283,10 @@ impl core::panic::unwind_safe::UnwindSafe for infino::ReindexMode
 #[non_exhaustive] pub enum infino::ReindexTarget
 pub infino::ReindexTarget::Superfile(infino::SuperfileIndex)
 impl core::clone::Clone for infino::ReindexTarget
-pub fn infino::ReindexTarget::clone(&self) -> infino::ReindexTarget
+pub fn infino::ReindexTarget::clone(&self) -> Self
 impl core::cmp::Eq for infino::ReindexTarget
 impl core::cmp::PartialEq for infino::ReindexTarget
-pub fn infino::ReindexTarget::eq(&self, &infino::ReindexTarget) -> bool
+pub fn infino::ReindexTarget::eq(&self, &Self) -> bool
 impl core::default::Default for infino::ReindexTarget
 pub fn infino::ReindexTarget::default() -> Self
 impl core::fmt::Debug for infino::ReindexTarget
@@ -312,10 +312,10 @@ pub const fn infino::RerankCodec::name(self) -> &'static str
 pub const fn infino::RerankCodec::recommended_rerank_mult_floor(self, usize) -> core::option::Option<usize>
 pub const fn infino::RerankCodec::supports_metric(self, infino::Metric) -> bool
 impl core::clone::Clone for infino::RerankCodec
-pub fn infino::RerankCodec::clone(&self) -> infino::RerankCodec
+pub fn infino::RerankCodec::clone(&self) -> Self
 impl core::cmp::Eq for infino::RerankCodec
 impl core::cmp::PartialEq for infino::RerankCodec
-pub fn infino::RerankCodec::eq(&self, &infino::RerankCodec) -> bool
+pub fn infino::RerankCodec::eq(&self, &Self) -> bool
 impl core::default::Default for infino::RerankCodec
 pub fn infino::RerankCodec::default() -> Self
 impl core::fmt::Debug for infino::RerankCodec
@@ -389,9 +389,9 @@ pub infino::SchemaError::TypeRequired::column: alloc::string::String
 pub infino::SchemaError::UnknownFieldId
 pub infino::SchemaError::UnknownFieldId::id: infino::FieldId
 impl core::clone::Clone for infino::SchemaError
-pub fn infino::SchemaError::clone(&self) -> infino::SchemaError
+pub fn infino::SchemaError::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::SchemaError
-pub fn infino::SchemaError::eq(&self, &infino::SchemaError) -> bool
+pub fn infino::SchemaError::eq(&self, &Self) -> bool
 impl core::error::Error for infino::SchemaError
 impl core::fmt::Debug for infino::SchemaError
 pub fn infino::SchemaError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -411,12 +411,12 @@ pub infino::Stemmer::None
 impl infino::Stemmer
 pub fn infino::Stemmer::from_name(&str) -> core::option::Option<Self>
 impl core::clone::Clone for infino::Stemmer
-pub fn infino::Stemmer::clone(&self) -> infino::Stemmer
+pub fn infino::Stemmer::clone(&self) -> Self
 impl core::cmp::Eq for infino::Stemmer
 impl core::cmp::PartialEq for infino::Stemmer
-pub fn infino::Stemmer::eq(&self, &infino::Stemmer) -> bool
+pub fn infino::Stemmer::eq(&self, &Self) -> bool
 impl core::default::Default for infino::Stemmer
-pub fn infino::Stemmer::default() -> infino::Stemmer
+pub fn infino::Stemmer::default() -> Self
 impl core::fmt::Debug for infino::Stemmer
 pub fn infino::Stemmer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::Stemmer
@@ -434,12 +434,12 @@ pub infino::Stopwords::None
 impl infino::Stopwords
 pub fn infino::Stopwords::from_name(&str) -> core::option::Option<Self>
 impl core::clone::Clone for infino::Stopwords
-pub fn infino::Stopwords::clone(&self) -> infino::Stopwords
+pub fn infino::Stopwords::clone(&self) -> Self
 impl core::cmp::Eq for infino::Stopwords
 impl core::cmp::PartialEq for infino::Stopwords
-pub fn infino::Stopwords::eq(&self, &infino::Stopwords) -> bool
+pub fn infino::Stopwords::eq(&self, &Self) -> bool
 impl core::default::Default for infino::Stopwords
-pub fn infino::Stopwords::default() -> infino::Stopwords
+pub fn infino::Stopwords::default() -> Self
 impl core::fmt::Debug for infino::Stopwords
 pub fn infino::Stopwords::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::Stopwords
@@ -454,12 +454,12 @@ impl core::panic::unwind_safe::UnwindSafe for infino::Stopwords
 #[non_exhaustive] pub enum infino::SuperfileIndex
 pub infino::SuperfileIndex::Fts
 impl core::clone::Clone for infino::SuperfileIndex
-pub fn infino::SuperfileIndex::clone(&self) -> infino::SuperfileIndex
+pub fn infino::SuperfileIndex::clone(&self) -> Self
 impl core::cmp::Eq for infino::SuperfileIndex
 impl core::cmp::PartialEq for infino::SuperfileIndex
-pub fn infino::SuperfileIndex::eq(&self, &infino::SuperfileIndex) -> bool
+pub fn infino::SuperfileIndex::eq(&self, &Self) -> bool
 impl core::default::Default for infino::SuperfileIndex
-pub fn infino::SuperfileIndex::default() -> infino::SuperfileIndex
+pub fn infino::SuperfileIndex::default() -> Self
 impl core::fmt::Debug for infino::SuperfileIndex
 pub fn infino::SuperfileIndex::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::SuperfileIndex
@@ -478,9 +478,9 @@ impl infino::Bm25Params
 pub const infino::Bm25Params::STANDARD: Self
 pub const fn infino::Bm25Params::new(f32, f32) -> Self
 impl core::clone::Clone for infino::Bm25Params
-pub fn infino::Bm25Params::clone(&self) -> infino::Bm25Params
+pub fn infino::Bm25Params::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::Bm25Params
-pub fn infino::Bm25Params::eq(&self, &infino::Bm25Params) -> bool
+pub fn infino::Bm25Params::eq(&self, &Self) -> bool
 impl core::default::Default for infino::Bm25Params
 pub fn infino::Bm25Params::default() -> Self
 impl core::fmt::Debug for infino::Bm25Params
@@ -504,11 +504,11 @@ pub fn infino::Bm25SearchOptions::with_bm25(self, f32, f32) -> Self
 pub fn infino::Bm25SearchOptions::with_mode(self, infino::BoolMode) -> Self
 pub fn infino::Bm25SearchOptions::with_stats(self, infino::Bm25Stats) -> Self
 impl core::clone::Clone for infino::Bm25SearchOptions
-pub fn infino::Bm25SearchOptions::clone(&self) -> infino::Bm25SearchOptions
+pub fn infino::Bm25SearchOptions::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::Bm25SearchOptions
-pub fn infino::Bm25SearchOptions::eq(&self, &infino::Bm25SearchOptions) -> bool
+pub fn infino::Bm25SearchOptions::eq(&self, &Self) -> bool
 impl core::default::Default for infino::Bm25SearchOptions
-pub fn infino::Bm25SearchOptions::default() -> infino::Bm25SearchOptions
+pub fn infino::Bm25SearchOptions::default() -> Self
 impl core::fmt::Debug for infino::Bm25SearchOptions
 pub fn infino::Bm25SearchOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::Bm25SearchOptions
@@ -528,10 +528,10 @@ pub infino::CompactionSettings::min_superfiles_for_merge: u64
 pub infino::CompactionSettings::stale_seal_timeout_ms: u64
 pub infino::CompactionSettings::target_superfile_size_mb: u64
 impl core::clone::Clone for infino::CompactionSettings
-pub fn infino::CompactionSettings::clone(&self) -> infino::CompactionSettings
+pub fn infino::CompactionSettings::clone(&self) -> Self
 impl core::cmp::Eq for infino::CompactionSettings
 impl core::cmp::PartialEq for infino::CompactionSettings
-pub fn infino::CompactionSettings::eq(&self, &infino::CompactionSettings) -> bool
+pub fn infino::CompactionSettings::eq(&self, &Self) -> bool
 impl core::default::Default for infino::CompactionSettings
 pub fn infino::CompactionSettings::default() -> Self
 impl core::fmt::Debug for infino::CompactionSettings
@@ -560,9 +560,9 @@ pub fn infino::ConnectOptions::with_read_consistency(self, infino::Consistency) 
 pub fn infino::ConnectOptions::with_storage_option(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::ConnectOptions::with_validate(self, bool) -> Self
 impl core::clone::Clone for infino::ConnectOptions
-pub fn infino::ConnectOptions::clone(&self) -> infino::ConnectOptions
+pub fn infino::ConnectOptions::clone(&self) -> Self
 impl core::default::Default for infino::ConnectOptions
-pub fn infino::ConnectOptions::default() -> infino::ConnectOptions
+pub fn infino::ConnectOptions::default() -> Self
 impl core::fmt::Debug for infino::ConnectOptions
 pub fn infino::ConnectOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for infino::ConnectOptions
@@ -584,7 +584,7 @@ pub fn infino::Connection::query_sql(&self, &str) -> core::result::Result<alloc:
 pub fn infino::Connection::schema(&self, &str) -> core::result::Result<infino::TableSchema, infino::InfinoError>
 pub fn infino::Connection::update_storage_credentials(&self, &[(alloc::string::String, alloc::string::String)]) -> bool
 impl core::clone::Clone for infino::Connection
-pub fn infino::Connection::clone(&self) -> infino::Connection
+pub fn infino::Connection::clone(&self) -> Self
 impl core::marker::Freeze for infino::Connection
 impl core::marker::Send for infino::Connection
 impl core::marker::Sync for infino::Connection
@@ -600,9 +600,9 @@ pub infino::FieldDef::index: core::option::Option<infino::ColumnIndex>
 pub infino::FieldDef::name: alloc::string::String
 pub infino::FieldDef::nullable: bool
 impl core::clone::Clone for infino::FieldDef
-pub fn infino::FieldDef::clone(&self) -> infino::FieldDef
+pub fn infino::FieldDef::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::FieldDef
-pub fn infino::FieldDef::eq(&self, &infino::FieldDef) -> bool
+pub fn infino::FieldDef::eq(&self, &Self) -> bool
 impl core::fmt::Debug for infino::FieldDef
 pub fn infino::FieldDef::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for infino::FieldDef
@@ -619,14 +619,14 @@ pub const infino::FieldId::BIRTH_VERSION: infino::FieldId
 pub const infino::FieldId::ID_COLUMN: infino::FieldId
 pub fn infino::FieldId::term_key(self, &str) -> alloc::vec::Vec<u8>
 impl core::clone::Clone for infino::FieldId
-pub fn infino::FieldId::clone(&self) -> infino::FieldId
+pub fn infino::FieldId::clone(&self) -> Self
 impl core::cmp::Eq for infino::FieldId
 impl core::cmp::Ord for infino::FieldId
-pub fn infino::FieldId::cmp(&self, &infino::FieldId) -> core::cmp::Ordering
+pub fn infino::FieldId::cmp(&self, &Self) -> core::cmp::Ordering
 impl core::cmp::PartialEq for infino::FieldId
-pub fn infino::FieldId::eq(&self, &infino::FieldId) -> bool
+pub fn infino::FieldId::eq(&self, &Self) -> bool
 impl core::cmp::PartialOrd for infino::FieldId
-pub fn infino::FieldId::partial_cmp(&self, &infino::FieldId) -> core::option::Option<core::cmp::Ordering>
+pub fn infino::FieldId::partial_cmp(&self, &Self) -> core::option::Option<core::cmp::Ordering>
 impl core::fmt::Debug for infino::FieldId
 pub fn infino::FieldId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for infino::FieldId
@@ -650,9 +650,9 @@ pub infino::FieldPatch::index: core::option::Option<infino::ColumnIndex>
 pub infino::FieldPatch::name: alloc::string::String
 pub infino::FieldPatch::nullable: core::option::Option<bool>
 impl core::clone::Clone for infino::FieldPatch
-pub fn infino::FieldPatch::clone(&self) -> infino::FieldPatch
+pub fn infino::FieldPatch::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::FieldPatch
-pub fn infino::FieldPatch::eq(&self, &infino::FieldPatch) -> bool
+pub fn infino::FieldPatch::eq(&self, &Self) -> bool
 impl core::fmt::Debug for infino::FieldPatch
 pub fn infino::FieldPatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for infino::FieldPatch
@@ -673,7 +673,7 @@ pub fn infino::FtsField::stemmer(self, infino::Stemmer) -> Self
 pub fn infino::FtsField::stopwords(self, infino::Stopwords) -> Self
 pub fn infino::FtsField::stored(self, bool) -> Self
 impl core::clone::Clone for infino::FtsField
-pub fn infino::FtsField::clone(&self) -> infino::FtsField
+pub fn infino::FtsField::clone(&self) -> Self
 impl core::convert::From<&str> for infino::FtsField
 pub fn infino::FtsField::from(&str) -> Self
 impl core::convert::From<alloc::string::String> for infino::FtsField
@@ -694,9 +694,9 @@ pub infino::GcReport::objects_deleted: u64
 pub infino::GcReport::objects_skipped_live: u64
 pub infino::GcReport::objects_skipped_too_new: u64
 impl core::clone::Clone for infino::GcReport
-pub fn infino::GcReport::clone(&self) -> infino::GcReport
+pub fn infino::GcReport::clone(&self) -> Self
 impl core::default::Default for infino::GcReport
-pub fn infino::GcReport::default() -> infino::GcReport
+pub fn infino::GcReport::default() -> Self
 impl core::fmt::Debug for infino::GcReport
 pub fn infino::GcReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for infino::GcReport
@@ -711,10 +711,10 @@ pub infino::GcSettings::safety_gap: core::time::Duration
 impl infino::GcSettings
 pub fn infino::GcSettings::with_safety_gap(self, core::time::Duration) -> Self
 impl core::clone::Clone for infino::GcSettings
-pub fn infino::GcSettings::clone(&self) -> infino::GcSettings
+pub fn infino::GcSettings::clone(&self) -> Self
 impl core::cmp::Eq for infino::GcSettings
 impl core::cmp::PartialEq for infino::GcSettings
-pub fn infino::GcSettings::eq(&self, &infino::GcSettings) -> bool
+pub fn infino::GcSettings::eq(&self, &Self) -> bool
 impl core::default::Default for infino::GcSettings
 pub fn infino::GcSettings::default() -> Self
 impl core::fmt::Debug for infino::GcSettings
@@ -733,9 +733,9 @@ pub fn infino::IndexSpec::fts(self, impl core::convert::Into<infino::FtsField>) 
 pub fn infino::IndexSpec::new() -> Self
 pub fn infino::IndexSpec::vector(self, impl core::convert::Into<alloc::string::String>, usize, infino::Metric) -> Self
 impl core::clone::Clone for infino::IndexSpec
-pub fn infino::IndexSpec::clone(&self) -> infino::IndexSpec
+pub fn infino::IndexSpec::clone(&self) -> Self
 impl core::default::Default for infino::IndexSpec
-pub fn infino::IndexSpec::default() -> infino::IndexSpec
+pub fn infino::IndexSpec::default() -> Self
 impl core::fmt::Debug for infino::IndexSpec
 pub fn infino::IndexSpec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for infino::IndexSpec
@@ -751,10 +751,10 @@ pub fn infino::MutationStats::matched(&self) -> usize
 pub fn infino::MutationStats::n_not_found(&self) -> usize
 pub fn infino::MutationStats::n_tombstoned(&self) -> usize
 impl core::clone::Clone for infino::MutationStats
-pub fn infino::MutationStats::clone(&self) -> infino::MutationStats
+pub fn infino::MutationStats::clone(&self) -> Self
 impl core::cmp::Eq for infino::MutationStats
 impl core::cmp::PartialEq for infino::MutationStats
-pub fn infino::MutationStats::eq(&self, &infino::MutationStats) -> bool
+pub fn infino::MutationStats::eq(&self, &Self) -> bool
 impl core::fmt::Debug for infino::MutationStats
 pub fn infino::MutationStats::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for infino::MutationStats
@@ -771,9 +771,9 @@ pub fn infino::OptimizeOptions::compact(infino::CompactionSettings) -> Self
 pub fn infino::OptimizeOptions::with_gc(self, infino::GcSettings) -> Self
 pub fn infino::OptimizeOptions::with_recalibrate(self, infino::RecalibratePolicy) -> Self
 impl core::clone::Clone for infino::OptimizeOptions
-pub fn infino::OptimizeOptions::clone(&self) -> infino::OptimizeOptions
+pub fn infino::OptimizeOptions::clone(&self) -> Self
 impl core::default::Default for infino::OptimizeOptions
-pub fn infino::OptimizeOptions::default() -> infino::OptimizeOptions
+pub fn infino::OptimizeOptions::default() -> Self
 impl core::fmt::Debug for infino::OptimizeOptions
 pub fn infino::OptimizeOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for infino::OptimizeOptions
@@ -788,10 +788,10 @@ pub infino::PlannedRepair::live_bytes: u64
 pub infino::PlannedRepair::mode: infino::ReindexMode
 pub infino::PlannedRepair::superfile_id: uuid::Uuid
 impl core::clone::Clone for infino::PlannedRepair
-pub fn infino::PlannedRepair::clone(&self) -> infino::PlannedRepair
+pub fn infino::PlannedRepair::clone(&self) -> Self
 impl core::cmp::Eq for infino::PlannedRepair
 impl core::cmp::PartialEq for infino::PlannedRepair
-pub fn infino::PlannedRepair::eq(&self, &infino::PlannedRepair) -> bool
+pub fn infino::PlannedRepair::eq(&self, &Self) -> bool
 impl core::fmt::Debug for infino::PlannedRepair
 pub fn infino::PlannedRepair::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::PlannedRepair
@@ -816,12 +816,12 @@ pub fn infino::ReindexOptions::with_mode(self, infino::ReindexMode) -> Self
 pub fn infino::ReindexOptions::with_stale_seal_timeout_ms(self, u64) -> Self
 pub fn infino::ReindexOptions::with_target(self, infino::ReindexTarget) -> Self
 impl core::clone::Clone for infino::ReindexOptions
-pub fn infino::ReindexOptions::clone(&self) -> infino::ReindexOptions
+pub fn infino::ReindexOptions::clone(&self) -> Self
 impl core::cmp::Eq for infino::ReindexOptions
 impl core::cmp::PartialEq for infino::ReindexOptions
-pub fn infino::ReindexOptions::eq(&self, &infino::ReindexOptions) -> bool
+pub fn infino::ReindexOptions::eq(&self, &Self) -> bool
 impl core::default::Default for infino::ReindexOptions
-pub fn infino::ReindexOptions::default() -> infino::ReindexOptions
+pub fn infino::ReindexOptions::default() -> Self
 impl core::fmt::Debug for infino::ReindexOptions
 pub fn infino::ReindexOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::ReindexOptions
@@ -840,12 +840,12 @@ pub infino::ReindexReport::held_by_another_run: usize
 pub infino::ReindexReport::rewritten: usize
 pub infino::ReindexReport::unrepairable_columns: alloc::vec::Vec<alloc::string::String>
 impl core::clone::Clone for infino::ReindexReport
-pub fn infino::ReindexReport::clone(&self) -> infino::ReindexReport
+pub fn infino::ReindexReport::clone(&self) -> Self
 impl core::cmp::Eq for infino::ReindexReport
 impl core::cmp::PartialEq for infino::ReindexReport
-pub fn infino::ReindexReport::eq(&self, &infino::ReindexReport) -> bool
+pub fn infino::ReindexReport::eq(&self, &Self) -> bool
 impl core::default::Default for infino::ReindexReport
-pub fn infino::ReindexReport::default() -> infino::ReindexReport
+pub fn infino::ReindexReport::default() -> Self
 impl core::fmt::Debug for infino::ReindexReport
 pub fn infino::ReindexReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for infino::ReindexReport
@@ -865,13 +865,13 @@ impl infino::SchemaPatch
 pub fn infino::SchemaPatch::from_json(&serde_json::value::Value) -> core::result::Result<Self, alloc::string::String>
 pub fn infino::SchemaPatch::to_json(&self) -> serde_json::value::Value
 impl core::clone::Clone for infino::SchemaPatch
-pub fn infino::SchemaPatch::clone(&self) -> infino::SchemaPatch
+pub fn infino::SchemaPatch::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::SchemaPatch
-pub fn infino::SchemaPatch::eq(&self, &infino::SchemaPatch) -> bool
+pub fn infino::SchemaPatch::eq(&self, &Self) -> bool
 impl core::convert::From<&infino::TableSchema> for infino::SchemaPatch
 pub fn infino::SchemaPatch::from(&infino::TableSchema) -> Self
 impl core::default::Default for infino::SchemaPatch
-pub fn infino::SchemaPatch::default() -> infino::SchemaPatch
+pub fn infino::SchemaPatch::default() -> Self
 impl core::fmt::Debug for infino::SchemaPatch
 pub fn infino::SchemaPatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for infino::SchemaPatch
@@ -891,12 +891,12 @@ pub infino::StalenessReport::unrepairable_columns: alloc::vec::Vec<alloc::string
 impl infino::StalenessReport
 pub fn infino::StalenessReport::is_current(&self) -> bool
 impl core::clone::Clone for infino::StalenessReport
-pub fn infino::StalenessReport::clone(&self) -> infino::StalenessReport
+pub fn infino::StalenessReport::clone(&self) -> Self
 impl core::cmp::Eq for infino::StalenessReport
 impl core::cmp::PartialEq for infino::StalenessReport
-pub fn infino::StalenessReport::eq(&self, &infino::StalenessReport) -> bool
+pub fn infino::StalenessReport::eq(&self, &Self) -> bool
 impl core::default::Default for infino::StalenessReport
-pub fn infino::StalenessReport::default() -> infino::StalenessReport
+pub fn infino::StalenessReport::default() -> Self
 impl core::fmt::Debug for infino::StalenessReport
 pub fn infino::StalenessReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for infino::StalenessReport
@@ -930,7 +930,7 @@ pub fn infino::Supertable::update(&self, datafusion_expr::expr::Expr, &arrow_arr
 pub fn infino::Supertable::update_rows(&self, datafusion_expr::expr::Expr, &[serde_json::value::Value]) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, core::option::Option<infino::VectorFilter<'_>>, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl core::clone::Clone for infino::Supertable
-pub fn infino::Supertable::clone(&self) -> infino::Supertable
+pub fn infino::Supertable::clone(&self) -> Self
 impl core::fmt::Debug for infino::Supertable
 pub fn infino::Supertable::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for infino::Supertable
@@ -945,27 +945,27 @@ impl infino::TableSchema
 pub fn infino::TableSchema::converting(&self) -> impl core::iter::traits::iterator::Iterator<Item = infino::FieldId> + '_
 pub fn infino::TableSchema::with_conversions_cleared(&self, &[infino::FieldId]) -> core::option::Option<infino::TableSchema>
 impl infino::TableSchema
-pub fn infino::TableSchema::effective_schema(&self, &str) -> alloc::sync::Arc<arrow_schema::schema::Schema>
+pub fn infino::TableSchema::effective_schema(&self, &str) -> alloc::rcs::arc::Arc<arrow_schema::schema::Schema>
 pub fn infino::TableSchema::fields(&self) -> &[infino::FieldDef]
 pub fn infino::TableSchema::from_json(&serde_json::value::Value) -> core::result::Result<Self, alloc::string::String>
 pub fn infino::TableSchema::from_user_schema(&arrow_schema::schema::Schema) -> Self
-pub fn infino::TableSchema::id_field(&str) -> alloc::sync::Arc<arrow_schema::field::Field>
+pub fn infino::TableSchema::id_field(&str) -> alloc::rcs::arc::Arc<arrow_schema::field::Field>
 pub fn infino::TableSchema::id_of(&self, &str) -> core::option::Option<infino::FieldId>
 pub fn infino::TableSchema::last_field_id(&self) -> u32
 pub fn infino::TableSchema::max_depth(&self) -> u32
 pub fn infino::TableSchema::max_fields(&self) -> u32
 pub fn infino::TableSchema::name_of(&self, infino::FieldId) -> core::option::Option<&str>
-pub fn infino::TableSchema::scalar_schema(&self, &str) -> alloc::sync::Arc<arrow_schema::schema::Schema>
+pub fn infino::TableSchema::scalar_schema(&self, &str) -> alloc::rcs::arc::Arc<arrow_schema::schema::Schema>
 pub fn infino::TableSchema::schema_id(&self) -> u32
-pub fn infino::TableSchema::stamp_field_ids(&self, &arrow_schema::schema::Schema, &str) -> alloc::sync::Arc<arrow_schema::schema::Schema>
-pub fn infino::TableSchema::stored_schema(&self, &str) -> alloc::sync::Arc<arrow_schema::schema::Schema>
+pub fn infino::TableSchema::stamp_field_ids(&self, &arrow_schema::schema::Schema, &str) -> alloc::rcs::arc::Arc<arrow_schema::schema::Schema>
+pub fn infino::TableSchema::stored_schema(&self, &str) -> alloc::rcs::arc::Arc<arrow_schema::schema::Schema>
 pub fn infino::TableSchema::to_json(&self) -> serde_json::value::Value
 pub fn infino::TableSchema::tombstoned(&self) -> &[infino::FieldId]
-pub fn infino::TableSchema::user_schema(&self) -> alloc::sync::Arc<arrow_schema::schema::Schema>
+pub fn infino::TableSchema::user_schema(&self) -> alloc::rcs::arc::Arc<arrow_schema::schema::Schema>
 impl core::clone::Clone for infino::TableSchema
-pub fn infino::TableSchema::clone(&self) -> infino::TableSchema
+pub fn infino::TableSchema::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::TableSchema
-pub fn infino::TableSchema::eq(&self, &infino::TableSchema) -> bool
+pub fn infino::TableSchema::eq(&self, &Self) -> bool
 impl core::convert::From<&infino::TableSchema> for infino::SchemaPatch
 pub fn infino::SchemaPatch::from(&infino::TableSchema) -> Self
 impl core::fmt::Debug for infino::TableSchema

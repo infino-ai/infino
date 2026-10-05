@@ -39,6 +39,12 @@ fmt:
 # surface change must land alongside a `make public-api-update` in the
 # same commit, so the diff is reviewed like any other contract change.
 # Requires the nightly toolchain and `cargo install cargo-public-api`.
+# The snapshot's rendering comes from rustdoc's JSON, so it moves with the
+# NIGHTLY toolchain, not just with the surface: a stale nightly spells a
+# derived `clone(&self) -> Self` as `-> infino::Foo` and rewrites ~90 lines
+# that no source change touched. CI runs the newest nightly, so run
+# `rustup update nightly` before regenerating, or the diff you review is
+# your toolchain's, not your change's.
 public-api:
 	cargo public-api --simplified > /tmp/infino-public-api.current
 	diff -u public-api.txt /tmp/infino-public-api.current \
