@@ -284,7 +284,7 @@ impl TableSchema {
     /// `vectors` configure: ids `1..=n` in declared order, `schema_id` 1.
     /// Every config names a field of `user`; the options constructor checks
     /// that before this is reached.
-    pub fn from_options(user: &Schema, fts: &[FtsConfig], vectors: &[VectorConfig]) -> Self {
+    pub(crate) fn from_options(user: &Schema, fts: &[FtsConfig], vectors: &[VectorConfig]) -> Self {
         let fields: Vec<FieldDef> = user
             .fields()
             .iter()
@@ -367,7 +367,7 @@ impl TableSchema {
 
     /// The full-text index configs the schema's fields carry, in declared
     /// order.
-    pub fn fts_configs(&self) -> Vec<FtsConfig> {
+    pub(crate) fn fts_configs(&self) -> Vec<FtsConfig> {
         self.fields
             .iter()
             .filter_map(|f| match &f.index {
@@ -396,7 +396,7 @@ impl TableSchema {
     /// The vector index configs the schema's fields carry, in declared
     /// order. A config built here carries no provided centroids: those are
     /// a creation-time seed, not part of the schema.
-    pub fn vector_configs(&self) -> Vec<VectorConfig> {
+    pub(crate) fn vector_configs(&self) -> Vec<VectorConfig> {
         self.fields
             .iter()
             .filter_map(|f| match (&f.index, &f.data_type) {
@@ -421,7 +421,7 @@ impl TableSchema {
     /// path uses to reject up front instead of failing deep in the scan.
     /// The whole chain, not the base: every caller tokenizes query-side
     /// text and must produce the forms the column was indexed under.
-    pub fn fts_tokenizer_for(&self, column: &str) -> Option<Arc<dyn Tokenizer>> {
+    pub(crate) fn fts_tokenizer_for(&self, column: &str) -> Option<Arc<dyn Tokenizer>> {
         let field = self.fields.iter().find(|f| f.name == column)?;
         match &field.index {
             Some(ColumnIndex::Fts {
@@ -448,14 +448,18 @@ impl TableSchema {
         self.max_depth
     }
 
-    /// The rules for columns documents add, in order.
-    pub fn templates(&self) -> &[Template] {
-        &self.templates
+    test_visible! {
+        /// The rules for columns documents add, in order. `Template` is
+        /// internal, so this stays off the shipped surface and is reachable
+        /// only from the integration tests.
+        fn templates(&self) -> &[Template] {
+            &self.templates
+        }
     }
 
     /// The first template that applies to a new column at `path` holding
     /// `kind`.
-    pub fn template_for(&self, path: &str, kind: Detected) -> Option<&Template> {
+    pub(crate) fn template_for(&self, path: &str, kind: Detected) -> Option<&Template> {
         self.templates.iter().find(|t| t.applies(path, kind))
     }
 

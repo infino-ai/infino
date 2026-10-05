@@ -202,7 +202,7 @@ impl RerankCodec {
     /// [`Self::Fp32`] so fp32-only superfiles that left the slot
     /// zero round-trip identically.
     #[inline]
-    pub const fn codec_id(self) -> u8 {
+    pub(crate) const fn codec_id(self) -> u8 {
         match self {
             Self::Fp32 => 0,
             Self::Sq8Residual => 1,
@@ -218,7 +218,7 @@ impl RerankCodec {
     /// `MalformedVersion` failure so a corrupted / future superfile
     /// fails loud rather than mis-decoding.
     #[inline]
-    pub const fn from_codec_id(id: u8) -> Option<Self> {
+    pub(crate) const fn from_codec_id(id: u8) -> Option<Self> {
         match id {
             0 => Some(Self::Fp32),
             1 => Some(Self::Sq8Residual),
@@ -247,7 +247,7 @@ impl RerankCodec {
     /// Per-vector body size in bytes inside the `full[]` region.
     /// `0` for [`Self::RabitqOnly`] (no rerank bytes at all).
     #[inline]
-    pub const fn per_vector_bytes(self, dim: usize) -> usize {
+    pub(crate) const fn per_vector_bytes(self, dim: usize) -> usize {
         match self {
             Self::Fp32 => dim * 4,
             Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16 | Self::Sq16Adaptive => dim * 2,
@@ -277,7 +277,7 @@ impl RerankCodec {
     /// this to skip the `full[]` allocation, the per-row spill
     /// in pass 2, and the bucket-read load in pass 3.
     #[inline]
-    pub const fn writes_full(self) -> bool {
+    pub(crate) const fn writes_full(self) -> bool {
         !matches!(self, Self::RabitqOnly)
     }
 
@@ -289,7 +289,7 @@ impl RerankCodec {
     /// targeted `Unimplemented` error rather than silently
     /// writing a byte format that the reader can't decode.
     #[inline]
-    pub const fn is_implemented(self) -> bool {
+    pub(crate) const fn is_implemented(self) -> bool {
         matches!(
             self,
             Self::Fp32
@@ -305,7 +305,7 @@ impl RerankCodec {
     /// `Sq16` is deliberately **not** a member — it is a single `u16`
     /// plane with its own scoring path, not the two-plane residual layout.
     #[inline]
-    pub const fn is_sq8_residual_family(self) -> bool {
+    pub(crate) const fn is_sq8_residual_family(self) -> bool {
         matches!(self, Self::Sq8Residual | Self::Sq8FixedResidual)
     }
 
@@ -322,7 +322,7 @@ impl RerankCodec {
     /// the mergeable set is named for what it means (eligible for IVF merge)
     /// rather than for the byte layout that happens to coincide with it today.
     #[inline]
-    pub const fn is_ivf_mergeable(self) -> bool {
+    pub(crate) const fn is_ivf_mergeable(self) -> bool {
         matches!(
             self,
             Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16 | Self::Sq16Adaptive
@@ -335,7 +335,7 @@ impl RerankCodec {
     /// -plane codecs share the same body/parse/dequant code — they differ only
     /// in the ruler (fixed grid vs per-cluster fitted).
     #[inline]
-    pub const fn writes_single_u16_plane(self) -> bool {
+    pub(crate) const fn writes_single_u16_plane(self) -> bool {
         matches!(self, Self::Sq16 | Self::Sq16Adaptive)
     }
 
@@ -346,7 +346,7 @@ impl RerankCodec {
     /// `u8` `255` confines every code to `0..=255` and silently throws away 8
     /// bits of the 16-bit grid.
     #[inline]
-    pub const fn code_max(self) -> f32 {
+    pub(crate) const fn code_max(self) -> f32 {
         if self.writes_single_u16_plane() {
             SQ16_CODE_MAX
         } else {
@@ -361,7 +361,7 @@ impl RerankCodec {
     /// ([`Self::is_sq8_residual_family`]) — `Sq16Adaptive` carries the arrays
     /// but is single-plane, so the two axes no longer coincide.
     #[inline]
-    pub const fn carries_cluster_quant_meta(self) -> bool {
+    pub(crate) const fn carries_cluster_quant_meta(self) -> bool {
         matches!(
             self,
             Self::Sq8Residual | Self::Sq8FixedResidual | Self::Sq16Adaptive
@@ -374,7 +374,7 @@ impl RerankCodec {
     /// destination cluster. True for `Sq8Residual` and `Sq16Adaptive`; the
     /// fixed-grid codecs (`Sq8FixedResidual`, `Sq16`) are excluded.
     #[inline]
-    pub const fn fits_per_cluster_ruler(self) -> bool {
+    pub(crate) const fn fits_per_cluster_ruler(self) -> bool {
         matches!(self, Self::Sq8Residual | Self::Sq16Adaptive)
     }
 
@@ -382,13 +382,13 @@ impl RerankCodec {
     /// `Sq16Kernel` — the `Fp32`
     /// distance path with a `u16 → f32` dequant front.
     #[inline]
-    pub const fn is_sq16(self) -> bool {
+    pub(crate) const fn is_sq16(self) -> bool {
         matches!(self, Self::Sq16)
     }
 
     /// Residual divisor implied by the on-disk codec discriminator.
     #[inline]
-    pub const fn residual_divisor(self) -> Option<f32> {
+    pub(crate) const fn residual_divisor(self) -> Option<f32> {
         match self {
             Self::Sq8Residual => Some(SQ8_RESIDUAL_DIVISOR),
             Self::Sq8FixedResidual => Some(SQ8_FIXED_RESIDUAL_DIVISOR),
@@ -408,7 +408,7 @@ impl RerankCodec {
     /// [`Self::is_sq8_residual_family`] to stay off the single-plane
     /// `Sq16` path.
     #[inline]
-    pub const fn uses_fixed_quantizer(self) -> bool {
+    pub(crate) const fn uses_fixed_quantizer(self) -> bool {
         matches!(self, Self::Sq8FixedResidual | Self::Sq16)
     }
 
@@ -495,7 +495,7 @@ impl RerankCodec {
     /// `n_cent × dim × 8` codec_meta bytes — small relative to
     /// the Sq8 `full[]` region at typical IVF shapes.
     #[inline]
-    pub const fn codec_meta_bytes(
+    pub(crate) const fn codec_meta_bytes(
         self,
         dim: usize,
         n_docs: usize,

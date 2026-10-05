@@ -308,24 +308,9 @@ pub infino::RerankCodec::Sq16Adaptive
 pub infino::RerankCodec::Sq8FixedResidual
 pub infino::RerankCodec::Sq8Residual
 impl infino::RerankCodec
-pub const fn infino::RerankCodec::carries_cluster_quant_meta(self) -> bool
-pub const fn infino::RerankCodec::code_max(self) -> f32
-pub const fn infino::RerankCodec::codec_id(self) -> u8
-pub const fn infino::RerankCodec::codec_meta_bytes(self, usize, usize, usize, infino::Metric) -> usize
-pub const fn infino::RerankCodec::fits_per_cluster_ruler(self) -> bool
-pub const fn infino::RerankCodec::from_codec_id(u8) -> core::option::Option<Self>
-pub const fn infino::RerankCodec::is_implemented(self) -> bool
-pub const fn infino::RerankCodec::is_ivf_mergeable(self) -> bool
-pub const fn infino::RerankCodec::is_sq16(self) -> bool
-pub const fn infino::RerankCodec::is_sq8_residual_family(self) -> bool
 pub const fn infino::RerankCodec::name(self) -> &'static str
-pub const fn infino::RerankCodec::per_vector_bytes(self, usize) -> usize
 pub const fn infino::RerankCodec::recommended_rerank_mult_floor(self, usize) -> core::option::Option<usize>
-pub const fn infino::RerankCodec::residual_divisor(self) -> core::option::Option<f32>
 pub const fn infino::RerankCodec::supports_metric(self, infino::Metric) -> bool
-pub const fn infino::RerankCodec::uses_fixed_quantizer(self) -> bool
-pub const fn infino::RerankCodec::writes_full(self) -> bool
-pub const fn infino::RerankCodec::writes_single_u16_plane(self) -> bool
 impl core::clone::Clone for infino::RerankCodec
 pub fn infino::RerankCodec::clone(&self) -> infino::RerankCodec
 impl core::cmp::Eq for infino::RerankCodec
@@ -376,6 +361,9 @@ pub infino::SchemaError::InvalidIndex::reason: alloc::string::String
 pub infino::SchemaError::InvalidRow
 pub infino::SchemaError::InvalidRow::reason: alloc::string::String
 pub infino::SchemaError::InvalidRow::row: usize
+pub infino::SchemaError::InvalidType
+pub infino::SchemaError::InvalidType::column: alloc::string::String
+pub infino::SchemaError::InvalidType::reason: alloc::string::String
 pub infino::SchemaError::MissingColumn
 pub infino::SchemaError::MissingColumn::column: alloc::string::String
 pub infino::SchemaError::MixedArray
@@ -954,17 +942,13 @@ impl !core::panic::unwind_safe::RefUnwindSafe for infino::Supertable
 impl !core::panic::unwind_safe::UnwindSafe for infino::Supertable
 pub struct infino::TableSchema
 impl infino::TableSchema
-pub fn infino::TableSchema::apply(&self, &[infino::supertable::schema::change::SchemaChange]) -> core::result::Result<infino::TableSchema, infino::SchemaError>
 pub fn infino::TableSchema::converting(&self) -> impl core::iter::traits::iterator::Iterator<Item = infino::FieldId> + '_
 pub fn infino::TableSchema::with_conversions_cleared(&self, &[infino::FieldId]) -> core::option::Option<infino::TableSchema>
 impl infino::TableSchema
 pub fn infino::TableSchema::effective_schema(&self, &str) -> alloc::sync::Arc<arrow_schema::schema::Schema>
 pub fn infino::TableSchema::fields(&self) -> &[infino::FieldDef]
 pub fn infino::TableSchema::from_json(&serde_json::value::Value) -> core::result::Result<Self, alloc::string::String>
-pub fn infino::TableSchema::from_options(&arrow_schema::schema::Schema, &[infino::superfile::builder::FtsConfig], &[infino::superfile::vector::builder::VectorConfig]) -> Self
 pub fn infino::TableSchema::from_user_schema(&arrow_schema::schema::Schema) -> Self
-pub fn infino::TableSchema::fts_configs(&self) -> alloc::vec::Vec<infino::superfile::builder::FtsConfig>
-pub fn infino::TableSchema::fts_tokenizer_for(&self, &str) -> core::option::Option<alloc::sync::Arc<dyn infino::superfile::fts::tokenize::Tokenizer>>
 pub fn infino::TableSchema::id_field(&str) -> alloc::sync::Arc<arrow_schema::field::Field>
 pub fn infino::TableSchema::id_of(&self, &str) -> core::option::Option<infino::FieldId>
 pub fn infino::TableSchema::last_field_id(&self) -> u32
@@ -975,12 +959,9 @@ pub fn infino::TableSchema::scalar_schema(&self, &str) -> alloc::sync::Arc<arrow
 pub fn infino::TableSchema::schema_id(&self) -> u32
 pub fn infino::TableSchema::stamp_field_ids(&self, &arrow_schema::schema::Schema, &str) -> alloc::sync::Arc<arrow_schema::schema::Schema>
 pub fn infino::TableSchema::stored_schema(&self, &str) -> alloc::sync::Arc<arrow_schema::schema::Schema>
-pub fn infino::TableSchema::template_for(&self, &str, infino::supertable::schema::Detected) -> core::option::Option<&infino::supertable::schema::Template>
-pub fn infino::TableSchema::templates(&self) -> &[infino::supertable::schema::Template]
 pub fn infino::TableSchema::to_json(&self) -> serde_json::value::Value
 pub fn infino::TableSchema::tombstoned(&self) -> &[infino::FieldId]
 pub fn infino::TableSchema::user_schema(&self) -> alloc::sync::Arc<arrow_schema::schema::Schema>
-pub fn infino::TableSchema::vector_configs(&self) -> alloc::vec::Vec<infino::superfile::vector::builder::VectorConfig>
 impl core::clone::Clone for infino::TableSchema
 pub fn infino::TableSchema::clone(&self) -> infino::TableSchema
 impl core::cmp::PartialEq for infino::TableSchema

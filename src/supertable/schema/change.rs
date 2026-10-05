@@ -458,7 +458,7 @@ pub fn merge(
 impl TableSchema {
     /// The document after `changes`, with `schema_id` advanced once when
     /// anything changed. Ids are minted here and nowhere else.
-    pub fn apply(&self, changes: &[SchemaChange]) -> Result<TableSchema, SchemaError> {
+    pub(crate) fn apply(&self, changes: &[SchemaChange]) -> Result<TableSchema, SchemaError> {
         if changes.is_empty() {
             return Ok(self.clone());
         }
