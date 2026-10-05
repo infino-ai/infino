@@ -460,6 +460,114 @@ fn open_surfaces_manifest_list_get_fault_and_recovers() {
     assert_eq!(st.reader().expect("reader").n_superfiles(), 1);
 }
 
+/// A read that fails in the middle of a search or a SQL query is the engine's
+/// failure, not the caller's: it surfaces as `Io`, which a caller can retry,
+/// never as the `Query` a bad query gets. Reopened, so nothing is cached and
+/// every query has to read the superfile; `title` is projected so the hits are
+/// decoded from it.
+#[test]
+fn a_storage_fault_mid_query_surfaces_as_io_not_a_query_error() {
+    let (st, faults, _dir) = faulted_table();
+    drop(st);
+    let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+    let st = Supertable::open(default_supertable_options().with_storage(storage)).expect("open");
+
+    for op in [FaultOp::Get, FaultOp::GetRange, FaultOp::Head] {
+        faults.fail(op, "data/", FANOUT_FAULTS);
+    }
+    let projection = Some(&["title"][..]);
+    let searches = [
+        (
+            "bm25_search",
+            st.bm25_search("title", "alpha", FTS_TOP_K, Default::default(), projection),
+        ),
+        (
+            "token_match",
+            st.token_match("title", "alpha", BoolMode::Or, projection),
+        ),
+        (
+            "exact_match",
+            st.exact_match("title", "first commit alpha", projection),
+        ),
+    ];
+    for (search, result) in searches {
+        let err = result.expect_err("every read of the superfile fails");
+        assert!(
+            matches!(err, InfinoError::Io(_)),
+            "{search}: a storage fault is not the caller's mistake, got {err:?}"
+        );
+    }
+    // The same fault under SQL: a scan, and a search table function, both
+    // inside a DataFusion plan that the error has to cross.
+    let reader = st.reader().expect("reader");
+    for sql in [
+        "SELECT title FROM supertable",
+        "SELECT title FROM bm25_search('title', 'alpha', 8)",
+    ] {
+        let err = InfinoError::from(
+            reader
+                .query_sql(sql)
+                .expect_err("every read of the superfile fails"),
+        );
+        assert!(
+            matches!(err, InfinoError::Io(_)),
+            "{sql}: a storage fault is not the caller's mistake, got {err:?}"
+        );
+    }
+    assert!(faults.fired() >= 1, "the searches actually hit the fault");
+}
+
+/// The same mid-query read, refused for the credentials in use: the caller
+/// has to see `PermissionDenied` (fix the credentials), not a retryable `Io`.
+#[test]
+fn a_refused_credential_mid_query_surfaces_as_permission_denied() {
+    let (st, faults, _dir) = faulted_table();
+    drop(st);
+    let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+    let st = Supertable::open(default_supertable_options().with_storage(storage)).expect("open");
+
+    for op in [FaultOp::Get, FaultOp::GetRange, FaultOp::Head] {
+        faults.fail_with(FaultKind::PermissionDenied, op, "data/", FANOUT_FAULTS);
+    }
+    let projection = Some(&["title"][..]);
+    let searches = [
+        (
+            "bm25_search",
+            st.bm25_search("title", "alpha", FTS_TOP_K, Default::default(), projection),
+        ),
+        (
+            "token_match",
+            st.token_match("title", "alpha", BoolMode::Or, projection),
+        ),
+        (
+            "exact_match",
+            st.exact_match("title", "first commit alpha", projection),
+        ),
+    ];
+    for (search, result) in searches {
+        let err = result.expect_err("every read of the superfile is refused");
+        assert!(
+            matches!(err, InfinoError::PermissionDenied(_)),
+            "{search}: got {err:?}"
+        );
+    }
+    let reader = st.reader().expect("reader");
+    for sql in [
+        "SELECT title FROM supertable",
+        "SELECT title FROM bm25_search('title', 'alpha', 8)",
+    ] {
+        let err = InfinoError::from(
+            reader
+                .query_sql(sql)
+                .expect_err("every read of the superfile is refused"),
+        );
+        assert!(
+            matches!(err, InfinoError::PermissionDenied(_)),
+            "{sql}: got {err:?}"
+        );
+    }
+}
+
 /// Superfile bytes for the disk-cache cold-read test: four docs, two of
 /// which contain the probe term "special".
 fn fts_superfile_bytes() -> Bytes {

@@ -531,3 +531,12 @@ memory:
   # A positive value enforces the ceiling (the engine reserves at 90% of it,
   # leaving headroom for small untracked allocations).
   connection_budget_bytes: 0
+
+  # Process-wide limit for SQL, in bytes of anonymous resident memory: a
+  # running statement is refused once the process passes it. The batches a
+  # plan streams between operators are not reserved against the connection
+  # budget above; this is what bounds them. Unset (default) takes 90% of the
+  # process's cgroup memory limit (the lower of memory.high and memory.max up
+  # its cgroup v2 hierarchy), and no limit where there is none. 0 sets no
+  # limit; a positive value is the limit.
+  # process_limit_bytes: 6442450944

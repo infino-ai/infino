@@ -18,12 +18,14 @@
 //!   memory by writing its buffered run to disk, then continues. The query still
 //!   succeeds, just slower.
 //! - Otherwise it surfaces as [`InfinoError::OverBudget`], when:
-//!     - the operator can't spill at all:
-//!        - non-spillable (hash-join build side, nested-loop join, window aggregate), or
-//!        - a streaming operator (scan / filter / projection) that buffers nothing, so a single
-//!          allocation already exceeds the budget and there is nothing to write out; or
+//!     - the operator can't spill at all (hash-join build side, nested-loop join), or
 //!     - it is spillable but can't reserve even the minimum it needs to run the
 //!       spill / merge (e.g. the sort's merge reservation).
+//!
+//! Some operators never ask this pool: the streaming ones — scan, filter,
+//! projection, `unnest` — and window functions, which buffer without
+//! reserving. Nothing they allocate is gated, however large; the process
+//! memory limit (see `resident`) is what bounds them.
 //!
 //! Spilling needs a disk manager; we use DataFusion's default (OS temp dir).
 //!
@@ -35,11 +37,12 @@ use datafusion::{
     execution::{
         memory_pool::{MemoryLimit, MemoryPool, MemoryReservation},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
+        session_state::SessionStateBuilder,
     },
     prelude::{SessionConfig, SessionContext},
 };
 
-use crate::memory::ConnectionMemoryBudget;
+use crate::{memory::ConnectionMemoryBudget, supertable::query::sorted_root::KeepSortedRoot};
 
 /// A DataFusion memory pool over a [`ConnectionMemoryBudget`]: measured never
 /// refuses, bounded refuses at the 90% gate (DataFusion then spills, or errors
@@ -140,10 +143,16 @@ pub(crate) fn budgeted_session_context(
         .execution
         .skip_partial_aggregation_probe_ratio_threshold = PARTIAL_AGG_SKIP_PROBE_RATIO;
 
-    Ok(SessionContext::new_with_config_rt(
-        config,
-        budgeted_runtime(budget)?,
-    ))
+    // Appended after DataFusion's own rules: the round-robin repartition it
+    // removes is one `EnforceDistribution` adds above a sorted result, which
+    // splits an `ORDER BY` back into partitions collected in completion order.
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_runtime_env(budgeted_runtime(budget)?)
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(KeepSortedRoot))
+        .build();
+    Ok(SessionContext::new_with_state(state))
 }
 
 #[cfg(test)]

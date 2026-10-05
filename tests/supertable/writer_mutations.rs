@@ -15,7 +15,7 @@ use arrow_array::{
     new_null_array,
 };
 use arrow_schema::{DataType, Field, Schema};
-use datafusion::prelude::{Expr, col, lit};
+use datafusion::prelude::{Expr, cast, col, lit};
 use infino::{
     Bm25SearchOptions, InfinoError,
     storage::{LocalFsStorageProvider, StorageProvider},
@@ -497,6 +497,32 @@ async fn folded_update_with_no_matches_but_replacement_rows_is_rejected() {
         )
         .expect_err("zero matches against one replacement row is a mismatch");
     assert!(matches!(err, InfinoError::Cardinality(_)), "got: {err}");
+}
+
+/// A predicate that fails on the table's own data (a cast the rows cannot
+/// take, a divide by zero) is the caller's mistake: `Query`, not the
+/// `Backend` an engine fault gets. DataFusion pushes it into the parquet scan,
+/// which hands the cause back as text, so this pins the classification that
+/// must survive that.
+#[test]
+fn a_predicate_that_fails_on_the_data_is_the_callers_query_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st =
+        Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
+    st.append(&build_title_batch(&["alpha", "bravo"]))
+        .expect("append");
+
+    let uncastable = || cast(col("title"), DataType::Int32).eq(lit(1));
+    let err = st
+        .delete(uncastable())
+        .expect_err("'alpha' is not an integer");
+    assert!(matches!(err, InfinoError::Query(_)), "delete: got {err:?}");
+    let err = st
+        .update(uncastable(), &build_title_batch(&["replacement"]))
+        .expect_err("'alpha' is not an integer");
+    assert!(matches!(err, InfinoError::Query(_)), "update: got {err:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

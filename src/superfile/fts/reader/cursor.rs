@@ -677,6 +677,34 @@ impl TermCursor {
         Ok(cursor)
     }
 
+    /// A cursor over one term's fetched body in whichever form its
+    /// dictionary value names: the short form ([`Self::new_short`]) or the
+    /// long one ([`Self::new`]). The one place a `Pfor` value's bytes become
+    /// a cursor, so every build reads the two forms alike.
+    pub(super) fn for_body(
+        bytes: Bytes,
+        short: bool,
+        col: &ColumnMeta,
+        stored: StoredBound,
+        global_idf: Option<f32>,
+        weight: u32,
+        header_probed: bool,
+        count_only: bool,
+    ) -> Result<Self, FtsError> {
+        match short {
+            true => Self::new_short(bytes, col, global_idf, weight, header_probed, count_only),
+            false => Self::new(
+                bytes,
+                col,
+                stored,
+                global_idf,
+                weight,
+                header_probed,
+                count_only,
+            ),
+        }
+    }
+
     /// Build a cursor from a short-form body (`fts::short`): decode the
     /// whole list — at most one block — into the cursor's buffers and
     /// synthesize its single block's metadata. The block's upper bound

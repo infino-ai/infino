@@ -49,10 +49,11 @@ use futures::stream;
 use crate::{
     superfile::fts::reader::BoolMode,
     supertable::{
+        error::QueryError,
         handle::{SupertableReader, WeakReader},
         query::exec::{
             common::{
-                arg_to_string, output_schema_with_score, resolve_hits, search_query_df_error,
+                arg_to_string, live_reader, output_schema_with_score, resolve_hits, scope_to_call,
                 traced_tvf,
             },
             fts_exec::arg_to_bool_mode,
@@ -130,18 +131,17 @@ impl TableFunctionImpl for TokenMatchFunc {
             Some(expr) => arg_to_bool_mode(expr)?,
             None => BoolMode::Or,
         };
-        let reader = self.reader.upgrade().ok_or_else(|| {
-            DataFusionError::Execution(
-                "token_match: supertable consumer dropped before execution".into(),
-            )
-        })?;
-        Ok(Arc::new(MatchTable {
-            reader,
-            column,
-            query: MatchQuery::Token { query, mode },
-            scalar_schema: Arc::clone(&self.scalar_schema),
-            output_schema: Arc::clone(&self.output_schema),
-        }))
+        let reader = live_reader(&self.reader, "token_match")?;
+        scope_to_call(
+            TOKEN_MATCH_UDTF,
+            Arc::new(MatchTable {
+                reader,
+                column,
+                query: MatchQuery::Token { query, mode },
+                scalar_schema: Arc::clone(&self.scalar_schema),
+                output_schema: Arc::clone(&self.output_schema),
+            }),
+        )
     }
 }
 
@@ -175,18 +175,17 @@ impl TableFunctionImpl for ExactMatchFunc {
         }
         let column = arg_to_string(&args[0], "exact_match column")?;
         let value = arg_to_string(&args[1], "exact_match value")?;
-        let reader = self.reader.upgrade().ok_or_else(|| {
-            DataFusionError::Execution(
-                "exact_match: supertable consumer dropped before execution".into(),
-            )
-        })?;
-        Ok(Arc::new(MatchTable {
-            reader,
-            column,
-            query: MatchQuery::Exact { value },
-            scalar_schema: Arc::clone(&self.scalar_schema),
-            output_schema: Arc::clone(&self.output_schema),
-        }))
+        let reader = live_reader(&self.reader, "exact_match")?;
+        scope_to_call(
+            EXACT_MATCH_UDTF,
+            Arc::new(MatchTable {
+                reader,
+                column,
+                query: MatchQuery::Exact { value },
+                scalar_schema: Arc::clone(&self.scalar_schema),
+                output_schema: Arc::clone(&self.output_schema),
+            }),
+        )
     }
 }
 
@@ -265,7 +264,7 @@ impl MatchExec {
             Some(indices) => Arc::new(
                 output_schema
                     .project(indices)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+                    .map_err(QueryError::internal)?,
             ),
             None => Arc::clone(&output_schema),
         };
@@ -358,8 +357,7 @@ impl ExecutionPlan for MatchExec {
                     reader.token_match_async(&column, query, *mode).await
                 }
                 MatchQuery::Exact { value } => reader.exact_match_async(&column, value).await,
-            }
-            .map_err(search_query_df_error)?;
+            }?;
             resolve_hits(
                 &reader,
                 &hits,
@@ -404,7 +402,7 @@ mod tests {
     use crate::{
         superfile::{builder::FtsConfig, fts::reader::BoolMode},
         supertable::{
-            Supertable, SupertableOptions, handle::SupertableReader,
+            Supertable, SupertableOptions, error::QueryError, handle::SupertableReader,
             query::exec::common::output_schema_with_score,
         },
     };
@@ -610,7 +608,16 @@ mod tests {
             Some(vec![n_cols + 5]),
         )
         .expect_err("out-of-range projection must fail");
-        assert!(matches!(err, DataFusionError::Execution(_)), "got {err:?}");
+        // DataFusion only hands in valid indices, so this is our invariant,
+        // carried through the plan typed.
+        assert!(
+            matches!(
+                &err,
+                DataFusionError::External(e)
+                    if matches!(e.downcast_ref::<QueryError>(), Some(QueryError::Internal(_)))
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -728,7 +735,7 @@ mod tests {
         use datafusion::{logical_expr::TableType, prelude::lit};
 
         use super::MatchTable;
-        use crate::supertable::query::exec::common::test_support::call_tvf;
+        use crate::supertable::query::exec::common::test_support::{call_tvf, scoped_inner};
 
         let st = demo();
         let reader = Arc::new(st.reader().expect("reader"));
@@ -739,7 +746,7 @@ mod tests {
         let dbg = format!("{table:?}");
         assert!(dbg.contains("MatchTable"), "Debug missing: {dbg}");
         assert!(
-            table.downcast_ref::<MatchTable>().is_some(),
+            scoped_inner(&table).downcast_ref::<MatchTable>().is_some(),
             "as_any downcasts to MatchTable"
         );
         assert_eq!(table.table_type(), TableType::Base);

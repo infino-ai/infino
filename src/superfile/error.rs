@@ -167,12 +167,13 @@ pub enum ReadError {
 }
 
 impl ReadError {
-    /// The over-budget message if this, or the vector error it wraps, is a
-    /// budget refusal, else `None`. Lets a `From` impl route to
+    /// The over-budget message if this, or the vector or FTS error it
+    /// wraps, is a budget refusal, else `None`. Lets a `From` impl route to
     /// `InfinoError::OverBudget` without matching the nested shape.
     pub(crate) fn over_budget(&self) -> Option<&str> {
         match self {
             ReadError::Vector(v) => v.over_budget(),
+            ReadError::Fts(f) => f.over_budget(),
             _ => None,
         }
     }
@@ -220,8 +221,39 @@ pub enum FtsError {
     #[error("dictionary walk dropped its result during {0}")]
     TaskDropped(&'static str),
 
+    /// An exact substring answer was asked of a column this superfile
+    /// indexed with an analyzer other than `standard`. The answer rests on
+    /// the standard analyzer's token rules, and the plan that asked for it
+    /// promised an exact answer, so the query fails rather than answer
+    /// from terms that could miss a row.
+    #[error(
+        "column {column:?} is indexed with the {analyzer:?} analyzer in this superfile; \
+         an exact substring answer needs the standard analyzer"
+    )]
+    ExactNeedsStandard { column: String, analyzer: String },
+
+    /// An exact substring answer's term values, postings or row bitsets
+    /// would cross the connection memory budget; the query is refused
+    /// before they are fetched or allocated. The string is already labelled
+    /// with the operation ("exact ILIKE, ..."); it routes to
+    /// `InfinoError::OverBudget` via [`FtsError::over_budget`].
+    #[error("{0}")]
+    OverBudget(String),
+
     #[error("read error: {0}")]
     Read(#[from] ReadError),
+}
+
+impl FtsError {
+    /// The over-budget message if this, or the read error it wraps, is a
+    /// budget refusal, else `None`.
+    pub(crate) fn over_budget(&self) -> Option<&str> {
+        match self {
+            FtsError::OverBudget(m) => Some(m),
+            FtsError::Read(r) => r.over_budget(),
+            _ => None,
+        }
+    }
 }
 
 /// Errors specific to vector query execution.

@@ -43,7 +43,9 @@
 //!     no DISTINCT / FILTER / ORDER BY; the sole grouped shape is one
 //!     low-cardinality column plus `COUNT(*)`;
 //!   * a provider already restricted to a segment subset is the
-//!     rewrite's own residual — never rewritten again (idempotency).
+//!     rewrite's own residual — never rewritten again (idempotency);
+//!   * a scan carrying a filter the provider answers exactly (which
+//!     leaves no `Filter` node to read) is never rewritten.
 
 use std::{cmp::Ordering, collections::HashSet, sync::Arc};
 
@@ -65,6 +67,7 @@ use datafusion::{
 use uuid::Uuid;
 
 use crate::supertable::{
+    error::QueryError,
     manifest::{SuperfileEntry, add_sum_arrays, list::ScalarValueCounts},
     options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
     query::provider::SupertableProvider,
@@ -93,7 +96,10 @@ impl OptimizerRule for CoveredAggregateRewrite {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> DfResult<Transformed<LogicalPlan>> {
-        match try_rewrite(&plan)? {
+        // `try_rewrite` declines with `None`. An error is a failure building
+        // our replacement from the manifest's own statistics: ours, never the
+        // query's, so it crosses DataFusion as an engine fault.
+        match try_rewrite(&plan).map_err(QueryError::internal)? {
             Some(rewritten) => Ok(Transformed::yes(rewritten)),
             None => Ok(Transformed::no(plan)),
         }
@@ -659,12 +665,20 @@ fn peel_unfiltered_scan(input: &LogicalPlan) -> Option<&TableScan> {
     }
 }
 
-/// The provider behind a scan, when it is ours.
+/// The provider behind a scan, when it is ours and the scan carries no
+/// filter the provider answers exactly.
+///
+/// An exact filter leaves no `Filter` node above the scan — DataFusion
+/// hands it to the scan alone — so the scan looks unfiltered while its rows
+/// are only the filter's. Every rewrite here answers from statistics that
+/// describe whole segments, so each would count rows the filter excludes;
+/// refusing the provider leaves the plan to the scan, which is exact.
 fn provider_of(scan: &TableScan) -> Option<&SupertableProvider> {
     // DataFusion 54 dropped `as_any` for an `Any` supertrait; downcast through
     // its provided `downcast_ref` (auto-derefs the `Arc`).
     let source = scan.source.downcast_ref::<DefaultTableSource>()?;
-    source.table_provider.downcast_ref::<SupertableProvider>()
+    let provider = source.table_provider.downcast_ref::<SupertableProvider>()?;
+    (!provider.has_exact_filter(&scan.filters)).then_some(provider)
 }
 
 /// Strictly extract a single-column range from the predicate: a

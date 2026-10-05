@@ -57,7 +57,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -67,6 +67,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use roaring::RoaringBitmap;
 use tokio::time::sleep;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -1024,11 +1025,47 @@ const fn sealed_retry_span_ms(retries: u32) -> u64 {
 // `SealedSidecarRetryExhausted` instead of taking the seal over. Raising the
 // staleness threshold — which its own doc-comment invites for large targets —
 // is the edit this catches.
+//
+// This guards the SHIPPED pair only. Both sides are configurable — `max_sealed_retries` per table
+// and `compaction.stale_seal_timeout_ms` per config — so the pair actually in force is checked at
+// runtime by [`warn_if_budget_cannot_outlast_seal`].
 const _: () = assert!(
     sealed_retry_span_ms(DEFAULT_MAX_SEALED_RETRIES) > DEFAULT_STALE_SEAL_TIMEOUT_MS,
     "the sealed-retry budget must outlast the seal staleness threshold, or a \
      delete exhausts its retries before it is allowed to steal an abandoned seal"
 );
+
+/// Warn once when the configured retry budget cannot outlast the configured staleness threshold.
+///
+/// A delete that meets a live seal waits for it to go stale and then takes it over. If its budget
+/// runs out first it fails with `SealedSidecarRetryExhausted` instead, so every delete landing on
+/// an input of a long merge fails while the table is perfectly healthy. The knobs are left
+/// authoritative rather than clamped: lowering the budget to reach the exhausted path in bounded
+/// time is exactly what the tests do, and a clamp would take that away.
+fn warn_if_budget_cannot_outlast_seal(max_sealed_retries: u32, stale_seal_timeout: Duration) {
+    static WARNED: OnceLock<()> = OnceLock::new();
+
+    let budget_ms = sealed_retry_span_ms(max_sealed_retries);
+    let timeout_ms = stale_seal_timeout.as_millis() as u64;
+    if budget_outlasts_seal(max_sealed_retries, stale_seal_timeout) || WARNED.set(()).is_err() {
+        return;
+    }
+    warn!(
+        budget_ms,
+        timeout_ms,
+        max_sealed_retries,
+        "sealed-retry budget is shorter than the seal staleness threshold; a delete meeting a \
+         live seal will exhaust its retries instead of taking the seal over"
+    );
+}
+
+/// Whether a delete can wait a live seal out before its retries run out.
+///
+/// The same ordering the const assert above pins for the shipped values, as a predicate over the
+/// pair actually in force.
+fn budget_outlasts_seal(max_sealed_retries: u32, stale_seal_timeout: Duration) -> bool {
+    sealed_retry_span_ms(max_sealed_retries) > stale_seal_timeout.as_millis() as u64
+}
 
 /// The lease span the current driver was granted, or `None` when the WAL
 /// carries no lease. Read once per phase, before any renewal moves
@@ -1168,6 +1205,12 @@ async fn do_tombstone_apply(
 
     let mut sealed_attempts = 0u32;
     let max_sealed_retries = inner.options.max_sealed_retries.max(1);
+    // The threshold a seal is judged stale by, from the one place that answers
+    // it: the compactor's re-stamp decision reads the same helper, and the gap
+    // between two different readings is a window where a delete lands a bit on
+    // a superfile about to be removed.
+    let stale_seal_timeout = tombstones_admin::writer_steal_timeout();
+    warn_if_budget_cannot_outlast_seal(max_sealed_retries, stale_seal_timeout);
     // What the manifest listed at the last sealed attempt, so a superfile
     // disappearing can refund the budget below. Seeded with the current
     // listing: a compaction that committed before this loop even started is
@@ -1200,7 +1243,7 @@ async fn do_tombstone_apply(
         let mut landed_any = false;
         for (superfile_id, hits) in doc_ids_in_superfile_map {
             let doc_ids: Vec<u32> = hits.iter().map(|&(doc_id, _)| doc_id).collect();
-            match cas_tombstone_bits(wal_store, superfile_id, &doc_ids).await? {
+            match cas_tombstone_bits(wal_store, superfile_id, &doc_ids, stale_seal_timeout).await? {
                 SidecarCasOutcome::Landed => {
                     landed_any = true;
                     for (_, idx) in hits {
@@ -1367,6 +1410,7 @@ async fn cas_tombstone_bits(
     wal_store: &WalStore,
     superfile_id: Uuid,
     doc_ids: &[u32],
+    stale_seal_timeout: Duration,
 ) -> Result<SidecarCasOutcome, TombstonePhaseError> {
     for _attempt in 0..MAX_CAS_RETRIES {
         // Read the current sidecar (None ↔ no tombstones yet).
@@ -1385,11 +1429,7 @@ async fn cas_tombstone_bits(
         // bit with `seal: None` below, clearing the dead seal too.
         if let Some(sc) = &existing
             && let Some(seal) = sc.seal.as_ref()
-            && !tombstones_admin::is_seal_stale(
-                seal.sealed_at,
-                Utc::now(),
-                Duration::from_millis(tombstones_admin::DEFAULT_STALE_SEAL_TIMEOUT_MS),
-            )
+            && !tombstones_admin::is_seal_stale(seal.sealed_at, Utc::now(), stale_seal_timeout)
         {
             return Ok(SidecarCasOutcome::Sealed);
         }
@@ -1689,6 +1729,29 @@ mod tests {
     /// A manifest listing, for the refund tests below.
     fn listing(ids: &[u128]) -> HashSet<Uuid> {
         ids.iter().copied().map(Uuid::from_u128).collect()
+    }
+
+    /// The shipped pair is ordered, and both knobs can break it.
+    ///
+    /// A delete that meets a live seal waits for it to go stale and takes it
+    /// over; if its budget runs out first it fails instead, on a table that is
+    /// working perfectly. Both sides are configurable, so the ordering is a
+    /// property of the pair in force, not of the defaults the const assert
+    /// above pins.
+    #[test]
+    fn a_delete_must_outlast_the_seal_it_waits_on() {
+        let shipped = Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
+        assert!(
+            budget_outlasts_seal(DEFAULT_MAX_SEALED_RETRIES, shipped),
+            "the shipped pair must be ordered"
+        );
+        // A budget lowered to reach the exhausted path, as the tests do.
+        assert!(!budget_outlasts_seal(3, shipped));
+        // A threshold raised for large targets, which its doc-comment invites.
+        assert!(!budget_outlasts_seal(
+            DEFAULT_MAX_SEALED_RETRIES,
+            Duration::from_secs(600)
+        ));
     }
 
     /// Landing a bit is progress, whatever the compactor is doing.

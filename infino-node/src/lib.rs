@@ -92,6 +92,12 @@ fn map_err(e: InfinoError) -> Error {
         InfinoError::Conflict(m) => {
             Error::new(Status::GenericFailure, format!("ConflictError: {m}"))
         }
+        // A valid query using something the engine does not support yet.
+        // Prefixed with the variant name, as `NotFound:` is, so a caller can
+        // tell it apart from a malformed query.
+        InfinoError::Unsupported(m) => {
+            Error::new(Status::GenericFailure, format!("Unsupported: {m}"))
+        }
         // `InfinoError` is `#[non_exhaustive]`: future variants fall back
         // to a generic runtime error carrying the message.
         other => Error::new(Status::GenericFailure, other.to_string()),
@@ -995,6 +1001,7 @@ impl Connection {
     /// the JS side reads with `tableFromIPC`. Search is available in SQL
     /// via the TVFs, e.g.
     /// `SELECT _id, score FROM bm25_search('docs', 'body', 'q', 10)`.
+    /// Read-only, one statement per call: a write throws `InvalidArg`.
     #[napi]
     pub fn query_sql(&self, sql: String) -> Result<Buffer> {
         let batches = self.inner.query_sql(&sql).map_err(map_err)?;

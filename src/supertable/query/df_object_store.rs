@@ -44,6 +44,7 @@ use object_store::{
 use crate::{
     runtime_metrics::op_stats::{self, OpStatsCollector},
     superfile::{LazyByteSource, lazy_source::Source},
+    supertable::error::QueryError,
 };
 
 /// Fixed `last_modified` reported for every registered superfile.
@@ -129,8 +130,12 @@ impl SuperfileObjectStore {
             .map(|source| Arc::clone(source.value()))
             .ok_or_else(|| OsError::NotFound {
                 path: location.to_string(),
-                source: format!("superfile {location} not registered in SuperfileObjectStore")
-                    .into(),
+                // Every superfile a scan reads is registered before it runs,
+                // so a miss is our bug, not a missing object: the source says
+                // so, and the query's error reports an engine fault.
+                source: Box::new(QueryError::Internal(format!(
+                    "superfile {location} not registered in SuperfileObjectStore"
+                ))),
             })
     }
 }

@@ -385,6 +385,28 @@ impl DiskCacheStore {
         let _ = fs::remove_file(self.blocks_idx_path(uri));
     }
 
+    /// Keep charging a dropped lazy entry's `.blocks` file. Its source releases its own bytes on
+    /// drop but leaves the file for a later open to adopt; untracked, the file would sit on disk
+    /// outside the budget, where eviction cannot reach it.
+    pub(crate) fn retain_block_file(&self, uri: &SuperfileUri, entry: &CachedEntry, now_us: u64) {
+        let Some(source) = entry.block_source() else {
+            return;
+        };
+        let filled = source.filled_bytes_handle().load(Ordering::Acquire);
+        if filled == 0 {
+            return;
+        }
+        self.current_bytes.fetch_add(filled, Ordering::Release);
+        let file = UnindexedFile {
+            size_bytes: filled,
+            mtime_us: now_us,
+        };
+        if let Some(prior) = self.block_files.insert(*uri, file) {
+            self.current_bytes
+                .fetch_sub(prior.size_bytes, Ordering::Release);
+        }
+    }
+
     pub(crate) fn release_scanned_block_file(&self, uri: &SuperfileUri) {
         if let Some((_, prior)) = self.block_files.remove(uri) {
             self.current_bytes

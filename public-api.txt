@@ -121,6 +121,7 @@ pub infino::InfinoError::OverBudget(alloc::string::String)
 pub infino::InfinoError::PermissionDenied(alloc::string::String)
 pub infino::InfinoError::Query(alloc::string::String)
 pub infino::InfinoError::Schema(alloc::string::String)
+pub infino::InfinoError::Unsupported(alloc::string::String)
 impl core::error::Error for infino::InfinoError
 impl core::fmt::Debug for infino::InfinoError
 pub fn infino::InfinoError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

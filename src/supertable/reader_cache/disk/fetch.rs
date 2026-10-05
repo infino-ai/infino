@@ -466,6 +466,33 @@ impl DiskCacheStore {
         }
     }
 
+    /// Download `[start, start + len)` of a lazily opened `uri` into its block cache in a few
+    /// parallel GETs, so a scan of that range reads from disk. Meant for a scan that reads most of
+    /// the range, such as a pass over the FTS section, whose reads would otherwise each be a GET.
+    /// Does nothing when `uri` is not open lazily: a whole file needs no prefetch.
+    pub(crate) async fn prefetch_range(
+        &self,
+        uri: &SuperfileUri,
+        start: u64,
+        len: u64,
+    ) -> Result<(), LazyByteSourceError> {
+        let block_source = match self.cached.get(uri) {
+            Some(entry) => match &entry.residency {
+                Residency::Paged { block_source, .. } => Arc::clone(block_source),
+                _ => return Ok(()),
+            },
+            None => return Ok(()),
+        };
+        block_source
+            .prefetch(
+                start,
+                len,
+                self.config.cold_fetch_chunk_bytes,
+                self.config.cold_fetch_streams,
+            )
+            .await
+    }
+
     /// Start the background fill for a lazy entry, at most once. Only `Warm` reads call this. The
     /// vector blob, if any, is left out of the download and keeps coming from the block cache.
     pub(crate) fn maybe_spawn_background_fill(

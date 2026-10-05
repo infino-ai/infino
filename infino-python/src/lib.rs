@@ -27,7 +27,9 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyKeyError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{
+    PyException, PyKeyError, PyNotImplementedError, PyRuntimeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -100,6 +102,8 @@ fn py_err(e: CoreError) -> PyErr {
         CoreError::OverBudget(m) => ConnectionMemoryBudgetError::new_err(m),
         // A lost CAS race: retryable
         CoreError::Conflict(m) => ConflictError::new_err(m),
+        // A valid query using something the engine does not support yet.
+        CoreError::Unsupported(m) => PyNotImplementedError::new_err(m),
         // The core error is `#[non_exhaustive]`: future variants fall back
         // to a generic runtime error carrying the message.
         other => PyRuntimeError::new_err(other.to_string()),
@@ -523,6 +527,7 @@ impl Connection {
     /// Run SQL across the catalog's tables; returns a pyarrow `Table`.
     /// Search is available in SQL via the TVFs, e.g.
     /// `SELECT _id, score FROM bm25_search('docs', 'body', 'q', 10)`.
+    /// Read-only, one statement per call: a write raises `ValueError`.
     fn query_sql<'py>(&self, py: Python<'py>, sql: &str) -> PyResult<Bound<'py, PyAny>> {
         let batches = py.detach(|| self.inner.query_sql(sql)).map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
