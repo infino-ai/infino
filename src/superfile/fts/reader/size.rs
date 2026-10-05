@@ -12,7 +12,7 @@
 use std::fmt;
 
 use super::{
-    core::{FtsReader, header_postings_length},
+    core::{FtsReader, fetch_source_range, header_postings_length},
     cursor::{SubindexKind, TermMeta},
 };
 use crate::{
@@ -245,12 +245,16 @@ impl FtsReader {
                         let len = match postings_length_hint {
                             Some(l) => l as usize,
                             None => header_postings_length(
-                                self.source
-                                    .get_range(start..start + TERM_META_SIZE)?
-                                    .as_ref(),
+                                fetch_source_range(
+                                    &self.source,
+                                    start..start + TERM_META_SIZE,
+                                    "fts/size header",
+                                )?
+                                .as_ref(),
                             )?,
                         };
-                        let bytes = self.source.get_range(start..start + len)?;
+                        let bytes =
+                            fetch_source_range(&self.source, start..start + len, "fts/size term")?;
                         let tb = bytes.as_ref();
                         if short {
                             let df = u64::from(short_df(tb).ok_or_else(|| {

@@ -798,10 +798,22 @@ mod tests {
     fn a_range_fetch_inside_a_reader_is_classified_by_its_kind() {
         let refused =
             || LazyByteSourceError::Storage(StorageError::PermissionDenied { uri: "u".into() });
-        let fts = |source| QueryError::from(ReadError::Fts(Box::new(FtsError::LazySource(source))));
+        let fts = |source| {
+            QueryError::from(ReadError::Fts(Box::new(FtsError::RangeFetch {
+                what: "fts/dict",
+                source,
+            })))
+        };
         assert!(matches!(fts(refused()), QueryError::PermissionDenied(_)));
         assert!(matches!(
             QueryError::from(VectorError::LazySource(refused())),
+            QueryError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            QueryError::from(VectorError::RangeFetch {
+                what: "lazy open: directory fetch".to_string(),
+                source: refused(),
+            }),
             QueryError::PermissionDenied(_)
         ));
         assert!(matches!(

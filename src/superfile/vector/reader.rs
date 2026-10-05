@@ -459,7 +459,13 @@ impl VectorReader {
             )));
         }
 
-        let header_bytes = source.range(0, OUTER_HEADER_SIZE as u64).await?;
+        let header_bytes = source
+            .range(0, OUTER_HEADER_SIZE as u64)
+            .await
+            .map_err(|e| VectorError::RangeFetch {
+                what: "lazy open: outer header fetch".to_string(),
+                source: e,
+            })?;
         if &header_bytes[0..MAGIC_BYTES] != format::vec::OUTER_MAGIC {
             return Err(VectorError::Read(ReadError::BadMagic {
                 section: "vector",
@@ -493,7 +499,11 @@ impl VectorReader {
 
         let dir_prefetch = source
             .range(dir_offset as u64, (dir_end - dir_offset) as u64)
-            .await?;
+            .await
+            .map_err(|e| VectorError::RangeFetch {
+                what: "lazy open: directory fetch".to_string(),
+                source: e,
+            })?;
 
         // Validate directory CRC against the prefetched bytes
         // before walking subsection metadata. A directory-CRC
@@ -574,7 +584,11 @@ impl VectorReader {
                 async move {
                     let bytes = source
                         .range(subsection_off as u64, SUB_HEADER_SIZE as u64)
-                        .await?;
+                        .await
+                        .map_err(|e| VectorError::RangeFetch {
+                            what: format!("lazy open: subsection {i} sub-header fetch"),
+                            source: e,
+                        })?;
                     Ok::<_, VectorError>((i, subsection_off, bytes))
                 }
             }));
@@ -1491,7 +1505,14 @@ impl VectorReader {
         // CRC-on: one full-blob GET so sync CRC verification can
         // `fetch_sync` contiguous ranges (PrefetchedSource does not stitch).
         if opts.verify_crc {
-            let full = source.range(0, blob_size as u64).await?;
+            let full =
+                source
+                    .range(0, blob_size as u64)
+                    .await
+                    .map_err(|e| VectorError::RangeFetch {
+                        what: "lazy multi-cell: full-blob CRC fetch".to_string(),
+                        source: e,
+                    })?;
             let mut overlay = PrefetchedSource::new(Arc::clone(&source));
             overlay.install(0, full);
             return Self::open_multi_cell_with_source(
@@ -1504,7 +1525,11 @@ impl VectorReader {
 
         let dir_prefetch = source
             .range(dir_offset as u64, (dir_end - dir_offset) as u64)
-            .await?;
+            .await
+            .map_err(|e| VectorError::RangeFetch {
+                what: "lazy multi-cell: directory fetch".to_string(),
+                source: e,
+            })?;
         let dir_bytes_slice = &dir_prefetch[0..dir_size];
         let dir_crc_expected = read_u32_le(&dir_prefetch[dir_size..dir_size + format::CRC_BYTES]);
         if dir_crc_expected != crc32c(dir_bytes_slice) {
@@ -1554,7 +1579,13 @@ impl VectorReader {
                     "multi-cell subsection {i} too short ({subsection_len} bytes)"
                 ))));
             }
-            let sub_hdr_bytes = source.range(subsection_off, SUB_HEADER_SIZE as u64).await?;
+            let sub_hdr_bytes = source
+                .range(subsection_off, SUB_HEADER_SIZE as u64)
+                .await
+                .map_err(|e| VectorError::RangeFetch {
+                    what: format!("lazy multi-cell: sub-header {i}"),
+                    source: e,
+                })?;
             overlay.install(subsection_off, sub_hdr_bytes.clone());
             let centroids_off = read_u64_le(
                 &sub_hdr_bytes[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES],
@@ -1578,7 +1609,11 @@ impl VectorReader {
             if idx_len > 0 {
                 let idx_bytes = source
                     .range(subsection_off + cluster_idx_off, idx_len)
-                    .await?;
+                    .await
+                    .map_err(|e| VectorError::RangeFetch {
+                        what: format!("lazy multi-cell: cluster index {i}"),
+                        source: e,
+                    })?;
                 overlay.install(subsection_off + cluster_idx_off, idx_bytes);
             }
         }
@@ -11583,12 +11618,21 @@ mod tests {
     /// those lets open succeed before the failing mode trips.
     const FAIL_NEVER: u64 = u64::MAX;
 
+    /// The label an open-time fetch failure carries, if `err` is one.
+    fn open_fetch_label(err: &VectorError) -> Option<&str> {
+        match err {
+            VectorError::RangeFetch { what, .. } => Some(what),
+            _ => None,
+        }
+    }
+
     /// Test-only [`LazyByteSource`] over a real blob that serves bytes
     /// until the test flips it into a failing mode. `try_get_range_sync`
     /// always returns `None`, so every reader fetch routes through the
     /// async `range()` (or its sync bridge) and observes the flag. Used
-    /// to pin that a backing-store failure surfaces as
-    /// `VectorError::LazySource` instead of a panic or silent miss.
+    /// to pin that a backing-store failure surfaces as a typed fetch error
+    /// (`VectorError::RangeFetch` while opening, `LazySource` after) instead
+    /// of a panic or silent miss.
     #[derive(Debug)]
     struct FlakyLazyByteSource {
         bytes: Bytes,
@@ -11759,8 +11803,8 @@ mod tests {
     }
 
     /// A failure on the outer-header fetch during `open_lazy` aborts open
-    /// with the fetch's own error, kept typed: a failed read, not a
-    /// malformed file.
+    /// with the fetch's own error, kept typed and labelled with the part it
+    /// was fetching: a failed read, not a malformed file.
     #[tokio::test]
     async fn open_lazy_header_fetch_failure_errors() {
         let (blob, json, _) = build_search_corpus();
@@ -11773,9 +11817,10 @@ mod tests {
         )
         .await
         .expect_err("header fetch failure must abort open_lazy");
-        assert!(
-            matches!(err, VectorError::LazySource(_)),
-            "expected the fetch's own error, got {err:?}"
+        assert_eq!(
+            open_fetch_label(&err),
+            Some("lazy open: outer header fetch"),
+            "got {err:?}"
         );
     }
 
@@ -11794,9 +11839,10 @@ mod tests {
         )
         .await
         .expect_err("directory fetch failure must abort open_lazy");
-        assert!(
-            matches!(err, VectorError::LazySource(_)),
-            "expected the fetch's own error, got {err:?}"
+        assert_eq!(
+            open_fetch_label(&err),
+            Some("lazy open: directory fetch"),
+            "got {err:?}"
         );
     }
 
@@ -11815,9 +11861,11 @@ mod tests {
         )
         .await
         .expect_err("subheader fetch failure must abort open_lazy");
+        // Which subsection fails first depends on the fetch wave's order.
         assert!(
-            matches!(err, VectorError::LazySource(_)),
-            "expected the fetch's own error, got {err:?}"
+            open_fetch_label(&err).is_some_and(|what| what.starts_with("lazy open: subsection")
+                && what.ends_with(" sub-header fetch")),
+            "got {err:?}"
         );
     }
 
