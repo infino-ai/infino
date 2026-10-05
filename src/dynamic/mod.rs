@@ -158,6 +158,22 @@ impl<'a> Column<'a> {
 
 /// Map `rows` to one batch under `schema`'s rules. Every row is a JSON
 /// object; see the module docs for how paths are typed.
+/// The live column a flattened `path` nests under, if any: `a.b.c` checks
+/// `a` and `a.b`. Documents flatten, so such a path cannot fill the column
+/// it nests under.
+fn live_prefix_of(path: &str, schema: &TableSchema) -> Option<String> {
+    let mut at = 0;
+    while let Some(dot) = path[at..].find('.') {
+        let end = at + dot;
+        let prefix = &path[..end];
+        if schema.id_of(prefix).is_some() {
+            return Some(prefix.to_owned());
+        }
+        at = end + 1;
+    }
+    None
+}
+
 pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch, SchemaError> {
     let mut columns: Vec<Column<'_>> = Vec::new();
     let mut by_path: HashMap<String, usize> = HashMap::new();
@@ -180,6 +196,18 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
                 Some(&i) => i,
                 None => {
                     if schema.id_of(&path).is_none() {
+                        // A path nesting under a column the table already
+                        // has would become a second column beside it rather
+                        // than filling it: the declared column would stay
+                        // null while the value sat in one whose name has to
+                        // be quoted to be read. Refuse instead of writing
+                        // the value where the caller is not looking.
+                        if let Some(shadowed) = live_prefix_of(&path, schema) {
+                            return Err(SchemaError::PathShadowsColumn {
+                                path,
+                                column: shadowed,
+                            });
+                        }
                         new_paths.push(path.clone());
                         if live_fields + new_paths.len() as u32 > schema.max_fields() {
                             return Err(SchemaError::FieldCapExceeded {

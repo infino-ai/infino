@@ -396,3 +396,47 @@ fn an_array_inside_an_array_of_objects_is_refused() {
     })])
     .expect("scalar leaves are positional");
 }
+
+/// Documents flatten to dot paths, so a document nesting under a column the
+/// table already has cannot fill it: `{"a": {"b": 1}}` against a declared
+/// `a: Struct{b}` used to leave the struct null and put the value in a
+/// second column called `a.b`, which only a quoted name could read, while
+/// the natural `SELECT a.b` resolved to the struct's field and returned
+/// null. The value went where the caller was not looking, silently.
+#[test]
+fn a_document_nesting_under_a_live_column_is_refused() {
+    let db = connect("memory://").expect("connect");
+    let struct_type =
+        DataType::Struct(vec![Arc::new(Field::new("b", DataType::Int64, true))].into());
+    let docs = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, true),
+                Field::new("a", struct_type, true),
+            ])),
+            IndexSpec::new(),
+        )
+        .expect("create");
+
+    let err = docs
+        .append_rows(&[json!({"title": "x", "a": {"b": 1}})])
+        .expect_err("the document nests under a live column");
+    assert!(
+        matches!(
+            &err,
+            InfinoError::Schema(SchemaError::PathShadowsColumn { path, column })
+                if path == "a.b" && column == "a"
+        ),
+        "{err:?}"
+    );
+
+    // The table is untouched: no shadow column was created.
+    let doc = db.schema(TABLE).expect("schema");
+    let names: Vec<&str> = doc.fields().iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["title", "a"]);
+
+    // A path that nests under nothing is still free to join.
+    docs.append_rows(&[json!({"title": "y", "meta": {"source": "s"}})])
+        .expect("a fresh nested path flattens as before");
+}

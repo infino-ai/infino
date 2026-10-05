@@ -94,6 +94,20 @@ pub enum SchemaError {
         /// The column's name.
         column: String,
     },
+    /// A document nests under a path the table already has as a column.
+    /// Documents flatten to dot paths, so the nested value would become a
+    /// second column beside the one that is there rather than filling it.
+    #[error(
+        "field `{path}` nests under live column `{column}`; a document cannot \
+         add a column beneath one the table already has"
+    )]
+    PathShadowsColumn {
+        /// The flattened path the document produced.
+        path: String,
+        /// The live column it would shadow.
+        column: String,
+    },
+
     /// An element of an array of objects carries an array of its own. The
     /// leaves of an array of objects line up one position per element, so
     /// that reading one position across them reads one element; a nested
