@@ -40,6 +40,21 @@ pub enum SchemaError {
         /// The column's name.
         column: String,
     },
+    /// A column holds an integer too large to be exact in `f64` beside a
+    /// value that makes the column a float.
+    #[error(
+        "field `{column}` holds the integer {value}, which a float column \
+         cannot hold exactly: it would read back as {stored}"
+    )]
+    IntegerNotExactInFloat {
+        /// The field's path.
+        column: String,
+        /// The integer that would change.
+        value: i128,
+        /// What it would read back as.
+        stored: f64,
+    },
+
     /// A document's array mixes element types.
     #[error("field `{column}` is an array of more than one type ({types:?})")]
     MixedArray {

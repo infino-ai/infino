@@ -263,6 +263,21 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
         });
         let kind = column.settle_kind(target.as_ref())?;
         let data_type = resolve_type(column, kind, target.as_ref());
+        // A path carrying both integers and floats is a float column, and
+        // an integer past f64's exact range would be rounded on the way in.
+        // The declared-target arms of `resolve_type` already refuse that by
+        // falling through to the kind's own type; a column the documents
+        // are creating has no target to fall back to, so refuse here rather
+        // than store a number the caller never sent.
+        if matches!(element_of(&data_type), DataType::Float64)
+            && let Some(value) = column.values().find_map(inexact_in_f64)
+        {
+            return Err(SchemaError::IntegerNotExactInFloat {
+                column: column.path.clone(),
+                value,
+                stored: value as f64,
+            });
+        }
         let array = build_array(column, rows.len(), &data_type)?;
         fields.push(Field::new(&column.path, data_type, true).with_metadata(metadata));
         arrays.push(array);
@@ -534,6 +549,24 @@ fn int_fits(value: &Value, t: &DataType) -> bool {
 
 fn int_exact_in_f64(value: &Value) -> bool {
     as_i128(value).is_some_and(|v| v.abs() <= F64_EXACT_INT_BOUND)
+}
+
+/// The integer `value` holds when it is one `f64` cannot carry exactly.
+/// A float literal is not an integer and is left alone: it arrived as an
+/// `f64` and is stored as the one it arrived as.
+fn inexact_in_f64(value: &Value) -> Option<i128> {
+    as_i128(value).filter(|v| v.abs() > F64_EXACT_INT_BOUND)
+}
+
+/// The element type of a list type, or the type itself when it is not a
+/// list: the type one of the column's values is actually stored as.
+fn element_of(data_type: &DataType) -> &DataType {
+    match data_type {
+        DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
+            item.data_type()
+        }
+        other => other,
+    }
 }
 
 fn float_exact_in_f32(value: &Value) -> bool {
@@ -816,6 +849,54 @@ mod tests {
                 .map(|(n, t)| Field::new(n, t, true))
                 .collect::<Vec<_>>(),
         ))
+    }
+
+    /// A path carrying an integer past f64's exact range and a float would
+    /// store the integer rounded. The declared-target arms already refuse
+    /// this; a column the documents create has no target, so it is refused
+    /// here. Without the guard the batch holds 9007199254740992.
+    #[test]
+    fn an_integer_a_float_column_cannot_hold_is_refused() {
+        let big = (1i64 << 53) + 1;
+        let err = rows_to_batch(
+            &[json!({"n": big}), json!({"n": 1.5})],
+            &table(Vec::new()),
+        )
+        .expect_err("the integer would be rounded");
+        assert!(
+            matches!(
+                &err,
+                SchemaError::IntegerNotExactInFloat { column, value, .. }
+                    if column == "n" && *value == big as i128
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The guard is about the integer, not about floats: a column of plain
+    /// integers keeps Int64 and its full range, and a float column of
+    /// floats is untouched.
+    #[test]
+    fn integers_alone_keep_their_range_and_floats_alone_are_fine() {
+        let big = i64::MAX;
+        let ints = rows_to_batch(&[json!({"n": big})], &table(Vec::new())).expect("ints map");
+        assert_eq!(types(&ints)["n"], DataType::Int64);
+        assert_eq!(col(&ints, "n").as_primitive::<Int64Type>().value(0), big);
+
+        let floats = rows_to_batch(&[json!({"f": 1.5}), json!({"f": 2.5})], &table(Vec::new()))
+            .expect("floats map");
+        assert_eq!(types(&floats)["f"], DataType::Float64);
+    }
+
+    /// An integer inside f64's exact range still joins a float column.
+    #[test]
+    fn an_exact_integer_still_joins_a_float_column() {
+        let batch = rows_to_batch(
+            &[json!({"n": 3}), json!({"n": 1.5})],
+            &table(Vec::new()),
+        )
+        .expect("an exact integer is fine beside a float");
+        assert_eq!(types(&batch)["n"], DataType::Float64);
     }
 
     /// Column types by name. Columns come out in key order, which
@@ -1119,3 +1200,4 @@ mod tests {
         assert_eq!(b.value(1), 9);
     }
 }
+
