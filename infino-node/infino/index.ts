@@ -306,8 +306,32 @@ function nativeTypeFromForeign(t: any): arrow.DataType {
         t.listSize,
         new arrow.Field("item", nativeTypeFromForeign(t.children[0].type), true),
       );
+    // The append path rebuilds a consumer Table through here too, and a
+    // Table is the route the document path points callers at for exactly
+    // the values JSON cannot spell. Leaving these out made `append` throw
+    // on a column the table declares and the engine writes.
+    case arrow.Type.Binary: return new arrow.Binary();
+    case arrow.Type.LargeBinary: return new arrow.LargeBinary();
+    case arrow.Type.FixedSizeBinary: return new arrow.FixedSizeBinary(t.byteWidth);
+    case arrow.Type.Decimal: return new arrow.Decimal(t.scale, t.precision, t.bitWidth);
+    case arrow.Type.Date: return new arrow.Date_(t.unit);
+    case arrow.Type.Time: return new arrow.Time(t.unit, t.bitWidth);
+    case arrow.Type.Timestamp: return new arrow.Timestamp(t.unit, t.timezone);
+    // `tableFromArrays` dictionary-encodes string columns, so this is the
+    // shape a Table built the obvious way arrives in. The engine stores the
+    // values, not the encoding, so the column rebuilds as what the
+    // dictionary holds.
+    case arrow.Type.Dictionary: return nativeTypeFromForeign(t.dictionary);
+    case arrow.Type.List:
+      return new arrow.List(
+        new arrow.Field(
+          t.children[0].name,
+          nativeTypeFromForeign(t.children[0].type),
+          t.children[0].nullable,
+        ),
+      );
     default:
-      throw new TypeError(`createTable: unsupported column type (typeId ${t.typeId})`);
+      throw new TypeError(`unsupported column type (typeId ${t.typeId})`);
   }
 }
 
@@ -423,7 +447,15 @@ function unspellableValue(rows: RowRecord[]): string | undefined {
   return undefined;
 }
 
-function writeInput(data: AppendData): WriteInput {
+// `getSchema` reads the table's declared columns, lazily: it is only
+// consulted when a consumer Table has to be rebuilt, and then only to let a
+// declared column keep its own type. Deriving every type from the consumer
+// instead would retype columns the table has already fixed — a declared
+// `LargeUtf8` read back as the `Utf8` inside a dictionary, for one — and the
+// append would be refused for disagreeing with the schema it was written
+// against. A column the table does not have yet keeps the consumer's type,
+// which is what lets a Table grow the schema.
+function writeInput(data: AppendData, getSchema?: () => arrow.Schema): WriteInput {
   if (Buffer.isBuffer(data)) return { ipc: data };
   if (data instanceof Uint8Array) return { ipc: Buffer.from(data) };
   if (Array.isArray(data)) {
@@ -439,8 +471,11 @@ function writeInput(data: AppendData): WriteInput {
   const d = data as any;
   if (d && (Array.isArray(d.batches) || (d.schema && typeof d.numRows === "number"))) {
     const rows = Array.from(d).map((r: any) => r.toJSON() as RowRecord);
+    const declared = new Map<string, arrow.DataType>();
+    if (getSchema) for (const f of getSchema().fields) declared.set(f.name, f.type);
     const fields: arrow.Field[] = d.schema.fields.map(
-      (f: any) => new arrow.Field(f.name, nativeTypeFromForeign(f.type), f.nullable),
+      (f: any) =>
+        new arrow.Field(f.name, declared.get(f.name) ?? nativeTypeFromForeign(f.type), f.nullable),
     );
     const cols: Record<string, arrow.Vector> = {};
     for (const field of fields) cols[field.name] = buildColumn(field, rows);
@@ -537,7 +572,7 @@ export class Table {
    * append == one commit.
    */
   append(data: AppendData): void {
-    const input = writeInput(data);
+    const input = writeInput(data, () => this.schema());
     guard(this.remote, () => ("rows" in input ? this.inner.appendRows(input.rows) : this.inner.append(input.ipc)));
   }
 
@@ -550,7 +585,7 @@ export class Table {
    * a hosted table.
    */
   appendNamed(data: AppendData, sourceName: string): void {
-    const input = writeInput(data);
+    const input = writeInput(data, () => this.schema());
     guard(this.remote, () =>
       "rows" in input ? this.inner.appendRowsNamed(input.rows, sourceName) : this.inner.appendNamed(input.ipc, sourceName),
     );
@@ -616,7 +651,7 @@ export class Table {
    * `data` (same shapes as `append`), 1:1 — the matched count must equal the
    * replacement-row count. Requires durable storage (not `memory://`). */
   update(predicate: string, data: AppendData): MutationStats {
-    const input = writeInput(data);
+    const input = writeInput(data, () => this.schema());
     return guard(this.remote, () =>
       "rows" in input ? this.inner.updateRows(predicate, input.rows) : this.inner.update(predicate, input.ipc),
     );

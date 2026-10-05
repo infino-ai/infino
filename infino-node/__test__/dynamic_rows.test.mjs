@@ -11,7 +11,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { connect, IndexSpec } from "../infino/index.js";
-import { Schema, Field, LargeUtf8 } from "apache-arrow";
+import { Schema, Field, LargeUtf8, Binary, Table, vectorFromArray } from "apache-arrow";
 
 const FIXTURES = fileURLToPath(new URL("../../tests/fixtures/dynamic/", import.meta.url));
 const titleSchema = () => new Schema([new Field("title", new LargeUtf8(), false)]);
@@ -58,4 +58,40 @@ test("documents grow the schema and disagreements are refused", () => {
       ["c", 5n, true],
     ],
   );
+});
+
+// A Table is the route the document path points callers at for values JSON
+// cannot spell, so appending one has to carry the types a table may declare.
+// Rebuilding the consumer's schema went through the createTable helper,
+// which knew only the handful of types that helper needed: it threw on a
+// declared `Binary` column, and on the dictionary-encoded strings
+// `vectorFromArray` produces for a plain array of strings.
+test("appending a Table carries the types a document cannot", () => {
+  const db = connect("memory://");
+  const t = db.createTable(
+    "docs",
+    new Schema([
+      new Field("title", new LargeUtf8(), false),
+      new Field("payload", new Binary(), true),
+    ]),
+    new IndexSpec(),
+  );
+
+  t.append(
+    new Table({
+      title: vectorFromArray(["a", "b"]),
+      payload: vectorFromArray(
+        [Uint8Array.from([0, 1]), Uint8Array.from([2, 3])],
+        new Binary(),
+      ),
+    }),
+  );
+
+  const rows = db.querySql("SELECT title, payload FROM docs ORDER BY _id");
+  assert.deepEqual(
+    rows.map((r) => r.title),
+    ["a", "b"],
+  );
+  assert.deepEqual(Array.from(rows[0].payload), [0, 1]);
+  assert.deepEqual(Array.from(rows[1].payload), [2, 3]);
 });
