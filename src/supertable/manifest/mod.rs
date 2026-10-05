@@ -3137,15 +3137,19 @@ pub struct SuperfileEntry {
 impl SuperfileEntry {
     /// Whether this superfile holds the full-text column with id `id`, in
     /// its Parquet body or its FTS blob. A file written before field ids
-    /// recorded no physical schema; it is taken to hold every column the
-    /// table had when it was written, which is every column that can be
-    /// asked of it.
-    pub(crate) fn holds_fts_column(&self, id: FieldId) -> bool {
-        self.physical_schema.as_ref().is_none_or(|ps| {
-            ps.column_by_id(id).is_some_and(|c| {
+    /// recorded no physical schema, and holds the columns the table had
+    /// when it was written — which is the creation schema, not whatever the
+    /// table has grown to since. `legacy` is what distinguishes the two: an
+    /// id it does not carry belongs to a column added after that file, so
+    /// the file contributes nothing rather than being asked for a column it
+    /// cannot have.
+    pub(crate) fn holds_fts_column(&self, id: FieldId, legacy: &LegacyNames) -> bool {
+        match self.physical_schema.as_ref() {
+            Some(ps) => ps.column_by_id(id).is_some_and(|c| {
                 matches!(c.kind, PhysicalKind::Stored | PhysicalKind::FtsIndexOnly)
-            })
-        })
+            }),
+            None => legacy.name_of(id).is_some(),
+        }
     }
 
     /// Whether this superfile holds the vector column with id `id` in its

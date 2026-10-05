@@ -11,6 +11,7 @@ pub mod hybrid_search;
 mod id_resolve;
 pub mod match_search;
 mod op_stats;
+mod pre_field_id_files;
 mod phrase_prune;
 mod query_errors;
 mod query_surface;

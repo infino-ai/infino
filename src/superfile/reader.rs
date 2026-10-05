@@ -77,7 +77,10 @@ use crate::{
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
         },
     },
-    supertable::{query::provider::tombstone_access_plan, schema::FieldId},
+    supertable::{
+        query::provider::tombstone_access_plan,
+        schema::{FieldId, LegacyNames},
+    },
     utils::terms::FstValue,
 };
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
@@ -692,9 +695,17 @@ impl SuperfileReader {
     /// the table's current name for it. A file written before a rename
     /// carries the old label in its FTS and vector blobs, which key their
     /// columns by name; the id is what identifies the column across both.
-    /// Falls back to `name` for a file written before ids, whose labels
-    /// were the table's at the time.
-    pub(crate) fn column_alias<'a>(&'a self, id: Option<FieldId>, name: &'a str) -> &'a str {
+    /// A file written before ids carries no id on any config, so nothing
+    /// matches: its labels were the table's names at the time, which are
+    /// the creation schema's, and `legacy` is what reads them back. Falling
+    /// back to the table's *current* name instead found nothing in the file
+    /// the moment the column had been renamed.
+    pub(crate) fn column_alias<'a>(
+        &'a self,
+        id: Option<FieldId>,
+        name: &'a str,
+        legacy: &'a LegacyNames,
+    ) -> &'a str {
         let Some(id) = id else {
             return name;
         };
@@ -711,6 +722,7 @@ impl SuperfileReader {
                 .find(|c| c.field_id == Some(id))
                 .map(|c| c.name.as_str())
         })
+        .or_else(|| legacy.name_of(id))
         .unwrap_or(name)
     }
 

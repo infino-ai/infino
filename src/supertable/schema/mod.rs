@@ -1253,6 +1253,24 @@ impl LegacyNames {
         stamped.or_else(|| self.resolve(name))
     }
 
+    /// The name the creation schema knew `id` by, or `None` for an id it
+    /// does not have. The inverse of [`Self::resolve`], and the question a
+    /// file written before ids answers: its blobs label their columns with
+    /// the table's names at the time, which are these, whatever the column
+    /// has been renamed to since. `None` also answers whether such a file
+    /// can hold the column at all — an id the creation schema does not
+    /// carry belongs to a column added after the file was written.
+    pub fn name_of(&self, id: FieldId) -> Option<&str> {
+        if id == FieldId::ID_COLUMN {
+            return Some(&self.id_column);
+        }
+        self.schema
+            .fields()
+            .iter()
+            .find(|f| f.id == id)
+            .map(|f| f.name.as_str())
+    }
+
     /// The id a stored column name resolves to, or `None` for a name the
     /// table does not have.
     pub fn resolve(&self, name: &str) -> Option<FieldId> {

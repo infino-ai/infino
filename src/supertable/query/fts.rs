@@ -651,6 +651,9 @@ impl SupertableReader {
             Self::validate_bm25_params(p)?;
         }
         let manifest = self.manifest();
+        // The names a file written before field ids labels its columns
+        // with: the table's at the time, which the creation schema holds.
+        let legacy = manifest.options.legacy_names();
         // The table-wide collection size for idf. The average document
         // length needs no such fold: every current-version superfile was
         // baked at the table-wide average as of its commit and is scored
@@ -982,11 +985,12 @@ impl SupertableReader {
                     .cloned()
                     .unwrap_or_else(|| Arc::new(RoaringBitmap::new()))
             });
+            let legacy = legacy.clone();
             async move {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+                let column_arc = r.column_alias(column_field_id, &column_arc, &legacy).to_owned();
 
                 // This superfile's open-wave fetches (global stats): the
                 // cursor builds below serve the scored terms from the memo
@@ -1239,6 +1243,9 @@ impl SupertableReader {
         kept: &[Arc<SuperfileEntry>],
         corpus: Option<ColumnLengthStats>,
     ) -> Result<(GlobalTermIdf, PrefetchMemos), QueryError> {
+        // The names a file written before field ids labels its columns
+        // with: the table's at the time, which the creation schema holds.
+        let legacy = manifest.options.legacy_names();
         let mut map = GlobalTermIdf::with_capacity(terms.len());
         // The collection size idf is computed against: documents that
         // carry tokens in this column, summed table-wide. It is the
@@ -1368,11 +1375,12 @@ impl SupertableReader {
                 let column_arc = Arc::clone(&column_arc);
                 let terms_arc = Arc::clone(&terms_arc);
                 let op_stats = op_stats.clone();
+                let legacy = legacy.clone();
                 async move {
                     // A file written before a rename labels the column as it was
                     // then, and its dictionary is keyed by that label; the id is
                     // what finds the column in either file.
-                    let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+                    let column_arc = r.column_alias(column_field_id, &column_arc, &legacy).to_owned();
 
                     let refs: Vec<&str> = terms_arc.iter().map(String::as_str).collect();
                     if full {
@@ -1450,6 +1458,9 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
+        // The names a file written before field ids labels its columns
+        // with: the table's at the time, which the creation schema holds.
+        let legacy = manifest.options.legacy_names();
         // As in `bm25_search_async`: a prefix query over a column with no
         // full-text index would otherwise fail deep in the scan with an opaque
         // missing-metadata error. Reject up front, naming the searchable set.
@@ -1526,11 +1537,12 @@ impl SupertableReader {
             let cursor_sets = Arc::clone(&cursor_sets);
             let reader_pool = Arc::clone(&reader_pool);
             let op_stats = op_stats.clone();
+            let legacy = legacy.clone();
             async move {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+                let column_arc = r.column_alias(column_field_id, &column_arc, &legacy).to_owned();
 
                 match range {
                     Some((start, end)) => {
@@ -1770,6 +1782,9 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        // The names a file written before field ids labels its columns
+        // with: the table's at the time, which the creation schema holds.
+        let legacy = self.manifest().options.legacy_names();
         let phases = self.phase_spans();
         let select_span = trace::phase(phases, || {
             detail_span!(
@@ -1826,11 +1841,12 @@ impl SupertableReader {
             let neg_ph_arc = Arc::clone(&neg_ph_arc);
             let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
+            let legacy = legacy.clone();
             async move {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+                let column_arc = r.column_alias(column_field_id, &column_arc, &legacy).to_owned();
 
                 let memo = memo_from_locations(&r, &locations, suid).await;
                 let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
@@ -1988,6 +2004,9 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<u64, QueryError> {
+        // The names a file written before field ids labels its columns
+        // with: the table's at the time, which the creation schema holds.
+        let legacy = self.manifest().options.legacy_names();
         let (match_set, negatives, kept) = self.parse_and_prune(column, query, mode).await?;
         if kept.is_empty() {
             return Ok(0);
@@ -2037,11 +2056,12 @@ impl SupertableReader {
                 let neg_arc = Arc::clone(&neg_arc);
                 let neg_ph_arc = Arc::clone(&neg_ph_arc);
                 let locations = Arc::clone(&locations);
+                let legacy = legacy.clone();
                 async move {
                     // A file written before a rename labels the column as it was
                     // then, and its dictionary is keyed by that label; the id is
                     // what finds the column in either file.
-                    let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+                    let column_arc = r.column_alias(column_field_id, &column_arc, &legacy).to_owned();
 
                     let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                     // Tombstone bitmap for this superfile (None = no deletes).
@@ -2179,6 +2199,9 @@ impl SupertableReader {
         value: &str,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
+        // The names a file written before field ids labels its columns
+        // with: the table's at the time, which the creation schema holds.
+        let legacy = manifest.options.legacy_names();
         // `exact_match` prunes through the column's own term dictionary, so
         // a column with no full-text index has nothing to prune with.
         let Some(tokenizer) = manifest.try_fts_tokenizer_for(column) else {
@@ -2238,11 +2261,12 @@ impl SupertableReader {
             let tokens_arc = Arc::clone(&tokens_arc);
             let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
+            let legacy = legacy.clone();
             async move {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+                let column_arc = r.column_alias(column_field_id, &column_arc, &legacy).to_owned();
 
                 let candidates: Vec<u32> = if tokens_arc.is_empty() {
                     (0..r.n_docs() as u32).collect()
@@ -2507,7 +2531,8 @@ async fn select_fts_superfiles(
 ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
     let mut kept = select_superfiles(manifest, leaves).await?;
     if let Some(id) = manifest.field_id(column) {
-        kept.retain(|entry| entry.holds_fts_column(id));
+        let legacy = manifest.options.legacy_names();
+        kept.retain(|entry| entry.holds_fts_column(id, &legacy));
     }
     Ok(kept)
 }

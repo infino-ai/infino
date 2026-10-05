@@ -2333,7 +2333,8 @@ async fn collect_hnsw_plane(
         let Some(vr) = reader.vec() else { continue };
         // A file written before a rename labels its vector blob with the name
         // the column had then; the id is what finds the column in either file.
-        let file_column = reader.column_alias(manifest.field_id(column), column);
+        let legacy = manifest.options.legacy_names();
+        let file_column = reader.column_alias(manifest.field_id(column), column, &legacy);
         let Some(rows) = vr
             .materialized_index_rows_excluding_async(
                 file_column,
@@ -2398,7 +2399,8 @@ async fn count_hnsw_rows(manifest: &ManifestSnapshot, column: &str) -> Result<us
         .await?;
         let Some(vr) = reader.vec() else { continue };
         // The file's own label for the column; see the fan-out sites.
-        if !vr.has_index_column(reader.column_alias(manifest.field_id(column), column)) {
+        let legacy = manifest.options.legacy_names();
+        if !vr.has_index_column(reader.column_alias(manifest.field_id(column), column, &legacy)) {
             continue;
         }
         let sup = superseded.get(&entry.superfile_id);
@@ -2737,7 +2739,8 @@ async fn gather_sq16_rows(
         let Some(vr) = reader.vec() else { continue };
         // A file written before a rename labels its vector blob with the name
         // the column had then; the id is what finds the column in either file.
-        let file_column = reader.column_alias(manifest.field_id(column), column);
+        let legacy = manifest.options.legacy_names();
+        let file_column = reader.column_alias(manifest.field_id(column), column, &legacy);
         let Some(rows) = vr
             .materialized_index_rows_excluding_async(
                 file_column,
@@ -3376,7 +3379,8 @@ pub(crate) async fn assemble_hnsw_incremental(
         let Some(vr) = reader.vec() else { continue };
         // A file written before a rename labels its vector blob with the name
         // the column had then; the id is what finds the column in either file.
-        let file_column = reader.column_alias(manifest.field_id(column), column);
+        let legacy = manifest.options.legacy_names();
+        let file_column = reader.column_alias(manifest.field_id(column), column, &legacy);
         let Some(rows) = vr
             .materialized_index_rows_excluding_async(
                 file_column,
@@ -4207,6 +4211,9 @@ impl SupertableReader {
         // A file written before a rename labels its vector blob with the name
         // the column had then; the id is what finds the column in either file.
         let column_field_id = manifest.field_id(column);
+        // The names a file written before field ids labels its columns
+        // with: the table's at the time, which the creation schema holds.
+        let legacy = manifest.options.legacy_names();
         let section = self.centroid_section().await.ok_or_else(|| {
             QueryError::Internal("global-fine: centroid section unavailable".into())
         })?;
@@ -4307,7 +4314,7 @@ impl SupertableReader {
             };
             let file_column = readers[si]
                 .as_ref()
-                .column_alias(column_field_id, column)
+                .column_alias(column_field_id, column, &legacy)
                 .to_owned();
             let pool = Arc::clone(&scan_pool);
             let budget = Arc::clone(&scan_budget);
@@ -4402,7 +4409,7 @@ impl SupertableReader {
             for (si, selected) in by_seg {
                 let entry = &superfiles[si];
                 let reader = readers[si].as_ref();
-                let file_column = reader.column_alias(column_field_id, column);
+                let file_column = reader.column_alias(column_field_id, column, &legacy);
                 let (hits, rerank_ns) = reader
                     .vector_rerank_selected(file_column, query, k, selected, None)
                     .await?;
@@ -5602,6 +5609,9 @@ impl SupertableReader {
         // with cache temperature) can never shrink the cap.
         let max_replica_overhead = Arc::new(AtomicU64::new(0));
         let max_replica_overhead_body = Arc::clone(&max_replica_overhead);
+        // The names a file written before field ids labels its columns
+        // with: the table's at the time, which the creation schema holds.
+        let legacy_src = manifest.options.legacy_names();
         let body =
             move |reader: Arc<SuperfileReader>,
                   entry: Arc<SuperfileEntry>,
@@ -5616,11 +5626,12 @@ impl SupertableReader {
                 let scan_pool = Arc::clone(&scan_pool_body);
                 let max_replica_overhead = Arc::clone(&max_replica_overhead_body);
                 let op_stats = op_stats_scan.clone();
+                let legacy = legacy_src.clone();
                 async move {
                     // A file written before a rename labels its vector
                     // blob with the name the column had then; the id is what
                     // finds the column in either file.
-                    let column = reader.column_alias(column_field_id, &column).to_owned();
+                    let column = reader.column_alias(column_field_id, &column, &legacy).to_owned();
                     // Unfiltered user path on row-addressable locals: resolve the
                     // bitmap once (warm after the orchestrator's prefetch) and
                     // push it down. Filtered search leaves it `None` — its
@@ -5892,6 +5903,7 @@ impl SupertableReader {
                 let query = Arc::clone(&query_arc2);
                 let reader_pool = Arc::clone(&manifest.options.reader_pool);
                 let op_stats_c = self.op_stats.clone();
+                let rerank_legacy = manifest.options.legacy_names();
                 let body_c = move |reader: Arc<SuperfileReader>,
                                    entry: Arc<SuperfileEntry>,
                                    _tombstone_cache: Option<Arc<SidecarCache>>,
@@ -5901,11 +5913,12 @@ impl SupertableReader {
                     let query = Arc::clone(&query);
                     let reader_pool = Arc::clone(&reader_pool);
                     let op_stats = op_stats_c.clone();
+                    let legacy = rerank_legacy.clone();
                     async move {
                         // A file written before a rename labels its vector
                         // blob with the name the column had then; the id is what
                         // finds the column in either file.
-                        let column = reader.column_alias(column_field_id, &column).to_owned();
+                        let column = reader.column_alias(column_field_id, &column, &legacy).to_owned();
                         // Hidden-path invariants: no tombstone sidecars (the
                         // manifest's deletes apply after the stable-id
                         // remap upstream), replica slack mirrors phase A.
