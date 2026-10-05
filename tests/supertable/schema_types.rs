@@ -924,3 +924,48 @@ fn a_vector_table_s_document_reads_back_as_a_no_op() {
         .expect("a document read back applies as a no-op");
     assert_eq!(after.schema_id(), doc.schema_id(), "nothing was committed");
 }
+
+/// Creating a table from another's document must reproduce that table, not
+/// a table that merely resembles it. The rotation seed and the rerank codec
+/// are not things the public builder varies, so a patch naming them used to
+/// be accepted and the defaults used instead: the clone searched a
+/// differently-built index and the caller was told nothing.
+#[test]
+fn a_table_created_from_a_document_keeps_the_vector_index_it_describes() {
+    let db = connect("memory://").expect("connect");
+    let vector_schema = Arc::new(Schema::new(vec![Field::new(
+        "emb",
+        DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 16),
+        true,
+    )]));
+    db.create_table(
+        "source",
+        vector_schema,
+        IndexSpec::new().vector("emb", VECTOR_DIM, Metric::Cosine),
+    )
+    .expect("create the source");
+
+    // A document naming a seed and codec other than the ones a fresh table
+    // would take, as a document from another table can.
+    let mut doc = db.schema("source").expect("schema").to_json();
+    doc["fields"][0]["index"]["rot_seed"] = serde_json::json!("1234567890123456789");
+    doc["fields"][0]["index"]["rerank_codec"] = serde_json::json!("sq16");
+
+    let patch = SchemaPatch::from_json(&doc).expect("the document is a patch");
+    let cloned = db.apply_schema("clone", &patch, None).expect("create");
+
+    let index = cloned
+        .fields()
+        .iter()
+        .find(|f| f.name == "emb")
+        .and_then(|f| f.index.clone())
+        .expect("the clone carries a vector index");
+    let json = infino::TableSchema::to_json(&cloned);
+    let recorded = &json["fields"][0]["index"];
+    assert_eq!(
+        recorded["rot_seed"].as_str(),
+        Some("1234567890123456789"),
+        "the seed the document named, not the default: {index:?}"
+    );
+    assert_eq!(recorded["rerank_codec"].as_str(), Some("sq16"));
+}

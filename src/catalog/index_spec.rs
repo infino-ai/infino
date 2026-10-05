@@ -13,7 +13,7 @@ use crate::superfile::{
         bm25::Bm25Params,
         tokenize::STANDARD_TOKENIZER,
     },
-    vector::{builder::VectorConfig, distance::Metric},
+    vector::{builder::VectorConfig, distance::Metric, rerank_codec::RerankCodec},
 };
 
 /// Default rotation-matrix RNG seed for vector columns. The seed only
@@ -26,6 +26,13 @@ struct VectorIndex {
     column: String,
     dim: usize,
     metric: Metric,
+    /// The rotation seed, which the public builder does not vary: it is
+    /// [`DEFAULT_ROT_SEED`] unless a schema document being replayed onto a
+    /// new table carried another, in which case the table has to be built
+    /// with the one the document named.
+    rot_seed: u64,
+    /// Likewise the rerank codec; `None` leaves the engine's default.
+    rerank_codec: Option<RerankCodec>,
 }
 
 /// One full-text (BM25) indexed column, with its per-column options.
@@ -266,6 +273,31 @@ impl IndexSpec {
             column: column.into(),
             dim,
             metric,
+            rot_seed: DEFAULT_ROT_SEED,
+            rerank_codec: None,
+        });
+        self
+    }
+
+    /// The same declaration, carrying a seed and codec a schema document
+    /// already fixed. Not public: a caller declaring a new table does not
+    /// choose these, but a table created from another's document must be
+    /// built with what that document said rather than silently taking the
+    /// defaults.
+    pub(crate) fn vector_as_recorded(
+        mut self,
+        column: impl Into<String>,
+        dim: usize,
+        metric: Metric,
+        rot_seed: u64,
+        rerank_codec: RerankCodec,
+    ) -> Self {
+        self.vectors.push(VectorIndex {
+            column: column.into(),
+            dim,
+            metric,
+            rot_seed,
+            rerank_codec: Some(rerank_codec),
         });
         self
     }
@@ -324,8 +356,10 @@ impl IndexSpec {
     }
 
     /// Lower to the internal `(FtsConfig, VectorConfig)` lists the
-    /// supertable options take. `rot_seed` / `rerank_codec` are not part
-    /// of the public spec — defaults are applied here.
+    /// supertable options take. `rot_seed` / `rerank_codec` are not part of
+    /// the public spec, so a column declared through [`Self::vector`]
+    /// carries the defaults; one replayed from a schema document carries
+    /// what that document recorded.
     pub(crate) fn to_configs(&self) -> (Vec<FtsConfig>, Vec<VectorConfig>) {
         let fts = self
             .fts
@@ -343,7 +377,13 @@ impl IndexSpec {
         let vectors = self
             .vectors
             .iter()
-            .map(|v| VectorConfig::new(v.column.clone(), v.dim, DEFAULT_ROT_SEED, v.metric))
+            .map(|v| {
+                let config = VectorConfig::new(v.column.clone(), v.dim, v.rot_seed, v.metric);
+                match v.rerank_codec {
+                    Some(codec) => config.with_rerank_codec(codec),
+                    None => config,
+                }
+            })
             .collect();
         (fts, vectors)
     }

@@ -1510,14 +1510,28 @@ fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), Infino
                         .bm25(bm25.k1, bm25.b),
                 );
             }
-            Some(ColumnIndex::Vector { metric, .. }) => {
+            Some(ColumnIndex::Vector {
+                metric,
+                rot_seed,
+                rerank_codec,
+            }) => {
                 let DataType::FixedSizeList(_, dim) = &data_type else {
                     return Err(InfinoError::Schema(SchemaError::InvalidIndex {
                         column: field.name.clone(),
                         reason: "a vector index needs a vector column".to_owned(),
                     }));
                 };
-                indexes = indexes.vector(field.name.clone(), *dim as usize, *metric);
+                // Carry what the document recorded. Taking the defaults
+                // instead would accept a patch naming a seed or a codec and
+                // silently build the table with different ones, so cloning a
+                // table's schema onto a new one would not reproduce it.
+                indexes = indexes.vector_as_recorded(
+                    field.name.clone(),
+                    *dim as usize,
+                    *metric,
+                    *rot_seed,
+                    *rerank_codec,
+                );
             }
             None => {}
         }
