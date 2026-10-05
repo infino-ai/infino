@@ -29,6 +29,7 @@ use crate::{
     config::{self, ReindexMode, ReindexOptions, ReindexTarget, SuperfileIndex},
     runtime_bridge::bridge_on_runtime,
     superfile::{
+        format::footer::{BlobRegion, has_duplicated_region_key, resolved_regions},
         fts::{
             analysis::{UNKNOWN_ANALYSIS_REVISION, analysis_revision_written_by},
             reader::{FtsStaleness, StaleColumn},
@@ -38,6 +39,7 @@ use crate::{
     supertable::{
         Supertable,
         error::{CompactionError, ReindexError},
+        manifest::SubsectionOffsets,
         optimize::compact::{CompactionJob, JobOutcome, SuperfileMerge},
         query::dispatch::open_compaction_input,
     },
@@ -73,6 +75,36 @@ pub(crate) struct StaleSuperfile {
     /// Live bytes, for the job's size estimate.
     pub(crate) live_bytes: u64,
     pub(crate) fts: FtsStaleness,
+    /// The footer stores a blob region key more than once. The copy this
+    /// engine reads is sound, and a rewrite lays the footer out afresh
+    /// from it, so it repairs this whatever the FTS index's state.
+    pub(crate) has_duplicated_region_keys: bool,
+}
+
+/// Where a superfile's footer says its blobs sit, judged against the file
+/// and its manifest entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FooterState {
+    /// Each region key stored once, inside the file, agreeing with the
+    /// manifest.
+    Sound,
+    /// A region key stored more than once, while the copy this engine
+    /// reads is inside the file and agrees with the manifest: a stale
+    /// duplicate a rewrite removes.
+    DuplicatedKeys,
+    /// The regions this engine reads run past the file or disagree with
+    /// the manifest. Nothing says which side is right, so a rewrite could
+    /// carry the wrong bytes and erase the evidence; the file is reported
+    /// and never rewritten.
+    Inconsistent,
+}
+
+/// What one scan found: the superfiles a reindex can repair, the ones it
+/// must leave for a person, and how many the snapshot held.
+pub(crate) struct Assessment {
+    pub(crate) stale: Vec<StaleSuperfile>,
+    pub(crate) inconsistent_footers: Vec<Uuid>,
+    pub(crate) superfiles: usize,
 }
 
 impl StaleSuperfile {
@@ -86,6 +118,7 @@ impl StaleSuperfile {
         partition_key: Vec<u8>,
         live_bytes: u64,
         reader: &SuperfileReader,
+        has_duplicated_region_keys: bool,
         trust_writer_analysis: bool,
     ) -> Self {
         // A file recording no revision is an unknown unless the caller has
@@ -104,7 +137,19 @@ impl StaleSuperfile {
             partition_key,
             live_bytes,
             fts,
+            has_duplicated_region_keys,
         }
+    }
+
+    /// Whether a rewrite would change anything: the container is behind,
+    /// or the footer stores a stale duplicate.
+    pub(crate) fn needs_rewrite(&self) -> bool {
+        self.fts.needs_rewrite() || self.has_duplicated_region_keys
+    }
+
+    /// Whether this file is behind on anything a reindex repairs.
+    pub(crate) fn is_current(&self) -> bool {
+        self.fts.is_current() && !self.has_duplicated_region_keys
     }
 
     /// Columns a rewrite cannot repair, because their text was never
@@ -116,6 +161,37 @@ impl StaleSuperfile {
     /// column from its source, which is outside this engine.
     pub(crate) fn unrepairable_columns(&self) -> impl Iterator<Item = &StaleColumn> {
         self.fts.unrepairable_columns()
+    }
+}
+
+/// Judge `reader`'s footer regions against the file and the manifest.
+///
+/// Judged on the copy of each key this engine reads, the last one, since
+/// that is what queries are served from; a stale earlier copy only misleads
+/// a reader that keeps the first.
+fn footer_state(reader: &SuperfileReader, offsets: Option<&SubsectionOffsets>) -> FooterState {
+    let metadata = reader.parquet_metadata();
+    // A reindex input is always opened whole; one that is not cannot be
+    // checked against its bytes, so it is left alone like any other doubt.
+    let (Some(resolved), Some(bytes)) = (resolved_regions(metadata), reader.whole_file_bytes())
+    else {
+        return FooterState::Inconsistent;
+    };
+    // An older manifest may record no region; only a recorded one can
+    // disagree.
+    let agrees = |manifest: Option<BlobRegion>, footer: Option<BlobRegion>| {
+        manifest.is_none_or(|m| Some(m) == footer)
+    };
+    let in_file = resolved.fit_within(bytes.len() as u64);
+    let matches_manifest =
+        offsets.is_none_or(|o| agrees(o.fts, resolved.fts) && agrees(o.vec, resolved.vec));
+    match (
+        in_file && matches_manifest,
+        has_duplicated_region_key(metadata),
+    ) {
+        (false, _) => FooterState::Inconsistent,
+        (true, true) => FooterState::DuplicatedKeys,
+        (true, false) => FooterState::Sound,
     }
 }
 
@@ -136,8 +212,9 @@ pub struct StalenessReport {
     /// Superfiles in the table, stale or not — the denominator for
     /// everything below.
     pub superfiles: usize,
-    /// Superfiles whose container is behind, which is exactly what
-    /// [`crate::ReindexMode::Rewrite`] would rewrite.
+    /// Superfiles whose container is behind or whose footer misplaces a
+    /// blob, which is exactly what [`crate::ReindexMode::Rewrite`] would
+    /// rewrite.
     pub needing_rewrite: usize,
     /// Superfiles holding terms an older analysis produced, which only
     /// [`crate::ReindexMode::Reanalyze`] can repair.
@@ -162,10 +239,22 @@ pub struct StalenessReport {
     /// an older analysis in these columns, and the only remaining repair
     /// is re-ingesting them from their source.
     pub unrepairable_columns: Vec<String>,
+    /// Superfiles whose footer places a blob somewhere the file or its
+    /// manifest entry contradicts, which a reindex reports and never
+    /// rewrites.
+    ///
+    /// Nothing in the file says whether the footer or the manifest is
+    /// right, so a rewrite could carry the wrong bytes and leave a file
+    /// that only looks consistent. Non-empty means a superfile needs a
+    /// person, not a migration; these are counted nowhere else.
+    pub inconsistent_footers: Vec<Uuid>,
 }
 
 impl StalenessReport {
     /// Whether a reindex would do anything at all.
+    ///
+    /// A table can be current and still hold
+    /// [`Self::inconsistent_footers`], which no reindex acts on.
     pub fn is_current(&self) -> bool {
         self.needing_rewrite == 0 && self.awaiting_reanalysis == 0
     }
@@ -237,6 +326,10 @@ pub struct ReindexReport {
     /// source, which is outside the engine — so this is reported rather
     /// than swallowed.
     pub unrepairable_columns: Vec<String>,
+    /// Superfiles left untouched because their footer places a blob
+    /// somewhere the file or its manifest entry contradicts; see
+    /// [`StalenessReport::inconsistent_footers`].
+    pub inconsistent_footers: Vec<Uuid>,
 }
 
 /// One rewrite job per stale superfile.
@@ -254,7 +347,7 @@ pub struct ReindexReport {
 /// already rewritten are no longer stale and drop out.
 ///
 /// Under [`ReindexMode::Rewrite`] this selects on
-/// [`FtsStaleness::needs_rewrite`] rather than on staleness in general,
+/// [`StaleSuperfile::needs_rewrite`] rather than on staleness in general,
 /// and the difference is what makes a migration terminate. A rewrite
 /// carries postings across, so it moves a file's container to the current
 /// one and leaves its analysis revision exactly where it was — planning a
@@ -272,11 +365,11 @@ pub(crate) fn plan_jobs(
             // A rewrite copies postings, so it cannot clear an analysis
             // revision — planning one for a file that is only
             // analysis-stale would emit the same job forever.
-            ReindexMode::Rewrite => s.fts.needs_rewrite(),
+            ReindexMode::Rewrite => s.needs_rewrite(),
             // Re-analysis produces new terms and a current container, so
             // it repairs either axis.
             ReindexMode::Auto | ReindexMode::Reanalyze => {
-                s.fts.needs_rewrite() || s.fts.needs_reanalysis()
+                s.needs_rewrite() || s.fts.needs_reanalysis()
             }
         })
         .collect();
@@ -345,12 +438,12 @@ impl Supertable {
     /// before taking the next. Peak memory is then a function of that
     /// constant rather than of how large the table is. Readers that the
     /// cache already holds cost nothing extra.
-    /// Returns the stale superfiles and how many the snapshot held, so a
-    /// caller can report both against one point in time.
+    /// Returns what it found against one snapshot, so a caller reports
+    /// every count against the same point in time.
     pub(crate) async fn stale_superfiles(
         &self,
         trust_writer_analysis: bool,
-    ) -> Result<(Vec<StaleSuperfile>, usize), CompactionError> {
+    ) -> Result<Assessment, CompactionError> {
         let manifest = self.inner().manifest.load_full();
         let store = manifest.options.store.clone();
         let disk_cache = manifest.options.disk_cache.clone();
@@ -358,6 +451,7 @@ impl Supertable {
 
         let entries = manifest.get_all_superfiles();
         let mut stale = Vec::new();
+        let mut inconsistent_footers = Vec::new();
         for batch in entries.chunks(SUPERFILES_ASSESSED_AT_ONCE) {
             let opens = batch.iter().map(|entry| {
                 let entry = entry.clone();
@@ -376,25 +470,38 @@ impl Supertable {
             });
             for (entry, reader) in join_all(opens).await {
                 let reader = reader.map_err(|e| CompactionError::Build(e.to_string()))?;
-                let live_bytes = entry
-                    .subsection_offsets
-                    .as_ref()
-                    .map_or(0, |o| o.total_size);
+                let offsets = entry.subsection_offsets.as_ref();
+                let has_duplicated_region_keys = match footer_state(&reader, offsets) {
+                    FooterState::Sound => false,
+                    FooterState::DuplicatedKeys => true,
+                    // Kept out of the stale list, so no plan or count can
+                    // reach it.
+                    FooterState::Inconsistent => {
+                        inconsistent_footers.push(entry.superfile_id);
+                        continue;
+                    }
+                };
                 let assessed = StaleSuperfile::assess(
                     entry.superfile_id,
                     entry.partition_key.clone(),
-                    live_bytes,
+                    offsets.map_or(0, |o| o.total_size),
                     &reader,
+                    has_duplicated_region_keys,
                     trust_writer_analysis,
                 );
-                if !assessed.fts.is_current() {
+                if !assessed.is_current() {
                     stale.push(assessed);
                 }
             }
             // Readers from this batch go out of scope here, so the next
             // batch's opens do not stack on top of them.
         }
-        Ok((stale, entries.len()))
+        inconsistent_footers.sort_unstable();
+        Ok(Assessment {
+            stale,
+            inconsistent_footers,
+            superfiles: entries.len(),
+        })
     }
 }
 
@@ -434,12 +541,12 @@ impl Supertable {
         if self.inner().manifest.load_full().options.storage.is_none() {
             return Err(ReindexError::NoStorage);
         }
-        let (stale, _) = self
+        let assessment = self
             .stale_superfiles(opts.trust_writer_analysis)
             .await
             .map_err(|e| ReindexError::Assess(e.to_string()))?;
         // The same planner the run drives, so the two cannot disagree.
-        Ok(plan_jobs(&stale, opts.mode)
+        Ok(plan_jobs(&assessment.stale, opts.mode)
             .into_iter()
             .map(|(job, repair)| PlannedRepair {
                 superfile_id: job.inputs[0],
@@ -473,19 +580,24 @@ impl Supertable {
         // No writer slot: this reads and reports. Taking one would make an
         // assessment fail while a migration it is meant to describe is
         // running, which is precisely when someone asks.
-        let (stale, superfiles) = self
+        let Assessment {
+            stale,
+            inconsistent_footers,
+            superfiles,
+        } = self
             .stale_superfiles(opts.trust_writer_analysis)
             .await
             .map_err(|e| ReindexError::Assess(e.to_string()))?;
 
         let mut report = StalenessReport {
             superfiles,
+            inconsistent_footers,
             ..Default::default()
         };
         for file in &stale {
             // Same predicates the planner filters on, so a count here is
             // the count that run acts on rather than an estimate of it.
-            if file.fts.needs_rewrite() {
+            if file.needs_rewrite() {
                 report.needing_rewrite += 1;
                 report.bytes_to_rewrite += file.live_bytes;
             }
@@ -560,13 +672,26 @@ impl Supertable {
         // from the manifest loaded above and `all` from inside the scan
         // would mix two points in time, so a commit landing between them
         // would skew the report by however many superfiles it added.
-        let (all, total) = self
+        let Assessment {
+            stale: all,
+            inconsistent_footers,
+            superfiles: total,
+        } = self
             .stale_superfiles(opts.trust_writer_analysis)
             .await
             .map_err(|e| ReindexError::Assess(e.to_string()))?;
+        if !inconsistent_footers.is_empty() {
+            warn!(
+                "[supertable reindex] {} superfile(s) have a footer that places a \
+                 blob where the file or its manifest entry contradicts; left \
+                 untouched for inspection: {:?}",
+                inconsistent_footers.len(),
+                inconsistent_footers,
+            );
+        }
 
         let mut report = ReindexReport {
-            already_current: total.saturating_sub(all.len()),
+            already_current: total.saturating_sub(all.len() + inconsistent_footers.len()),
             awaiting_reanalysis: match opts.mode {
                 // Re-analysis is what clears this axis, so a run that
                 // performs it leaves nothing waiting — except the columns
@@ -576,6 +701,7 @@ impl Supertable {
                 ReindexMode::Auto | ReindexMode::Reanalyze => 0,
                 ReindexMode::Rewrite => all.iter().filter(|s| s.fts.needs_reanalysis()).count(),
             },
+            inconsistent_footers,
             ..Default::default()
         };
         report.unrepairable_columns = unrepairable_column_names(&all);
@@ -668,16 +794,23 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, slice};
+
+    use bytes::Bytes;
     use datafusion::prelude::{col, lit};
     use tempfile::TempDir;
 
     use super::*;
     use crate::{
         Bm25SearchOptions,
-        superfile::fts::reader::StaleColumn,
+        storage::StorageProvider,
+        superfile::{
+            format::{footer::with_forged_footer_kv, kv},
+            fts::reader::StaleColumn,
+        },
         supertable::{
             Supertable,
-            writer::{CommitListMetadata, persist_commit_async},
+            writer::{CommitListMetadata, build_subsection_offsets, persist_commit_async},
         },
         test_helpers::{copy_dir_recursive, old_format_fts_fixture, open_old_format_fts_fixture},
     };
@@ -957,6 +1090,7 @@ mod tests {
             partition_key: vec![7],
             live_bytes: 1_024,
             fts,
+            has_duplicated_region_keys: false,
         }
     }
 
@@ -977,6 +1111,158 @@ mod tests {
                 stored: true,
             }],
         }
+    }
+
+    /// The bytes of the fixture's first superfile.
+    fn first_fixture_superfile(table: &Supertable, storage: &Arc<dyn StorageProvider>) -> Bytes {
+        let manifest = table.reader().expect("reader").manifest().clone();
+        let entries = table
+            .block_on_query(manifest.get_all_superfiles_loaded())
+            .expect("load entries");
+        let (bytes, _) = table
+            .block_on_query(storage.get(&entries[0].storage_path()))
+            .expect("read superfile");
+        bytes
+    }
+
+    /// A footer is judged on the copy of each key this engine reads: sound
+    /// when the manifest records the same regions, inconsistent the moment
+    /// it records one elsewhere — whichever side is wrong.
+    #[test]
+    fn a_footer_the_manifest_contradicts_is_inconsistent() {
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+        let (storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+        let bytes = first_fixture_superfile(&table, &storage);
+        let offsets = build_subsection_offsets(&bytes).expect("subsection offsets");
+        let reader = SuperfileReader::open(bytes).expect("open superfile");
+
+        assert_eq!(footer_state(&reader, Some(&offsets)), FooterState::Sound);
+        assert_eq!(footer_state(&reader, None), FooterState::Sound);
+
+        let (at, len) = offsets.fts.expect("the fixture has an FTS region");
+        let elsewhere = SubsectionOffsets {
+            fts: Some((at + 1, len)),
+            ..offsets
+        };
+        assert_eq!(
+            footer_state(&reader, Some(&elsewhere)),
+            FooterState::Inconsistent
+        );
+    }
+
+    /// A stale copy of a region key ahead of the real one, the shape a
+    /// carried rewrite once left, is a duplicate a rewrite can repair: the
+    /// copy this engine reads still matches the file and the manifest.
+    #[test]
+    fn a_stale_region_copy_ahead_of_the_real_one_is_a_duplicate() {
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+        let (storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+        let bytes = first_fixture_superfile(&table, &storage);
+        let offsets = build_subsection_offsets(&bytes).expect("subsection offsets");
+        let (at, _) = offsets.fts.expect("the fixture has an FTS region");
+
+        let stale = (at + 1).to_string();
+        let forged = with_forged_footer_kv(&bytes, &[(kv::FTS_OFFSET, &stale)]);
+        let reader = SuperfileReader::open(forged).expect("the last copy still opens");
+        assert_eq!(
+            footer_state(&reader, Some(&offsets)),
+            FooterState::DuplicatedKeys
+        );
+    }
+
+    /// A duplicated region key on a table that is otherwise current is
+    /// found and repaired: the footer is the only reason the file is
+    /// rewritten, and the rewrite stores each key once.
+    #[test]
+    fn a_reindex_repairs_a_duplicated_region_key() {
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+        let (_storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+        table
+            .reindex(&ReindexOptions::default())
+            .expect("bring the fixture current");
+        let survivors = hits(&table, "shared");
+
+        // Plant the stale copy on one file of the now-current table.
+        let manifest = table.reader().expect("reader").manifest().clone();
+        let entries = table
+            .block_on_query(manifest.get_all_superfiles_loaded())
+            .expect("load entries");
+        let path = dir.path().join(entries[0].storage_path());
+        let bytes = fs::read(&path).expect("read superfile");
+        let offsets = build_subsection_offsets(&Bytes::from(bytes.clone())).expect("offsets");
+        let (at, _) = offsets.fts.expect("an FTS region");
+        let stale = (at + 1).to_string();
+        fs::write(
+            &path,
+            with_forged_footer_kv(&bytes, &[(kv::FTS_OFFSET, &stale)]),
+        )
+        .expect("write forged superfile");
+        drop(table);
+        let (storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+
+        let before = table
+            .index_staleness(&ReindexOptions::default())
+            .expect("assess");
+        assert_eq!(before.needing_rewrite, 1, "{before:?}");
+        assert_eq!(before.awaiting_reanalysis, 0, "{before:?}");
+        assert!(before.inconsistent_footers.is_empty(), "{before:?}");
+
+        let report = table
+            .reindex(&ReindexOptions::default())
+            .expect("repair the footer");
+        assert_eq!(report.rewritten, 1, "{report:?}");
+        for entry in table
+            .block_on_query(
+                table
+                    .reader()
+                    .expect("reader")
+                    .manifest()
+                    .get_all_superfiles_loaded(),
+            )
+            .expect("load entries")
+        {
+            let (bytes, _) = table
+                .block_on_query(storage.get(&entry.storage_path()))
+                .expect("read superfile");
+            let reader = SuperfileReader::open(bytes).expect("open superfile");
+            assert!(
+                !has_duplicated_region_key(reader.parquet_metadata()),
+                "{}: footer still stores a region key twice",
+                entry.storage_path()
+            );
+        }
+        assert_eq!(hits(&table, "shared"), survivors, "the repair moved rows");
+        assert!(
+            table
+                .index_staleness(&ReindexOptions::default())
+                .expect("assess the repaired table")
+                .is_current()
+        );
+    }
+
+    /// A footer storing a stale duplicate earns a rewrite under every
+    /// mode, even with a current FTS index: the rewrite is what lays the
+    /// footer out afresh.
+    #[test]
+    fn a_duplicated_region_key_earns_a_rewrite_under_every_mode() {
+        let duplicated = StaleSuperfile {
+            has_duplicated_region_keys: true,
+            ..entry(1, FtsStaleness::default())
+        };
+        for (mode, repair) in [
+            (ReindexMode::Rewrite, Repair::Layout),
+            (ReindexMode::Auto, Repair::Layout),
+            (ReindexMode::Reanalyze, Repair::Terms),
+        ] {
+            let jobs = plan_jobs(slice::from_ref(&duplicated), mode);
+            assert_eq!(jobs.len(), 1, "{mode:?}");
+            assert_eq!(jobs[0].1, repair, "{mode:?}");
+        }
+        assert!(!duplicated.is_current());
+        assert!(entry(2, FtsStaleness::default()).is_current());
     }
 
     /// A superfile behind on its container earns a job; one that is

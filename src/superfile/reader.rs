@@ -2451,6 +2451,7 @@ mod tests {
     use crate::{
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+            format::footer::with_forged_footer_kv,
             vector::distance::normalize,
         },
         test_helpers::{decimal128_ids, default_vector_config},
@@ -3529,8 +3530,18 @@ mod tests {
             .expect("build RecordBatch");
         let body = encode_parquet_body(&schema, &[batch], Compression::SNAPPY, ROW_GROUP_SIZE, &[])
             .expect("encode parquet body");
-        let parts = splice_index_blobs(body, &[], &[], &[], extra_kv).expect("splice index blobs");
-        Bytes::from(parts.bytes)
+        // The splice writes region keys itself and drops a caller's, so the
+        // malformed ones these tests need are forged onto the footer after.
+        let (region, rest): (Vec<_>, Vec<_>) = extra_kv
+            .iter()
+            .cloned()
+            .partition(|(k, _)| kv::REGION_KEYS.contains(&k.as_str()));
+        let parts = splice_index_blobs(body, &[], &[], &[], &rest).expect("splice index blobs");
+        let region: Vec<(&str, &str)> = region
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        with_forged_footer_kv(&parts.bytes, &region)
     }
 
     /// The five always-required KV entries, with a correct format value

@@ -197,6 +197,9 @@ export interface ReindexReport {
   /** Columns whose text was never stored, so no repair can fix their terms;
    * only re-ingesting them from source can. */
   unrepairableColumns: string[];
+  /** Superfiles left untouched because their footer places a blob where
+   * the file or its manifest entry contradicts; they need inspection. */
+  inconsistentFooters: string[];
 }
 
 /** What a `reindex` would do, and what it would cost. */
@@ -212,6 +215,9 @@ export interface StalenessReport {
   bytesToRewrite: number;
   /** Columns no repair can fix, because their text was never stored. */
   unrepairableColumns: string[];
+  /** Superfiles whose footer places a blob where the file or its manifest
+   * entry contradicts. A reindex reports these and never rewrites them. */
+  inconsistentFooters: string[];
   /** Whether a reindex would do nothing at all. */
   isCurrent: boolean;
 }

@@ -2386,12 +2386,15 @@ impl SuperfileBuilder {
         for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
-                fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
-                    if rows[local_doc as usize].is_some() {
-                        df[term_bucket(term) as usize] += 1;
-                    }
-                    Ok(())
-                })
+                fts.for_each_term_doc(
+                    column_id,
+                    |term| Some(term_bucket(term)),
+                    |&t, local_doc| {
+                        if rows[local_doc as usize].is_some() {
+                            df[t as usize] += 1;
+                        }
+                    },
+                )
                 .map_err(|e| {
                     BuildError::Io(Error::other(format!(
                         "fts merge: counting terms for the document order failed: {e}"
@@ -2410,6 +2413,8 @@ impl SuperfileBuilder {
         // fixed number of slots per document. `worst` tracks the slot
         // holding the least selective term kept so far, so a posting
         // that cannot displace it costs one comparison.
+        // An ineligible term is skipped before its postings are read, and
+        // `displaced` counts the kept terms that later lost their slot.
         let pick_span = detail_span!("merge_order_pick_terms").entered();
         let n = n_out_docs as usize;
         let mut slots: Vec<u32> = vec![0; n * REORDER_TERMS_PER_DOC];
@@ -2418,14 +2423,15 @@ impl SuperfileBuilder {
         for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
-                fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
-                    let Some(row) = rows[local_doc as usize] else {
-                        return Ok(());
-                    };
+                let on_term = |term: &[u8]| {
                     let t = term_bucket(term);
-                    if !eligible(t) {
-                        return Ok(());
-                    }
+                    let keep = eligible(t);
+                    keep.then_some(t)
+                };
+                fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
+                    let Some(row) = rows[local_doc as usize] else {
+                        return;
+                    };
                     let row = row.get() as usize;
                     let slot_base = row * REORDER_TERMS_PER_DOC;
                     let used = filled[row] as usize;
@@ -2437,13 +2443,14 @@ impl SuperfileBuilder {
                             worst[row] = used as u8;
                         }
                         filled[row] = (used + 1) as u8;
-                        return Ok(());
+                        return;
                     }
                     let worst_slot = slot_base + worst[row] as usize;
                     if df[t as usize] >= df[slots[worst_slot] as usize] {
-                        return Ok(());
+                        return;
                     }
                     slots[worst_slot] = t;
+
                     // The worst moved; find it again over the fixed,
                     // small slot count.
                     let mut w = 0usize;
@@ -2453,7 +2460,6 @@ impl SuperfileBuilder {
                         }
                     }
                     worst[row] = w as u8;
-                    Ok(())
                 })
                 .map_err(|e| {
                     BuildError::Io(Error::other(format!(
@@ -2941,27 +2947,40 @@ impl SuperfileBuilder {
         // The reader decoded this footer when it opened; decoding the bytes
         // again would buy nothing.
         let src_kv = extract_kv_map(source.parquet_metadata()).map_err(BuildError::Footer)?;
-        // Bounds-checked: these come off a file's footer, so a truncated or
-        // hand-edited one must be refused rather than panic the slice below.
-        let region = |offset: &str, length: &str| -> Option<Range<usize>> {
-            let at: usize = src_kv.get(offset)?.parse().ok()?;
-            let len: usize = src_kv.get(length)?.parse().ok()?;
-            let end = at.checked_add(len)?;
-            (len > 0 && end <= bytes.len()).then_some(at..end)
+        // `None` only when the footer declares no such blob. A declared one
+        // that is partial, unparsable or out of bounds is refused: carrying
+        // it as absent would silently drop the blob from the output, and
+        // these come off a file's footer, so a truncated or hand-edited one
+        // must not panic the slice below either.
+        let region = |offset: &str, length: &str| -> Result<Option<Range<usize>>, BuildError> {
+            let malformed =
+                || BuildError::Io(Error::other(format!("carried footer: malformed {offset}")));
+            let (at, len) = match (src_kv.get(offset), src_kv.get(length)) {
+                (None, None) => return Ok(None),
+                (Some(at), Some(len)) => (at, len),
+                _ => return Err(malformed()),
+            };
+            let at: usize = at.parse().map_err(|_| malformed())?;
+            let len: usize = len.parse().map_err(|_| malformed())?;
+            let end = at
+                .checked_add(len)
+                .filter(|&end| end <= bytes.len())
+                .ok_or_else(malformed)?;
+            Ok((len > 0).then_some(at..end))
         };
         // Splice order is body, FTS, vector, ids — so the FTS blob starts
         // where the body ends.
-        let fts_region = region(kv::FTS_OFFSET, kv::FTS_LENGTH)
+        let fts_region = region(kv::FTS_OFFSET, kv::FTS_LENGTH)?
             .ok_or_else(|| BuildError::Io(Error::other("carried body needs an FTS region")))?;
         let body = bytes.slice(..fts_region.start);
-        let vec_bytes = region(kv::VEC_OFFSET, kv::VEC_LENGTH)
+        let vec_bytes = region(kv::VEC_OFFSET, kv::VEC_LENGTH)?
             .map(|r| bytes.slice(r))
             .unwrap_or_default();
 
         // The ids sidecar is derived from rows this build never decoded, so
         // it is carried too — re-packed when the source predates the packed
         // layout, which is the upgrade a rewrite is expected to perform.
-        let raw_ids = region(kv::IDS_OFFSET, kv::IDS_LENGTH).map(|r| bytes.slice(r));
+        let raw_ids = region(kv::IDS_OFFSET, kv::IDS_LENGTH)?.map(|r| bytes.slice(r));
         let ids_bytes: Vec<u8> = match (&raw_ids, source.id_sidecar_is_packed()) {
             (Some(ids), true) => ids.to_vec(),
             (Some(ids), false) => ids::encode_packed(ids),

@@ -863,6 +863,12 @@ pub mod kv {
     /// The [`IDS_LAYOUT`] value for the packed sidecar.
     pub const IDS_LAYOUT_PACKED: &str = "packed";
 
+    /// Keys locating a blob in the file. Only the splice that lays the
+    /// file out writes them, since only it knows where each blob landed.
+    pub const REGION_KEYS: [&str; 6] = [
+        FTS_OFFSET, FTS_LENGTH, VEC_OFFSET, VEC_LENGTH, IDS_OFFSET, IDS_LENGTH,
+    ];
+
     /// Sentinel value for the `inf.format` key.
     pub const FORMAT_VALUE: &str = "infino-superfile";
 

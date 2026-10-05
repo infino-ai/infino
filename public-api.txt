@@ -857,6 +857,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::ReindexOptions
 pub infino::ReindexReport::already_current: usize
 pub infino::ReindexReport::awaiting_reanalysis: usize
 pub infino::ReindexReport::held_by_another_run: usize
+pub infino::ReindexReport::inconsistent_footers: alloc::vec::Vec<uuid::Uuid>
 pub infino::ReindexReport::rewritten: usize
 pub infino::ReindexReport::unrepairable_columns: alloc::vec::Vec<alloc::string::String>
 impl core::clone::Clone for infino::ReindexReport
@@ -908,6 +909,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::SchemaPatch
 #[non_exhaustive] pub struct infino::StalenessReport
 pub infino::StalenessReport::awaiting_reanalysis: usize
 pub infino::StalenessReport::bytes_to_rewrite: u64
+pub infino::StalenessReport::inconsistent_footers: alloc::vec::Vec<uuid::Uuid>
 pub infino::StalenessReport::needing_rewrite: usize
 pub infino::StalenessReport::superfiles: usize
 pub infino::StalenessReport::unrepairable_columns: alloc::vec::Vec<alloc::string::String>

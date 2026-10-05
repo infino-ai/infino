@@ -669,6 +669,9 @@ pub struct ReindexReport {
     /// Columns whose text was never stored, so no repair can fix their terms;
     /// only re-ingesting them from source can.
     pub unrepairable_columns: Vec<String>,
+    /// Superfiles left untouched because their footer places a blob where
+    /// the file or its manifest entry contradicts; they need inspection.
+    pub inconsistent_footers: Vec<String>,
 }
 
 impl From<infino::ReindexReport> for ReindexReport {
@@ -679,6 +682,7 @@ impl From<infino::ReindexReport> for ReindexReport {
             awaiting_reanalysis: r.awaiting_reanalysis as i64,
             held_by_another_run: r.held_by_another_run as i64,
             unrepairable_columns: r.unrepairable_columns,
+            inconsistent_footers: ids_to_strings(&r.inconsistent_footers),
         }
     }
 }
@@ -697,6 +701,9 @@ pub struct StalenessReport {
     pub bytes_to_rewrite: i64,
     /// Columns no repair can fix, because their text was never stored.
     pub unrepairable_columns: Vec<String>,
+    /// Superfiles whose footer places a blob where the file or its manifest
+    /// entry contradicts. A reindex reports these and never rewrites them.
+    pub inconsistent_footers: Vec<String>,
     /// Whether a reindex would do nothing at all.
     pub is_current: bool,
 }
@@ -710,8 +717,14 @@ impl From<infino::StalenessReport> for StalenessReport {
             awaiting_reanalysis: r.awaiting_reanalysis as i64,
             bytes_to_rewrite: r.bytes_to_rewrite as i64,
             unrepairable_columns: r.unrepairable_columns,
+            inconsistent_footers: ids_to_strings(&r.inconsistent_footers),
         }
     }
+}
+
+/// Superfile ids as the strings the binding exposes them as.
+fn ids_to_strings(ids: &[impl ToString]) -> Vec<String> {
+    ids.iter().map(ToString::to_string).collect()
 }
 
 /// One superfile a `reindex` would repair, and how.
