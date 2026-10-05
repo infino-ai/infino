@@ -21,6 +21,7 @@ Supertable::delete	covered	(&self, Expr) -> Result<MutationStats, InfinoError>
 Supertable::exact_match	covered	(&self, &str, &str, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
 Supertable::gc	covered	(&self, Duration) -> Result<GcReport, GcError>
 Supertable::hybrid_search	covered	(&self, &str, &str, BoolMode, &str, &[f32], usize, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
+Supertable::hydrate	exempt	experimental SQL-only bulk-load; engine-only, not yet wrapped in bindings
 Supertable::index_staleness	covered	(&self, &ReindexOptions) -> Result<StalenessReport, ReindexError>
 Supertable::optimize	covered	(&self, &OptimizeOptions) -> Result<(), OptimizeError>
 Supertable::reindex	covered	(&self, &ReindexOptions) -> Result<ReindexReport, ReindexError>

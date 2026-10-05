@@ -343,6 +343,12 @@ hashbrown = "0.17.1"
 # lands; the public surface itself is guarded by `cargo-public-api`.
 infino-bench-utils = { path = "benches/utils" }
 
+# Read side of the Hydrate pilot test: decode a Parquet fixture to Arrow
+# batches. `parquet` is already a direct build dependency (a superfile is a
+# Parquet file), so this adds no new supply-chain surface; it is dev-only
+# because the engine never reads a foreign Parquet file outside that path yet.
+parquet = { version = "58", features = ["arrow"] }
+
 # `test-util` adds tokio's paused-clock test surface
 # (`start_paused`), which lets concurrency regression tests drive
 # sleep-based polling loops deterministically instead of racing real

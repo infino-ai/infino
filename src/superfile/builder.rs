@@ -2763,6 +2763,47 @@ impl SuperfileBuilder {
         Ok((buf, stats))
     }
 
+    /// Hydrate: build ONE no-blob superfile straight from Arrow batches whose
+    /// `_id` column is already prepended at index 0, streaming each batch
+    /// through [`ParquetBodyEncoder`] so the whole corpus is never held in RAM.
+    ///
+    /// This is the contrast to [`finish`](Self::finish), which buffers every
+    /// `add_batch` into `self.batches` and encodes the lot at the end (the
+    /// cost that makes a single large superfile slow to build). Here each batch
+    /// is written to the Parquet body and dropped, so peak memory is one batch
+    /// plus the running row-group, independent of the superfile size.
+    ///
+    /// `opts` must carry empty FTS and vector columns (no-blob). The assembled
+    /// superfile is streamed to `output`; the returned [`ParquetLayout`] gives
+    /// its size and blob offsets for manifest metadata.
+    ///
+    /// Isolated hydrate path: nothing in the normal append or compaction flow
+    /// calls this, so it cannot change existing ingest behaviour.
+    pub(crate) fn build_no_blob_from_batches_to<W: Write>(
+        opts: BuilderOptions,
+        batches: &[RecordBatch],
+        output: W,
+    ) -> Result<ParquetLayout, BuildError> {
+        let n_docs: u32 = batches.iter().map(|b| b.num_rows() as u32).sum();
+        let mut sb = SuperfileBuilder::new(opts)?;
+        let id_page_limit = [(sb.opts.id_column.as_str(), sb.opts.id_page_size_limit)];
+        let mut encoder = ParquetBodyEncoder::new(
+            &sb.opts.schema,
+            sb.opts.compression,
+            sb.opts.row_group_size,
+            &id_page_limit,
+        )?;
+        for batch in batches {
+            encoder.write_batch(batch)?;
+        }
+        let ids = stable_id_sidecar_bytes(batches, &sb.opts.id_column);
+        let body = encoder.finish()?;
+        // `finish_to_with_body` writes `self.next_local_doc_id` as the doc count
+        // and emits empty FTS/vector blobs because `opts` has none.
+        sb.next_local_doc_id = n_docs;
+        sb.finish_to_with_body(body, &ids, output)
+    }
+
     /// Consume the builder and emit one self-contained superfile.
     ///
     /// If no `add_batch` calls have landed any rows, returns an
@@ -3778,6 +3819,45 @@ mod tests {
             vec![FtsConfig::new("title")],
             vec![],
         )
+    }
+
+    /// Hydrate build path: stream Arrow batches (with `_id` prepended) straight
+    /// into one no-blob superfile and read it back. Proves the isolated
+    /// `build_no_blob_from_batches_to` produces a valid, queryable superfile
+    /// with empty FTS/vector blobs, without going through `add_batch`/`finish`.
+    #[test]
+    fn hydrate_build_no_blob_from_batches_reads_back() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Decimal128(38, 0), false),
+            Field::new("n", DataType::Int64, false),
+            Field::new("s", DataType::LargeUtf8, false),
+        ]));
+        let n: i64 = 1000;
+        let ids = Decimal128Array::from((0..n as i128).collect::<Vec<_>>())
+            .with_precision_and_scale(38, 0)
+            .expect("decimal precision/scale");
+        let nums = Int64Array::from((0..n).collect::<Vec<_>>());
+        let strs = LargeStringArray::from((0..n).map(|i| format!("r{i}")).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(nums), Arc::new(strs)],
+        )
+        .expect("valid batch");
+
+        let opts = BuilderOptions::new(schema, "_id", vec![], vec![]);
+        let mut buf = Vec::new();
+        let layout = SuperfileBuilder::build_no_blob_from_batches_to(
+            opts,
+            std::slice::from_ref(&batch),
+            &mut buf,
+        )
+        .expect("hydrate build");
+        assert!(layout.total_size > 0, "wrote a non-empty superfile");
+        assert_eq!(layout.fts_length, 0, "no-blob: empty fts");
+        assert_eq!(layout.vec_length, 0, "no-blob: empty vector");
+
+        let reader = SuperfileReader::open(Bytes::from(buf)).expect("open hydrated superfile");
+        assert_eq!(reader.n_docs(), n as u64, "all rows present");
     }
 
     /// User column names may not contain the FST separator byte or the

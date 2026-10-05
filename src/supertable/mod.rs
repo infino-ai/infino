@@ -28,6 +28,7 @@ pub mod error;
 pub(crate) mod gc;
 pub mod handle;
 pub(crate) mod hidden_deleted;
+pub(crate) mod hydrate;
 pub mod lazy_source;
 pub mod manifest;
 pub mod mutations;

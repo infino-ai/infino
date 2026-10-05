@@ -329,6 +329,19 @@ impl Table for RemoteTable {
         Err(OptimizeError::NoStorage)
     }
 
+    fn hydrate(
+        &self,
+        _batches: &mut dyn Iterator<Item = RecordBatch>,
+        _target_rows: usize,
+    ) -> Result<usize, InfinoError> {
+        // Hydrate writes superfiles and commits the manifest directly, which
+        // needs the storage backend and the writer slot the hosted side owns,
+        // not a client. Deliberately not exposed over the remote transport.
+        Err(InfinoError::Backend(
+            "hydrate is not supported over the remote transport".to_string(),
+        ))
+    }
+
     fn reindex(&self, _opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
         // A reindex rewrites committed superfiles in place, which is the
         // hosted side's job for the same reason compaction is: it needs the

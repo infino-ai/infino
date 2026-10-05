@@ -88,6 +88,11 @@ pub(crate) trait Table: Send + Sync {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError>;
+    fn hydrate(
+        &self,
+        batches: &mut dyn Iterator<Item = RecordBatch>,
+        target_rows: usize,
+    ) -> Result<usize, InfinoError>;
     fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError>;
     fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError>;
     fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError>;
@@ -198,6 +203,17 @@ impl Table for SupertableHandle {
     }
     fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
         SupertableHandle::optimize(self, opts)
+    }
+    fn hydrate(
+        &self,
+        batches: &mut dyn Iterator<Item = RecordBatch>,
+        target_rows: usize,
+    ) -> Result<usize, InfinoError> {
+        Ok(crate::supertable::hydrate::hydrate_from_batches(
+            self,
+            batches,
+            target_rows,
+        )?)
     }
     fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
         SupertableHandle::reindex(self, opts)
@@ -510,6 +526,23 @@ impl Supertable {
     /// Optimize (compact) the table.
     pub fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
         self.inner.optimize(opts)
+    }
+
+    /// Bulk-load `batches` (schema == the table's user schema) into a small,
+    /// bounded number of large superfiles committed in one shot, with no
+    /// optimize pass. `target_rows` targets the number of rows per superfile.
+    /// Returns the number of rows committed.
+    ///
+    /// This is the fast path for loading data already in columnar form that is
+    /// queried with SQL only: it skips the per-append superfiles and the
+    /// compaction pass that `append` + `optimize` would otherwise produce.
+    /// Hosted (remote) tables return an error.
+    pub fn hydrate(
+        &self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+        target_rows: usize,
+    ) -> Result<usize, InfinoError> {
+        self.inner.hydrate(&mut batches.into_iter(), target_rows)
     }
 
     /// Rewrite every superfile whose full-text index is behind the format
