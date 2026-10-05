@@ -13,6 +13,9 @@ cd "$(dirname "$0")"
 tables="$PWD/tables"
 
 # shape : generator directory : expected FTS blob version : profile (optional)
+#
+# A `reindex=<shape>` profile copies that already-generated shape and has
+# the generator reindex the copy, for shapes only a repair writes.
 shapes=(
   "v1_positionless:v0_1_5:1"
   "v2_positions_region:v0_5_4:2"
@@ -21,6 +24,7 @@ shapes=(
   "v5_positional:v0_8_2:5"
   "v6_positional:v0_8_3:6"
   "v6_with_vectors:v0_8_3:6:vectors"
+  "v7_reindexed_vectors:v0_9_0:7:reindex=v6_with_vectors"
 )
 
 wanted=("$@")
@@ -35,8 +39,18 @@ for entry in "${shapes[@]}"; do
   ( cd "generators/$gen" && cargo build --release --quiet )
 
   rm -rf "${tables:?}/$shape"
-  mkdir -p "$tables/$shape"
-  "$bin" "$tables/$shape" corpus ${profile:+"$profile"} >/dev/null
+  if [[ "$profile" == reindex=* ]]; then
+    source_shape="${profile#reindex=}"
+    if [ ! -d "$tables/$source_shape" ]; then
+      echo "$shape reindexes $source_shape, which has not been generated" >&2
+      exit 1
+    fi
+    cp -R "$tables/$source_shape" "$tables/$shape"
+    "$bin" "$tables/$shape" corpus >/dev/null
+  else
+    mkdir -p "$tables/$shape"
+    "$bin" "$tables/$shape" corpus ${profile:+"$profile"} >/dev/null
+  fi
 
   # The shape is content-dependent, not just a property of the writer: a
   # corpus too sparse to produce a dense block, or too small for a
