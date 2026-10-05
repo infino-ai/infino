@@ -14,7 +14,7 @@
 //! maturin — it consumes the core crate's curated public API only (no
 //! `test-helpers`), so it is also a public-surface consumer test.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ use pyo3::exceptions::{
     PyException, PyKeyError, PyNotImplementedError, PyRuntimeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyDict, PyList};
 
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
@@ -861,7 +861,7 @@ impl Table {
     /// refused. Durable when this returns — one `append` == one commit ==
     /// one sealed superfile, so batch rows per call.
     fn append(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        match append_input(py, data)? {
+        match append_input(py, data, &self.schema(py)?)? {
             // Append commits a superfile to storage — release the GIL. The
             // engine brings the batch to the table's shape: a column it does
             // not have joins the schema, an absent nullable one is null-filled.
@@ -884,7 +884,7 @@ impl Table {
         data: &Bound<'_, PyAny>,
         source_name: &str,
     ) -> PyResult<()> {
-        match append_input(py, data)? {
+        match append_input(py, data, &self.schema(py)?)? {
             AppendInput::Batch(batch) => py
                 .detach(|| self.inner.append_named(&batch, source_name))
                 .map_err(py_err),
@@ -1256,7 +1256,7 @@ impl Table {
     ) -> PyResult<MutationStats> {
         // Empty input goes through rather than short-circuiting like
         // `append` does — we want the engine's cardinality check to run.
-        let input = append_input(py, new_rows)?;
+        let input = append_input(py, new_rows, &self.schema(py)?)?;
         // Parse and mutate both off the GIL — neither touches Python.
         let stats = py.detach(|| {
             let expr = self.parse_predicate(predicate)?;
@@ -1472,7 +1472,11 @@ enum AppendInput {
 /// Python's `json` module, so a Python `5` arrives as an integer literal
 /// and a `5.0` as a float literal, and the engine's number rule sees the
 /// literal the caller wrote.
-fn append_input(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<AppendInput> {
+fn append_input(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    schema: &Bound<'_, PyAny>,
+) -> PyResult<AppendInput> {
     let pa = py.import("pyarrow")?;
     let table_cls = pa.getattr("Table")?;
     let record_batch_cls = pa.getattr("RecordBatch")?;
@@ -1508,22 +1512,112 @@ fn append_input(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<AppendInput
             }
         });
     }
-    // A list of dicts, or anything with `to_dict("records")` (a DataFrame).
-    let records = if data.is_instance_of::<PyList>() {
-        data.clone()
-    } else {
+    // A list of dicts, or a DataFrame. The document path is the contract and
+    // stays the default: nested dicts flatten to dot paths, a new key adds a
+    // column typed from its values, and a value disagreeing with a column's
+    // type is refused.
+    //
+    // It cannot carry what JSON has no spelling for. `json.dumps` raises on
+    // bytes, `Decimal`, `datetime` and numpy scalars, and the engine's mapper
+    // has no arm for binary or decimal, so a `Binary` or `Decimal128` column
+    // the caller declared was unwritable from a list of dicts. Those rows go
+    // through pyarrow instead, typed by inference and cast to the columns the
+    // table declares, which is the only route that carries them.
+    let is_frame = !data.is_instance_of::<PyList>();
+    let records = if is_frame {
         data.call_method1("to_dict", ("records",))?
-    };
-    let text: String = py
-        .import("json")?
-        .call_method1("dumps", (records,))?
-        .extract()?;
-    let rows: Vec<serde_json::Value> =
-        serde_json::from_str(&text).map_err(|e| PyValueError::new_err(format!("rows: {e}")))?;
-    Ok(if rows.is_empty() {
-        AppendInput::Empty
     } else {
-        AppendInput::Rows(rows)
+        data.clone()
+    };
+    match py.import("json")?.call_method1("dumps", (&records,)) {
+        Ok(text) => {
+            let text: String = text.extract()?;
+            let rows: Vec<serde_json::Value> = serde_json::from_str(&text)
+                .map_err(|e| PyValueError::new_err(format!("rows: {e}")))?;
+            Ok(if rows.is_empty() {
+                AppendInput::Empty
+            } else {
+                AppendInput::Rows(rows)
+            })
+        }
+        Err(_) => typed_batch_input(py, data, schema, is_frame, &table_cls),
+    }
+}
+
+/// Rows carrying values JSON cannot spell, as one batch typed by the table's
+/// own columns.
+///
+/// Every column's type comes from the schema; the binding decides none of
+/// them. pyarrow's inference is a step on the way and never the answer: the
+/// batch is immediately cast to the declared types, so a `string` lands in a
+/// `LargeUtf8` column, and the cast is `safe`, so a value that would be
+/// truncated is refused rather than quietly changed.
+///
+/// A column the table does not declare is refused. Inventing a type for it
+/// here would mean the binding choosing by pyarrow's rules what the engine
+/// chooses by its own on the document path, so the same value could become
+/// different columns depending on which route it took. A new column has to
+/// arrive as something the document path can carry, or be declared first.
+fn typed_batch_input(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    schema: &Bound<'_, PyAny>,
+    is_frame: bool,
+    table_cls: &Bound<'_, PyAny>,
+) -> PyResult<AppendInput> {
+    let pa_table = if is_frame {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("preserve_index", false)?;
+        table_cls.call_method("from_pandas", (data,), Some(&kwargs))?
+    } else {
+        table_cls.call_method1("from_pylist", (data,))?
+    };
+
+    // Target types: the table's for a column it has, the inferred one
+    // otherwise, in the batch's own column order as `cast` requires.
+    let declared: HashSet<String> = schema
+        .getattr("names")?
+        .try_iter()?
+        .map(|n| n?.extract::<String>())
+        .collect::<PyResult<_>>()?;
+    let inferred = pa_table.getattr("schema")?;
+    let fields = PyList::empty(py);
+    for name in inferred.getattr("names")?.try_iter()? {
+        let name: String = name?.extract()?;
+        if !declared.contains(&name) {
+            return Err(PyValueError::new_err(format!(
+                "column `{name}` is new and the row carries a value no document can \
+                 spell; add the column with a schema write first, or send a value \
+                 the document path carries"
+            )));
+        }
+        fields.append(schema.call_method1("field", (&name,))?)?;
+    }
+    let target = py.import("pyarrow")?.call_method1("schema", (fields,))?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("safe", true)?;
+    let pa_table = pa_table
+        .call_method("cast", (target,), Some(&kwargs))
+        .map_err(|e| PyValueError::new_err(format!("rows: {e}")))?;
+
+    let batches = pa_table
+        .call_method0("combine_chunks")?
+        .call_method0("to_batches")?;
+    let batches = batches.cast::<PyList>()?;
+    let mut rust_batches = Vec::with_capacity(batches.len());
+    for batch in batches.iter() {
+        rust_batches.push(RecordBatch::from_pyarrow_bound(&batch)?);
+    }
+    Ok(match rust_batches.len() {
+        0 => AppendInput::Empty,
+        1 => AppendInput::Batch(rust_batches.remove(0)),
+        _ => {
+            let merged_schema = rust_batches[0].schema();
+            AppendInput::Batch(
+                concat_batches(&merged_schema, &rust_batches)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            )
+        }
     })
 }
 

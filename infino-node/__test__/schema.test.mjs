@@ -8,7 +8,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { connect, IndexSpec } from "../infino/index.js";
-import { Schema, Field, LargeUtf8, Int64, FixedSizeList, Float32, Table, tableToIPC, vectorFromArray } from "apache-arrow";
+import { Schema, Field, LargeUtf8, Int64, Binary, FixedSizeList, Float32, Table, tableToIPC, vectorFromArray } from "apache-arrow";
 
 const titleSchema = () => new Schema([new Field("title", new LargeUtf8(), false)]);
 const names = (doc) => doc.fields.map((f) => [f.name, f.id]);
@@ -104,4 +104,23 @@ test("a vector table's document reads back as a no-op", () => {
   const after = db.schema("vecs", doc);
   assert.equal(after.schema_id, doc.schema_id);
   assert.equal(after.fields.find((f) => f.name === "emb").index.rot_seed, emb.index.rot_seed);
+});
+
+// A Buffer stringifies to `{"type":"Buffer","data":[...]}` and a Date to a
+// string, so neither throws on the document path and neither arrives as what
+// it was. They are refused with the route that carries them, rather than
+// written as whatever JSON made of them. Ordinary rows are untouched.
+test("a row value JSON cannot spell is refused, not silently converted", () => {
+  const db = connect("memory://");
+  const t = db.createTable("docs", titleSchema(), new IndexSpec());
+
+  assert.throws(
+    () => t.append([{ title: "a", payload: Buffer.from([0, 1, 2]) }]),
+    /Buffer has no document form/,
+  );
+  assert.throws(() => t.append([{ title: "a", seen: new Date() }]), /Date has no document form/);
+
+  // Ordinary rows still take the document path and still grow the schema.
+  t.append([{ title: "b", extra: 7 }]);
+  assert.ok(db.schema("docs").fields.some((f) => f.name === "extra"));
 });

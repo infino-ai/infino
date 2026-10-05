@@ -54,3 +54,59 @@ def test_documents_grow_the_schema_and_disagreements_are_refused():
         {"title": "a", "n": 1, "extra": None},
         {"title": "c", "n": None, "extra": True},
     ]
+
+
+def test_declared_columns_keep_the_types_json_cannot_carry():
+    """Rows that stay inside the declared schema are typed by that schema.
+
+    `json.dumps` raises on bytes, Decimal and datetime, and the engine's own
+    document mapper has no arm for binary or decimal, so routing every
+    list[dict] through JSON lost column types the table had declared. Rows
+    naming only declared columns go through pyarrow instead, which carries
+    them.
+    """
+    import datetime
+    import decimal
+
+    db = infino.connect("memory://")
+    schema = pa.schema(
+        [
+            pa.field("title", pa.large_utf8(), nullable=False),
+            pa.field("payload", pa.binary(), nullable=True),
+            pa.field("price", pa.decimal128(12, 2), nullable=True),
+            pa.field("seen", pa.timestamp("ms"), nullable=True),
+        ]
+    )
+    t = db.create_table("docs", schema, infino.IndexSpec())
+    t.append(
+        [
+            {
+                "title": "a",
+                "payload": b"\x00\x01",
+                "price": decimal.Decimal("12.34"),
+                "seen": datetime.datetime(2026, 1, 2, 3, 4, 5),
+            }
+        ]
+    )
+
+    out = db.query_sql('SELECT payload, price, seen FROM docs').to_pylist()
+    assert out[0]["payload"] == b"\x00\x01"
+    assert out[0]["price"] == decimal.Decimal("12.34")
+    assert out[0]["seen"] == datetime.datetime(2026, 1, 2, 3, 4, 5)
+
+    # A row naming a column the table does not have still grows the schema,
+    # through the document path.
+    t.append([{"title": "b", "extra": 7}])
+    names = [f["name"] for f in db.schema("docs")["fields"]]
+    assert "extra" in names
+
+    # But a new column cannot arrive carrying a value no document can spell:
+    # the binding would have to invent its type, and by pyarrow's rules
+    # rather than the engine's. Declare it first.
+    with pytest.raises(ValueError, match="is new"):
+        t.append([{"title": "c", "blob": b"\x09"}])
+
+    # And a declared column still refuses a value that would be truncated,
+    # rather than quietly changing it.
+    with pytest.raises(ValueError, match="(?i)data loss|truncat"):
+        t.append([{"title": "d", "price": decimal.Decimal("1.234"), "payload": b"\x01"}])

@@ -401,10 +401,35 @@ function rowsToJson(rows: RowRecord[]): string {
   return text.replace(/\{"\$infino\$bigint":"(-?\d+)"\}/g, "$1");
 }
 
+// Values JSON has no faithful spelling for. A `Buffer` stringifies to
+// `{"type":"Buffer","data":[...]}` and a `Date` to a string, so neither
+// throws on the document path and neither arrives as what it was. Rows
+// carrying them are refused with the route that does carry them, rather
+// than written as the object or the string JSON turned them into.
+function unspellableValue(rows: RowRecord[]): string | undefined {
+  for (const row of rows) {
+    for (const value of Object.values(row as Record<string, unknown>)) {
+      if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) return "a Buffer";
+      if (value instanceof Uint8Array) return "a Uint8Array";
+      if (value instanceof Date) return "a Date";
+    }
+  }
+  return undefined;
+}
+
 function writeInput(data: AppendData): WriteInput {
   if (Buffer.isBuffer(data)) return { ipc: data };
   if (data instanceof Uint8Array) return { ipc: Buffer.from(data) };
-  if (Array.isArray(data)) return { rows: rowsToJson(data) };
+  if (Array.isArray(data)) {
+    const unspellable = unspellableValue(data);
+    if (unspellable) {
+      throw new TypeError(
+        `append: ${unspellable} has no document form and would be written as what JSON ` +
+          "turned it into; pass an apache-arrow Table or RecordBatch to keep its type",
+      );
+    }
+    return { rows: rowsToJson(data) };
+  }
   const d = data as any;
   if (d && (Array.isArray(d.batches) || (d.schema && typeof d.numRows === "number"))) {
     const rows = Array.from(d).map((r: any) => r.toJSON() as RowRecord);
