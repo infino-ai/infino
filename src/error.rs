@@ -372,11 +372,13 @@ impl From<SuperfileBuildError> for InfinoError {
             | SuperfileBuildError::VectorCountMismatch { .. }
             | SuperfileBuildError::WrongRowShape { .. }
             | SuperfileBuildError::BatchSchemaMismatch { .. }
-            | SuperfileBuildError::BatchReadError
             | SuperfileBuildError::FtsColumnMissing(_) => InfinoError::Schema,
             SuperfileBuildError::UnknownAnalyzer { .. } => InfinoError::Config,
             SuperfileBuildError::VectorRerankCodecUnimplemented { .. } => InfinoError::Unsupported,
+            // Decoding a superfile we wrote, a missing internal builder or an
+            // empty merge input: never the caller's batch.
             SuperfileBuildError::VectorReadError
+            | SuperfileBuildError::BatchReadError
             | SuperfileBuildError::Io(_)
             | SuperfileBuildError::Footer(_) => InfinoError::Backend,
         };
@@ -630,7 +632,11 @@ mod tests {
             column: "emb".into(),
             codec: "pq",
         };
-        let cases: [(InfinoError, fn(&InfinoError) -> bool); 8] = [
+        let cases: [(InfinoError, fn(&InfinoError) -> bool); 9] = [
+            (
+                InfinoError::from(SuperfileBuildError::BatchReadError),
+                |e| matches!(e, InfinoError::Backend(_)),
+            ),
             (
                 InfinoError::from(SupertableBuildError::Store(
                     "term-stats write timed out".into(),

@@ -362,16 +362,16 @@ impl ColumnNorms {
 /// The one empty table a failed read scores against, shared by every
 /// column in the process: it belongs to no column, so it is never put in a
 /// column's cell, which stays empty for the next read to fill.
+fn empty_norms() -> &'static ColumnNorms {
+    static EMPTY: OnceLock<ColumnNorms> = OnceLock::new();
+    EMPTY.get_or_init(ColumnNorms::empty)
+}
+
 /// The norm table a merge that never scores is handed: its sink never asks
 /// for a score, so the table is never indexed, and passing this one keeps an
 /// unranked match from reading the column's length array for nothing.
 pub(super) fn unscored_norm_table() -> &'static NormTable {
     &empty_norms().dl_norm_k1
-}
-
-fn empty_norms() -> &'static ColumnNorms {
-    static EMPTY: OnceLock<ColumnNorms> = OnceLock::new();
-    EMPTY.get_or_init(ColumnNorms::empty)
 }
 
 impl ColumnNorms {
