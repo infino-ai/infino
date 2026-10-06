@@ -1191,10 +1191,9 @@ impl FtsReader {
             .source
             .range_async(col.array_with_crc_range())
             .await
-            .map_err(|e| {
-                FtsError::Read(ReadError::MalformedVersion(format!(
-                    "fts/doc_lengths_array range fetch failed: {e}"
-                )))
+            .map_err(|e| FtsError::RangeFetch {
+                what: "fts/doc_lengths_array",
+                source: e,
             })?;
         col.check_array_crc(&array)?;
         let norms = col.norms_from_array(&array[..col.array_len()]);
@@ -1211,10 +1210,9 @@ impl FtsReader {
         self.source
             .range_async(self.fst_range.clone())
             .await
-            .map_err(|e| {
-                FtsError::Read(ReadError::MalformedVersion(format!(
-                    "fts/dict range fetch failed: {e}"
-                )))
+            .map_err(|e| FtsError::RangeFetch {
+                what: "fts/dict",
+                source: e,
             })
     }
 
@@ -1308,10 +1306,9 @@ impl FtsReader {
             .source
             .get_ranges_parallel_async(plan.fetch_ranges())
             .await
-            .map_err(|e| {
-                FtsError::Read(ReadError::MalformedVersion(format!(
-                    "fts/postings term body range fetch failed: {e}"
-                )))
+            .map_err(|e| FtsError::RangeFetch {
+                what: "fts/postings term body",
+                source: e,
             })?;
         Ok(plan.restore(&fetched))
     }
@@ -1348,10 +1345,9 @@ impl FtsReader {
         self.source
             .get_ranges_parallel_async(&ranges)
             .await
-            .map_err(|e| {
-                FtsError::Read(ReadError::MalformedVersion(format!(
-                    "fts/positions term range fetch failed: {e}"
-                )))
+            .map_err(|e| FtsError::RangeFetch {
+                what: "fts/positions term",
+                source: e,
             })
     }
 
@@ -2026,28 +2022,22 @@ pub(super) fn top_k(scores: FxHashMap<RowId, f32>, k: usize) -> Vec<(RowId, f32)
 pub(super) fn fetch_source_range(
     source: &Source,
     range: Range<usize>,
-    what: &str,
+    what: &'static str,
 ) -> Result<Bytes, FtsError> {
-    source.get_range(range).map_err(|e| {
-        FtsError::Read(ReadError::MalformedVersion(format!(
-            "{what} lazy source range fetch failed: {e}"
-        )))
-    })
+    source
+        .get_range(range)
+        .map_err(|e| FtsError::RangeFetch { what, source: e })
 }
 
 async fn fetch_lazy_range(
     source: &dyn LazyByteSource,
     range: Range<usize>,
-    what: &str,
+    what: &'static str,
 ) -> Result<Bytes, FtsError> {
     source
         .range(range.start as u64, range.len() as u64)
         .await
-        .map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "{what} lazy source range fetch failed: {e}"
-            )))
-        })
+        .map_err(|e| FtsError::RangeFetch { what, source: e })
 }
 
 #[inline]

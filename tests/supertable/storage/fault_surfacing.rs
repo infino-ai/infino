@@ -17,7 +17,7 @@
 use std::{sync::Arc, time::Duration};
 
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use datafusion::prelude::{col, lit};
 use infino::{
@@ -61,6 +61,9 @@ const OPTIMIZE_FAULT_COMMITS: usize = 3;
 
 /// Top-k for the recovery searches; above corpus size.
 const FTS_TOP_K: usize = 8;
+/// Rows in the ranged-read fixture: enough that its superfile outgrows the
+/// tail the manifest carries inline, so a query reads the file by range.
+const RANGED_READ_ROWS: usize = 4_000;
 /// Generous rule budget for fanout paths (cold search issues many range
 /// GETs); large enough that every fetch of the failing phase hits it.
 const FANOUT_FAULTS: usize = 1024;
@@ -100,13 +103,47 @@ fn faulted_vector_table() -> (Supertable, RecordBatch, Arc<FaultStorage>, TempDi
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let faults = FaultStorage::wrap(local);
     let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+    let options = vector_table_options(storage);
+    let batch = vector_batch(&options.schema, VECTOR_ROWS);
+    let st = Supertable::create(options).expect("create");
+    (st, batch, faults, dir)
+}
 
+/// `rows` rows for the [`faulted_vector_table`]: titles `vec row000`.., and
+/// vectors planted in two directions, half each.
+fn vector_batch(schema: &SchemaRef, rows: usize) -> RecordBatch {
+    let titles: Vec<String> = (0..rows).map(|i| format!("vec row{i:03}")).collect();
+    let mut flat = vec![0.0f32; rows * VECTOR_DIM];
+    for row in 0..rows {
+        flat[row * VECTOR_DIM + usize::from(row >= rows / 2)] = 1.0;
+    }
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let fsl = FixedSizeListArray::try_new(
+        item,
+        VECTOR_DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(LargeStringArray::from(titles)) as ArrayRef,
+            Arc::new(fsl),
+        ],
+    )
+    .expect("batch")
+}
+
+/// The [`faulted_vector_table`]'s options over `storage`: called again to
+/// reopen the table, since options are built per handle.
+fn vector_table_options(storage: Arc<dyn StorageProvider>) -> SupertableOptions {
     let item = Arc::new(Field::new("item", DataType::Float32, true));
     let schema = Arc::new(Schema::new(vec![
         Field::new("title", DataType::LargeUtf8, false),
         Field::new(
             "emb",
-            DataType::FixedSizeList(Arc::clone(&item), VECTOR_DIM as i32),
+            DataType::FixedSizeList(item, VECTOR_DIM as i32),
             false,
         ),
     ]));
@@ -116,38 +153,14 @@ fn faulted_vector_table() -> (Supertable, RecordBatch, Arc<FaultStorage>, TempDi
             .build()
             .expect("rayon pool"),
     );
-    let options = SupertableOptions::new(
-        Arc::clone(&schema),
+    SupertableOptions::new(
+        schema,
         vec![FtsConfig::new("title")],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
     )
     .expect("valid options")
     .with_writer_pool(pool)
-    .with_storage(storage);
-
-    let titles: Vec<String> = (0..VECTOR_ROWS).map(|i| format!("vec row{i:03}")).collect();
-    let mut flat = vec![0.0f32; VECTOR_ROWS * VECTOR_DIM];
-    for row in 0..VECTOR_ROWS {
-        flat[row * VECTOR_DIM + usize::from(row >= VECTOR_ROWS / 2)] = 1.0;
-    }
-    let fsl = FixedSizeListArray::try_new(
-        item,
-        VECTOR_DIM as i32,
-        Arc::new(Float32Array::from(flat)) as ArrayRef,
-        None,
-    )
-    .expect("FSL");
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(LargeStringArray::from(titles)) as ArrayRef,
-            Arc::new(fsl),
-        ],
-    )
-    .expect("batch");
-
-    let st = Supertable::create(options).expect("create");
-    (st, batch, faults, dir)
+    .with_storage(storage)
 }
 
 #[test]
@@ -708,4 +721,87 @@ fn delete_losing_the_sidecar_cas_surfaces_a_retryable_conflict() {
         .delete(col("title").eq(lit("first commit alpha")))
         .expect("the reissued delete succeeds once contention clears");
     assert_eq!(stats.n_tombstoned(), 1);
+}
+
+/// A ranged read refused for the credentials in use. The superfile is past
+/// the tail the manifest carries inline, and the cache starts empty, so each
+/// query reads it by range and has to answer `PermissionDenied` (fix the
+/// credentials), not a retryable `Io`. The FTS and vector readers are the
+/// paths that once turned the error into text; the SQL scan, which reads
+/// through an object store that kept it typed, guards that it stays so.
+#[test]
+fn a_refused_credential_on_a_ranged_read_surfaces_as_permission_denied() {
+    let (st, _, faults, _dir) = faulted_vector_table();
+    let mut w = st.writer().expect("writer");
+    w.append(&vector_batch(&st.schema(), RANGED_READ_ROWS))
+        .expect("append");
+    w.commit().expect("commit");
+    drop(w);
+    drop(st);
+
+    faults.fail_with(
+        FaultKind::PermissionDenied,
+        FaultOp::GetRange,
+        "data/",
+        FANOUT_FAULTS,
+    );
+    let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let st = Supertable::open(
+        vector_table_options(storage)
+            .with_disk_cache(cache)
+            .with_cache_prepopulation(false),
+    )
+    .expect("open reads only the manifest");
+
+    let mut q_vec = vec![0.0f32; VECTOR_DIM];
+    q_vec[0] = 1.0;
+    let projection = Some(&["title"][..]);
+    let reader = st.reader().expect("reader");
+
+    let fired = faults.fired();
+    let bm25 = st
+        .bm25_search("title", "row001", FTS_TOP_K, Default::default(), projection)
+        .map(drop);
+    assert_refused_ranged_read("bm25_search", bm25, &faults, fired);
+
+    let fired = faults.fired();
+    let vector = st
+        .vector_search(
+            "emb",
+            &q_vec,
+            FTS_TOP_K,
+            Default::default(),
+            None,
+            projection,
+        )
+        .map(drop);
+    assert_refused_ranged_read("vector_search", vector, &faults, fired);
+
+    let fired = faults.fired();
+    let scan = reader
+        .query_sql("SELECT title FROM supertable")
+        .map(drop)
+        .map_err(InfinoError::from);
+    assert_refused_ranged_read("SQL scan", scan, &faults, fired);
+}
+
+/// `query` reached a ranged read (a fault fired past `fired_before`) and
+/// answered `PermissionDenied`.
+fn assert_refused_ranged_read(
+    query: &str,
+    result: Result<(), InfinoError>,
+    faults: &FaultStorage,
+    fired_before: usize,
+) {
+    let err = result.expect_err("every ranged read of the superfile is refused");
+    assert!(
+        faults.fired() > fired_before,
+        "{query}: never reached a ranged read"
+    );
+    assert!(
+        matches!(err, InfinoError::PermissionDenied(_)),
+        "{query}: got {err:?}"
+    );
 }

@@ -390,6 +390,10 @@ pub(crate) struct BuiltSegment {
 /// shape, so a change to what this writes reaches existing tables only if
 /// it also bumps `ROOT_FORMAT_VERSION`: an old root then fails to load and
 /// is rebuilt.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(skip_all, fields(inputs = contributions.len()))
+)]
 pub(crate) fn build(
     contributions: &[Contribution],
     policy: &BuildPolicy,

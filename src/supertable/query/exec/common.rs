@@ -1202,7 +1202,7 @@ impl AsyncFileReader for ByteSourceAsyncReader {
             source
                 .range_async(range)
                 .await
-                .map_err(|error| ParquetError::General(error.to_string()))
+                .map_err(|error| ParquetError::External(Box::new(error)))
         }
         .boxed()
     }
@@ -1223,7 +1223,7 @@ impl AsyncFileReader for ByteSourceAsyncReader {
             source
                 .get_ranges_parallel_async(&ranges)
                 .await
-                .map_err(|error| ParquetError::General(error.to_string()))
+                .map_err(|error| ParquetError::External(Box::new(error)))
         }
         .boxed()
     }

@@ -175,6 +175,10 @@ pub(crate) async fn write_root(
 }
 
 /// Persist every slice of a build; idempotent by content hash.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(skip_all, fields(slices = slices.len()))
+)]
 async fn write_slices(
     storage: &dyn StorageProvider,
     slices: Vec<(ContentHash, Vec<u8>)>,

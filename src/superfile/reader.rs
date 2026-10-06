@@ -233,7 +233,7 @@ impl MetadataFetch for &mut LazyMetadataFetch {
             source
                 .range(range.start, len)
                 .await
-                .map_err(|error| ParquetError::General(error.to_string()))
+                .map_err(|error| ParquetError::External(Box::new(error)))
         }
         .boxed()
     }
@@ -2432,11 +2432,11 @@ impl fmt::Display for SuperfileSizeBreakdown {
 }
 
 /// An FTS read error surfaced by the size report is a read error of the
-/// file it was read from.
+/// file it was read from; any other FTS error stays typed under it.
 fn fts_reader_error_to_read(e: FtsError) -> ReadError {
     match e {
         FtsError::Read(r) => r,
-        other => ReadError::MalformedVersion(other.to_string()),
+        other => ReadError::Fts(Box::new(other)),
     }
 }
 
