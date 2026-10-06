@@ -385,6 +385,11 @@ pub(crate) struct BuiltSegment {
 }
 
 /// Merge contributions into a base root: one segment, ordinals from zero.
+///
+/// Optimize skips the rebuild when the current index already has this
+/// shape, so a change to what this writes reaches existing tables only if
+/// it also bumps `ROOT_FORMAT_VERSION`: an old root then fails to load and
+/// is rebuilt.
 pub(crate) fn build(
     contributions: &[Contribution],
     policy: &BuildPolicy,

@@ -35,7 +35,7 @@
 
 use std::{
     collections::HashMap,
-    env, fmt,
+    env, fmt, fs,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -204,6 +204,15 @@ pub fn global() -> &'static Config {
             Config::default()
         }
     })
+}
+
+/// Resolve the root used for temporary scratch space.
+pub(crate) fn scratch_root() -> PathBuf {
+    global()
+        .storage
+        .scratch_root
+        .clone()
+        .unwrap_or_else(env::temp_dir)
 }
 
 /// Supertable subsection of [`Config`]. Keeps supertable-
@@ -1283,6 +1292,8 @@ pub struct StorageSettings {
     pub backend: StorageBackend,
     /// Local filesystem root when `backend: local_fs`.
     pub local_root: Option<PathBuf>,
+    /// Configurable root directory for temporary scratch files.
+    pub scratch_root: Option<PathBuf>,
     /// Object-store bucket name (used by the `s3` backend).
     pub bucket: Option<String>,
     /// Credentials/tuning for the backend, keyed by `object_store`
@@ -1337,6 +1348,7 @@ impl Default for StorageSettings {
         Self {
             backend: StorageBackend::None,
             local_root: None,
+            scratch_root: None,
             bucket: None,
             storage_options: HashMap::new(),
             prefix: String::new(),
@@ -1613,6 +1625,13 @@ impl Config {
     /// load time so a bad config fails fast with a clear message instead of
     /// panicking or misbehaving at query time.
     fn validate(&self) -> Result<(), ConfigError> {
+        // Create scratch root directory if it doesn't exist
+        if let Some(path) = self.storage.scratch_root.as_deref() {
+            fs::create_dir_all(path).map_err(|e| {
+                ConfigError::Invalid(format!("storage.scratch_root {}: {e}", path.display()))
+            })?;
+        }
+
         let v = &self.vector;
         // The calibrator's ef grid starts at the smallest [`HNSW_EF_CANDIDATES`]
         // entry (128). A ceiling below that filters the grid to empty, so the

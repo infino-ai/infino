@@ -10,15 +10,28 @@
 //! were — a migration that changed answers would be a worse outcome than
 //! the staleness it set out to fix.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, fs, sync::Arc, time::Duration};
 
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
-use infino::{ReindexOptions, superfile::format::fts::VERSION_CURRENT};
+use bytes::Bytes;
+use futures::executor::block_on;
+use infino::{
+    ReindexMode, ReindexOptions,
+    superfile::{
+        SuperfileReader, VectorSearchOptions,
+        format::{fts::VERSION_CURRENT, kv},
+    },
+    supertable::manifest::SuperfileEntry,
+};
 
 use crate::corpus_shapes::{
-    N_DOCS, assert_scores_equivalent, blob_versions, corpus_dir, hits, hits_k, open_corpus,
-    probe_embedding, scores_by_id, vector_hits,
+    N_DOCS, assert_scores_equivalent, blob_versions, corpus_dir, first_region, hits, hits_k,
+    open_corpus, probe_embedding, raw_footer_kvs, scores_by_id, table_dir, vector_hits,
 };
+
+/// Neighbours a footer-only open is probed for, matching the table-level
+/// probe so both see the same depth of the index.
+const FOOTER_PROBE_NEIGHBOURS: usize = 16;
 
 /// Rewriting a table written by an older engine brings every superfile to
 /// the current format and changes nothing a caller can observe.
@@ -633,4 +646,209 @@ fn the_default_mode_leaves_the_table_current_where_a_rewrite_cannot() {
         (0, 0),
         "{again:?}"
     );
+}
+
+/// Vector hits from a superfile opened from its bytes alone, with no
+/// manifest hints, so every region is located through the footer.
+fn footer_only_vector_hits(bytes: &Bytes, probe: &[f32]) -> Vec<(u32, f32)> {
+    let reader = SuperfileReader::open(bytes.clone()).expect("open superfile from its footer");
+    block_on(reader.vector_hits_async(
+        "emb",
+        probe,
+        FOOTER_PROBE_NEIGHBOURS,
+        VectorSearchOptions::default(),
+    ))
+    .expect("footer-only vector search")
+}
+
+/// A reindex that carries a superfile's vector subsection writes a footer
+/// that describes the file it wrote, not the one it read.
+///
+/// The carry path reuses the input's body and vector bytes but rebuilds
+/// the FTS blob, which changes size, so the vector bytes move. Every
+/// region key has to follow them, and has to be stored exactly once: a
+/// stale copy left beside the right one is invisible to this engine's
+/// reader, which keeps the last value, and misleads any reader that keeps
+/// the first.
+#[test]
+fn a_carried_vector_subsection_gets_a_footer_that_describes_it() {
+    let Some((_tmp, table, root)) = open_corpus("v6_with_vectors") else {
+        return;
+    };
+    let dir = table_dir(&root);
+    let probe = probe_embedding();
+
+    // Inputs keyed by their vector bytes: a carried subsection is copied
+    // byte for byte, so that is what pairs an output with its input.
+    let mut inputs: HashMap<Bytes, Bytes> = HashMap::new();
+    for entry in fs::read_dir(dir.join("data")).expect("read data dir") {
+        let bytes = Bytes::from(fs::read(entry.expect("dir entry").path()).expect("read input"));
+        let kvs = raw_footer_kvs(&bytes);
+        let (at, len) = first_region(&kvs, kv::VEC_OFFSET, kv::VEC_LENGTH)
+            .expect("every corpus superfile carries a vector subsection");
+        inputs.insert(bytes.slice(at as usize..(at + len) as usize), bytes);
+    }
+    assert!(!inputs.is_empty(), "the fixture has no superfiles");
+
+    let report = table
+        .reindex(&ReindexOptions::default())
+        .expect("reindex a hybrid table");
+    assert_eq!(
+        report.rewritten,
+        inputs.len(),
+        "every superfile is rewritten"
+    );
+    table.gc(Duration::ZERO).expect("collect superseded bytes");
+
+    let reader = table.local_handle().reader().expect("reader");
+    let entries = reader.manifest().get_all_superfiles();
+    assert_eq!(entries.len(), inputs.len(), "one output per input");
+
+    for entry in entries {
+        let path = entry.storage_path();
+        let bytes = Bytes::from(fs::read(dir.join(&path)).expect("read output"));
+        // (a) and (c), plus no region key stored twice.
+        let (vec_at, vec_len) = assert_footer_describes_layout(&path, &bytes, entry);
+
+        // (b) The bytes there are the input's vector subsection.
+        let vec_bytes = bytes.slice(vec_at as usize..(vec_at + vec_len) as usize);
+        let input = inputs
+            .get(&vec_bytes)
+            .unwrap_or_else(|| panic!("{path}: vector bytes match no input's subsection"));
+
+        // (d) Opened from the footer alone, the output answers as its input.
+        assert_eq!(
+            footer_only_vector_hits(&bytes, &probe),
+            footer_only_vector_hits(input, &probe),
+            "{path}: a footer-only open changed the vector results"
+        );
+    }
+}
+
+/// Asserts that `bytes`' footer describes the file it ends: every region
+/// key stored once, the vector range inside the file and right after the
+/// FTS blob, and both ranges agreeing with the manifest `entry`. Returns
+/// the vector range.
+///
+/// Read as a first-match reader would, since that is the reader a stale
+/// duplicate misleads; storing each key once makes every reader agree.
+fn assert_footer_describes_layout(path: &str, bytes: &Bytes, entry: &SuperfileEntry) -> (u64, u64) {
+    let file_len = bytes.len() as u64;
+    let kvs = raw_footer_kvs(bytes);
+
+    let (fts_at, fts_len) = first_region(&kvs, kv::FTS_OFFSET, kv::FTS_LENGTH)
+        .unwrap_or_else(|| panic!("{path}: no FTS region"));
+    let (vec_at, vec_len) = first_region(&kvs, kv::VEC_OFFSET, kv::VEC_LENGTH)
+        .unwrap_or_else(|| panic!("{path}: no vector region"));
+
+    // The vector range lies inside the file, right after the FTS blob —
+    // splice order is body, FTS, vector, ids.
+    assert!(
+        vec_at
+            .checked_add(vec_len)
+            .is_some_and(|end| end <= file_len),
+        "{path}: footer vector range {vec_at}+{vec_len} runs past the {file_len}-byte file"
+    );
+    assert_eq!(
+        vec_at,
+        fts_at + fts_len,
+        "{path}: vector blob does not start where the FTS blob ends"
+    );
+
+    for key in kv::REGION_KEYS {
+        let stored = kvs.iter().filter(|(k, _)| k == key).count();
+        assert!(stored <= 1, "{path}: footer stores {key} {stored} times");
+    }
+
+    // The footer and the manifest name the same regions.
+    let offsets = entry
+        .subsection_offsets
+        .as_ref()
+        .unwrap_or_else(|| panic!("{path}: manifest entry has no subsection offsets"));
+    assert_eq!(offsets.total_size, file_len, "{path}: manifest file size");
+    assert_eq!(offsets.fts, Some((fts_at, fts_len)), "{path}: FTS region");
+    assert_eq!(
+        offsets.vec,
+        Some((vec_at, vec_len)),
+        "{path}: vector region"
+    );
+    (vec_at, vec_len)
+}
+
+/// A footer a past reindex left a stale vector region in is found, and a
+/// reindex repairs it.
+///
+/// The fixture is real 0.9.0 output: that release's reindex stored its
+/// input's vector region keys ahead of the output's own. The engine reads
+/// the last copy, so the table searches correctly and its FTS index is
+/// current — nothing about the index says the file needs work. Only the
+/// footer does, so the assessment has to read it, and the repair has to
+/// rewrite the footer without disturbing the vectors it locates.
+#[test]
+fn a_vector_region_a_past_reindex_misplaced_is_found_and_repaired() {
+    let Some((_tmp, table, root)) = open_corpus("v7_reindexed_vectors") else {
+        return;
+    };
+    let dir = table_dir(&root);
+    let probe = probe_embedding();
+    let hits_before = vector_hits(&table, &probe);
+    assert!(
+        !hits_before.is_empty(),
+        "the fixture's vector index returns nothing"
+    );
+
+    let before = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess");
+    assert!(before.superfiles > 0, "the fixture has no superfiles");
+    assert_eq!(
+        before.needing_rewrite, before.superfiles,
+        "every misplaced footer needs a rewrite: {before:?}"
+    );
+    assert!(!before.is_current(), "{before:?}");
+    // The copy this engine reads agrees with the manifest, so these are
+    // stale duplicates a rewrite removes, not files left for a person.
+    assert!(
+        before.inconsistent_footers.is_empty(),
+        "a stale duplicate was reported as inconsistent: {before:?}"
+    );
+
+    // The plan is what the run does, and a footer needs only a layout
+    // rewrite: re-analysis would buy nothing the FTS index lacks.
+    let plan = table
+        .reindex_plan(&ReindexOptions::default())
+        .expect("plan");
+    assert_eq!(plan.len(), before.superfiles, "{plan:?}");
+    assert!(
+        plan.iter().all(|p| p.mode == ReindexMode::Rewrite),
+        "a footer repair re-analyzed: {plan:?}"
+    );
+
+    let report = table
+        .reindex(&ReindexOptions::default())
+        .expect("repair the misplaced footers");
+    assert_eq!(report.rewritten, before.superfiles, "{report:?}");
+    assert!(report.inconsistent_footers.is_empty(), "{report:?}");
+    table.gc(Duration::ZERO).expect("collect superseded bytes");
+
+    let reader = table.local_handle().reader().expect("reader");
+    for entry in reader.manifest().get_all_superfiles() {
+        let path = entry.storage_path();
+        let bytes = Bytes::from(fs::read(dir.join(&path)).expect("read output"));
+        assert_footer_describes_layout(&path, &bytes, entry);
+    }
+    assert_eq!(
+        vector_hits(&table, &probe),
+        hits_before,
+        "repairing the footer moved the vectors it locates"
+    );
+
+    let after = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess the repaired table");
+    assert!(after.is_current(), "{after:?}");
+    let again = table
+        .reindex(&ReindexOptions::default())
+        .expect("second run");
+    assert_eq!(again.rewritten, 0, "{again:?}");
 }

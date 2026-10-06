@@ -158,16 +158,30 @@ fn repair_carrying_body_to(
 /// A column whose text was never stored cannot be re-analyzed, so its
 /// postings are carried and it keeps the revision it was built at.
 ///
-/// Vectors are decoded and re-encoded rather than spliced, so the output
-/// holds whatever that round trip produces. Nothing gates which codec may
-/// take this path, so a codec that does not round-trip exactly would move
-/// its vectors here.
+/// Refuses a superfile with a vector index: this build would decode its
+/// vectors and re-encode them, and the default codecs do not round-trip
+/// exactly, so an FTS repair would quietly move the vectors. A user-table
+/// repair carries its body instead and never reaches here; a file that
+/// does needs a vector-preserving rebuild first.
 fn reanalyze_to<W: Write>(
     readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     fts_corpus: &HashMap<String, ColumnLengthStats>,
     output: W,
 ) -> Result<SuperfileStats, BuildError> {
     let builder_opts = merge_builder_opts(readers, fts_corpus)?.reanalyze_stored_columns();
+    if !builder_opts.vector_columns.is_empty() {
+        let columns: Vec<&str> = builder_opts
+            .vector_columns
+            .iter()
+            .map(|c| c.column.as_str())
+            .collect();
+        return Err(BuildError::Superfile(SuperfileBuildError::Io(
+            Error::other(format!(
+                "re-analysis cannot carry the vector index on {columns:?} across \
+                 untouched, and re-encoding it would move the vectors"
+            )),
+        )));
+    }
     let mut builder = SuperfileBuilder::new(builder_opts)?;
 
     let mut stats = Vec::with_capacity(readers.len());
@@ -187,7 +201,8 @@ fn reanalyze_to<W: Write>(
 mod tests {
     use std::collections::HashMap;
 
-    use arrow_array::RecordBatch;
+    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
     use uuid::Uuid;
 
@@ -199,8 +214,15 @@ mod tests {
             vector::layout::VectorLayout,
         },
         supertable::manifest::SuperfileUri,
-        test_helpers::{decimal128_id_field, decimal128_ids},
+        test_helpers::{
+            decimal128_id_field, decimal128_ids, default_vector_config, distinct_unit_vectors,
+        },
     };
+
+    /// Rows in the vector-bearing fixture.
+    const VECTOR_ROWS: usize = 4;
+    /// Rotation seed for the fixture's vector column.
+    const VECTOR_ROT_SEED: u64 = 7;
 
     /// A carrying build reports the manifest's row count as its own, so
     /// the only number that can disagree is the file's. A manifest entry
@@ -209,9 +231,6 @@ mod tests {
     /// a different row count means they mark different rows.
     #[test]
     fn a_manifest_row_count_that_disagrees_with_the_file_refuses_the_carry() {
-        use arrow_array::LargeStringArray;
-        use arrow_schema::{DataType, Field, Schema};
-
         let schema = Arc::new(Schema::new(vec![
             decimal128_id_field("doc_id"),
             Field::new("title", DataType::LargeUtf8, false),
@@ -266,5 +285,41 @@ mod tests {
             carried_doc_count(&source, &drifted).is_err(),
             "an entry claiming a row the file does not hold must refuse"
         );
+    }
+
+    /// The rebuild fallback refuses a vector-bearing superfile rather than
+    /// re-encode its vectors, so the day an FTS repair reaches it the run
+    /// stops instead of moving them.
+    #[test]
+    fn a_rebuild_refuses_a_superfile_with_a_vector_index() {
+        let schema = Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let vector = default_vector_config("emb", VECTOR_ROT_SEED);
+        let flat = distinct_unit_vectors(VECTOR_ROWS, vector.dim, VECTOR_ROT_SEED);
+        let opts = BuilderOptions::new(
+            schema.clone(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![vector],
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("new builder");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(decimal128_ids(0..VECTOR_ROWS as u64)),
+                Arc::new(LargeStringArray::from(vec!["hello"; VECTOR_ROWS])),
+            ],
+        )
+        .expect("batch matches schema");
+        b.add_batch(&batch, &[flat.as_slice()]).expect("add");
+        let source = Arc::new(
+            SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"),
+        );
+
+        let err = reanalyze_to(&[(source, None)], &HashMap::new(), Vec::new())
+            .expect_err("a vector-bearing rebuild must refuse");
+        assert!(err.to_string().contains("emb"), "{err}");
     }
 }
