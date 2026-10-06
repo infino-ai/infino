@@ -1257,6 +1257,31 @@ impl ManifestSnapshot {
         self.list.as_ref().is_some_and(|l| l.term_index_complete)
     }
 
+    /// Whether a term-index rebuild would change anything: false when the
+    /// table is empty, or when the index is complete, has one segment, and
+    /// lists exactly the live superfiles.
+    pub(crate) async fn needs_term_index_rebuild(&self, entries: &[Arc<SuperfileEntry>]) -> bool {
+        if entries.is_empty() {
+            return false;
+        }
+        if !self.term_index_complete() {
+            return true;
+        }
+        // An index that cannot be loaded is rebuilt.
+        let Some(index) = self.term_index().await else {
+            return true;
+        };
+        let root = index.root();
+        // Every commit since the last rebuild appends a segment.
+        if root.segments.len() != 1 {
+            return true;
+        }
+        // A commit that only removes superfiles appends no segment, so the
+        // root can still list superfiles that are gone.
+        root.superfiles.len() != entries.len()
+            || !entries.iter().all(|e| index.is_indexed(&e.superfile_id))
+    }
+
     /// All superfile entries, loaded through the hierarchical part loader in
     /// manifest (time) order. Vector search fans over every entry — cell
     /// routing (nearest global centroids) is the selection mechanism, not a

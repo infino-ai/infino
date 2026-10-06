@@ -91,6 +91,9 @@ storage:
   #     azure_storage_account_key: ...
   storage_options: {}
 
+  # Directory for temporary files.
+  # Defaults to the system temp directory.
+  scratch_root:
   # When set, storage-backed reads use DiskCacheStore. For S3,
   # lazy_foreground_with_background_fill is the object-store-native
   # cold path: foreground opens/searches with exact range GETs (or zero

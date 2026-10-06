@@ -74,6 +74,7 @@ def test_a_table_this_engine_wrote_is_current(tmp_path):
     assert staleness.awaiting_reanalysis == 0
     assert staleness.bytes_to_rewrite == 0
     assert staleness.unrepairable_columns == []
+    assert staleness.inconsistent_footers == []
 
     assert table.reindex_plan() == []
     report = table.reindex()

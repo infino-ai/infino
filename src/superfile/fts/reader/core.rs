@@ -1611,7 +1611,6 @@ impl FtsReader {
     ) -> Result<(), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let positional = col_meta.positions;
-        let region_base = self.postings_range.start;
         let positions_region = self.positions_range.clone();
 
         for (term, packed) in entries {
@@ -1632,23 +1631,7 @@ impl FtsReader {
                     postings_length_hint,
                     short,
                 } => {
-                    let start = region_base + metadata_offset as usize;
-                    let postings_length = match postings_length_hint {
-                        Some(len) => len as usize,
-                        None => {
-                            let header = fetch_source_range(
-                                &self.source,
-                                start..start + TERM_META_SIZE,
-                                "fts/merge header",
-                            )?;
-                            header_postings_length(header.as_ref())?
-                        }
-                    };
-                    let term_bytes = fetch_source_range(
-                        &self.source,
-                        start..start + postings_length,
-                        "fts/merge postings",
-                    )?;
+                    let term_bytes = self.term_bytes_sync(metadata_offset, postings_length_hint)?;
 
                     if short {
                         // Short-form term: the whole list is the body; its
@@ -1786,6 +1769,121 @@ impl FtsReader {
             }
         }
         Ok(())
+    }
+
+    /// Walk a column's postings for the merge's document-order pass, which
+    /// needs only which documents carry each term: doc ids are decoded, tfs
+    /// and positions are not read. For every term, in lex order,
+    /// `on_term(term)` returns what to carry for it, or `None` to skip the
+    /// term without reading its postings; `on_doc(&carry, local_doc_id)`
+    /// then runs for each of its docs, ascending.
+    ///
+    /// Synchronous, like [`Self::for_each_term_posting`]: compaction opens
+    /// its inputs over resident bytes.
+    pub(crate) fn for_each_term_doc<K>(
+        &self,
+        column_id: u32,
+        mut on_term: impl FnMut(&[u8]) -> Option<K>,
+        mut on_doc: impl FnMut(&K, u32),
+    ) -> Result<(), FtsError> {
+        let col_meta = &self.columns[column_id as usize];
+        let fst_bytes = self.dict_bytes()?;
+        let dict = self.open_dict(&fst_bytes)?;
+        let prefix = make_key(&col_meta.name, "");
+        let mut doc_ids = [0u32; BLOCK_LEN];
+        let mut tfs = [0u32; BLOCK_LEN];
+        let mut failed = None;
+        dict.for_each_prefix(&prefix, |key, packed| {
+            let Some(carry) = on_term(&key[prefix.len()..]) else {
+                return true;
+            };
+            let docs = match packed {
+                FstValue::Inline { doc_id, .. } => {
+                    on_doc(&carry, doc_id);
+                    Ok(())
+                }
+                FstValue::Pfor {
+                    metadata_offset,
+                    postings_length_hint,
+                    short,
+                } => self
+                    .term_bytes_sync(metadata_offset, postings_length_hint)
+                    .and_then(|term_bytes| match short {
+                        true => {
+                            let decoded = decode_short(
+                                term_bytes.as_ref(),
+                                col_meta.positions,
+                                &mut doc_ids,
+                                &mut tfs,
+                            )
+                            .ok_or_else(|| {
+                                FtsError::Read(ReadError::MalformedVersion(
+                                    "malformed short-form term body".into(),
+                                ))
+                            })?;
+                            for &doc in &doc_ids[..decoded.n] {
+                                on_doc(&carry, doc);
+                            }
+                            Ok(())
+                        }
+                        // A count-only cursor decodes a block's doc ids and
+                        // skips its tfs.
+                        false => {
+                            let mut cursor = TermCursor::new(
+                                term_bytes,
+                                col_meta,
+                                self.bounds,
+                                None,
+                                1,
+                                false,
+                                true,
+                            )?;
+                            while !cursor.is_exhausted() {
+                                for &doc in &cursor.block_doc_ids[cursor.pos..cursor.block_n] {
+                                    on_doc(&carry, doc);
+                                }
+                                cursor.pos = cursor.block_n;
+                                cursor.advance_block();
+                            }
+                            Ok(())
+                        }
+                    }),
+            };
+            match docs {
+                Ok(()) => true,
+                Err(e) => {
+                    failed = Some(e);
+                    false
+                }
+            }
+        });
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// One PFOR term's bytes, from its metadata header to its end. A
+    /// dictionary value without a length hint costs a header read first.
+    fn term_bytes_sync(
+        &self,
+        metadata_offset: u64,
+        postings_length_hint: Option<u32>,
+    ) -> Result<Bytes, FtsError> {
+        let start = self.postings_range.start + metadata_offset as usize;
+        let postings_length = match postings_length_hint {
+            Some(len) => len as usize,
+            None => {
+                let header = fetch_source_range(
+                    &self.source,
+                    start..start + TERM_META_SIZE,
+                    "fts/merge header",
+                )?;
+                header_postings_length(header.as_ref())?
+            }
+        };
+        fetch_source_range(
+            &self.source,
+            start..start + postings_length,
+            "fts/merge postings",
+        )
     }
 
     /// Read a column's stored per-doc lengths (token counts), one `u32` per
@@ -3149,6 +3247,71 @@ mod tests {
             got.get(&t("c")).expect("term streamed").as_slice(),
             &[(1, 1, vec![2])]
         );
+    }
+
+    /// The doc-only walk visits exactly the `(term, doc)` pairs the full
+    /// walk does, in the same order, over inline, short and long terms
+    /// (long ones dense enough for bitset blocks) on a positional and a
+    /// plain column; and a term it is told to skip contributes no doc.
+    #[test]
+    fn for_each_term_doc_matches_the_full_walk_and_skips_terms() {
+        const N_DOCS: u32 = 700;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("pos".into(), true).expect("register");
+        b.register_column("flat".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            // `every` is long and dense, `some` long and sparse, `few`
+            // short, `u{i}` inline.
+            let mut text = format!("every every u{i}");
+            if i.is_multiple_of(3) {
+                text.push_str(" some");
+            }
+            if i.is_multiple_of(50) {
+                text.push_str(" few");
+            }
+            b.add_doc(0, i, &text).expect("add pos");
+            b.add_doc(1, i, &text).expect("add flat");
+        }
+        let bytes = b.finish().expect("finish");
+        let json = r#"[{"name":"pos","tokenizer":"ascii_lower","positions":true},{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
+        for column_id in 0..2 {
+            let mut full: Vec<(Vec<u8>, u32)> = Vec::new();
+            r.for_each_term_posting(column_id, |term, doc, _, _| {
+                full.push((term.to_vec(), doc));
+                Ok(())
+            })
+            .expect("full walk");
+            let mut docs_only: Vec<(Vec<u8>, u32)> = Vec::new();
+            r.for_each_term_doc(
+                column_id,
+                |term| Some(term.to_vec()),
+                |term, doc| {
+                    docs_only.push((term.clone(), doc));
+                },
+            )
+            .expect("doc-only walk");
+            assert_eq!(
+                docs_only, full,
+                "column {column_id}: same pairs, same order"
+            );
+
+            let skipped = b"some".as_slice();
+            let mut kept: Vec<(Vec<u8>, u32)> = Vec::new();
+            r.for_each_term_doc(
+                column_id,
+                |term| (term != skipped).then(|| term.to_vec()),
+                |term, doc| kept.push((term.clone(), doc)),
+            )
+            .expect("walk with a skip");
+            let expected: Vec<(Vec<u8>, u32)> =
+                full.into_iter().filter(|(t, _)| t != skipped).collect();
+            assert_eq!(
+                kept, expected,
+                "column {column_id}: a skipped term has no docs"
+            );
+        }
     }
 
     #[test]

@@ -705,6 +705,8 @@ struct ReindexReport {
     held_by_another_run: usize,
     #[pyo3(get)]
     unrepairable_columns: Vec<String>,
+    #[pyo3(get)]
+    inconsistent_footers: Vec<String>,
 }
 
 impl ReindexReport {
@@ -715,6 +717,7 @@ impl ReindexReport {
             awaiting_reanalysis: r.awaiting_reanalysis,
             held_by_another_run: r.held_by_another_run,
             unrepairable_columns: r.unrepairable_columns,
+            inconsistent_footers: ids_to_strings(&r.inconsistent_footers),
         }
     }
 }
@@ -724,12 +727,13 @@ impl ReindexReport {
     fn __repr__(&self) -> String {
         format!(
             "ReindexReport(rewritten={}, already_current={}, awaiting_reanalysis={}, \
-             held_by_another_run={}, unrepairable_columns={:?})",
+             held_by_another_run={}, unrepairable_columns={:?}, inconsistent_footers={:?})",
             self.rewritten,
             self.already_current,
             self.awaiting_reanalysis,
             self.held_by_another_run,
             self.unrepairable_columns,
+            self.inconsistent_footers,
         )
     }
 }
@@ -748,6 +752,8 @@ struct StalenessReport {
     #[pyo3(get)]
     unrepairable_columns: Vec<String>,
     #[pyo3(get)]
+    inconsistent_footers: Vec<String>,
+    #[pyo3(get)]
     is_current: bool,
 }
 
@@ -760,8 +766,14 @@ impl StalenessReport {
             awaiting_reanalysis: r.awaiting_reanalysis,
             bytes_to_rewrite: r.bytes_to_rewrite,
             unrepairable_columns: r.unrepairable_columns,
+            inconsistent_footers: ids_to_strings(&r.inconsistent_footers),
         }
     }
+}
+
+/// Superfile ids as the strings the binding exposes them as.
+fn ids_to_strings(ids: &[impl ToString]) -> Vec<String> {
+    ids.iter().map(ToString::to_string).collect()
 }
 
 #[pymethods]
@@ -769,12 +781,14 @@ impl StalenessReport {
     fn __repr__(&self) -> String {
         format!(
             "StalenessReport(superfiles={}, needing_rewrite={}, awaiting_reanalysis={}, \
-             bytes_to_rewrite={}, unrepairable_columns={:?}, is_current={})",
+             bytes_to_rewrite={}, unrepairable_columns={:?}, inconsistent_footers={:?}, \
+             is_current={})",
             self.superfiles,
             self.needing_rewrite,
             self.awaiting_reanalysis,
             self.bytes_to_rewrite,
             self.unrepairable_columns,
+            self.inconsistent_footers,
             if self.is_current { "True" } else { "False" },
         )
     }

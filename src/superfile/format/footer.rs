@@ -47,7 +47,10 @@ use parquet::{
 };
 use tempfile::NamedTempFile;
 
-use crate::superfile::{LazyByteSource, LazyByteSourceError, format::kv};
+use crate::{
+    config::scratch_root,
+    superfile::{LazyByteSource, LazyByteSourceError, format::kv},
+};
 
 /// Length of Parquet's trailing `PAR1` magic, in bytes.
 const PARQUET_MAGIC_LEN: usize = 4;
@@ -218,7 +221,8 @@ impl ParquetBodyEncoder {
         // writer owns an independent handle to the same file (`reopen`); the
         // struct's `body_file` handle reads the footer back after close, and
         // their cursors don't alias.
-        let body_file = NamedTempFile::new()?;
+        let scratch_root = scratch_root();
+        let body_file = NamedTempFile::new_in(&scratch_root)?;
         let write_handle = body_file.reopen()?;
         let writer = ArrowWriter::try_new(write_handle, schema.clone(), Some(props))?;
         Ok(Self { body_file, writer })
@@ -442,7 +446,12 @@ where
     // last value, but a first-match reader resolves the stale offsets, and
     // the footer grows by a key set on every rewrite.
     kvs.retain(|entry| !entry.key.starts_with(kv::PREFIX));
-    for (k, v) in extra_kv {
+    // Region keys are this splice's to write: a caller's copy describes
+    // some other file's layout.
+    for (k, v) in extra_kv
+        .iter()
+        .filter(|(k, _)| !kv::REGION_KEYS.contains(&k.as_str()))
+    {
         kvs.push(KeyValue::new(k.clone(), Some(v.clone())));
     }
     if fts_length > 0 {
@@ -621,12 +630,150 @@ pub fn extract_kv_map(metadata: &ParquetMetaData) -> Result<KvMap, FooterError> 
     Ok(out)
 }
 
+/// A blob's `(offset, length)` within its superfile.
+pub(crate) type BlobRegion = (u64, u64);
+
+/// Where a superfile's footer places each of its blobs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BlobRegions {
+    pub(crate) fts: Option<BlobRegion>,
+    pub(crate) vec: Option<BlobRegion>,
+    pub(crate) ids: Option<BlobRegion>,
+}
+
+impl BlobRegions {
+    /// Whether every region ends inside a `file_len`-byte file.
+    pub(crate) fn fit_within(&self, file_len: u64) -> bool {
+        [self.fts, self.vec, self.ids]
+            .into_iter()
+            .flatten()
+            .all(|(at, len)| at.checked_add(len).is_some_and(|end| end <= file_len))
+    }
+}
+
+/// Whether `metadata` stores any region key more than once.
+///
+/// Counts the key list as stored rather than through [`extract_kv_map`],
+/// which keeps a key's last copy and so cannot see a stale duplicate.
+pub(crate) fn has_duplicated_region_key(metadata: &ParquetMetaData) -> bool {
+    let kvs = metadata
+        .file_metadata()
+        .key_value_metadata()
+        .map_or(&[][..], Vec::as_slice);
+    kv::REGION_KEYS
+        .iter()
+        .any(|key| kvs.iter().filter(|entry| entry.key == *key).count() > 1)
+}
+
+/// The blob regions this engine's reader resolves from `metadata`, which
+/// keeps the last copy of a repeated key; `None` when a region key is not
+/// a `u64` or has no partner.
+pub(crate) fn resolved_regions(metadata: &ParquetMetaData) -> Option<BlobRegions> {
+    let kv_map = extract_kv_map(metadata).ok()?;
+    // Outer `None` is a malformed key; inner `None` an absent one.
+    let value = |key: &str| -> Option<Option<u64>> {
+        kv_map
+            .get(key)
+            .map_or(Some(None), |v| v.parse().ok().map(Some))
+    };
+    let region = |offset: &str, length: &str| -> Option<Option<BlobRegion>> {
+        match (value(offset)?, value(length)?) {
+            (Some(at), Some(len)) => Some(Some((at, len))),
+            (None, None) => Some(None),
+            _ => None,
+        }
+    };
+    Some(BlobRegions {
+        fts: region(kv::FTS_OFFSET, kv::FTS_LENGTH)?,
+        vec: region(kv::VEC_OFFSET, kv::VEC_LENGTH)?,
+        ids: region(kv::IDS_OFFSET, kv::IDS_LENGTH)?,
+    })
+}
+
 /// Translate a `LazyByteSourceError` to a `FooterError` for the
 /// async-tail readers. Storage failures become `Parquet`-shaped
 /// errors via the existing `Malformed` channel — the variant
 /// shape exists for both signal and source-chain preservation.
 fn footer_lazy_err(e: LazyByteSourceError) -> FooterError {
     FooterError::LazySource(e.to_string())
+}
+
+/// Test-only: where `bytes`' footer starts, and the footer decoded.
+#[cfg(test)]
+fn split_footer(bytes: &[u8]) -> (usize, ParquetMetaData) {
+    let n = bytes.len();
+    let len_bytes: [u8; PARQUET_FOOTER_LEN_FIELD_BYTES] = bytes
+        [n - PARQUET_FOOTER_SUFFIX_BYTES..n - PARQUET_MAGIC_LEN]
+        .try_into()
+        .expect("footer length field");
+    let footer_len = u32::from_le_bytes(len_bytes) as usize;
+    let start = n - PARQUET_FOOTER_SUFFIX_BYTES - footer_len;
+    let metadata =
+        ParquetMetaDataReader::decode_metadata(&bytes[start..n - PARQUET_FOOTER_SUFFIX_BYTES])
+            .expect("decode footer");
+    (start, metadata)
+}
+
+/// Test-only: `metadata` with `extra` appended to its key-value list.
+#[cfg(test)]
+pub(crate) fn with_appended_kv(
+    metadata: &ParquetMetaData,
+    extra: &[(&str, &str)],
+) -> ParquetMetaData {
+    let mut kvs = stored_kvs(metadata);
+    kvs.extend(key_values(extra));
+    with_kv_list(metadata, kvs)
+}
+
+/// Test-only: `bytes` with `extra` written ahead of its footer's own keys,
+/// verbatim — where a carried rewrite left its stale copies, and the
+/// malformed footers [`splice_carried_body_to`] refuses to write.
+#[cfg(test)]
+pub(crate) fn with_forged_footer_kv(bytes: &[u8], extra: &[(&str, &str)]) -> Bytes {
+    let (start, metadata) = split_footer(bytes);
+    let mut kvs = key_values(extra);
+    kvs.extend(stored_kvs(&metadata));
+    let mut out = bytes[..start].to_vec();
+    ParquetMetaDataWriter::new(&mut out, &with_kv_list(&metadata, kvs))
+        .finish()
+        .expect("write forged footer");
+    Bytes::from(out)
+}
+
+/// Test-only: the footer's key-value list as stored.
+#[cfg(test)]
+fn stored_kvs(metadata: &ParquetMetaData) -> Vec<KeyValue> {
+    metadata
+        .file_metadata()
+        .key_value_metadata()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Test-only: `pairs` as footer key-value entries.
+#[cfg(test)]
+fn key_values(pairs: &[(&str, &str)]) -> Vec<KeyValue> {
+    pairs
+        .iter()
+        .map(|(k, v)| KeyValue::new(k.to_string(), Some(v.to_string())))
+        .collect()
+}
+
+/// Test-only: `metadata` with its key-value list replaced by `kvs`.
+#[cfg(test)]
+fn with_kv_list(metadata: &ParquetMetaData, kvs: Vec<KeyValue>) -> ParquetMetaData {
+    let fm = metadata.file_metadata();
+    let fm = FileMetaData::new(
+        fm.version(),
+        fm.num_rows(),
+        fm.created_by().map(String::from),
+        Some(kvs),
+        fm.schema_descr_ptr(),
+        fm.column_orders().cloned(),
+    );
+    ParquetMetaDataBuilder::new(fm)
+        .set_row_groups(metadata.row_groups().to_vec())
+        .build()
 }
 
 #[cfg(test)]
@@ -685,17 +832,8 @@ mod tests {
     /// included — unlike [`read_kv_metadata`], which folds a repeated key
     /// onto its last value and so cannot see a duplicate at all.
     fn raw_footer_kv(bytes: &[u8]) -> Vec<(String, Option<String>)> {
-        let n = bytes.len();
-        let len_bytes: [u8; PARQUET_FOOTER_LEN_FIELD_BYTES] = bytes
-            [n - PARQUET_FOOTER_SUFFIX_BYTES..n - PARQUET_MAGIC_LEN]
-            .try_into()
-            .expect("footer length field");
-        let footer_len = u32::from_le_bytes(len_bytes) as usize;
-        let start = n - PARQUET_FOOTER_SUFFIX_BYTES - footer_len;
-        let meta =
-            ParquetMetaDataReader::decode_metadata(&bytes[start..n - PARQUET_FOOTER_SUFFIX_BYTES])
-                .expect("decode footer");
-        meta.file_metadata()
+        footer_metadata(bytes)
+            .file_metadata()
             .key_value_metadata()
             .cloned()
             .unwrap_or_default()
@@ -783,6 +921,115 @@ mod tests {
             layout.fts_offset.to_string(),
             "the first `inf.fts.offset` must be this rewrite's"
         );
+    }
+
+    /// The footer of `bytes`, decoded.
+    fn footer_metadata(bytes: &[u8]) -> ParquetMetaData {
+        split_footer(bytes).1
+    }
+
+    /// A superfile with an FTS and a vector blob, built with `extra_kv`.
+    fn write_with_both_blobs(extra_kv: &[(String, String)]) -> ParquetParts {
+        const FTS: &[u8] = b"fts blob";
+        const VEC: &[u8] = b"a vector blob";
+        let schema = small_schema();
+        let batch = small_batch(&schema);
+        write_with_blobs(
+            &schema,
+            &[batch],
+            FTS,
+            VEC,
+            extra_kv,
+            Compression::SNAPPY,
+            1024,
+            &[],
+        )
+        .expect("write superfile")
+    }
+
+    /// Where a blob sits is the splice's to say. A caller that hands in
+    /// region keys — a rewrite carrying another file's `inf.vec.*` set —
+    /// must not get them into the footer, where a first-match reader would
+    /// take them over the splice's own.
+    #[test]
+    fn a_callers_region_keys_never_reach_the_footer() {
+        const STALE: &str = "999999";
+        let stale: Vec<(String, String)> = kv::REGION_KEYS
+            .iter()
+            .map(|k| (k.to_string(), STALE.to_string()))
+            .collect();
+        let parts = write_with_both_blobs(&stale);
+
+        let entries = raw_footer_kv(&parts.bytes);
+        for key in kv::REGION_KEYS {
+            let values: Vec<_> = entries.iter().filter(|(k, _)| k == key).collect();
+            assert!(values.len() <= 1, "{key} stored {} times", values.len());
+            assert!(
+                values.iter().all(|(_, v)| v.as_deref() != Some(STALE)),
+                "{key} kept the caller's value"
+            );
+        }
+        let metadata = footer_metadata(&parts.bytes);
+        assert!(!has_duplicated_region_key(&metadata));
+        let resolved = resolved_regions(&metadata).expect("well-formed");
+        assert_eq!(resolved.fts, Some((parts.fts_offset, parts.fts_length)));
+        assert_eq!(resolved.vec, Some((parts.vec_offset, parts.vec_length)));
+        assert!(resolved.fit_within(parts.bytes.len() as u64));
+    }
+
+    /// A region key stored twice is found by counting the stored list:
+    /// which copy a reader resolves depends on the reader.
+    #[test]
+    fn a_duplicated_region_key_is_counted_as_stored() {
+        let parts = write_with_both_blobs(&[]);
+        let metadata = footer_metadata(&parts.bytes);
+        assert!(!has_duplicated_region_key(&metadata));
+
+        let stale_offset = (parts.vec_offset + 1).to_string();
+        let duplicated = with_appended_kv(&metadata, &[(kv::VEC_OFFSET, &stale_offset)]);
+        assert!(has_duplicated_region_key(&duplicated));
+
+        // This engine's reader still resolves one: the last copy.
+        let resolved = resolved_regions(&duplicated).expect("last copy resolves");
+        assert_eq!(resolved.vec, Some((parts.vec_offset + 1, parts.vec_length)));
+    }
+
+    /// An offset without its length, or a value that is not a number,
+    /// resolves to no region a reader could use.
+    #[test]
+    fn a_partial_or_unparsable_region_does_not_resolve() {
+        // Written without an ids sidecar, so `inf.ids.*` is free to plant.
+        let metadata = footer_metadata(&write_with_both_blobs(&[]).bytes);
+        let no_length = with_appended_kv(&metadata, &[(kv::IDS_OFFSET, "0")]);
+        assert_eq!(resolved_regions(&no_length), None);
+
+        let unparsable = with_appended_kv(
+            &metadata,
+            &[(kv::IDS_OFFSET, "0"), (kv::IDS_LENGTH, "not a number")],
+        );
+        assert_eq!(resolved_regions(&unparsable), None);
+    }
+
+    /// A region ending past the file does not fit it; one ending exactly at
+    /// its end does.
+    #[test]
+    fn a_region_past_the_end_of_the_file_does_not_fit() {
+        const FILE_LEN: u64 = 100;
+        let at_end = BlobRegions {
+            vec: Some((90, 10)),
+            ..Default::default()
+        };
+        assert!(at_end.fit_within(FILE_LEN));
+        let past_end = BlobRegions {
+            vec: Some((90, 11)),
+            ..Default::default()
+        };
+        assert!(!past_end.fit_within(FILE_LEN));
+        let overflowing = BlobRegions {
+            fts: Some((u64::MAX, 1)),
+            ..Default::default()
+        };
+        assert!(!overflowing.fit_within(FILE_LEN));
     }
 
     #[test]

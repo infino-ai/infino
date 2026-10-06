@@ -761,6 +761,7 @@ impl TermIndex {
 mod tests {
     use std::{
         collections::HashMap,
+        fs,
         ops::Range,
         sync::{
             Arc,
@@ -776,9 +777,14 @@ mod tests {
 
     use super::*;
     use crate::{
+        CompactionSettings, OptimizeOptions,
         storage::{LocalFsStorageProvider, ObjectMeta},
         supertable::query::prune::select_superfiles,
-        test_helpers::{copy_dir_recursive, old_format_fts_fixture, open_old_format_fts_fixture},
+        test_helpers::{
+            copy_dir_recursive,
+            fault_storage::{FaultOp, FaultStorage},
+            old_format_fts_fixture, open_old_format_fts_fixture,
+        },
         utils::terms::{FstValue, make_key},
     };
 
@@ -1114,15 +1120,18 @@ mod tests {
         alpha
     }
 
-    /// Compaction-free optimize: the maintenance passes alone.
-    fn stats_only_optimize(st: &crate::supertable::Supertable) {
-        use crate::{CompactionSettings, OptimizeOptions};
-        st.optimize(&OptimizeOptions::compact(CompactionSettings {
+    /// Optimize options that merge nothing: the maintenance passes alone.
+    fn stats_only_options() -> OptimizeOptions {
+        OptimizeOptions::compact(CompactionSettings {
             min_fill_percent: 100,
             min_superfiles_for_merge: u64::MAX,
             ..CompactionSettings::default()
-        }))
-        .expect("optimize");
+        })
+    }
+
+    /// Compaction-free optimize: the maintenance passes alone.
+    fn stats_only_optimize(st: &crate::supertable::Supertable) {
+        st.optimize(&stats_only_options()).expect("optimize");
     }
 
     /// The live superfile ids and the root's covered set, for comparison.
@@ -1704,6 +1713,166 @@ mod tests {
             manifest.term_index_complete(),
             "a rebuild over the whole membership marks the index complete"
         );
+    }
+
+    /// An empty FTS table whose storage can fail chosen operations.
+    fn fault_table() -> (
+        TempDir,
+        Arc<FaultStorage>,
+        Arc<dyn StorageProvider>,
+        crate::supertable::Supertable,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let inner: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let faults = FaultStorage::wrap(inner);
+        let storage: Arc<dyn StorageProvider> = Arc::clone(&faults) as Arc<dyn StorageProvider>;
+        let st = crate::supertable::Supertable::create(fresh_options(&storage)).expect("create");
+        (dir, faults, storage, st)
+    }
+
+    /// Run a compaction-free optimize with term-index writes failing, and
+    /// return whether it tried to write one, i.e. whether it rebuilt the
+    /// index. A rebuild always writes, even when it reproduces the same
+    /// content-addressed objects.
+    fn optimize_rebuilds_term_index(
+        st: &crate::supertable::Supertable,
+        faults: &FaultStorage,
+    ) -> bool {
+        let fired_before = faults.fired();
+        faults.fail(FaultOp::PutAtomic, STORAGE_PREFIX, 1);
+        let result = st.optimize(&stats_only_options());
+        faults.clear();
+        let rebuilt = faults.fired() > fired_before;
+        if !rebuilt {
+            result.expect("optimize");
+        }
+        rebuilt
+    }
+
+    /// A fragmented table, optimized once so its index is one segment over
+    /// exactly the live superfiles.
+    fn optimized_fault_table() -> (
+        TempDir,
+        Arc<FaultStorage>,
+        Arc<dyn StorageProvider>,
+        crate::supertable::Supertable,
+    ) {
+        let (dir, faults, storage, st) = fault_table();
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        stats_only_optimize(&st);
+        (dir, faults, storage, st)
+    }
+
+    /// A second optimize over an unchanged table finds the index already in
+    /// the shape a rebuild would produce, and writes nothing.
+    #[test]
+    fn a_repeat_optimize_skips_the_term_index_rebuild() {
+        let (_dir, faults, _storage, st) = optimized_fault_table();
+        let reference = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned();
+        assert!(
+            !optimize_rebuilds_term_index(&st, &faults),
+            "nothing changed, so nothing is rebuilt"
+        );
+        assert_eq!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_ref()
+                .cloned(),
+            reference
+        );
+    }
+
+    /// An append after the last rebuild adds a delta segment, which the next
+    /// optimize folds back in.
+    #[test]
+    fn an_appended_delta_segment_triggers_the_rebuild() {
+        let (_dir, faults, storage, st) = optimized_fault_table();
+        commit_segment(&st, SEGMENTS);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(root.segments.len(), 2, "the append added a delta");
+        assert!(optimize_rebuilds_term_index(&st, &faults));
+    }
+
+    /// A commit that only removes superfiles appends no segment and leaves
+    /// the index complete, but the root still lists the removed superfile.
+    /// Only the live-set check sees it.
+    #[test]
+    fn a_removal_only_commit_triggers_the_rebuild() {
+        let (_dir, faults, storage, st) = optimized_fault_table();
+        let reader = st.reader().expect("reader");
+        let entries = reader.manifest().get_all_superfiles();
+        commit_without_postings(&st, &storage, Vec::new(), &entries[..1]);
+        // A direct commit does not advance the handle; adopt it.
+        st.block_on_query(st.refresh()).expect("refresh");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        assert_eq!(root.segments.len(), 1, "a removal appends no delta");
+        assert_eq!(
+            root.superfiles.len(),
+            live.len() + 1,
+            "the removed one is still listed"
+        );
+
+        assert!(optimize_rebuilds_term_index(&st, &faults));
+        stats_only_optimize(&st);
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        let covered: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        assert_eq!(covered, live, "the rebuild drops the removed superfile");
+    }
+
+    /// An index marked incomplete is rebuilt even when its root already has
+    /// one segment over exactly the live superfiles.
+    #[test]
+    fn an_incomplete_index_triggers_the_rebuild() {
+        let (_dir, faults, storage, st) = fault_table();
+        commit_segment(&st, 0);
+        // Adding then removing an unindexed superfile leaves the root as it
+        // was but the index marked incomplete.
+        let entry = unindexed_entry();
+        commit_without_postings(&st, &storage, vec![Arc::clone(&entry)], &[]);
+        commit_without_postings(&st, &storage, Vec::new(), &[entry]);
+        st.block_on_query(st.refresh()).expect("refresh");
+        assert!(
+            !st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        assert!(optimize_rebuilds_term_index(&st, &faults));
+    }
+
+    /// A root that cannot be loaded is rebuilt rather than trusted.
+    #[test]
+    fn an_unloadable_root_triggers_the_rebuild() {
+        let (dir, faults, storage, st) = optimized_fault_table();
+        let reference = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned()
+            .expect("reference");
+        drop(st);
+        fs::remove_file(dir.path().join(&reference.uri)).expect("remove root");
+        // A fresh handle, so no loaded index is cached in memory.
+        let st = crate::supertable::Supertable::open(fresh_options(&storage)).expect("open");
+        assert!(optimize_rebuilds_term_index(&st, &faults));
     }
 
     /// Every ceiling the index computes is an upper bound on the score any
@@ -3195,14 +3364,7 @@ mod tests {
     /// root restarts it.
     #[test]
     fn a_transient_read_of_the_prior_root_keeps_the_index_and_marks_it_incomplete() {
-        use crate::test_helpers::fault_storage::{FaultOp, FaultStorage};
-
-        let dir = TempDir::new().expect("tempdir");
-        let inner: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
-        let faults = FaultStorage::wrap(inner);
-        let storage: Arc<dyn StorageProvider> = Arc::clone(&faults) as Arc<dyn StorageProvider>;
-        let st = crate::supertable::Supertable::create(fresh_options(&storage)).expect("create");
+        let (_dir, faults, storage, st) = fault_table();
         commit_segment(&st, 0);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live_before, root_before) = live_and_covered(&st, &storage, &rt);

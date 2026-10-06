@@ -47,6 +47,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use bytes::Bytes;
 use infino::{
     Bm25SearchOptions, Connection, Supertable, connect,
     superfile::format::{
@@ -55,8 +56,10 @@ use infino::{
             BlobLayout, VERSION_CURRENT, VERSION_V1_LEGACY, VERSION_V2, VERSION_V3, VERSION_V4,
             VERSION_V5, VERSION_V6, VERSION_V7, VERSION_V8,
         },
+        kv,
     },
 };
+use parquet::file::metadata::ParquetMetaDataReader;
 use tempfile::TempDir;
 
 /// Where the generated tables live, relative to the crate root.
@@ -232,6 +235,59 @@ fn find_columns_json(bytes: &[u8]) -> Option<String> {
     let start = bytes.windows(OPEN.len()).position(|w| w == OPEN)?;
     let end = bytes[start..].windows(2).position(|w| w == b"}]")?;
     String::from_utf8(bytes[start..start + end + 2].to_vec()).ok()
+}
+
+/// Every key-value pair in a superfile's Parquet footer, in stored order
+/// and duplicates kept.
+///
+/// Parsed with parquet-rs rather than this engine's reader: the engine
+/// folds the list into a map, so it cannot see a key stored twice, and a
+/// reader that takes the first occurrence of a key is the one a stale
+/// duplicate misleads.
+pub(crate) fn raw_footer_kvs(bytes: &Bytes) -> Vec<(String, String)> {
+    let metadata = ParquetMetaDataReader::new()
+        .parse_and_finish(bytes)
+        .expect("parse superfile footer");
+    metadata
+        .file_metadata()
+        .key_value_metadata()
+        .map(|kvs| {
+            kvs.iter()
+                .filter_map(|e| Some((e.key.clone(), e.value.clone()?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The first value stored for `key`, as a first-match footer reader
+/// resolves it.
+fn first_u64(kvs: &[(String, String)], key: &str) -> Option<u64> {
+    kvs.iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.parse().expect("footer offset is a u64"))
+}
+
+/// A blob's `(offset, length)` as a first-match reader resolves it.
+pub(crate) fn first_region(
+    kvs: &[(String, String)],
+    offset: &str,
+    length: &str,
+) -> Option<(u64, u64)> {
+    Some((first_u64(kvs, offset)?, first_u64(kvs, length)?))
+}
+
+/// The table's own directory under a corpus root (not the catalog's).
+pub(crate) fn table_dir(root: &Path) -> PathBuf {
+    fs::read_dir(root)
+        .expect("read corpus root")
+        .map(|e| e.expect("dir entry").path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&format!("{TABLE}-")))
+        })
+        .expect("corpus table directory")
 }
 
 /// Copy a corpus table into a temp dir and connect to it.
@@ -634,6 +690,78 @@ mod v6_positional {
 /// it is already unreachable code. The bytes stay checked in as the v1
 /// format fixture, and this pins the boundary so that a change making
 /// these tables openable is a deliberate one.
+/// A table 0.9.0's reindex repaired: real bytes from the release whose
+/// reindex stored its input's vector region keys ahead of each output's
+/// own.
+mod v7_reindexed_vectors {
+    use super::*;
+
+    const SHAPE: &str = "v7_reindexed_vectors";
+
+    /// Every file is at the blob version the 0.9.0 reindex writes, and the
+    /// corpus is whole. Not `assert_shape`: these files were re-analyzed,
+    /// so they record an analysis revision, which that check forbids for
+    /// the migration sources it exists to pin.
+    #[test]
+    fn carries_its_format_shape() {
+        let Some(root) = corpus_dir(SHAPE) else {
+            return;
+        };
+        let headers = blob_headers(&root);
+        assert!(!headers.is_empty(), "{SHAPE}: no superfiles");
+        let total: usize = headers.iter().map(|h| h.n_docs as usize).sum();
+        assert_eq!(total, N_DOCS as usize, "{SHAPE}: document count drifted");
+        for (i, h) in headers.iter().enumerate() {
+            assert_eq!(
+                h.version, VERSION_V7,
+                "{SHAPE}: superfile {i} carries blob version {}",
+                h.version
+            );
+        }
+    }
+
+    #[test]
+    fn opens_and_ranks() {
+        assert_opens_and_ranks(SHAPE);
+    }
+
+    /// Pinned in the negative, as the tokenization defect is for the
+    /// other shapes: a repair test against this fixture proves nothing
+    /// unless the fixture actually carries the stale copy.
+    #[test]
+    fn stores_a_stale_vector_region_ahead_of_the_right_one() {
+        let Some(root) = corpus_dir(SHAPE) else {
+            return;
+        };
+        let paths = superfile_paths(&root);
+        assert!(!paths.is_empty(), "{SHAPE}: no superfiles");
+        for path in paths {
+            let bytes = Bytes::from(fs::read(&path).expect("read superfile"));
+            let kvs = raw_footer_kvs(&bytes);
+            let stored: Vec<&str> = kvs
+                .iter()
+                .filter(|(k, _)| k == kv::VEC_OFFSET)
+                .map(|(_, v)| v.as_str())
+                .collect();
+            assert_eq!(
+                stored.len(),
+                2,
+                "{}: expected a stale and a current inf.vec.offset, got {stored:?}",
+                path.display()
+            );
+            let (fts_at, fts_len) = first_region(&kvs, kv::FTS_OFFSET, kv::FTS_LENGTH)
+                .unwrap_or_else(|| panic!("{}: no FTS region", path.display()));
+            let current = (fts_at + fts_len).to_string();
+            assert!(
+                stored[0] != current && stored[1] == current,
+                "{}: expected the stale copy first and the vector blob's real \
+                 offset {current} last, got {stored:?}",
+                path.display()
+            );
+        }
+    }
+}
+
 mod v1_positionless {
     use super::*;
 
