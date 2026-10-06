@@ -685,14 +685,6 @@ pub(crate) fn resolved_regions(metadata: &ParquetMetaData) -> Option<BlobRegions
     })
 }
 
-/// Translate a `LazyByteSourceError` to a `FooterError` for the
-/// async-tail readers. Storage failures become `Parquet`-shaped
-/// errors via the existing `Malformed` channel — the variant
-/// shape exists for both signal and source-chain preservation.
-fn footer_lazy_err(e: LazyByteSourceError) -> FooterError {
-    FooterError::LazySource(e.to_string())
-}
-
 /// Test-only: where `bytes`' footer starts, and the footer decoded.
 #[cfg(test)]
 fn split_footer(bytes: &[u8]) -> (usize, ParquetMetaData) {
