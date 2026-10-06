@@ -5,9 +5,9 @@
 //! across byte for byte.
 //!
 //! Regions are read from the footer rather than listed here, so one added
-//! later is covered by default. The Parquet body is compared by values
-//! instead: a rewrite re-encodes it, so its bytes legitimately differ.
-//! Distances are compared exactly — a splice is byte-faithful or broken.
+//! later is covered by default. The Parquet body is held to byte equality
+//! too, and the stored rows to value equality. Distances are compared
+//! exactly — a splice is byte-faithful or broken.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -24,14 +24,10 @@ use infino::{
     supertable::wal::tombstones_codec::decode_sidecar,
 };
 
-use super::corpus_shapes::{
-    TABLE, connect_corpus, corpus_dir, files_with_extension, footer_values, open_corpus,
-    probe_embedding, superfile_paths, vector_hits,
+use super::reindex_fixture::{
+    StaleTable, Staleness, TABLE, files_with_extension, footer_values, open_stale, probe_embedding,
+    repairing, superfile_paths, vector_hits,
 };
-
-/// The shape every test here runs on: a table carrying both an FTS index
-/// and a vector index, so "nothing but FTS moves" has something to move.
-const SHAPE: &str = "v6_with_vectors";
 
 // Footer keys come from `format::kv`, not from copies: a test that spells
 // them itself keeps passing after the writer renames one.
@@ -41,18 +37,19 @@ const REGION_OFFSET_SUFFIX: &str = ".offset";
 const REGION_LENGTH_SUFFIX: &str = ".length";
 /// The region a reindex exists to repair.
 const FTS_REGION: &str = "fts";
-/// The stable-id sidecar, which a rewrite re-encodes as a side effect.
+/// The stable-id sidecar, which a repair re-encodes as a side effect.
 const IDS_REGION: &str = "ids";
 /// The [`footer_kv::VEC_LAYOUT`] value for cell-directory subsections.
 const VEC_LAYOUT_MULTI_CELL: &str = "multi_cell_ivf";
 
-/// Regions a rewrite may change; everything else is held to byte equality.
+/// Regions a repair may change; everything else is held to byte equality.
 ///
-/// The id sidecar is here because the builder re-packs it unconditionally.
-/// A region joins this list only with its reason.
+/// The FTS blob is the index being repaired; the id sidecar is here because
+/// the builder re-packs it unconditionally. A region joins this list only
+/// with its reason.
 const REPAIRED_REGIONS: &[&str] = &[FTS_REGION, IDS_REGION];
 
-/// Rows the deletion tests remove; enough to span more than one superfile.
+/// Rows the deletion tests remove.
 pub(crate) const DELETED_DOCS: usize = 25;
 
 /// One superfile's spliced regions as `name -> bytes`, read from its footer.
@@ -175,33 +172,37 @@ pub(crate) fn rows_by_id(db: &Connection) -> Vec<(i128, String, String, Option<S
     out
 }
 
-/// Rewrite the shape's table in place, then drop the superseded bytes so
-/// what remains on disk is what the table now reads.
-fn rewrite(table: &Supertable) {
+/// Repair the table in place with the cheapest repair `staleness` needs,
+/// then drop the superseded bytes so what remains on disk is what the
+/// table now reads.
+///
+/// Every superfile has to be rewritten: a run that moved nothing would
+/// pass every byte-identity check below without carrying anything.
+fn repair(fixture: &StaleTable, staleness: Staleness) {
+    let table = &fixture.table;
     let report = table
-        .reindex(&ReindexOptions::rewriting())
-        .expect("a container rewrite is available to a hybrid table");
-    assert!(
-        report.rewritten > 0,
-        "the rewrite migrated nothing, so nothing below is being tested: {report:?}"
+        .reindex(&repairing(staleness))
+        .expect("repair the stale table");
+    assert_eq!(
+        report.rewritten, fixture.superfiles,
+        "{staleness:?}: the repair skipped superfiles, so nothing below is being tested: \
+         {report:?}"
     );
     table.gc(Duration::ZERO).expect("collect superseded bytes");
 }
 
-/// Every region except [`REPAIRED_REGIONS`] comes out byte-identical, and
-/// the FTS blob is asserted to have changed — a check where nothing moved
-/// would pass on an engine that did nothing.
+/// Every region except [`REPAIRED_REGIONS`] comes out byte-identical.
 ///
-/// Run per shape: the claim is worth as many writers as it is checked on.
-fn assert_only_repaired_regions_change(shape: &str) {
-    let Some((_tmp, table, root)) = open_corpus(shape) else {
-        return;
-    };
+/// Run per repair: re-analysis and a layout rewrite each build their own
+/// FTS blob and carry everything else.
+fn assert_only_repaired_regions_change(staleness: Staleness) {
+    let fixture = open_stale(staleness);
+    let root = fixture.root();
 
-    let before = table_regions(&root);
+    let before = table_regions(root);
     assert!(
         before.contains_key(FTS_REGION),
-        "{shape}: the fixture declares no FTS region, so this proves nothing: {:?}",
+        "{staleness:?}: the fixture declares no FTS region, so this proves nothing: {:?}",
         before.keys().collect::<Vec<_>>()
     );
     let carried: Vec<&String> = before
@@ -209,18 +210,16 @@ fn assert_only_repaired_regions_change(shape: &str) {
         .filter(|n| !REPAIRED_REGIONS.contains(&n.as_str()))
         .collect();
 
-    rewrite(&table);
-    let after = table_regions(&root);
+    repair(&fixture, staleness);
+    let after = table_regions(root);
 
-    // Only carried regions must be the same set: the oldest shapes gain an
-    // id sidecar they never had, which is a repair, not a defect.
     let carried_after: Vec<&String> = after
         .keys()
         .filter(|n| !REPAIRED_REGIONS.contains(&n.as_str()))
         .collect();
     assert_eq!(
         carried, carried_after,
-        "{shape}: a rewrite added or dropped a region it does not repair"
+        "{staleness:?}: a repair added or dropped a region it does not repair"
     );
     // Report every moved region, not just the first: stopping at one hides
     // the rest.
@@ -234,242 +233,160 @@ fn assert_only_repaired_regions_change(shape: &str) {
         .collect();
     assert!(
         moved.is_empty(),
-        "{shape}: a rewrite changed {} region(s) it does not repair — either \
-         the change is a defect, or the region belongs in REPAIRED_REGIONS \
-         with the reason written down:\n{}",
+        "{staleness:?}: a repair changed {} region(s) it does not repair — \
+         either the change is a defect, or the region belongs in \
+         REPAIRED_REGIONS with the reason written down:\n{}",
         moved.len(),
         moved.join("\n")
     );
-    assert_ne!(
-        before.get(FTS_REGION),
-        after.get(FTS_REGION),
-        "{shape}: the FTS region came through unchanged, so the rewrite \
-         repaired nothing"
-    );
-}
-
-// No `v1_positionless` case: a v1-era record names no analyzer, so the
-// table cannot be opened at all. `corpus_shapes::v1_positionless` pins it.
-
-#[test]
-fn a_positions_region_rewrite_changes_only_what_it_repairs() {
-    assert_only_repaired_regions_change("v2_positions_region");
 }
 
 #[test]
-fn a_bitset_block_rewrite_changes_only_what_it_repairs() {
-    assert_only_repaired_regions_change("v4_bitset_blocks");
+fn a_reanalysis_changes_only_what_it_repairs() {
+    assert_only_repaired_regions_change(Staleness::Analysis);
 }
 
 #[test]
-fn a_positionless_rewrite_changes_only_what_it_repairs() {
-    assert_only_repaired_regions_change("v5_positionless");
+fn a_rewrite_changes_only_what_it_repairs() {
+    assert_only_repaired_regions_change(Staleness::DuplicatedFooter);
 }
 
-#[test]
-fn a_positional_rewrite_changes_only_what_it_repairs() {
-    assert_only_repaired_regions_change("v5_positional");
-}
-
-#[test]
-fn a_coarse_rewrite_changes_only_what_it_repairs() {
-    assert_only_repaired_regions_change("v6_positional");
-}
-
-#[test]
-fn a_hybrid_rewrite_changes_only_what_it_repairs() {
-    assert_only_repaired_regions_change(SHAPE);
-}
-
-/// Vector results survive a rewrite exactly — the same neighbours at the
+/// Vector results survive a repair exactly — the same neighbours at the
 /// same distances, compared without tolerance.
 #[test]
-fn a_rewrite_preserves_vector_ids_and_distances_exactly() {
-    let Some((_tmp, table, _root)) = open_corpus(SHAPE) else {
-        return;
-    };
+fn a_repair_preserves_vector_ids_and_distances_exactly() {
+    let fixture = open_stale(Staleness::Analysis);
+    let table = &fixture.table;
 
     let probe = probe_embedding();
-    let before = vector_hits(&table, &probe);
+    let before = vector_hits(table, &probe);
     assert!(
         !before.is_empty(),
         "the fixture's vector index returns nothing"
     );
 
-    rewrite(&table);
+    repair(&fixture, Staleness::Analysis);
 
     assert_eq!(
-        vector_hits(&table, &probe),
+        vector_hits(table, &probe),
         before,
-        "a rewrite moved the vector results it is supposed to splice across untouched"
+        "a repair moved the vector results it is supposed to splice across untouched"
     );
 }
 
-/// The stored columns and their ids round-trip a rewrite unchanged, in
+/// The stored columns and their ids round-trip a repair unchanged, in
 /// the same order.
 #[test]
-fn a_rewrite_round_trips_the_stored_columns() {
-    let Some((_tmp, db, _root)) = connect_corpus(SHAPE) else {
-        return;
-    };
-    let table = db.open_table(TABLE).expect("open corpus table");
+fn a_repair_round_trips_the_stored_columns() {
+    let fixture = open_stale(Staleness::Analysis);
 
-    let before = rows_by_id(&db);
+    let before = rows_by_id(&fixture.db);
     assert!(!before.is_empty(), "the fixture has no rows");
 
-    rewrite(&table);
+    repair(&fixture, Staleness::Analysis);
 
-    let after = rows_by_id(&db);
     assert_eq!(
-        after, before,
-        "a rewrite changed the stored columns or the order they come back in"
+        rows_by_id(&fixture.db),
+        before,
+        "a repair changed the stored columns or the order they come back in"
     );
 }
 
-/// The id sidecar is upgraded, not merely disturbed: raw array in, packed
-/// and smaller out. That the ids survive is
-/// [`a_rewrite_round_trips_the_stored_columns`]'s claim, not this one.
+/// The fixture really is multi-cell, so the byte-identity claim covers
+/// the layout hardest to carry. A fixture that wrote single-cell would
+/// weaken every vector claim here without failing one.
 #[test]
-fn a_rewrite_upgrades_the_id_sidecar_to_the_packed_layout() {
-    let Some((_tmp, table, root)) = open_corpus(SHAPE) else {
-        return;
-    };
+fn the_fixture_carries_multi_cell_vector_subsections() {
+    let fixture = open_stale(Staleness::Analysis);
 
-    let before_layouts = footer_values(&root, footer_kv::IDS_LAYOUT);
-    assert!(
-        before_layouts.iter().all(Option::is_none),
-        "the fixture already names an id-sidecar layout, so it cannot show \
-         the upgrade: {before_layouts:?}"
-    );
-    let before_bytes = total_ids_bytes(&root);
+    let layouts = footer_values(fixture.root(), footer_kv::VEC_LAYOUT);
 
-    rewrite(&table);
-
-    let after_layouts = footer_values(&root, footer_kv::IDS_LAYOUT);
-    assert!(
-        after_layouts
-            .iter()
-            .all(|l| l.as_deref() == Some(footer_kv::IDS_LAYOUT_PACKED)),
-        "a rewrite left an id sidecar in a layout other than the packed \
-         one: {after_layouts:?}"
-    );
-    let after_bytes = total_ids_bytes(&root);
-    assert!(
-        after_bytes < before_bytes,
-        "the packed sidecar is no smaller than the raw array it replaced: \
-         {before_bytes} -> {after_bytes} bytes"
-    );
-}
-
-/// Bytes every superfile under `root` spends on its id sidecar.
-fn total_ids_bytes(root: &Path) -> usize {
-    table_regions(root)
-        .get(IDS_REGION)
-        .map(|regions| regions.iter().map(Vec::len).sum())
-        .unwrap_or_default()
-}
-
-/// The hybrid fixture really is multi-cell, so the byte-identity claim
-/// covers the layout hardest to carry. A fixture that regenerated as
-/// single-cell would weaken every vector claim here without failing one.
-#[test]
-fn the_hybrid_fixture_carries_multi_cell_vector_subsections() {
-    let Some(dir) = corpus_dir(SHAPE) else {
-        return;
-    };
-
-    let layouts = footer_values(&dir, footer_kv::VEC_LAYOUT);
-
-    assert!(!layouts.is_empty(), "the hybrid fixture has no superfiles");
+    assert_eq!(layouts.len(), fixture.superfiles, "{layouts:?}");
     assert!(
         layouts
             .iter()
             .all(|l| l.as_deref() == Some(VEC_LAYOUT_MULTI_CELL)),
-        "the hybrid fixture is not multi-cell throughout, so the vector \
+        "the fixture is not multi-cell throughout, so the vector \
          byte-identity claim covers less than it appears to: {layouts:?}"
     );
 }
 
-/// A rewrite does not resurrect a deleted row.
+/// A repair does not resurrect a deleted row.
 ///
-/// Tombstones are keyed by local doc id and a rewrite mints a new
+/// Tombstones are keyed by local doc id and a repair mints a new
 /// superfile id, so the carry is where dead rows come back.
 #[test]
-fn a_rewrite_keeps_deleted_rows_deleted() {
-    let Some((_tmp, db, _root)) = connect_corpus(SHAPE) else {
-        return;
-    };
-    let table = db.open_table(TABLE).expect("open corpus table");
+fn a_repair_keeps_deleted_rows_deleted() {
+    let fixture = open_stale(Staleness::Analysis);
+    let (db, table) = (&fixture.db, &fixture.table);
 
-    let deleted = delete_leading_rows(&db, &table);
-    let live_before: Vec<i128> = rows_by_id(&db).into_iter().map(|(id, ..)| id).collect();
+    let deleted = delete_leading_rows(db, table);
+    let live_before: Vec<i128> = rows_by_id(db).into_iter().map(|(id, ..)| id).collect();
     assert!(
         live_before.iter().all(|id| !deleted.contains(id)),
-        "a deleted row was still readable before the rewrite"
+        "a deleted row was still readable before the repair"
     );
     let probe = probe_embedding();
-    let vector_before = vector_hits(&table, &probe);
+    let vector_before = vector_hits(table, &probe);
     assert!(
         vector_before.iter().all(|(id, _)| !deleted.contains(id)),
-        "vector search returned a deleted row before the rewrite"
+        "vector search returned a deleted row before the repair"
     );
 
-    rewrite(&table);
+    repair(&fixture, Staleness::Analysis);
 
-    let live_after: Vec<i128> = rows_by_id(&db).into_iter().map(|(id, ..)| id).collect();
+    let live_after: Vec<i128> = rows_by_id(db).into_iter().map(|(id, ..)| id).collect();
     assert!(
         live_after.iter().all(|id| !deleted.contains(id)),
-        "a rewrite brought a deleted row back to life"
+        "a repair brought a deleted row back to life"
     );
     assert_eq!(
         live_after, live_before,
-        "a rewrite changed which rows are live, or the order they read in"
+        "a repair changed which rows are live, or the order they read in"
     );
-    let vector_after = vector_hits(&table, &probe);
+    let vector_after = vector_hits(table, &probe);
     assert!(
         vector_after.iter().all(|(id, _)| !deleted.contains(id)),
-        "vector search returned a deleted row after the rewrite"
+        "vector search returned a deleted row after the repair"
     );
     assert_eq!(
         vector_after, vector_before,
-        "a rewrite moved the vector results of a table with deletions"
+        "a repair moved the vector results of a table with deletions"
     );
 }
 
-/// The rewrite carries the tombstones rather than dropping the rows:
+/// The repair carries the tombstones rather than dropping the rows:
 /// unchanged doc count, same bits under the new superfile id. A build that
-/// went back to dropping them would still pass
-/// [`a_rewrite_keeps_deleted_rows_deleted`] while renumbering every row.
+/// dropped them would still pass [`a_repair_keeps_deleted_rows_deleted`]
+/// while renumbering every row.
 #[test]
-fn a_rewrite_carries_the_tombstone_sidecar_to_the_new_superfile() {
-    let Some((_tmp, db, root)) = connect_corpus(SHAPE) else {
-        return;
-    };
-    let table = db.open_table(TABLE).expect("open corpus table");
+fn a_repair_carries_the_tombstone_sidecar_to_the_new_superfile() {
+    let fixture = open_stale(Staleness::Analysis);
+    let root = fixture.root();
 
-    delete_leading_rows(&db, &table);
+    delete_leading_rows(&fixture.db, &fixture.table);
 
-    let docs_before = total_docs(&root);
-    let sidecars_before = tombstone_bit_counts(&root);
+    let docs_before = total_docs(root);
+    let sidecars_before = tombstone_bit_counts(root);
     let bits_before: u64 = sidecars_before.iter().sum();
     assert_eq!(
         bits_before, DELETED_DOCS as u64,
         "the delete did not land the bits this test is about: {sidecars_before:?}"
     );
 
-    rewrite(&table);
+    repair(&fixture, Staleness::Analysis);
 
     assert_eq!(
-        total_docs(&root),
+        total_docs(root),
         docs_before,
-        "a rewrite dropped rows, so the surviving rows renumbered — the \
+        "a repair dropped rows, so the surviving rows renumbered — the \
          tombstones carried onto the output no longer name the same rows"
     );
-    let sidecars_after = tombstone_bit_counts(&root);
+    let sidecars_after = tombstone_bit_counts(root);
     assert_eq!(
         sidecars_after.iter().sum::<u64>(),
         bits_before,
-        "the rewrite did not carry the same number of tombstone bits: \
+        "the repair did not carry the same number of tombstone bits: \
          {sidecars_before:?} -> {sidecars_after:?}"
     );
 }
@@ -500,30 +417,27 @@ fn tombstone_bit_counts(root: &Path) -> Vec<u64> {
         .collect()
 }
 
-/// A migration still terminates on a table with deletions: a run that left
+/// A repair still terminates on a table with deletions: a run that left
 /// its output as stale as its input would rewrite the same files forever.
 #[test]
 fn a_second_run_over_a_table_with_deletions_has_nothing_to_do() {
-    let Some((_tmp, db, _root)) = connect_corpus(SHAPE) else {
-        return;
-    };
-    let table = db.open_table(TABLE).expect("open corpus table");
+    let fixture = open_stale(Staleness::Analysis);
+    let table = &fixture.table;
 
-    delete_leading_rows(&db, &table);
+    delete_leading_rows(&fixture.db, table);
 
-    rewrite(&table);
+    repair(&fixture, Staleness::Analysis);
 
     let after = table
         .index_staleness(&ReindexOptions::default())
-        .expect("assess the rewritten table");
-    assert_eq!(
-        after.needing_rewrite, 0,
-        "a rewritten table still reports containers to rewrite, so the \
-         migration would repeat this work on every run: {after:?}"
+        .expect("assess the repaired table");
+    assert!(
+        after.is_current(),
+        "a repaired table still reports work, so the run would repeat it: {after:?}"
     );
 
     let second = table
-        .reindex(&ReindexOptions::rewriting())
+        .reindex(&ReindexOptions::default())
         .expect("a second run is allowed");
     assert_eq!(
         second.rewritten, 0,
@@ -534,30 +448,39 @@ fn a_second_run_over_a_table_with_deletions_has_nothing_to_do() {
 
 /// The Parquet body is carried across byte for byte, not re-encoded.
 ///
-/// This is both a correctness claim and the proof that the carrying build
-/// ran at all: the merge path re-encodes the body with the current writer,
-/// so a fixture written by an older release could not come back identical.
-#[test]
-fn a_rewrite_carries_the_parquet_body_byte_for_byte() {
-    let Some((_tmp, table, root)) = open_corpus(SHAPE) else {
-        return;
-    };
+/// Run per repair, since each has its own carrying build.
+fn assert_body_carried(staleness: Staleness) {
+    let fixture = open_stale(staleness);
 
-    let before = table_bodies(&root);
-    assert!(!before.is_empty(), "the fixture has no superfiles");
+    let before = table_bodies(fixture.root());
+    assert_eq!(
+        before.len(),
+        fixture.superfiles,
+        "the fixture has no superfiles"
+    );
 
-    rewrite(&table);
+    repair(&fixture, staleness);
 
     assert_eq!(
-        table_bodies(&root),
+        table_bodies(fixture.root()),
         before,
-        "a rewrite re-encoded the Parquet body instead of carrying it"
+        "{staleness:?}: a repair re-encoded the Parquet body instead of carrying it"
     );
+}
+
+#[test]
+fn a_reanalysis_carries_the_parquet_body_byte_for_byte() {
+    assert_body_carried(Staleness::Analysis);
+}
+
+#[test]
+fn a_rewrite_carries_the_parquet_body_byte_for_byte() {
+    assert_body_carried(Staleness::DuplicatedFooter);
 }
 
 /// Each superfile's Parquet body — everything before the first spliced
 /// blob — with the bodies sorted so two tables compare without pairing
-/// superfile ids a rewrite has changed.
+/// superfile ids a repair has changed.
 fn table_bodies(root: &Path) -> Vec<Vec<u8>> {
     let mut bodies: Vec<Vec<u8>> = superfile_paths(root)
         .iter()

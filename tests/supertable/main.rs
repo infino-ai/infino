@@ -20,13 +20,16 @@
 //!   sweep policies + supertable-disk-cache integration.
 //! - **storage/**: the supertable-driven S3 smoke run.
 //!
+//! - **reindex / reindex_invariance**: planning and repairing a
+//!   stale table, and what a repair must carry across untouched,
+//!   over the stale tables `reindex_fixture` writes.
 //! - **reindex_crash**: killing a reindex mid-run and resuming
 //!   it. Spawn-self, but bundled here rather than given its own
 //!   top-level binary like `supertable_commit_crash_localfs.rs`:
-//!   its fixture is a corpus table, so it needs this binary's
-//!   corpus helpers, and duplicating them to keep the file at the
-//!   top level would cost more than it buys. `--exact` names the
-//!   one test the child re-enters.
+//!   it shares `reindex_fixture` and the invariance helpers, and
+//!   duplicating them to keep the file at the top level would cost
+//!   more than it buys. `--exact` names the one test the child
+//!   re-enters.
 //!
 //! Spawn-self tests
 //! (`supertable_commit_crash_localfs.rs`,
@@ -47,6 +50,7 @@ mod manifest;
 mod query;
 mod reindex;
 mod reindex_crash;
+mod reindex_fixture;
 mod reindex_invariance;
 mod storage;
 mod update_crash_property;
