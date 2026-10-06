@@ -2,7 +2,7 @@ name: Benchmark
 
 # Each PR is benchmarked A/B on one VM: the PR ref and base `main` are built
 # and run side by side and the PR is compared against that same-host main arm
-# (see supertable-bench-azure.yml). Findings are informational except the one
+# (see supertable-bench.yml). Findings are informational except the one
 # designated warm gate metric, which blocks the merge past >50% AND >5 ms.
 # Uses `pull_request_target` (not `pull_request`) so the job runs in the
 # base-repo context where the cloud credentials live — a fork `pull_request` run
@@ -22,7 +22,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/bench.yml"
-      - ".github/workflows/supertable-bench-azure.yml"
+      - ".github/workflows/supertable-bench.yml"
       # The merge gate itself: a change to the classifier must be re-benchmarked.
       - ".github/scripts/bench_summary.py"
   pull_request_target:
@@ -38,7 +38,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/bench.yml"
-      - ".github/workflows/supertable-bench-azure.yml"
+      - ".github/workflows/supertable-bench.yml"
       # The merge gate itself: a change to the classifier must be re-benchmarked.
       - ".github/scripts/bench_summary.py"
 
@@ -108,7 +108,7 @@ jobs:
       # Kept so summary_destination=pr_comment stays usable; PR runs default to
       # step_summary, so this path is exercised only by a manual dispatch.
       pull-requests: write
-    uses: ./.github/workflows/supertable-bench-azure.yml
+    uses: ./.github/workflows/supertable-bench.yml
     with:
       bench: ${{ matrix.bench }}
       docs: ${{ matrix.docs }}
