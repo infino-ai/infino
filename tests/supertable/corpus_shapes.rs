@@ -633,10 +633,9 @@ mod v6_with_vectors {
 /// postdates it. A reader therefore cannot tell these terms from an older
 /// chain's, and treats the column as stale.
 ///
-/// That is the conservative default working, not a defect: a file that
-/// cannot name its analysis gets re-analyzed rather than trusted. Pinning
-/// it here is what stops the default being quietly relaxed into "a recent
-/// container implies recent terms", which would leave the tables this
+/// That is intended, not a defect: a file that cannot name its analysis
+/// gets re-analyzed. Pinning it here stops "a recent container implies
+/// recent terms" from creeping in, which would leave the tables this
 /// migration exists for silently unrepaired.
 mod v6_positional {
     use super::*;

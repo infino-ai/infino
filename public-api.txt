@@ -600,11 +600,9 @@ impl core::panic::unwind_safe::UnwindSafe for infino::PlannedRepair
 pub infino::ReindexOptions::mode: infino::ReindexMode
 pub infino::ReindexOptions::stale_seal_timeout_ms: core::option::Option<u64>
 pub infino::ReindexOptions::target: infino::ReindexTarget
-pub infino::ReindexOptions::trust_writer_analysis: bool
 impl infino::ReindexOptions
 pub fn infino::ReindexOptions::reanalyzing() -> Self
 pub fn infino::ReindexOptions::rewriting() -> Self
-pub fn infino::ReindexOptions::trusting_writer_analysis(self) -> Self
 pub fn infino::ReindexOptions::with_mode(self, infino::ReindexMode) -> Self
 pub fn infino::ReindexOptions::with_stale_seal_timeout_ms(self, u64) -> Self
 pub fn infino::ReindexOptions::with_target(self, infino::ReindexTarget) -> Self

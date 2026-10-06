@@ -22,7 +22,10 @@
 
 use crate::superfile::{
     format,
-    fts::{analysis::chain_revision, reader::FtsReader},
+    fts::{
+        analysis::{UNKNOWN_ANALYSIS_REVISION, chain_revision},
+        reader::FtsReader,
+    },
 };
 
 /// What is behind in one superfile's FTS index, if anything.
@@ -40,7 +43,7 @@ pub(crate) struct FtsStaleness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StaleColumn {
     pub(crate) name: String,
-    /// The revision the column records; `0` when it predates the field.
+    /// The revision the column records; `0` when it records none.
     pub(crate) recorded: u32,
     /// The revision this engine's chain emits for the same analysis.
     pub(crate) current: u32,
@@ -97,13 +100,9 @@ impl FtsStaleness {
 impl FtsReader {
     /// What this index is behind on, if anything.
     ///
-    /// `assume_unrecorded` is the revision to credit a column that
-    /// records none. Zero is the only always-safe value: a file written
-    /// before the field existed may hold postings a still older engine
-    /// produced, carried through a merge, and nothing in it says so. A
-    /// caller that can rule that out passes the writer's revision instead
-    /// and saves re-analyzing terms that are already current.
-    pub(crate) fn staleness(&self, assume_unrecorded: u32) -> FtsStaleness {
+    /// A column recording no revision is stale: nothing in the file says
+    /// which analysis produced its terms.
+    pub(crate) fn staleness(&self) -> FtsStaleness {
         let container = match self.version < format::fts::VERSION_CURRENT {
             true => Some(self.version),
             false => None,
@@ -116,7 +115,7 @@ impl FtsReader {
                 // analyzed with `ascii_lower` is not stale because
                 // `standard` moved.
                 let current = chain_revision(c.base, c.stopwords, c.stemmer);
-                let recorded = c.analysis_revision.unwrap_or(assume_unrecorded);
+                let recorded = c.analysis_revision.unwrap_or(UNKNOWN_ANALYSIS_REVISION);
                 (recorded < current).then(|| StaleColumn {
                     name: c.name.clone(),
                     recorded,
@@ -181,8 +180,7 @@ mod tests {
     }
 
     /// Reopen the same index with the recorded revision stripped from its
-    /// column JSON, standing in for a file written before the field
-    /// existed. The builder always emits it, so no build produces this.
+    /// column JSON. The builder always emits it, so no build produces this.
     fn reader_recording_no_revision() -> FtsReader {
         let bytes = Bytes::from(built_bytes(None, true));
         let kv = format::footer::read_kv_metadata(&bytes).expect("kv");
@@ -207,52 +205,20 @@ mod tests {
         FtsReader::open(bytes.slice(off..off + len), &stripped).expect("open fts")
     }
 
-    /// A column recording no revision is credited the one it is told to
-    /// assume, and nothing more.
-    ///
-    /// The two callers differ on whether that inference is sound, so the
-    /// reader takes the number rather than deciding: crediting the
-    /// writer's revision is only safe where the file cannot have carried
-    /// postings from an older one.
+    /// A column recording no revision is stale and must be re-analyzed.
     #[test]
-    fn an_unrecorded_revision_is_credited_only_what_the_caller_assumes() {
-        let fts = reader_recording_no_revision();
-
-        let conservative = fts.staleness(0);
-        assert_eq!(conservative.analysis.len(), 1, "{conservative:?}");
-        assert_eq!(conservative.analysis[0].recorded, 0);
-        assert!(
-            conservative.needs_reanalysis(),
-            "assuming nothing, the terms are unknown and must be rebuilt"
-        );
-
-        let credited = fts.staleness(1);
-        assert!(
-            credited.is_current(),
-            "credited with revision 1 the column is current: {credited:?}"
-        );
-    }
-
-    /// Crediting an unrecorded revision must not touch a column that
-    /// records one. A recorded zero is a known-stale carry, not an
-    /// unknown, and the whole point of writing it down is that it
-    /// survives this.
-    #[test]
-    fn a_recorded_zero_is_not_credited() {
-        let stale = reader(Some(0), true).fts().expect("fts").staleness(1);
+    fn an_unrecorded_revision_is_stale() {
+        let stale = reader_recording_no_revision().staleness();
         assert_eq!(stale.analysis.len(), 1, "{stale:?}");
-        assert_eq!(stale.analysis[0].recorded, 0);
-        assert!(
-            stale.needs_reanalysis(),
-            "a recorded zero stays stale however generous the assumption"
-        );
+        assert_eq!(stale.analysis[0].recorded, UNKNOWN_ANALYSIS_REVISION);
+        assert!(stale.needs_reanalysis(), "{stale:?}");
     }
 
     /// A file this engine just wrote is behind on nothing.
     #[test]
     fn a_fresh_build_is_current() {
         let r = reader(None, true);
-        let stale = r.fts().expect("fts").staleness(0);
+        let stale = r.fts().expect("fts").staleness();
         assert!(stale.is_current(), "{stale:?}");
     }
 
@@ -263,7 +229,7 @@ mod tests {
     #[test]
     fn current_container_does_not_imply_current_analysis() {
         let r = reader(Some(0), true);
-        let stale = r.fts().expect("fts").staleness(0);
+        let stale = r.fts().expect("fts").staleness();
         assert_eq!(stale.container, None, "the container is this engine's");
         assert_eq!(stale.analysis.len(), 1, "{stale:?}");
         assert_eq!(stale.analysis[0].recorded, 0);
@@ -279,11 +245,11 @@ mod tests {
     /// repaired says so rather than looking finished.
     #[test]
     fn an_index_only_stale_column_is_reported_but_not_planned() {
-        let stored = reader(Some(0), true).fts().expect("fts").staleness(0);
+        let stored = reader(Some(0), true).fts().expect("fts").staleness();
         assert!(stored.needs_reanalysis(), "stored text can be re-analyzed");
         assert_eq!(stored.unrepairable_columns().count(), 0);
 
-        let index_only = reader(Some(0), false).fts().expect("fts").staleness(0);
+        let index_only = reader(Some(0), false).fts().expect("fts").staleness();
         assert_eq!(index_only.analysis.len(), 1, "it is stale");
         assert!(
             !index_only.needs_reanalysis(),

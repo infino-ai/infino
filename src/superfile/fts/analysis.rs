@@ -461,51 +461,6 @@ pub(crate) fn chain_revision(base: Base, stopwords: Stopwords, stemmer: Stemmer)
     combine_revisions(base.revision(), stopwords.revision(), stemmer.revision())
 }
 
-/// Prefix an `inf.builder` value carries when this engine wrote the file.
-const BUILDER_PREFIX: &str = "infino/";
-
-/// First crate version whose chains emit the revision they emit today.
-///
-/// The token-length cap, the single emitter behind the ASCII fast paths
-/// and `standard`'s emoji tokens all landed together and first shipped
-/// here; nothing has moved the tokenizer since. A file written by this
-/// version or later therefore holds revision-1 terms even though the
-/// field did not exist yet to say so.
-const FIRST_VERSION_AT_CURRENT_REVISION: (u32, u32, u32) = (0, 8, 3);
-
-/// The revision the chains were at from
-/// [`FIRST_VERSION_AT_CURRENT_REVISION`] onward.
-const REVISION_AT_THAT_VERSION: u32 = 1;
-
-/// The analysis revision an engine identified by `builder` emitted.
-///
-/// `builder` is an `inf.builder` value — `infino/<version>+<hash>`. It
-/// answers what a file's terms *would* be at when the file itself records
-/// nothing, which is only sound where that file cannot have carried
-/// postings from an older engine; see
-/// [`FtsReader::staleness`](super::reader::FtsReader::staleness).
-///
-/// Anything unparseable, or written by something other than this engine,
-/// reads as [`UNKNOWN_ANALYSIS_REVISION`] — a writer this cannot identify
-/// is never credited.
-pub(crate) fn analysis_revision_written_by(builder: &str) -> u32 {
-    let Some(rest) = builder.strip_prefix(BUILDER_PREFIX) else {
-        return UNKNOWN_ANALYSIS_REVISION;
-    };
-    // `+<hash>` is optional; a `-dirty` marker rides on the hash, so
-    // splitting at the `+` leaves the version alone.
-    let version = rest.split('+').next().unwrap_or_default();
-    let mut parts = version.split('.');
-    let mut next = || parts.next().and_then(|p| p.parse::<u32>().ok());
-    let (Some(major), Some(minor), Some(patch)) = (next(), next(), next()) else {
-        return UNKNOWN_ANALYSIS_REVISION;
-    };
-    match (major, minor, patch) >= FIRST_VERSION_AT_CURRENT_REVISION {
-        true => REVISION_AT_THAT_VERSION,
-        false => UNKNOWN_ANALYSIS_REVISION,
-    }
-}
-
 /// The revision to credit terms whose own is unknown.
 ///
 /// The oldest, so a column recording no revision can never read as
@@ -888,58 +843,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    /// Reading a writer's revision off its `inf.builder` string.
-    ///
-    /// The comparison is numeric per component: `0.8.10` is newer than
-    /// `0.8.3`, which a string compare gets backwards. Anything this
-    /// cannot parse reads as unknown, so an unrecognized writer is never
-    /// credited with terms it may not hold.
-    #[test]
-    fn a_writers_analysis_revision_is_read_from_its_version() {
-        for builder in [
-            "infino/0.8.3+abc123def456",
-            "infino/0.8.6+abc123def456",
-            "infino/0.8.10+abc123def456",
-            "infino/0.9.0+abc123def456",
-            "infino/1.0.0+abc123def456",
-            "infino/0.8.6+abc123def456-dirty",
-            "infino/0.8.6+unknown",
-            "infino/0.8.6",
-        ] {
-            assert_eq!(
-                analysis_revision_written_by(builder),
-                1,
-                "{builder} shipped the current chains"
-            );
-        }
-
-        for builder in [
-            "infino/0.8.2+abc123def456",
-            "infino/0.1.0+abc123def456",
-            "infino/0.0.0+abc123def456",
-        ] {
-            assert_eq!(
-                analysis_revision_written_by(builder),
-                UNKNOWN_ANALYSIS_REVISION,
-                "{builder} predates the current chains"
-            );
-        }
-
-        for builder in [
-            "",
-            "infino/",
-            "infino/x.y.z+abc",
-            "0.8.6",
-            "other/9.9.9+abc",
-        ] {
-            assert_eq!(
-                analysis_revision_written_by(builder),
-                UNKNOWN_ANALYSIS_REVISION,
-                "{builder:?} is not a writer this engine recognizes"
-            );
         }
     }
 

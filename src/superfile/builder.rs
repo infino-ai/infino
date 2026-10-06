@@ -3359,11 +3359,8 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         if !c.stored {
             s.push_str(r#","stored":false"#);
         }
-        // Always emitted, zero included: a missing field is reserved for
-        // files written before revisions existed, whose analysis this
-        // engine can only infer from the writer's version. Omitting a
-        // known zero would put a carried-stale column in that same
-        // bucket and let it be credited with terms it does not hold.
+        // Always emitted, zero included, so every column names the
+        // analysis revision its terms were produced at.
         s.push_str(r#","analysis_revision":"#);
         s.push_str(&c.analysis_revision().to_string());
         s.push('}');
@@ -3750,13 +3747,8 @@ mod tests {
         assert!(!kv.contains_key("inf.fts.offset"));
     }
 
-    /// Every column records a revision, zero included.
-    ///
-    /// Omitting a zero would make a carried-from-pre-revision column
-    /// indistinguishable from one written before the field existed, and
-    /// those mean different things: the first is known-stale, the second
-    /// is unknown. Only a reader that can tell them apart may credit an
-    /// unrecorded column with the revision its writer would have emitted.
+    /// Every column records a revision, zero included, so no file this
+    /// engine writes leaves its analysis unknown.
     #[test]
     fn every_column_records_its_analysis_revision() {
         let fresh = fts_columns_json(&[FtsConfig::new("title")]);

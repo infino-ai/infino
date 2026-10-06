@@ -240,18 +240,11 @@ class OptimizeOptions:
     ) -> None: ...
 
 class ReindexOptions:
-    # `trust_writer_analysis=True` credits a superfile recording no analysis
-    # revision with the one its writer emitted. It is only sound when the table
-    # never held superfiles older than that writer: an older compaction can
-    # have folded stale terms into a newer-stamped file, and crediting it
-    # reports the table migrated with those terms still in place. Leave it off
-    # unless the table's whole history is known.
     def __init__(
         self,
         *,
         mode: ReindexMode | None = ...,
         stale_seal_timeout_ms: int | None = ...,
-        trust_writer_analysis: bool = ...,
     ) -> None: ...
 
 class ReindexReport:

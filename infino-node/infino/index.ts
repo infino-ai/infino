@@ -132,15 +132,6 @@ export interface ReindexOptions {
   /** How old a sealed tombstone sidecar has to be, in milliseconds, before a
    * rewrite takes it over. Omit to use the table's compaction setting. */
   staleSealTimeoutMs?: number;
-  /**
-   * Credit a superfile that records no analysis revision with the one its
-   * writer emitted (default `false`). **Only sound when the table never held
-   * superfiles older than that writer**: an older compaction can have folded
-   * stale terms into a newer-stamped file, and crediting it reports the table
-   * migrated with those terms still in place. Leave unset unless the table's
-   * whole history is known.
-   */
-  trustWriterAnalysis?: boolean;
 }
 
 /** What a `reindex` did. */

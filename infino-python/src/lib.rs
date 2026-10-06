@@ -646,22 +646,16 @@ impl CompactOptions {
 struct ReindexOptions {
     mode: Option<String>,
     stale_seal_timeout_ms: Option<u64>,
-    trust_writer_analysis: bool,
 }
 
 #[pymethods]
 impl ReindexOptions {
     #[new]
-    #[pyo3(signature = (*, mode=None, stale_seal_timeout_ms=None, trust_writer_analysis=false))]
-    fn new(
-        mode: Option<String>,
-        stale_seal_timeout_ms: Option<u64>,
-        trust_writer_analysis: bool,
-    ) -> Self {
+    #[pyo3(signature = (*, mode=None, stale_seal_timeout_ms=None))]
+    fn new(mode: Option<String>, stale_seal_timeout_ms: Option<u64>) -> Self {
         Self {
             mode,
             stale_seal_timeout_ms,
-            trust_writer_analysis,
         }
     }
 }
@@ -676,9 +670,6 @@ impl ReindexOptions {
         }
         if let Some(ms) = self.stale_seal_timeout_ms {
             out = out.with_stale_seal_timeout_ms(ms);
-        }
-        if self.trust_writer_analysis {
-            out = out.trusting_writer_analysis();
         }
         Ok(out)
     }

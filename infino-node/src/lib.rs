@@ -193,9 +193,6 @@ fn reindex_options(opts: Option<ReindexOptions>) -> Result<InfinoReindexOptions>
         })?;
         out = out.with_stale_seal_timeout_ms(ms);
     }
-    if o.trust_writer_analysis == Some(true) {
-        out = out.trusting_writer_analysis();
-    }
     Ok(out)
 }
 
@@ -636,13 +633,6 @@ pub struct ReindexOptions {
     // `i64`, not `u32`: a JS number carries any timeout up to 2^53 ms, and a
     // `u32` would wrap the ones past ~49 days instead of passing them on.
     pub stale_seal_timeout_ms: Option<i64>,
-    /// Credit a superfile that records no analysis revision with the one its
-    /// writer emitted (default `false`). **Only sound when the table never held
-    /// superfiles older than that writer**: an older compaction can have folded
-    /// stale terms into a newer-stamped file, and crediting it reports the
-    /// table migrated with those terms still in place. Leave unset unless the
-    /// table's whole history is known.
-    pub trust_writer_analysis: Option<bool>,
 }
 
 /// What a `reindex` did.
