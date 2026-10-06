@@ -5,7 +5,7 @@ name: Benchmark
 # (see supertable-bench-azure.yml). Findings are informational except the one
 # designated warm gate metric, which blocks the merge past >50% AND >5 ms.
 # Uses `pull_request_target` (not `pull_request`) so the job runs in the
-# base-repo context where the Azure secrets live — a fork `pull_request` run
+# base-repo context where the cloud credentials live — a fork `pull_request` run
 # gets none. Fork code is gated on maintainer approval before secrets are
 # exposed (see `is_fork_pr`).
 on:
@@ -44,7 +44,7 @@ on:
 
 jobs:
   bench:
-    # Skip on forks (no Azure secrets); fork PRs into upstream still run.
+    # Skip on forks (no cloud credentials); fork PRs into upstream still run.
     if: github.repository_owner == 'infino-ai'
     strategy:
       fail-fast: false # one member failing must not cancel the other
