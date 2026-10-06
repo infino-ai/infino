@@ -34,7 +34,10 @@
 //! Nothing here reads or writes a blob. It takes term sets and returns
 //! an order, so it can be tested against the cost it claims to lower.
 
-use std::sync::{Mutex, PoisonError};
+use std::{
+    mem,
+    sync::{Mutex, PoisonError},
+};
 
 use rayon::{join, prelude::*};
 
@@ -58,6 +61,14 @@ const MAX_DEPTH: u32 = 24;
 /// below it, and at 256 KiB per side the tables stay in cache. Larger
 /// degrees call [`term_cost`] directly, so the values are the same.
 const COST_TABLE_LEN: usize = 1 << 16;
+
+/// How many ranked documents per side a round orders before it starts
+/// swapping. A round only reads down its two lists until a pair stops paying
+/// for itself, and after the first round or two that prefix is tiny, so
+/// ordering the whole partition every round is almost all waste. The block
+/// doubles when a round consumes it, which costs one extra linear selection
+/// per doubling and never changes which swaps happen.
+const SWAP_BLOCK: usize = 64;
 
 /// Partitions below this size are split on one thread, with one scratch
 /// state for their whole subtree. Above it the two halves recurse in
@@ -146,7 +157,7 @@ pub(crate) fn bisect_order(fwd: &ForwardIndex) -> Vec<u32> {
 /// of a large partition in parallel.
 fn split_parallel(fwd: &ForwardIndex, order: &mut [u32], depth: u32, pool: &StatePool) {
     if order.len() < PARALLEL_MIN_PARTITION {
-        pool.with_state(|state| state.split(fwd, order, depth));
+        pool.with_state(|state| state.split_localized(fwd, order, depth));
         return;
     }
     if depth >= MAX_DEPTH {
@@ -206,6 +217,12 @@ struct BisectState {
     /// be cleared in proportion to the partition rather than to the
     /// vocabulary.
     touched: Vec<u32>,
+    /// Ranked documents for each side, reused by every round of every
+    /// split this state serves. Ranking used to return a fresh `Vec` per
+    /// side per round, which is two allocations per round per partition —
+    /// millions of them over a corpus-sized bisection.
+    left_gains: Vec<(f32, u32)>,
+    right_gains: Vec<(f32, u32)>,
 }
 
 impl BisectState {
@@ -218,6 +235,69 @@ impl BisectState {
             cost_left: Vec::new(),
             cost_right: Vec::new(),
             touched: Vec::new(),
+            left_gains: Vec::new(),
+            right_gains: Vec::new(),
+        }
+    }
+
+    /// Split a partition small enough to own its vocabulary: renumber the
+    /// terms it actually carries into a dense range and run the whole
+    /// subtree against that instead of against the corpus vocabulary.
+    ///
+    /// The degree and move-gain tables are indexed by term id, so over the
+    /// shared vocabulary they stay `n_terms` entries wide however few
+    /// documents a partition holds — tens of megabytes that every round
+    /// walks at random and misses cache on, even once a partition is down
+    /// to a few thousand documents. Renumbering costs one pass over this
+    /// partition's postings, and every split beneath it inherits tables
+    /// sized to the terms actually present.
+    ///
+    /// Renumbering is a bijection, so every degree, gain and comparison is
+    /// unchanged, and the terms within a document keep their order, so the
+    /// gain sums add in the same sequence and to the same float.
+    fn split_localized(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32) {
+        if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
+            return;
+        }
+
+        // Outside a refine `deg_left` is all zeros — `clear_degrees` leaves
+        // it that way and this runs in a refine's place — so it serves as
+        // the global-to-local term map without a second table that size.
+        // Zero means "not seen here"; a local id is held as `id + 1`.
+        let mut terms: Vec<u32> = Vec::with_capacity(order.len() * 8);
+        let mut starts: Vec<u32> = Vec::with_capacity(order.len() + 1);
+        starts.push(0);
+        let mut n_local = 0u32;
+        for &d in order.iter() {
+            for &t in fwd.doc(d) {
+                let slot = &mut self.deg_left[t as usize];
+                if *slot == 0 {
+                    n_local += 1;
+                    *slot = n_local;
+                    self.touched.push(t);
+                }
+                terms.push(*slot - 1);
+            }
+            starts.push(terms.len() as u32);
+        }
+        for &t in &self.touched {
+            self.deg_left[t as usize] = 0;
+        }
+        self.touched.clear();
+
+        let local = ForwardIndex {
+            terms,
+            starts,
+            n_terms: n_local as usize,
+        };
+        // Positions within this partition, permuted by the subtree and then
+        // applied to the caller's slice.
+        let mut local_order: Vec<u32> = (0..order.len() as u32).collect();
+        BisectState::new(local.n_terms).split(&local, &mut local_order, depth);
+
+        let was: Vec<u32> = order.to_vec();
+        for (slot, &l) in order.iter_mut().zip(local_order.iter()) {
+            *slot = was[l as usize];
         }
     }
 
@@ -242,6 +322,13 @@ impl BisectState {
         fill_cost_table(&mut self.cost_left, n_left);
         fill_cost_table(&mut self.cost_right, n_right);
 
+        // Taken out of `self` so the ranking can borrow the move-gain
+        // tables while writing them, and put back before returning so the
+        // next split reuses the same allocations.
+        let mut left_gains = mem::take(&mut self.left_gains);
+        let mut right_gains = mem::take(&mut self.right_gains);
+        let mut last_swaps = 0usize;
+
         for _ in 0..MAX_ROUNDS {
             // A document's gain is what the cost drops by if it moves:
             // its terms get one rarer on this side and one commoner on
@@ -249,16 +336,33 @@ impl BisectState {
             let moved = {
                 self.compute_move_gains(n_left, n_right);
                 let (left, right) = order.split_at_mut(mid);
-                let mut left_gains = rank_by_gain(fwd, left, &self.move_gain_left, parallel);
-                let mut right_gains = rank_by_gain(fwd, right, &self.move_gain_right, parallel);
-                sort_by_gain(&mut left_gains, parallel);
-                sort_by_gain(&mut right_gains, parallel);
+                rank_by_gain(fwd, left, &self.move_gain_left, parallel, &mut left_gains);
+                rank_by_gain(
+                    fwd,
+                    right,
+                    &self.move_gain_right,
+                    parallel,
+                    &mut right_gains,
+                );
 
                 // Swap in pairs so the halves keep their sizes. Both
-                // lists are sorted by gain, so once a pair does not pay
-                // for itself no later pair can either.
+                // lists are ordered by gain, so once a pair does not pay
+                // for itself no later pair can either — which is why only
+                // the leading `ready` entries need to be in order, and why
+                // extending the block cannot change the outcome.
+                let pairs = left_gains.len().min(right_gains.len());
+                let mut ready = last_swaps.saturating_mul(2).max(SWAP_BLOCK).min(pairs);
+                order_leading_gains(&mut left_gains, ready, parallel);
+                order_leading_gains(&mut right_gains, ready, parallel);
+
                 let mut swaps = 0usize;
-                for (l, r) in left_gains.iter().zip(right_gains.iter()) {
+                while swaps < pairs {
+                    if swaps == ready {
+                        ready = (ready * 2).min(pairs);
+                        order_leading_gains(&mut left_gains, ready, parallel);
+                        order_leading_gains(&mut right_gains, ready, parallel);
+                    }
+                    let (l, r) = (left_gains[swaps], right_gains[swaps]);
                     if l.0 + r.0 <= 0.0 {
                         break;
                     }
@@ -279,10 +383,14 @@ impl BisectState {
                 }
                 swaps
             };
+            last_swaps = moved;
             if moved == 0 {
                 break;
             }
         }
+
+        self.left_gains = left_gains;
+        self.right_gains = right_gains;
         self.clear_degrees();
     }
 
@@ -338,14 +446,18 @@ impl BisectState {
     }
 }
 
-/// `(gain, position within the half)` for every document in `half`:
-/// the sum of its terms' move gains for that side.
+/// `(gain, position within the half)` for every document in `half`: the
+/// sum of its terms' move gains for that side, written into `out`.
+///
+/// Takes the output buffer rather than returning one so a split's rounds
+/// share two allocations instead of making two apiece.
 fn rank_by_gain(
     fwd: &ForwardIndex,
     half: &[u32],
     move_gain: &[f32],
     parallel: bool,
-) -> Vec<(f32, u32)> {
+    out: &mut Vec<(f32, u32)>,
+) {
     let gain_of = |(i, &d): (usize, &u32)| {
         let mut gain = 0.0f32;
         for &t in fwd.doc(d) {
@@ -353,19 +465,41 @@ fn rank_by_gain(
         }
         (gain, i as u32)
     };
+    out.clear();
     match parallel {
-        true => half.par_iter().enumerate().map(gain_of).collect(),
-        false => half.iter().enumerate().map(gain_of).collect(),
+        // `par_extend` over an indexed iterator fills `out` in index
+        // order, so the ranking is the same whichever way it ran.
+        true => out.par_extend(half.par_iter().enumerate().map(gain_of)),
+        false => out.extend(half.iter().enumerate().map(gain_of)),
     }
 }
 
-/// Sort by gain, highest first, ties by position. Positions are unique,
-/// so the result is the same whichever sort runs.
-fn sort_by_gain(gains: &mut [(f32, u32)], parallel: bool) {
-    let by_gain = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+/// Put the `want` highest-gain entries at the front of `gains`, in the
+/// order a full sort would have put them; leave the rest unordered.
+///
+/// Ties break by position, which is unique, so the comparison is a total
+/// order and the leading `want` entries are the same whatever `want` was
+/// asked for before. That is what lets a round grow its block without
+/// changing which documents it swaps.
+fn order_leading_gains(gains: &mut [(f32, u32)], want: usize, parallel: bool) {
+    let by = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+    if want >= gains.len() {
+        match parallel {
+            true => gains.par_sort_by(by),
+            false => gains.sort_by(by),
+        }
+        return;
+    }
+    if want == 0 {
+        return;
+    }
+    // Linear-time partition around the `want`-th entry, then order only
+    // what sits in front of it.
+    gains.select_nth_unstable_by(want, by);
+    let head = &mut gains[..want];
     match parallel {
-        true => gains.par_sort_by(by_gain),
-        false => gains.sort_by(by_gain),
+        true => head.par_sort_by(by),
+        false => head.sort_by(by),
     }
 }
 
@@ -570,6 +704,164 @@ mod tests {
                 side.cost(d).to_bits(),
                 term_cost(d, SIZE).to_bits(),
                 "d={d}"
+            );
+        }
+    }
+
+    /// Today's bisection, kept verbatim as an oracle.
+    ///
+    /// Every optimization in this module is required to leave the chosen
+    /// order byte-for-byte unchanged — that is what lets them ship without
+    /// re-arguing reorder quality. This is the thing they are checked
+    /// against: a direct transcription of the straightforward algorithm,
+    /// full sorts and full recomputation per round, no reuse, no
+    /// renumbering. It is slow on purpose.
+    struct RefState {
+        deg_left: Vec<u32>,
+        deg_right: Vec<u32>,
+        move_gain_left: Vec<f32>,
+        move_gain_right: Vec<f32>,
+        cost_left: Vec<f32>,
+        cost_right: Vec<f32>,
+        touched: Vec<u32>,
+    }
+
+    impl RefState {
+        fn new(n_terms: usize) -> Self {
+            Self {
+                deg_left: vec![0; n_terms],
+                deg_right: vec![0; n_terms],
+                move_gain_left: vec![0.0; n_terms],
+                move_gain_right: vec![0.0; n_terms],
+                cost_left: Vec::new(),
+                cost_right: Vec::new(),
+                touched: Vec::new(),
+            }
+        }
+
+        fn split(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32) {
+            if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
+                return;
+            }
+            let mid = order.len() / 2;
+            self.refine(fwd, order, mid);
+            let (left, right) = order.split_at_mut(mid);
+            self.split(fwd, left, depth + 1);
+            self.split(fwd, right, depth + 1);
+        }
+
+        fn refine(&mut self, fwd: &ForwardIndex, order: &mut [u32], mid: usize) {
+            for (i, &d) in order.iter().enumerate() {
+                for &t in fwd.doc(d) {
+                    if self.deg_left[t as usize] == 0 && self.deg_right[t as usize] == 0 {
+                        self.touched.push(t);
+                    }
+                    match i < mid {
+                        true => self.deg_left[t as usize] += 1,
+                        false => self.deg_right[t as usize] += 1,
+                    }
+                }
+            }
+            let n_left = mid as f32;
+            let n_right = (order.len() - mid) as f32;
+            fill_cost_table(&mut self.cost_left, n_left);
+            fill_cost_table(&mut self.cost_right, n_right);
+
+            for _ in 0..MAX_ROUNDS {
+                for &t in &self.touched {
+                    let t = t as usize;
+                    let (dl, dr) = (self.deg_left[t], self.deg_right[t]);
+                    let left = Side {
+                        deg: dl,
+                        size: n_left,
+                        costs: &self.cost_left,
+                    };
+                    let right = Side {
+                        deg: dr,
+                        size: n_right,
+                        costs: &self.cost_right,
+                    };
+                    if dl > 0 {
+                        self.move_gain_left[t] = move_gain(&left, &right);
+                    }
+                    if dr > 0 {
+                        self.move_gain_right[t] = move_gain(&right, &left);
+                    }
+                }
+                let (left, right) = order.split_at_mut(mid);
+                let gains = |half: &[u32], g: &[f32]| -> Vec<(f32, u32)> {
+                    half.iter()
+                        .enumerate()
+                        .map(|(i, &d)| {
+                            (
+                                fwd.doc(d).iter().map(|&t| g[t as usize]).sum::<f32>(),
+                                i as u32,
+                            )
+                        })
+                        .collect()
+                };
+                let mut lg = gains(left, &self.move_gain_left);
+                let mut rg = gains(right, &self.move_gain_right);
+                let by = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+                lg.sort_by(by);
+                rg.sort_by(by);
+
+                let mut swaps = 0usize;
+                for (l, r) in lg.iter().zip(rg.iter()) {
+                    if l.0 + r.0 <= 0.0 {
+                        break;
+                    }
+                    swaps += 1;
+                    let (li, ri) = (l.1 as usize, r.1 as usize);
+                    let (ld, rd) = (left[li], right[ri]);
+                    for &t in fwd.doc(ld) {
+                        self.deg_left[t as usize] -= 1;
+                        self.deg_right[t as usize] += 1;
+                    }
+                    for &t in fwd.doc(rd) {
+                        self.deg_right[t as usize] -= 1;
+                        self.deg_left[t as usize] += 1;
+                    }
+                    left[li] = rd;
+                    right[ri] = ld;
+                }
+                if swaps == 0 {
+                    break;
+                }
+            }
+            for &t in &self.touched {
+                self.deg_left[t as usize] = 0;
+                self.deg_right[t as usize] = 0;
+            }
+            self.touched.clear();
+        }
+    }
+
+    fn reference_order(fwd: &ForwardIndex) -> Vec<u32> {
+        let mut order: Vec<u32> = (0..fwd.len() as u32).collect();
+        if fwd.len() <= MIN_PARTITION {
+            return order;
+        }
+        RefState::new(fwd.n_terms).split(fwd, &mut order, 0);
+        order
+    }
+
+    /// The optimizations must not move a single document. Several shapes,
+    /// including one past `PARALLEL_MIN_PARTITION` so the parallel arm and
+    /// the whole recursion below it are both covered.
+    #[test]
+    fn the_order_matches_the_unoptimized_bisection() {
+        for (docs, clusters, seed) in [
+            (2_000usize, 7usize, 1u64),
+            (5_000, 3, 2),
+            (9_000, 40, 3),
+            (PARALLEL_MIN_PARTITION + 1_500, 11, 4),
+        ] {
+            let (fwd, _) = clustered(docs, clusters, seed);
+            assert_eq!(
+                bisect_order(&fwd),
+                reference_order(&fwd),
+                "order diverged at docs={docs} clusters={clusters} seed={seed}"
             );
         }
     }
