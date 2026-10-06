@@ -20,7 +20,17 @@ on:
         required: false
         default: supertable_all
         type: choice
-        options: [superfile, supertable, supertable_all, supertable_fts, supertable_vector, supertable_sql, all]
+        options: [superfile, supertable, supertable_all, supertable_fts, supertable_fts_warm, supertable_fts_cold, supertable_vector, supertable_sql, all]
+      corpus:
+        description: "Corpus spec (empty = synthetic; `realistic` = generated text the FTS legs use)."
+        required: false
+        default: ""
+        type: string
+      metric:
+        description: "Vector metric (empty/cosine, l2sq, negdot)."
+        required: false
+        default: ""
+        type: string
       docs:
         description: "Doc count (plain integer, NOT 1M/100K — those do not parse)"
         required: false
