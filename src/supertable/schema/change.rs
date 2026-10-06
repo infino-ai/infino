@@ -12,6 +12,8 @@
 //! column the patch does not mention is untouched. Nothing is ever
 //! dropped by omission.
 
+use std::collections::BTreeMap;
+
 use arrow_schema::DataType;
 use serde_json::{Map, Value};
 
@@ -31,6 +33,10 @@ pub enum SchemaChange {
         data_type: DataType,
         nullable: bool,
         index: Option<ColumnIndex>,
+        /// Arrow field metadata the column arrived with, less the engine's
+        /// own keys. Empty for a column a schema write adds, which has no
+        /// Arrow field to carry any.
+        metadata: BTreeMap<String, String>,
     },
     /// Retire a column: its id is tombstoned and its index config goes.
     DropColumn { id: FieldId },
@@ -413,6 +419,7 @@ pub fn merge(
                 data_type,
                 nullable,
                 index: field.index.clone(),
+                metadata: BTreeMap::new(),
             });
             continue;
         };
@@ -528,6 +535,7 @@ impl TableSchema {
                 data_type,
                 nullable,
                 index,
+                metadata,
             } => {
                 if self.fields.iter().any(|f| &f.name == name) {
                     return Err(SchemaError::NameTaken { name: name.clone() });
@@ -551,6 +559,7 @@ impl TableSchema {
                     nullable: *nullable,
                     index: index.clone(),
                     converting_from: None,
+                    metadata: metadata.clone(),
                 });
             }
             SchemaChange::DropColumn { id } => {
@@ -820,7 +829,8 @@ mod tests {
                     name: "tag".into(),
                     data_type: DataType::LargeUtf8,
                     nullable: true,
-                    index: None
+                    index: None,
+                    metadata: BTreeMap::new()
                 },
                 SchemaChange::RenameColumn {
                     id: FieldId(2),

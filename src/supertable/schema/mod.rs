@@ -29,7 +29,11 @@ pub mod map;
 pub mod resolve;
 pub mod types;
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    sync::Arc,
+};
 
 use arrow_schema::{DataType, Field, Schema};
 use serde_json::{Map, Value};
@@ -172,6 +176,29 @@ pub struct FieldDef {
     /// The type the column is being converted from: set while files
     /// written in that type remain, cleared when the last is rewritten.
     pub converting_from: Option<DataType>,
+    /// Arrow field metadata the column was declared with, less the keys the
+    /// engine owns. A consumer that stamps a column (a server that fills it,
+    /// a tool that tags it) reads its own key back from the schema this
+    /// document rebuilds, so the document has to carry what it did not write.
+    /// Sorted, so the document's bytes do not depend on map iteration order.
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Arrow field metadata minus the keys the engine stamps for itself: the
+/// field id, the index request a batch carries, and the physical-kind mark.
+/// Those are modelled by the document's own keys, so carrying them here too
+/// would let a stale copy contradict it.
+pub(crate) fn user_metadata(field: &Field) -> BTreeMap<String, String> {
+    field
+        .metadata()
+        .iter()
+        .filter(|(k, _)| {
+            k.as_str() != FIELD_ID_META_KEY
+                && k.as_str() != INDEX_META_KEY
+                && k.as_str() != PHYSICAL_KIND_META_KEY
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// The table's current user columns, in declared order, with the counter
@@ -214,6 +241,7 @@ impl TableSchema {
                 nullable: f.is_nullable(),
                 index: column_index(f.name(), fts, vectors),
                 converting_from: None,
+                metadata: user_metadata(f),
             })
             .collect();
         let last_field_id = fields.len() as u32;
@@ -232,7 +260,14 @@ impl TableSchema {
         Arc::new(Schema::new(
             self.fields
                 .iter()
-                .map(|f| Arc::new(Field::new(&f.name, f.data_type.clone(), f.nullable)))
+                .map(|f| {
+                    let field = Field::new(&f.name, f.data_type.clone(), f.nullable);
+                    Arc::new(if f.metadata.is_empty() {
+                        field
+                    } else {
+                        field.with_metadata(f.metadata.clone().into_iter().collect())
+                    })
+                })
                 .collect::<Vec<_>>(),
         ))
     }
@@ -382,6 +417,17 @@ impl TableSchema {
                 }
                 if let Some(from) = &f.converting_from {
                     keys.insert("converting_from".into(), Value::Object(type_keys(from)));
+                }
+                if !f.metadata.is_empty() {
+                    keys.insert(
+                        "metadata".into(),
+                        Value::Object(
+                            f.metadata
+                                .iter()
+                                .map(|(k, v)| (k.clone(), Value::from(v.as_str())))
+                                .collect(),
+                        ),
+                    );
                 }
                 Value::Object(keys)
             })
@@ -705,6 +751,20 @@ fn field_from_json(json: &Value) -> Result<FieldDef, String> {
                 .and_then(data_type_from_keys)
         })
         .transpose()?;
+    let metadata = keys
+        .get("metadata")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    v.as_str()
+                        .map(|v| (k.clone(), v.to_owned()))
+                        .ok_or_else(|| format!("metadata value for `{k}` is not a string"))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(FieldDef {
         id,
         name,
@@ -712,6 +772,7 @@ fn field_from_json(json: &Value) -> Result<FieldDef, String> {
         nullable,
         index,
         converting_from,
+        metadata,
     })
 }
 
@@ -1286,5 +1347,52 @@ mod key_tests {
         let back = PhysicalSchema::from_ipc(&ps.to_ipc()).expect("decode");
         assert_eq!(back, ps);
         assert!(PhysicalSchema::from_ipc(b"garbage").is_err());
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use std::collections::HashMap;
+
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::*;
+
+    /// A consumer stamps a column and reads its own key back off the schema
+    /// the document rebuilds. The engine's own keys are modelled by the
+    /// document's fields, so they are not carried a second time.
+    #[test]
+    fn a_columns_own_metadata_survives_the_document() {
+        let stamped =
+            Field::new("embedding", DataType::Float32, false).with_metadata(HashMap::from([
+                (
+                    "infino:embedding".to_string(),
+                    "{\"model\":\"m\"}".to_string(),
+                ),
+                (FIELD_ID_META_KEY.to_string(), "7".to_string()),
+            ]));
+        let ts = TableSchema::from_user_schema(&Schema::new(vec![stamped]));
+
+        let field = &ts.fields()[0];
+        assert_eq!(
+            field.metadata.get("infino:embedding").map(String::as_str),
+            Some("{\"model\":\"m\"}"),
+            "the consumer's key is kept"
+        );
+        assert!(
+            !field.metadata.contains_key(FIELD_ID_META_KEY),
+            "the engine's own key is not carried twice: {:?}",
+            field.metadata
+        );
+
+        let reopened = TableSchema::from_json(&ts.to_json()).expect("document round-trips");
+        assert_eq!(reopened, ts, "the document carries the metadata");
+
+        let arrow = reopened.user_schema();
+        assert_eq!(
+            arrow.field(0).metadata().get("infino:embedding"),
+            Some(&"{\"model\":\"m\"}".to_string()),
+            "and hands it back on the Arrow schema a consumer reads"
+        );
     }
 }

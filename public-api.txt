@@ -609,6 +609,7 @@ pub infino::FieldDef::converting_from: core::option::Option<arrow_schema::dataty
 pub infino::FieldDef::data_type: arrow_schema::datatype::DataType
 pub infino::FieldDef::id: infino::FieldId
 pub infino::FieldDef::index: core::option::Option<infino::ColumnIndex>
+pub infino::FieldDef::metadata: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
 pub infino::FieldDef::name: alloc::string::String
 pub infino::FieldDef::nullable: bool
 impl core::clone::Clone for infino::FieldDef

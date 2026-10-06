@@ -11928,6 +11928,7 @@ mod tests {
                 data_type: DataType::LargeUtf8,
                 nullable: false,
                 index: None,
+                metadata: Default::default(),
             }])
             .expect("a document with a column that admits no nulls"),
         );

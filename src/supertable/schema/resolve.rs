@@ -10,14 +10,14 @@
 //! filled with nulls, and anything else is refused as a whole. A type
 //! never changes from a batch; that takes a schema write.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
 
 use super::{
     ColumnIndex, INDEX_META_KEY, TableSchema, change::SchemaChange, error::SchemaError,
-    index_from_json,
+    index_from_json, user_metadata,
 };
 
 /// A column a batch adds to the table.
@@ -28,6 +28,9 @@ pub struct AddColumn {
     /// The index the batch asks for it, from the field's
     /// [`INDEX_META_KEY`] metadata.
     pub index: Option<ColumnIndex>,
+    /// The rest of the field's metadata, which the column keeps so a
+    /// consumer that stamped it reads its own key back.
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// The index a batch field asks its new column to carry, if it names one.
@@ -111,6 +114,7 @@ pub fn resolve_batch(
             name: field.name().clone(),
             data_type: field.data_type().clone(),
             index: requested_index(field)?,
+            metadata: user_metadata(field),
         });
         columns.push(Arc::clone(batch.column(i)));
         fields.push(
@@ -175,6 +179,7 @@ pub fn union_schema<'a>(
                     name: field.name().clone(),
                     data_type: field.data_type().clone(),
                     index: requested_index(field)?,
+                    metadata: user_metadata(field),
                 }),
             }
         }
@@ -189,6 +194,7 @@ pub fn union_schema<'a>(
             data_type: a.data_type,
             nullable: true,
             index: a.index,
+            metadata: a.metadata,
         })
         .collect();
     current.apply(&changes).map(Some)
@@ -342,6 +348,7 @@ mod tests {
                 name: "tag".into(),
                 data_type: DataType::LargeUtf8,
                 index: None,
+                metadata: BTreeMap::new(),
             }]
         );
         let names: Vec<String> = resolved
