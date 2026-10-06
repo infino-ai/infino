@@ -667,6 +667,13 @@ pub enum QueryError {
     #[error("failed to run the query: {0}")]
     Internal(String),
 
+    /// A superfile the query read is in a format this engine no longer
+    /// reads (an index written by a release it dropped support for).
+    /// Neither the query nor a retry can fix it; rewriting the table's
+    /// indexes can. Maps to the public `Unsupported`.
+    #[error("{0}")]
+    Unsupported(String),
+
     /// DataFusion failed to plan or run a query, typed as it returned it, so
     /// the public mapping can tell a bad query from a failed read or an
     /// engine fault (`crate::error::datafusion_error`).
@@ -707,6 +714,7 @@ impl From<QueryError> for DataFusionError {
 /// |---|---|
 /// | over the connection's memory budget | `OverBudget` |
 /// | an FTS query the column cannot answer: a phrase without positions, nothing positive to rank | `InvalidQuery`: the caller's |
+/// | a full-text index older than this engine reads | `Unsupported` |
 /// | the store refused our credentials | `PermissionDenied` |
 /// | a local doc id past the superfile's end, or a read called on a codec it does not support: our bug, retrying cannot help | `Internal` |
 /// | anything else | `Parquet`: a read failed |
@@ -722,6 +730,11 @@ impl From<ReadError> for QueryError {
             )
         {
             return QueryError::InvalidQuery(e.to_string());
+        }
+        if let ReadError::Fts(fts) = &e
+            && matches!(fts.as_ref(), FtsError::IndexTooOld { .. })
+        {
+            return QueryError::Unsupported(e.to_string());
         }
         if permission_denied_in_chain(&e) {
             return QueryError::PermissionDenied(e.to_string());
@@ -902,6 +915,12 @@ mod tests {
         assert!(matches!(
             QueryError::from(ReadError::Fts(Box::new(FtsError::NegationOnly))),
             QueryError::InvalidQuery(_)
+        ));
+        assert!(matches!(
+            QueryError::from(ReadError::Fts(Box::new(FtsError::IndexTooOld {
+                version: 5
+            }))),
+            QueryError::Unsupported(_)
         ));
         // A local doc id past the end is our bug: retrying the read cannot help.
         assert!(matches!(

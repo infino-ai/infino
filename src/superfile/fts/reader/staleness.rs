@@ -6,11 +6,12 @@
 //! Two independent things can be behind, and they need different repairs,
 //! so they are reported separately rather than as one "stale" flag:
 //!
-//! - The **container** — the blob's layout and how its block-max bounds
-//!   encode. An older container is read correctly but scored with looser
-//!   bounds, and costs the faster kernels its version does not advertise.
-//!   Copying the postings into a current container fixes it, because the
-//!   terms themselves are fine.
+//! - The **container** — the blob's layout. A blob below
+//!   [`format::fts::VERSION_CURRENT`] is read correctly but is not what
+//!   this engine writes; copying the postings into a current container
+//!   fixes it, because the terms themselves are fine. Every version this
+//!   engine reads is current, so a stale container arises only once the
+//!   current version moves past one it still reads.
 //! - The **analysis** — which version of a named chain produced the terms.
 //!   Copying postings cannot fix this: the terms are the problem, so only
 //!   re-analyzing the source text does, and a column whose text was never
@@ -18,7 +19,6 @@
 //!
 //! Reporting them apart is what lets a migration choose the cheap repair
 //! where it suffices and reserve the expensive one for where it does not.
-//!
 
 use crate::superfile::{
     format,

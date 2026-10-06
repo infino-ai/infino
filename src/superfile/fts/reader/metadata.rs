@@ -143,16 +143,15 @@ impl NormTable {
     /// alongside the totals the pass produced.
     ///
     /// The same pass that quantizes each length sums them, so the
-    /// column's statistics cost nothing extra; `decode_avgdl` then picks
-    /// the average the table decodes at, given those statistics — the
-    /// average the file declares, or one corrected from them. A column
-    /// no document contributes to yields an empty table; it is never
-    /// indexed because `search` short-circuits on empty columns.
+    /// column's statistics cost nothing extra; the table decodes at
+    /// `avgdl`, the average the file declares. A column no document
+    /// contributes to yields an empty table; it is never indexed because
+    /// `search` short-circuits on empty columns.
     pub(super) fn new(
         doc_lengths: impl Iterator<Item = u32>,
         n_docs: usize,
         params: bm25::Bm25Params,
-        decode_avgdl: impl FnOnce(&ColumnLengthStats) -> f32,
+        avgdl: f32,
     ) -> (Self, ColumnLengthStats) {
         let mut bytes = Vec::with_capacity(n_docs);
         let mut lo = u8::MAX;
@@ -168,7 +167,6 @@ impl NormTable {
         if stats.n_scored_docs == 0 {
             return (Self::empty(), stats);
         }
-        let avgdl = decode_avgdl(&stats);
         let table = Self {
             bytes: Arc::from(bytes),
             lut: build_lut(avgdl, params),
@@ -180,8 +178,7 @@ impl NormTable {
 
     /// The same per-doc buckets decoded at a different average length
     /// and/or parameter pair — for a query that overrides what the
-    /// column declared, and for an older file whose declared average the
-    /// reader corrects. Shares `bytes`, so the cost is one 256-entry
+    /// column declared. Shares `bytes`, so the cost is one 256-entry
     /// table.
     pub(super) fn rescored(&self, avgdl: f32, params: bm25::Bm25Params) -> Self {
         if self.bytes.is_empty() {
@@ -298,53 +295,31 @@ fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]> {
 pub struct ColumnNorms {
     pub dl_norm_k1: NormTable,
     pub length_stats: ColumnLengthStats,
-    /// `1.0` for a file whose bounds were baked at the average it declares;
-    /// the older-file correction otherwise; composed with the override
-    /// factor when the column is scored at other parameters.
+    /// `1.0` at the declared parameters, whose stored bounds are exact;
+    /// the override factor when the column is scored at other parameters.
     pub bound_scale: f32,
 }
 
 impl ColumnNorms {
     /// Build from a column's length array, at `params` (the pair the stored
-    /// bounds were baked at) and the average the file declares.
+    /// bounds were baked at) and the average the file declares, at which
+    /// the stored bounds are exact.
     pub(super) fn from_array(
         array: &[u8],
         n_docs: usize,
-        doc_length_bytes: usize,
         params: bm25::Bm25Params,
         baked_avgdl: f32,
-        declared: bool,
     ) -> Self {
         let (dl_norm_k1, length_stats) = NormTable::new(
-            (0..n_docs).map(|d| read_doc_length(array, d, doc_length_bytes)),
+            (0..n_docs).map(|d| read_doc_length(array, d)),
             n_docs,
             params,
-            |stats| match declared {
-                true => baked_avgdl,
-                false => bm25::stored_avgdl(stats.avgdl()),
-            },
+            baked_avgdl,
         );
-        // A current-version file is scored at the average it declares, so
-        // its bounds are exact as stored. An older file is scored at the
-        // average over the documents that carry tokens, computed from the
-        // array being walked, and its bounds owe two corrections: that
-        // average can only be higher than the row-count one it was baked
-        // at (no more documents carry tokens than there are rows), which
-        // lowers the norm and raises every score above the bound meant to
-        // cap it, so the bound is inflated by the supremum of that move;
-        // and the `(k1 + 1)` factor those files carry is divided out, which
-        // restores exactly the pruning they had.
-        let bound_scale = match declared {
-            true => 1.0,
-            false => {
-                let baked = dl_norm_k1.rescored(baked_avgdl, params);
-                baked.bound_scale(&dl_norm_k1, params, params) / (params.k1 + 1.0)
-            }
-        };
         Self {
             dl_norm_k1,
             length_stats,
-            bound_scale,
+            bound_scale: 1.0,
         }
     }
 
@@ -377,10 +352,7 @@ pub(super) fn unscored_norm_table() -> &'static NormTable {
 impl ColumnNorms {
     /// These norms re-derived at `params`, for a view that scores with
     /// parameters other than `declared` — the ones the stored bounds were
-    /// baked at. The per-doc length buckets are shared, not copied; the
-    /// bound factor composes rather than replaces, since an older file's
-    /// bounds already owe the correction applied above and this move is
-    /// owed on top of it. The product of the two suprema cannot under-bound.
+    /// baked at. The per-doc length buckets are shared, not copied.
     fn rescored(&self, declared: bm25::Bm25Params, params: bm25::Bm25Params) -> Self {
         let dl_norm_k1 = self.dl_norm_k1.rescored(self.dl_norm_k1.avgdl(), params);
         Self {
@@ -424,10 +396,7 @@ pub struct ColumnMeta {
     /// Where the length array is read from when the norms are first needed.
     pub(super) source: Source,
     pub(super) n_docs: u32,
-    pub(super) doc_length_bytes: usize,
     pub(super) baked_avgdl: f32,
-    /// Whether the file declares the average its bounds were baked at.
-    pub(super) declared: bool,
     /// The pair the stored bounds were baked at.
     pub(super) declared_params: bm25::Bm25Params,
     /// Whether the length array's CRC is checked when it is read.
@@ -513,7 +482,7 @@ impl ColumnMeta {
         Ok(self.base_norms.get_or_init(|| norms))
     }
 
-    /// The length array's byte length, `n_docs × doc_length_bytes`: the
+    /// The length array's byte length, `n_docs × DOC_LENGTH_BYTES`: the
     /// span of [`Self::doc_lengths_range`], which the open path computed and
     /// bounded against the blob. Read off the range rather than recomputed,
     /// so no reader of the array carries arithmetic of its own.
@@ -529,7 +498,7 @@ impl ColumnMeta {
     }
 
     /// Check the CRC that trails the length array in `array_with_crc`, when
-    /// verification is on. The array is `n_docs × doc_length_bytes` long
+    /// verification is on. The array is `n_docs × DOC_LENGTH_BYTES` long
     /// and its CRC32C follows it.
     pub(super) fn check_array_crc(&self, array_with_crc: &[u8]) -> Result<(), FtsError> {
         if !self.verify_crc {
@@ -556,10 +525,8 @@ impl ColumnMeta {
         ColumnNorms::from_array(
             array,
             self.n_docs as usize,
-            self.doc_length_bytes,
             self.declared_params,
             self.baked_avgdl,
-            self.declared,
         )
     }
 
@@ -587,20 +554,6 @@ impl ColumnMeta {
         self.base_norms.get().is_some()
     }
 
-    /// This column with its bound factor replaced — for tests that probe the
-    /// decoder's scaling. Marks the file as not declaring its average so the
-    /// exact-`1.0` shortcut in [`Self::bound_scale`] does not bypass the
-    /// replaced value.
-    #[cfg(test)]
-    pub(super) fn with_bound_scale_for_test(mut self, bound_scale: f32) -> Self {
-        let mut norms = self.base_norms().clone();
-        norms.bound_scale = bound_scale;
-        self.base_norms = Arc::new(OnceLock::from(norms));
-        self.view_norms = Arc::new(OnceLock::new());
-        self.declared = false;
-        self
-    }
-
     /// The BM25 length-normalization table; see [`Self::norms`].
     pub fn dl_norm_k1(&self) -> &NormTable {
         &self.norms().dl_norm_k1
@@ -620,10 +573,10 @@ impl ColumnMeta {
     }
 
     /// The factor that keeps this column's stored bounds upper bounds under
-    /// the parameters it is scored at. Exactly `1.0` for a current-version
-    /// file scored as declared, known without reading anything.
+    /// the parameters it is scored at. Exactly `1.0` when scored at the
+    /// declared parameters, known without reading anything.
     pub fn bound_scale(&self) -> f32 {
-        if self.declared && self.params == self.declared_params {
+        if self.params == self.declared_params {
             return 1.0;
         }
         self.norms().bound_scale

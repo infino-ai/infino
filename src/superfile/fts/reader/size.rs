@@ -12,15 +12,18 @@
 use std::fmt;
 
 use super::{
-    core::{FtsReader, fetch_source_range, header_postings_length},
-    cursor::{SubindexKind, TermMeta},
+    core::{FtsReader, fetch_source_range},
+    cursor::TermMeta,
 };
 use crate::{
     superfile::{
         ReadError,
         bits::width_of,
         error::FtsError,
-        format::{self, FST_SEPARATOR, fts::POSITION_SUBINDEX_ENTRIES_PER_BLOCK},
+        format::{
+            self, FST_SEPARATOR,
+            fts::{coarse_slot, skip_entry},
+        },
         fts::{
             builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
             posting::{
@@ -65,11 +68,10 @@ pub struct DfBucket {
     /// Terms in the short form and their body bytes.
     pub short_terms: u64,
     pub short_bytes: u64,
-    /// Long-form fixed overhead: metadata headers, skip entries, position
-    /// sub-index rows, coarse slots, block headers.
+    /// Long-form fixed overhead: metadata headers, skip entries, coarse
+    /// slots, block headers.
     pub meta_bytes: u64,
     pub skip_bytes: u64,
-    pub subindex_bytes: u64,
     pub coarse_bytes: u64,
     pub block_header_bytes: u64,
     /// Long-form payload: packed doc-id lanes, packed tf lanes, bitset
@@ -113,7 +115,6 @@ impl DfBucket {
         self.short_bytes += o.short_bytes;
         self.meta_bytes += o.meta_bytes;
         self.skip_bytes += o.skip_bytes;
-        self.subindex_bytes += o.subindex_bytes;
         self.coarse_bytes += o.coarse_bytes;
         self.block_header_bytes += o.block_header_bytes;
         self.docid_bytes += o.docid_bytes;
@@ -141,7 +142,6 @@ impl DfBucket {
         self.short_bytes
             + self.meta_bytes
             + self.skip_bytes
-            + self.subindex_bytes
             + self.coarse_bytes
             + self.block_header_bytes
             + self.docid_bytes
@@ -151,11 +151,7 @@ impl DfBucket {
 
     /// Long-form bytes that are neither doc ids, tfs nor a bitset.
     pub fn fixed_overhead_bytes(&self) -> u64 {
-        self.meta_bytes
-            + self.skip_bytes
-            + self.subindex_bytes
-            + self.coarse_bytes
-            + self.block_header_bytes
+        self.meta_bytes + self.skip_bytes + self.coarse_bytes + self.block_header_bytes
     }
 }
 
@@ -207,14 +203,10 @@ impl FtsReader {
     /// report, not a query.
     pub fn size_breakdown(&self) -> Result<FtsSizeBreakdown, FtsError> {
         let fst_bytes = self.dict_bytes()?;
-        let dict = self.open_dict(&fst_bytes)?;
+        let dict = Self::open_dict(&fst_bytes)?;
         let mut columns = Vec::with_capacity(self.columns.len());
         for col in &self.columns {
             let positional = col.positions;
-            let subindex = match positional {
-                true => self.subindex,
-                false => SubindexKind::None,
-            };
             let mut prefix = col.name.as_bytes().to_vec();
             prefix.push(FST_SEPARATOR);
             let mut buckets: Vec<DfBucket> = DF_BAND_LABELS
@@ -238,21 +230,11 @@ impl FtsReader {
                     }
                     FstValue::Pfor {
                         metadata_offset,
-                        postings_length_hint,
+                        postings_length,
                         short,
                     } => {
                         let start = self.postings_range.start + metadata_offset as usize;
-                        let len = match postings_length_hint {
-                            Some(l) => l as usize,
-                            None => header_postings_length(
-                                fetch_source_range(
-                                    &self.source,
-                                    start..start + TERM_META_SIZE,
-                                    "fts/size header",
-                                )?
-                                .as_ref(),
-                            )?,
-                        };
+                        let len = postings_length as usize;
                         let bytes =
                             fetch_source_range(&self.source, start..start + len, "fts/size term")?;
                         let tb = bytes.as_ref();
@@ -282,14 +264,7 @@ impl FtsReader {
                                 .unwrap_or(0);
                             continue;
                         }
-                        let meta = TermMeta::parse(
-                            tb,
-                            0,
-                            positional,
-                            subindex,
-                            self.bounds,
-                            self.positions_grouped,
-                        )?;
+                        let meta = TermMeta::parse(tb, 0, positional)?;
                         let nb = meta.num_blocks as u64;
                         let b = &mut buckets[band_of(meta.df)];
                         b.terms += 1;
@@ -301,25 +276,16 @@ impl FtsReader {
                             true => TERM_META_POSITIONAL_SIZE,
                             false => TERM_META_SIZE,
                         } as u64;
-                        b.skip_bytes += nb * meta.skip.entry_bytes(positional) as u64;
-                        b.subindex_bytes += nb
-                            * (POSITION_SUBINDEX_ENTRIES_PER_BLOCK * subindex.entry_bytes()) as u64;
-                        if meta.has_coarse {
-                            b.coarse_bytes += nb
-                                .div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN as u64)
-                                * meta.skip.coarse_slot_bytes() as u64;
-                        }
+                        b.skip_bytes += nb * skip_entry::bytes(positional) as u64;
+                        b.coarse_bytes += nb.div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN as u64)
+                            * coarse_slot::BYTES as u64;
                         b.positions_bytes += u64::from(meta.positions_length);
                         let mut prev_end: Option<usize> = None;
                         for i in 0..meta.num_blocks {
                             let range = meta.block_range_in_term(tb, i, prev_end);
                             prev_end = Some(range.end);
                             let block = &tb[range];
-                            let hdr = BlockHeader::parse(
-                                block,
-                                meta.block_layout,
-                                meta.prev_last_doc_id(tb, i),
-                            );
+                            let hdr = BlockHeader::parse(block, meta.prev_last_doc_id(tb, i));
                             let doc_count = hdr.count() as u64;
                             b.block_header_bytes += hdr.payload() as u64;
                             if doc_count < LANES {
@@ -398,11 +364,7 @@ impl FtsReader {
             n_terms: u64::from(self.n_terms_total),
             fst_bytes: self.fst_range.len() as u64,
             postings_region_bytes: self.postings_range.len() as u64,
-            positions_region_bytes: self
-                .positions_range
-                .as_ref()
-                .map(|r| r.len() as u64)
-                .unwrap_or(0),
+            positions_region_bytes: self.positions_range.len() as u64,
             columns,
         })
     }
@@ -443,7 +405,7 @@ impl fmt::Display for FtsSizeBreakdown {
             )?;
             writeln!(
                 f,
-                "  {:<12} {:>9} {:>11} {:>7} {:>7} | {:>8} {:>8} | {:>7} {:>7} {:>7} {:>7} {:>7} | {:>8} {:>8} {:>8} {:>7} {:>8} | {:>8} | {:>8}",
+                "  {:<12} {:>9} {:>11} {:>7} {:>7} | {:>8} {:>8} | {:>7} {:>7} {:>7} {:>7} | {:>8} {:>8} {:>8} {:>7} {:>8} | {:>8} | {:>8}",
                 "band",
                 "terms",
                 "postings",
@@ -453,7 +415,6 @@ impl fmt::Display for FtsSizeBreakdown {
                 "keyMiB",
                 "metaMiB",
                 "skipMiB",
-                "subMiB",
                 "crsMiB",
                 "hdrMiB",
                 "docidMiB",
@@ -470,7 +431,7 @@ impl fmt::Display for FtsSizeBreakdown {
                 }
                 writeln!(
                     f,
-                    "  {:<12} {:>9} {:>11} {:>7} {:>7} | {:>8.2} {:>8.2} | {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} | {:>8.2} {:>8.2} {:>8.2} {:>7.2} {:>8.2} | {:>8.2} | {:>8.2}",
+                    "  {:<12} {:>9} {:>11} {:>7} {:>7} | {:>8.2} {:>8.2} | {:>7.2} {:>7.2} {:>7.2} {:>7.2} | {:>8.2} {:>8.2} {:>8.2} {:>7.2} {:>8.2} | {:>8.2} | {:>8.2}",
                     b.label,
                     b.terms,
                     b.postings,
@@ -480,7 +441,6 @@ impl fmt::Display for FtsSizeBreakdown {
                     mib(b.key_bytes),
                     mib(b.meta_bytes),
                     mib(b.skip_bytes),
-                    mib(b.subindex_bytes),
                     mib(b.coarse_bytes),
                     mib(b.block_header_bytes),
                     mib(b.docid_bytes),

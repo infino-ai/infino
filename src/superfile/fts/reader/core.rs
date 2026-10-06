@@ -11,8 +11,8 @@
 //! ## Threading
 //!
 //! `FtsReader` is `Send + Sync` and immutable after `open()` — concurrent
-//! `search` calls share the underlying `Bytes`. The DictReader is
-//! constructed per call (cheap; the FST validates its header in O(1) and
+//! `search` calls share the underlying `Bytes`. The term dictionary view
+//! is constructed per call (cheap; opening it reads only its footer, and
 //! then it's a borrowed view).
 
 use std::{
@@ -26,8 +26,7 @@ use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 
 use super::{
-    bounds::StoredBound,
-    cursor::{SubindexKind, TermCursor, TermMeta},
+    cursor::{TermCursor, TermMeta},
     filter::ExcludeFilter,
     metadata::{ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions},
     phrase::{AnyCursor, PhraseCursor},
@@ -42,16 +41,13 @@ use crate::{
         format::{
             self, FST_SEPARATOR,
             checksum::crc32c,
-            fts::{
-                BlobLayout, DictLayout, HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, MAGIC_BYTES,
-                U32_BYTES, U64_BYTES, hdr, term_meta,
-            },
+            fts::{HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, VERSION_MIN, hdr, term_meta},
         },
         fts::{
             analysis::{Base, chain_tokenizer},
             bm25,
-            builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
-            positions::{GroupIndex, decode_run},
+            builder::DOC_LENGTHS_ENTRY_SIZE,
+            positions::GroupIndex,
             posting::{BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
             short::{SHORT_MAX_DF, decode_short},
             tokenize::{Phrase, Tokenizer},
@@ -59,7 +55,7 @@ use crate::{
         id_space::{DocMap, FtsDocId, RowId},
         lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
     },
-    utils::terms::{FstValue, TermDict, make_key},
+    utils::terms::{FstValue, TermBlocks, make_key},
 };
 
 /// Largest gap worth overfetching when adjacent term postings share a request.
@@ -480,45 +476,18 @@ pub struct FtsReader {
     pub(super) n_terms_total: u32,
     pub(super) fst_range: Range<usize>,
     pub(super) postings_range: Range<usize>,
-    /// Byte range of the positions region (CRC stripped) — `Some`
-    /// iff the blob is v2. Phrase queries fetch per-term run ranges
-    /// out of it via [`Self::fetch_term_positions`].
-    pub(super) positions_range: Option<Range<usize>>,
-    /// How this blob's positional long-form terms lay out the position
-    /// run-offset sub-index between skip table and blocks, which the
-    /// phrase decode uses to reach a pair's runs by skipping
-    /// `< POSITION_SUBINDEX_STRIDE` runs. `V1`/`V2` blobs have none and
-    /// take the block-start skip-walk fallback.
-    pub(super) subindex: SubindexKind,
-    /// Whether positions are per-block groups decoded whole (`V7`+)
-    /// rather than LEB128 runs walked with the sub-index.
-    pub(super) positions_grouped: bool,
-    /// Bytes per stored document length (`u16` from `V7`, `u32` before).
-    pub(super) doc_length_bytes: usize,
-    /// True iff the blob is `VERSION_V4` — some posting blocks may be
-    /// bitset-encoded, so the unranked count kernels prefer membership
-    /// bit-tests (no decode) over decoding a common term's blocks.
-    pub(super) has_bitset_blocks: bool,
-    /// How the blob's block-max slots encode their maxima and which
-    /// average length they were baked at, decided by its version. Also
-    /// says whether each PFOR term ends with a coarse table.
-    pub(super) bounds: StoredBound,
-    /// How this blob lays out its term dictionary (front-coded blocks
-    /// from `VERSION_V7`, an FST of packed values before).
-    pub(super) dict_layout: DictLayout,
-    /// The blob version from the header, kept verbatim.
-    ///
-    /// The decode fields above carry everything the read path needs to
-    /// interpret the bytes, but each groups the versions that decode
-    /// alike — so together they still cannot say which version a file
-    /// actually is. A migration has to report and plan on that, hence
-    /// the raw number.
+    /// Byte range of the positions region (CRC stripped). Phrase queries
+    /// fetch per-term group ranges out of it via
+    /// [`Self::fetch_term_positions`].
+    pub(super) positions_range: Range<usize>,
+    /// The blob version from the header, kept verbatim: `V7` and `V8`
+    /// decode alike, but a migration reports and plans on which one a file
+    /// actually is.
     pub(super) version: u32,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
     /// The Parquet row each doc id in this blob stands for. The
-    /// identity on every blob below `V8`, where a doc id already is a
-    /// row.
+    /// identity on a `V7` blob, where a doc id already is a row.
     ///
     /// The kernels never consult it: they walk, score and prune in the
     /// blob's own id space from end to end, and the ids they return are
@@ -586,16 +555,15 @@ impl FtsReader {
         // Length of the FTS subsection itself (≈ `kv::FTS_LENGTH`), not
         // the whole superfile: `source` is the FTS-scoped sub-source.
         let fts_blob_len = source.size() as usize;
-        // One GET covers every header size: every version's header is
-        // this wide, `V8` included, because the doc-id map's position is
-        // derived from the document count rather than stored in a field
-        // of its own. Fetching a byte more would overfetch, and eight
-        // spare bytes are enough to break the coalesced group a cold
-        // query's reads form -- the same bytes then arrive as two
-        // requests instead of one.
-        let header_fetch = format::fts::HEADER_SIZE_V2.min(fts_blob_len);
+        // One GET covers the header: every version's header is this wide,
+        // `V8` included, because the doc-id map's position is derived from
+        // the document count rather than stored in a field of its own.
+        // Fetching a byte more would overfetch, and eight spare bytes are
+        // enough to break the coalesced group a cold query's reads form --
+        // the same bytes then arrive as two requests instead of one.
+        let header_fetch = HEADER_SIZE.min(fts_blob_len);
         let header = fetch_lazy_range(source.as_ref(), 0..header_fetch, "fts header").await?;
-        if header.len() < FTS_HEADER_SIZE {
+        if header.len() < HEADER_SIZE {
             return Err(FtsError::Read(ReadError::MissingKv("fts header")));
         }
         if &header[0..MAGIC_BYTES] != format::fts::MAGIC {
@@ -605,24 +573,9 @@ impl FtsReader {
                 actual: header[0..MAGIC_BYTES].to_vec(),
             }));
         }
-        let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
-        // The slot mapping is the accept list: a version it has no arm
-        // for is refused here rather than read under another version's
-        // rules.
-        StoredBound::for_version(version).ok_or_else(|| {
-            FtsError::Read(ReadError::UnsupportedVersion(format!(
-                "fts section version {version}"
-            )))
-        })?;
-        // The FST directory starts right after whichever header
-        // applies; a v2/v3/v4 header's extension bytes are already in the
-        // fetched span (and in the overlay below), so
-        // `open_with_source` re-reads them without another GET. (v3/v4 share
-        // v2's header size.)
-        let header_size = format::fts::header_size(version).unwrap_or(FTS_HEADER_SIZE);
-        if header.len() < header_size {
-            return Err(FtsError::Read(ReadError::MissingKv("fts header")));
-        }
+        check_version(read_u32_le(
+            &header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES],
+        ))?;
 
         let doc_lengths_table_offset =
             read_u64_le(&header[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
@@ -665,10 +618,10 @@ impl FtsReader {
         opts: OpenOptions,
     ) -> Result<Self, FtsError> {
         let source_len = source.len();
-        if source_len < FTS_HEADER_SIZE {
+        if source_len < HEADER_SIZE {
             return Err(FtsError::Read(ReadError::MissingKv("fts header")));
         }
-        let header = fetch_source_range(&source, 0..FTS_HEADER_SIZE, "fts header")?;
+        let header = fetch_source_range(&source, 0..HEADER_SIZE, "fts header")?;
 
         // Magic check.
         if &header[0..MAGIC_BYTES] != format::fts::MAGIC {
@@ -679,45 +632,8 @@ impl FtsReader {
             }));
         }
 
-        // Version check. v1 = no positions (48-byte header); v2 adds
-        // the positions-region offset at [48..56] and a positions
-        // region between the postings and the doc-lengths directory.
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
-        // v3/v4 share v2's header and region layout; v3+ additionally
-        // carries a per-term position sub-index (handled in the phrase
-        // decode), and v4 may store dense blocks in the bitset encoding
-        // (self-describing per block, handled in the codec).
-        let layout = BlobLayout::for_version(version).ok_or_else(|| {
-            FtsError::Read(ReadError::UnsupportedVersion(format!(
-                "fts section version {version}"
-            )))
-        })?;
-        let positional_blob = version != format::fts::VERSION_V1_LEGACY;
-        let positions_grouped = layout.grouped_positions;
-        let subindex = match layout.position_subindex {
-            true => SubindexKind::Wide,
-            false => SubindexKind::None,
-        };
-        let doc_length_bytes = layout.doc_length_bytes;
-        let has_bitset_blocks = layout.bitset_blocks;
-        let dict_layout = layout.dict;
-        let bounds = StoredBound::for_version(version).ok_or_else(|| {
-            FtsError::Read(ReadError::UnsupportedVersion(format!(
-                "fts section version {version}"
-            )))
-        })?;
-        // From the version, the same way the writer sizes what it
-        // assembles. Deriving it from the layout instead would call a
-        // `V8` header 56 bytes and let a dictionary claiming to start
-        // inside the header past the bound check below.
-        let header_size = format::fts::header_size(version).ok_or_else(|| {
-            FtsError::Read(ReadError::UnsupportedVersion(format!(
-                "fts section version {version}"
-            )))
-        })?;
-        if source_len < header_size {
-            return Err(FtsError::Read(ReadError::MissingKv("fts header")));
-        }
+        check_version(version)?;
 
         let n_columns =
             read_u32_le(&header[hdr::N_COLUMNS_OFF..hdr::N_COLUMNS_OFF + U32_BYTES]) as usize;
@@ -731,21 +647,11 @@ impl FtsReader {
         let doc_lengths_table_offset =
             read_u64_le(&header[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
                 as usize;
-        // The v2 extension lives past the 48 bytes fetched above; on
-        // the lazy path it resolves from the prefetch overlay.
-        let positions_offset: Option<usize> = match positional_blob {
-            true => {
-                let ext = fetch_source_range(
-                    &source,
-                    FTS_HEADER_SIZE..format::fts::HEADER_SIZE_V2,
-                    "fts header ext",
-                )?;
-                Some(read_u64_le(&ext[0..U64_BYTES]) as usize)
-            }
-            false => None,
-        };
+        let positions_offset =
+            read_u64_le(&header[hdr::POSITIONS_OFFSET_OFF..hdr::POSITIONS_OFFSET_OFF + U64_BYTES])
+                as usize;
 
-        // The doc-id map region, `VERSION_V8` only: one `u32` per document
+        // The doc-id map region, `V8` only: one `u32` per document
         // giving the Parquet row that document's postings belong to, then
         // a CRC. It is the last thing before the doc-lengths directory,
         // and its size follows from the document count, so where it
@@ -773,19 +679,19 @@ impl FtsReader {
         // only the trailing 4-byte CRC32C(empty) sits between
         // `postings_offset` and `doc_lengths_table_offset`.
         let regions_end = doc_map_offset.unwrap_or(doc_lengths_table_offset);
-        let postings_end = positions_offset.unwrap_or(regions_end);
-        if fst_offset < header_size
+        let postings_end = positions_offset;
+        if fst_offset < HEADER_SIZE
             || postings_offset < fst_offset + 4
             || postings_end < postings_offset + 4
             || regions_end < postings_end
             || doc_lengths_table_offset < regions_end
             || doc_lengths_table_offset > source_len
-            || positions_offset.is_some_and(|po| regions_end < po + 4)
+            || regions_end < positions_offset + 4
             || doc_map_offset.is_some_and(|mo| doc_lengths_table_offset < mo + format::CRC_BYTES)
         {
             return Err(FtsError::Read(ReadError::Malformed(format!(
                 "fts header offsets out of range: fst={fst_offset}, postings={postings_offset}, \
-                 positions={positions_offset:?}, doc_lengths={doc_lengths_table_offset}, \
+                 positions={positions_offset}, doc_lengths={doc_lengths_table_offset}, \
                  blob_len={}",
                 source_len
             ))));
@@ -793,13 +699,11 @@ impl FtsReader {
 
         // Region lengths aren't stored explicitly (each region ends
         // with its CRC32C). Compute from the surrounding offsets —
-        // postings end where the positions region begins (or the
-        // doc-lengths directory on a v1 blob), positions end where the
-        // directory begins.
+        // postings end where the positions region begins, positions end
+        // where the doc-id map or the doc-lengths directory begins.
         let fst_range = fst_offset..postings_offset.saturating_sub(4); // strip CRC
         let postings_range = postings_offset..postings_end.saturating_sub(4); // strip CRC
-        let positions_range: Option<Range<usize>> =
-            positions_offset.map(|po| po..regions_end.saturating_sub(4));
+        let positions_range = positions_offset..regions_end.saturating_sub(4); // strip CRC
 
         // Verify FST CRC32C (4 bytes after fst body).
         if opts.verify_crc {
@@ -836,17 +740,15 @@ impl FtsReader {
             }
         }
 
-        // Verify positions region CRC32C (v2 blobs only).
-        if opts.verify_crc
-            && let Some(pos_range) = &positions_range
-        {
+        // Verify positions region CRC32C.
+        if opts.verify_crc {
             // The positions region's CRC trails the region, which is the
             // doc-lengths directory only on a blob with no doc-id map;
             // with one, the map sits between them.
             let crc_pos = regions_end.saturating_sub(4);
             let crc_bytes = fetch_source_range(&source, crc_pos..regions_end, "fts/positions crc")?;
             let crc_expected = read_u32_le(&crc_bytes);
-            let pos_bytes = fetch_source_range(&source, pos_range.clone(), "fts/positions")?;
+            let pos_bytes = fetch_source_range(&source, positions_range.clone(), "fts/positions")?;
             let crc_actual = crc32c(&pos_bytes);
             if crc_expected != crc_actual {
                 return Err(FtsError::Read(ReadError::ChecksumMismatch {
@@ -923,11 +825,11 @@ impl FtsReader {
                 ))));
             }
 
-            // Per-column doc-lengths array: 4 * n_docs bytes + 4-byte CRC.
+            // Per-column doc-lengths array: `DOC_LENGTH_BYTES` per doc + CRC.
             // Bounded here; read lazily on the column's first scored use,
             // except that CRC verification reads it now to check it, which
             // on the lazy path is one GET per column at open.
-            let array_byte_len = doc_length_bytes * n_docs as usize;
+            let array_byte_len = format::fts::DOC_LENGTH_BYTES * n_docs as usize;
             let array_end = doc_lengths_offset + array_byte_len;
             if array_end + 4 > source_len {
                 return Err(FtsError::Read(ReadError::Malformed(format!(
@@ -936,7 +838,6 @@ impl FtsReader {
             }
             let baked_avgdl = (avgdl_x1000 as f32) / format::fts::AVGDL_FIXED_POINT_SCALE;
             let params = col_cfg.params();
-            let declared = bounds.declares_scoring_average();
             let base = Base::from_name(&col_cfg.tokenizer).ok_or_else(|| {
                 FtsError::Read(ReadError::Malformed(format!(
                     "inf.fts.columns: unknown tokenizer {:?} for column {:?}",
@@ -973,9 +874,7 @@ impl FtsReader {
                 analysis_revision: col_cfg.analysis_revision,
                 source: source.clone(),
                 n_docs,
-                doc_length_bytes,
                 baked_avgdl,
-                declared,
                 declared_params: params,
                 verify_crc: opts.verify_crc,
                 base_norms: Arc::new(OnceLock::new()),
@@ -1035,13 +934,7 @@ impl FtsReader {
             fst_range,
             postings_range,
             positions_range,
-            subindex,
-            positions_grouped,
-            doc_length_bytes,
-            has_bitset_blocks,
             version,
-            bounds,
-            dict_layout,
             columns,
             column_id_by_name,
             doc_map,
@@ -1050,8 +943,8 @@ impl FtsReader {
 
     /// The Parquet row a doc id of this blob stands for.
     ///
-    /// The identity on every blob through `V7`, where the two are the
-    /// same number, and a lookup on a `V8` blob whose documents are
+    /// The identity on a `V7` blob, where the two are the same number,
+    /// and a lookup on a `V8` blob whose documents are
     /// stored under an ordering of their own.
     ///
     /// An id past the end of the map is a bug in the caller or a blob
@@ -1145,20 +1038,14 @@ impl FtsReader {
         }
     }
 
-    /// Open the term dictionary over fetched FST bytes, mapping an FST
-    /// parse failure to the reader's malformed-blob error.
-    pub(super) fn open_dict<'b>(&self, fst_bytes: &'b [u8]) -> Result<TermDict<'b>, FtsError> {
-        Self::open_dict_with(fst_bytes, self.dict_layout)
-    }
-
-    /// [`Self::open_dict`] for the pooled walks that carry the layout
-    /// instead of a reader.
-    pub(super) fn open_dict_with(
-        fst_bytes: &[u8],
-        layout: DictLayout,
-    ) -> Result<TermDict<'_>, FtsError> {
-        TermDict::open(fst_bytes, layout)
-            .map_err(|e| FtsError::Read(ReadError::Malformed(format!("FST parse failed: {e}"))))
+    /// Open the term dictionary over fetched bytes, mapping a parse
+    /// failure to the reader's malformed-blob error.
+    pub(super) fn open_dict(dict_bytes: &[u8]) -> Result<TermBlocks<'_>, FtsError> {
+        TermBlocks::open(dict_bytes).map_err(|e| {
+            FtsError::Read(ReadError::Malformed(format!(
+                "term dictionary parse failed: {e}"
+            )))
+        })
     }
 
     /// Build `column_id`'s norms from its length array if a scoring path has
@@ -1203,9 +1090,10 @@ impl FtsReader {
     }
 
     /// Fetch the complete byte range of each requested term — metadata
-    /// header (20 bytes) + skip table + encoded posting blocks — in
-    /// parallel. `terms` are `(metadata_offset, postings_length)` pairs
-    /// stored in the FST (`FstValue::Pfor`); the
+    /// header + skip table + encoded posting blocks, or a short-form
+    /// body — in parallel, coalescing adjacent ranges. `terms` are
+    /// `(metadata_offset, postings_length)` pairs from the dictionary
+    /// (`FstValue::Pfor`); the
     /// returned `Bytes` for term `i` starts at that term's metadata
     /// header (offset 0) and runs to the end of its last block, so a
     /// `TermCursor` can index it directly.
@@ -1218,56 +1106,12 @@ impl FtsReader {
     /// ranges are coalesced under one async bridge and returned in
     /// input order.
     ///
-    /// Whenever the FST value carries the length, this is a single
-    /// range batch. The metadata header remains in the returned bytes
-    /// for validation and cursor construction.
-    ///
-    /// A `None` length means the FST value held `PFOR_LENGTH_UNKNOWN`;
-    /// its real length is read from the header first.
+    /// The metadata header remains in the returned bytes for validation
+    /// and cursor construction.
     pub(super) async fn fetch_term_postings(
         &self,
-        terms: &[(usize, Option<usize>)],
+        terms: &[(usize, usize)],
     ) -> Result<Vec<Bytes>, FtsError> {
-        if terms.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Recover the lengths the FST could not express. `postings_length`
-        // sits at offset 12 in both header strides, so 20 bytes covers it.
-        let probe_ranges: Vec<(usize, usize)> = terms
-            .iter()
-            .filter(|(_, len)| len.is_none())
-            .map(|&(metadata_offset, _)| (metadata_offset, TERM_META_SIZE))
-            .collect();
-        let probed = self.fetch_ranges(&probe_ranges).await?;
-
-        let mut resolved: Vec<(usize, usize)> = Vec::with_capacity(terms.len());
-        let mut next_probe = 0usize;
-        for &(metadata_offset, slot_length) in terms {
-            let postings_length = match slot_length {
-                Some(length) => length,
-                None => {
-                    let header = probed.get(next_probe).ok_or_else(|| {
-                        FtsError::Read(ReadError::Malformed(
-                            "fetched fewer term metadata headers than probed".into(),
-                        ))
-                    })?;
-                    next_probe += 1;
-                    header_postings_length(header.as_ref())?
-                }
-            };
-            resolved.push((metadata_offset, postings_length));
-        }
-
-        self.fetch_ranges(&resolved).await
-    }
-
-    /// Fetch each `(metadata_offset, length)` range from the postings
-    /// region in parallel, coalescing adjacent ranges, and return the
-    /// per-request slices in input order. The byte-level half of
-    /// [`Self::fetch_term_postings`]; every length here is already
-    /// known to be real.
-    async fn fetch_ranges(&self, terms: &[(usize, usize)]) -> Result<Vec<Bytes>, FtsError> {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
@@ -1310,11 +1154,7 @@ impl FtsReader {
         if terms.iter().all(|&(_, len)| len == 0) {
             return Ok(vec![Bytes::new(); terms.len()]);
         }
-        let region = self.positions_range.as_ref().ok_or_else(|| {
-            FtsError::Read(ReadError::Malformed(
-                "positional term in a blob with no positions region".into(),
-            ))
-        })?;
+        let region = &self.positions_range;
         let base = region.start;
         let region_len = region.len();
         let mut ranges: Vec<Range<usize>> = Vec::with_capacity(terms.len());
@@ -1410,17 +1250,9 @@ impl FtsReader {
             for (cursor, term) in cursors.iter().zip(&member_refs) {
                 match (cursor.predecoded, cursor.bytes.is_empty()) {
                     (false, _) => {
-                        // This is the phrase member's own term_meta —
-                        // the one `decode_current_positions` uses — so it
-                        // carries the sub-index when the blob has one.
-                        let term_meta = TermMeta::parse(
-                            cursor.bytes.as_ref(),
-                            0,
-                            true,
-                            self.subindex,
-                            self.bounds,
-                            self.positions_grouped,
-                        )?;
+                        // This is the phrase member's own term_meta — the
+                        // one `decode_current_positions` uses.
+                        let term_meta = TermMeta::parse(cursor.bytes.as_ref(), 0, true)?;
                         positional.push((Some(term_meta), None));
                     }
                     (true, false) => {
@@ -1447,7 +1279,7 @@ impl FtsReader {
                     (true, true) => {
                         dict_ranges += 1;
                         let fst_bytes = self.dict_bytes_async().await?;
-                        let dict = self.open_dict(&fst_bytes)?;
+                        let dict = Self::open_dict(&fst_bytes)?;
                         let key = make_key(&col_meta.name, term);
                         let packed = dict
                             .lookup(&key)
@@ -1506,7 +1338,7 @@ impl FtsReader {
     ) -> Result<Vec<Vec<u8>>, FtsError> {
         self.debug_assert_own_dict(fst_bytes);
         // An unregistered column has no keys, so the walk is empty.
-        collect_terms_with_prefix(fst_bytes, self.dict_layout, column, b"")
+        collect_terms_with_prefix(fst_bytes, column, b"")
     }
 
     /// Catches a caller handing in a dictionary of the wrong size, such as
@@ -1523,7 +1355,7 @@ impl FtsReader {
     /// (lex order) and every doc in its posting list (doc_ids ascending),
     /// invoke `emit(term_bytes, local_doc_id, tf, positions)`. Reuses the
     /// query-path [`TermCursor`] block decode for doc_ids/tfs and the
-    /// positional `decode_run` for positions, so what is streamed is exactly
+    /// block's position group for positions, so what is streamed is exactly
     /// what a fresh build produced. `positions` is empty for a non-positional
     /// column; otherwise it holds the `tf` token offsets for this `(term, doc)`
     /// (borrowed from a reused buffer — copy it if you need to retain it past
@@ -1539,7 +1371,7 @@ impl FtsReader {
     ) -> Result<(), FtsError> {
         let column_name = &self.columns[column_id as usize].name;
         let fst_bytes = self.dict_bytes()?;
-        let dict = self.open_dict(&fst_bytes)?;
+        let dict = Self::open_dict(&fst_bytes)?;
 
         // Column-scoped FST keys are `column_name <FST_SEPARATOR> term`;
         // `iter_prefix` yields `(key, packed_value)` in lex term order, so we
@@ -1570,7 +1402,7 @@ impl FtsReader {
         from: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, FstValue)>, FtsError> {
-        let dict = self.open_dict(fst_bytes)?;
+        let dict = Self::open_dict(fst_bytes)?;
         let prefix = make_key(&self.columns[column_id as usize].name, "");
         let mut start = prefix.clone();
         start.extend_from_slice(from);
@@ -1595,7 +1427,7 @@ impl FtsReader {
     ) -> Result<(), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let positional = col_meta.positions;
-        let positions_region = self.positions_range.clone();
+        let positions_region = &self.positions_range;
 
         for (term, packed) in entries {
             match packed {
@@ -1612,10 +1444,10 @@ impl FtsReader {
                 }
                 FstValue::Pfor {
                     metadata_offset,
-                    postings_length_hint,
+                    postings_length,
                     short,
                 } => {
-                    let term_bytes = self.term_bytes_sync(metadata_offset, postings_length_hint)?;
+                    let term_bytes = self.term_bytes_sync(metadata_offset, postings_length)?;
 
                     if short {
                         // Short-form term: the whole list is the body; its
@@ -1661,25 +1493,13 @@ impl FtsReader {
                         continue;
                     }
 
-                    // For a positional column, this term's position runs live
+                    // For a positional column, this term's position groups live
                     // contiguously in the positions region at `positions_offset`,
-                    // one `decode_run` per doc in posting order. Read the slice
+                    // one group per block in posting order. Read the slice
                     // once and walk it in lockstep with the doc cursor.
                     let position_bytes = if positional {
-                        let meta = TermMeta::parse(
-                            term_bytes.as_ref(),
-                            0,
-                            true,
-                            SubindexKind::None,
-                            self.bounds,
-                            self.positions_grouped,
-                        )?;
-                        let region = positions_region.as_ref().ok_or_else(|| {
-                            FtsError::Read(ReadError::Malformed(
-                                "positional column missing a positions region".into(),
-                            ))
-                        })?;
-                        let pstart = region.start + meta.positions_offset as usize;
+                        let meta = TermMeta::parse(term_bytes.as_ref(), 0, true)?;
+                        let pstart = positions_region.start + meta.positions_offset as usize;
                         let pend = pstart + meta.positions_length as usize;
                         Some(fetch_source_range(
                             &self.source,
@@ -1694,15 +1514,12 @@ impl FtsReader {
                     // This walk carries postings across into a merge; it
                     // reads doc ids, tfs and positions and never consults
                     // a score bound.
-                    let mut cursor =
-                        TermCursor::new(term_bytes, col_meta, self.bounds, None, 1, false, false)?;
-                    // Grouped positions (V7): each block's runs are one
-                    // group, decoded whole at the block's start and sliced
-                    // per pair; older blobs are one run after another.
-                    let grouped = self.positions_grouped;
+                    let mut cursor = TermCursor::new(term_bytes, col_meta, None, 1, false)?;
+                    // Each block's runs are one group, decoded whole at the
+                    // block's start and sliced per pair.
                     let mut group = GroupIndex::default();
                     while !cursor.is_exhausted() {
-                        if grouped && let Some(bytes) = &position_bytes {
+                        if let Some(bytes) = &position_bytes {
                             let tfs = &cursor.block_tfs[..cursor.block_n];
                             group
                                 .locate(bytes.as_ref(), &mut pos_at, tfs)
@@ -1716,7 +1533,7 @@ impl FtsReader {
                             let doc_id = cursor.block_doc_ids[cursor.pos];
                             let tf = cursor.block_tfs[cursor.pos];
                             let positions: &[u32] = match &position_bytes {
-                                Some(bytes) if grouped => {
+                                Some(bytes) => {
                                     positions_buf.clear();
                                     group
                                         .run_positions(
@@ -1728,16 +1545,6 @@ impl FtsReader {
                                         .ok_or_else(|| {
                                             FtsError::Read(ReadError::Malformed(
                                                 "position run overflowing in merge read".into(),
-                                            ))
-                                        })?;
-                                    positions_buf.as_slice()
-                                }
-                                Some(bytes) => {
-                                    positions_buf.clear();
-                                    decode_run(bytes.as_ref(), &mut pos_at, tf, positions_buf)
-                                        .ok_or_else(|| {
-                                            FtsError::Read(ReadError::Malformed(
-                                                "truncated position run in merge read".into(),
                                             ))
                                         })?;
                                     positions_buf.as_slice()
@@ -1772,7 +1579,7 @@ impl FtsReader {
     ) -> Result<(), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let fst_bytes = self.dict_bytes()?;
-        let dict = self.open_dict(&fst_bytes)?;
+        let dict = Self::open_dict(&fst_bytes)?;
         let prefix = make_key(&col_meta.name, "");
         let mut doc_ids = [0u32; BLOCK_LEN];
         let mut tfs = [0u32; BLOCK_LEN];
@@ -1788,10 +1595,10 @@ impl FtsReader {
                 }
                 FstValue::Pfor {
                     metadata_offset,
-                    postings_length_hint,
+                    postings_length,
                     short,
                 } => self
-                    .term_bytes_sync(metadata_offset, postings_length_hint)
+                    .term_bytes_sync(metadata_offset, postings_length)
                     .and_then(|term_bytes| match short {
                         true => {
                             let decoded = decode_short(
@@ -1813,15 +1620,7 @@ impl FtsReader {
                         // A count-only cursor decodes a block's doc ids and
                         // skips its tfs.
                         false => {
-                            let mut cursor = TermCursor::new(
-                                term_bytes,
-                                col_meta,
-                                self.bounds,
-                                None,
-                                1,
-                                false,
-                                true,
-                            )?;
+                            let mut cursor = TermCursor::new(term_bytes, col_meta, None, 1, true)?;
                             while !cursor.is_exhausted() {
                                 for &doc in &cursor.block_doc_ids[cursor.pos..cursor.block_n] {
                                     on_doc(&carry, doc);
@@ -1844,33 +1643,21 @@ impl FtsReader {
         failed.map_or(Ok(()), Err)
     }
 
-    /// One PFOR term's bytes, from its metadata header to its end. A
-    /// dictionary value without a length hint costs a header read first.
+    /// One PFOR term's bytes, from its metadata header to its end.
     fn term_bytes_sync(
         &self,
         metadata_offset: u64,
-        postings_length_hint: Option<u32>,
+        postings_length: u32,
     ) -> Result<Bytes, FtsError> {
         let start = self.postings_range.start + metadata_offset as usize;
-        let postings_length = match postings_length_hint {
-            Some(len) => len as usize,
-            None => {
-                let header = fetch_source_range(
-                    &self.source,
-                    start..start + TERM_META_SIZE,
-                    "fts/merge header",
-                )?;
-                header_postings_length(header.as_ref())?
-            }
-        };
         fetch_source_range(
             &self.source,
-            start..start + postings_length,
+            start..start + postings_length as usize,
             "fts/merge postings",
         )
     }
 
-    /// Read a column's stored per-doc lengths (token counts), one `u32` per
+    /// Read a column's stored per-doc lengths (token counts), one per
     /// local doc-id in `0..n_docs`. The FTS compaction merge carries these
     /// forward (with the input's doc-id remap) rather than recomputing them
     /// from text. These are the already-clamped values written at build time.
@@ -1879,13 +1666,12 @@ impl FtsReader {
         let range = self.columns[column_id as usize].doc_lengths_range.clone();
         let bytes = fetch_source_range(&self.source, range, "fts/merge doc_lengths")?;
         let region = bytes.as_ref();
-        let width = self.doc_length_bytes;
-        if region.len() < n * width {
+        if region.len() < n * format::fts::DOC_LENGTH_BYTES {
             return Err(FtsError::Read(ReadError::Malformed(
                 "doc-lengths region shorter than n_docs entries".into(),
             )));
         }
-        Ok((0..n).map(|d| read_doc_length(region, d, width)).collect())
+        Ok((0..n).map(|d| read_doc_length(region, d)).collect())
     }
 
     /// Walk the FST and collect every term registered under
@@ -1912,7 +1698,7 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let fst_bytes = self.dict_bytes()?;
-        collect_terms_with_prefix(&fst_bytes, self.dict_layout, column, term_prefix)
+        collect_terms_with_prefix(&fst_bytes, column, term_prefix)
     }
 
     /// Whether `column` is registered as an FTS column in this superfile.
@@ -1927,7 +1713,6 @@ impl FtsReader {
 /// the query path's pooled one (`FtsReader::terms_with_prefix`).
 pub(super) fn collect_terms_with_prefix(
     fst_bytes: &[u8],
-    layout: DictLayout,
     column: &str,
     term_prefix: &[u8],
 ) -> Result<Vec<Vec<u8>>, FtsError> {
@@ -1935,7 +1720,7 @@ pub(super) fn collect_terms_with_prefix(
     full_prefix.push(FST_SEPARATOR);
     let column_prefix_len = full_prefix.len();
     full_prefix.extend_from_slice(term_prefix);
-    let dict = FtsReader::open_dict_with(fst_bytes, layout)?;
+    let dict = FtsReader::open_dict(fst_bytes)?;
     let pairs = dict.iter_prefix(&full_prefix);
     Ok(pairs
         .into_iter()
@@ -2285,29 +2070,25 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
     n
 }
 
-/// Read `postings_length` out of a term metadata header, given only
-/// enough bytes to cover that field.
-/// Document `d`'s stored length from a doc-lengths array of `width`-byte
-/// little-endian entries (`u16` from `V7`, `u32` before).
+/// Document `d`'s stored length from a doc-lengths array of `u16`
+/// little-endian entries.
 #[inline]
-pub(super) fn read_doc_length(region: &[u8], d: usize, width: usize) -> u32 {
-    let at = d * width;
-    match width {
-        format::fts::DOC_LENGTH_BYTES_V7 => {
-            u32::from(u16::from_le_bytes([region[at], region[at + 1]]))
-        }
-        _ => read_u32_le(&region[at..at + U32_BYTES]),
-    }
+pub(super) fn read_doc_length(region: &[u8], d: usize) -> u32 {
+    let at = d * format::fts::DOC_LENGTH_BYTES;
+    u32::from(u16::from_le_bytes([region[at], region[at + 1]]))
 }
 
-pub(super) fn header_postings_length(header: &[u8]) -> Result<usize, FtsError> {
-    let field_end = term_meta::POSTINGS_LENGTH_OFF + U32_BYTES;
-    if header.len() < field_end {
-        return Err(FtsError::Read(ReadError::Malformed(
-            "term metadata header shorter than its postings_length field".into(),
-        )));
+/// Refuse a blob version this crate does not read: one below
+/// [`VERSION_MIN`] with the instruction to reindex it, anything else
+/// unknown as unsupported.
+fn check_version(version: u32) -> Result<(), FtsError> {
+    match version {
+        format::fts::VERSION_V7 | format::fts::VERSION_V8 => Ok(()),
+        v if v < VERSION_MIN => Err(FtsError::IndexTooOld { version: v }),
+        v => Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
+            "fts section version {v}"
+        )))),
     }
-    Ok(read_u32_le(&header[term_meta::POSTINGS_LENGTH_OFF..field_end]) as usize)
 }
 
 #[cfg(test)]
@@ -2388,6 +2169,39 @@ mod tests {
             Bytes::from(b.finish().expect("finish")),
             r#"[{"name":"body","tokenizer":"standard"}]"#,
         )
+    }
+
+    /// A blob older than the oldest version this engine reads is refused
+    /// on open, eager and lazy alike, with an error that says to reindex;
+    /// a version past the newest is unsupported, not too old.
+    #[tokio::test]
+    async fn a_blob_below_the_minimum_version_is_refused_with_a_reindex_hint() {
+        let (blob, json) = multi_block_blob();
+        let stamp = |version: u32| {
+            let mut bytes = blob.to_vec();
+            bytes[VERSION_FIELD].copy_from_slice(&version.to_le_bytes());
+            Bytes::from(bytes)
+        };
+        let old = format::fts::VERSION_MIN - 1;
+        let err = FtsReader::open(stamp(old), json).expect_err("a pre-minimum blob");
+        assert!(
+            matches!(err, FtsError::IndexTooOld { version } if version == old),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("reindex"), "{err}");
+
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(stamp(old)));
+        let err = FtsReader::open_lazy(src, json, OpenOptions::default())
+            .await
+            .expect_err("a pre-minimum blob, lazily");
+        assert!(matches!(err, FtsError::IndexTooOld { .. }), "{err:?}");
+
+        let err =
+            FtsReader::open(stamp(format::fts::VERSION_V8 + 1), json).expect_err("a future blob");
+        assert!(
+            matches!(err, FtsError::Read(ReadError::UnsupportedVersion(_))),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -3173,14 +2987,13 @@ mod tests {
         b.add_doc(0, 1, "tok tok tok").expect("short doc");
         let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        assert_eq!(r.doc_length_bytes, format::fts::DOC_LENGTH_BYTES_V7);
         assert_eq!(
             r.read_doc_lengths(0).expect("doc lengths"),
             vec![format::fts::DOC_LENGTH_STORED_MAX, 3]
         );
         assert_eq!(
             r.columns[0].doc_lengths_range.len(),
-            2 * format::fts::DOC_LENGTH_BYTES_V7
+            2 * format::fts::DOC_LENGTH_BYTES
         );
         let hits = r
             .search("body", &["tok"], 10, BoolMode::Or)
@@ -3500,7 +3313,7 @@ mod tests {
         let (blob, json) = build_mixed_df_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let fst_bytes = r.dict_bytes().expect("dict");
-        let dict = r.open_dict(&fst_bytes).expect("open dict");
+        let dict = FtsReader::open_dict(&fst_bytes).expect("open dict");
 
         for term in ["common", "rust"] {
             match dict.lookup(&make_key("body", term)).expect("in dict") {
@@ -3557,8 +3370,8 @@ mod tests {
                 .try_into()
                 .expect("postings_off_i slice is 8 bytes"),
         ) as usize;
-        // v2 layout: the postings region ends where the positions
-        // region begins (header bytes [48..56]).
+        // The postings region ends where the positions region begins
+        // (header bytes [48..56]).
         let positions_off_i = u64::from_le_bytes(
             blob_inline[48..56]
                 .try_into()
@@ -4248,12 +4061,10 @@ mod tests {
     }
 
     /// An unranked match (the matching rows, or their count, under OR or AND)
-    /// never scores, so it must not read the length array, even on a file
-    /// older than V6, whose bound scale is computed from the norms that array
-    /// holds.
+    /// never scores, so it must not read the length array.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unranked_match_never_reads_the_length_array() {
-        let (blob, json) = versioned_blob(BlobEra::V2ToV4);
+        let (blob, json) = multi_block_blob();
         let terms = ["common", "shared"];
         let eager = FtsReader::open(blob.clone(), json).expect("eager open");
         let source = Arc::new(FailingOnceSource {

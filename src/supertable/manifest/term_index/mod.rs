@@ -3158,15 +3158,15 @@ mod tests {
                     (
                         FetchedTermSlot::Pfor { bytes, short, .. },
                         FstValue::Pfor {
-                            postings_length_hint,
+                            postings_length,
                             short: s,
                             ..
                         },
                     ) => {
                         assert_eq!(short, s);
                         assert_eq!(
-                            Some(bytes.len() as u32),
-                            postings_length_hint,
+                            bytes.len() as u32,
+                            postings_length,
                             "{name}: fetched exactly the postings range"
                         );
                     }

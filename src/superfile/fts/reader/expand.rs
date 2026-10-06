@@ -21,17 +21,13 @@ use crate::{
     superfile::{
         ReadError,
         error::FtsError,
-        format::fts::DictLayout,
         fts::{
             posting::BLOCK_LEN,
             tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER},
         },
         id_space::{DocMap, FtsDocId},
     },
-    utils::terms::{
-        make_key,
-        value::{FstValue, PFOR_LENGTH_UNKNOWN},
-    },
+    utils::terms::{make_key, value::FstValue},
 };
 
 /// Long s (U+017F). Simple case folding puts it in `s`'s class;
@@ -395,36 +391,21 @@ impl ValueCharge {
 #[derive(Debug, Clone, Copy)]
 struct TermBody {
     metadata_offset: usize,
-    /// The body's length in bytes, when the dictionary slot could hold it.
-    length: Option<usize>,
+    /// The body's length in bytes.
+    length: usize,
     short: bool,
-}
-
-impl TermBody {
-    /// The bytes reserved for the body before it is fetched: its length,
-    /// or — when the slot could not hold it — the slot's limit, which such
-    /// a body is at least. Its wave's reservation grows to the bytes that
-    /// actually came once it is fetched.
-    fn budget_bytes(&self) -> usize {
-        self.length.unwrap_or(PFOR_LENGTH_UNKNOWN as usize)
-    }
 }
 
 /// How many of `bodies`, from the front, one fetch wave takes: bodies
 /// until their bytes would pass [`CONTAINS_FETCH_BATCH_BYTES`], and
-/// always at least one. A body whose length the slot could not hold is at
-/// least the slot's limit but could be any size past it, so it is fetched
-/// alone: several of them in one wave could pass the cap many times over.
+/// always at least one.
 fn wave_len(bodies: &[TermBody]) -> usize {
     let mut bytes = 0usize;
     bodies
         .iter()
-        .position(|body| match body.length {
-            None => true,
-            Some(length) => {
-                bytes += length;
-                bytes > CONTAINS_FETCH_BATCH_BYTES
-            }
+        .position(|body| {
+            bytes += body.length;
+            bytes > CONTAINS_FETCH_BATCH_BYTES
         })
         .map_or(bodies.len(), |past| past.max(1))
 }
@@ -489,11 +470,9 @@ impl FtsReader {
             let column = column.to_owned();
             let owned: Vec<OwnedPattern> = patterns.iter().map(|p| p.into_owned()).collect();
             let walks = walks.clone();
-            let layout = self.dict_layout;
             run_on_pool(pool, "like expansion", move || {
                 walk_dictionary(
                     &fst_bytes,
-                    layout,
                     &column,
                     &owned,
                     &walks,
@@ -540,9 +519,8 @@ impl FtsReader {
         let fst_bytes = self.dict_bytes_async().await?;
         let column = column.to_owned();
         let term_prefix = term_prefix.to_vec();
-        let layout = self.dict_layout;
         run_on_pool(pool, "prefix expansion", move || {
-            collect_terms_with_prefix(&fst_bytes, layout, &column, &term_prefix)
+            collect_terms_with_prefix(&fst_bytes, &column, &term_prefix)
         })
         .await
         .map_err(|_| FtsError::TaskDropped("prefix expansion"))?
@@ -595,7 +573,6 @@ impl FtsReader {
         }
         let fst_bytes = self.dict_bytes_async().await?;
         work.planned_ranges += 1;
-        let layout = self.dict_layout;
         let owned_column = column.to_owned();
         let patterns: Vec<OwnedPattern> = needles
             .iter()
@@ -608,7 +585,6 @@ impl FtsReader {
             timed_section(|| {
                 walk_dictionary(
                     &fst_bytes,
-                    layout,
                     &owned_column,
                     &patterns,
                     &walks,
@@ -667,11 +643,11 @@ impl FtsReader {
                 FstValue::Inline { doc_id, .. } => inline.push(doc_id),
                 FstValue::Pfor {
                     metadata_offset,
-                    postings_length_hint,
+                    postings_length,
                     short,
                 } => bodies.push(TermBody {
                     metadata_offset: metadata_offset as usize,
-                    length: postings_length_hint.map(|len| len as usize),
+                    length: postings_length as usize,
                     short,
                 }),
             }
@@ -684,51 +660,28 @@ impl FtsReader {
             let (wave, tail) = rest.split_at(wave_len(rest));
             rest = tail;
             // Released once this wave is unioned, before the next is fetched.
-            let mut held = reserve_exact(
+            let _held = reserve_exact(
                 budget,
-                wave.iter().map(TermBody::budget_bytes).sum(),
+                wave.iter().map(|body| body.length).sum(),
                 "postings",
             )?;
-            let refs: Vec<(usize, Option<usize>)> = wave
+            let refs: Vec<(usize, usize)> = wave
                 .iter()
                 .map(|body| (body.metadata_offset, body.length))
                 .collect();
             let fetched = self.fetch_term_postings(&refs).await?;
             let fetched_bytes: usize = fetched.iter().map(|b| b.len()).sum();
-            // A body of unknown length was reserved at its lower bound;
-            // charge what actually came before it is unioned.
-            if let Some(held) = held.as_mut() {
-                let short = fetched_bytes.saturating_sub(held.size());
-                held.try_grow(short)
-                    .map_err(|refusal| exact_over_budget("postings", refusal))?;
-            }
             work.postings_bytes += fetched_bytes as u64;
-            // One range per body, and one more for a header probed for a
-            // length the slot could not hold — as a match's build counts.
-            work.planned_ranges += wave
-                .iter()
-                .map(|body| 1 + u64::from(body.length.is_none()))
-                .sum::<u64>();
-            let forms: Vec<(bool, bool)> = wave
-                .iter()
-                .map(|body| (body.short, body.length.is_none()))
-                .collect();
+            // One range per body, as a match's build counts.
+            work.planned_ranges += wave.len() as u64;
+            let forms: Vec<bool> = wave.iter().map(|body| body.short).collect();
             let col = col.clone();
-            let stored = self.bounds;
             let (ored, ns) = run_on_pool(pool, "contains union", move || {
                 timed_section(|| {
                     let mut scratch = [0u32; BLOCK_LEN];
-                    for (bytes, (short, header_probed)) in fetched.into_iter().zip(forms) {
-                        let cursor = TermCursor::for_body(
-                            bytes,
-                            short,
-                            &col,
-                            stored,
-                            None,
-                            UNWEIGHTED,
-                            header_probed,
-                            true,
-                        )?;
+                    for (bytes, short) in fetched.into_iter().zip(forms) {
+                        let cursor =
+                            TermCursor::for_body(bytes, short, &col, None, UNWEIGHTED, true)?;
                         // The bitset spans this blob's documents; a list
                         // reaching past them is a damaged blob, refused
                         // before it can index out of the bitset.
@@ -827,7 +780,6 @@ fn charge_admitted(
 /// collectors for the caller to hold while it uses them.
 fn walk_dictionary(
     fst_bytes: &[u8],
-    layout: DictLayout,
     column: &str,
     patterns: &[OwnedPattern],
     walks: &[Walk],
@@ -837,7 +789,7 @@ fn walk_dictionary(
     keep: Keep,
     mut charge: Option<ValueCharge>,
 ) -> Result<(Vec<Collected>, Option<ValueCharge>), FtsError> {
-    let dict = FtsReader::open_dict_with(fst_bytes, layout)?;
+    let dict = FtsReader::open_dict(fst_bytes)?;
     let mut collected: Vec<Collected> = patterns.iter().map(|_| Collected::new()).collect();
     // Every key in the column's range starts with `<column>\x1F`; the
     // term is what follows. `for_each_prefix` only visits keys carrying
@@ -1404,7 +1356,7 @@ mod tests {
     fn a_non_utf8_dictionary_key_fails_every_walk_rather_than_skip_its_rows() {
         // `body`'s terms: `rust`, and one that is `r` plus a byte no UTF-8
         // holds. Skipping the second could drop the rows it indexes.
-        let mut dict = TermDictBuilder::new(DictLayout::Blocks);
+        let mut dict = TermDictBuilder::new();
         dict.insert(
             &make_key("body", "rust"),
             FstValue::Inline { doc_id: 0, tf: 1 },
@@ -1427,7 +1379,6 @@ mod tests {
         for (pattern, walk, keep) in walks {
             let err = walk_dictionary(
                 &fst,
-                DictLayout::Blocks,
                 "body",
                 &[pattern],
                 &[walk],
@@ -1481,7 +1432,6 @@ mod tests {
         let walk = |charge: Option<ValueCharge>| {
             walk_dictionary(
                 &fst,
-                r.dict_layout,
                 "body",
                 &[OwnedPattern::Contains("common".into())],
                 &[Walk::Full],
@@ -1551,28 +1501,21 @@ mod tests {
 
     #[test]
     fn a_fetch_wave_stops_at_the_byte_budget_and_always_takes_one_body() {
-        let body = |length: Option<usize>| TermBody {
+        let body = |length: usize| TermBody {
             metadata_offset: 0,
             length,
             short: false,
         };
         let half = CONTAINS_FETCH_BATCH_BYTES / 2;
-        let bodies = [body(Some(half)), body(Some(half)), body(Some(1))];
+        let bodies = [body(half), body(half), body(1)];
         assert_eq!(wave_len(&bodies), 2, "exactly the budget fits");
         assert_eq!(wave_len(&bodies[2..]), 1);
-        let oversized = [body(Some(CONTAINS_FETCH_BATCH_BYTES + 1)), body(Some(1))];
+        let oversized = [body(CONTAINS_FETCH_BATCH_BYTES + 1), body(1)];
         assert_eq!(
             wave_len(&oversized),
             1,
             "one body over the budget goes alone"
         );
-        // A body too long for its slot could be any size past its limit,
-        // so it goes alone, and a wave of known lengths stops before it.
-        let unknown = [body(None); 8];
-        assert_eq!(wave_len(&unknown), 1, "an unknown length goes alone");
-        let mixed = [body(Some(1)), body(Some(1)), body(None), body(Some(1))];
-        assert_eq!(wave_len(&mixed), 2, "known lengths stop before it");
-        assert_eq!(wave_len(&mixed[2..]), 1);
     }
 
     #[test]

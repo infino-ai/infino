@@ -16,8 +16,7 @@ use super::{
     filter::ExcludeFilter,
     metadata::{NormTable, unscored_norm_table},
     sink::{
-        AndSink, CollectSink, CountSink, MustShouldSink, ScoreSink, TopKEntry, drain_top_k_desc,
-        replace_worst,
+        AndSink, CollectSink, MustShouldSink, ScoreSink, TopKEntry, drain_top_k_desc, replace_worst,
     },
 };
 use crate::superfile::{
@@ -189,8 +188,7 @@ fn score_noness_batched(c: &mut TermCursor, docs: &[u32], scores: &mut [f32], dl
 /// term with the fewest blocks and count docs the others all contain. Each
 /// membership probe is `TermCursor::contains`, which bit-tests a bitset
 /// block with no decode — so a common (bitset) term's blocks are never
-/// expanded. Used for `v4` blobs; the flat-merge stays for `v1`–`v3`, where
-/// every block is PFOR and the sorted merge over decoded blocks is faster.
+/// expanded.
 fn count_and_intersect_membership(mut cursors: Vec<TermCursor>) -> u64 {
     // Drive by the rarest term (fewest blocks) to minimise membership
     // probes. Ties don't matter; any driver yields the same count.
@@ -276,9 +274,9 @@ fn block_max_and_bound(
 }
 
 /// Route a ranked AND to the membership walk ([`FtsReader::and_membership_scored`])
-/// instead of the block flat-merge. True only for v4/v5 blobs — where a common
-/// term's blocks are bitset-encoded, so a membership probe is an O(1) bit-test
-/// (plus a popcount-rank for the tf) with no doc-id decode — with **≥3 terms**
+/// instead of the block flat-merge. A common term's blocks may be
+/// bitset-encoded, so a membership probe is an O(1) bit-test (plus a
+/// popcount-rank for the tf) with no doc-id decode. True with **≥3 terms**
 /// and a **sparse rarest term**: driving the rarest doc-by-doc is then cheap and
 /// bit-testing the common others beats decoding their blocks to align them.
 ///
@@ -303,8 +301,8 @@ fn block_max_and_bound(
 // place it out of line — keeping its size (and edits to it) from shifting the
 // layout of the flat-merge/membership scorers it shares this module with.
 #[cold]
-fn and_prefer_membership(has_bitset_blocks: bool, cursors: &[TermCursor]) -> bool {
-    if !has_bitset_blocks || cursors.len() < 2 {
+fn and_prefer_membership(cursors: &[TermCursor]) -> bool {
+    if cursors.len() < 2 {
         return false;
     }
     let max_doc = cursors
@@ -718,7 +716,7 @@ impl FtsReader {
             filter,
             floor_eff,
         };
-        if and_prefer_membership(self.has_bitset_blocks, &cursors) {
+        if and_prefer_membership(&cursors) {
             // Rarest-driven membership walk: bit-test the common terms instead
             // of decoding their blocks to align them (the flat-merge's dominant
             // cost on rare∧common). See `and_membership_scored`.
@@ -951,46 +949,38 @@ impl FtsReader {
         sink.out
     }
 
-    /// Unranked multi-term AND **count**: the size of the intersection
-    /// via the same flat-merge as [`collect_and_intersect`](Self::collect_and_intersect),
-    /// but through a [`CountSink`] that tallies hits instead of
-    /// collecting them — no `Vec<u32>` materialized.
-    pub(super) fn count_and_intersect(&self, mut cursors: Vec<TermCursor>) -> u64 {
+    /// Unranked multi-term AND **count**: the size of the intersection,
+    /// tallied rather than collected — no `Vec<u32>` materialized. A
+    /// common term's blocks may be bitset-encoded, where decoding (set-bit
+    /// expansion) is slower than probing them, so the flat-merge
+    /// [`collect_and_intersect`](Self::collect_and_intersect) uses is not
+    /// the shape here.
+    pub(super) fn count_and_intersect(&self, cursors: Vec<TermCursor>) -> u64 {
         if cursors.is_empty() {
             return 0;
         }
-        // On a v4 blob a common term's blocks may be bitset-encoded, where
-        // decoding (set-bit expansion) is slower than the PFOR path the
-        // flat-merge assumes.
-        if self.has_bitset_blocks {
-            // When even the *rarest* term is dense (covers ≥ 1/DIVISOR of the
-            // corpus), the rarest-driven membership walk still iterates a long
-            // list. AND the terms' presence bitsets word-at-a-time instead —
-            // cost is independent of the terms' lengths. The two full-width
-            // bitsets it allocates only pay off at this density, so a sparser
-            // intersection keeps the membership probe.
-            if cursors.len() >= 2 {
-                let max_doc = cursors
-                    .iter()
-                    .filter_map(|c| c.blocks.last())
-                    .map(|b| b.last_doc_id)
-                    .max()
-                    .unwrap_or(0);
-                let min_df = cursors.iter().map(|c| c.df).min().unwrap_or(0);
-                if min_df.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) >= u64::from(max_doc) {
-                    return count_and_intersect_bitset(cursors, max_doc);
-                }
+        // When even the *rarest* term is dense (covers ≥ 1/DIVISOR of the
+        // corpus), the rarest-driven membership walk still iterates a long
+        // list. AND the terms' presence bitsets word-at-a-time instead —
+        // cost is independent of the terms' lengths. The two full-width
+        // bitsets it allocates only pay off at this density, so a sparser
+        // intersection keeps the membership probe.
+        if cursors.len() >= 2 {
+            let max_doc = cursors
+                .iter()
+                .filter_map(|c| c.blocks.last())
+                .map(|b| b.last_doc_id)
+                .max()
+                .unwrap_or(0);
+            let min_df = cursors.iter().map(|c| c.df).min().unwrap_or(0);
+            if min_df.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) >= u64::from(max_doc) {
+                return count_and_intersect_bitset(cursors, max_doc);
             }
-            // Rarest term is sparse: drive by it and probe the rest by
-            // membership — a bitset block answers with an O(1) bit-test, no
-            // decode. See `count_and_intersect_membership`.
-            return count_and_intersect_membership(cursors);
         }
-        cursors.sort_by_key(|c| c.block_count());
-        let mut sink = CountSink { n: 0 };
-        // A count never scores, so it needs none of the column's norms.
-        self.and_flat_merge(&mut cursors, unscored_norm_table(), &mut sink);
-        sink.n
+        // Rarest term is sparse: drive by it and probe the rest by
+        // membership — a bitset block answers with an O(1) bit-test, no
+        // decode. See `count_and_intersect_membership`.
+        count_and_intersect_membership(cursors)
     }
 
     /// Dispatch to the 2-term specialization or the general `n >= 3`
@@ -3602,7 +3592,7 @@ mod tests {
                 .expect("cursors")
         };
         assert!(
-            and_prefer_membership(r.has_bitset_blocks, &build().await),
+            and_prefer_membership(&build().await),
             "this corpus must route to the membership walk for the screen to be under test"
         );
         for k in [1usize, 5, 10, 50, 200] {

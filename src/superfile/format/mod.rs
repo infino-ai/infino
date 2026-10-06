@@ -25,160 +25,63 @@ pub const CRC_BYTES: usize = 4;
 
 /// FTS section magic bytes and constants.
 pub mod fts {
-    use crate::superfile::fts::posting::BLOCK_LEN;
-
     /// 8-byte magic at the start of the FTS blob: `INF` + `FTS` +
     /// `01`. The trailing `01` is a fixed part of the section
     /// identity, **not** a version — it never changes across blob
-    /// versions (v2 blobs carry this same magic). The blob's version
-    /// is the `u32` at [`hdr::VERSION_OFF`], and only that field.
+    /// versions. The blob's version is the `u32` at
+    /// [`hdr::VERSION_OFF`], and only that field.
     pub const MAGIC: &[u8; 8] = b"INFFTS01";
-    /// Legacy blob version: the positionless layout with the 48-byte
-    /// header. **Read-only** — files written before the positions
-    /// region existed carry it and stay readable until support is
-    /// explicitly dropped; new code always writes
-    /// [`VERSION_V2`].
-    pub const VERSION_V1_LEGACY: u32 = 1;
 
-    /// The version new code writes: the header grows to
-    /// [`HEADER_SIZE_V2`] with the positions-region offset at
-    /// [`hdr::POSITIONS_OFFSET_OFF`], and a positions region —
-    /// empty unless a column records positions — sits between the
-    /// postings region and the doc-lengths directory. Readers accept
-    /// both versions.
-    pub const VERSION_V2: u32 = 2;
-
-    /// The version new code writes when a column stores positions: same
-    /// header and region layout as [`VERSION_V2`], but each positional
-    /// term's region gains a **position run-offset sub-index** between its
-    /// skip table and its posting blocks. The sub-index stores, every
-    /// [`POSITION_SUBINDEX_STRIDE`] pairs within a block, the byte offset
-    /// of that pair's position run (relative to the term's positions), so
-    /// the reader reaches a pair's positions by skipping `< STRIDE` runs
-    /// instead of walking every run from the block start. Readers accept
-    /// `V1`/`V2`/`V3`; `V1`/`V2` files (no sub-index) stay readable
-    /// unchanged, so existing indices need no reindex. A column *without*
-    /// positions is written as [`VERSION_V2`] — the sub-index only exists
-    /// where positions do.
-    pub const VERSION_V3: u32 = 3;
-
-    /// The version written when any posting block is stored in the **bitset
-    /// encoding**: a dense block's doc ids are a presence bitset (header
-    /// byte 3 = [`crate::superfile::fts::posting::ENCODING_BITSET`]) rather
-    /// than PFOR deltas, so the union count OR's it in without decoding.
-    /// Same header + region layout as [`VERSION_V2`]/[`VERSION_V3`]
-    /// (positions region present iff positional; sub-index for positional
-    /// terms as in `V3`) — `V4` adds only the per-block encoding choice,
-    /// which is self-describing via the header byte. Readers accept
-    /// `V1`–`V4`; `V1`–`V3` blobs carry only PACKED blocks and read
-    /// unchanged, so existing indices need no reindex.
-    pub const VERSION_V4: u32 = 4;
-
-    /// The version new code writes: everything `V4` allows (positions region
-    /// iff positional, `V3` sub-index for positional terms, bitset blocks
-    /// self-describing per block) **plus** two block-max changes:
+    /// The baseline blob version.
     ///
-    /// 1. Each skip-table entry stores the per-block max BM25 as an **exact
-    ///    little-endian `f32`** (the 4-byte slot that held `V1`–`V4`'s
-    ///    `ceil`-quantised fixed-point `u32`). It equals the reader's per-doc
-    ///    score for the block's max doc (same quantized-length scoring), so it
-    ///    is an exact upper bound with none of the fixed-point `ceil` slack.
-    /// 2. A per-term **coarse block-max table** at the tail of each PFOR
-    ///    term's postings region — one `f32` per [`COARSE_BLOCK_MAX_SPAN`]
-    ///    blocks, the span's max of the per-block maxes — giving the ranked
-    ///    walk a second, coarser skip level.
+    /// Regions, in order: the [`HEADER_SIZE`]-byte header ([`hdr`]), the
+    /// term dictionary, the postings region, the positions region (empty
+    /// unless a column records positions) and the doc-lengths directory
+    /// followed by each column's length array. Every region ends with a
+    /// CRC-32C.
     ///
-    /// The header + region layout is otherwise identical to `V2`–`V4`.
-    /// Readers accept `V1`–`V5` and gate the block-max decode on the version:
-    /// `V1`–`V4` blobs decode the fixed-point `u32` (and carry no coarse
-    /// table), so existing indices read unchanged and need no reindex.
-    pub const VERSION_V5: u32 = 5;
-
-    /// The version new code writes. Byte-for-byte the [`VERSION_V5`]
-    /// layout; what changes is the **scale** of the stored bounds and the
-    /// **average document length** they and the file's scoring are
-    /// expressed at.
+    /// The term dictionary is sorted, front-coded term blocks behind a
+    /// first-key index (`utils::terms`). Each entry says which of three
+    /// forms the term's postings take:
     ///
-    /// `V1`–`V5` bounds are maxima of `idf · tf · (k1 + 1) / (tf + k1 ·
-    /// norm)`. `V6` drops the `(k1 + 1)` factor, so a bound is a maximum
-    /// of `idf · tf / (tf + k1 · norm)` — the same quantity the scorer
-    /// now produces, and the one a BM25 implementation is conventionally
-    /// expected to report. The factor was a constant multiplier on every
-    /// score in a query, so it never changed a ranking; it did make
-    /// every published score a fixed multiple of what the same `k1` and
-    /// `b` produce elsewhere, which matters to anything reading the
-    /// number rather than the order — a score threshold, a weighted
-    /// fusion against vector distances, a comparison against another
-    /// engine.
+    /// - **inline**: a df=1 posting that fits the dictionary value, with
+    ///   no bytes in the postings region;
+    /// - **short** (`fts::short`): a term whose posting list fits one
+    ///   block — a varint `df`, a tf-equals-one bitmap, the doc-id deltas
+    ///   as group-varint, the remaining tfs as varints and, on a
+    ///   positional column, the term's position group;
+    /// - **long**: a metadata header ([`term_meta`]), a skip table
+    ///   ([`skip_entry`]), the posting blocks and a coarse block-max
+    ///   table ([`coarse_slot`]) at the tail.
     ///
-    /// The average a `V6` file declares in its doc-lengths directory is
-    /// the one to score it at: the writer bakes it as the table-wide
-    /// average over the documents that carry tokens, folding in every
-    /// superfile committed before it, so a query needs no other value
-    /// and the stored bounds — exact scores at that average — stay
-    /// exact with nothing to inflate. A `V5` file declares its own
-    /// row-count average, which the reader corrects on open.
+    /// A posting block's header is one 4-byte word (`posting`); a packed
+    /// or patched block's base doc id is the previous block's last doc id,
+    /// which the skip table already holds, and a dense block may take the
+    /// presence-bitset encoding. A skip entry carries the block's byte
+    /// length and its max BM25 as exact `f32` bits — the scorer's own
+    /// score for the block's best document — so a random block is one
+    /// coarse slot plus at most `COARSE_BLOCK_MAX_SPAN - 1` lengths away.
+    /// Positions are per-block groups, decoded whole and indexed by the
+    /// block's tf prefix sums.
     ///
-    /// Readers accept `V1`–`V6`. An older blob's bounds are still exact
-    /// upper bounds in their own scale, and the reader brings them into
-    /// this one by folding `1 / (k1 + 1)` into the column's bound
-    /// correction — so existing indices read unchanged, keep their
-    /// pruning power, and need no reindex. Getting that gate wrong in
-    /// the other direction (treating a `V6` blob as older) would divide
-    /// a bound that is already correct and silently prune documents out
-    /// of the top-k, which is why the scale is version-stamped rather
-    /// than inferred.
-    pub const VERSION_V6: u32 = 6;
-
-    /// The version new code writes. Same header, regions, bound scale
-    /// and declared average as [`VERSION_V6`]; what changes is how a
-    /// **rare term** is laid out, and one bit of every dictionary value.
-    ///
-    /// A term whose whole posting list fits one block (`df <=
-    /// BLOCK_LEN`) no longer pays the long-form fixed cost — the 20/32
-    /// byte metadata header, a skip entry, a position sub-index row, a
-    /// coarse slot and a block header, 92 bytes before the first posting
-    /// on a positional column — nor the block codec's padding of a
-    /// partial block to `BLOCK_LEN` lanes, which on a term with two docs
-    /// far apart is hundreds of bytes for two doc ids. It is written in
-    /// the **short form** instead (`fts::short`): a varint `df`, a
-    /// tf-equals-one bitmap, the doc-id deltas as group-varint, the
-    /// remaining tfs as varints and, on a positional column, the term's
-    /// position offset and length. A few bytes per posting, no lane
-    /// padding, nothing per block. On a Zipfian corpus the single-block
-    /// terms are ~97% of the dictionary and were more than half of the
-    /// postings region; they are read once and whole, so the reader
-    /// decodes a short body into the same pre-filled single-block cursor
-    /// the df=1 inline form already uses.
-    ///
-    /// The term dictionary is no longer an FST: it is sorted,
-    /// front-coded term blocks behind a first-key index (`utils::terms`),
-    /// whose entries carry the short/long form explicitly and the
-    /// metadata offset as a delta — a third smaller than the FST for
-    /// the same terms. Readers select the layout by this version;
-    /// `V1`–`V6` blobs keep their FST and its packed values.
-    /// Multi-block terms change in two fixed costs. A block's header is
-    /// one 4-byte word (`posting::BlockLayout::Compact`): the base doc
-    /// id is the previous block's last doc id, which the skip table
-    /// already holds, and a patched block's exception counts ride in the
-    /// word. A skip entry carries the block's byte length instead of its
-    /// offset ([`SkipLayout::Length`]) and drops the positions field on
-    /// a positionless column; each coarse slot gains its span's start
-    /// offset so a random block is still reached in constant work.
-    ///
-    /// Readers accept `V1`–`V7`.
+    /// Each column's doc-lengths directory entry declares the average
+    /// document length the file is scored at: the table-wide average over
+    /// the documents that carry tokens, folding in every superfile
+    /// committed before it, so a query needs no other value and the
+    /// stored bounds are exact. Lengths are stored as `u16`, saturating
+    /// at [`DOC_LENGTH_STORED_MAX`].
     pub const VERSION_V7: u32 = 7;
 
-    /// The version new code writes when a superfile's documents are
-    /// stored in the FTS blob under an ordering of their own. Byte for
-    /// byte the [`VERSION_V7`] layout for every term, block, skip entry
-    /// and dictionary value; what it adds is one region, the **doc-id
-    /// map**. Its header is the [`VERSION_V7`] header unchanged: the
-    /// map is the last region before the doc-lengths directory and its
-    /// size follows from the document count, so where it begins is
-    /// arithmetic and needs no field of its own.
+    /// The version written when a superfile's documents are stored in
+    /// the FTS blob under an ordering of their own. Byte for byte the
+    /// [`VERSION_V7`] layout for every term, block, skip entry and
+    /// dictionary value; what it adds is one region, the **doc-id map**.
+    /// Its header is the [`VERSION_V7`] header unchanged: the map is the
+    /// last region before the doc-lengths directory and its size follows
+    /// from the document count, so where it begins is arithmetic and
+    /// needs no field of its own.
     ///
-    /// Through `V7` an FTS doc id *is* a Parquet row index, so postings
+    /// In a `V7` blob an FTS doc id *is* a Parquet row index, so postings
     /// are ordered by arrival. `V8` separates the two: postings are
     /// ordered by whatever grouping the writer chose, and the map gives
     /// the row a doc id belongs to, one `u32` per document followed by a
@@ -188,13 +91,12 @@ pub mod fts {
     /// groups keep the statistics arrival order gave them, the vector
     /// blob keeps its own ordering, and the table stays time ordered.
     ///
-    /// The map is the whole of the difference. A reader that has it can
-    /// serve a `V8` blob; the search kernels never see it, because they
-    /// work in the blob's own id space throughout and the ids are
-    /// translated once, on the way out. The region sits between the
-    /// positions region and the doc-lengths directory, and the open-time
-    /// tail fetch starts at the map rather than at the directory, so the
-    /// two arrive in one range read instead of two.
+    /// The map is the whole of the difference. The search kernels never
+    /// see it, because they work in the blob's own id space throughout
+    /// and the ids are translated once, on the way out. The region sits
+    /// between the positions region and the doc-lengths directory, and
+    /// the open-time tail fetch starts at the map rather than at the
+    /// directory, so the two arrive in one range read instead of two.
     ///
     /// One thing a caller can observe changes, and it is not a bug: a
     /// top-k breaks equal scores by the blob's own doc id, so a `V8`
@@ -204,59 +106,30 @@ pub mod fts {
     /// claims; which of several tied documents is chosen is not part of
     /// the ordering the scorer defines, and reordering is precisely a
     /// change to the id that breaks the tie.
-    ///
-    /// Readers accept `V1`–`V8`. Nothing older carries a map and nothing
-    /// older needs one, since for those blobs the identity is the map.
     pub const VERSION_V8: u32 = 8;
+
+    /// The oldest blob version this crate reads. A blob below it was
+    /// written by infino < 0.8.4 and is refused on open with an error
+    /// that says to reindex it with infino 0.9.1.
+    pub const VERSION_MIN: u32 = VERSION_V7;
 
     /// The blob version a file must carry to be current — what the
     /// staleness check compares against and what a migration plans from.
     ///
-    /// Deliberately *not* what the writer stamps. The writer maps a layout
-    /// era to the version that era defines, and the two are different
-    /// facts: raising this constant says "older files are now stale",
-    /// while stamping it would say "the bytes I just wrote are whatever
-    /// the newest version is" — which is false unless a new era was
-    /// written too. Getting that backwards would label a `V7` layout as
-    /// `V8`, and the reader's feature gates, which enumerate the versions
-    /// that carry a position sub-index, bitset blocks, a term-block
-    /// dictionary and short-form terms, would stop recognising it and
-    /// silently decode none of them.
-    ///
-    /// A new version therefore means: add the constant, add the era that
-    /// writes it, then raise this. `current_version_matches_the_written_era`
-    /// fails if the last step happens without the middle one.
-    ///
-    /// Not the newest version — the one the default era stamps. [`VERSION_V8`]
-    /// sits above it and is written only where a compaction chooses an order,
-    /// so deriving this from the highest known version would mark every plain
-    /// file stale and have a reindex re-emit the same version forever.
+    /// Not the newest version: [`VERSION_V8`] sits above it and is written
+    /// only where a compaction chooses an order, so deriving this from the
+    /// highest known version would mark every plain file stale and have a
+    /// reindex re-emit the same version forever.
     pub const VERSION_CURRENT: u32 = VERSION_V7;
 
-    /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
-    /// stored offset per this many pairs within a posting block. A decode
-    /// skips at most `STRIDE - 1` runs from the nearest sub-index entry.
-    /// Divides evenly into the posting-block length so every block's
-    /// sub-index has `ceil(pairs_in_block / STRIDE)` entries.
-    pub const POSITION_SUBINDEX_STRIDE: usize = 16;
-
-    /// Sub-index run-offset checkpoints stored per posting block
-    /// ([`VERSION_V3`]): the whole-block entry count, one every
-    /// [`POSITION_SUBINDEX_STRIDE`] pairs across a full posting block.
-    /// Both the writer's per-term sub-index sizing and the reader's flat
-    /// `block * ENTRIES + slot` indexing derive from this single value, so
-    /// they stay in lockstep.
-    pub const POSITION_SUBINDEX_ENTRIES_PER_BLOCK: usize = BLOCK_LEN / POSITION_SUBINDEX_STRIDE;
-
-    /// Bytes per stored document length from [`VERSION_V7`]: a `u16`,
-    /// saturating at [`DOC_LENGTH_STORED_MAX`], instead of the `u32`
-    /// `V1`–`V6` stored. The scorer reads a one-byte bucket of the length
-    /// and the directory carries the exact average, so nothing about
-    /// scoring changes; a document past 65,535 tokens has its stored
-    /// length (and so its stored bucket and bound) computed from the
-    /// saturated value, consistently on the writer and the reader.
-    pub const DOC_LENGTH_BYTES_V7: usize = 2;
-    /// Largest per-document length a `V7` blob stores.
+    /// Bytes per stored document length: a `u16`, saturating at
+    /// [`DOC_LENGTH_STORED_MAX`]. The scorer reads a one-byte bucket of
+    /// the length and the directory carries the exact average; a document
+    /// past 65,535 tokens has its stored length (and so its stored bucket
+    /// and bound) computed from the saturated value, consistently on the
+    /// writer and the reader.
+    pub const DOC_LENGTH_BYTES: usize = 2;
+    /// Largest per-document length a blob stores.
     pub const DOC_LENGTH_STORED_MAX: u32 = u16::MAX as u32;
 
     /// Fixed-point scale for the per-column average document length.
@@ -266,29 +139,14 @@ pub mod fts {
     /// write and read paths share one scale.
     pub const AVGDL_FIXED_POINT_SCALE: f32 = 1000.0;
 
-    /// **Legacy** fixed-point scale for a posting block's max-BM25 upper
-    /// bound, used only by `V1`–`V4` blobs. Those store `ceil(max_bm25 ×
-    /// this)` as a `u32` in each skip-table entry; the reader recovers the
-    /// bound by dividing by this and adding one step (a safety margin for
-    /// files written before the encode-side `ceil`).
-    ///
-    /// `V5` no longer uses a fixed-point scale at all — it stores the block
-    /// max as an **exact `f32`** (see [`VERSION_V5`]). The `ceil`-to-`u32`
-    /// quantization at scale 1000 rounded the bound *up* by up to ~0.002,
-    /// which for a low-idf term like "the" (BM25 ~0.1–0.3) is a large
-    /// *relative* inflation that blocks skips a tight bound would allow.
-    /// Storing the exact `f32` (same 4 bytes, matching the precision of the
-    /// reader's per-doc scoring) removes that slack.
-    pub const BLOCK_MAX_BM25_FIXED_POINT_SCALE: f32 = 1000.0;
-
     /// Offset of `avgdl_x1000` within a doc-lengths directory entry
     /// (`[0..4]` column id, `[4..12]` array offset, `[12..16]` this).
     pub const DOC_LENGTHS_ENTRY_AVGDL_OFF: usize = 12;
 
     /// Number of consecutive posting blocks summarised by one entry of
-    /// a term's coarse block-max table (V5 and later). The table sits at
-    /// the tail of a PFOR term's postings region: `ceil(num_blocks / this)`
-    /// `f32`s, each the max of its span's per-block max BM25.
+    /// a term's coarse block-max table. The table sits at the tail of a
+    /// long-form term's postings region: `ceil(num_blocks / this)` slots,
+    /// each the max of its span's per-block max BM25.
     ///
     /// It gives the ranked single-term walk a second, coarser skip level:
     /// when the running k-th-best score already dominates a whole span's
@@ -296,19 +154,13 @@ pub mod fts {
     /// touching each block's skip entry. On a very long, heavily-skipped
     /// posting list (a common term at small k) the per-block skip scan is
     /// itself the dominant cost; the coarse level removes ~31/32 of it.
-    /// The span is a coarse-max of already-`ceil`-quantised block bounds,
-    /// so it stays a true upper bound and the top-k is unchanged.
+    /// The span bound is the max of exact block bounds, so it stays a
+    /// true upper bound and the top-k is unchanged.
     pub const COARSE_BLOCK_MAX_SPAN: usize = 32;
 
-    /// Total FTS blob header size in bytes for [`VERSION_V1_LEGACY`] (no
-    /// positions). The FST directory begins immediately after this
-    /// fixed-size header.
-    pub const HEADER_SIZE_V1_LEGACY: usize = 48;
-
-    /// Header size for [`VERSION_V2`]: the v1 fields plus the
-    /// trailing positions-region offset (`u64` at
-    /// [`hdr::POSITIONS_OFFSET_OFF`]).
-    pub const HEADER_SIZE_V2: usize = 56;
+    /// FTS blob header size in bytes: the fields in [`hdr`]. The term
+    /// dictionary begins immediately after it.
+    pub const HEADER_SIZE: usize = 56;
 
     /// Width of the 8-byte FTS magic field.
     pub const MAGIC_BYTES: usize = 8;
@@ -317,7 +169,7 @@ pub mod fts {
     /// Width of a little-endian `u64` header field.
     pub const U64_BYTES: usize = 8;
 
-    /// FTS blob header field offsets (48-byte header):
+    /// FTS blob header field offsets ([`HEADER_SIZE`] bytes):
     ///
     /// ```text
     /// [ 0.. 8] MAGIC
@@ -325,9 +177,10 @@ pub mod fts {
     /// [12..16] n_columns (u32 LE)
     /// [16..20] n_docs (u32 LE)
     /// [20..24] n_terms_total (u32 LE)
-    /// [24..32] fst_offset (u64 LE)
+    /// [24..32] dictionary offset (u64 LE)
     /// [32..40] postings_offset (u64 LE)
     /// [40..48] doc_lengths_table_offset (u64 LE)
+    /// [48..56] positions_offset (u64 LE)
     /// ```
     pub mod hdr {
         /// `[8..12]` format version (`u32` LE).
@@ -338,18 +191,15 @@ pub mod fts {
         pub const N_DOCS_OFF: usize = 16;
         /// `[20..24]` total distinct `(column, term)` pairs (`u32` LE).
         pub const N_TERMS_OFF: usize = 20;
-        /// `[24..32]` FST body offset (`u64` LE).
+        /// `[24..32]` term dictionary offset (`u64` LE).
         pub const FST_OFFSET_OFF: usize = 24;
         /// `[32..40]` postings region offset (`u64` LE).
         pub const POSTINGS_OFFSET_OFF: usize = 32;
         /// `[40..48]` doc-lengths directory offset (`u64` LE).
         pub const DOC_LENGTHS_DIR_OFF: usize = 40;
-        /// `[48..56]` positions region offset (`u64` LE).
-        /// [`VERSION_V2`](super::VERSION_V2) headers
-        /// only — a v1 header ends at
-        /// [`HEADER_SIZE_V1_LEGACY`](super::HEADER_SIZE_V1_LEGACY). The region sits
-        /// between the postings region and the doc-lengths directory
-        /// so the lazy-open doc-lengths tail fetch stays small.
+        /// `[48..56]` positions region offset (`u64` LE). The region sits
+        /// between the postings region and the doc-lengths directory so
+        /// the lazy-open doc-lengths tail fetch stays small.
         pub const POSITIONS_OFFSET_OFF: usize = 48;
     }
 
@@ -388,211 +238,54 @@ pub mod fts {
         pub const POSITIONS_LENGTH_OFF: usize = 28;
     }
 
-    /// Which header a posting block carries — by blob version.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum BlockLayout {
-        /// `V1`–`V6`: the 8-byte header with the base doc id stored.
-        Wide,
-        /// `V7`+: the 4-byte header word; a packed or patched block's base
-        /// doc id is the previous block's last doc id (zero for the first
-        /// block), a bitset block's origin follows the word.
-        Compact,
-    }
-
-    /// How the term dictionary lays its terms out — by blob version. The
-    /// enum lives with the dictionary code it selects (`utils::terms`); it
-    /// is re-exported here because it is part of the blob layout table.
-    pub use crate::utils::terms::DictLayout;
-
-    /// Everything a blob version decides about how its regions are laid
-    /// out — the one table the writer (by the era it writes) and the
-    /// reader (by the version it opened) both consult, so the version
-    /// ladder is spelled out once.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct BlobLayout {
-        /// Each long-form term ends with a coarse block-max table, one
-        /// slot per [`COARSE_BLOCK_MAX_SPAN`] blocks (`V5`+).
-        pub coarse: bool,
-        /// A single-block term is written in the short form (`V7`+).
-        pub short_form: bool,
-        /// Positions are per-block groups (`V7`+); a grouped blob carries
-        /// no run-offset sub-index.
-        pub grouped_positions: bool,
-        /// A positional long-form term carries a run-offset sub-index
-        /// between its skip table and its blocks (`V3`–`V6`).
-        pub position_subindex: bool,
-        /// Dense blocks may take the presence-bitset encoding (`V4`+).
-        pub bitset_blocks: bool,
-        pub block: BlockLayout,
-        pub skip: SkipLayout,
-        pub dict: DictLayout,
-        /// Bytes per stored document length.
-        pub doc_length_bytes: usize,
-    }
-
-    impl BlobLayout {
-        /// The layout of blob `version`, or `None` for a version this
-        /// crate does not know.
-        pub fn for_version(version: u32) -> Option<Self> {
-            let legacy = Self {
-                coarse: false,
-                short_form: false,
-                grouped_positions: false,
-                position_subindex: false,
-                bitset_blocks: false,
-                block: BlockLayout::Wide,
-                skip: SkipLayout::Absolute,
-                dict: DictLayout::Fst,
-                doc_length_bytes: U32_BYTES,
-            };
-            Some(match version {
-                VERSION_V1_LEGACY | VERSION_V2 => legacy,
-                VERSION_V3 => Self {
-                    position_subindex: true,
-                    ..legacy
-                },
-                VERSION_V4 => Self {
-                    position_subindex: true,
-                    bitset_blocks: true,
-                    ..legacy
-                },
-                VERSION_V5 | VERSION_V6 => Self {
-                    coarse: true,
-                    position_subindex: true,
-                    bitset_blocks: true,
-                    ..legacy
-                },
-                // `V8` adds a region and a header field, nothing that
-                // changes how a term, block, skip entry or dictionary
-                // value is laid out, so it reads as `V7` does.
-                VERSION_V7 | VERSION_V8 => Self {
-                    coarse: true,
-                    short_form: true,
-                    grouped_positions: true,
-                    position_subindex: false,
-                    bitset_blocks: true,
-                    block: BlockLayout::Compact,
-                    skip: SkipLayout::Length,
-                    dict: DictLayout::Blocks,
-                    doc_length_bytes: DOC_LENGTH_BYTES_V7,
-                },
-                _ => return None,
-            })
-        }
-    }
-
-    /// Bytes of fixed header a blob of `version` carries, or `None` for
-    /// a version this crate does not know. One place so the writer's
-    /// assembly and the reader's parse cannot drift.
-    pub fn header_size(version: u32) -> Option<usize> {
-        Some(match version {
-            VERSION_V1_LEGACY => HEADER_SIZE_V1_LEGACY,
-            VERSION_V2 | VERSION_V3 | VERSION_V4 | VERSION_V5 | VERSION_V6 | VERSION_V7
-            | VERSION_V8 => HEADER_SIZE_V2,
-            _ => return None,
-        })
-    }
-
-    /// How a term's skip table locates its blocks — by blob version.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum SkipLayout {
-        /// `V1`–`V6`: 16-byte entries carrying each block's absolute byte
-        /// offset within the term; 4-byte coarse slots.
-        Absolute,
-        /// `V7`+: an entry carries the block's byte **length** (`u16`) in
-        /// place of its offset — 10 bytes, 14 on a positional column —
-        /// and each 8-byte coarse slot adds the offset of its span's
-        /// first block. A sequential walk accumulates lengths; a random
-        /// block is one slot read plus at most `COARSE_BLOCK_MAX_SPAN - 1`
-        /// lengths summed.
-        Length,
-    }
-
-    impl SkipLayout {
-        /// Bytes one skip entry takes on a column with or without
-        /// positions.
-        pub fn entry_bytes(self, positional: bool) -> usize {
-            match (self, positional) {
-                (Self::Absolute, _) => 16,
-                (Self::Length, true) => 14,
-                (Self::Length, false) => 10,
-            }
-        }
-
-        /// Bytes one coarse block-max slot takes.
-        pub fn coarse_slot_bytes(self) -> usize {
-            match self {
-                Self::Absolute => U32_BYTES,
-                Self::Length => 2 * U32_BYTES,
-            }
-        }
-
-        /// Entry offset of the block-max bound (`u32` LE).
-        pub fn bound_off(self) -> usize {
-            match self {
-                Self::Absolute => 8,
-                Self::Length => 6,
-            }
-        }
-
-        /// Entry offset of the block's position-group offset (`u32` LE,
-        /// positional columns).
-        pub fn positions_off(self) -> usize {
-            match self {
-                Self::Absolute => 12,
-                Self::Length => 10,
-            }
-        }
-    }
-
-    /// Skip-table entry field offsets (relative to the entry start).
-    ///
-    /// [`SkipLayout::Absolute`]:
-    ///
-    /// ```text
-    /// [ 0.. 4] last_doc_id (u32 LE)
-    /// [ 4.. 8] block_offset (u32 LE, relative to term metadata start)
-    /// [ 8..12] block-max bound (u32 LE)
-    /// [12..16] positions_block_offset (u32 LE; positional columns)
-    /// ```
-    ///
-    /// [`SkipLayout::Length`]:
+    /// Skip-table entry field offsets (relative to the entry start):
     ///
     /// ```text
     /// [ 0.. 4] last_doc_id (u32 LE)
     /// [ 4.. 6] block_len (u16 LE, the block's encoded bytes)
-    /// [ 6..10] block-max bound (u32 LE)
+    /// [ 6..10] block-max bound (u32 LE, f32 bits)
     /// [10..14] positions_block_offset (u32 LE; positional columns only)
     /// ```
     ///
-    /// A block's offset under the length layout is the coarse slot's
-    /// span start plus the lengths of the span's earlier blocks. The
-    /// positions field records the byte offset of this block's position
-    /// group, relative to the term's `positions_offset` — per-block
-    /// random access into the term's position bytes, aligned with the
-    /// doc blocks. An absolute-layout positionless column writes zero
-    /// there (the field's reserved era); a length-layout one omits it.
+    /// A block's offset is its coarse slot's span start plus the lengths
+    /// of the span's earlier blocks. The positions field records the
+    /// byte offset of this block's position group, relative to the
+    /// term's `positions_offset` — per-block random access into the
+    /// term's position bytes, aligned with the doc blocks.
     pub mod skip_entry {
-        /// `[0..4]` largest doc-id in the block (`u32` LE), both layouts.
+        /// `[0..4]` largest doc-id in the block (`u32` LE).
         pub const LAST_DOC_ID_OFF: usize = 0;
-        /// `[4..8]` byte offset to the encoded block (`u32` LE), absolute
-        /// layout.
-        pub const BLOCK_OFFSET_OFF: usize = 4;
-        /// `[4..6]` byte length of the encoded block (`u16` LE), length
-        /// layout.
+        /// `[4..6]` byte length of the encoded block (`u16` LE).
         pub const BLOCK_LEN_OFF: usize = 4;
+        /// `[6..10]` the block-max bound (`u32` LE, `f32` bits).
+        pub const BOUND_OFF: usize = 6;
+        /// `[10..14]` the block's position-group offset (`u32` LE),
+        /// positional columns only.
+        pub const POSITIONS_OFF: usize = 10;
+        /// Bytes one entry takes on a positionless column.
+        pub const BYTES: usize = 10;
+        /// Bytes one entry takes on a positional column.
+        pub const POSITIONAL_BYTES: usize = 14;
+
+        /// Bytes one entry takes on a column with or without positions.
+        pub fn bytes(positional: bool) -> usize {
+            match positional {
+                true => POSITIONAL_BYTES,
+                false => BYTES,
+            }
+        }
     }
 
     /// Coarse slot field offsets (relative to the slot start): the
-    /// span's block-max bound, and under [`SkipLayout::Length`] the byte
-    /// offset (relative to term metadata start) of the span's first
-    /// block.
+    /// span's block-max bound and the byte offset (relative to term
+    /// metadata start) of the span's first block.
     pub mod coarse_slot {
-        /// `[0..4]` span bound (`u32` LE: `f32` bits from V5, fixed point
-        /// before).
+        /// `[0..4]` span bound (`u32` LE, `f32` bits).
         pub const BOUND_OFF: usize = 0;
-        /// `[4..8]` span start offset (`u32` LE), length layout only.
+        /// `[4..8]` span start offset (`u32` LE).
         pub const SPAN_START_OFF: usize = 4;
+        /// Bytes one slot takes.
+        pub const BYTES: usize = 8;
     }
 }
 
@@ -956,82 +649,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blob_layout_table_follows_the_version_ladder() {
-        use fts::{BlobLayout, BlockLayout, DictLayout, SkipLayout};
-        let legacy = BlobLayout::for_version(fts::VERSION_V1_LEGACY).expect("v1");
-        assert!(
-            !legacy.coarse
-                && !legacy.short_form
-                && !legacy.grouped_positions
-                && !legacy.position_subindex
-                && !legacy.bitset_blocks
-        );
-        assert_eq!(legacy.block, BlockLayout::Wide);
-        assert_eq!(legacy.skip, SkipLayout::Absolute);
-        assert_eq!(legacy.dict, DictLayout::Fst);
-        assert_eq!(legacy.doc_length_bytes, fts::U32_BYTES);
-        assert_eq!(BlobLayout::for_version(fts::VERSION_V2), Some(legacy));
-        let v3 = BlobLayout::for_version(fts::VERSION_V3).expect("v3");
-        assert!(v3.position_subindex && !v3.bitset_blocks && !v3.coarse);
-        let v4 = BlobLayout::for_version(fts::VERSION_V4).expect("v4");
-        assert!(v4.position_subindex && v4.bitset_blocks && !v4.coarse);
-        let v5 = BlobLayout::for_version(fts::VERSION_V5).expect("v5");
-        assert!(v5.coarse && v5.position_subindex && v5.bitset_blocks && !v5.short_form);
-        assert_eq!(BlobLayout::for_version(fts::VERSION_V6), Some(v5));
-        assert_eq!(v5.block, BlockLayout::Wide);
-        let v7 = BlobLayout::for_version(fts::VERSION_V7).expect("v7");
-        assert!(v7.coarse && v7.short_form && v7.grouped_positions && v7.bitset_blocks);
-        assert!(!v7.position_subindex, "grouped positions need no sub-index");
-        assert_eq!(v7.block, BlockLayout::Compact);
-        assert_eq!(v7.skip, SkipLayout::Length);
-        assert_eq!(v7.dict, DictLayout::Blocks);
-        assert_eq!(v7.doc_length_bytes, fts::DOC_LENGTH_BYTES_V7);
-        // `V8` adds a region and a header field, not a posting layout,
-        // so it reads exactly as `V7` does.
-        assert_eq!(BlobLayout::for_version(fts::VERSION_V8), Some(v7));
-        assert_eq!(BlobLayout::for_version(fts::VERSION_V8 + 1), None);
-
-        // Header size is the one thing `V8` does move, and the helper is
-        // the single place the writer and the reader read it from.
+    fn skip_entry_fields_tile_their_entries() {
+        use fts::{coarse_slot, skip_entry};
         assert_eq!(
-            fts::header_size(fts::VERSION_V1_LEGACY),
-            Some(fts::HEADER_SIZE_V1_LEGACY)
+            skip_entry::LAST_DOC_ID_OFF + fts::U32_BYTES,
+            skip_entry::BLOCK_LEN_OFF
         );
-        for v in [
-            fts::VERSION_V2,
-            fts::VERSION_V3,
-            fts::VERSION_V4,
-            fts::VERSION_V5,
-            fts::VERSION_V6,
-            fts::VERSION_V7,
-        ] {
-            assert_eq!(fts::header_size(v), Some(fts::HEADER_SIZE_V2), "v{v}");
-        }
-        assert_eq!(fts::header_size(fts::VERSION_V8), Some(fts::HEADER_SIZE_V2));
-        assert_eq!(fts::header_size(fts::VERSION_V8 + 1), None);
-        assert_eq!(BlobLayout::for_version(0), None);
+        assert_eq!(
+            skip_entry::BLOCK_LEN_OFF + size_of::<u16>(),
+            skip_entry::BOUND_OFF
+        );
+        assert_eq!(skip_entry::BOUND_OFF + fts::U32_BYTES, skip_entry::BYTES);
+        assert_eq!(skip_entry::POSITIONS_OFF, skip_entry::BYTES);
+        assert_eq!(
+            skip_entry::POSITIONS_OFF + fts::U32_BYTES,
+            skip_entry::POSITIONAL_BYTES
+        );
+        assert_eq!(skip_entry::bytes(false), skip_entry::BYTES);
+        assert_eq!(skip_entry::bytes(true), skip_entry::POSITIONAL_BYTES);
+        assert_eq!(
+            coarse_slot::SPAN_START_OFF + fts::U32_BYTES,
+            coarse_slot::BYTES
+        );
     }
 
     #[test]
-    fn skip_layouts_size_their_entries_and_slots() {
-        use fts::SkipLayout;
-        assert_eq!(SkipLayout::Absolute.entry_bytes(true), 16);
-        assert_eq!(SkipLayout::Absolute.entry_bytes(false), 16);
-        assert_eq!(SkipLayout::Length.entry_bytes(true), 14);
-        assert_eq!(SkipLayout::Length.entry_bytes(false), 10);
-        assert_eq!(SkipLayout::Absolute.coarse_slot_bytes(), 4);
-        assert_eq!(SkipLayout::Length.coarse_slot_bytes(), 8);
-        // The bound and positions fields sit right after what precedes them.
-        assert_eq!(SkipLayout::Absolute.bound_off(), 8);
-        assert_eq!(
-            SkipLayout::Length.bound_off(),
-            fts::skip_entry::BLOCK_LEN_OFF + 2
-        );
-        assert_eq!(SkipLayout::Absolute.positions_off(), 12);
-        assert_eq!(
-            SkipLayout::Length.positions_off(),
-            SkipLayout::Length.bound_off() + 4
-        );
+    fn the_current_version_is_readable_and_below_the_newest() {
+        const {
+            assert!(fts::VERSION_MIN <= fts::VERSION_CURRENT);
+            assert!(fts::VERSION_CURRENT <= fts::VERSION_V8);
+        }
     }
 
     #[test]

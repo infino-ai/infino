@@ -92,7 +92,7 @@ impl TermRuns<'_> {
 /// Decode one run of exactly `tf` positions from `bytes` at `*at`,
 /// appending the absolute positions to `out` and advancing `*at`.
 /// `None` on corrupt (truncated / overflowing) bytes.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn decode_run(bytes: &[u8], at: &mut usize, tf: u32, out: &mut Vec<u32>) -> Option<()> {
     let mut prev: u32 = 0;
     for i in 0..tf {
@@ -146,7 +146,7 @@ const GROUP_MAX_EXCEPTIONS: usize = 64;
 ///
 /// A packed group can be decoded whole and indexed by the block's tf
 /// prefix sums, so a positional term needs no run offsets past its
-/// block starts: `V7` carries no position sub-index. That only holds if
+/// block starts. That only holds if
 /// every long-form group is packed, so `allow_leb128` is `false` for
 /// them; a short-form term's group is decoded whole in any case and may
 /// take the LEB128 form when that is smaller.

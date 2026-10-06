@@ -275,6 +275,16 @@ pub enum FtsError {
     #[error("{0}")]
     OverBudget(String),
 
+    /// The full-text index blob is older than the oldest version this
+    /// engine reads (`format::fts::VERSION_MIN`). Rewriting the table's
+    /// indexes with an engine that reads both versions brings it forward;
+    /// nothing a query does can.
+    #[error(
+        "full-text index (blob version {version}) was written by infino < 0.8.4; \
+         reindex the table with infino 0.9.1 before upgrading"
+    )]
+    IndexTooOld { version: u32 },
+
     #[error("read error: {0}")]
     Read(#[from] ReadError),
 }

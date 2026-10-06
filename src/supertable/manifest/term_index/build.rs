@@ -323,7 +323,7 @@ impl SliceBuilder {
                 key,
                 FstValue::Pfor {
                     metadata_offset: self.postings.len() as u64,
-                    postings_length_hint: Some(run.len() as u32),
+                    postings_length: run.len() as u32,
                     short: false,
                 },
             )

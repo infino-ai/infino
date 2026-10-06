@@ -57,7 +57,7 @@ use crate::{
     supertable::manifest::{part::ContentHash, term_range::prefix_upper_bound},
     utils::{
         bytes::{u32_le_at, u64_le_at},
-        terms::{DictLayout, FstValue, TermDict},
+        terms::{FstValue, TermBlocks},
         varint::{push_u64_varint, push_varint, read_u64_varint, read_varint},
     },
 };
@@ -128,21 +128,19 @@ impl Location {
             FstValue::Inline { doc_id, tf } => Self::Inline { doc_id, tf },
             FstValue::Pfor {
                 metadata_offset,
-                postings_length_hint,
-                short,
-            } => match (postings_length_hint, short) {
-                (Some(len), true) => Self::Short {
-                    offset: metadata_offset,
-                    len,
-                },
-                (Some(len), false) => Self::Pfor {
-                    offset: metadata_offset,
-                    len,
-                },
-                // An FST slot that could not hold the length: the range
-                // is not known without reading the header, so it is not
-                // carried. Only pre-V7 blobs can produce this.
-                (None, _) => Self::None,
+                postings_length: len,
+                short: true,
+            } => Self::Short {
+                offset: metadata_offset,
+                len,
+            },
+            FstValue::Pfor {
+                metadata_offset,
+                postings_length: len,
+                short: false,
+            } => Self::Pfor {
+                offset: metadata_offset,
+                len,
             },
         }
     }
@@ -156,12 +154,12 @@ impl Location {
             Self::None => None,
             Self::Pfor { offset, len } => Some(FstValue::Pfor {
                 metadata_offset: offset,
-                postings_length_hint: Some(len),
+                postings_length: len,
                 short: false,
             }),
             Self::Short { offset, len } => Some(FstValue::Pfor {
                 metadata_offset: offset,
-                postings_length_hint: Some(len),
+                postings_length: len,
                 short: true,
             }),
             Self::Inline { doc_id, tf } => Some(FstValue::Inline { doc_id, tf }),
@@ -494,7 +492,7 @@ pub(crate) fn encode_slice(dict: &[u8], postings: &[u8]) -> Vec<u8> {
 
 /// An opened slice: its dictionary and postings region, borrowed.
 pub(crate) struct Slice<'a> {
-    dict: TermDict<'a>,
+    dict: TermBlocks<'a>,
     postings: &'a [u8],
 }
 
@@ -510,7 +508,7 @@ impl<'a> Slice<'a> {
         if c.at != bytes.len() {
             return Err(malformed("slice: trailing bytes"));
         }
-        let dict = TermDict::open(dict_bytes, DictLayout::Blocks)
+        let dict = TermBlocks::open(dict_bytes)
             .map_err(|e| TermIndexError::Malformed(format!("slice dictionary: {e}")))?;
         Ok(Self { dict, postings })
     }
@@ -518,7 +516,7 @@ impl<'a> Slice<'a> {
     fn run_at(&self, value: FstValue) -> Result<Vec<Posting>, TermIndexError> {
         let FstValue::Pfor {
             metadata_offset,
-            postings_length_hint: Some(len),
+            postings_length: len,
             ..
         } = value
         else {
@@ -640,7 +638,7 @@ mod tests {
         assert_eq!(
             Location::from_dict_value(FstValue::Pfor {
                 metadata_offset: 10,
-                postings_length_hint: Some(20),
+                postings_length: 20,
                 short: true
             }),
             Location::Short {
@@ -651,22 +649,13 @@ mod tests {
         assert_eq!(
             Location::from_dict_value(FstValue::Pfor {
                 metadata_offset: 10,
-                postings_length_hint: Some(20),
+                postings_length: 20,
                 short: false
             }),
             Location::Pfor {
                 offset: 10,
                 len: 20
             }
-        );
-        assert_eq!(
-            Location::from_dict_value(FstValue::Pfor {
-                metadata_offset: 10,
-                postings_length_hint: None,
-                short: false
-            }),
-            Location::None,
-            "an unknown length cannot be carried"
         );
     }
 
@@ -830,7 +819,7 @@ mod tests {
     }
 
     fn build_slice(entries: &[(&str, &str, Vec<Posting>)]) -> Vec<u8> {
-        let mut dict = TermDictBuilder::new(DictLayout::Blocks);
+        let mut dict = TermDictBuilder::new();
         let mut postings = Vec::new();
         for (col, term, run) in entries {
             let bytes = encode_run(run);
@@ -838,7 +827,7 @@ mod tests {
                 &make_key(col, term),
                 FstValue::Pfor {
                     metadata_offset: postings.len() as u64,
-                    postings_length_hint: Some(bytes.len() as u32),
+                    postings_length: bytes.len() as u32,
                     short: false,
                 },
             );

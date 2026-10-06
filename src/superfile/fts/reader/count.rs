@@ -9,7 +9,7 @@
 use std::str::from_utf8;
 
 #[cfg(any(test, feature = "test-helpers"))]
-use super::cursor::{SubindexKind, TermCursor, TermMeta};
+use super::cursor::{TermCursor, TermMeta};
 use super::{
     core::*,
     filter::AtomExcludeFilter,
@@ -314,8 +314,8 @@ impl FtsReader {
 
     /// Unranked token-match **count** — the cardinality
     /// [`token_match`](Self::token_match) would return, without
-    /// materializing the doc-id `Vec`. The AND path tallies through a
-    /// [`CountSink`], the OR path counts the union walk; both skip the
+    /// materializing the doc-id `Vec`. The AND path counts its
+    /// intersection, the OR path its union walk; both skip the
     /// `Vec<u32>` so a high-cardinality count doesn't allocate one id
     /// per match.
     pub async fn token_match_count(
@@ -398,7 +398,7 @@ impl FtsReader {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
-        let dict = self.open_dict(fst_bytes)?;
+        let dict = Self::open_dict(fst_bytes)?;
         let col_meta = &self.columns[column_id as usize];
         let entries: Vec<Option<FstValue>> = tokens
             .iter()
@@ -537,7 +537,7 @@ impl FtsReader {
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
-        let dict = self.open_dict(fst_bytes)?;
+        let dict = Self::open_dict(fst_bytes)?;
         let col_meta = &self.columns[column_id as usize];
 
         // First pass — pure in-memory FST lookups. Absent and inline
@@ -545,7 +545,7 @@ impl FtsReader {
         // collected for the single batched fetch below, remembering
         // which token slot it fills so results scatter back in order.
         let mut dfs = vec![0u64; tokens.len()];
-        let mut header_ranges: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut header_ranges: Vec<(usize, usize)> = Vec::new();
         let mut pfor_slots: Vec<(usize, bool)> = Vec::new();
         for (i, token) in tokens.iter().enumerate() {
             let key = make_key(&col_meta.name, token);
@@ -555,15 +555,15 @@ impl FtsReader {
                     FstValue::Inline { .. } => dfs[i] = 1,
                     FstValue::Pfor {
                         metadata_offset,
-                        postings_length_hint,
+                        postings_length,
                         short,
                     } => {
                         // A long term's df heads its 20-byte header; a
                         // short body is at most a few hundred bytes and
                         // leads with its df, so fetch it whole.
                         let len = match short {
-                            true => postings_length_hint.map(|l| l as usize),
-                            false => Some(TERM_META_SIZE),
+                            true => postings_length as usize,
+                            false => TERM_META_SIZE,
                         };
                         header_ranges.push((metadata_offset as usize, len));
                         pfor_slots.push((i, short));
@@ -643,12 +643,12 @@ impl FtsReader {
         let column_id = self.resolve_column_id(column)?;
         let col_meta = &self.columns[column_id as usize];
         let fst_bytes = self.dict_bytes_async().await?;
-        let dict = self.open_dict(&fst_bytes)?;
+        let dict = Self::open_dict(&fst_bytes)?;
         let key = make_key(&col_meta.name, term);
         let Some(packed) = dict.lookup(&key) else {
             return Ok(None);
         };
-        let (metadata_offset, postings_length_hint, short) = match packed {
+        let (metadata_offset, postings_length, short) = match packed {
             FstValue::Inline { .. } => {
                 return Ok(Some(TermLayout {
                     df: 1,
@@ -658,15 +658,12 @@ impl FtsReader {
             }
             FstValue::Pfor {
                 metadata_offset,
-                postings_length_hint,
+                postings_length,
                 short,
-            } => (metadata_offset, postings_length_hint, short),
+            } => (metadata_offset, postings_length, short),
         };
         let mut fetched = self
-            .fetch_term_postings(&[(
-                metadata_offset as usize,
-                postings_length_hint.map(|len| len as usize),
-            )])
+            .fetch_term_postings(&[(metadata_offset as usize, postings_length as usize)])
             .await?;
         let bytes = fetched.pop().expect("one fetched range for one PFOR term");
         if short {
@@ -682,23 +679,8 @@ impl FtsReader {
                 ..TermLayout::default()
             }));
         }
-        let meta = TermMeta::parse(
-            bytes.as_ref(),
-            0,
-            col_meta.positions,
-            SubindexKind::None,
-            self.bounds,
-            self.positions_grouped,
-        )?;
-        let cursor = TermCursor::new(
-            bytes,
-            col_meta,
-            self.bounds,
-            None,
-            1,
-            postings_length_hint.is_none(),
-            true,
-        )?;
+        let meta = TermMeta::parse(bytes.as_ref(), 0, col_meta.positions)?;
+        let cursor = TermCursor::new(bytes, col_meta, None, 1, true)?;
         let mut layout = TermLayout {
             df: meta.df,
             num_blocks: meta.num_blocks,
@@ -814,7 +796,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_match_count_matches_token_match_len() {
-        // The counting path (CountSink for AND, or_count_unranked for OR)
+        // The counting path (count_and_intersect for AND, or_count_unranked for OR)
         // must agree with token_match's materialized length on every
         // shape — single token, OR union, AND intersection, absent
         // tokens, and the empty list.
@@ -911,9 +893,9 @@ mod tests {
 
     #[tokio::test]
     async fn and_count_matches_merge_on_dense_bitset_corpus() {
-        // A dense corpus stores common terms as bitset blocks (v4). The
+        // A dense corpus stores common terms as bitset blocks. The
         // intersection count must agree with `token_match`'s flat-merge AND
-        // length across both v4 intersection kernels: the bitset-AND
+        // length across both count intersection kernels: the bitset-AND
         // (word-parallel presence AND, when every term is dense enough to
         // trip the density gate) and the rarest-driven membership walk (when
         // a sparse term keeps the intersection below the gate). `token_match`

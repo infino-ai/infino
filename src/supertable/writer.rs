@@ -114,7 +114,7 @@ use crate::{
         format::{
             CRC_BYTES,
             footer::read_kv_metadata,
-            fts::{HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, U64_BYTES, hdr},
+            fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr},
             kv,
             vec::{
                 CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE,
@@ -122,6 +122,7 @@ use crate::{
                 sub_hdr,
             },
         },
+        fts::builder::DOC_LENGTHS_ENTRY_SIZE,
         reader::vector_layout_from_kv,
         vector::{
             builder::{
@@ -2890,11 +2891,6 @@ fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>>
     if blob.len() < FTS_HEADER_SIZE {
         return None;
     }
-    let version = read_u32_le(blob.get(hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES)?);
-    let header_size = match version == crate::superfile::format::fts::VERSION_V1_LEGACY {
-        true => FTS_HEADER_SIZE,
-        false => crate::superfile::format::fts::HEADER_SIZE_V2,
-    };
     let n_columns =
         read_u32_le(blob.get(hdr::N_COLUMNS_OFF..hdr::N_COLUMNS_OFF + U32_BYTES)?) as usize;
     let doc_lengths_offset =
@@ -2902,13 +2898,13 @@ fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>>
             as usize;
     // Entries plus the directory's CRC.
     let dir_len = n_columns
-        .checked_mul(crate::superfile::fts::builder::DOC_LENGTHS_ENTRY_SIZE)?
+        .checked_mul(DOC_LENGTHS_ENTRY_SIZE)?
         .checked_add(4)?;
-    if header_size > blob.len() || doc_lengths_offset.checked_add(dir_len)? > blob.len() {
+    if doc_lengths_offset.checked_add(dir_len)? > blob.len() {
         return None;
     }
     Some(merge_ranges(vec![
-        (off, header_size as u64),
+        (off, FTS_HEADER_SIZE as u64),
         (off + doc_lengths_offset as u64, dir_len as u64),
     ]))
 }
