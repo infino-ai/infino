@@ -5,7 +5,6 @@ from pyarrow import RecordBatch, Schema, Table as ArrowTable
 
 Metric: TypeAlias = Literal["cosine", "l2sq", "l2", "negdot", "dot"]
 BoolMode: TypeAlias = Literal["or", "and"]
-Bm25Stats: TypeAlias = Literal["per_superfile", "global"]
 # How much a reindex repairs: "auto" gives each superfile the cheapest repair
 # that makes it current; "rewrite" brings layouts current and leaves superfiles
 # whose terms are stale (reported); "reanalyze" re-tokenizes every stale
@@ -139,7 +138,6 @@ class Table:
         k: int,
         mode: BoolMode | None = ...,
         projection: Sequence[str] | None = ...,
-        stats: Bm25Stats | None = ...,
         k1: float | None = ...,
         b: float | None = ...,
     ) -> ArrowTable: ...

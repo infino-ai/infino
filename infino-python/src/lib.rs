@@ -34,7 +34,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use infino::{
-    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
+    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
     GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
     ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions, Stemmer, Stopwords,
     VectorFilter,
@@ -885,15 +885,10 @@ impl Table {
     /// keep belongs on the column (`IndexSpec.fts`), where the bounds
     /// are built with it and the correction disappears.
     ///
-    /// `stats` selects the BM25 corpus statistics: `"global"` (default)
-    /// scores against table-wide statistics gathered across all segments,
-    /// so a fragmented table ranks like a single unified corpus, at the
-    /// cost of a document-frequency gather before scoring.
-    /// `"per_superfile"` scores each segment against its own local
-    /// document count and term frequencies — fastest, and it skips that
-    /// gather, but a term's idf depends on which segment a document
-    /// landed in, so ranking drifts as the table fragments.
-    #[pyo3(signature = (column, query, k, mode=None, projection=None, stats=None, k1=None, b=None))]
+    /// Every segment scores against table-wide statistics gathered across
+    /// all segments, so a fragmented table ranks like a single unified
+    /// corpus.
+    #[pyo3(signature = (column, query, k, mode=None, projection=None, k1=None, b=None))]
     #[allow(clippy::too_many_arguments)]
     fn bm25_search<'py>(
         &self,
@@ -903,13 +898,10 @@ impl Table {
         k: usize,
         mode: Option<&str>,
         projection: Option<Vec<String>>,
-        stats: Option<&str>,
         k1: Option<f32>,
         b: Option<f32>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mut opts = Bm25SearchOptions::new()
-            .with_mode(parse_mode(mode)?)
-            .with_stats(parse_stats(stats)?);
+        let mut opts = Bm25SearchOptions::new().with_mode(parse_mode(mode)?);
         // Both or neither: overriding one parameter and silently
         // keeping the engine default for the other is a footgun, since
         // the two interact through the length norm.
@@ -1412,20 +1404,6 @@ fn parse_filter<'a>(
         _ => Err(PyValueError::new_err(
             "filter_column and filter_query must be provided together",
         )),
-    }
-}
-
-fn parse_stats(stats: Option<&str>) -> PyResult<Bm25Stats> {
-    let Some(stats) = stats else {
-        // Omitted means the engine default.
-        return Ok(Bm25Stats::default());
-    };
-    match stats.to_ascii_lowercase().as_str() {
-        "per_superfile" => Ok(Bm25Stats::PerSuperfile),
-        "global" => Ok(Bm25Stats::Global),
-        other => Err(PyValueError::new_err(format!(
-            "stats must be 'per_superfile' or 'global', got {other:?}"
-        ))),
     }
 }
 

@@ -22,9 +22,6 @@ const STREAM = "stream";
 export type Metric = "cosine" | "l2sq" | "l2" | "negdot" | "dot";
 /** Boolean mode for multi-term FTS queries. */
 export type BoolMode = "or" | "and";
-/** BM25 statistics scope: corpus-wide `"global"` IDF across superfiles
- * (the default) or `"per_superfile"` segment-local IDF. */
-export type Bm25Stats = "per_superfile" | "global";
 /** A row from a query/search when not materializing to Arrow. */
 export type RowRecord = Record<string, unknown>;
 /** A plain `{ column: type }` schema descriptor for `createTable`. */
@@ -185,8 +182,6 @@ export interface PlannedRepair {
 
 export interface Bm25SearchOptions {
   mode?: BoolMode;
-  /** BM25 statistics scope: `"global"` (default) or `"per_superfile"`. */
-  stats?: Bm25Stats;
   /** Columns to return, e.g. `["_id", "score"]`; omit for full rows. */
   projection?: string[];
   /** BM25 `k1` for this search only, overriding the column's declared value.
@@ -470,7 +465,7 @@ export class Table {
   bm25Search(column: string, query: string, k: number, opts?: Bm25SearchOptions): RowRecord[];
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions = {}): RowRecord[] | arrow.Table {
     const buf = guard(this.remote, () =>
-      this.inner.bm25Search(column, query, k, opts.mode, opts.stats, opts.projection, opts.k1, opts.b),
+      this.inner.bm25Search(column, query, k, opts.mode, opts.projection, opts.k1, opts.b),
     );
     return decode(buf, opts.arrow);
   }

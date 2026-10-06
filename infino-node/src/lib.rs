@@ -47,7 +47,7 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
+    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError,
     InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
     RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions, Stemmer,
     Stopwords,
@@ -498,23 +498,6 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
         other => Err(Error::new(
             Status::InvalidArg,
             format!("mode must be 'or' or 'and', got {other:?}"),
-        )),
-    }
-}
-
-/// Parse a BM25 statistics-scope string: `"global"` (corpus-wide IDF, the
-/// default when omitted) or `"per_superfile"` (segment-local IDF).
-fn parse_stats(stats: Option<&str>) -> Result<Bm25Stats> {
-    let Some(stats) = stats else {
-        // Omitted means the engine default.
-        return Ok(Bm25Stats::default());
-    };
-    match stats.to_ascii_lowercase().as_str() {
-        "per_superfile" => Ok(Bm25Stats::PerSuperfile),
-        "global" => Ok(Bm25Stats::Global),
-        other => Err(Error::new(
-            Status::InvalidArg,
-            format!("stats must be 'per_superfile' or 'global', got {other:?}"),
         )),
     }
 }
@@ -1073,14 +1056,11 @@ impl Table {
         query: String,
         k: u32,
         mode: Option<String>,
-        stats: Option<String>,
         projection: Option<Vec<String>>,
         k1: Option<f64>,
         b: Option<f64>,
     ) -> Result<Buffer> {
-        let mut opts = Bm25SearchOptions::new()
-            .with_mode(parse_mode(mode.as_deref())?)
-            .with_stats(parse_stats(stats.as_deref())?);
+        let mut opts = Bm25SearchOptions::new().with_mode(parse_mode(mode.as_deref())?);
         opts = match (k1, b) {
             (Some(k1), Some(b)) => opts.with_bm25(k1 as f32, b as f32),
             (None, None) => opts,
