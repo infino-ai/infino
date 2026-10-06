@@ -109,7 +109,7 @@ use crate::{
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
             reorder::{ForwardIndex, bisect_order},
             sorted_merge::SortedInput,
-            tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
+            tokenize::{STANDARD_TOKENIZER, StandardTokenizer},
         },
         id_space::{FtsDocId, RowId, StableId},
         ids,
@@ -1080,7 +1080,7 @@ impl SuperfileBuilder {
         } else {
             // The constructor's default tokenizer is irrelevant: every
             // column below registers its own analyzer explicitly.
-            let mut fb = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            let mut fb = FtsBuilder::new(Arc::new(StandardTokenizer));
             for fc in &opts.fts_columns {
                 // The whole chain, not just the base: a column that
                 // declares a stopword set or a stemmer must be indexed
@@ -5581,16 +5581,16 @@ mod tests {
     #[test]
     fn remap_by_blob_id_rekeys_a_row_remap_by_the_inputs_own_doc_ids() {
         use crate::superfile::fts::{
-            builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
+            builder::FtsBuilder, reader::FtsReader, tokenize::StandardTokenizer,
         };
 
-        const JSON: &str = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        const JSON: &str = r#"[{"name":"body","tokenizer":"standard"}]"#;
         /// `map[blob doc id] = row`, a permutation that moves every
         /// document.
         const MAP: [u32; 8] = [3, 1, 7, 0, 5, 2, 6, 4];
 
         let reader_over = |doc_map: Option<Vec<u32>>| {
-            let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
             b.register_column("body".into(), false).expect("register");
             for id in 0..MAP.len() as u32 {
                 b.add_doc(0, id, "alpha").expect("add doc");
@@ -5979,7 +5979,7 @@ mod tests {
         );
         let docs = SORTED_MERGE_INPUT_DOCS[1];
         let input = merge_input(&opts, 0, &sorted_merge_docs(0, 0, docs), BlobEra::V7);
-        let mut fb = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut fb = FtsBuilder::new(Arc::new(StandardTokenizer));
         fb.register_column("title".into(), false).expect("register");
         fb.add_doc(0, 0, "hello").expect("add doc");
         fb.set_sorted_inputs(vec![SortedInput {

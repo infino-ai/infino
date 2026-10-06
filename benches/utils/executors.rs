@@ -288,7 +288,7 @@ pub mod fts {
             SuperfileReader,
             fts::{
                 reader::BoolMode as InfinoBoolMode,
-                tokenize::{AsciiLowerTokenizer, Phrase, Tokenizer},
+                tokenize::{Phrase, StandardTokenizer, Tokenizer},
             },
         },
         supertable::SupertableReader,
@@ -740,7 +740,7 @@ pub mod fts {
                 // never change which docs count); otherwise the bare
                 // terms match under `mode`. Phrase atoms take the
                 // phrase-aware walk.
-                let clauses = AsciiLowerTokenizer.parse(query).into_clauses(mode);
+                let clauses = StandardTokenizer.parse(query).into_clauses(mode);
                 let has_musts = !clauses.musts.is_empty() || !clauses.must_phrases.is_empty();
                 let (terms, phrases, eff_mode) = if has_musts {
                     (clauses.musts, clauses.must_phrases, InfinoBoolMode::And)
