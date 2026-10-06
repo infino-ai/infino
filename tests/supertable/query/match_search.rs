@@ -28,10 +28,7 @@ use arrow_schema::{DataType, Field, Schema};
 use infino::{
     Bm25SearchOptions,
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::{
-        builder::FtsConfig,
-        fts::reader::{Bm25Stats, BoolMode},
-    },
+    superfile::{builder::FtsConfig, fts::reader::BoolMode},
     supertable::{
         SuperfileUri, Supertable, SupertableOptions,
         query::{
@@ -262,45 +259,32 @@ fn count_dedups_repeated_negatives_and_required_excluded() {
     );
 }
 
-/// BM25 with GLOBAL statistics gathers corpus-wide document frequencies
-/// across every superfile before scoring. Statistics change SCORES,
-/// never MEMBERSHIP: with `k` covering every match, the global-stats
-/// result holds the same number of rows as the per-superfile mode's hit
-/// set. The per-superfile arm is requested explicitly — `bm25_hits`
-/// scores with the crate default, which is `Global`, so relying on it
-/// here would compare global statistics against themselves and assert
-/// nothing.
+/// BM25 gathers corpus-wide document frequencies across every superfile
+/// before scoring. Statistics change SCORES, never MEMBERSHIP: with `k`
+/// covering every match, the ranked result holds exactly the unranked
+/// match set.
 #[test]
-fn bm25_global_stats_keeps_the_per_superfile_membership() {
+fn bm25_table_wide_stats_keep_the_match_set() {
     let st = demo_two_superfiles();
     let reader = st.reader().expect("reader");
-    let per_superfile_hits = reader
-        .bm25_hits(
-            "title",
-            "rust",
-            TOP_K,
-            Bm25SearchOptions::new()
-                .with_mode(BoolMode::Or)
-                .with_stats(Bm25Stats::PerSuperfile),
-        )
-        .expect("per-superfile bm25");
-    let global = reader
+    let matched = reader
+        .token_match("title", "rust", BoolMode::Or)
+        .expect("token_match");
+    let ranked = reader
         .bm25_search(
             "title",
             "rust",
             TOP_K,
-            Bm25SearchOptions::new()
-                .with_mode(BoolMode::Or)
-                .with_stats(Bm25Stats::Global),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
             None,
         )
-        .expect("global-stats bm25");
-    let global_rows: usize = global.iter().map(|b| b.num_rows()).sum();
-    assert!(!per_superfile_hits.is_empty(), "the corpus has rust docs");
+        .expect("bm25");
+    let ranked_rows: usize = ranked.iter().map(|b| b.num_rows()).sum();
+    assert!(!matched.is_empty(), "the corpus has rust docs");
     assert_eq!(
-        global_rows,
-        per_superfile_hits.len(),
-        "global statistics rescore the same match set"
+        ranked_rows,
+        matched.len(),
+        "table-wide statistics rescore the same match set"
     );
 }
 

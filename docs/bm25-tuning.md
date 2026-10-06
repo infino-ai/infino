@@ -21,6 +21,10 @@ the scoring math and the parameter type.
   score(t, d)        = idf(t) * tf / ( tf + k1 * norm(dl, avgdl) )
 ```
 
+`N` and `df` are table-wide: every search scores each superfile against
+the document count and document frequencies summed across the whole table,
+so a fragmented table ranks like one corpus.
+
 A document's score for a query is the sum over its matching terms. Higher
 is better (the opposite direction from `vector_search`, which returns a
 distance).
@@ -463,7 +467,6 @@ text.
 
 | Lever | Where | Changeable later | What it does |
 | --- | --- | --- | --- |
-| Corpus statistics scope (`Bm25Stats`) | Per search | Yes | `Global` (the default) scores every superfile against table-wide document counts and document frequencies, so a fragmented table ranks like one corpus. `PerSuperfile` uses each file's own statistics: faster, but a term's IDF depends on which file a document landed in. On a fragmented table this is usually the single biggest ranking lever. See [`src/superfile/fts/reader/options.rs`](../src/superfile/fts/reader/options.rs). |
 | Base tokenizer | `FtsField::analyzer` | No | `standard` or `ascii_lower`. See [Tokenizer, stopwords, and stemming](#tokenizer-stopwords-and-stemming). |
 | Stopwords | `FtsField::stopwords` | No | Drops very common words from index and query. See [Stopwords](#stopwords). |
 | Stemmer | `FtsField::stemmer` | No | Folds inflections onto one term, so one form finds the others. See [Stemming](#stemming). |
@@ -537,7 +540,6 @@ Two debugging helpers repay the time they take:
 | --- | --- |
 | Scores are smaller than another engine reports | The missing `(k1 + 1)` numerator. Ranking is unaffected; multiply by `k1 + 1` to compare numbers. |
 | Scores differ slightly from a hand-written BM25 | One-byte length quantization and the thousandths-resolution `avgdl`. Feed `stored_len` and `stored_avgdl` into the reference formula. |
-| Ranking shifts as the table is written to | Per-superfile corpus statistics. Use the default `Bm25Stats::Global`. |
 | A tuned pair works in Rust or a binding but not in SQL | SQL and `hybrid_search` have no override. Declare the pair on the column. |
 | `create_table` rejects the pair | `k1` must be finite and greater than 0, `b` finite and in `[0, 1]`. The error names the column ([`src/supertable/error.rs`](../src/supertable/error.rs)). |
 | A query-time override made things slower | Expected: looser bounds prune fewer blocks. Bake the pair once you have settled on it. |
@@ -556,14 +558,14 @@ Two debugging helpers repay the time they take:
 | Analysis chain (stopwords, stemmer, position holes) | [`src/superfile/fts/analysis.rs`](../src/superfile/fts/analysis.rs) |
 | Analysis compatibility on merge | [`src/superfile/builder.rs`](../src/superfile/builder.rs) |
 | `LIKE` lowering and analyzer recognition | [`src/supertable/query/candidate.rs`](../src/supertable/query/candidate.rs) |
-| Per-search options (`Bm25SearchOptions`, `BoolMode`, `Bm25Stats`) | [`src/superfile/fts/reader/options.rs`](../src/superfile/fts/reader/options.rs) |
+| Per-search options (`Bm25SearchOptions`, `BoolMode`) | [`src/superfile/fts/reader/options.rs`](../src/superfile/fts/reader/options.rs) |
 | Column declaration (`FtsField`, `IndexSpec`) | [`src/catalog/index_spec.rs`](../src/catalog/index_spec.rs) |
 | Declared pair recorded in the catalog | [`src/catalog/manifest.rs`](../src/catalog/manifest.rs), [`src/catalog/mod.rs`](../src/catalog/mod.rs) |
 | Bound baking at build time | [`src/superfile/fts/builder.rs`](../src/superfile/fts/builder.rs) |
 | Override view and bound correction | [`src/superfile/fts/reader/core.rs`](../src/superfile/fts/reader/core.rs), [`src/superfile/fts/reader/metadata.rs`](../src/superfile/fts/reader/metadata.rs) |
 | Bound decoding for the ranked kernels | [`src/superfile/fts/reader/bounds.rs`](../src/superfile/fts/reader/bounds.rs) |
 | Per-superfile derived-view memo | [`src/superfile/reader.rs`](../src/superfile/reader.rs) |
-| Query fan-out, statistics scope, query syntax | [`src/supertable/query/fts.rs`](../src/supertable/query/fts.rs) |
+| Query fan-out, table-wide statistics, query syntax | [`src/supertable/query/fts.rs`](../src/supertable/query/fts.rs) |
 | SQL search table functions | [`src/supertable/query/exec/fts_exec.rs`](../src/supertable/query/exec/fts_exec.rs), [`src/catalog/search_tvf.rs`](../src/catalog/search_tvf.rs) |
 | Public search surface | [`src/catalog/table.rs`](../src/catalog/table.rs) |
 

@@ -67,9 +67,8 @@ const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
 /// Maximum total gap bytes tolerated in one coalesced postings request.
 const TERM_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
 
-/// Per-term table-wide BM25 idf, keyed
-/// by term, used by [`Bm25Stats::Global`]. A term absent from the map
-/// falls back to that superfile's local idf.
+/// Per-term table-wide BM25 idf, keyed by term. A term absent from the
+/// map falls back to that superfile's local idf.
 pub(crate) type GlobalTermIdf = std::collections::HashMap<String, f32>;
 
 /// A query's parsed clause lists, borrowed for one search call —
@@ -84,8 +83,8 @@ pub(crate) struct ClauseLists<'a> {
     pub must_phrases: &'a [Phrase<String>],
     pub should_phrases: &'a [Phrase<String>],
     pub negative_phrases: &'a [Phrase<String>],
-    /// Per-term global idf for [`Bm25Stats::Global`], the default;
-    /// `None` scores with [`Bm25Stats::PerSuperfile`] local idf.
+    /// Per-term table-wide idf; `None` scores with this superfile's local
+    /// statistics, which is what a single-superfile read wants.
     pub global_idf: Option<&'a GlobalTermIdf>,
     /// Open-wave fetches for the scored terms (global stats): the
     /// cursor builds serve these terms from the memo instead of

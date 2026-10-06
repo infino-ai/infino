@@ -1985,7 +1985,7 @@ mod tests {
         *,
     };
     use crate::{
-        Bm25Stats, BoolMode, VectorSearchOptions,
+        BoolMode, VectorSearchOptions,
         config::{DEFAULT_GC_SAFETY_GAP, DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
         memory::ConnectionMemoryBudget,
         superfile::{
@@ -4036,9 +4036,7 @@ mod tests {
                     "title",
                     &token,
                     5,
-                    Bm25SearchOptions::new()
-                        .with_mode(BoolMode::And)
-                        .with_stats(Bm25Stats::Global),
+                    Bm25SearchOptions::new().with_mode(BoolMode::And),
                     Some(&["title"]),
                 )
                 .unwrap_or_else(|e| panic!("bm25_search for {token}: {e}"));
@@ -4738,9 +4736,7 @@ mod tests {
                 "title",
                 query,
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25_search warmup");
@@ -4752,9 +4748,7 @@ mod tests {
                 "title",
                 query,
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25_search measured");

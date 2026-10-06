@@ -176,10 +176,8 @@ async fn bm25_search_sends_json_and_decodes_arrow() {
             "query": "hello",
             "k": 10,
             "mode": "or",
-            // A defaulted request sends the CURRENT default explicitly —
-            // "global" since the stats default flipped — rather than
-            // relying on the server's own default (which stays frozen at
-            // its historical meaning for bare/omitted).
+            // Every request names table-wide statistics: the server scores
+            // an omitted `stats` per superfile.
             "stats": "global",
         })))
         .respond_with(

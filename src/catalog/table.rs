@@ -281,12 +281,11 @@ impl Supertable {
 
     /// Ranked BM25 full-text search over one FTS column.
     ///
-    /// `opts` ([`Bm25SearchOptions`]) carries the boolean `mode` and the
-    /// corpus-statistics selector: [`Bm25Stats::Global`](crate::Bm25Stats::Global)
-    /// (the default, each segment scored against its own local statistics) or
-    /// [`Bm25Stats::Global`](crate::Bm25Stats::Global) (one table-wide idf
-    /// across all segments, so a fragmented table ranks like a single unified
-    /// corpus). `Bm25SearchOptions::new()` is `Or` mode + per-superfile stats.
+    /// `opts` ([`Bm25SearchOptions`]) carries the boolean `mode` and an
+    /// optional similarity override; `Bm25SearchOptions::new()` is `Or` mode
+    /// with each column's declared parameters. Every segment scores against
+    /// one table-wide idf, so a fragmented table ranks like a single unified
+    /// corpus.
     pub fn bm25_search(
         &self,
         column: &str,

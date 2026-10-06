@@ -7536,7 +7536,6 @@ mod tests {
             SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             error::{ReadError, VectorError},
-            fts::reader::Bm25Stats,
             vector::{
                 distance::Metric,
                 flat::Sq4FlatIndex,
@@ -10544,9 +10543,7 @@ mod tests {
                 "title",
                 "5",
                 8,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::And)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::And),
                 None,
             )
             .expect("global-stats bm25");

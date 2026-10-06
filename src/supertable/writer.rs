@@ -11393,7 +11393,7 @@ mod tests {
         config::Config,
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
+            fts::reader::{Bm25SearchOptions, BoolMode},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -11924,9 +11924,7 @@ mod tests {
                 "title",
                 "alpha",
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 over one-piece commit");

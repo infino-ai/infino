@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! Global term-stats sidecar behavior over the public surface: optimize
-//! publishes it, global-stats queries read df from it instead of fanning
+//! publishes it, queries read df from it instead of fanning
 //! the query-time gather, appends compose (sidecar + uncovered tail),
 //! and a maintenance republish reflects membership changes — with
 //! ranking always equal to a never-optimized control table holding the
@@ -19,10 +19,7 @@ use infino::{
     Bm25SearchOptions, CompactionSettings, OptimizeOptions,
     runtime_metrics::op_stats::with_op_stats,
     storage::StorageProvider,
-    superfile::{
-        builder::FtsConfig,
-        fts::reader::{Bm25Stats, BoolMode},
-    },
+    superfile::{builder::FtsConfig, fts::reader::BoolMode},
     supertable::{Supertable, SupertableOptions, storage::LocalFsStorageProvider},
 };
 use tempfile::TempDir;
@@ -103,7 +100,7 @@ fn commit_segment(st: &Supertable, segment: usize) {
     w.commit().expect("commit");
 }
 
-/// Ranked `(title, score)` rows for a global-stats BM25 query.
+/// Ranked `(title, score)` rows for a BM25 query.
 fn global_hits(st: &Supertable, query: &str, mode: BoolMode) -> Vec<(String, f32)> {
     let batches = st
         .reader()
@@ -112,9 +109,7 @@ fn global_hits(st: &Supertable, query: &str, mode: BoolMode) -> Vec<(String, f32
             "title",
             query,
             TOP_K,
-            Bm25SearchOptions::new()
-                .with_mode(mode)
-                .with_stats(Bm25Stats::Global),
+            Bm25SearchOptions::new().with_mode(mode),
             Some(&["title", "score"]),
         )
         .expect("bm25_search");
@@ -138,7 +133,7 @@ fn global_hits(st: &Supertable, query: &str, mode: BoolMode) -> Vec<(String, f32
 }
 
 /// Planned read ranges for one scoped BM25 query.
-fn planned_ranges(st: &Supertable, query: &str, mode: BoolMode, stats: Bm25Stats) -> u64 {
+fn planned_ranges(st: &Supertable, query: &str, mode: BoolMode) -> u64 {
     let (hits, op) = with_op_stats(|| {
         st.reader()
             .expect("reader")
@@ -146,7 +141,7 @@ fn planned_ranges(st: &Supertable, query: &str, mode: BoolMode, stats: Bm25Stats
                 "title",
                 query,
                 TOP_K,
-                Bm25SearchOptions::new().with_mode(mode).with_stats(stats),
+                Bm25SearchOptions::new().with_mode(mode),
             )
             .expect("bm25")
     });
@@ -196,24 +191,25 @@ fn sidecar_covers_fragmented_table_and_composes_with_tail() {
         );
     }
 
-    // Plan parity: with every superfile covered, a first global query —
-    // AND shapes included, whose gather previously paid a dict-only
-    // residual — plans EXACTLY the per-superfile work. (`red` appears
-    // only in half the docs, so the AND prune and presence set genuinely
-    // differ across shards.)
-    let and_q = "alpha red";
-    let per_superfile = planned_ranges(&st, and_q, BoolMode::And, Bm25Stats::PerSuperfile);
+    // Plan parity: with every superfile covered, a first query — AND
+    // shapes included, whose gather would otherwise pay a dict-only
+    // residual — plans EXACTLY what its repeat plans once the idf cache
+    // serves every term, i.e. only the query's own work. (`green` is not
+    // yet cached and appears only in half the docs, so the AND prune and
+    // presence set genuinely differ across shards.)
+    let and_q = "alpha green";
+    let first_and = planned_ranges(&st, and_q, BoolMode::And);
     assert_eq!(
-        planned_ranges(&st, and_q, BoolMode::And, Bm25Stats::Global),
-        per_superfile,
-        "sidecar-covered global AND query plans the per-superfile work"
+        first_and,
+        planned_ranges(&st, and_q, BoolMode::And),
+        "sidecar-covered AND query plans only its own work"
     );
     let or_q = "beta";
-    let per_superfile_or = planned_ranges(&st, or_q, BoolMode::Or, Bm25Stats::PerSuperfile);
+    let first_or = planned_ranges(&st, or_q, BoolMode::Or);
     assert_eq!(
-        planned_ranges(&st, or_q, BoolMode::Or, Bm25Stats::Global),
-        per_superfile_or,
-        "sidecar-covered global OR query plans the per-superfile work"
+        first_or,
+        planned_ranges(&st, or_q, BoolMode::Or),
+        "sidecar-covered OR query plans only its own work"
     );
 
     // Appends carry the sidecar and compose with the uncovered tail:
@@ -233,11 +229,11 @@ fn sidecar_covers_fragmented_table_and_composes_with_tail() {
     // for a term the earlier queries never cached.
     st.optimize(&stats_only_optimize()).expect("re-optimize");
     let fresh_q = "green";
-    let per_superfile_fresh = planned_ranges(&st, fresh_q, BoolMode::Or, Bm25Stats::PerSuperfile);
+    let first_fresh = planned_ranges(&st, fresh_q, BoolMode::Or);
     assert_eq!(
-        planned_ranges(&st, fresh_q, BoolMode::Or, Bm25Stats::Global),
-        per_superfile_fresh,
-        "re-covered table plans the per-superfile work on a fresh term"
+        first_fresh,
+        planned_ranges(&st, fresh_q, BoolMode::Or),
+        "re-covered table plans only the query's own work on a fresh term"
     );
 }
 

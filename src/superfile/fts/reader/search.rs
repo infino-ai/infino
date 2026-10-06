@@ -1572,7 +1572,7 @@ impl FtsReader {
             .collect())
     }
 
-    /// Open-wave fetch for `Bm25Stats::Global`: resolve `terms` in this
+    /// Open-wave fetch for table-wide idf: resolve `terms` in this
     /// superfile's dictionary and fetch each PFOR term's full postings
     /// range — exactly the reads the cursor build performs — recording
     /// df per term so the caller can aggregate corpus-wide idf BEFORE
@@ -1711,8 +1711,8 @@ impl FtsReader {
         // it — its bytes were fetched when its df was gathered — so the
         // dictionary is opened, and the PFOR fan below issued, only for the
         // terms the memo does not cover (all of them on the single-pass
-        // path). Each resolved entry carries its term's global idf (when in
-        // `Bm25Stats::Global`) so the cursor is built with the global value;
+        // path). Each resolved entry carries its term's global idf (when the
+        // caller supplied one) so the cursor is built with the global value;
         // `None` per term falls back to this superfile's local idf.
         enum Resolved {
             Memo {
