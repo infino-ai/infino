@@ -321,8 +321,14 @@ published atomically.
 A superfile's indexes can fall behind what the engine writes today on two
 independent axes, and they need different repairs:
 
-- **The layout** — the index blob's version. Copying the postings into a
-current blob fixes it; the terms themselves are fine.
+- **The layout** — the index blob's version, or a footer that stores a
+region key more than once. A blob below the current version, or with a
+duplicated key, is rewritten by copying its postings into a current blob;
+the terms themselves are fine. Every blob version the engine reads is
+current, so a stale version arises only once the current version moves
+past one the engine still reads. A blob older than the oldest version the
+engine reads is not repaired: it fails to open, with an error that names
+the release to reindex it with.
 - **The analysis** — which revision of a named analysis chain produced the
 terms. Copying postings cannot fix this, so only re-analyzing the stored
 text does, and a column whose text was never stored cannot be repaired at
