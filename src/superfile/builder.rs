@@ -3451,9 +3451,7 @@ mod tests {
         superfile::{
             format::footer::read_kv_metadata,
             fts::{
-                builder::{BlobEra, RADIX_SORT_MIN_TRIPLES},
-                reader::BoolMode,
-                short::SHORT_MAX_DF,
+                builder::RADIX_SORT_MIN_TRIPLES, reader::BoolMode, short::SHORT_MAX_DF,
                 sorted_merge::TERMS_PER_CHUNK,
             },
             vector::rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
@@ -5749,13 +5747,11 @@ mod tests {
         )
     }
 
-    /// One merge input over `(title, body)` docs with ids from `first_id`,
-    /// its FTS blob written in `era`.
+    /// One merge input over `(title, body)` docs with ids from `first_id`.
     fn merge_input(
         opts: &BuilderOptions,
         first_id: u32,
         docs: &[(String, String)],
-        era: BlobEra,
     ) -> Arc<SuperfileReader> {
         let ids = decimal128_ids((first_id..first_id + docs.len() as u32).map(u64::from));
         let (titles, bodies): (Vec<&str>, Vec<&str>) =
@@ -5770,7 +5766,6 @@ mod tests {
         )
         .expect("build RecordBatch");
         let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
-        b.fts_builder.as_mut().expect("fts builder").era = era;
         b.add_batch(&batch, &[]).expect("add_batch");
         let bytes = b.finish().expect("finish input");
         Arc::new(SuperfileReader::open(Bytes::from(bytes)).expect("open input"))
@@ -5924,7 +5919,7 @@ mod tests {
         for (i, &docs) in sizes.iter().enumerate() {
             let docs_text = make_docs(i as u32, first_id, docs);
             inputs.push((
-                merge_input(&opts, first_id, &docs_text, BlobEra::V7),
+                merge_input(&opts, first_id, &docs_text),
                 tombstones(deletes.get(i).copied().unwrap_or(&[])),
             ));
             first_id += docs;
@@ -5947,10 +5942,7 @@ mod tests {
 
     /// Inputs of the given vocabulary sizes, every `EDGE_DELETE_STEP`th doc
     /// of the last one tombstoned.
-    fn vocab_inputs(
-        sizes: &[usize],
-        era: BlobEra,
-    ) -> Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> {
+    fn vocab_inputs(sizes: &[usize]) -> Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> {
         let opts = sorted_merge_opts(true);
         let mut first_id = 0;
         let mut inputs = Vec::new();
@@ -5960,10 +5952,7 @@ mod tests {
                 true => (0..docs.len() as u32).step_by(EDGE_DELETE_STEP).collect(),
                 false => Vec::new(),
             };
-            inputs.push((
-                merge_input(&opts, first_id, &docs, era),
-                tombstones(&deleted),
-            ));
+            inputs.push((merge_input(&opts, first_id, &docs), tombstones(&deleted)));
             first_id += docs.len() as u32;
         }
         inputs
@@ -5978,7 +5967,7 @@ mod tests {
             vec![],
         );
         let docs = SORTED_MERGE_INPUT_DOCS[1];
-        let input = merge_input(&opts, 0, &sorted_merge_docs(0, 0, docs), BlobEra::V7);
+        let input = merge_input(&opts, 0, &sorted_merge_docs(0, 0, docs));
         let mut fb = FtsBuilder::new(Arc::new(StandardTokenizer));
         fb.register_column("title".into(), false).expect("register");
         fb.add_doc(0, 0, "hello").expect("add doc");
@@ -6093,58 +6082,54 @@ mod tests {
         const DOCS: u32 = 300;
         const MAX_TERMS: usize = 1 << 16;
         let opts = sorted_merge_opts(true);
-        for era in [BlobEra::V7, BlobEra::V2ToV4] {
-            let reader = merge_input(&opts, 0, &sorted_merge_docs(0, 0, DOCS), era);
-            let fts = reader.fts().expect("fts");
-            let dict = fts.dict_bytes().expect("dict");
-            let (mut inline, mut short, mut long) = (0, 0, 0);
-            for column_id in 0..2 {
-                let terms = fts
-                    .column_terms_from(&dict, column_id, b"", MAX_TERMS)
-                    .expect("terms");
-                assert!(terms.len() < MAX_TERMS, "premise: every term listed");
-                for (term, value) in terms {
-                    let mut postings = 0u32;
-                    fts.for_each_posting_in(
-                        column_id,
-                        once((term.as_slice(), value)),
-                        &mut Vec::new(),
-                        |_, _, _, _| {
-                            postings += 1;
-                            Ok(())
-                        },
-                    )
-                    .expect("postings");
-                    let at_most = fts.term_postings_at_most(value).expect("postings bound");
-                    match value {
-                        FstValue::Inline { .. } => {
-                            inline += 1;
-                            assert_eq!((at_most, postings), (1, 1), "inline {term:?}");
-                        }
-                        FstValue::Pfor { short: true, .. } => {
-                            short += 1;
-                            assert_eq!(at_most, SHORT_MAX_DF as u32, "short {term:?}");
-                            assert!(postings <= at_most, "short {term:?} over its limit");
-                        }
-                        FstValue::Pfor { .. } => {
-                            long += 1;
-                            assert_eq!(at_most, postings, "long {term:?}");
-                        }
+        let reader = merge_input(&opts, 0, &sorted_merge_docs(0, 0, DOCS));
+        let fts = reader.fts().expect("fts");
+        let dict = fts.dict_bytes().expect("dict");
+        let (mut inline, mut short, mut long) = (0, 0, 0);
+        for column_id in 0..2 {
+            let terms = fts
+                .column_terms_from(&dict, column_id, b"", MAX_TERMS)
+                .expect("terms");
+            assert!(terms.len() < MAX_TERMS, "premise: every term listed");
+            for (term, value) in terms {
+                let mut postings = 0u32;
+                fts.for_each_posting_in(
+                    column_id,
+                    once((term.as_slice(), value)),
+                    &mut Vec::new(),
+                    |_, _, _, _| {
+                        postings += 1;
+                        Ok(())
+                    },
+                )
+                .expect("postings");
+                let at_most = fts.term_postings_at_most(value).expect("postings bound");
+                match value {
+                    FstValue::Inline { .. } => {
+                        inline += 1;
+                        assert_eq!((at_most, postings), (1, 1), "inline {term:?}");
+                    }
+                    FstValue::Pfor { short: true, .. } => {
+                        short += 1;
+                        assert_eq!(at_most, SHORT_MAX_DF as u32, "short {term:?}");
+                        assert!(postings <= at_most, "short {term:?} over its limit");
+                    }
+                    FstValue::Pfor { .. } => {
+                        long += 1;
+                        assert_eq!(at_most, postings, "long {term:?}");
                     }
                 }
             }
-            assert!(
-                inline > 0 && long > 0,
-                "{era:?} holds inline and long terms"
-            );
-            // Only the current layout has the short form.
-            assert_eq!(short > 0, era == BlobEra::V7, "{era:?} short terms");
         }
+        assert!(
+            inline > 0 && short > 0 && long > 0,
+            "holds inline, short and long terms"
+        );
     }
 
     /// Vocabularies one short of a chunk, exactly one and two chunks, one
     /// past, and more than three, in a positional and a non-positional
-    /// column, in both dictionary layouts (`V2ToV4` writes the FST one).
+    /// column.
     #[test]
     fn sorted_merge_handles_vocabularies_on_and_across_chunk_edges() {
         let sizes = [
@@ -6154,29 +6139,27 @@ mod tests {
             2 * TERMS_PER_CHUNK,
             3 * TERMS_PER_CHUNK + 1,
         ];
-        for era in [BlobEra::V7, BlobEra::V2ToV4] {
-            let inputs = vocab_inputs(&sizes, era);
-            for ((reader, _), &n) in inputs.iter().zip(&sizes) {
-                let fts = reader.fts().expect("fts");
-                let dict = fts.dict_bytes().expect("dict");
-                for column_id in 0..2 {
-                    let terms = fts
-                        .column_terms_from(&dict, column_id, b"", n + 1)
-                        .expect("terms");
-                    assert_eq!(
-                        terms.len(),
-                        n,
-                        "premise: column {column_id} holds {n} terms"
-                    );
-                }
+        let inputs = vocab_inputs(&sizes);
+        for ((reader, _), &n) in inputs.iter().zip(&sizes) {
+            let fts = reader.fts().expect("fts");
+            let dict = fts.dict_bytes().expect("dict");
+            for column_id in 0..2 {
+                let terms = fts
+                    .column_terms_from(&dict, column_id, b"", n + 1)
+                    .expect("terms");
+                assert_eq!(
+                    terms.len(),
+                    n,
+                    "premise: column {column_id} holds {n} terms"
+                );
             }
-            assert_merges_agree(&inputs);
         }
+        assert_merges_agree(&inputs);
     }
 
     #[test]
     fn sorted_merge_handles_a_single_input() {
-        assert_merges_agree(&vocab_inputs(&[2 * TERMS_PER_CHUNK + 1], BlobEra::V7));
+        assert_merges_agree(&vocab_inputs(&[2 * TERMS_PER_CHUNK + 1]));
     }
 
     /// `mid` is the last term of input 0's first chunk, so its next chunk
@@ -6197,11 +6180,8 @@ mod tests {
         let first = input_docs(TERMS_PER_CHUNK - 1);
         let second = input_docs(TAIL_TERMS);
         let inputs = vec![
-            (merge_input(&opts, 0, &first, BlobEra::V7), None),
-            (
-                merge_input(&opts, first.len() as u32, &second, BlobEra::V7),
-                None,
-            ),
+            (merge_input(&opts, 0, &first), None),
+            (merge_input(&opts, first.len() as u32, &second), None),
         ];
         let fts = inputs[0].0.fts().expect("fts");
         let chunk = fts

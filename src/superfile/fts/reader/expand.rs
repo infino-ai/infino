@@ -926,7 +926,7 @@ mod tests {
         },
         *,
     };
-    use crate::{superfile::fts::builder::BlobEra, utils::terms::DictBuilder};
+    use crate::utils::terms::TermDictBuilder;
 
     /// Generous cap so a test never trips the too-many fallback by accident.
     const MAX_TERMS: usize = 64;
@@ -1201,10 +1201,6 @@ mod tests {
         assert_eq!(exact.planned_ranges, 0, "no dictionary needed");
     }
 
-    /// Every blob era the builder writes: the kernel reads dictionary
-    /// values and posting bodies straight, so each layout must agree.
-    const ERAS: [BlobEra; 4] = [BlobEra::V7, BlobEra::V6, BlobEra::V5, BlobEra::V2ToV4];
-
     /// Rows of the contains fixture carrying the dense term, enough for
     /// several long-form posting blocks.
     const DENSE_ROWS: usize = 3 * BLOCK_LEN + 7;
@@ -1287,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn contains_rows_brackets_arrows_ilike_on_every_era() {
+    fn contains_rows_brackets_arrows_ilike() {
         let docs = contains_docs();
         let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
         let planted = DENSE_ROWS as u32;
@@ -1300,47 +1296,39 @@ mod tests {
             planted + 5,
             planted + 6,
         );
-        for era in ERAS {
-            let (blob, json) = build_standard_blob_with(&refs, era, None);
-            let r = FtsReader::open(blob, &json).expect("open");
-            for needle in NEEDLES {
-                let (rows, work) = contains(&r, needle);
-                let oracle = arrow_ilike(&docs, needle);
-                assert_bracketed(&rows, &oracle, &format!("{needle} in {era:?}"));
-                assert!(work.planned_ranges >= 1, "the dictionary fetch is counted");
-            }
-            // The planted spellings land where the rule says.
-            let (bbc, _) = contains(&r, "bbc");
-            assert_eq!(
-                bbc.doubtful,
-                RoaringBitmap::from_iter([near_row, cut_row]),
-                "{era:?}: the cut match and the near miss beside a cut, nothing else"
-            );
-            assert!(arrow_ilike(&docs, "bbc").contains(cut_row));
-            assert!(!arrow_ilike(&docs, "bbc").contains(near_row));
-            let (xi, _) = contains(&r, "xi");
-            assert!(
-                xi.doubtful.contains(dotted_cut_row),
-                "{era:?}: `İ` at a cut"
-            );
-            assert!(!arrow_ilike(&docs, "xi").contains(dotted_cut_row));
-            let (taxi_rows, _) = contains(&r, "taxi");
-            assert!(taxi_rows.proven.contains(taxi), "{era:?}");
-            assert!(
-                taxi_rows.doubtful.contains(taxi_dotted),
-                "{era:?}: `İ` whole"
-            );
-            assert!(!arrow_ilike(&docs, "taxi").contains(taxi_dotted));
-            for needle in ["sun", "kelvin"] {
-                let (folded, _) = contains(&r, needle);
-                assert!(folded.proven.contains(fold_row), "{needle} in {era:?}");
-            }
-            // A needle no cut or dotted I can touch is decided outright.
-            for needle in ["common", "news", "zzq"] {
-                let (clean, _) = contains(&r, needle);
-                assert!(clean.doubtful.is_empty(), "{needle} in {era:?}");
-                assert_eq!(clean.proven, arrow_ilike(&docs, needle), "{needle}");
-            }
+        let (blob, json) = build_standard_blob(&refs);
+        let r = FtsReader::open(blob, &json).expect("open");
+        for needle in NEEDLES {
+            let (rows, work) = contains(&r, needle);
+            let oracle = arrow_ilike(&docs, needle);
+            assert_bracketed(&rows, &oracle, needle);
+            assert!(work.planned_ranges >= 1, "the dictionary fetch is counted");
+        }
+        // The planted spellings land where the rule says.
+        let (bbc, _) = contains(&r, "bbc");
+        assert_eq!(
+            bbc.doubtful,
+            RoaringBitmap::from_iter([near_row, cut_row]),
+            "the cut match and the near miss beside a cut, nothing else"
+        );
+        assert!(arrow_ilike(&docs, "bbc").contains(cut_row));
+        assert!(!arrow_ilike(&docs, "bbc").contains(near_row));
+        let (xi, _) = contains(&r, "xi");
+        assert!(xi.doubtful.contains(dotted_cut_row), "`İ` at a cut");
+        assert!(!arrow_ilike(&docs, "xi").contains(dotted_cut_row));
+        let (taxi_rows, _) = contains(&r, "taxi");
+        assert!(taxi_rows.proven.contains(taxi));
+        assert!(taxi_rows.doubtful.contains(taxi_dotted), "`İ` whole");
+        assert!(!arrow_ilike(&docs, "taxi").contains(taxi_dotted));
+        for needle in ["sun", "kelvin"] {
+            let (folded, _) = contains(&r, needle);
+            assert!(folded.proven.contains(fold_row), "{needle}");
+        }
+        // A needle no cut or dotted I can touch is decided outright.
+        for needle in ["common", "news", "zzq"] {
+            let (clean, _) = contains(&r, needle);
+            assert!(clean.doubtful.is_empty(), "{needle}");
+            assert_eq!(clean.proven, arrow_ilike(&docs, needle), "{needle}");
         }
     }
 
@@ -1353,7 +1341,7 @@ mod tests {
         let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
         let n = docs.len() as u32;
         let order: Vec<u32> = (0..n).rev().collect();
-        let (blob, json) = build_standard_blob_with(&refs, BlobEra::V7, Some(&order));
+        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
         let r = FtsReader::open(blob, &json).expect("open");
         assert!(r.has_doc_map(), "the fixture must reorder to mean anything");
         for needle in NEEDLES {
@@ -1416,11 +1404,14 @@ mod tests {
     fn a_non_utf8_dictionary_key_fails_every_walk_rather_than_skip_its_rows() {
         // `body`'s terms: `rust`, and one that is `r` plus a byte no UTF-8
         // holds. Skipping the second could drop the rows it indexes.
-        let mut dict = DictBuilder::new();
-        dict.insert(&make_key("body", "rust"), FstValue::pack_inline(0, 1));
+        let mut dict = TermDictBuilder::new(DictLayout::Blocks);
+        dict.insert(
+            &make_key("body", "rust"),
+            FstValue::Inline { doc_id: 0, tf: 1 },
+        );
         let mut bad = make_key("body", "r");
         bad.push(NOT_UTF8_BYTE);
-        dict.insert(&bad, FstValue::pack_inline(1, 1));
+        dict.insert(&bad, FstValue::Inline { doc_id: 1, tf: 1 });
         let fst = dict.finish();
         let walks = [
             // The LIKE expansion's shared walk and a prefix's subtree walk.
@@ -1436,7 +1427,7 @@ mod tests {
         for (pattern, walk, keep) in walks {
             let err = walk_dictionary(
                 &fst,
-                DictLayout::Fst,
+                DictLayout::Blocks,
                 "body",
                 &[pattern],
                 &[walk],

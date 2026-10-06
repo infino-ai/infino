@@ -846,10 +846,7 @@ mod tests {
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
-        bm25,
-        builder::{BlobEra, FtsBuilder},
-        reader::FtsReader,
-        tokenize::StandardTokenizer,
+        builder::FtsBuilder, reader::FtsReader, tokenize::StandardTokenizer,
     };
 
     // ── Column length totals ──────────────────────────────────────────
@@ -907,9 +904,8 @@ mod tests {
 
     /// Two documents of two tokens each, then rows this column is null
     /// for: four tokens over two documents, eight rows.
-    fn sparse_builder(era: BlobEra) -> FtsBuilder {
+    fn sparse_builder() -> FtsBuilder {
         let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
-        b.era = era;
         b.register_column("body".into(), false).expect("register");
         b.add_doc(0, 0, "alpha beta").expect("doc 0");
         b.add_doc(0, 1, "alpha gamma").expect("doc 1");
@@ -923,7 +919,7 @@ mod tests {
     fn sparse_reader() -> FtsReader {
         let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         FtsReader::open(
-            Bytes::from(sparse_builder(BlobEra::V6).finish().expect("finish")),
+            Bytes::from(sparse_builder().finish().expect("finish")),
             json,
         )
         .expect("open")
@@ -992,55 +988,10 @@ mod tests {
     }
 
     #[test]
-    fn an_older_sparse_file_is_corrected_and_its_bounds_inflated() {
-        // A pre-current file divided by its row count. Correcting the
-        // average raises it, which lowers the norm and raises every
-        // score, so the bounds baked at the row-count average sit below
-        // the scores they exist to cap and owe the supremum factor —
-        // on top of the `(k1 + 1)` those files carry. If this regresses,
-        // block-max pruning silently drops documents from the top-k.
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
-        for era in [BlobEra::V5, BlobEra::V2ToV4] {
-            let blob = Bytes::from(sparse_builder(era).finish().expect("finish"));
-            let r = FtsReader::open(blob, json).expect("open");
-            let col = &r.columns[0];
-            assert_eq!(
-                col.avgdl(),
-                2.0,
-                "{era:?}: scored at the average over documents"
-            );
-            let legacy_scale = 1.0 / (col.params.k1 + 1.0);
-            assert!(
-                col.bound_scale() > legacy_scale,
-                "{era:?}: a corrected average owes an inflation factor beyond the scale change, got {}",
-                col.bound_scale()
-            );
-            // What that build recorded: the same token total over every row.
-            let rows = (SPARSE_FILLED_ROWS + SPARSE_EMPTY_ROWS) as f32;
-            let baked = col
-                .dl_norm_k1()
-                .rescored(col.length_stats().total_tokens as f32 / rows, col.params);
-            for doc in 0..SPARSE_FILLED_ROWS {
-                for tf in 1..8u32 {
-                    let at_baked =
-                        bm25::score_with_dl_norm_k1(col.params.k1 + 1.0, tf, baked.get(doc));
-                    let at_scored = bm25::score_with_dl_norm_k1(1.0, tf, col.dl_norm_k1().get(doc));
-                    assert!(
-                        at_baked * col.bound_scale() >= at_scored - f32::EPSILON,
-                        "{era:?} doc {doc} tf {tf}: {at_baked} * {} < {at_scored}",
-                        col.bound_scale()
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn bound_scale_reacts_to_the_average_alone() {
-        // The regression that made the correction above possible: the
-        // short-circuit compared only the parameter pair, so two tables
-        // at the same k1/b but different averages returned 1.0 and
-        // under-bounded every score.
+        // Two tables at the same k1/b but different averages need an
+        // inflation factor; comparing only the parameter pair would return
+        // 1.0 and under-bound every score.
         let r = sparse_reader();
         let col = &r.columns[0];
         let wider = col.dl_norm_k1().rescored(col.avgdl() * 2.0, col.params);

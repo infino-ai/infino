@@ -8,27 +8,19 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::superfile::fts::{
-    builder::{BlobEra, FtsBuilder},
-    tokenize::StandardTokenizer,
-};
+use crate::superfile::fts::{builder::FtsBuilder, tokenize::StandardTokenizer};
 
 /// A one-column (`body`) `standard`-analyzer blob holding `docs`, doc `i`
 /// being `docs[i]`.
 pub(super) fn build_standard_blob(docs: &[&str]) -> (Bytes, String) {
-    build_standard_blob_with(docs, BlobEra::V7, None)
+    build_standard_blob_with(docs, None)
 }
 
-/// [`build_standard_blob`] written in `era`'s format, and, when `order` is
-/// given, storing its documents in that order: blob position `i` holds
-/// `docs[order[i]]`, the way a merge that reorders writes a blob.
-pub(super) fn build_standard_blob_with(
-    docs: &[&str],
-    era: BlobEra,
-    order: Option<&[u32]>,
-) -> (Bytes, String) {
+/// [`build_standard_blob`], when `order` is given storing its documents in
+/// that order: blob position `i` holds `docs[order[i]]`, the way a merge
+/// that reorders writes a blob.
+pub(super) fn build_standard_blob_with(docs: &[&str], order: Option<&[u32]>) -> (Bytes, String) {
     let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
-    b.era = era;
     b.register_column("body".into(), false)
         .expect("register column");
     let rows: Vec<u32> = match order {

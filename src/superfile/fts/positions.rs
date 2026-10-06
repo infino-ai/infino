@@ -87,21 +87,6 @@ impl TermRuns<'_> {
             Self::Values { values, starts } => values[starts[0]],
         }
     }
-
-    /// The runs as LEB128 bytes, which the layouts before grouped
-    /// positions store verbatim. `tfs` gives each posting's run length.
-    pub(crate) fn encode_into(&self, tfs: impl Iterator<Item = u32>, out: &mut Vec<u8>) {
-        match *self {
-            Self::Encoded(bytes) => out.extend_from_slice(bytes),
-            Self::Values { values, starts } => {
-                for (i, tf) in tfs.enumerate() {
-                    for &v in &values[starts[i]..starts[i] + tf as usize] {
-                        push_varint(out, v);
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Decode one run of exactly `tf` positions from `bytes` at `*at`,
@@ -548,9 +533,6 @@ mod tests {
         assert_eq!(at_encoded, bytes.len(), "the encoded walk covers every run");
         assert_eq!(decoded.first_value(), encoded.first_value(), "first value");
 
-        let mut reencoded = Vec::new();
-        decoded.encode_into(tfs.iter().copied(), &mut reencoded);
-        assert_eq!(reencoded, bytes, "re-encoded runs");
         assert_eq!(decoded.encoded(), None);
         assert_eq!(encoded.encoded(), Some(bytes.as_slice()));
     }

@@ -2364,23 +2364,17 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::{
         BytesLazyByteSource, LazyByteSourceError,
-        fts::{
-            bm25,
-            builder::{BlobEra, FtsBuilder},
-            reader::BoolMode,
-            tokenize::StandardTokenizer,
-        },
+        fts::{bm25, builder::FtsBuilder, reader::BoolMode, tokenize::StandardTokenizer},
     };
 
     /// Byte offset of the blob's version field.
     const VERSION_FIELD: std::ops::Range<usize> = 8..12;
 
     /// A corpus big enough to produce several posting blocks, so the
-    /// blob carries a real skip table (and, when coarse is on, a coarse
-    /// table) rather than a single degenerate block.
-    fn versioned_blob(era: BlobEra) -> (Bytes, &'static str) {
+    /// blob carries a real skip table and coarse table rather than a
+    /// single degenerate block.
+    fn multi_block_blob() -> (Bytes, &'static str) {
         let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
-        b.era = era;
         b.register_column("body".into(), false).expect("register");
         for doc in 0..600u32 {
             let text = match doc % 3 {
@@ -2396,26 +2390,12 @@ mod tests {
         )
     }
 
-    /// `blob` with its FTS version field overwritten — how the read path
-    /// for a version the builder no longer writes is exercised.
-    fn stamped(blob: &Bytes, version: u32) -> Bytes {
-        let mut bytes = blob.to_vec();
-        bytes[VERSION_FIELD].copy_from_slice(&version.to_le_bytes());
-        Bytes::from(bytes)
-    }
-
-    /// The `(k1 + 1)` the score no longer carries, which every stored
-    /// bound written before the current blob version still does.
-    fn legacy_bound_factor() -> f32 {
-        1.0 / (bm25::Bm25Params::STANDARD.k1 + 1.0)
-    }
-
     #[test]
     fn current_version_bounds_need_no_scale_correction() {
-        let (blob, json) = versioned_blob(BlobEra::V6);
+        let (blob, json) = multi_block_blob();
         assert_eq!(
             read_u32_le(&blob[VERSION_FIELD]),
-            format::fts::VERSION_V6,
+            format::fts::VERSION_CURRENT,
             "the builder writes the current version"
         );
         let r = FtsReader::open(blob, json).expect("open");
@@ -2427,78 +2407,6 @@ mod tests {
     }
 
     #[test]
-    fn pre_current_version_bounds_are_corrected_to_the_current_scale() {
-        // A no-coarse build still stamps a pre-V6 version, so its bounds
-        // carry the factor the scorer dropped and must be divided out —
-        // otherwise they sit a uniform 2.2x above the scores they cap
-        // and block-max pruning stops doing its job on every file
-        // written before this.
-        let (blob, json) = versioned_blob(BlobEra::V2ToV4);
-        assert!(
-            read_u32_le(&blob[VERSION_FIELD]) < format::fts::VERSION_V6,
-            "a no-coarse build must stamp a pre-current version"
-        );
-        let r = FtsReader::open(blob, json).expect("open");
-        assert!(
-            (r.columns[0].bound_scale() - legacy_bound_factor()).abs() < 1e-6,
-            "expected the legacy bound factor, got {}",
-            r.columns[0].bound_scale()
-        );
-    }
-
-    #[test]
-    fn the_version_before_current_is_read_as_legacy_scale() {
-        // The builder can no longer emit it — it writes the current
-        // version or drops to the no-coarse one — but it is what the
-        // released engine wrote, so every file already on disk is this
-        // version and it is the read path that matters most.
-        //
-        // The header and region layout are identical to the current
-        // one; only what a block-max slot holds differs, and open never
-        // decodes a slot, so stamping the version is enough to exercise
-        // the classification: what must hold is that it is treated as
-        // legacy and its bounds corrected. Reading it as current would
-        // leave them 2.2x too large — sound but with pruning disabled —
-        // and the opposite mistake, reading a current blob as legacy,
-        // would divide bounds that are already right and silently prune
-        // real hits out of the top-k.
-        let (current, json) = versioned_blob(BlobEra::V6);
-        let previous = stamped(&current, format::fts::VERSION_V5);
-
-        let r = FtsReader::open(previous, json).expect("the previous version still opens");
-        assert!(
-            (r.columns[0].bound_scale() - legacy_bound_factor()).abs() < 1e-6,
-            "expected the legacy bound factor, got {}",
-            r.columns[0].bound_scale()
-        );
-        // And it is genuinely the version-gated half doing the work: the
-        // same bytes read at the current version take no correction.
-        let r_current = FtsReader::open(current, json).expect("open");
-        assert_eq!(r_current.columns[0].bound_scale(), 1.0);
-    }
-
-    #[test]
-    fn every_accepted_version_still_opens() {
-        // A guard on the accept list for the versions that share the
-        // current region layout (V1–V3 differ in header and regions and
-        // cannot be stamped onto these bytes): a version dropped from it
-        // turns every file written by that release into an open error.
-        for v in [
-            format::fts::VERSION_V4,
-            format::fts::VERSION_V5,
-            format::fts::VERSION_V6,
-        ] {
-            let (current, json) = versioned_blob(BlobEra::V6);
-            let r = FtsReader::open(stamped(&current, v), json)
-                .unwrap_or_else(|e| panic!("version {v} must open: {e}"));
-            assert!(
-                r.columns[0].bound_scale() > 0.0,
-                "version {v} must yield a usable bound correction"
-            );
-        }
-    }
-
-    #[test]
     fn a_reused_scored_view_matches_a_freshly_derived_one() {
         // The view is memoized on the reader so it is not rebuilt per
         // call. Reuse is only safe because deriving it is a pure
@@ -2506,7 +2414,7 @@ mod tests {
         // must agree on everything scoring reads — otherwise a query
         // would score differently depending on whether it happened to
         // be the first to ask.
-        let (blob, json) = versioned_blob(BlobEra::V6);
+        let (blob, json) = multi_block_blob();
         let r = FtsReader::open(blob, json).expect("open");
         let over = bm25::Bm25Params::new(1.4, 0.6);
         let first = r.with_bm25_override(over);
@@ -2529,9 +2437,8 @@ mod tests {
     #[test]
     fn a_current_file_is_scored_at_the_average_it_declares() {
         // The writer bakes the table-wide average into the file, so the
-        // reader takes it as given: no correction, no inflation. An
-        // older file declared its row-count average and is corrected.
-        let (blob, json) = versioned_blob(BlobEra::V6);
+        // reader takes it as given: no correction, no inflation.
+        let (blob, json) = multi_block_blob();
         let r = FtsReader::open(blob, json).expect("open");
         let col = &r.columns[0];
         assert_eq!(col.bound_scale(), 1.0);
@@ -2557,9 +2464,8 @@ mod tests {
     /// A corpus whose common term's blocks tie closely, with every other
     /// row null when `sparse`, so block-max pruning is live at small `k`
     /// and the corrected collection size and average both matter.
-    fn tied_corpus(era: BlobEra, sparse: bool) -> (Bytes, &'static str) {
+    fn tied_corpus(sparse: bool) -> (Bytes, &'static str) {
         let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
-        b.era = era;
         b.register_column("body".into(), false).expect("register");
         let mut next = 0u32;
         for doc in 0..900u32 {
@@ -2799,35 +2705,6 @@ mod tests {
         );
     }
 
-    /// A doc-id map is what lifts the current era to `V8`, and only the
-    /// current era's header has room for the field locating it. Asked to
-    /// write a map under an older era, the builder refuses.
-    ///
-    /// Without the refusal the blob would be stamped with a version
-    /// whose readers parse a 56-byte header while carrying a 64-byte
-    /// one, putting every offset after it eight bytes from where they
-    /// look. Nothing in the file would say so: the magic, the version
-    /// and the checksums would all be intact.
-    #[test]
-    fn a_doc_map_on_a_legacy_era_is_refused_rather_than_mislabelled() {
-        const N_DOCS: u32 = 64;
-        for era in [BlobEra::V6, BlobEra::V5, BlobEra::V2ToV4] {
-            let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
-            b.register_column("body".into(), false).expect("register");
-            for row in 0..N_DOCS {
-                b.add_doc(0, row, &format!("alpha t{}", row % 7))
-                    .expect("add doc");
-            }
-            b.era = era;
-            b.doc_map = Some((0..N_DOCS).rev().collect());
-            let err = b.finish().expect_err("a legacy era must refuse a map");
-            assert!(
-                format!("{err}").contains("doc-id map"),
-                "expected the refusal to name the map, got {err:?} for {era:?}"
-            );
-        }
-    }
-
     /// The map region round-trips for any permutation, at sizes either
     /// side of the block and partition boundaries.
     ///
@@ -2971,77 +2848,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_older_sparse_file_ranks_exactly_like_a_fresh_one() {
-        // The legacy path end to end: a V5 file written as 0.8 wrote it —
-        // bounds carrying `(k1 + 1)`, average over rows — on a column
-        // that is null for every other row. The reader corrects the
-        // average, inflates the bounds, and must return the same top-k
-        // with the same scores as a fresh file of the same documents.
-        let json = tied_corpus(BlobEra::V6, true).1;
-        let fresh = FtsReader::open(tied_corpus(BlobEra::V6, true).0, json).expect("open");
-        for era in [BlobEra::V5, BlobEra::V2ToV4] {
-            let old = FtsReader::open(tied_corpus(era, true).0, json).expect("open");
-            let col = &old.columns[0];
-            assert!(
-                col.bound_scale() > 1.0 / (col.params.k1 + 1.0),
-                "{era:?}: inflated"
-            );
-            assert_eq!(
-                col.avgdl(),
-                fresh.columns[0].avgdl(),
-                "{era:?}: corrected average"
-            );
-            for terms in [
-                &["common"][..],
-                &["common", "shared"][..],
-                &["gamma", "beta"][..],
-            ] {
-                for k in [1usize, 3, 10] {
-                    assert_eq!(
-                        top(&old, terms, k).await,
-                        top(&fresh, terms, k).await,
-                        "{era:?} {terms:?} k={k}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn an_override_on_an_older_file_composes_its_corrections() {
-        // The open-time correction and a query-time `k1`/`b` move are
-        // both owed; the product must still cap every score, which the
-        // parity against a fresh file scored under the same override
-        // shows with pruning live.
-        let json = tied_corpus(BlobEra::V6, false).1;
-        let params = bm25::Bm25Params::new(0.9, 0.4);
-        let fresh = FtsReader::open(tied_corpus(BlobEra::V6, false).0, json)
-            .expect("open")
-            .with_bm25_override(params);
-        let old = FtsReader::open(tied_corpus(BlobEra::V5, false).0, json).expect("open");
-        let overridden = old.with_bm25_override(params);
-        assert!(
-            overridden.columns[0].bound_scale() > old.columns[0].bound_scale(),
-            "the override owes a factor on top of the open-time one"
-        );
-        for k in [1usize, 3, 10] {
-            assert_eq!(
-                top(&overridden, &["common", "shared"], k).await,
-                top(&fresh, &["common", "shared"], k).await,
-                "k={k}"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn null_rows_change_neither_idf_nor_the_average() {
         // The same documents with and without null rows interleaved must
         // score identically: the collection size idf uses and the
         // average length both count documents that carry tokens. Doc
         // ids differ (nulls occupy rows), so compare by score sequence.
-        let json = tied_corpus(BlobEra::V6, false).1;
-        let dense = FtsReader::open(tied_corpus(BlobEra::V6, false).0, json).expect("open");
-        let sparse = FtsReader::open(tied_corpus(BlobEra::V6, true).0, json).expect("open");
+        let json = tied_corpus(false).1;
+        let dense = FtsReader::open(tied_corpus(false).0, json).expect("open");
+        let sparse = FtsReader::open(tied_corpus(true).0, json).expect("open");
         assert_eq!(
             sparse.columns[0].scored_doc_count(),
             dense.columns[0].scored_doc_count()
