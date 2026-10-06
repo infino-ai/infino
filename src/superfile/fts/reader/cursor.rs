@@ -609,18 +609,20 @@ impl TermCursor {
             stored,
             false,
         )?;
-        // A match-only cursor never scores, so it neither needs the idf nor
-        // the norms it would read the length array for.
-        let local_idf = match count_only {
-            true => 0.0,
-            false => bm25::idf(col.scored_doc_count(), term_meta.df),
-        };
-        // Effective idf folds in the query-term-frequency `weight` (> 1
-        // only for a deduplicated repeated term) on top of any global-idf
-        // override. Every stored bound is decoded at this idf too, so the
+        // A match-only cursor never scores, so it needs neither the idf nor
+        // the bounds, both of which read the norms the length array holds.
+        // Otherwise the effective idf folds in the query-term-frequency
+        // `weight` (> 1 only for a deduplicated repeated term) on top of any
+        // global-idf override, and every stored bound is decoded at it, so the
         // bounds stay consistent with the scores computed from it.
-        let idf = global_idf.unwrap_or(local_idf) * weight as f32;
-        let bounds = BoundDecoder::new(stored, col, idf, local_idf);
+        let (idf, bounds) = match count_only {
+            true => (0.0, BoundDecoder::unscored(stored)),
+            false => {
+                let local_idf = bm25::idf(col.scored_doc_count(), term_meta.df);
+                let idf = global_idf.unwrap_or(local_idf) * weight as f32;
+                (idf, BoundDecoder::new(stored, col, idf, local_idf))
+            }
+        };
 
         // Collect straight into the `Arc` allocation: `0..num_blocks` is
         // an exact-size iterator, so this writes each entry in place —

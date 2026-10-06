@@ -26,6 +26,9 @@ use crate::superfile::{
     lazy_source::Source,
 };
 
+/// The section a column's length array is read as, in a failed read's error.
+pub(super) const LENGTH_ARRAY: &str = "fts/doc_lengths_array";
+
 /// Per-doc BM25 length normalizer, quantized to one byte per doc.
 ///
 /// The scorer needs `dl_norm_k1[doc] = K1·(1 - B + B·dl/avgdl)` for
@@ -359,6 +362,13 @@ impl ColumnNorms {
 /// The one empty table a failed read scores against, shared by every
 /// column in the process: it belongs to no column, so it is never put in a
 /// column's cell, which stays empty for the next read to fill.
+/// The norm table a merge that never scores is handed: its sink never asks
+/// for a score, so the table is never indexed, and passing this one keeps an
+/// unranked match from reading the column's length array for nothing.
+pub(super) fn unscored_norm_table() -> &'static NormTable {
+    &empty_norms().dl_norm_k1
+}
+
 fn empty_norms() -> &'static ColumnNorms {
     static EMPTY: OnceLock<ColumnNorms> = OnceLock::new();
     EMPTY.get_or_init(ColumnNorms::empty)
@@ -445,50 +455,62 @@ impl fmt::Debug for ColumnMeta {
 impl ColumnMeta {
     /// The norms at the declared parameters, reading the length array now
     /// if no scoring entry point has done so yet. The entry points prewarm
-    /// through `FtsReader::ensure_norms` on the async path; this synchronous
-    /// fallback exists so a kernel can never find the norms absent — on an
-    /// in-memory source it costs nothing, on a lazy one it is the read the
-    /// prewarm would have made. A read that fails here logs and scores
-    /// against an empty table rather than aborting mid-kernel — and leaves
-    /// the cell empty, so the next scoring entry point's prewarm reads
-    /// again rather than every later query scoring against the failure.
-    ///
-    /// The read runs outside the cell rather than inside `get_or_init`. An
-    /// initializer that fetches holds the cell's lock across the fetch, and
-    /// every other thread reaching the same cold column then parks on that
-    /// lock with no way to yield — on an `infino-io` worker that is the
-    /// runtime's own core, and the fetch that would release it is driven by
-    /// that runtime. Two threads racing here may both read the array; the
-    /// first to set wins and either is the same table, the trade the async
-    /// prewarm already makes.
+    /// through `FtsReader::ensure_norms` on the async path, which fails the
+    /// query on a read that fails; this synchronous fallback exists so a
+    /// kernel can never find the norms absent. A read that fails here logs
+    /// and scores against an empty table rather than aborting mid-kernel,
+    /// and leaves the cell empty, so the next prewarm reads again. A caller
+    /// that must not count a failure as an empty column (the commit path's
+    /// length totals) reads through [`Self::try_length_stats`] instead.
     fn base_norms(&self) -> &ColumnNorms {
         if let Some(norms) = self.base_norms.get() {
             return norms;
         }
-        let fetched = self
+        self.try_base_norms().unwrap_or_else(|error| {
+            tracing::error!(column = %self.name, %error, "doc-length array unreadable; scoring against empty norms");
+            // A racing reader may have set the cell meanwhile; its table is
+            // the real one.
+            match self.base_norms.get() {
+                Some(norms) => norms,
+                None => empty_norms(),
+            }
+        })
+    }
+
+    /// The norms at the declared parameters, reading and checking the length
+    /// array now if the cell is empty; a read that fails is returned and
+    /// leaves the cell empty.
+    ///
+    /// The read runs outside the cell rather than inside `get_or_init`. An
+    /// initializer that fetches holds the cell's lock across the fetch, and
+    /// every other thread reaching the same cold column then parks on that
+    /// lock with no way to yield: on an `infino-io` worker that is the
+    /// runtime's own core, and the fetch that would release it is driven by
+    /// that runtime. Two threads racing here may both read the array; the
+    /// first to set wins and either is the same table, the trade the async
+    /// prewarm already makes.
+    fn try_base_norms(&self) -> Result<&ColumnNorms, FtsError> {
+        if let Some(norms) = self.base_norms.get() {
+            return Ok(norms);
+        }
+        let array = self
             .source
             .get_range(self.array_with_crc_range())
-            .map_err(|e| e.to_string())
-            .and_then(|array| {
-                self.check_array_crc(&array)
-                    .map(|()| array)
-                    .map_err(|e| e.to_string())
-            });
-        match fetched {
-            Ok(array) => {
-                let norms = self.norms_from_array(&array[..self.array_len()]);
-                self.base_norms.get_or_init(|| norms)
-            }
-            Err(error) => {
-                tracing::error!(column = %self.name, %error, "doc-length array unreadable; scoring against empty norms");
-                // A racing reader may have set the cell meanwhile; its
-                // table is the real one.
-                match self.base_norms.get() {
-                    Some(norms) => norms,
-                    None => empty_norms(),
-                }
-            }
-        }
+            .map_err(|e| FtsError::RangeFetch {
+                what: LENGTH_ARRAY,
+                source: e,
+            })?;
+        self.install_norms(&array)
+    }
+
+    /// Check `array_with_crc` (the length array and its CRC, as read) and
+    /// build the declared-parameter norms from it into the cell: the one way
+    /// a read of the array becomes norms, whichever path read it. A racing
+    /// reader may have filled the cell first; either is the same table.
+    pub(super) fn install_norms(&self, array_with_crc: &[u8]) -> Result<&ColumnNorms, FtsError> {
+        self.check_array_crc(array_with_crc)?;
+        let norms = self.norms_from_array(&array_with_crc[..self.array_len()]);
+        Ok(self.base_norms.get_or_init(|| norms))
     }
 
     /// The length array's byte length, `n_docs × doc_length_bytes`: the
@@ -522,7 +544,7 @@ impl ColumnMeta {
         let expected = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
         if expected != crc32c(&array_with_crc[..len]) {
             return Err(FtsError::Read(ReadError::ChecksumMismatch {
-                section: "fts/doc_lengths_array",
+                section: LENGTH_ARRAY,
                 column: format!(" (column '{}')", self.name),
             }));
         }
@@ -587,6 +609,14 @@ impl ColumnMeta {
     /// The length statistics the norms were computed from.
     pub fn length_stats(&self) -> ColumnLengthStats {
         self.norms().length_stats
+    }
+
+    /// [`Self::length_stats`] for a caller that records them: a length array
+    /// that cannot be read is returned as the error, never counted as a
+    /// column with no tokens. The same at any parameters: rescoring keeps
+    /// the lengths.
+    pub(super) fn try_length_stats(&self) -> Result<ColumnLengthStats, FtsError> {
+        Ok(self.try_base_norms()?.length_stats)
     }
 
     /// The factor that keeps this column's stored bounds upper bounds under

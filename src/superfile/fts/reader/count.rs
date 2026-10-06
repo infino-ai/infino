@@ -301,7 +301,7 @@ impl FtsReader {
                 if cursors.len() != tokens.len() {
                     return Vec::new();
                 }
-                self.collect_and_intersect(column_id, cursors)
+                self.collect_and_intersect(cursors)
             }
             BoolMode::Or => or_merge_unranked(cursors)
                 .into_iter()
@@ -351,7 +351,7 @@ impl FtsReader {
                 if cursors.len() != tokens.len() {
                     return 0;
                 }
-                self.count_and_intersect(column_id, cursors)
+                self.count_and_intersect(cursors)
             }
             BoolMode::Or => or_count_unranked(cursors),
         });

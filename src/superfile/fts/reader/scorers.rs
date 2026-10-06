@@ -14,7 +14,7 @@ use super::{
     core::*,
     cursor::TermCursor,
     filter::ExcludeFilter,
-    metadata::NormTable,
+    metadata::{NormTable, unscored_norm_table},
     sink::{
         AndSink, CollectSink, CountSink, MustShouldSink, ScoreSink, TopKEntry, drain_top_k_desc,
         replace_worst,
@@ -940,19 +940,14 @@ impl FtsReader {
     /// the two always agree on which docs match, and an unranked count
     /// over high-frequency terms costs the same posting-list work as the
     /// ranked search minus the scoring.
-    pub(super) fn collect_and_intersect(
-        &self,
-        column_id: u32,
-        mut cursors: Vec<TermCursor>,
-    ) -> Vec<FtsDocId> {
+    pub(super) fn collect_and_intersect(&self, mut cursors: Vec<TermCursor>) -> Vec<FtsDocId> {
         if cursors.is_empty() {
             return Vec::new();
         }
-        let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1();
         cursors.sort_by_key(|c| c.block_count());
         let mut sink = CollectSink { out: Vec::new() };
-        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
+        // A collect never scores, so it needs none of the column's norms.
+        self.and_flat_merge(&mut cursors, unscored_norm_table(), &mut sink);
         sink.out
     }
 
@@ -960,7 +955,7 @@ impl FtsReader {
     /// via the same flat-merge as [`collect_and_intersect`](Self::collect_and_intersect),
     /// but through a [`CountSink`] that tallies hits instead of
     /// collecting them — no `Vec<u32>` materialized.
-    pub(super) fn count_and_intersect(&self, column_id: u32, mut cursors: Vec<TermCursor>) -> u64 {
+    pub(super) fn count_and_intersect(&self, mut cursors: Vec<TermCursor>) -> u64 {
         if cursors.is_empty() {
             return 0;
         }
@@ -991,11 +986,10 @@ impl FtsReader {
             // decode. See `count_and_intersect_membership`.
             return count_and_intersect_membership(cursors);
         }
-        let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1();
         cursors.sort_by_key(|c| c.block_count());
         let mut sink = CountSink { n: 0 };
-        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
+        // A count never scores, so it needs none of the column's norms.
+        self.and_flat_merge(&mut cursors, unscored_norm_table(), &mut sink);
         sink.n
     }
 

@@ -343,9 +343,44 @@ fn manifest_load_variant(e: &ManifestLoadError) -> fn(String) -> InfinoError {
     }
 }
 
+/// A superfile build failure, by whose it is: the caller's schema or data
+/// (`Schema`), a valid choice we do not run yet (`Unsupported`), or ours
+/// (`Backend`: an I/O or encoding failure while writing). A refused
+/// credential under any of them keeps its own class. Exhaustive on purpose,
+/// so a new variant has to be classified rather than read as the caller's.
 impl From<SuperfileBuildError> for InfinoError {
     fn from(e: SuperfileBuildError) -> Self {
-        InfinoError::Schema(e.to_string())
+        if permission_denied_in_chain(&e) {
+            return InfinoError::PermissionDenied(e.to_string());
+        }
+        let variant = match &e {
+            SuperfileBuildError::MissingIdColumn(_)
+            | SuperfileBuildError::IdColumnWrongType(..)
+            | SuperfileBuildError::IdColumnMismatch(..)
+            | SuperfileBuildError::FtsColumnMustBeLargeUtf8 { .. }
+            | SuperfileBuildError::FtsColumnTypeInvalid { .. }
+            | SuperfileBuildError::FTSSchemaMismatch(_)
+            | SuperfileBuildError::DuplicateColumnName(_)
+            | SuperfileBuildError::DuplicateLogicalName(_)
+            | SuperfileBuildError::ReservedSeparatorInColumnName(_)
+            | SuperfileBuildError::PositionOverflow { .. }
+            | SuperfileBuildError::SchemaMismatch { .. }
+            | SuperfileBuildError::ReservedPrefixInColumnName(_)
+            | SuperfileBuildError::VectorDimOutOfRange { .. }
+            | SuperfileBuildError::VectorDimMismatch { .. }
+            | SuperfileBuildError::VectorSchemaMismatch(_)
+            | SuperfileBuildError::VectorCountMismatch { .. }
+            | SuperfileBuildError::WrongRowShape { .. }
+            | SuperfileBuildError::BatchSchemaMismatch { .. }
+            | SuperfileBuildError::BatchReadError
+            | SuperfileBuildError::FtsColumnMissing(_) => InfinoError::Schema,
+            SuperfileBuildError::UnknownAnalyzer { .. } => InfinoError::Config,
+            SuperfileBuildError::VectorRerankCodecUnimplemented { .. } => InfinoError::Unsupported,
+            SuperfileBuildError::VectorReadError
+            | SuperfileBuildError::Io(_)
+            | SuperfileBuildError::Footer(_) => InfinoError::Backend,
+        };
+        variant(e.to_string())
     }
 }
 
@@ -360,19 +395,51 @@ impl From<SupertableBuildError> for InfinoError {
         if e.is_conflict() {
             return InfinoError::Conflict(e.to_string());
         }
-        // A commit that found its table dropped and purged is not a schema
-        // problem; it is the name no longer resolving. Same answer the read
-        // path gives, so a caller can match one condition, not three.
-        if matches!(e, SupertableBuildError::TableGone) {
-            return InfinoError::NotFound(e.to_string());
-        }
-        // A bad analyzer name is a configuration mistake, not a schema
-        // shape problem — surface it as the same class a bad connect
-        // option gets.
-        if matches!(e, SupertableBuildError::UnknownAnalyzer { .. }) {
-            return InfinoError::Config(e.to_string());
-        }
-        InfinoError::Schema(e.to_string())
+        // Exhaustive on purpose, so a new variant has to be classified rather
+        // than read as the caller's.
+        let message = e.to_string();
+        let variant = match e {
+            // The superfile layer classifies its own failures.
+            SupertableBuildError::Superfile(inner) => return InfinoError::from(inner),
+            // The caller's table shape, batch or parameters.
+            SupertableBuildError::NoDocsToBuild
+            | SupertableBuildError::MissingIdColumn(_)
+            | SupertableBuildError::IdColumnWrongType(..)
+            | SupertableBuildError::IdColumnReserved(_)
+            | SupertableBuildError::FtsColumnMissing { .. }
+            | SupertableBuildError::FtsColumnMustBeLargeUtf8 { .. }
+            | SupertableBuildError::FtsBm25ParamsOutOfRange { .. }
+            | SupertableBuildError::VectorColumnMissing { .. }
+            | SupertableBuildError::VectorColumnNotFixedSizeList { .. }
+            | SupertableBuildError::VectorColumnDimMismatch { .. }
+            | SupertableBuildError::VectorColumnHasNulls { .. }
+            | SupertableBuildError::VectorDimOutOfRange { .. }
+            | SupertableBuildError::DuplicateLogicalName(_)
+            | SupertableBuildError::ReservedSeparatorInColumnName(_)
+            | SupertableBuildError::ReservedPrefixInColumnName(_)
+            | SupertableBuildError::BatchSchemaMismatch
+            | SupertableBuildError::PartitionColumnMissing(_) => InfinoError::Schema,
+            // A bad analyzer name is a configuration mistake, the same class a
+            // bad connect option gets.
+            SupertableBuildError::UnknownAnalyzer { .. } => InfinoError::Config,
+            // A commit that found its table dropped and purged: the name no
+            // longer resolves, the same answer the read path gives.
+            SupertableBuildError::TableGone => InfinoError::NotFound,
+            // Decided by the checks above, named here for completeness.
+            SupertableBuildError::OverBudget(_) => InfinoError::OverBudget,
+            SupertableBuildError::PermissionDenied(_) => InfinoError::PermissionDenied,
+            SupertableBuildError::SupertableInUse | SupertableBuildError::WriteContention => {
+                InfinoError::Conflict
+            }
+            // Ours: a store, scratch file, thread pool or cache directory
+            // failing while the write ran, none of it the caller's to fix.
+            SupertableBuildError::Store(_)
+            | SupertableBuildError::ThreadPoolCreation(_)
+            | SupertableBuildError::ReadAfterCommit(_)
+            | SupertableBuildError::StorageConstruction(_)
+            | SupertableBuildError::DiskCacheRootUnwritable(_) => InfinoError::Backend,
+        };
+        variant(message)
     }
 }
 
@@ -549,6 +616,61 @@ mod tests {
             InfinoError::from(SupertableBuildError::NoDocsToBuild),
             InfinoError::Schema(_)
         ));
+    }
+
+    /// A build failure on our side (a store, scratch file or encoding step
+    /// failing while the write ran) is `Backend`, never the `Schema` a
+    /// caller's own table shape gets; a valid choice we do not run yet is
+    /// `Unsupported`, and the superfile layer's failures keep their class
+    /// through the supertable's wrapper.
+    #[test]
+    fn a_build_failure_is_classified_by_whose_it_is() {
+        let io = || SuperfileBuildError::Io(io::Error::other("disk full"));
+        let codec = || SuperfileBuildError::VectorRerankCodecUnimplemented {
+            column: "emb".into(),
+            codec: "pq",
+        };
+        let cases: [(InfinoError, fn(&InfinoError) -> bool); 8] = [
+            (
+                InfinoError::from(SupertableBuildError::Store(
+                    "term-stats write timed out".into(),
+                )),
+                |e| matches!(e, InfinoError::Backend(_)),
+            ),
+            (
+                InfinoError::from(SupertableBuildError::ThreadPoolCreation(
+                    "no threads".into(),
+                )),
+                |e| matches!(e, InfinoError::Backend(_)),
+            ),
+            (InfinoError::from(io()), |e| {
+                matches!(e, InfinoError::Backend(_))
+            }),
+            (
+                InfinoError::from(SupertableBuildError::Superfile(io())),
+                |e| matches!(e, InfinoError::Backend(_)),
+            ),
+            (InfinoError::from(codec()), |e| {
+                matches!(e, InfinoError::Unsupported(_))
+            }),
+            (
+                InfinoError::from(SupertableBuildError::Superfile(codec())),
+                |e| matches!(e, InfinoError::Unsupported(_)),
+            ),
+            (
+                InfinoError::from(SupertableBuildError::Superfile(
+                    SuperfileBuildError::MissingIdColumn("c".into()),
+                )),
+                |e| matches!(e, InfinoError::Schema(_)),
+            ),
+            (
+                InfinoError::from(SupertableBuildError::MissingIdColumn("c".into())),
+                |e| matches!(e, InfinoError::Schema(_)),
+            ),
+        ];
+        for (got, expected) in cases {
+            assert!(expected(&got), "got {got:?}");
+        }
     }
 
     #[test]

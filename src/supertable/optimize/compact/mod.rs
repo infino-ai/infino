@@ -2886,7 +2886,7 @@ mod tests {
             .expect("open reader on merged superfile");
         let fts = merged_reader.fts().expect("fts index");
         assert_eq!(
-            fts.column_length_stats("title"),
+            fts.column_length_stats("title").expect("lengths readable"),
             Some(ColumnLengthStats {
                 total_tokens: 8,
                 n_scored_docs: 3,

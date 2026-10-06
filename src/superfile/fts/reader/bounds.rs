@@ -151,6 +151,14 @@ impl BoundDecoder {
         }
     }
 
+    /// A decoder for a cursor that only counts matches and never scores: its
+    /// bounds are never compared, so it needs neither the idf nor the
+    /// column's bound scale, which on a file older than V6 is computed from
+    /// norms the count-only build must not read.
+    pub(super) fn unscored(stored: StoredBound) -> Self {
+        Self { stored, scale: 1.0 }
+    }
+
     /// The upper bound a raw slot stands for.
     #[inline]
     pub(super) fn bound(&self, raw: u32) -> f32 {

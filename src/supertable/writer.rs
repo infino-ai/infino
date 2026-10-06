@@ -109,7 +109,7 @@ use crate::{
     },
     storage::{StorageError, StorageProvider},
     superfile::{
-        BuildError as SuperfileBuildError, ReadError, SuperfileReader,
+        BuildError as SuperfileBuildError, FtsError, ReadError, SuperfileReader,
         builder::{SuperfileBuilder, VectorConfig},
         format::{
             CRC_BYTES,
@@ -2995,19 +2995,18 @@ impl PreparedSuperfile {
 /// already — the totals landed in one and not the other — and a
 /// superfile whose summary omits them silently disables table-wide
 /// statistics for the whole manifest, which is a ranking change with no
-/// error attached.
+/// error attached. For the same reason a dictionary or length array that
+/// cannot be read is an error here, never an empty summary.
 pub(crate) fn build_fts_summary(
     reader: &SuperfileReader,
     options: &SupertableOptions,
-) -> HashMap<String, FtsSummaryAgg> {
+) -> Result<HashMap<String, FtsSummaryAgg>, FtsError> {
     let mut out: HashMap<String, FtsSummaryAgg> = HashMap::new();
     let Some(fts_reader) = reader.fts() else {
-        return out;
+        return Ok(out);
     };
     for fc in &options.fts_columns {
-        let terms = fts_reader
-            .iter_column_terms(&fc.column)
-            .expect("FST bytes valid: superfile just built");
+        let terms = fts_reader.iter_column_terms(&fc.column)?;
         let n_terms_distinct = terms.len() as u32;
         let (min_term, max_term) = match (terms.first(), terms.last()) {
             (Some(min), Some(max)) => (min.clone(), max.clone()),
@@ -3017,10 +3016,6 @@ pub(crate) fn build_fts_summary(
         // than a fixed 64 KiB, which is ~1000x over-provisioned for a
         // small superfile. Readers derive the block count from the byte
         // length, so heterogeneous sizes coexist across superfiles.
-        // Recorded here so table-wide BM25 statistics are a fold over the
-        // manifest instead of a fan-out that reopens every superfile: the
-        // reader summed them during the pass it already makes over the
-        // doc-lengths array.
         let term_bloom = options.storage.is_none().then(|| {
             let mut bloom_builder = BloomBuilder::sized_for_terms(terms.len());
             for term in &terms {
@@ -3028,8 +3023,12 @@ pub(crate) fn build_fts_summary(
             }
             bloom_builder.finish()
         });
+        // Recorded here so table-wide BM25 statistics are a fold over the
+        // manifest instead of a fan-out that reopens every superfile; an
+        // unreadable length array fails the summary rather than recording
+        // zeros there.
         let length_stats = fts_reader
-            .column_length_stats(&fc.column)
+            .column_length_stats(&fc.column)?
             .expect("column just registered in this superfile's FTS index");
         out.insert(
             fc.column.clone(),
@@ -3050,7 +3049,7 @@ pub(crate) fn build_fts_summary(
             ),
         );
     }
-    out
+    Ok(out)
 }
 
 /// Spill this superfile's term-index contribution from a reader over its
@@ -3216,7 +3215,8 @@ pub(super) fn prepare_superfile_named(
         SuperfileReader::open_with(shard.bytes.clone(), inner.options.superfile_open_options())
             .map_err(|e| BuildError::Store(format!("opening superfile for summary: {e}")))?;
 
-    let fts_summary = build_fts_summary(&reader, &inner.options);
+    let fts_summary = build_fts_summary(&reader, &inner.options)
+        .map_err(|e| BuildError::Store(format!("summarizing superfile: {e}")))?;
 
     let mut vector_summary: HashMap<String, VectorSummary> = HashMap::new();
     if let Some(vec_reader) = reader.vec() {
@@ -9820,14 +9820,11 @@ pub(in crate::supertable) async fn stamp_term_stats(
                         ReadIntent::Stream,
                     )
                     .await
-                    .map_err(|e| term_stats::TermStatsError::Build(e.to_string()))
+                    .map_err(term_stats::TermStatsError::Open)
                 }
             })
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-            let reference = term_stats::write(storage.as_ref(), bytes)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+            .await?;
+            let reference = term_stats::write(storage.as_ref(), bytes).await?;
             if old.term_stats_blob() == Some(&reference) {
                 return Ok(None);
             }

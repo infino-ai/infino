@@ -29,7 +29,7 @@ use super::{
     bounds::StoredBound,
     cursor::{SubindexKind, TermCursor, TermMeta},
     filter::ExcludeFilter,
-    metadata::{ColumnLengthStats, ColumnMeta, FtsColumnConfig, OpenOptions},
+    metadata::{ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions},
     phrase::{AnyCursor, PhraseCursor},
     search::FetchedTermMemo,
     sink::{LiveFloor, TopKEntry, drain_top_k_desc},
@@ -573,13 +573,12 @@ impl FtsReader {
     }
 
     /// Open from a range source without materializing the FTS
-    /// subsection. Three open-time GETs prefetch the only regions a
-    /// reader needs before it can serve queries: the fixed header, the
-    /// FST term directory (contiguous after the header), and the
-    /// doc-length tables (the trailing region, needed to build BM25
-    /// normalization). The postings region stays lazy — each query
-    /// term's bytes are fetched on demand by [`Self::fetch_term_postings`],
-    /// mirroring how the vector reader fetches only probed clusters.
+    /// subsection. The open reads only the fixed header and the doc-length
+    /// directory, which says where each column's length array sits. The
+    /// dictionary is fetched on the first lookup that needs it, each
+    /// column's length array on its first scored use, and each query term's
+    /// postings on demand by [`Self::fetch_term_postings`], mirroring how
+    /// the vector reader fetches only probed clusters.
     pub async fn open_lazy(
         source: Arc<dyn LazyByteSource>,
         columns_json: &str,
@@ -874,13 +873,10 @@ impl FtsReader {
 
         // Read doc-lengths directory: n_columns × 16-byte entries + 4-byte CRC.
         //
-        // On the lazy open path this directory — and every per-column
-        // array fetched below — falls inside the
-        // `[doc_lengths_table_offset..fts_blob_len]` tail that
-        // `open_lazy` already fetched in one GET and installed in the
-        // overlay, so these `fetch_source_range` calls resolve from the
-        // overlay with **no** per-column GETs. On the eager path the
-        // whole subsection is in memory, so they are zero-copy slices.
+        // On the lazy open path `open_lazy` already fetched this directory
+        // and installed it in the overlay, so reading it here costs no GET.
+        // On the eager path the whole subsection is in memory, so every
+        // read below is a zero-copy slice.
         let dir_size = n_columns * DOC_LENGTHS_ENTRY_SIZE;
         let dir_end = doc_lengths_table_offset + dir_size;
         if dir_end + 4 > source_len {
@@ -931,9 +927,9 @@ impl FtsReader {
             }
 
             // Per-column doc-lengths array: 4 * n_docs bytes + 4-byte CRC.
-            // `doc_lengths_offset` lies within the prefetched doc-lengths
-            // tail, so on the lazy path this resolves from the overlay
-            // (see the directory comment above) — no per-column GET.
+            // Bounded here; read lazily on the column's first scored use,
+            // except that CRC verification reads it now to check it, which
+            // on the lazy path is one GET per column at open.
             let array_byte_len = doc_length_bytes * n_docs as usize;
             let array_end = doc_lengths_offset + array_byte_len;
             if array_end + 4 > source_len {
@@ -989,11 +985,8 @@ impl FtsReader {
                 view_norms: Arc::new(OnceLock::new()),
             };
             if opts.verify_crc {
-                let array = fetch_source_range(
-                    &source,
-                    doc_lengths_offset..array_end + 4,
-                    "fts/doc_lengths_array",
-                )?;
+                let array =
+                    fetch_source_range(&source, doc_lengths_offset..array_end + 4, LENGTH_ARRAY)?;
                 column.check_array_crc(&array)?;
             }
             columns.push(column);
@@ -1097,14 +1090,18 @@ impl FtsReader {
         self.columns.iter()
     }
 
-    /// This superfile's document-length totals for `column`, as summed
-    /// when the reader opened. `None` if `column` is not an FTS column
-    /// here. The commit path records these on the manifest so table-wide
-    /// statistics are a fold over the summaries rather than a fan-out
-    /// that reopens every superfile.
-    pub fn column_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
-        let id = self.resolve_column_id(column).ok()?;
-        Some(self.columns[id as usize].length_stats())
+    /// This superfile's document-length totals for `column`, read from its
+    /// length array (now, if no query has). `None` if `column` is not an FTS
+    /// column here. The commit path records these on the manifest so
+    /// table-wide statistics are a fold over the summaries rather than a
+    /// fan-out that reopens every superfile, so an array that cannot be read
+    /// is an error, not a column with no tokens: a zero recorded there would
+    /// skew every query's statistics for as long as the superfile lives.
+    pub fn column_length_stats(&self, column: &str) -> Result<Option<ColumnLengthStats>, FtsError> {
+        let Ok(id) = self.resolve_column_id(column) else {
+            return Ok(None);
+        };
+        self.columns[id as usize].try_length_stats().map(Some)
     }
 
     test_visible! {
@@ -1190,13 +1187,10 @@ impl FtsReader {
             .range_async(col.array_with_crc_range())
             .await
             .map_err(|e| FtsError::RangeFetch {
-                what: "fts/doc_lengths_array",
+                what: LENGTH_ARRAY,
                 source: e,
             })?;
-        col.check_array_crc(&array)?;
-        let norms = col.norms_from_array(&array[..col.array_len()]);
-        // A concurrent prewarm may have won; either set is the same table.
-        let _ = col.base_norms.set(norms);
+        col.install_norms(&array)?;
         Ok(())
     }
 
@@ -4234,8 +4228,8 @@ mod tests {
     #[tokio::test]
     async fn open_lazy_round_trips_a_search() {
         // Wrap the eager blob in a whole-blob lazy source so the lazy
-        // open path (header + FST + doc-length tail prefetch) runs and
-        // serves a real query.
+        // open path (header and length directory, everything else on
+        // first use) runs and serves a real query.
         let (blob, json) = build_blob();
         let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob));
         let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
@@ -4437,27 +4431,111 @@ mod tests {
         }
     }
 
-    /// A length-array read that fails in the synchronous fallback scores
-    /// that call against the empty table and leaves the column's cell
-    /// empty, so the next read fills it: the failure is not what every
-    /// later query on the reader scores against.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_failed_fallback_read_of_the_norms_is_not_cached() {
+    /// A lazy reader over the test blob whose next read of the length array
+    /// fails once, armed after the open so that read is the first after it;
+    /// with the eager reader's length totals for `body`, the real ones.
+    async fn lazy_reader_failing_once_on_the_length_array() -> (FtsReader, Option<ColumnLengthStats>)
+    {
         let (blob, json) = build_blob();
         let eager = FtsReader::open(blob.clone(), &json).expect("eager open");
-        let lengths = eager.columns[0].doc_lengths_range.clone();
+        let real = eager.column_length_stats("body").expect("eager lengths");
         let source = Arc::new(FailingOnceSource {
             inner: BytesLazyByteSource::new(blob),
-            region: lengths,
+            region: eager.columns[0].doc_lengths_range.clone(),
             armed: AtomicBool::new(false),
         });
         let src: Arc<dyn LazyByteSource> = source.clone();
         let reader = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
             .await
             .expect("open_lazy");
-        // Armed after the open, so the first read of the array is the
-        // fallback's.
         source.armed.store(true, Ordering::SeqCst);
+        (reader, real)
+    }
+
+    /// The commit path records a column's length totals on the manifest, so a
+    /// length array that cannot be read is an error there, never a column with
+    /// no tokens; and like the scoring fallback, it is not cached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_length_array_is_an_error_not_empty_length_stats() {
+        let (reader, real) = lazy_reader_failing_once_on_the_length_array().await;
+        let err = reader
+            .column_length_stats("body")
+            .expect_err("an unreadable length array must not count as empty");
+        assert!(
+            matches!(
+                err,
+                FtsError::RangeFetch {
+                    what: "fts/doc_lengths_array",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            !reader.columns[0].norms_loaded(),
+            "the failure is not cached"
+        );
+        assert_eq!(
+            reader.column_length_stats("body").expect("the next read"),
+            real,
+            "the next read gets the real totals"
+        );
+    }
+
+    /// An unranked match (the matching rows, or their count, under OR or AND)
+    /// never scores, so it must not read the length array, even on a file
+    /// older than V6, whose bound scale is computed from the norms that array
+    /// holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unranked_match_never_reads_the_length_array() {
+        let (blob, json) = versioned_blob(BlobEra::V2ToV4);
+        let terms = ["common", "shared"];
+        let eager = FtsReader::open(blob.clone(), json).expect("eager open");
+        let source = Arc::new(FailingOnceSource {
+            inner: BytesLazyByteSource::new(blob),
+            region: eager.columns[0].doc_lengths_range.clone(),
+            armed: AtomicBool::new(false),
+        });
+        let src: Arc<dyn LazyByteSource> = source.clone();
+        let reader = FtsReader::open_lazy(src, json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        source.armed.store(true, Ordering::SeqCst);
+
+        for mode in [BoolMode::Or, BoolMode::And] {
+            let (want, _) = eager
+                .token_match("body", &terms, mode)
+                .await
+                .expect("eager");
+            let (got, _) = reader
+                .token_match("body", &terms, mode)
+                .await
+                .expect("match");
+            assert_eq!(got, want, "{mode:?} rows");
+            let (want, _) = eager
+                .token_match_count("body", &terms, mode)
+                .await
+                .expect("eager count");
+            let (got, _) = reader
+                .token_match_count("body", &terms, mode)
+                .await
+                .expect("count");
+            assert_eq!(got, want, "{mode:?} count");
+        }
+        assert!(
+            source.armed.load(Ordering::SeqCst),
+            "an unranked match must not read the length array"
+        );
+        assert!(!reader.columns[0].norms_loaded());
+    }
+
+    /// A length-array read that fails in the synchronous fallback scores
+    /// that call against the empty table and leaves the column's cell
+    /// empty, so the next read fills it: the failure is not what every
+    /// later query on the reader scores against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_fallback_read_of_the_norms_is_not_cached() {
+        let (reader, _) = lazy_reader_failing_once_on_the_length_array().await;
         let column = &reader.columns[0];
 
         // The fallback survives the failure without publishing it.
