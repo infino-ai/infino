@@ -827,6 +827,32 @@ mod tests {
     }
 
     #[test]
+    fn encoded_len_matches_the_finished_bytes() {
+        // Empty, one term, mid-block, one short of a block, exactly on a
+        // block boundary, one past it, and several blocks in. Guards the
+        // estimate against drifting from the layout `finish` writes.
+        for n in [
+            0usize,
+            1,
+            TERM_BLOCK_SIZE / 2,
+            TERM_BLOCK_SIZE - 1,
+            TERM_BLOCK_SIZE,
+            TERM_BLOCK_SIZE + 1,
+            2 * TERM_BLOCK_SIZE,
+            5 * TERM_BLOCK_SIZE + 7,
+        ] {
+            let items = entries(n as u32);
+            let mut w = TermBlockWriter::new(Vec::new());
+            for (k, v) in &items {
+                w.insert_sorted(k, *v).expect("vec sink");
+            }
+            let estimate = w.encoded_len();
+            let bytes = w.finish().expect("vec sink");
+            assert_eq!(estimate, bytes.len(), "n={n}");
+        }
+    }
+
+    #[test]
     fn term_blocks_are_smaller_than_the_fst_for_the_same_terms() {
         let items = entries(20_000);
         // The FST arm has no short form; compare against long-form entries.

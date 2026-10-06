@@ -698,6 +698,13 @@ impl TermIndex {
             }
             wanted.push((i, hashes));
         }
+        if wanted.is_empty() {
+            // Every term was resident: nothing to fetch, decode or cache.
+            return Ok(out
+                .into_iter()
+                .map(|run| run.expect("every term was resident"))
+                .collect());
+        }
         let keys = &keys;
         let mut decoded: HashMap<(usize, ContentHash), Vec<Posting>> = stream::iter(by_slice)
             .map(|(hash, terms_here)| async move {
