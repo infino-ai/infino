@@ -752,7 +752,7 @@ mod tests {
     use crate::superfile::fts::{
         builder::FtsBuilder,
         posting::{self, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
-        tokenize::AsciiLowerTokenizer,
+        tokenize::StandardTokenizer,
     };
 
     #[tokio::test]
@@ -854,7 +854,7 @@ mod tests {
         // length) is the reference. Tied to OR_WINDOW so it keeps crossing
         // the boundary if the window size changes.
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -871,7 +871,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         let shapes: &[&[&str]] = &[
@@ -921,7 +921,7 @@ mod tests {
         // reference from either count kernel.
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
         const RARE_STRIDE: u32 = 371; // sparse ⇒ below the density gate
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -941,7 +941,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         let shapes: &[&[&str]] = &[
@@ -990,7 +990,7 @@ mod tests {
         const DENSE_END: u32 = 256; // docs 0..256 hold `mix` every doc → BITSET
         const SPARSE_STRIDE: u32 = 30; // docs after that every 30th → PACKED
         const N_DOCS: u32 = 4200;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -1009,7 +1009,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         // Prove `mix` really has both encodings — else the test silently checks
@@ -1077,7 +1077,7 @@ mod tests {
         // union (`or_cursor_into_bitset` inline branch). All cross-checked
         // against `token_match`'s independent flat-merge length.
         const N_DOCS: u32 = 4096; // max doc id 4095
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -1100,7 +1100,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         // Pin the gate arithmetic: `gatehi` lands on/above the switch, `gatelo`
@@ -1194,7 +1194,7 @@ mod tests {
         const RARE_STRIDE: u32 = 250; // rare term hits ~1/250 docs
         const RAREB_STRIDE: u32 = 400;
         const HOLE_STRIDE: u32 = 300; // docs missing the dominant term
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -1218,7 +1218,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         // `common` alone is far more than 4× `rare` + `rareb` combined, so
@@ -1304,7 +1304,7 @@ mod tests {
     #[tokio::test]
     async fn a_column_with_no_scored_documents_walks_without_scoring() {
         const N_DOCS: u32 = 8;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("filled".into(), false).expect("register");
         b.register_column("empty".into(), false).expect("register");
@@ -1315,7 +1315,8 @@ mod tests {
             b.add_doc(1, i, "").expect("add empty");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"filled","tokenizer":"ascii_lower"},{"name":"empty","tokenizer":"ascii_lower"}]"#;
+        let json =
+            r#"[{"name":"filled","tokenizer":"standard"},{"name":"empty","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let fst_bytes = r.dict_bytes_async().await.expect("dict");
 
@@ -1343,7 +1344,7 @@ mod tests {
     async fn facts_from_the_walk_match_facts_from_lookups() {
         const N_DOCS: u32 = 600;
         const CHUNK: usize = 5;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("pos".into(), true).expect("register");
         b.register_column("flat".into(), false).expect("register");
@@ -1359,7 +1360,7 @@ mod tests {
             b.add_doc(1, i, &text).expect("add flat");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"pos","tokenizer":"ascii_lower","positions":true},{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"pos","tokenizer":"standard","positions":true},{"name":"flat","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let fst_bytes = r.dict_bytes_async().await.expect("dict");
         for column in ["pos", "flat"] {

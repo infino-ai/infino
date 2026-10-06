@@ -849,7 +849,7 @@ mod tests {
         bm25,
         builder::{BlobEra, FtsBuilder},
         reader::FtsReader,
-        tokenize::AsciiLowerTokenizer,
+        tokenize::StandardTokenizer,
     };
 
     // ── Column length totals ──────────────────────────────────────────
@@ -908,7 +908,7 @@ mod tests {
     /// Two documents of two tokens each, then rows this column is null
     /// for: four tokens over two documents, eight rows.
     fn sparse_builder(era: BlobEra) -> FtsBuilder {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.era = era;
         b.register_column("body".into(), false).expect("register");
         b.add_doc(0, 0, "alpha beta").expect("doc 0");
@@ -921,7 +921,7 @@ mod tests {
     }
 
     fn sparse_reader() -> FtsReader {
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         FtsReader::open(
             Bytes::from(sparse_builder(BlobEra::V6).finish().expect("finish")),
             json,
@@ -999,7 +999,7 @@ mod tests {
         // the scores they exist to cap and owe the supremum factor —
         // on top of the `(k1 + 1)` those files carry. If this regresses,
         // block-max pruning silently drops documents from the top-k.
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         for era in [BlobEra::V5, BlobEra::V2ToV4] {
             let blob = Bytes::from(sparse_builder(era).finish().expect("finish"));
             let r = FtsReader::open(blob, json).expect("open");
@@ -1062,12 +1062,12 @@ mod tests {
         // Every row null: no document carries a token, so there is no
         // average to normalize against and the table stays empty rather
         // than dividing by zero.
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         for row in 0..4 {
             b.add_doc(0, row, "").expect("null row");
         }
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let col = &r.columns[0];
         assert_eq!(col.length_stats().n_scored_docs, 0);
@@ -1138,7 +1138,7 @@ mod tests {
         // 4-byte-per-doc `f32` table it replaced. Build enough
         // varied-length docs that the per-doc term dominates the LUT.
         const N: u32 = 5_000;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false)
             .expect("register column");
@@ -1150,7 +1150,7 @@ mod tests {
             b.add_doc(0, d, text.trim()).expect("add doc");
         }
         let bytes = b.finish().expect("finish");
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
         let nt = r.columns[0].dl_norm_k1();
 

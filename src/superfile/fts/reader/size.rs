@@ -557,7 +557,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
+    use crate::superfile::fts::{builder::FtsBuilder, tokenize::StandardTokenizer};
 
     #[test]
     fn patched_form_is_granted_only_under_the_posting_cap() {
@@ -566,7 +566,7 @@ mod tests {
         // carry one large delta among small ones, exactly the shape the
         // patched form is for. `rare` sits under the cap and takes it;
         // `common` is over it and stays plain, the histograms tally.
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("text".into(), false).expect("register");
         for i in 0..24_000u32 {
             let in_hole = i % 4_000 >= 3_000;
@@ -582,7 +582,7 @@ mod tests {
             }
             b.add_doc(0, i, &text).expect("doc");
         }
-        let json = r#"[{"name":"text","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"text","tokenizer":"standard"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let s = r.size_breakdown().expect("breakdown");
         let c = &s.columns[0];
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn every_postings_byte_is_attributed_and_forms_are_told_apart() {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), true).expect("register");
         // `only` inlines (df=1, tf=1); `pair` is short (df=2); `every`
         // spans two blocks (long form).
@@ -642,7 +642,7 @@ mod tests {
             };
             b.add_doc(0, i, text).expect("doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let s = r.size_breakdown().expect("breakdown");
         assert_eq!(s.columns.len(), 1);

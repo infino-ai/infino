@@ -760,7 +760,7 @@ mod tests {
         fts::{
             builder::FtsBuilder,
             reader::{FtsReader, core::ClauseLists},
-            tokenize::{AsciiLowerTokenizer, Phrase},
+            tokenize::{Phrase, StandardTokenizer},
         },
         id_space::FtsDocId,
     };
@@ -781,10 +781,10 @@ mod tests {
         use std::sync::Arc;
 
         use crate::superfile::fts::{
-            builder::FtsBuilder, reader::cursor::SubindexKind, tokenize::AsciiLowerTokenizer,
+            builder::FtsBuilder, reader::cursor::SubindexKind, tokenize::StandardTokenizer,
         };
         let n_docs = 300u32;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("title".into(), true).expect("register");
         for i in 0..n_docs {
             let text = format!(
@@ -794,7 +794,7 @@ mod tests {
             );
             b.add_doc(0, i, &text).expect("doc");
         }
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         assert!(r.positions_grouped);
         assert_eq!(r.subindex, SubindexKind::None);
@@ -845,10 +845,10 @@ mod tests {
         use std::sync::Arc;
 
         use crate::superfile::fts::{
-            builder::FtsBuilder, posting::BLOCK_LEN, tokenize::AsciiLowerTokenizer,
+            builder::FtsBuilder, posting::BLOCK_LEN, tokenize::StandardTokenizer,
         };
         const N_DOCS: u32 = 200;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("title".into(), true).expect("register");
         for d in 0..N_DOCS {
             let alpha: Vec<u32> = match d < BLOCK_LEN as u32 {
@@ -868,7 +868,7 @@ mod tests {
             }
         }
         b.append_prebuilt_doc_lengths(0, &vec![(1 << 20) + 8; N_DOCS as usize]);
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
 
         let hits = r
@@ -917,10 +917,10 @@ mod tests {
         use std::sync::Arc;
 
         use crate::superfile::fts::{
-            builder::FtsBuilder, posting::BLOCK_LEN, tokenize::AsciiLowerTokenizer,
+            builder::FtsBuilder, posting::BLOCK_LEN, tokenize::StandardTokenizer,
         };
         const N_DOCS: u32 = BLOCK_LEN as u32 * 40;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("title".into(), true).expect("register");
         for d in 0..N_DOCS {
             let hot = (d / (8 * BLOCK_LEN as u32)).is_multiple_of(5);
@@ -932,7 +932,7 @@ mod tests {
             };
             b.add_doc(0, d, text).expect("add doc");
         }
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let phrases = phrase(&["the", "movement"]);
         let clauses = || ClauseLists {
@@ -985,10 +985,10 @@ mod tests {
         use rand::{RngExt, SeedableRng, rngs::StdRng};
 
         use crate::superfile::fts::{
-            bm25, builder::FtsBuilder, posting::BLOCK_LEN, tokenize::AsciiLowerTokenizer,
+            bm25, builder::FtsBuilder, posting::BLOCK_LEN, tokenize::StandardTokenizer,
         };
         const N_DOCS: u32 = BLOCK_LEN as u32 * 60;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("title".into(), true).expect("register");
         for d in 0..N_DOCS {
             let text = match (d % 53, d % 2, d % 3) {
@@ -1000,7 +1000,7 @@ mod tests {
             };
             b.add_doc(0, d, text).expect("add doc");
         }
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let phrases = phrase(&["the", "mid", "rare"]);
         let build = || async {
@@ -1111,11 +1111,11 @@ mod tests {
     async fn a_block_with_very_long_runs_verifies_phrases() {
         use std::sync::Arc;
 
-        use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
+        use crate::superfile::fts::{builder::FtsBuilder, tokenize::StandardTokenizer};
         const N_DOCS: u32 = 129;
         const TF: u32 = 600;
         const OUTLIER_GAP: u32 = 1 << 25;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("title".into(), true).expect("register");
         let alpha: Vec<u32> = (0..TF)
             .map(|j| match j + 1 == TF {
@@ -1131,7 +1131,7 @@ mod tests {
                 .expect("filler");
         }
         b.append_prebuilt_doc_lengths(0, &vec![2 * TF + OUTLIER_GAP; N_DOCS as usize]);
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
 
         let phrases = phrase(&["alpha", "filler"]);
@@ -1296,7 +1296,7 @@ mod tests {
         b.add_doc(0, 0, "new york").expect("add doc");
         let blob = Bytes::from(b.finish().expect("finish"));
         let r =
-            FtsReader::open(blob, r#"[{"name":"title","tokenizer":"ascii_lower"}]"#).expect("open");
+            FtsReader::open(blob, r#"[{"name":"title","tokenizer":"standard"}]"#).expect("open");
         let phrases = phrase(&["new", "york"]);
         let err = r
             .search_excluding(
@@ -1337,12 +1337,12 @@ mod tests {
     }
 
     fn open_positional(docs: impl Iterator<Item = String>) -> FtsReader {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("title".into(), true).expect("register");
         for (i, text) in docs.enumerate() {
             b.add_doc(0, i as u32, &text).expect("add doc");
         }
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 

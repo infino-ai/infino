@@ -2369,7 +2369,7 @@ mod tests {
             bm25,
             builder::{BlobEra, FtsBuilder},
             reader::BoolMode,
-            tokenize::AsciiLowerTokenizer,
+            tokenize::{AsciiLowerTokenizer, StandardTokenizer},
         },
     };
 
@@ -2380,7 +2380,7 @@ mod tests {
     /// blob carries a real skip table (and, when coarse is on, a coarse
     /// table) rather than a single degenerate block.
     fn versioned_blob(era: BlobEra) -> (Bytes, &'static str) {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.era = era;
         b.register_column("body".into(), false).expect("register");
         for doc in 0..600u32 {
@@ -2393,7 +2393,7 @@ mod tests {
         }
         (
             Bytes::from(b.finish().expect("finish")),
-            r#"[{"name":"body","tokenizer":"ascii_lower"}]"#,
+            r#"[{"name":"body","tokenizer":"standard"}]"#,
         )
     }
 
@@ -2542,7 +2542,7 @@ mod tests {
             "dense: declared == over documents"
         );
 
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         b.add_doc(0, 0, "alpha beta gamma").expect("doc");
         b.add_doc(0, 1, "").expect("null row");
@@ -2559,7 +2559,7 @@ mod tests {
     /// row null when `sparse`, so block-max pruning is live at small `k`
     /// and the corrected collection size and average both matter.
     fn tied_corpus(era: BlobEra, sparse: bool) -> (Bytes, &'static str) {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.era = era;
         b.register_column("body".into(), false).expect("register");
         let mut next = 0u32;
@@ -2579,7 +2579,7 @@ mod tests {
         }
         (
             Bytes::from(b.finish().expect("finish")),
-            r#"[{"name":"body","tokenizer":"ascii_lower"}]"#,
+            r#"[{"name":"body","tokenizer":"standard"}]"#,
         )
     }
 
@@ -2617,9 +2617,9 @@ mod tests {
             t.trim().to_string()
         }
 
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
 
-        let mut plain = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut plain = FtsBuilder::new(Arc::new(StandardTokenizer));
         plain
             .register_column("body".into(), false)
             .expect("register");
@@ -2646,7 +2646,7 @@ mod tests {
             "and must move something"
         );
 
-        let mut reordered = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut reordered = FtsBuilder::new(Arc::new(StandardTokenizer));
         reordered
             .register_column("body".into(), false)
             .expect("register");
@@ -2730,8 +2730,8 @@ mod tests {
     #[tokio::test]
     async fn a_damaged_doc_map_is_refused_at_open() {
         const N_DOCS: u32 = 300;
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         for row in 0..N_DOCS {
             b.add_doc(0, row, &format!("alpha t{}", row % 17))
@@ -2813,7 +2813,7 @@ mod tests {
     fn a_doc_map_on_a_legacy_era_is_refused_rather_than_mislabelled() {
         const N_DOCS: u32 = 64;
         for era in [BlobEra::V6, BlobEra::V5, BlobEra::V2ToV4] {
-            let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
             b.register_column("body".into(), false).expect("register");
             for row in 0..N_DOCS {
                 b.add_doc(0, row, &format!("alpha t{}", row % 7))
@@ -2840,7 +2840,7 @@ mod tests {
     /// is the one where a bug is invisible to a parity test.
     #[tokio::test]
     async fn a_doc_map_round_trips_for_any_permutation() {
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         for (n_docs, seed) in [(1u32, 1u64), (2, 2), (7, 3), (128, 4), (129, 5), (513, 6)] {
             let mut rng = StdRng::seed_from_u64(seed);
             // Fisher-Yates, so every size gets a genuine permutation
@@ -2851,7 +2851,7 @@ mod tests {
             }
             let text = |row: u32| format!("alpha t{} p{}", row % 11, row % 5);
 
-            let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
             b.register_column("body".into(), false).expect("register");
             for (id, &row) in map.iter().enumerate() {
                 b.add_doc(0, id as u32, &text(row)).expect("add doc");
@@ -2917,11 +2917,11 @@ mod tests {
     async fn a_sliced_range_union_over_a_reordered_blob_equals_the_unsliced_search() {
         const N_DOCS: u32 = 600;
         const STRIDE: u32 = 137;
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let text = |row: u32| format!("alpha beta t{} t{}", row % 23, row % 31);
 
         let map: Vec<u32> = (0..N_DOCS).map(|id| (id * STRIDE) % N_DOCS).collect();
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         for (id, &row) in map.iter().enumerate() {
             b.add_doc(0, id as u32, &text(row)).expect("add doc");
@@ -3073,8 +3073,8 @@ mod tests {
         // enters normalization is the truthful one, and the run is no
         // longer the "shortest document in the corpus".
         let run = "a".repeat(511);
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         b.add_doc(0, 0, &run).expect("doc 0");
         b.add_doc(0, 1, &format!("{run} b")).expect("doc 1");
@@ -3192,14 +3192,14 @@ mod tests {
         use std::collections::BTreeMap;
         // doc 0 "a b a", doc 1 "b a c". "a"/"b" are df=2 (PFOR path); "c" is
         // df=1 (inline path). Positions are token offsets within each doc.
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), true)
             .expect("register positional column");
         b.add_doc(0, 0, "a b a").expect("add doc 0");
         b.add_doc(0, 1, "b a c").expect("add doc 1");
         let bytes = b.finish().expect("finish");
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","positions":true}]"#;
         let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
 
         let mut got: BTreeMap<Vec<u8>, Vec<(u32, u32, Vec<u32>)>> = BTreeMap::new();
@@ -3235,7 +3235,7 @@ mod tests {
     #[test]
     fn for_each_term_doc_matches_the_full_walk_and_skips_terms() {
         const N_DOCS: u32 = 700;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("pos".into(), true).expect("register");
         b.register_column("flat".into(), false).expect("register");
@@ -3253,7 +3253,7 @@ mod tests {
             b.add_doc(1, i, &text).expect("add flat");
         }
         let bytes = b.finish().expect("finish");
-        let json = r#"[{"name":"pos","tokenizer":"ascii_lower","positions":true},{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"pos","tokenizer":"standard","positions":true},{"name":"flat","tokenizer":"standard"}]"#;
         let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
         for column_id in 0..2 {
             let mut full: Vec<(Vec<u8>, u32)> = Vec::new();
@@ -3296,10 +3296,10 @@ mod tests {
     #[test]
     fn add_prebuilt_term_posting_round_trips_read_to_write() {
         use std::collections::BTreeMap;
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","positions":true}]"#;
 
         // Build A from text.
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut a = FtsBuilder::new(tok.clone());
         a.register_column("body".into(), true).expect("register a");
         a.add_doc(0, 0, "a b a").expect("a doc 0");
@@ -3343,9 +3343,9 @@ mod tests {
     #[test]
     fn add_prebuilt_term_posting_spilled_round_trips() {
         use std::collections::BTreeMap;
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","positions":true}]"#;
 
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut a = FtsBuilder::new(tok.clone());
         a.register_column("body".into(), true).expect("register a");
         a.add_doc(0, 0, "a b c a").expect("a doc 0");
@@ -3394,12 +3394,12 @@ mod tests {
     /// length, so the block skip cannot drop it).
     #[tokio::test]
     async fn doc_lengths_store_in_two_bytes_and_saturate() {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         let long = "tok ".repeat(70_000);
         b.add_doc(0, 0, &long).expect("long doc");
         b.add_doc(0, 1, "tok tok tok").expect("short doc");
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         assert_eq!(r.doc_length_bytes, format::fts::DOC_LENGTH_BYTES_V7);
         assert_eq!(
@@ -3421,12 +3421,12 @@ mod tests {
 
     #[test]
     fn read_doc_lengths_returns_token_counts() {
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         b.add_doc(0, 0, "a b a").expect("doc 0"); // 3 tokens
         b.add_doc(0, 1, "b a c d").expect("doc 1"); // 4 tokens
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         assert_eq!(r.read_doc_lengths(0).expect("doc lengths"), vec![3, 4]);
     }
@@ -3436,18 +3436,18 @@ mod tests {
         // A column whose entry records a non-standard pair: the reader
         // must score with what the file says, never with the crate
         // default, because the stored bounds were baked at that pair.
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column_with_tokenizer(
             "body".into(),
             false,
-            Arc::new(AsciiLowerTokenizer),
+            Arc::new(StandardTokenizer),
             bm25::Bm25Params::new(1.4, 0.6),
         )
         .expect("register");
         b.add_doc(0, 0, "a b a").expect("doc 0");
         b.add_doc(0, 1, "b a c d").expect("doc 1");
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower","k1":1.4,"b":0.6}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.4,"b":0.6}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         assert_eq!(r.columns[0].params, bm25::Bm25Params::new(1.4, 0.6));
         assert_ne!(r.columns[0].params, bm25::Bm25Params::STANDARD);
@@ -3459,11 +3459,11 @@ mod tests {
         // recordable can only have been built with the standard values,
         // so absence has exactly one meaning and must not track a later
         // change to what the API recommends.
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         b.add_doc(0, 0, "a b a").expect("doc 0");
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         assert_eq!(r.columns[0].params, bm25::Bm25Params::STANDARD);
         assert_eq!(r.columns[0].params.k1, bm25::K1);
@@ -3477,11 +3477,11 @@ mod tests {
         // same corpus at different pairs must therefore disagree on the
         // norm and agree on nothing else being different.
         let build = |params: bm25::Bm25Params| {
-            let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
             b.register_column_with_tokenizer(
                 "body".into(),
                 false,
-                Arc::new(AsciiLowerTokenizer),
+                Arc::new(StandardTokenizer),
                 params,
             )
             .expect("register");
@@ -3490,8 +3490,8 @@ mod tests {
             b.finish().expect("finish")
         };
 
-        let std_json = r#"[{"name":"body","tokenizer":"ascii_lower","k1":1.2,"b":0.75}]"#;
-        let alt_json = r#"[{"name":"body","tokenizer":"ascii_lower","k1":1.4,"b":0.6}]"#;
+        let std_json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let alt_json = r#"[{"name":"body","tokenizer":"standard","k1":1.4,"b":0.6}]"#;
         let std_reader = FtsReader::open(Bytes::from(build(bm25::Bm25Params::STANDARD)), std_json)
             .expect("open standard");
         let alt_reader = FtsReader::open(
@@ -3516,14 +3516,14 @@ mod tests {
 
     #[test]
     fn bound_scale_is_one_for_the_same_pair_and_above_one_otherwise() {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         for d in 0..64u32 {
             let words = (d % 30) + 1;
             let text: String = (0..words).map(|w| format!("t{w} ")).collect();
             b.add_doc(0, d, text.trim()).expect("add doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let col = &r.columns[0];
         let baked = col.params;
@@ -3551,14 +3551,14 @@ mod tests {
         // the column, R * score_at(baked) >= score_at(query). Checked
         // against the closed form over the corpus's own length range
         // rather than a hand-picked case.
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         for d in 0..128u32 {
             let words = (d % 50) + 1;
             let text: String = (0..words).map(|w| format!("t{w} ")).collect();
             b.add_doc(0, d, text.trim()).expect("add doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let col = &r.columns[0];
         let baked = col.params;
@@ -3616,11 +3616,11 @@ mod tests {
             .collect();
 
         let build = |params: bm25::Bm25Params| {
-            let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
             b.register_column_with_tokenizer(
                 "body".into(),
                 false,
-                Arc::new(AsciiLowerTokenizer),
+                Arc::new(StandardTokenizer),
                 params,
             )
             .expect("register");
@@ -3632,9 +3632,9 @@ mod tests {
 
         for (k1, b_param) in [(1.4_f32, 0.6_f32), (0.5, 0.9), (2.0, 0.2), (1.2, 0.0)] {
             let params = bm25::Bm25Params::new(k1, b_param);
-            let json_std = r#"[{"name":"body","tokenizer":"ascii_lower","k1":1.2,"b":0.75}]"#;
+            let json_std = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
             let json_alt = format!(
-                r#"[{{"name":"body","tokenizer":"ascii_lower","k1":{k1:?},"b":{b_param:?}}}]"#
+                r#"[{{"name":"body","tokenizer":"standard","k1":{k1:?},"b":{b_param:?}}}]"#
             );
 
             let baked_standard =
@@ -3685,10 +3685,10 @@ mod tests {
     /// no rescaled table, no correction factor.
     #[test]
     fn an_override_matching_the_declared_pair_changes_nothing() {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         b.add_doc(0, 0, "a b a").expect("doc 0");
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let same = r.with_bm25_override(bm25::Bm25Params::STANDARD);
         assert_eq!(same.columns[0].bound_scale(), 1.0);
@@ -3715,7 +3715,8 @@ mod tests {
     fn open_rejects_columns_json_mismatch() {
         let (blob, _) = build_blob();
         // Header says n_columns=1; pass a 2-column JSON.
-        let bad_json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower"}]"#;
+        let bad_json =
+            r#"[{"name":"body","tokenizer":"standard"},{"name":"title","tokenizer":"standard"}]"#;
         let err = FtsReader::open(blob, bad_json).expect_err("expected error");
         assert!(matches!(err, FtsError::Read(ReadError::Malformed(_))));
     }
@@ -3751,7 +3752,7 @@ mod tests {
         // A blob with only df=1 terms should produce a much smaller
         // postings region than a blob with the same term count but
         // df ≥ 2 — the inline form writes nothing for df=1.
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
 
         let mut b_inline = FtsBuilder::new(tok.clone());
         b_inline
@@ -4181,8 +4182,8 @@ mod tests {
     #[tokio::test]
     async fn open_lazy_serves_a_reordered_blob_from_an_async_only_source() {
         const N_DOCS: u32 = 400;
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         // Fed in reverse, with the map that puts each document back.
         let map: Vec<u32> = (0..N_DOCS).rev().collect();

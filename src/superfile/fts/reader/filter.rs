@@ -196,7 +196,7 @@ mod tests {
         builder::FtsBuilder,
         posting::BLOCK_LEN,
         reader::FtsReader,
-        tokenize::{AsciiLowerTokenizer, Phrase},
+        tokenize::{Phrase, StandardTokenizer},
     };
 
     // ── ExcludeFilter (negation gate) ─────────────────────────────────
@@ -332,13 +332,13 @@ mod tests {
     /// `pos` in every row: `neg`'s list is 500 postings, four blocks
     /// with a partial last one.
     fn edge_reader() -> FtsReader {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         for doc in 0..EDGE_DOCS {
             let text = if doc % 2 == 0 { "pos neg" } else { "pos" };
             b.add_doc(0, doc, text).expect("add doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 
@@ -346,7 +346,7 @@ mod tests {
     /// in order except every `REVERSED_EVERY`th row, which holds them
     /// reversed.
     fn phrase_edge_reader() -> FtsReader {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), true).expect("register");
         for doc in 0..EDGE_DOCS {
             let text = if doc % REVERSED_EVERY == 0 {
@@ -356,7 +356,7 @@ mod tests {
             };
             b.add_doc(0, doc, text).expect("add doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","positions":true}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 

@@ -196,9 +196,7 @@ pub fn decimal128_id_field(name: &str) -> Field {
 }
 
 /// The engine's default tokenizer, for tests + benches:
-/// `StandardTokenizer` wrapped in `Arc<dyn Tokenizer>`. A fixture that
-/// exercises ASCII-only tokenization names `AsciiLowerTokenizer`
-/// itself rather than relying on this.
+/// `StandardTokenizer` wrapped in `Arc<dyn Tokenizer>`.
 ///
 /// Callers passing this into `BuilderOptions::new` wrap in
 /// `Some(...)` at the call site:

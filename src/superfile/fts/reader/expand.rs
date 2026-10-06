@@ -931,6 +931,10 @@ mod tests {
     /// Generous cap so a test never trips the too-many fallback by accident.
     const MAX_TERMS: usize = 64;
 
+    /// A `body` column analyzed by `standard` plus the English stemmer.
+    const STEMMED_BODY_JSON: &str =
+        r#"[{"name":"body","tokenizer":"standard","stemmer":"english"}]"#;
+
     fn expand_all(
         r: &FtsReader,
         patterns: &[TermPattern<'_>],
@@ -1392,12 +1396,12 @@ mod tests {
 
     #[test]
     fn contains_rows_refuses_a_column_indexed_by_another_analyzer() {
-        let (blob, json) = build_blob();
-        let r = FtsReader::open(blob, &json).expect("open");
+        let (blob, _) = build_blob();
+        let r = FtsReader::open(blob, STEMMED_BODY_JSON).expect("open");
         let rt = Runtime::new().expect("runtime");
         let err = rt
             .block_on(r.contains_rows("body", &["rust"], None, None))
-            .expect_err("ascii_lower column");
+            .expect_err("stemmed column");
         assert!(matches!(err, FtsError::ExactNeedsStandard { .. }), "{err}");
         let err = rt
             .block_on(r.contains_rows("nope", &["rust"], None, None))

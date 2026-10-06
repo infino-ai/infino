@@ -2661,7 +2661,7 @@ mod tests {
             builder::FtsBuilder,
             posting::{ENCODING_BITSET, block_encoding},
             reader::BoolMode,
-            tokenize::AsciiLowerTokenizer,
+            tokenize::StandardTokenizer,
         },
         id_space::{FtsDocId, RowId},
     };
@@ -2693,7 +2693,7 @@ mod tests {
         // interesting (some docs have multiple terms, some have one).
         // Both algorithms must return identical top-K (descending
         // score, ascending doc_id tiebreak).
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false)
             .expect("register column");
@@ -2724,7 +2724,7 @@ mod tests {
             b.add_doc(0, i as u32, text).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         // Three terms with similar UBs — the heuristic should pick
@@ -2760,7 +2760,7 @@ mod tests {
         // loop never ran. Plant a block where the probed docs sit at bit >= 64
         // with a tf that differs from the rest, so a wrong cross-word popcount
         // would land on the wrong tf.
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false)
             .expect("register column");
@@ -2783,7 +2783,7 @@ mod tests {
             b.add_doc(0, id, text).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         let mut cursors = r
@@ -2825,7 +2825,7 @@ mod tests {
     async fn search_with_algo_wand_bmw_agrees_with_bmm() {
         // The historical WAND+BMW baseline must agree with the production
         // BMM path on the planted corpus.
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         let docs = [
@@ -2842,7 +2842,7 @@ mod tests {
             b.add_doc(0, i as u32, t).expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let terms: &[&str] = &["alpha", "beta", "gamma"];
         let bmm = r
@@ -2877,7 +2877,7 @@ mod tests {
         /// score threshold starts pruning blocks.
         const K: usize = 5;
 
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -2901,7 +2901,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         let terms: &[&str] = &["alpha", "beta", "gamma", "delta", "epsilon"];
@@ -2932,7 +2932,7 @@ mod tests {
         // not just a single window. Tied to OR_WINDOW so it keeps crossing
         // the boundary if the window size changes.
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -2952,7 +2952,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let shapes: &[&[&str]] = &[
             &["alpha", "beta"],
@@ -2992,7 +2992,7 @@ mod tests {
         // keeps every term essential (the pure windowed OR-sum path). The
         // multi-window corpus exercises the partition changing across windows.
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -3012,7 +3012,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         let shapes: &[&[&str]] = &[
@@ -3052,7 +3052,7 @@ mod tests {
         // run_windowed_maxscore and check they match MaxScore+BMM with the same
         // exclusion (the oracle-validated reference).
         const N_DOCS: u32 = OR_WINDOW + 1000; // spans more than one window
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -3072,7 +3072,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let col = r.resolve_column_id("body").expect("col");
 
@@ -3148,7 +3148,7 @@ mod tests {
             let n_docs = 500 + (rng() % 5000) as u32;
             // Per-term inclusion probability (out of 8) — varied densities.
             let probs: Vec<u64> = (0..vocab.len()).map(|_| 1 + rng() % 8).collect();
-            let tok = Arc::new(AsciiLowerTokenizer);
+            let tok = Arc::new(StandardTokenizer);
             let mut b = FtsBuilder::new(tok);
             b.register_column("body".into(), false).expect("register");
             for i in 0..n_docs {
@@ -3168,7 +3168,7 @@ mod tests {
                 b.add_doc(0, i, text.trim()).expect("add doc");
             }
             let blob = Bytes::from(b.finish().expect("finish"));
-            let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+            let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
             let r = FtsReader::open(blob, json).expect("open");
             for _ in 0..4 {
                 let nt = 2 + (rng() % 4) as usize;
@@ -3216,7 +3216,7 @@ mod tests {
         // so the tight bound actually prunes where the loose one would not. Must
         // still return the identical top-k as per-candidate MaxScore+BMM.
         const N_DOCS: u32 = OR_WINDOW * 2 + 313; // several blocks, > 1 window
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -3238,7 +3238,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let terms = ["to", "be", "or", "not"];
         for k in [1usize, 5, 10, 50, 200] {
@@ -3271,7 +3271,7 @@ mod tests {
         // (stopword non-essential outright) and huge k (heap never fills)
         // bracket the path. Every k must match per-candidate MaxScore+BMM.
         const N_DOCS: u32 = OR_WINDOW * 3 + 500;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -3293,7 +3293,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         for terms in [&["the", "incredibles"], &["incredibles", "the"]] {
             for k in [
@@ -3348,7 +3348,7 @@ mod tests {
         /// one of them straddles it; this offset puts the rare doc inside that
         /// block, past the cap.
         const RARE_OFFSET: u32 = 200;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -3374,7 +3374,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         for terms in [&["the", "incredibles"], &["incredibles", "the"]] {
             for k in [
@@ -3444,7 +3444,7 @@ mod tests {
             let common_gap = rng.random_range(4..7u32);
             let rare_period = rng.random_range(1500..4200u32);
             let rare_offset = rng.random_range(0..1500u32);
-            let tok = Arc::new(AsciiLowerTokenizer);
+            let tok = Arc::new(StandardTokenizer);
             let mut b = FtsBuilder::new(tok);
             b.register_column("body".into(), false).expect("register");
             for i in 0..N_DOCS {
@@ -3498,7 +3498,7 @@ mod tests {
                 b.add_doc(0, i, text.trim()).expect("add doc");
             }
             let blob = Bytes::from(b.finish().expect("finish"));
-            let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+            let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
             let r = FtsReader::open(blob, json).expect("open");
             for terms in [
                 &["alpha", "beta"][..],
@@ -3564,7 +3564,7 @@ mod tests {
         // matching docs, leaving the screen shut).
         const N_DOCS: u32 = 128 * 40;
         const DRIVER_EVERY: u32 = 32;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -3591,7 +3591,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let col = r.resolve_column_id("body").expect("col");
         let norms = &r.columns[col as usize].dl_norm_k1();
@@ -3644,7 +3644,7 @@ mod tests {
         // MaxScore+BMM restricted to the identical window — a sliced query
         // returns exactly the docs in its slice, scored identically.
         const N_DOCS: u32 = OR_WINDOW * 2 + 777;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -3661,7 +3661,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let col = r.resolve_column_id("body").expect("col");
         let terms: &[&str] = &["alpha", "beta", "gamma", "delta"];
@@ -3755,7 +3755,7 @@ mod tests {
         // that fills the heap early, and for k large enough that it does
         // not fill at all.
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -3771,7 +3771,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let col = r.resolve_column_id("body").expect("col");
         for terms in [&["the", "rare"], &["rare", "the"]] {
@@ -3804,7 +3804,7 @@ mod tests {
         // must still push qualifying docs until the heap holds k and only
         // then evict, and end with the same top-k as MaxScore+BMM.
         const N_DOCS: u32 = OR_WINDOW + 700;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -3817,7 +3817,7 @@ mod tests {
             b.add_doc(0, i, &text).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let col = r.resolve_column_id("body").expect("col");
         let dl_norm_k1 = &r.columns[col as usize].dl_norm_k1();
@@ -3857,7 +3857,7 @@ mod tests {
         // (`NEG_INFINITY`). Multi-window corpus so WAND exercises block
         // skips; `gamma` rarer than `beta` rarer than `alpha`.
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -3871,7 +3871,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let col = r.resolve_column_id("body").expect("col");
 
@@ -3908,7 +3908,7 @@ mod tests {
         // only when one posting list is >= WAND_BMW_2TERM_DF_RATIO× shorter
         // than the other (a rare anchor), not when both terms are common.
         const N_DOCS: u32 = 4000;
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -3922,7 +3922,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let col = r.resolve_column_id("body").expect("col");
 
@@ -3955,7 +3955,7 @@ mod tests {
         // the windowed filter arm. (Calls the scorers directly so the
         // windowed arm is exercised regardless of the production dispatch.)
         const N_DOCS: u32 = OR_WINDOW + 1000; // spans more than one window
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -3975,7 +3975,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let col = r.resolve_column_id("body").expect("col");
 
@@ -4125,12 +4125,12 @@ mod tests {
             rng % m
         };
         let phase = draw(3) as u32;
-        let mut builder = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut builder = FtsBuilder::new(Arc::new(StandardTokenizer));
         builder
             .register_column_with_tokenizer(
                 "body".into(),
                 false,
-                Arc::new(AsciiLowerTokenizer),
+                Arc::new(StandardTokenizer),
                 bm25::Bm25Params::new(k1, b),
             )
             .expect("register");
@@ -4157,7 +4157,7 @@ mod tests {
             lead_tf.push(lt);
             other_tf.push(ot);
         }
-        let json = format!(r#"[{{"name":"body","tokenizer":"ascii_lower","k1":{k1},"b":{b}}}]"#);
+        let json = format!(r#"[{{"name":"body","tokenizer":"standard","k1":{k1},"b":{b}}}]"#);
         let r =
             FtsReader::open(Bytes::from(builder.finish().expect("finish")), &json).expect("open");
         (r, lead_tf, other_tf)

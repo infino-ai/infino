@@ -182,7 +182,7 @@ mod tests {
 
     use super::*;
     use crate::superfile::fts::{
-        builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
+        builder::FtsBuilder, reader::FtsReader, tokenize::StandardTokenizer,
     };
 
     #[test]
@@ -228,10 +228,10 @@ mod tests {
 
     #[test]
     fn a_decoded_bound_takes_the_idf_ratio_and_the_column_scale() {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         b.add_doc(0, 0, "a b").expect("doc");
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let col = r.columns[0].clone().with_bound_scale_for_test(0.5);
 

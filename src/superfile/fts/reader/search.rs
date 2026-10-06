@@ -1887,7 +1887,7 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
         builder::FtsBuilder,
-        tokenize::{AsciiLowerTokenizer, Phrase},
+        tokenize::{Phrase, StandardTokenizer},
     };
 
     #[tokio::test]
@@ -2244,7 +2244,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_multi_weights_and_combines_columns() {
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("title".into(), false).expect("register");
         b.register_column("body".into(), false).expect("register");
@@ -2256,7 +2256,8 @@ mod tests {
         b.add_doc(0, 2, "go").expect("add");
         b.add_doc(1, 2, "concurrency").expect("add");
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower"},{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard"},{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let hits = r
             .search_multi(&[("title", 1.0), ("body", 1.0)], "rust", 10, BoolMode::Or)
@@ -2272,14 +2273,14 @@ mod tests {
     async fn search_or_range_restricts_to_doc_id_window() {
         // Larger corpus so an OR query spans several doc ids and the
         // ranged path actually clips some out.
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..8u32 {
             b.add_doc(0, i, "alpha beta").expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         // Restrict to [2, 5): only docs 2,3,4 are eligible.
         let hits = r
@@ -2310,7 +2311,7 @@ mod tests {
         /// Top-k size for the truncated comparison.
         const K_TOP: usize = 10;
 
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -2334,7 +2335,7 @@ mod tests {
             b.add_doc(0, i, &text).expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         // Two shapes through the one ranged union kernel: a uniform OR
@@ -2419,7 +2420,7 @@ mod tests {
         /// Ask for every match so whole result sets are compared.
         const K_ALL: usize = N_DOCS as usize;
 
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -2437,7 +2438,7 @@ mod tests {
             b.add_doc(0, i, &text).expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         let terms: &[&str] = &["alpha", "beta", "gamma", "delta"];
@@ -2495,14 +2496,14 @@ mod tests {
 
     #[tokio::test]
     async fn search_or_range_with_floor_prunes() {
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false).expect("register");
         for i in 0..8u32 {
             b.add_doc(0, i, "alpha beta").expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let hits = r
             .search_or_range_pretokenized_with_floor(

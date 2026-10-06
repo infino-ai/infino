@@ -1691,7 +1691,7 @@ mod tests {
         builder::FtsBuilder,
         posting::{ENCODING_PACKED, ENCODING_PATCHED},
         reader::FtsReader,
-        tokenize::AsciiLowerTokenizer,
+        tokenize::StandardTokenizer,
     };
 
     /// The per-block BM25 upper bound stored in the skip table must be a
@@ -1717,7 +1717,7 @@ mod tests {
     fn realistic_reader(n_docs: u32) -> FtsReader {
         let mut rng = StdRng::seed_from_u64(114);
         let lengths = LogNormal::new(4.4886, 1.55).expect("log-normal params");
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         let mut text = String::new();
         for doc_id in 0..n_docs {
@@ -1732,7 +1732,7 @@ mod tests {
             }
             b.add_doc(0, doc_id, text.trim_end()).expect("add doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 
@@ -1740,7 +1740,7 @@ mod tests {
     /// many blocks whose gaps vary, so the length-coded skip table has
     /// to be right in both entry widths.
     fn two_column_reader() -> FtsReader {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("pos".into(), true).expect("register");
         b.register_column("flat".into(), false).expect("register");
         let mut text = String::new();
@@ -1760,7 +1760,7 @@ mod tests {
             b.add_doc(0, doc_id, text.trim_end()).expect("add pos");
             b.add_doc(1, doc_id, text.trim_end()).expect("add flat");
         }
-        let json = r#"[{"name":"pos","tokenizer":"ascii_lower","positions":true},{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"pos","tokenizer":"standard","positions":true},{"name":"flat","tokenizer":"standard"}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 
@@ -1770,7 +1770,7 @@ mod tests {
     /// whole-block unpack would show a different doc's tf.
     #[tokio::test]
     async fn same_block_tf_probes_leave_the_lazy_doc_intact() {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("flat".into(), false).expect("register");
         for doc_id in 0..6000u32 {
             let mut text = String::new();
@@ -1779,7 +1779,7 @@ mod tests {
             }
             b.add_doc(0, doc_id, text.trim_end()).expect("add");
         }
-        let json = r#"[{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"flat","tokenizer":"standard"}]"#;
         let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let cursors = view
             .build_term_cursors(0, &["common"], None, false, None, None)
@@ -1823,7 +1823,7 @@ mod tests {
     #[tokio::test]
     async fn packed_block_tf_probes_match_the_walk() {
         use crate::superfile::fts::posting::{ENCODING_BITSET, block_encoding};
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("flat".into(), false).expect("register");
         let tf_of = |doc: u32| doc.is_multiple_of(37).then(|| 1 + doc % 5);
         for doc_id in 0..60_000u32 {
@@ -1833,7 +1833,7 @@ mod tests {
             };
             b.add_doc(0, doc_id, &text).expect("add");
         }
-        let json = r#"[{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"flat","tokenizer":"standard"}]"#;
         let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let cursors = view
             .build_term_cursors(0, &["sparse"], None, false, None, None)
@@ -2163,7 +2163,7 @@ mod tests {
     /// leaves every bound one ULP above its block's maximum.
     #[tokio::test]
     async fn bounds_stay_exact_when_the_average_is_not_exactly_representable() {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         // 501 tokens over 500 documents: an average of 1.002.
         for doc in 0..500u32 {
@@ -2174,7 +2174,7 @@ mod tests {
             };
             b.add_doc(0, doc, text).expect("add doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let reader = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         assert_eq!(reader.columns[0].avgdl(), bm25::stored_avgdl(1.002));
         for (i, (bound, max)) in block_bounds_and_maxima(&reader)
@@ -2208,7 +2208,7 @@ mod tests {
         // skip table's fixed-point rounding and the assertion is decisive.
         const N_DOCS: u32 = 1300;
 
-        let tok = Arc::new(AsciiLowerTokenizer);
+        let tok = Arc::new(StandardTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into(), false)
             .expect("register column");
@@ -2233,7 +2233,7 @@ mod tests {
             b.add_doc(0, doc_id, text.trim_end()).expect("add doc");
         }
         let bytes = Bytes::from(b.finish().expect("finish builder"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         let reader = FtsReader::open(bytes, json).expect("open FtsReader");
 
         let mut cursors = reader
@@ -2292,7 +2292,7 @@ mod tests {
     /// with `n_docs` rows (rows no term mentions carry a filler token so
     /// every row is a document). Doc ids are the row indices.
     fn planted_reader(planted: &[Planted], n_docs: u32) -> FtsReader {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
         b.register_column("body".into(), false).expect("register");
         let mut at = vec![0usize; planted.len()];
         let mut text = String::new();
@@ -2317,7 +2317,7 @@ mod tests {
         for (t, list) in planted.iter().enumerate() {
             assert_eq!(at[t], list.len(), "term {t}: every planted doc emitted");
         }
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 

@@ -10,7 +10,7 @@ use bytes::Bytes;
 
 use crate::superfile::fts::{
     builder::{BlobEra, FtsBuilder},
-    tokenize::{AsciiLowerTokenizer, StandardTokenizer},
+    tokenize::StandardTokenizer,
 };
 
 /// A one-column (`body`) `standard`-analyzer blob holding `docs`, doc `i`
@@ -57,7 +57,7 @@ pub(super) fn build_standard_fold_blob() -> (Bytes, String) {
 
 pub(super) fn build_blob() -> (Bytes, String) {
     // 3 docs, 1 column.
-    let tok = Arc::new(AsciiLowerTokenizer);
+    let tok = Arc::new(StandardTokenizer);
     let mut b = FtsBuilder::new(tok);
     b.register_column("body".into(), false)
         .expect("register column");
@@ -65,14 +65,14 @@ pub(super) fn build_blob() -> (Bytes, String) {
     b.add_doc(0, 1, "tokio is a rust runtime").expect("add doc");
     b.add_doc(0, 2, "java spring boot").expect("add doc");
     let bytes = b.finish().expect("finish");
-    let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
     (Bytes::from(bytes), json.to_string())
 }
 
 /// Build a corpus that exercises both the df=1 inline-encoded
 /// path and the df ≥ 2 PFOR path side-by-side.
 pub(super) fn build_mixed_df_blob() -> (Bytes, String) {
-    let tok = Arc::new(AsciiLowerTokenizer);
+    let tok = Arc::new(StandardTokenizer);
     let mut b = FtsBuilder::new(tok);
     b.register_column("body".into(), false)
         .expect("register column");
@@ -84,7 +84,7 @@ pub(super) fn build_mixed_df_blob() -> (Bytes, String) {
     b.add_doc(0, 1, "common rust").expect("add doc");
     b.add_doc(0, 2, "common uniqtwo").expect("add doc");
     let bytes = b.finish().expect("finish");
-    let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
     (Bytes::from(bytes), json.to_string())
 }
 
@@ -109,6 +109,6 @@ pub(super) fn build_phrase_blob() -> (Bytes, &'static str) {
     }
     (
         Bytes::from(b.finish().expect("finish")),
-        r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#,
+        r#"[{"name":"title","tokenizer":"standard","positions":true}]"#,
     )
 }
