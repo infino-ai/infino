@@ -47,7 +47,10 @@ use parquet::{
 };
 use tempfile::NamedTempFile;
 
-use crate::superfile::{LazyByteSource, LazyByteSourceError, format::kv};
+use crate::{
+    config::scratch_root,
+    superfile::{LazyByteSource, LazyByteSourceError, format::kv},
+};
 
 /// Length of Parquet's trailing `PAR1` magic, in bytes.
 const PARQUET_MAGIC_LEN: usize = 4;
@@ -218,7 +221,8 @@ impl ParquetBodyEncoder {
         // writer owns an independent handle to the same file (`reopen`); the
         // struct's `body_file` handle reads the footer back after close, and
         // their cursors don't alias.
-        let body_file = NamedTempFile::new()?;
+        let scratch_root = scratch_root();
+        let body_file = NamedTempFile::new_in(&scratch_root)?;
         let write_handle = body_file.reopen()?;
         let writer = ArrowWriter::try_new(write_handle, schema.clone(), Some(props))?;
         Ok(Self { body_file, writer })

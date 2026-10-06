@@ -84,10 +84,11 @@ use arrow_array::{Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatc
 use arrow_schema::{DataType, Field, Schema};
 use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
-use tempfile::{NamedTempFile, tempfile};
+use tempfile::NamedTempFile;
 
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::{
+    config::scratch_root,
     superfile::{
         BuildError, FtsError, ReadError, SuperfileReader,
         format::{
@@ -3089,8 +3090,8 @@ impl SuperfileBuilder {
             self.opts.row_group_size,
             &id_page_limit,
         )?;
-
-        let mut vector_file = tempfile().map_err(BuildError::Io)?;
+        let scratch_root = scratch_root();
+        let mut vector_file = tempfile::tempfile_in(&scratch_root).map_err(BuildError::Io)?;
         finish_multi_cell_blob_to(cells, BufWriter::new(&mut vector_file))?;
         let vector_length = vector_file.seek(SeekFrom::End(0)).map_err(BuildError::Io)?;
         vector_file
@@ -3289,12 +3290,16 @@ fn stream_index_blobs_to_scratch(
     cell_posting_builder: Option<CellPostingBuilder>,
     prebuilt_multi_cell: Option<Vec<(u32, MergedIvfSubsection)>>,
 ) -> Result<(NamedTempFile, NamedTempFile), BuildError> {
-    let fts_file = NamedTempFile::new().map_err(BuildError::Io)?;
-    let vec_file = NamedTempFile::new().map_err(BuildError::Io)?;
+    let scratch_root = scratch_root();
+
+    let fts_file = NamedTempFile::new_in(&scratch_root)?;
+    let vec_file = NamedTempFile::new_in(&scratch_root)?;
+
     let fts_write = fts_file.reopen().map_err(BuildError::Io)?;
     let vec_write = vec_file.reopen().map_err(BuildError::Io)?;
     let mut fw = BufWriter::new(fts_write);
     let mut vw = BufWriter::new(vec_write);
+
     finish_index_blobs_streamed(
         fts_builder,
         vec_builder,
@@ -3303,8 +3308,10 @@ fn stream_index_blobs_to_scratch(
         &mut fw,
         &mut vw,
     )?;
+
     fw.flush().map_err(BuildError::Io)?;
     vw.flush().map_err(BuildError::Io)?;
+
     Ok((fts_file, vec_file))
 }
 

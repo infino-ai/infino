@@ -89,9 +89,11 @@ use bumpalo::Bump;
 use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
+use tempfile::{Builder, TempDir};
 use tracing::debug;
 
 use crate::{
+    config::scratch_root,
     superfile::{
         BuildError,
         bits::PackScratch,
@@ -1412,7 +1414,7 @@ pub struct FtsBuilder {
     /// Lazily populated — small builds (every column stays in RAM)
     /// never write here. Dropped after `finish_to` copies its
     /// contents into the output writer.
-    scratch_dir: tempfile::TempDir,
+    scratch_dir: TempDir,
     /// Per-column in-RAM accumulator budget. When a column's `InRam`
     /// state's `bytes` would cross this on an `add_doc`, that column
     /// is flushed to spill files and transitions to `Spilled` for the
@@ -1485,9 +1487,9 @@ pub struct FtsBuilder {
 }
 
 impl FtsBuilder {
-    /// Construct a builder with the default scratch directory
-    /// (under `$TMPDIR` via `tempfile::tempdir()`) and the default
-    /// 256 MiB spill threshold. Mirror of `VectorBuilder::new`.
+    /// Construct a builder with the scratch directory at `storage.scratch_root`
+    /// (defaults to the system temp dir when unset) and the
+    /// default 256 MiB spill threshold. Mirror of `VectorBuilder::new`.
     ///
     /// Panics if creating the scratch tempdir fails — same policy
     /// as `VectorBuilder::new` for the same reason (no realistic
@@ -1496,7 +1498,13 @@ impl FtsBuilder {
     /// [`Self::with_scratch`] pointing at an instance-store NVMe
     /// partition.
     pub fn new(tokenizer: Arc<dyn Tokenizer>) -> Self {
-        let scratch_dir = tempfile::tempdir().expect("create FtsBuilder scratch tempdir");
+        let scratch_root = scratch_root();
+
+        let scratch_dir = Builder::new()
+            .prefix("infino-fts-")
+            .tempdir_in(&scratch_root)
+            .expect("create FtsBuilder scratch tempdir");
+
         Self::from_parts(tokenizer, scratch_dir)
     }
 
@@ -1513,13 +1521,11 @@ impl FtsBuilder {
         tokenizer: Arc<dyn Tokenizer>,
         scratch: PathBuf,
     ) -> Result<Self, BuildError> {
-        let scratch_dir = tempfile::Builder::new()
-            .prefix("infino-fts-")
-            .tempdir_in(&scratch)?;
+        let scratch_dir = Builder::new().prefix("infino-fts-").tempdir_in(&scratch)?;
         Ok(Self::from_parts(tokenizer, scratch_dir))
     }
 
-    fn from_parts(tokenizer: Arc<dyn Tokenizer>, scratch_dir: tempfile::TempDir) -> Self {
+    fn from_parts(tokenizer: Arc<dyn Tokenizer>, scratch_dir: TempDir) -> Self {
         Self {
             default_tokenizer: tokenizer,
             column_tokenizers: Vec::new(),
@@ -3601,7 +3607,7 @@ struct BlobAssemblyInputs {
     doc_lengths_by_orig_col: Vec<Option<Vec<u32>>>,
     /// Scratch dir owning every spill file. Dropped after the
     /// streamed regions (FST + postings) have been copied into `w`.
-    scratch_dir: tempfile::TempDir,
+    scratch_dir: TempDir,
     /// Profile accumulator — final block of `[fts-finish]` timings
     /// is emitted at the bottom of assembly.
     finish_profile: FinishProfile,
@@ -4819,9 +4825,10 @@ fn sort_partition_to_file<const N: usize>(
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
     use crate::{superfile::fts::tokenize::Phrase, test_helpers::default_tokenizer as tokenizer};
-
     /// The radix path (n >= `RADIX_SORT_MIN_TRIPLES`) must deliver
     /// `(lex_rank, doc_id)` order even when a term's docs arrive out of
     /// order — the compaction carry paths feed postings remapped through
@@ -5161,7 +5168,7 @@ mod tests {
                 .expect("add doc");
         }
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("fts.blob");
         {
             let file = File::create(&path).expect("create blob");
@@ -5204,7 +5211,7 @@ mod tests {
         // Mirror of vector's "small build never touches the disk
         // during add_doc" gate. With the default spill threshold
         // (256 MiB) a 100-doc build can never cross it.
-        let parent = tempfile::tempdir().expect("parent");
+        let parent = tempdir().expect("parent");
         let mut b = FtsBuilder::with_scratch(tokenizer(), parent.path().to_path_buf())
             .expect("with_scratch");
         b.register_column("body".into(), false)
@@ -5276,7 +5283,7 @@ mod tests {
         // tempdir we control so we can inspect on-disk partition
         // files mid-build (counterpart to the negative assertion in
         // `small_build_stays_in_ram_no_spill_files_created`).
-        let parent = tempfile::tempdir().expect("parent");
+        let parent = tempdir().expect("parent");
         let mut spilled = FtsBuilder::with_scratch(tokenizer(), parent.path().to_path_buf())
             .expect("with_scratch");
         spilled.set_spill_threshold_bytes(16 * 1024);
@@ -5403,7 +5410,7 @@ mod tests {
         // consumed by `finish`; if it isn't, repeated builds leak
         // disk. This test asserts the directory the builder created
         // under the override path is gone after the build.
-        let parent = tempfile::tempdir().expect("parent tempdir");
+        let parent = tempdir().expect("parent tempdir");
         let dir_count_before = fs::read_dir(parent.path()).expect("read parent").count();
 
         let mut b = FtsBuilder::with_scratch(tokenizer(), parent.path().to_path_buf())
@@ -5521,7 +5528,7 @@ mod tests {
     #[test]
     fn read_partition_triples_empty_file_is_empty() {
         // An empty spill partition file decodes to zero triples.
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let path = dir.path().join("empty.part");
         fs::write(&path, []).expect("write empty file");
         let triples = read_partition_records::<PLAIN_RECORD_LANES>(&path).expect("read empty");
@@ -5532,7 +5539,7 @@ mod tests {
     fn read_partition_triples_round_trips_le_bytes() {
         // Spill files are a contiguous run of 12-byte little-endian
         // `[term_id, doc_id, tf]` triples; decoding restores them.
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let path = dir.path().join("good.part");
         let mut bytes = Vec::new();
         for field in [3u32, 4, 5, 6, 7, 8] {
@@ -5547,7 +5554,7 @@ mod tests {
     fn read_partition_triples_rejects_non_multiple_length() {
         // A file whose byte length isn't a multiple of the 12-byte
         // triple size is malformed and must error.
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let path = dir.path().join("ragged.part");
         // One full triple plus a stray byte.
         fs::write(
