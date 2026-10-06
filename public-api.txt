@@ -562,6 +562,7 @@ impl infino::OptimizeOptions
 pub fn infino::OptimizeOptions::compact(infino::CompactionSettings) -> Self
 pub fn infino::OptimizeOptions::with_gc(self, infino::GcSettings) -> Self
 pub fn infino::OptimizeOptions::with_recalibrate(self, infino::RecalibratePolicy) -> Self
+pub fn infino::OptimizeOptions::with_skip_router_cache_warmup(self, bool) -> Self
 impl core::clone::Clone for infino::OptimizeOptions
 pub fn infino::OptimizeOptions::clone(&self) -> Self
 impl core::default::Default for infino::OptimizeOptions

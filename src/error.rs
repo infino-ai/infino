@@ -463,6 +463,7 @@ mod tests {
     use super::*;
     use crate::{
         storage::StorageError,
+        superfile::LazyByteSourceError,
         supertable::wal::{
             WalStoreError,
             pipeline::{AppendPhaseError, TombstonePhaseError},
@@ -757,6 +758,44 @@ mod tests {
                 "{e:?}"
             );
         }
+    }
+
+    /// A SQL scan reads a superfile through an object store, so a range fetch
+    /// reaches the plan under the store's error, typed: refused credentials
+    /// are found under it, and any other range-fetch failure is a read that
+    /// failed.
+    #[test]
+    fn a_range_fetch_inside_a_scan_is_classified_by_its_kind() {
+        let in_scan = |fetch: LazyByteSourceError| {
+            datafusion_error(&DataFusionError::ParquetError(Box::new(
+                ParquetError::External(Box::new(ObjectStoreError::Generic {
+                    store: "SuperfileObjectStore",
+                    source: Box::new(fetch),
+                })),
+            )))
+        };
+        assert!(matches!(
+            in_scan(LazyByteSourceError::Storage(
+                StorageError::PermissionDenied { uri: "u".into() }
+            )),
+            InfinoError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            in_scan(LazyByteSourceError::ShortRead {
+                start: 0,
+                requested: 8,
+                got: 4
+            }),
+            InfinoError::Io(_)
+        ));
+        assert!(matches!(
+            in_scan(LazyByteSourceError::OutOfBounds {
+                start: 9,
+                len: 1,
+                size: 4
+            }),
+            InfinoError::Io(_)
+        ));
     }
 
     /// The chain branches: refused credentials, a failed read, a store that

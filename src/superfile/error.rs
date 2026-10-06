@@ -9,6 +9,8 @@
 
 use thiserror::Error;
 
+use crate::superfile::LazyByteSourceError;
+
 /// Errors that can occur while building a superfile.
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -147,11 +149,13 @@ pub enum ReadError {
     #[error("schema unavailable in Parquet metadata")]
     MissingSchema,
 
+    // Each carries its error as the source, so a storage error under it
+    // (refused credentials) stays reachable from the read error.
     #[error("FTS error: {0}")]
-    Fts(Box<FtsError>),
+    Fts(#[source] Box<FtsError>),
 
     #[error("vector error: {0}")]
-    Vector(Box<VectorError>),
+    Vector(#[source] Box<VectorError>),
 
     #[error("column {0:?} not found in superfile schema")]
     UnknownColumn(String),
@@ -194,6 +198,16 @@ impl From<VectorError> for ReadError {
 /// Errors specific to FTS query execution.
 #[derive(Debug, Error)]
 pub enum FtsError {
+    /// A range fetch from the column's byte source failed (a storage error,
+    /// a range past the end, a short read). `what` names the part of the
+    /// column being read, so the message says which fetch failed; the source
+    /// error stays typed, so a refused credential under it still reads as one.
+    #[error("{what} range fetch failed: {source}")]
+    RangeFetch {
+        what: &'static str,
+        source: LazyByteSourceError,
+    },
+
     #[error("unknown FTS column {0:?}")]
     UnknownColumn(String),
 
@@ -268,13 +282,20 @@ pub enum VectorError {
     #[error("read error: {0}")]
     Read(#[from] ReadError),
 
-    /// The underlying [`crate::superfile::LazyByteSource`]
-    /// surfaced a typed error during a range fetch (storage failure,
-    /// out-of-bounds range, …). Stringified for crate-boundary
-    /// stability; callers that need the typed
-    /// `LazyByteSourceError` should match on the source directly.
-    #[error("lazy source error during vector search: {0}")]
-    LazySource(String),
+    /// A range fetch from the column's byte source failed once the column is
+    /// open (a storage error, a range past the end, a short read). Kept typed,
+    /// so a refused credential under it still reads as one.
+    #[error("lazy source error during vector read: {0}")]
+    LazySource(#[from] LazyByteSourceError),
+
+    /// The same failure while opening the column, where the reader knows which
+    /// part it was fetching: `what` names it (`lazy open: directory fetch`,
+    /// a subsection's header), so the message says where the open stopped.
+    #[error("{what}: {source}")]
+    RangeFetch {
+        what: String,
+        source: LazyByteSourceError,
+    },
 
     /// A cold cluster-block fetch would cross the connection memory budget; the
     /// search is refused before the fetch. The string is already labelled with

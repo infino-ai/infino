@@ -1023,6 +1023,7 @@ pub struct OptimizeOptions {
     pub(crate) compaction: CompactionSettings,
     pub(crate) gc: GcSettings,
     pub(crate) recalibrate: RecalibratePolicy,
+    pub(crate) skip_router_cache_warmup: bool,
 }
 
 impl OptimizeOptions {
@@ -1030,8 +1031,7 @@ impl OptimizeOptions {
     pub fn compact(settings: CompactionSettings) -> Self {
         Self {
             compaction: settings,
-            gc: GcSettings::default(),
-            recalibrate: RecalibratePolicy::default(),
+            ..Self::default()
         }
     }
 
@@ -1045,6 +1045,14 @@ impl OptimizeOptions {
     /// [`RecalibratePolicy::Auto`] when unset — backward compatible).
     pub fn with_recalibrate(mut self, recalibrate: RecalibratePolicy) -> Self {
         self.recalibrate = recalibrate;
+        self
+    }
+
+    /// Skip pre-building the in-process centroid-router cache after
+    /// compaction. For a process that optimizes but serves no queries;
+    /// queries still load or build the router lazily.
+    pub fn with_skip_router_cache_warmup(mut self, skip: bool) -> Self {
+        self.skip_router_cache_warmup = skip;
         self
     }
 }
