@@ -741,7 +741,7 @@ mod tests {
     }
 
     fn options_id_cat_title() -> SupertableOptions {
-        options_id_cat_title_with(ASCII_LOWER_TOKENIZER)
+        options_id_cat_title_with(STANDARD_TOKENIZER)
     }
 
     /// Single-threaded writer pool so each commit produces exactly one
@@ -773,7 +773,7 @@ mod tests {
     // reader. The returned `TempDir` guard must be held: dropping it deletes the
     // store the reader is still reading through.
     fn zero_gate_reader_after_ingest(batch: &RecordBatch) -> (tempfile::TempDir, Supertable) {
-        zero_gate_reader_after_ingest_with(batch, ASCII_LOWER_TOKENIZER)
+        zero_gate_reader_after_ingest_with(batch, STANDARD_TOKENIZER)
     }
 
     /// [`zero_gate_reader_after_ingest`] with `title` analyzed by the named

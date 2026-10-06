@@ -1514,7 +1514,7 @@ mod tests {
         assert!(!unbounded.bounds_rows(&[partial]));
     }
 
-    /// Resolver for the lowering tests: every column tokenizes with the
+    /// Resolver for the `ascii_lower` tests: every column tokenizes with the
     /// ASCII-lower analyzer.
     fn ascii_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
         Some(Arc::new(AsciiLowerTokenizer))
@@ -1618,6 +1618,10 @@ mod tests {
     }
 
     fn plan(expr: Expr) -> CandidatePlan {
+        CandidatePlan::from_filters(&[expr], &fts_cols(), &standard_resolver)
+    }
+
+    fn ascii_plan(expr: Expr) -> CandidatePlan {
         CandidatePlan::from_filters(&[expr], &fts_cols(), &ascii_resolver)
     }
 
@@ -1796,10 +1800,6 @@ mod tests {
         Some(Arc::new(StandardTokenizer))
     }
 
-    fn standard_plan(expr: Expr) -> CandidatePlan {
-        CandidatePlan::from_filters(&[expr], &fts_cols(), &standard_resolver)
-    }
-
     fn like_token(text: &str, open_left: bool, open_right: bool) -> LikeToken {
         LikeToken {
             text: text.into(),
@@ -1844,21 +1844,21 @@ mod tests {
     #[test]
     fn like_open_edges_lower_to_dictionary_shapes_under_standard() {
         assert_eq!(
-            standard_plan(col("title").like(lit("rust%"))),
+            plan(col("title").like(lit("rust%"))),
             terms_like(vec![like_token("rust", false, true)])
         );
         assert_eq!(
-            standard_plan(col("title").like(lit("%rust"))),
+            plan(col("title").like(lit("%rust"))),
             terms_like(vec![like_token("rust", true, false)])
         );
         assert_eq!(
-            standard_plan(col("title").like(lit("%rust%"))),
+            plan(col("title").like(lit("%rust%"))),
             terms_like(vec![like_token("rust", true, true)])
         );
         // `_` is a wildcard too: `ab` closed on the left by the pattern
         // start and open on the right; `cd` open on both sides.
         assert_eq!(
-            standard_plan(col("title").like(lit("ab_cd%"))),
+            plan(col("title").like(lit("ab_cd%"))),
             terms_like(vec![
                 like_token("ab", false, true),
                 like_token("cd", true, true)
@@ -1871,13 +1871,13 @@ mod tests {
         // Spaces are hard breaks: both tokens are complete, and an
         // all-complete pattern is the plain term-AND.
         assert_eq!(
-            standard_plan(col("title").like(lit("% quick fox %"))),
+            plan(col("title").like(lit("% quick fox %"))),
             terms_all(&["quick", "fox"])
         );
         // The hyphen closes `fox` on the left; the wildcard leaves the
         // right open.
         assert_eq!(
-            standard_plan(col("title").like(lit("%-fox%"))),
+            plan(col("title").like(lit("%-fox%"))),
             terms_like(vec![like_token("fox", false, true)])
         );
     }
@@ -1888,11 +1888,11 @@ mod tests {
         // the head of a longer term; `.` likewise keeps `fox` open on the
         // left (`a.fox`), while the trailing space closes its right.
         assert_eq!(
-            standard_plan(col("title").like(lit("%don'%"))),
+            plan(col("title").like(lit("%don'%"))),
             terms_like(vec![like_token("don", true, true)])
         );
         assert_eq!(
-            standard_plan(col("title").like(lit("%.fox %"))),
+            plan(col("title").like(lit("%.fox %"))),
             terms_like(vec![like_token("fox", true, false)])
         );
     }
@@ -1902,12 +1902,12 @@ mod tests {
         // `ΟΔΟΣ` lowercases to `οδος` on its own but to `οδοσ…` mid-word,
         // so an open-right token has two spellings and cannot be required.
         assert_eq!(
-            standard_plan(col("title").like(lit("%ΟΔΟΣ%"))),
+            plan(col("title").like(lit("%ΟΔΟΣ%"))),
             CandidatePlan::Unbounded
         );
         // Closed on the right the word really ends there: kept as a suffix.
         assert_eq!(
-            standard_plan(col("title").like(lit("%ΟΔΟΣ"))),
+            plan(col("title").like(lit("%ΟΔΟΣ"))),
             terms_like(vec![like_token("οδος", true, false)])
         );
     }
@@ -1925,48 +1925,48 @@ mod tests {
         // ending in 255 a's.
         let word = "a".repeat(LONG_FRAGMENT_WORD);
         assert_eq!(
-            standard_plan(col("title").like(lit(format!("%{word}%")))),
+            plan(col("title").like(lit(format!("%{word}%")))),
             CandidatePlan::Unbounded
         );
         assert_eq!(
-            standard_plan(col("title").ilike(lit(format!("%{word}")))),
+            plan(col("title").ilike(lit(format!("%{word}")))),
             CandidatePlan::Unbounded
         );
         // A separate word beside the long one keeps its own bound.
         assert_eq!(
-            standard_plan(col("title").like(lit(format!("%{word} fox%")))),
+            plan(col("title").like(lit(format!("%{word} fox%")))),
             terms_like(vec![like_token("fox", false, true)])
         );
         // A word of exactly the cut length cannot be told from a piece.
         let exact_cut = "a".repeat(MAX_TOKEN_CHARS);
         assert_eq!(
-            standard_plan(col("title").like(lit(format!("% {exact_cut} fox %")))),
+            plan(col("title").like(lit(format!("% {exact_cut} fox %")))),
             CandidatePlan::Unbounded
         );
     }
 
     #[test]
     fn like_under_ascii_lower_keeps_only_complete_tokens() {
-        // The default analyzer drops any run holding a non-ASCII byte, so
+        // `ascii_lower` drops any run holding a non-ASCII byte, so
         // a token that may be the head or tail of a longer run is not
         // guaranteed indexed: open-edged tokens drop out, and a pattern
         // made only of them is Unbounded.
         assert_eq!(
-            plan(col("title").like(lit("%rust%"))),
+            ascii_plan(col("title").like(lit("%rust%"))),
             CandidatePlan::Unbounded
         );
         assert_eq!(
-            plan(col("title").like(lit("rust%"))),
+            ascii_plan(col("title").like(lit("rust%"))),
             CandidatePlan::Unbounded
         );
         // A token closed by separators inside the fragment is exact.
         assert_eq!(
-            plan(col("title").like(lit("%(rust)%"))),
+            ascii_plan(col("title").like(lit("%(rust)%"))),
             terms_all(&["rust"])
         );
         // Mixed: the complete token stays, the open one drops.
         assert_eq!(
-            plan(col("title").like(lit("rust async%"))),
+            ascii_plan(col("title").like(lit("rust async%"))),
             terms_all(&["rust"])
         );
     }
@@ -1981,10 +1981,7 @@ mod tests {
         );
         // The literal `%` is itself a separator, so `100` is complete even
         // though a real wildcard follows the fragment.
-        assert_eq!(
-            standard_plan(col("title").like(lit("100\\%%"))),
-            terms_all(&["100"])
-        );
+        assert_eq!(plan(col("title").like(lit("100\\%%"))), terms_all(&["100"]));
         // A trailing backslash is a pattern the executor rejects.
         assert_eq!(
             plan(col("title").like(lit("rust\\"))),
@@ -1995,11 +1992,11 @@ mod tests {
     #[test]
     fn negated_like_is_unbounded() {
         assert_eq!(
-            standard_plan(col("title").not_like(lit("rust%"))),
+            plan(col("title").not_like(lit("rust%"))),
             CandidatePlan::Unbounded
         );
         assert_eq!(
-            standard_plan(col("title").not_ilike(lit("rust%"))),
+            plan(col("title").not_ilike(lit("rust%"))),
             CandidatePlan::Unbounded
         );
     }
@@ -2009,18 +2006,18 @@ mod tests {
         // The pattern's own case is irrelevant (the analyzer lowercases);
         // the leaf carries `fold` so the dictionary walk folds `ſ`.
         assert_eq!(
-            standard_plan(col("title").ilike(lit("%FoX%"))),
+            plan(col("title").ilike(lit("%FoX%"))),
             terms_ilike(vec![like_token("fox", true, true)])
         );
         // Complete tokens without an `s` are exact terms, as under LIKE.
         assert_eq!(
-            standard_plan(col("title").ilike(lit("% Quick Fox %"))),
+            plan(col("title").ilike(lit("% Quick Fox %"))),
             terms_all(&["quick", "fox"])
         );
         // A complete token holding an `s` may be spelled `ſ` in a matching
         // row's term, so it needs the dictionary even though it is complete.
         assert_eq!(
-            standard_plan(col("title").ilike(lit("% rust %"))),
+            plan(col("title").ilike(lit("% rust %"))),
             terms_ilike(vec![like_token("rust", false, false)])
         );
     }
@@ -2030,12 +2027,12 @@ mod tests {
         // Arrow's fold widens non-ASCII letters past `to_lowercase`
         // (medial `σ` matches `ς`), so the token cannot be required.
         assert_eq!(
-            standard_plan(col("title").ilike(lit("%ΟΔΟΣ%"))),
+            plan(col("title").ilike(lit("%ΟΔΟΣ%"))),
             CandidatePlan::Unbounded
         );
         // A mixed pattern keeps the ASCII token and drops the other.
         assert_eq!(
-            standard_plan(col("title").ilike(lit("%fox%süd%"))),
+            plan(col("title").ilike(lit("%fox%süd%"))),
             terms_ilike(vec![like_token("fox", true, true)])
         );
     }
@@ -2046,25 +2043,25 @@ mod tests {
         // run under `ascii_lower`; a complete token holding `s` or `k` is
         // therefore not guaranteed indexed. Others still are.
         assert_eq!(
-            plan(col("title").ilike(lit("% rust %"))),
+            ascii_plan(col("title").ilike(lit("% rust %"))),
             CandidatePlan::Unbounded
         );
         assert_eq!(
-            plan(col("title").ilike(lit("% quick %"))),
+            ascii_plan(col("title").ilike(lit("% quick %"))),
             CandidatePlan::Unbounded
         );
         assert_eq!(
-            plan(col("title").ilike(lit("% fox %"))),
+            ascii_plan(col("title").ilike(lit("% fox %"))),
             terms_all(&["fox"])
         );
         // The drop is per token: a sibling without `s` or `k` stays
         // required, so the leaf narrows instead of vanishing.
         assert_eq!(
-            plan(col("title").ilike(lit("% rust fox %"))),
+            ascii_plan(col("title").ilike(lit("% rust fox %"))),
             terms_all(&["fox"])
         );
         assert_eq!(
-            plan(col("title").ilike(lit("%fox%"))),
+            ascii_plan(col("title").ilike(lit("%fox%"))),
             CandidatePlan::Unbounded
         );
     }
@@ -2107,16 +2104,16 @@ mod tests {
     #[test]
     fn like_needs_an_fts_column_and_a_literal_pattern() {
         assert_eq!(
-            standard_plan(col("category").like(lit("rust%"))),
+            plan(col("category").like(lit("rust%"))),
             CandidatePlan::Unbounded
         );
         assert_eq!(
-            standard_plan(col("title").like(col("category"))),
+            plan(col("title").like(col("category"))),
             CandidatePlan::Unbounded
         );
         // Wildcards only: no fragment, nothing to bound.
         assert_eq!(
-            standard_plan(col("title").like(lit("%_%"))),
+            plan(col("title").like(lit("%_%"))),
             CandidatePlan::Unbounded
         );
     }
@@ -2140,7 +2137,7 @@ mod tests {
             &leaves[1],
             PruneLeaf::Prefix { column, prefix } if column == "title" && prefix == b"rust"
         ));
-        // Under the default analyzer only the complete tokens survive.
+        // Under `ascii_lower` only the complete tokens survive.
         let leaves = like_prune_leaves(
             &[col("title").like(lit("rust% quick fox %tail"))],
             &fts_cols(),
@@ -2182,9 +2179,9 @@ mod tests {
 
     #[test]
     fn has_like_finds_a_dictionary_leaf_anywhere_in_the_tree() {
-        assert!(standard_plan(col("title").like(lit("rust%"))).has_like());
+        assert!(plan(col("title").like(lit("rust%"))).has_like());
         assert!(
-            standard_plan(
+            plan(
                 col("title")
                     .eq(lit("alpha"))
                     .or(col("title").like(lit("%beta")))
@@ -2225,7 +2222,7 @@ mod tests {
         let p = CandidatePlan::from_filters(
             &[col("title").eq(lit("rust"))],
             &HashSet::new(),
-            &ascii_resolver,
+            &standard_resolver,
         );
         assert_eq!(p, CandidatePlan::Unbounded);
     }

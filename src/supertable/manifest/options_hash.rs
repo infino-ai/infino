@@ -343,6 +343,7 @@ mod tests {
         Stemmer, Stopwords,
         superfile::{
             builder::{FtsConfig, VectorConfig},
+            fts::tokenize::STANDARD_TOKENIZER,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -369,7 +370,7 @@ mod tests {
     }
 
     fn fts_opts() -> SupertableOptions {
-        fts_opts_analyzer(ASCII_LOWER_TOKENIZER)
+        fts_opts_analyzer(STANDARD_TOKENIZER)
     }
 
     fn fts_opts_analyzer(analyzer: &str) -> SupertableOptions {
@@ -595,7 +596,7 @@ mod tests {
     #[test]
     fn compute_options_hash_analyzer_choice() {
         let strat = time_range();
-        let ascii = compute_options_hash(&fts_opts(), &strat);
+        let ascii = compute_options_hash(&fts_opts_analyzer(ASCII_LOWER_TOKENIZER), &strat);
 
         // The standard analyzer changes the hash: its superfiles are
         // tokenized differently, so the options identity must differ.
@@ -614,7 +615,8 @@ mod tests {
         // And the analyzer block is present even for an all-ascii_lower
         // table: its hash differs from the superseded stream that left
         // the block out.
-        let superseded = superseded_options_hash(&fts_opts(), &strat).expect("all ascii_lower");
+        let superseded = superseded_options_hash(&fts_opts_analyzer(ASCII_LOWER_TOKENIZER), &strat)
+            .expect("all ascii_lower");
         assert_ne!(
             ascii.0, superseded.0,
             "the analyzer block must be part of an ascii_lower table's identity"
@@ -643,7 +645,7 @@ mod tests {
         // An all-ascii_lower table stamped by an earlier release carries
         // the block-less hash. It must still open — the next commit
         // re-stamps it under the current rule.
-        let opts = fts_opts();
+        let opts = fts_opts_analyzer(ASCII_LOWER_TOKENIZER);
         let strat = time_range();
         let stored = superseded_options_hash(&opts, &strat).expect("all ascii_lower");
         verify_options_hash(&opts, &strat, stored).expect("superseded hash accepted");

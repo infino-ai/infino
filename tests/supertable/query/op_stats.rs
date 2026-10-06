@@ -1308,18 +1308,16 @@ fn a_like_inside_a_boolean_tree_keeps_its_bound() {
 
 #[test]
 fn an_open_edged_like_under_the_default_analyzer_still_scans() {
-    // Under `ascii_lower` an open-edged token is never required, whatever
-    // the data: the analyzer drops any run holding a non-ASCII byte whole,
-    // so in general a term merely containing `rust` may not exist for a
-    // row that matches. `%rust%` therefore scans here even though this
-    // corpus is pure ASCII. Control for the tests above: no posting work,
-    // same answer.
+    // `%rust%` needs a whole-dictionary walk, and this fixture's vocabulary
+    // (one `fillerN` term per short row) is nearly as large as the column,
+    // so the walk does not pay: the token stays unbounded and the query
+    // scans. Control for the tests above: no posting work, same answer.
     let dir = TempDir::new().expect("tempdir");
     let db = sql_fixture(&dir);
     let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%rust%'");
     assert_eq!(
         stats.fts_postings_bytes, 0,
-        "no index bound under ascii_lower; got {}",
+        "no index bound when the walk does not pay; got {}",
         stats.fts_postings_bytes
     );
     assert!(

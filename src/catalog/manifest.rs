@@ -220,7 +220,7 @@ mod tests {
             location: "docs".into(),
             schema_ipc: schema_to_ipc(&sample_schema()).expect("ipc"),
             fts: vec!["title".into()],
-            fts_analyzers: vec!["ascii_lower".into()],
+            fts_analyzers: vec!["standard".into()],
             fts_stopwords: vec![String::new()],
             fts_stemmers: vec![String::new()],
             fts_positions: vec![false],
