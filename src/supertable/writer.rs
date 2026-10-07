@@ -3543,38 +3543,6 @@ pub(super) fn prepare_superfile_named(
     let bytes_for_cache =
         (cache_attached && inner.options.prepopulate_cache_on_commit).then(|| shard.bytes.clone());
 
-    // No-blob fast path: with no FTS and no vector columns the general path below
-    // opens the just-written bytes only to rebuild empty summaries. Skip that and
-    // build the entry from the shard's in-memory stats plus the footer offsets.
-    // Same entry as the general path for a no-blob superfile; indexed tables fall
-    // through.
-    if inner.options.fts_columns.is_empty() && inner.options.vector_columns.is_empty() {
-        let entry = Arc::new(SuperfileEntry {
-            birth_version: 0,
-            superfile_id: uuid::Uuid::new_v4(),
-            uri,
-            stem: stem.map(str::to_owned),
-            n_docs: shard.n_docs,
-            id_min: shard.id_min,
-            id_max: shard.id_max,
-            scalar_stats: shard.scalar_stats,
-            fts_summary: HashMap::new(),
-            vector_summary: HashMap::new(),
-            partition_key: Vec::new(),
-            partition_hint: None,
-            subsection_offsets: build_subsection_offsets(&shard.bytes),
-            vector_layout: read_vector_layout_from_bytes(&shard.bytes),
-        });
-        let storage_key = entry.storage_path();
-        return Ok(Some(PreparedSuperfile {
-            entry,
-            bytes_for_store: bytes_for_store.map(|b| (uri, b)),
-            bytes_for_storage: bytes_for_storage.map(|b| (storage_key, b)),
-            bytes_for_cache: bytes_for_cache.map(|b| (uri, b)),
-            term_contribution: None,
-        }));
-    }
-
     // Open the reader directly on shard bytes (not via the
     // in-memory `SuperfileReaderCache`). This lets the cache-attached
     // path skip the in-memory tier entirely — the bytes can go

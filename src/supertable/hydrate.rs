@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Decimal128Array, RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, Schema};
+use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::ArrowError;
 use bytes::Bytes;
 use rayon::prelude::*;
 use tracing::debug;
@@ -24,16 +24,15 @@ use crate::{
     supertable::{
         error::BuildError,
         handle::{Supertable, SupertableInner},
-        manifest::ScalarStatsAgg,
-        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+        manifest::{ManifestSnapshot, ScalarStatsAgg},
+        schema::{error::SchemaError, resolve::resolve_batch},
         utils::vector_split::split_vectors,
         writer::{
-            CommitListMetadata, ShardOutput, commit_output_stats,
+            CommitListMetadata, ShardOutput, builder_options_of, commit_output_stats,
             persist_superfile_publish_batch_async, planned_data_objects,
-            prepare_user_superfile_batch, schedule_background_storage_reclaim,
+            prepare_user_superfile_batch, schedule_background_storage_reclaim, with_id_column,
         },
     },
-    utils::schema::compare_schema,
 };
 
 /// Share of the memory free to the process that one wave may use, 2/5 = 40%.
@@ -79,28 +78,31 @@ fn hydrate_with_budget(
     if target_rows == 0 {
         return Err(BuildError::HydrateZeroTargetRows);
     }
+    // Take the writer slot for the whole load, as `append` does. Without a storage
+    // backend a commit has no CAS, so only this slot stops a concurrent commit
+    // from overwriting ours. Released on drop.
+    let _writer = handle.writer()?;
+    // Read the schema once, under the slot, so it can't change mid-load.
+    let manifest = inner.manifest.load();
+
     // Reject an indexed table: hydrate writes empty FTS/vector blobs, so its
     // rows would be invisible to search. Fail loudly, don't drop the index.
-    let fts = options.fts_columns.len();
-    let vector = options.vector_columns.len();
+    let mut base_opts = builder_options_of(&manifest);
+    let fts = base_opts.fts_columns.len();
+    let vector = base_opts.vector_columns.len();
     if fts != 0 || vector != 0 {
         return Err(BuildError::HydrateRequiresNoIndex { fts, vector });
     }
     // Check the reader's schema before reading anything, so a wrong file fails
     // with nothing committed. Each batch is checked again as it is built.
-    if !compare_schema(&reader.schema(), &options.schema) {
-        return Err(BuildError::BatchSchemaMismatch);
-    }
+    resolve_to_table(
+        &RecordBatch::new_empty(reader.schema()),
+        &manifest,
+        &options.id_column,
+    )?;
 
-    // Take the writer slot for the whole load, as `append` does. Without a storage
-    // backend a commit has no CAS, so only this slot stops a concurrent commit
-    // from overwriting ours. Released on drop.
-    let _writer = handle.writer()?;
-
-    // No-blob build options: same as a normal build, but with the FTS and vector
-    // columns cleared so each superfile is a plain Parquet body, empty blobs.
-    let scalar_schema = options.scalar_schema();
-    let mut base_opts = options.builder_options();
+    // No-blob build options: the table's own build options, with the FTS and
+    // vector columns cleared so each superfile is a plain Parquet body.
     base_opts.fts_columns = Vec::new();
     base_opts.vector_columns = Vec::new();
 
@@ -156,7 +158,7 @@ fn hydrate_with_budget(
         // Committing per wave keeps only one wave in memory.
         let shards: Vec<ShardOutput> = build_pool.install(|| {
             wave.par_iter()
-                .map(|chunk| build_hydrate_shard(inner, &base_opts, &scalar_schema, chunk))
+                .map(|chunk| build_hydrate_shard(inner, &manifest, &base_opts, chunk))
                 .collect::<Result<_, BuildError>>()
         })?;
         let rows: u64 = wave.iter().map(|chunk| chunk.rows as u64).sum();
@@ -166,7 +168,7 @@ fn hydrate_with_budget(
         drop(wave);
 
         let hints = vec![None; built];
-        let mut batch = prepare_user_superfile_batch(inner, shards, hints, None)?;
+        let mut batch = prepare_user_superfile_batch(inner, &manifest, shards, hints, None)?;
         // With a storage backend the bytes are durable once committed, so skip
         // the in-memory reader cache, which would hold the whole load in RAM.
         // Without one, that cache is the only copy, so it stays.
@@ -220,6 +222,28 @@ fn batch_data_bytes(batch: &RecordBatch) -> u64 {
         .sum()
 }
 
+/// Bring `batch` to the table's shape as `append` does: columns matched by name,
+/// and a nullable column the batch lacks read as null. Unlike `append`, a column
+/// the table doesn't have is refused, since hydrate doesn't grow the schema.
+fn resolve_to_table(
+    batch: &RecordBatch,
+    manifest: &ManifestSnapshot,
+    id_column: &str,
+) -> Result<RecordBatch, BuildError> {
+    let resolved = resolve_batch(batch, &manifest.table_schema(), id_column)?;
+    if let Some(column) = resolved.added.first() {
+        return Err(SchemaError::Invalid {
+            reason: format!(
+                "hydrate doesn't add columns, and `{}` is not in the table; add it with \
+                 append or a schema change first",
+                column.name
+            ),
+        }
+        .into());
+    }
+    Ok(resolved.batch)
+}
+
 /// Input batches that become one superfile, measured once as they are read.
 struct Chunk {
     batches: Vec<RecordBatch>,
@@ -249,8 +273,8 @@ impl Chunk {
 /// and builds the arrays outside it, and the workers don't queue on the lock.
 fn build_hydrate_shard(
     inner: &SupertableInner,
+    manifest: &ManifestSnapshot,
     base_opts: &BuilderOptions,
-    scalar_schema: &Arc<Schema>,
     chunk: &Chunk,
 ) -> Result<ShardOutput, BuildError> {
     // `target_rows` is clamped to this, so only a single oversized input batch
@@ -274,22 +298,15 @@ fn build_hydrate_shard(
     // Flatten the spans into one id per row, in row order (total == rows).
     let mut ids = id_spans.iter().flat_map(|&(first, last)| first..=last);
 
+    // Each batch goes through the same steps as in `append`: brought to the
+    // table's shape, split from vectors, then given its `_id` column.
+    let id_column = &inner.options.id_column;
     let mut ided: Vec<RecordBatch> = Vec::with_capacity(chunk.batches.len());
     for batch in &chunk.batches {
-        // Check the batch against the table schema by name, type and nullability,
-        // and put its columns in the table's order: the same check `append` runs.
-        // A permuted batch loads correctly; a misnamed or mistyped one is rejected.
-        let (scalar, _) = split_vectors(batch, &inner.options)?;
-        let id_array = Decimal128Array::from_iter_values((&mut ids).take(scalar.num_rows()))
-            .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
-            .expect("invariant: precision 38 + scale 0 is valid for any i128 payload");
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(scalar.num_columns() + 1);
-        columns.push(Arc::new(id_array));
-        columns.extend(scalar.columns().iter().cloned());
-        ided.push(
-            RecordBatch::try_new(Arc::clone(scalar_schema), columns)
-                .map_err(|_| BuildError::BatchSchemaMismatch)?,
-        );
+        let resolved = resolve_to_table(batch, manifest, id_column)?;
+        let (scalar_no_id, _) = split_vectors(&resolved, manifest)?;
+        let batch_ids = (&mut ids).take(scalar_no_id.num_rows()).collect();
+        ided.push(with_id_column(&scalar_no_id, batch_ids, id_column));
     }
 
     // Stream into one no-blob superfile. Size the sink to the chunk's footprint:
@@ -298,8 +315,9 @@ fn build_hydrate_shard(
     SuperfileBuilder::build_no_blob_from_batches_to(base_opts.clone(), &ided, &mut bytes)?;
 
     // Per-scalar-column min/max for skip pruning, over the id-prepended batches.
+    let scalar_schema = ided[0].schema();
     let scalar_refs: Vec<&RecordBatch> = ided.iter().collect();
-    let scalar_stats = ScalarStatsAgg::from_batches(scalar_schema, &scalar_refs);
+    let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &scalar_refs);
 
     Ok(ShardOutput::new_with_params(
         Bytes::from(bytes),
@@ -388,8 +406,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        ConnectOptions, Connection, IndexSpec, InfinoError, Metric, OptimizeOptions, connect,
-        connect_with,
+        ConnectOptions, Connection, FieldPatch, IndexSpec, InfinoError, Metric, OptimizeOptions,
+        SchemaPatch, connect, connect_with,
         runtime_metrics::op_stats::with_op_stats,
         supertable::{
             Supertable,
@@ -803,44 +821,47 @@ mod tests {
         );
     }
 
-    /// A schema that doesn't match the table is rejected, as in `append`, and
-    /// nothing commits.
-    ///  - the reader declares a wrong schema: rejected before anything is read.
-    ///  - the reader declares the right schema but a batch differs (a misnamed
-    ///    column, or a nullable `n` into the non-nullable `n`): rejected when
-    ///    that batch is built.
-    /// The table stays empty and the writer slot is released either way.
+    /// A batch that doesn't fit the table is rejected and nothing commits.
+    ///  - misnamed `(x, s)`: the table's non-nullable `n` is missing.
+    ///  - an extra column `extra`: `append` would add it, hydrate doesn't grow
+    ///    the schema.
+    /// Each is caught both when the reader declares it (before anything is
+    /// read) and when the reader declares the right schema but a batch differs.
+    /// The table stays empty and the writer slot is released.
     #[test]
-    fn hydrate_rejects_schema_mismatch_before_committing() {
+    fn hydrate_rejects_a_batch_that_does_not_fit() {
         let (_dir, db, table) = table_with(user_schema());
-        let with_fields = |fields: Vec<Field>| {
-            RecordBatch::try_new(
-                Arc::new(Schema::new(fields)),
-                vec![
-                    Arc::new(Int64Array::from(vec![1, 2])),
-                    Arc::new(StringArray::from(vec!["a", "b"])),
-                ],
-            )
-            .expect("valid batch")
-        };
-        let misnamed = with_fields(vec![
-            Field::new("x", DataType::Int64, false),
-            Field::new("s", DataType::Utf8, false),
-        ]);
-        let nullable = with_fields(vec![
-            Field::new("n", DataType::Int64, true),
-            Field::new("s", DataType::Utf8, false),
-        ]);
+        let misnamed = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("x", DataType::Int64, false),
+                Field::new("s", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("valid batch");
+        let extra = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("n", DataType::Int64, false),
+                Field::new("s", DataType::Utf8, false),
+                Field::new("extra", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![7, 8])),
+            ],
+        )
+        .expect("valid batch");
 
-        for bad in [misnamed, nullable] {
+        for bad in [misnamed, extra] {
             let declared_wrong = hydrate(&table, bad.schema(), vec![bad.clone()], 1_000);
             let declared_right = hydrate(&table, user_schema(), vec![bad], 1_000);
             for err in [declared_wrong, declared_right] {
-                let err = err.expect_err("a mismatched schema must be rejected");
-                assert!(
-                    matches!(err, BuildError::BatchSchemaMismatch),
-                    "got {err:?}"
-                );
+                let err = err.expect_err("a batch that doesn't fit must be rejected");
+                assert!(matches!(err, BuildError::Schema(_)), "got {err:?}");
             }
         }
 
@@ -852,10 +873,7 @@ mod tests {
             wrong,
         );
         let err = hydrate_from_reader(&table, &mut unread, 1_000).expect_err("wrong schema");
-        assert!(
-            matches!(err, BuildError::BatchSchemaMismatch),
-            "got {err:?}"
-        );
+        assert!(matches!(err, BuildError::Schema(_)), "got {err:?}");
 
         assert_eq!(query(&db, "SELECT COUNT(*) FROM t"), vec!["0"]);
         table.writer().expect("slot released on the error path");
@@ -1022,5 +1040,30 @@ mod tests {
         assert!(matches!(InfinoError::from(err), InfinoError::OverBudget(_)));
         assert_eq!(committed_rows(&table), 0);
         table.writer().expect("slot released on the error path");
+    }
+
+    /// Files hydrate writes carry the table's column ids, so they read correctly
+    /// after a column is renamed.
+    ///  - hydrate rows into `(n, s)`, then rename `n` to `num` by its id.
+    ///  - the hydrated values read back under `num`.
+    #[test]
+    fn hydrated_rows_survive_a_column_rename() {
+        let (_dir, db, table) = table_with(user_schema());
+        hydrate(&table, user_schema(), vec![rows_batch(1, 100)], 1_000).expect("hydrate");
+
+        let schema = db.schema("t").expect("schema");
+        let n = schema
+            .fields()
+            .iter()
+            .find(|f| f.name == "n")
+            .expect("column n")
+            .id;
+        let rename = FieldPatch::named("num")
+            .with_type(DataType::Int64)
+            .with_id(n);
+        db.apply_schema("t", &SchemaPatch::new(vec![rename]), None)
+            .expect("rename n to num");
+
+        assert_eq!(query(&db, "SELECT SUM(num) FROM t"), vec!["5050"]);
     }
 }

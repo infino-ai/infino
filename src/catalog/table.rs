@@ -537,7 +537,8 @@ impl Supertable {
     /// - SQL-only: the table must have no full-text or vector index, else
     ///   [`InfinoError::Schema`]. Hydrated rows are never found by BM25 or
     ///   vector search.
-    /// - Columns are matched by name, type and nullability, like `append`.
+    /// - Columns are matched by name, like `append`. Unlike `append`, a column the
+    ///   table doesn't have is refused: hydrate doesn't grow the schema.
     /// - Takes the table's writer slot for the whole load; a concurrent writer
     ///   gets [`InfinoError::Conflict`].
     /// - Not atomic: superfiles commit in waves to bound memory, so an error part
