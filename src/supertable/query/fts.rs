@@ -136,7 +136,7 @@ use crate::{
         tombstones::SidecarCache,
     },
     utils::{
-        terms::{DictEntry, make_key},
+        terms::DictEntry,
         trace::{self, detail_span, tiered_span},
     },
 };
@@ -1462,118 +1462,103 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // Expand the prefix in every kept superfile first, then weight each
-        // expanded term by its corpus-wide idf through the same gather an
-        // exact-term query takes, so a term reached by prefix scores exactly
-        // as it does when named outright.
-        let expansions = self
-            .expand_prefix(manifest.as_ref(), column, &prefix_lower, &kept)
-            .await?;
-        let mut expanded: Vec<String> = expansions.values().flatten().cloned().collect();
-        expanded.sort_unstable();
-        expanded.dedup();
-        if expanded.is_empty() {
-            return Ok(Vec::new());
-        }
-        let (global_idf, prefetch_memos) = self
-            .global_idf_open_wave(manifest.as_ref(), column, &expanded, &kept)
-            .instrument(trace::phase(self.phase_spans(), || {
-                tiered_span!("fts.global_idf", terms = expanded.len())
-            }))
-            .await?;
-        let global_idf = Arc::new(global_idf);
-        let expansions: HashMap<Uuid, Arc<Vec<String>>> = expansions
-            .into_iter()
-            .map(|(id, terms)| (id, Arc::new(terms)))
-            .collect();
-        let kept: Vec<Arc<SuperfileEntry>> = kept
-            .into_iter()
-            .filter(|e| expansions.contains_key(&e.superfile_id))
-            .collect();
-
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
         // Prefix expansion is always multi-term OR with no negation, so
-        // it is directly sub-range eligible. An un-ranged unit scores its
-        // whole superfile as one range, so every unit runs the same kernel.
+        // it is directly sub-range eligible.
         let work_units = build_work_units(&kept_refs, FanOut::SubRanges, pool_threads);
-        let units: Vec<(Arc<SuperfileEntry>, (u32, u32, Uuid))> = work_units
+        let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, Uuid))> = work_units
             .into_iter()
             .map(|u| {
                 let suid = u.entry.superfile_id;
-                let (start, end) = u.range.unwrap_or((0, u.entry.n_docs as u32));
-                (u.entry, (start, end, suid))
+                (u.entry, (u.range, suid))
             })
             .collect();
 
         let column_arc = Arc::new(column_owned);
-        let expansions = Arc::new(expansions);
+        let prefix_arc = Arc::new(prefix_owned);
         // No scope here: prefix search takes no pushed-down `WHERE` (the
         // `bm25_search_prefix` table function fills its k by over-fetching
         // under the exact predicate instead), so its units stay the plain
         // `(range, superfile id)` pair.
         let reader_pool = Arc::clone(&manifest.options.reader_pool);
 
-        // Share one cursor build per superfile across its slices, keyed by
-        // superfile id.
+        // Share one FST expansion + cursor build per superfile across its
+        // slices, keyed by superfile id.
         type SharedCursorCell = Arc<OnceCell<Arc<OrCursorSet>>>;
         let cursor_sets: Arc<Mutex<HashMap<Uuid, SharedCursorCell>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // Shared fan-out — see `bm25_search` for the rationale.
+        // Shared fan-out — see `bm25_search` for the rationale; the
+        // kernel differs only in calling the prefix search variants.
         let op_stats = self.op_stats.clone();
-        let kernel = move |r: Arc<SuperfileReader>, (start, end, suid): (u32, u32, Uuid)| {
+        let kernel = move |r: Arc<SuperfileReader>, (range, suid): (Option<(u32, u32)>, Uuid)| {
             let column_arc = Arc::clone(&column_arc);
-            let expansions = Arc::clone(&expansions);
-            let global_idf = Arc::clone(&global_idf);
-            let prefetch_memos = prefetch_memos.clone();
+            let prefix_arc = Arc::clone(&prefix_arc);
             let cursor_sets = Arc::clone(&cursor_sets);
             let reader_pool = Arc::clone(&reader_pool);
             let op_stats = op_stats.clone();
             async move {
-                let cell = {
-                    let mut sets = cursor_sets.lock().expect("cursor-set map lock poisoned");
-                    Arc::clone(sets.entry(suid).or_default())
-                };
-                let set = cell
-                    .get_or_try_init(|| async {
-                        let terms: Vec<&str> = expansions
-                            .get(&suid)
-                            .map(|t| t.iter().map(String::as_str).collect())
-                            .unwrap_or_default();
-                        let memo = prefetch_memos.as_ref().and_then(|m| m.get(&suid));
-                        let set = r
-                            .bm25_or_cursor_set(
-                                &column_arc,
-                                &terms,
-                                Some(&global_idf),
-                                memo.map(Arc::as_ref),
-                            )
+                match range {
+                    Some((start, end)) => {
+                        let cell = {
+                            let mut sets =
+                                cursor_sets.lock().expect("cursor-set map lock poisoned");
+                            Arc::clone(sets.entry(suid).or_default())
+                        };
+                        let set = cell
+                            .get_or_try_init(|| async {
+                                let set = r
+                                    .bm25_prefix_cursor_set(
+                                        &column_arc,
+                                        &prefix_arc,
+                                        Some(&reader_pool),
+                                    )
+                                    .await?;
+                                // Flushed inside the OnceCell init so slices
+                                // sharing this superfile's expansion count
+                                // its posting work exactly once — the same
+                                // contract as the exact-term ranged path.
+                                if let Some(stats) = &op_stats {
+                                    stats.add_fts_postings_bytes(set.postings_bytes());
+                                    stats.add_planned_read_ranges(set.planned_ranges());
+                                }
+                                Ok::<_, QueryError>(Arc::new(set))
+                            })
                             .await?;
-                        // Flushed inside the OnceCell init so slices sharing
-                        // this superfile's expansion count its posting work
-                        // exactly once — the same contract as the exact-term
-                        // ranged path.
-                        if let Some(stats) = &op_stats {
-                            stats.add_fts_postings_bytes(set.postings_bytes());
-                            stats.add_planned_read_ranges(set.planned_ranges());
-                        }
-                        Ok::<_, QueryError>(Arc::new(set))
-                    })
-                    .await?;
-                // Prefix search takes no search options yet, so there is
-                // nothing to override with; columns score with what they
-                // baked in.
-                if set.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
-                    let kernel_reader = Arc::clone(&r);
-                    let kernel_set = Arc::clone(set);
-                    let kernel_stats = op_stats.clone();
-                    run_on_pool(
-                        Some(&reader_pool),
-                        "ranged prefix kernel: reader pool dropped result",
-                        move || {
-                            op_stats::timed_kernel(&kernel_stats, || {
-                                kernel_reader.bm25_search_or_range_prebuilt(
-                                    &kernel_set,
+                        if set.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
+                            let kernel_reader = Arc::clone(&r);
+                            let kernel_set = Arc::clone(set);
+                            let kernel_stats = op_stats.clone();
+                            run_on_pool(
+                                Some(&reader_pool),
+                                "ranged prefix kernel: reader pool dropped result",
+                                move || {
+                                    op_stats::timed_kernel(&kernel_stats, || {
+                                        kernel_reader.bm25_search_or_range_prebuilt(
+                                            &kernel_set,
+                                            k,
+                                            start,
+                                            end,
+                                            f32::NEG_INFINITY,
+                                            // Prefix search takes no
+                                            // search options yet, so
+                                            // there is nothing to
+                                            // override with; columns
+                                            // score with what they
+                                            // baked in.
+                                            None,
+                                        )
+                                    })
+                                },
+                            )
+                            .await
+                            .map_err(|e| QueryError::Internal(e.to_string()))?
+                            .map_err(QueryError::from)
+                            .map(rows_as_local_ids)
+                        } else {
+                            op_stats::timed_kernel(&op_stats, || {
+                                r.bm25_search_or_range_prebuilt(
+                                    set,
                                     k,
                                     start,
                                     end,
@@ -1581,94 +1566,27 @@ impl SupertableReader {
                                     None,
                                 )
                             })
-                        },
-                    )
-                    .await
-                    .map_err(|e| QueryError::Internal(e.to_string()))?
-                    .map_err(QueryError::from)
-                    .map(rows_as_local_ids)
-                } else {
-                    op_stats::timed_kernel(&op_stats, || {
-                        r.bm25_search_or_range_prebuilt(set, k, start, end, f32::NEG_INFINITY, None)
-                    })
-                    .map_err(QueryError::from)
-                    .map(rows_as_local_ids)
+                            .map_err(QueryError::from)
+                            .map(rows_as_local_ids)
+                        }
+                    }
+                    None => {
+                        let (hits, work) = r
+                            .bm25_search_prefix(&column_arc, &prefix_arc, k, Some(&reader_pool))
+                            .await?;
+                        if let Some(stats) = &op_stats {
+                            stats.add_fts_postings_bytes(work.postings_bytes);
+                            stats.add_planned_read_ranges(work.planned_ranges);
+                            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                        }
+                        Ok(rows_as_local_ids(hits))
+                    }
                 }
             }
         };
         let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
         let hits = select_top_k_stable(self, per_unit, k).await?;
         Ok(hits)
-    }
-
-    /// Each kept superfile's expansion of `prefix` (already lowercased) in
-    /// `column`, keyed by superfile id; superfiles with no matching term are
-    /// absent. A complete term index answers without opening a superfile;
-    /// otherwise each superfile walks its own dictionary.
-    async fn expand_prefix(
-        &self,
-        manifest: &ManifestSnapshot,
-        column: &str,
-        prefix: &str,
-        kept: &[Arc<SuperfileEntry>],
-    ) -> Result<HashMap<Uuid, Vec<String>>, QueryError> {
-        if manifest.term_index_complete()
-            && let Some(index) = manifest.term_index().await
-        {
-            let kept_ids: HashSet<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
-            let term_start = make_key(column, "").len();
-            let mut out: HashMap<Uuid, Vec<String>> = HashMap::new();
-            index
-                .for_each_prefix(column, prefix, |key, run| {
-                    // Index keys are built from tokenizer terms, so they are
-                    // valid UTF-8.
-                    let Ok(term) = str::from_utf8(&key[term_start..]) else {
-                        return true;
-                    };
-                    for posting in run {
-                        if let Some(id) = index.superfile_id(posting.superfile)
-                            && kept_ids.contains(&id)
-                        {
-                            out.entry(id).or_default().push(term.to_owned());
-                        }
-                    }
-                    true
-                })
-                .await
-                .map_err(|e| {
-                    QueryError::Store(format!("term index unreadable for prefix expansion: {e}"))
-                })?;
-            return Ok(out);
-        }
-        let column_arc = Arc::new(column.to_owned());
-        let prefix_arc = Arc::new(prefix.to_owned());
-        let reader_pool = Arc::clone(&manifest.options.reader_pool);
-        let units: Vec<(Arc<SuperfileEntry>, Uuid)> = kept
-            .iter()
-            .map(|e| (Arc::clone(e), e.superfile_id))
-            .collect();
-        let per_sf: Vec<(Uuid, Vec<String>)> = dispatch::fanout_with(
-            self,
-            units,
-            false,
-            ReadIntent::Warm,
-            move |r, _entry, _sidecars, _now, suid: Uuid| {
-                let column_arc = Arc::clone(&column_arc);
-                let prefix_arc = Arc::clone(&prefix_arc);
-                let reader_pool = Arc::clone(&reader_pool);
-                async move {
-                    let terms = r
-                        .prefix_terms(&column_arc, &prefix_arc, Some(&reader_pool))
-                        .await?;
-                    Ok::<_, QueryError>((suid, terms))
-                }
-            },
-        )
-        .await?;
-        Ok(per_sf
-            .into_iter()
-            .filter(|(_, terms)| !terms.is_empty())
-            .collect())
     }
 
     /// Parse `query` into positive and negated tokens, then select the
