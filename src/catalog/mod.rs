@@ -2214,6 +2214,18 @@ mod tests {
                 && msg.contains("re-create"),
             "must name the table, column, analyzer and fix: {msg}"
         );
+
+        // An unrelated catalog commit rewrites every record; the removed
+        // analyzer must survive it, or the refusal silently disappears.
+        connect(&uri)
+            .expect("reconnect")
+            .create_table("other", schema_title_body(), IndexSpec::new().fts("title"))
+            .expect("an unrelated create_table");
+        let err = connect(&uri)
+            .expect("reconnect")
+            .open_table("docs")
+            .expect_err("the refusal survives an unrelated catalog commit");
+        assert!(err.to_string().contains("ascii_lower"), "got: {err}");
     }
 
     /// An index-only column (`FtsField::stored(false)`) survives a
