@@ -281,6 +281,11 @@ impl ConnectionMemoryBudget {
         self.used.load(Ordering::Relaxed)
     }
 
+    /// Bytes still free under the ceiling, or `None` for a measure-only budget.
+    pub(crate) fn remaining(&self) -> Option<usize> {
+        self.limit.map(|limit| limit.saturating_sub(self.used()))
+    }
+
     test_visible! {
         /// The largest [`used`](Self::used) ever reached. Only grows; never reset.
         /// Test-visible so integration tests can assert a query actually reserved

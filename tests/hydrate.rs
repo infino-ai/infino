@@ -3,9 +3,9 @@
 
 //! Integration coverage for the public [`Supertable::hydrate`] bulk-load path.
 //!
-//! These drive the public method from a real Parquet file on disk and check two
-//! things: the hydrated table answers SQL correctly, and it answers identically
-//! to a table built the regular way (append, then optimize + gc).
+//! These stream a real Parquet file on disk straight into the public method and
+//! check two things: the hydrated table answers SQL correctly, and it answers
+//! identically to a table built the regular way (append, then optimize + gc).
 
 #![deny(clippy::unwrap_used)]
 
@@ -22,6 +22,9 @@ use tempfile::TempDir;
 
 /// Target rows per coalesced superfile for the tests.
 const HYDRATE_TARGET_ROWS: usize = 64;
+/// Rows per batch the Parquet reader hands out: half the target, so two reader
+/// batches coalesce into each superfile.
+const READ_BATCH_ROWS: usize = 32;
 
 /// The user schema, no `_id` (the supertable mints and prepends it).
 fn user_schema() -> SchemaRef {
@@ -46,26 +49,19 @@ fn write_parquet(path: &Path, batch: &RecordBatch) {
     writer.close().expect("close parquet");
 }
 
-/// Read every batch from a Parquet file into memory.
-fn read_parquet(path: &Path) -> Vec<RecordBatch> {
-    ParquetRecordBatchReaderBuilder::try_new(File::open(path).expect("open parquet"))
-        .expect("parquet reader builder")
-        .build()
-        .expect("parquet reader")
-        .map(|b| b.expect("decode parquet batch"))
-        .collect()
-}
-
 /// Hydrate a Parquet file into table `name` through the public API: create a
-/// no-index table, read the file, and bulk-load it with [`Supertable::hydrate`]
-/// (no optimize, no GC). Returns the row count the call reports committed.
+/// no-index table and stream the file's reader straight into
+/// [`Supertable::hydrate`] (no optimize, no GC). Returns the rows committed.
 fn hydrate_parquet(db: &infino::Connection, name: &str, parquet_path: &Path) -> usize {
     let table = db
         .create_table(name, user_schema(), IndexSpec::new())
         .expect("create_table");
-    table
-        .hydrate(read_parquet(parquet_path), HYDRATE_TARGET_ROWS)
-        .expect("hydrate")
+    let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(parquet_path).expect("open"))
+        .expect("parquet reader builder")
+        .with_batch_size(READ_BATCH_ROWS)
+        .build()
+        .expect("parquet reader");
+    table.hydrate(reader, HYDRATE_TARGET_ROWS).expect("hydrate")
 }
 
 /// Render a query result as `|`-joined rows, in result order, so two results
@@ -127,16 +123,15 @@ fn hydrate_parquet_file_is_queryable() {
 }
 
 /// A hydrated table and a normally-ingested one (two appends, then optimize +
-/// GC) answer every query identically. `target_rows` well below the row count
-/// forces coalescing into several superfiles, so the multi-chunk path is
-/// exercised, not just a single-file load.
+/// GC) answer every query identically, with hydrate building several
+/// superfiles rather than one.
 #[test]
 fn hydrate_matches_normal_ingest() {
     let dir = TempDir::new().expect("tempdir");
     let db = connect(dir.path().join("db").to_str().expect("utf-8 path")).expect("connect");
 
-    // Hydrated: one Parquet file of 200 rows, bulk-loaded via the public method
-    // at a 64-row target, so it coalesces into ~4 superfiles.
+    // Hydrated: a 200-row Parquet file read in 32-row batches at a 64-row
+    // target, so it lands as 4 superfiles (64 + 64 + 64 + 8).
     let parquet_path = dir.path().join("rows.parquet");
     write_parquet(&parquet_path, &rows_batch(1, 200));
     let committed = hydrate_parquet(&db, "hydrated", &parquet_path);

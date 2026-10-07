@@ -2764,10 +2764,10 @@ impl SuperfileBuilder {
     }
 
     /// Hydrate: build one no-blob superfile straight from Arrow batches whose
-    /// `_id` column is already prepended at index 0. Each batch is streamed
-    /// through [`ParquetBodyEncoder`] and dropped, so peak memory is one batch
-    /// plus the running row-group, independent of the superfile size (unlike
-    /// [`finish`](Self::finish), which buffers every batch and encodes at the end).
+    /// `_id` column is already prepended at index 0. Batches are streamed through
+    /// [`ParquetBodyEncoder`], so the build adds only the running row group and
+    /// the id sidecar (16 B per row) on top of the caller's batches.
+    /// [`finish`](Self::finish) instead buffers a second copy of the data.
     ///
     /// `opts` must carry empty FTS and vector columns (no-blob). The superfile is
     /// streamed to `output`; the returned [`ParquetLayout`] gives its size and

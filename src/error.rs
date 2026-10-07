@@ -413,12 +413,17 @@ impl From<SupertableBuildError> for InfinoError {
             | SupertableBuildError::DuplicateLogicalName(_)
             | SupertableBuildError::ReservedSeparatorInColumnName(_)
             | SupertableBuildError::ReservedPrefixInColumnName(_)
-            | SupertableBuildError::PartitionColumnMissing(_) => {
+            | SupertableBuildError::PartitionColumnMissing(_)
+            | SupertableBuildError::HydrateRequiresNoIndex { .. }
+            | SupertableBuildError::HydrateChunkTooLarge { .. } => {
                 InfinoError::Schema(SchemaError::Invalid { reason: message })
             }
-            // A bad analyzer name is a configuration mistake, the same class a
-            // bad connect option gets.
-            SupertableBuildError::UnknownAnalyzer { .. } => InfinoError::Config(message),
+            // A bad setting: an unknown analyzer name (the same class a bad
+            // connect option gets), or a zero hydrate `target_rows`.
+            SupertableBuildError::UnknownAnalyzer { .. }
+            | SupertableBuildError::HydrateZeroTargetRows => InfinoError::Config(message),
+            // The caller's input reader failing during hydrate: I/O on their side.
+            SupertableBuildError::HydrateInputRead(_) => InfinoError::Io(message),
             // A commit that found its table dropped and purged: the name no
             // longer resolves, the same answer the read path gives.
             SupertableBuildError::TableGone => InfinoError::NotFound(message),

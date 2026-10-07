@@ -12,7 +12,7 @@
 use std::any::Any;
 use std::{sync::Arc, time::Duration};
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
 use datafusion::{prelude::Expr, sql::unparser::expr_to_sql};
 use serde_json::{Value, json};
@@ -331,13 +331,12 @@ impl Table for RemoteTable {
 
     fn hydrate(
         &self,
-        _batches: &mut dyn Iterator<Item = RecordBatch>,
+        _batches: &mut dyn RecordBatchReader,
         _target_rows: usize,
     ) -> Result<usize, InfinoError> {
         // Hydrate writes superfiles and commits the manifest directly, which
-        // needs the storage backend and the writer slot the hosted side owns,
-        // not a client. Deliberately not exposed over the remote transport.
-        Err(InfinoError::Backend(
+        // needs the storage backend and writer slot the hosted side owns.
+        Err(InfinoError::Unsupported(
             "hydrate is not supported over the remote transport".to_string(),
         ))
     }
@@ -371,5 +370,38 @@ impl Table for RemoteTable {
     #[cfg(any(test, feature = "test-helpers"))]
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{RecordBatch, RecordBatchIterator};
+    use arrow_schema::{ArrowError, DataType, Field, Schema};
+
+    use crate::{
+        InfinoError,
+        catalog::{
+            remote::{RemoteCatalog, table::RemoteTable},
+            table::Table,
+        },
+    };
+
+    /// Hydrate over the remote transport is refused as unsupported, before any
+    /// request is sent.
+    #[test]
+    fn hydrate_is_unsupported_over_remote() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let catalog =
+            RemoteCatalog::new("http://127.0.0.1:1".into(), "db".into(), Some("key".into()))
+                .expect("catalog");
+        let table = RemoteTable::new(Arc::new(catalog), "t".into(), Arc::clone(&schema));
+        let mut empty =
+            RecordBatchIterator::new(Vec::<Result<RecordBatch, ArrowError>>::new(), schema);
+        let err = table
+            .hydrate(&mut empty, 1_000)
+            .expect_err("remote hydrate must be refused");
+        assert!(matches!(err, InfinoError::Unsupported(_)), "got {err:?}");
     }
 }

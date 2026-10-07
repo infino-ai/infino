@@ -790,7 +790,7 @@ fn split_buffer_into_superfile_inputs(
 /// after the grace, delete exactly those keys (see [`reclaim`]). Never a listing sweep, so a file
 /// whose commit is still in flight cannot be taken for garbage. Deleting inline instead would race
 /// readers still pinned to the manifest the commit replaced.
-fn schedule_background_storage_reclaim(inner: Arc<SupertableInner>) {
+pub(super) fn schedule_background_storage_reclaim(inner: Arc<SupertableInner>) {
     // Unit tests take the recorded keys and call `reclaim` themselves; spawning here from a
     // `current_thread` tokio test runtime panics in `block_in_place`.
     #[cfg(not(test))]
@@ -2731,13 +2731,6 @@ impl ShardOutput {
             scalar_stats,
         }
     }
-
-    /// Rows in this shard. The single source of truth for a shard's row count,
-    /// so callers (e.g. the hydrate loader tallying committed rows) read it back
-    /// rather than threading a parallel count alongside the `ShardOutput`.
-    pub(crate) fn n_docs(&self) -> u64 {
-        self.n_docs
-    }
 }
 
 /// Reserve the build's estimated transient heap:
@@ -3707,6 +3700,15 @@ pub(super) struct SuperfilePublishBatch {
     term_contributions: Vec<TermContribution>,
 }
 
+impl SuperfilePublishBatch {
+    /// Skip the in-memory reader-cache fill. Only for a storage-backed table,
+    /// where the bytes are durable and reads fetch them from storage; a bulk
+    /// load would otherwise keep every superfile it wrote in RAM.
+    pub(super) fn skip_memory_fill(&mut self) {
+        self.pending_store_inserts.clear();
+    }
+}
+
 fn collect_prepared_superfiles(
     _inner: &SupertableInner,
     prepared: Vec<PreparedSuperfile>,
@@ -3803,7 +3805,7 @@ fn commit_target_object_bytes() -> u64 {
 /// function of the shard split, which follows the writer pool's width, so
 /// pricing off them would make the same append cost different amounts on
 /// different hosts. See [`buffered_payload_bytes`].
-fn planned_data_objects(payload_bytes: u64) -> u64 {
+pub(super) fn planned_data_objects(payload_bytes: u64) -> u64 {
     if payload_bytes == 0 {
         return 0;
     }
@@ -3884,7 +3886,7 @@ pub(crate) fn commit_built_superfile(st: &Supertable, bytes: Bytes) -> Result<()
     ))
 }
 
-fn commit_output_stats(batch: &SuperfilePublishBatch) -> (u64, u64, u64) {
+pub(super) fn commit_output_stats(batch: &SuperfilePublishBatch) -> (u64, u64, u64) {
     let superfiles = batch.new_entries.len() as u64;
     let bytes: u64 = batch
         .new_entries

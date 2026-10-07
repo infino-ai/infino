@@ -21,7 +21,6 @@ Supertable::delete	covered	(&self, Expr) -> Result<MutationStats, InfinoError>
 Supertable::exact_match	covered	(&self, &str, &str, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
 Supertable::gc	covered	(&self, Duration) -> Result<GcReport, GcError>
 Supertable::hybrid_search	covered	(&self, &str, &str, BoolMode, &str, &[f32], usize, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
-Supertable::hydrate	exempt	experimental SQL-only bulk-load; engine-only, not yet wrapped in bindings
 Supertable::index_staleness	covered	(&self, &ReindexOptions) -> Result<StalenessReport, ReindexError>
 Supertable::optimize	covered	(&self, &OptimizeOptions) -> Result<(), OptimizeError>
 Supertable::reindex	covered	(&self, &ReindexOptions) -> Result<ReindexReport, ReindexError>
@@ -37,5 +36,6 @@ Connection::apply_schema	exempt	the bindings fold the write into the `schema(nam
 Connection::update_storage_credentials	exempt	Rotates an object-store credential in place; Rust-embedder API, not part of the language-binding operation surface
 Supertable::append_rows	exempt	the bindings' append(rows) routes record input through it; their public shape is the one append
 Supertable::append_rows_named	exempt	the bindings' append_named(rows, source) routes record input through it; one public method per binding
+Supertable::hydrate	exempt	experimental SQL-only bulk-load; engine-only, not yet wrapped in bindings
 Supertable::tokenize	exempt	How the index reads a text; Rust-embedder API for a caller judging its own texts against a column's terms, not a data operation the bindings wrap.
 Supertable::update_rows	exempt	the bindings' update(predicate, rows) routes record input through it; their public shape is the one update
