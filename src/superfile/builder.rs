@@ -6288,10 +6288,9 @@ mod tests {
         assert_eq!(results_merged.len(), 2);
     }
 
-    /// Merged `df` for a shared term here is well past the point
-    /// where its postings outgrow the dictionary entry's 21-bit length slot.
+    /// A term common to millions of merged docs keeps every posting.
     #[tokio::test(flavor = "multi_thread")]
-    async fn build_from_readers_merges_common_term_past_pfor_length_slot() {
+    async fn build_from_readers_merges_a_term_common_to_millions_of_docs() {
         const NUM_FILES: usize = 12;
         const DOCS_PER_FILE: usize = 450_000;
 
