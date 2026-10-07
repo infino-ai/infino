@@ -4919,17 +4919,17 @@ mod tests {
         );
     }
 
-    /// A filter that fails on the table's own values is the caller's mistake,
-    /// even though DataFusion pushes it into the parquet scan, which hands the
-    /// failure back as text. The message check pins that text: if a DataFusion
-    /// upgrade rewords it, this fails instead of the error silently turning
+    /// A filter that fails on the table's own values is the caller's mistake.
+    /// The filter runs in the `FilterExec` above the scan, so the failure is
+    /// Arrow's cast error itself; the message check pins that, so a DataFusion
+    /// upgrade that rewords it fails here instead of the error silently turning
     /// into an engine fault.
     #[test]
     fn query_sql_reports_a_filter_that_fails_on_the_data_as_the_callers() {
         let conn = conn_with_docs();
         let err = conn.query_sql("SELECT title FROM docs WHERE CAST(title AS BIGINT) = 1");
         assert!(
-            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("Error evaluating filter predicate")),
+            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("Cannot cast string")),
             "got {err:?}"
         );
         // A regex the caller wrote that does not parse: DataFusion returns the

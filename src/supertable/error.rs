@@ -21,7 +21,11 @@ use thiserror::Error;
 use crate::{
     storage::{StorageError, error_chain, permission_denied_in_chain},
     superfile::error::{BuildError as SuperfileBuildError, FtsError, ReadError, VectorError},
-    supertable::{ManifestLoadError, manifest::part, schema::error::SchemaError},
+    supertable::{
+        ManifestLoadError,
+        manifest::{part, term_stats::TermStatsError},
+        schema::error::SchemaError,
+    },
 };
 
 /// Errors raised when constructing or operating against a
@@ -220,6 +224,18 @@ impl BuildError {
             BuildError::StorageConstruction(e) => e.is_permission_denied(),
             _ => false,
         }
+    }
+}
+
+impl From<TermStatsError> for BuildError {
+    /// The term-stats pass reaches the build path as `Store` carrying the
+    /// message, except a refused credential under it, which keeps its own
+    /// variant so the caller is told to fix the credentials, not to retry.
+    fn from(e: TermStatsError) -> Self {
+        if e.is_permission_denied() {
+            return BuildError::PermissionDenied(e.to_string());
+        }
+        BuildError::Store(e.to_string())
     }
 }
 
@@ -711,7 +727,7 @@ impl From<QueryError> for DataFusionError {
 /// | over the connection's memory budget | `OverBudget` |
 /// | an FTS query the column cannot answer: a phrase without positions, nothing positive to rank | `InvalidQuery`: the caller's |
 /// | the store refused our credentials | `PermissionDenied` |
-/// | a local doc id past the superfile's end: our bug, retrying cannot help | `Internal` |
+/// | a local doc id past the superfile's end, or a read called on a codec it does not support: our bug, retrying cannot help | `Internal` |
 /// | anything else | `Parquet`: a read failed |
 impl From<ReadError> for QueryError {
     fn from(e: ReadError) -> Self {
@@ -729,7 +745,7 @@ impl From<ReadError> for QueryError {
         if permission_denied_in_chain(&e) {
             return QueryError::PermissionDenied(e.to_string());
         }
-        if matches!(e, ReadError::DocIdOutOfRange { .. }) {
+        if e.is_internal() {
             return QueryError::Internal(e.to_string());
         }
         QueryError::Parquet(e.to_string())
@@ -809,6 +825,34 @@ mod tests {
     use super::*;
     use crate::{superfile::LazyByteSourceError, supertable::reader_cache::disk::DiskCacheError};
 
+    /// The term-stats pass runs during optimize: a refused credential under
+    /// any of its failures (a dictionary read, a reader open, the artifact
+    /// write) reaches the build path as `PermissionDenied`, so the caller
+    /// fixes the credentials instead of retrying; anything else stays `Store`.
+    #[test]
+    fn a_refused_credential_in_the_term_stats_pass_stays_permission_denied() {
+        let refused = || StorageError::PermissionDenied { uri: "u".into() };
+        let read = TermStatsError::Read {
+            what: "dict fetch",
+            source: FtsError::RangeFetch {
+                what: "fts/dict",
+                source: LazyByteSourceError::Storage(refused()),
+            },
+        };
+        let open = TermStatsError::Open(QueryError::PermissionDenied("refused".into()));
+        for failure in [read, open, TermStatsError::Storage(refused())] {
+            assert!(
+                matches!(BuildError::from(failure), BuildError::PermissionDenied(_)),
+                "a refused credential must stay one"
+            );
+        }
+        let timeout = TermStatsError::Storage(StorageError::TransientExhausted {
+            uri: "u".into(),
+            source: "boom".into(),
+        });
+        assert!(matches!(BuildError::from(timeout), BuildError::Store(_)));
+    }
+
     /// A range fetch inside the FTS or vector reader keeps its kind through
     /// the reader's error: refused credentials are found under it, and any
     /// other range-fetch failure is a read that failed.
@@ -884,6 +928,14 @@ mod tests {
                 doc_id: 9,
                 n_docs: 4
             }),
+            QueryError::Internal(_)
+        ));
+        // So is asking a read path for a codec it does not support, which
+        // the vector reader raises wrapped in its own error.
+        assert!(matches!(
+            QueryError::from(VectorError::Read(ReadError::WrongCodecPath(
+                "fp32 only".into()
+            ))),
             QueryError::Internal(_)
         ));
     }

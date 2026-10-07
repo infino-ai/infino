@@ -183,10 +183,10 @@ pub enum AppendPhaseError {
     #[error("superfile build failed: {message}")]
     SuperfileBuild { message: String },
 
-    /// Opening the just-built bytes as a `SuperfileReader` to
-    /// extract FTS / vector summaries failed.
-    #[error("superfile open for summary failed: {message}")]
-    SuperfileOpenForSummary { message: String },
+    /// Opening the just-built bytes as a `SuperfileReader`, or reading the
+    /// FTS / vector summaries from it, failed.
+    #[error("summarizing the superfile failed: {message}")]
+    SuperfileSummary { message: String },
 
     /// The manifest-commit machinery failed. Surfaces both the
     /// "I lost the pointer CAS" path (which the inner code
@@ -578,10 +578,13 @@ async fn append_replacement_rows(
     // the in-memory `RecordBatch` directly; nothing needs to
     // round-trip through Parquet.
     let reader = SuperfileReader::open_with(bytes.clone(), inner.options.superfile_open_options())
-        .map_err(|e| AppendPhaseError::SuperfileOpenForSummary {
+        .map_err(|e| AppendPhaseError::SuperfileSummary {
             message: e.to_string(),
         })?;
-    let fts_summary = build_fts_summary(&reader, &manifest);
+    let fts_summary =
+        build_fts_summary(&reader, &manifest).map_err(|e| AppendPhaseError::SuperfileSummary {
+            message: e.to_string(),
+        })?;
     let vector_summary = build_vector_summary(&reader, &manifest);
     // The replacement superfile's postings go into the term index in the
     // same commit as its entry, exactly as an appended superfile's do.

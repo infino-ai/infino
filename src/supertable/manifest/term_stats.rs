@@ -36,9 +36,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    storage::StorageProvider,
-    superfile::SuperfileReader,
+    storage::{StorageError, StorageProvider, permission_denied_in_chain},
+    superfile::{FtsError, SuperfileReader},
     supertable::{
+        error::QueryError,
         manifest::{RoutingRef, SuperfileEntry, part::ContentHash},
         schema::{FieldId, LegacyNames},
     },
@@ -64,13 +65,38 @@ const BUILD_DF_BATCH_TERMS: usize = 8_192;
 #[derive(Debug, Error)]
 pub enum TermStatsError {
     #[error("term-stats storage error: {0}")]
-    Storage(String),
+    Storage(#[from] StorageError),
     #[error("term-stats artifact malformed: {0}")]
     Malformed(String),
     #[error("term-stats artifact hash mismatch")]
     HashMismatch,
-    #[error("term-stats build error: {0}")]
-    Build(String),
+    /// Opening a superfile to read its dictionary failed.
+    #[error("term-stats open: {0}")]
+    Open(#[source] QueryError),
+    /// Reading a superfile's dictionary or its document frequencies failed;
+    /// `what` names the read. Kept typed, so a refused credential under it
+    /// still reads as one.
+    #[error("term-stats {what} failed: {source}")]
+    Read {
+        what: &'static str,
+        source: FtsError,
+    },
+    /// A column's dictionary held a term that is not UTF-8, which the
+    /// artifact cannot key.
+    #[error("term-stats: a term in column {0:?} is not UTF-8")]
+    NonUtf8Term(String),
+}
+
+impl TermStatsError {
+    /// True when the backend refused the credentials in use, whether a
+    /// storage error under this one says so or the reader open already
+    /// classified it.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            TermStatsError::Open(e) => e.is_permission_denied(),
+            other => permission_denied_in_chain(other),
+        }
+    }
 }
 
 /// One decoded term-stats artifact: which superfiles its sums cover,
@@ -182,20 +208,29 @@ where
         let fst_bytes = fts
             .dict_bytes_async()
             .await
-            .map_err(|e| TermStatsError::Build(format!("dict fetch: {e}")))?;
+            .map_err(|source| TermStatsError::Read {
+                what: "dict fetch",
+                source,
+            })?;
         for (column, column_id) in &columns {
             let term_bytes = fts
                 .iter_column_terms_with(&fst_bytes, column)
-                .map_err(|e| TermStatsError::Build(format!("term walk: {e}")))?;
+                .map_err(|source| TermStatsError::Read {
+                    what: "term walk",
+                    source,
+                })?;
             let terms: Vec<&str> = term_bytes
                 .iter()
-                .map(|t| from_utf8(t).map_err(|_| TermStatsError::Build("non-utf8 term".into())))
+                .map(|t| from_utf8(t).map_err(|_| TermStatsError::NonUtf8Term(column.clone())))
                 .collect::<Result<_, _>>()?;
             for chunk in terms.chunks(BUILD_DF_BATCH_TERMS) {
-                let (dfs, _work) = fts
-                    .term_dfs_with(&fst_bytes, column, chunk)
-                    .await
-                    .map_err(|e| TermStatsError::Build(format!("df batch: {e}")))?;
+                let (dfs, _work) =
+                    fts.term_dfs_with(&fst_bytes, column, chunk)
+                        .await
+                        .map_err(|source| TermStatsError::Read {
+                            what: "df batch",
+                            source,
+                        })?;
                 for (term, df) in chunk.iter().zip(dfs) {
                     *merged.entry(column_id.term_key(term)).or_insert(0) += df;
                 }
@@ -219,7 +254,7 @@ pub(crate) async fn write(
         bytes,
     )
     .await
-    .map_err(|e| TermStatsError::Storage(e.to_string()))
+    .map_err(TermStatsError::from)
 }
 
 /// Fetch + verify + decode the artifact a manifest references.
@@ -227,10 +262,7 @@ pub(crate) async fn load(
     storage: &dyn StorageProvider,
     reference: &RoutingRef,
 ) -> Result<TermStatsSidecar, TermStatsError> {
-    let (bytes, _meta) = storage
-        .get(&reference.uri)
-        .await
-        .map_err(|e| TermStatsError::Storage(e.to_string()))?;
+    let (bytes, _meta) = storage.get(&reference.uri).await?;
     if ContentHash::of(bytes.as_ref()) != reference.content_hash {
         return Err(TermStatsError::HashMismatch);
     }
@@ -370,7 +402,7 @@ mod tests {
         let open_indexed = |_e: &Arc<SuperfileEntry>| async {
             SuperfileReader::open(indexed_superfile_bytes())
                 .map(Arc::new)
-                .map_err(|e| TermStatsError::Build(e.to_string()))
+                .map_err(|e| TermStatsError::Open(QueryError::from(e)))
         };
 
         // A stamped column needs no name map: the footer's id keys it.
@@ -414,12 +446,17 @@ mod tests {
     async fn build_propagates_an_open_failure() {
         let entries = vec![entry()];
         let result = build(&entries, &LegacyNames::none(), |_entry| async {
-            Err(TermStatsError::Build("open refused".into()))
+            Err(TermStatsError::Open(QueryError::PermissionDenied(
+                "open refused".into(),
+            )))
         })
         .await;
         assert!(
-            matches!(result, Err(TermStatsError::Build(m)) if m.contains("open refused")),
-            "the opener's error must propagate"
+            matches!(
+                result,
+                Err(TermStatsError::Open(QueryError::PermissionDenied(_)))
+            ),
+            "the opener's error must propagate, typed"
         );
     }
 
@@ -455,7 +492,7 @@ mod tests {
             async move {
                 SuperfileReader::open(bytes)
                     .map(Arc::new)
-                    .map_err(|e| TermStatsError::Build(e.to_string()))
+                    .map_err(|e| TermStatsError::Open(QueryError::Store(e.to_string())))
             }
         })
         .await

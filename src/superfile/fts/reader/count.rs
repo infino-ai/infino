@@ -301,7 +301,7 @@ impl FtsReader {
                 if cursors.len() != tokens.len() {
                     return Vec::new();
                 }
-                self.collect_and_intersect(column_id, cursors)
+                self.collect_and_intersect(cursors)
             }
             BoolMode::Or => or_merge_unranked(cursors)
                 .into_iter()
@@ -351,7 +351,7 @@ impl FtsReader {
                 if cursors.len() != tokens.len() {
                     return 0;
                 }
-                self.count_and_intersect(column_id, cursors)
+                self.count_and_intersect(cursors)
             }
             BoolMode::Or => or_count_unranked(cursors),
         });
@@ -487,7 +487,7 @@ impl FtsReader {
                 .iter()
                 .map(|&i| from_utf8(&out[i].0))
                 .collect::<Result<Vec<&str>, _>>()
-                .map_err(|_| FtsError::Read(ReadError::MalformedVersion("non-utf8 term".into())))?;
+                .map_err(|_| FtsError::Read(ReadError::Malformed("non-utf8 term".into())))?;
             self.term_index_facts_with(fst_bytes, column, &terms)
                 .await?
         };
@@ -587,7 +587,7 @@ impl FtsReader {
             let (decoded, decode_ns) = timed_section(|| {
                 for (fetched_idx, &(slot, short)) in pfor_slots.iter().enumerate() {
                     let header = fetched.get(fetched_idx).ok_or_else(|| {
-                        FtsError::Read(ReadError::MalformedVersion(
+                        FtsError::Read(ReadError::Malformed(
                             "term_dfs: fetched fewer headers than requested".into(),
                         ))
                     })?;
@@ -595,14 +595,14 @@ impl FtsReader {
                     let header_bytes = header.as_ref();
                     if short {
                         dfs[slot] = u64::from(short_df(header_bytes).ok_or_else(|| {
-                            FtsError::Read(ReadError::MalformedVersion(
-                                "term_dfs: malformed short-form term body".into(),
+                            FtsError::Read(ReadError::Malformed(
+                                "term_dfs: short-form term body does not decode".into(),
                             ))
                         })?);
                         continue;
                     }
                     if header_bytes.len() < U32_BYTES {
-                        return Err(FtsError::Read(ReadError::MalformedVersion(
+                        return Err(FtsError::Read(ReadError::Malformed(
                             "term_dfs: short postings header".into(),
                         )));
                     }
@@ -671,8 +671,8 @@ impl FtsReader {
         let bytes = fetched.pop().expect("one fetched range for one PFOR term");
         if short {
             let df = short_df(bytes.as_ref()).ok_or_else(|| {
-                FtsError::Read(ReadError::MalformedVersion(
-                    "term_layout: malformed short-form term body".into(),
+                FtsError::Read(ReadError::Malformed(
+                    "term_layout: short-form term body does not decode".into(),
                 ))
             })?;
             return Ok(Some(TermLayout {
@@ -711,7 +711,7 @@ impl FtsReader {
                 ENCODING_PATCHED => layout.patched_blocks += 1,
                 ENCODING_BITSET => layout.bitset_blocks += 1,
                 other => {
-                    return Err(FtsError::Read(ReadError::MalformedVersion(format!(
+                    return Err(FtsError::Read(ReadError::Malformed(format!(
                         "term_layout: block {b} carries unknown encoding {other}"
                     ))));
                 }

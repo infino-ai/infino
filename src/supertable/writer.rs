@@ -113,7 +113,7 @@ use crate::{
     },
     storage::{StorageError, StorageProvider},
     superfile::{
-        BuildError as SuperfileBuildError, ReadError, SuperfileReader,
+        BuildError as SuperfileBuildError, FtsError, ReadError, SuperfileReader,
         builder::{BuilderOptions, SuperfileBuilder, VectorConfig},
         format::{
             CRC_BYTES,
@@ -3291,7 +3291,8 @@ impl PreparedSuperfile {
 /// already — the totals landed in one and not the other — and a
 /// superfile whose summary omits them silently disables table-wide
 /// statistics for the whole manifest, which is a ranking change with no
-/// error attached.
+/// error attached. For the same reason a dictionary or length array that
+/// cannot be read is an error here, never an empty summary.
 /// Per-vector-column centroid summary (fp32 + 1-bit admit slab; see
 /// [`build_column_vector_summary`]). `None` from the reader → column
 /// absent from this superfile's vector blob → no entry in the map.
@@ -3317,15 +3318,13 @@ pub(crate) fn build_vector_summary(
 pub(crate) fn build_fts_summary(
     reader: &SuperfileReader,
     manifest: &ManifestSnapshot,
-) -> HashMap<FieldId, FtsSummaryAgg> {
+) -> Result<HashMap<FieldId, FtsSummaryAgg>, FtsError> {
     let mut out: HashMap<FieldId, FtsSummaryAgg> = HashMap::new();
     let Some(fts_reader) = reader.fts() else {
-        return out;
+        return Ok(out);
     };
     for fc in &manifest.fts_configs() {
-        let terms = fts_reader
-            .iter_column_terms(&fc.column)
-            .expect("FST bytes valid: superfile just built");
+        let terms = fts_reader.iter_column_terms(&fc.column)?;
         let n_terms_distinct = terms.len() as u32;
         let (min_term, max_term) = match (terms.first(), terms.last()) {
             (Some(min), Some(max)) => (min.clone(), max.clone()),
@@ -3346,8 +3345,12 @@ pub(crate) fn build_fts_summary(
             }
             bloom_builder.finish()
         });
+        // Recorded here so table-wide BM25 statistics are a fold over the
+        // manifest instead of a fan-out that reopens every superfile; an
+        // unreadable length array fails the summary rather than recording
+        // zeros there.
         let length_stats = fts_reader
-            .column_length_stats(&fc.column)
+            .column_length_stats(&fc.column)?
             .expect("column just registered in this superfile's FTS index");
         let Some(id) = manifest.field_id(&fc.column) else {
             continue;
@@ -3371,7 +3374,7 @@ pub(crate) fn build_fts_summary(
             ),
         );
     }
-    out
+    Ok(out)
 }
 
 /// Spill this superfile's term-index contribution from a reader over its
@@ -3554,7 +3557,8 @@ pub(super) fn prepare_superfile_named(
     // `manifest` is the one the shard was built under — the commit's, which
     // may carry columns and indexes the committed list does not have yet —
     // so a column indexed from its first file is summarised from that file.
-    let fts_summary = build_fts_summary(&reader, manifest);
+    let fts_summary = build_fts_summary(&reader, manifest)
+        .map_err(|e| BuildError::Store(format!("summarizing superfile: {e}")))?;
     let vector_summary = build_vector_summary(&reader, manifest);
 
     // capture `(total_size, vec_off/len, fts_off/len)`
@@ -10224,14 +10228,11 @@ pub(in crate::supertable) async fn stamp_term_stats(
                         ReadIntent::Stream,
                     )
                     .await
-                    .map_err(|e| term_stats::TermStatsError::Build(e.to_string()))
+                    .map_err(term_stats::TermStatsError::Open)
                 }
             })
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-            let reference = term_stats::write(storage.as_ref(), bytes)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+            .await?;
+            let reference = term_stats::write(storage.as_ref(), bytes).await?;
             if old.term_stats_blob() == Some(&reference) {
                 return Ok(None);
             }

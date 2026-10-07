@@ -1293,10 +1293,11 @@ impl SupertableReader {
                 .map(|e| e.superfile_id)
                 .collect();
             let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(misses.len());
-            for t in &misses {
-                let postings = index.postings(column_id, t).await.map_err(|e| {
-                    QueryError::Store(format!("term index unreadable for global stats: {e}"))
-                })?;
+            let asked: Vec<&str> = misses.iter().map(String::as_str).collect();
+            let runs = index.postings_many(column_id, &asked).await.map_err(|e| {
+                QueryError::Store(format!("term index unreadable for global stats: {e}"))
+            })?;
+            for (t, postings) in misses.iter().zip(runs) {
                 let df: u64 = postings
                     .iter()
                     .filter(|p| {

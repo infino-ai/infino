@@ -224,12 +224,12 @@ pub fn score(idf_t: f32, tf: u32, dl: u32, avgdl: f32, params: Bm25Params) -> f3
 /// BM25 score using a precomputed `dl_norm_k1 = K1 * (1 - B + B * dl/avgdl)`
 /// and `idf_weight = idf` (folding in any query-term-frequency weight).
 ///
-/// Both `dl_norm_k1` (per doc) and `idf_weight` (per cursor) are
-/// computed once at reader open / cursor build. The hot inner loop
-/// drops to a single multiply + add + divide per call.
+/// Both `dl_norm_k1` (per doc, when the column's norms are first built)
+/// and `idf_weight` (per cursor, at cursor build) are computed once. The
+/// hot inner loop drops to a single multiply + add + divide per call.
 ///
 /// Caller invariant: `tf > 0` (callers gate on posting list membership)
-/// and `dl_norm_k1 > 0` (precomputed positive at reader open, since
+/// and `dl_norm_k1 > 0` (precomputed positive with the norms, since
 /// `K1 > 0` and `1 - B + B * dl/avgdl > 0` for any non-negative dl).
 /// So the denominator is always positive.
 #[inline(always)]

@@ -328,8 +328,9 @@ impl SuperfileReader {
             )));
         }
         let version_str = kv_map.get(kv::FORMAT_VERSION).expect("checked above");
-        let version = format::Version::parse(version_str)
-            .ok_or_else(|| ReadError::MalformedVersion(version_str.clone()))?;
+        let version = format::Version::parse(version_str).ok_or_else(|| {
+            ReadError::Malformed(format!("format-version {version_str:?} does not parse"))
+        })?;
         if !version.is_compatible_with_current() {
             return Err(ReadError::UnsupportedVersion(version_str.clone()));
         }
@@ -463,8 +464,9 @@ impl SuperfileReader {
             )));
         }
         let version_str = kv_map.get(kv::FORMAT_VERSION).expect("checked above");
-        let version = format::Version::parse(version_str)
-            .ok_or_else(|| ReadError::MalformedVersion(version_str.clone()))?;
+        let version = format::Version::parse(version_str).ok_or_else(|| {
+            ReadError::Malformed(format!("format-version {version_str:?} does not parse"))
+        })?;
         if !version.is_compatible_with_current() {
             return Err(ReadError::UnsupportedVersion(version_str.clone()));
         }
@@ -3576,6 +3578,19 @@ mod tests {
         let bytes = superfile_with_kv(&kvs);
         let err = SuperfileReader::open(bytes).expect_err("expected error");
         assert!(matches!(err, ReadError::UnsupportedVersion(_)));
+    }
+
+    #[test]
+    fn open_with_rejects_a_format_version_that_does_not_parse() {
+        // Not a version at all: a malformed file, not one from another version.
+        let mut kvs = required_kv();
+        kvs[1] = (kv::FORMAT_VERSION.into(), "not-a-version".into());
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(
+            matches!(&err, ReadError::Malformed(m) if m.contains("not-a-version")),
+            "got {err:?}"
+        );
     }
 
     #[test]

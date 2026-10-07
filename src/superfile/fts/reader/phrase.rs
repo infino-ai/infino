@@ -110,8 +110,8 @@ impl PhraseMember {
                 self.group_index
                     .locate(&self.positions, &mut at, tfs)
                     .ok_or_else(|| {
-                        FtsError::Read(ReadError::MalformedVersion(
-                            "position group truncated or malformed".into(),
+                        FtsError::Read(ReadError::Malformed(
+                            "position group truncated or undecodable".into(),
                         ))
                     })?;
                 self.group_block = block;
@@ -124,7 +124,7 @@ impl PhraseMember {
                     &mut self.pos_scratch,
                 )
                 .ok_or_else(|| {
-                    FtsError::Read(ReadError::MalformedVersion(
+                    FtsError::Read(ReadError::Malformed(
                         "position run truncated or overflowing".into(),
                     ))
                 })?;
@@ -151,7 +151,7 @@ impl PhraseMember {
             }
             for p in from_pair..pair {
                 skip_run(&self.positions, &mut at, self.cursor.block_tfs[p]).ok_or_else(|| {
-                    FtsError::Read(ReadError::MalformedVersion(
+                    FtsError::Read(ReadError::Malformed(
                         "position runs truncated within block".into(),
                     ))
                 })?;
@@ -167,7 +167,7 @@ impl PhraseMember {
                 &mut self.pos_scratch,
             )
             .ok_or_else(|| {
-                FtsError::Read(ReadError::MalformedVersion(
+                FtsError::Read(ReadError::Malformed(
                     "position run truncated or overflowing".into(),
                 ))
             })?;
@@ -184,7 +184,7 @@ impl PhraseMember {
             for i in 0..self.cursor.block_n {
                 self.run_offsets.push(at as u32);
                 skip_run(&self.positions, &mut at, self.cursor.block_tfs[i]).ok_or_else(|| {
-                    FtsError::Read(ReadError::MalformedVersion(
+                    FtsError::Read(ReadError::Malformed(
                         "position runs truncated within block".into(),
                     ))
                 })?;
@@ -199,7 +199,7 @@ impl PhraseMember {
             &mut self.pos_scratch,
         )
         .ok_or_else(|| {
-            FtsError::Read(ReadError::MalformedVersion(
+            FtsError::Read(ReadError::Malformed(
                 "position run truncated or overflowing".into(),
             ))
         })?;

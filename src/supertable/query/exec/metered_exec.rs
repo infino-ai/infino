@@ -103,11 +103,11 @@ impl MeteredExec {
     /// selections, and a scan-level limit lets the Parquet opener's limit
     /// pruning replace those selections with whole row groups that the
     /// predicate's statistics prove "fully matching" — returning deleted
-    /// rows. With the `FilterExec` folded into the scan as a row filter,
-    /// nothing else above the scan would hold the fetch, so this node
-    /// refuses it and DataFusion keeps a limit node above instead. The
-    /// provider pushes its own scan-level limit only for filter-less
-    /// scans, where no predicate can mark a row group fully matching.
+    /// rows. With a `FilterExec` above the scan the fetch lives there. An
+    /// exact filter leaves no `FilterExec`, so this node refuses the fetch
+    /// and the limit node above keeps it. The provider pushes its own
+    /// scan-level limit only for filter-less scans, where no predicate can
+    /// mark a row group fully matching.
     pub(crate) fn without_limit_pushdown(
         input: Arc<dyn ExecutionPlan>,
         op_stats: Option<Arc<OpStatsCollector>>,

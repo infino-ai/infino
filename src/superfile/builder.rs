@@ -1554,7 +1554,7 @@ impl SuperfileBuilder {
                     return Ok(());
                 };
                 let term_str = from_utf8(term).map_err(|_| {
-                    FtsError::Read(ReadError::MalformedVersion(
+                    FtsError::Read(ReadError::Malformed(
                         "non-utf8 term in FTS merge input".into(),
                     ))
                 })?;
@@ -1566,7 +1566,7 @@ impl SuperfileBuilder {
                     fb.add_prebuilt_term_posting(column_id, term_str, out_doc, tf, positions)
                 {
                     push_err = Some(e);
-                    return Err(FtsError::Read(ReadError::MalformedVersion(
+                    return Err(FtsError::Read(ReadError::Malformed(
                         "prebuilt push aborted".into(),
                     )));
                 }
