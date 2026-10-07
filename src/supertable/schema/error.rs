@@ -136,6 +136,21 @@ pub enum SchemaError {
         column: String,
     },
 
+    /// A document carries a key a declared struct column does not have. A
+    /// top-level key the table has not seen adds a column; a struct's fields
+    /// are the table's, so an undeclared one is a mistake rather than a
+    /// field to add, and dropping it would lose the value silently.
+    #[error(
+        "column `{column}` has no field `{field}`; a struct column's fields are \
+         the ones it was declared with, so add it with a schema change first"
+    )]
+    UnknownStructField {
+        /// The struct column.
+        column: String,
+        /// The key the document carried that it does not declare.
+        field: String,
+    },
+
     /// An element of an array of objects carries an array of its own. The
     /// leaves of an array of objects line up one position per element, so
     /// that reading one position across them reads one element; a nested

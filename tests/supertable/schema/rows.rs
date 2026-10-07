@@ -219,20 +219,19 @@ fn every_refusal_names_the_schema_write_that_admits_the_rows() {
     docs.append_rows(&[json!({"title": "a", "n": 1})])
         .expect("n is Int64 from here");
 
-    // A fraction, `5.0` and a string are all refused on an Int64 path, and
-    // a retype to Float64 admits the numbers.
+    // A fraction is refused on an Int64 path, and a retype to Float64 admits
+    // it. `5.0` and `"42"` are not fractions: JSON has one number type, so a
+    // producer that round-trips through a double writes the first and one
+    // avoiding a double's precision loss writes the second. Both name the
+    // integer they wrote, and are stored as it.
     schema_error(
         docs.append_rows(&[json!({"title": "b", "n": 1.5})]),
         "Int64",
     );
-    schema_error(
-        docs.append_rows(&[json!({"title": "b", "n": 5.0})]),
-        "Int64",
-    );
-    schema_error(
-        docs.append_rows(&[json!({"title": "b", "n": "42"})]),
-        "Int64",
-    );
+    docs.append_rows(&[json!({"title": "i", "n": 5.0})])
+        .expect("`5.0` names the integer 5");
+    docs.append_rows(&[json!({"title": "j", "n": "42"})])
+        .expect("`\"42\"` names the integer 42");
     db.apply_schema(
         TABLE,
         &SchemaPatch::new(vec![FieldPatch::named("n").with_type(DataType::Float64)]),
@@ -244,7 +243,7 @@ fn every_refusal_names_the_schema_write_that_admits_the_rows() {
         json!({"title": "c", "n": 5}),
     ])
     .expect("floats and integral literals fit a Float64 column");
-    assert_eq!(column(&db, "n"), vec!["1", "1.5", "5"]);
+    assert_eq!(column(&db, "n"), vec!["1", "5", "42", "1.5", "5"]);
 
     // A mixed array is refused outright.
     schema_error(
@@ -397,14 +396,15 @@ fn an_array_inside_an_array_of_objects_is_refused() {
     .expect("scalar leaves are positional");
 }
 
-/// Documents flatten to dot paths, so a document nesting under a column the
-/// table already has cannot fill it: `{"a": {"b": 1}}` against a declared
-/// `a: Struct{b}` used to leave the struct null and put the value in a
-/// second column called `a.b`, which only a quoted name could read, while
-/// the natural `SELECT a.b` resolved to the struct's field and returned
-/// null. The value went where the caller was not looking, silently.
+/// A document fills a struct column the table declares. Documents flatten to
+/// dot paths, so `{"a": {"b": 1}}` against a declared `a: Struct{b}` used to
+/// put the value in a second column called `a.b`, which only a quoted name
+/// could read, while the natural `SELECT a.b` resolved to the struct's field
+/// and returned null: the value went where the caller was not looking. The
+/// flattening now stops at the struct and the object fills it, so the value
+/// is where `SELECT a.b` reads it and no shadow column exists.
 #[test]
-fn a_document_nesting_under_a_live_column_is_refused() {
+fn a_document_fills_a_struct_column_it_names() {
     let db = connect("memory://").expect("connect");
     let struct_type =
         DataType::Struct(vec![Arc::new(Field::new("b", DataType::Int64, true))].into());
@@ -419,9 +419,53 @@ fn a_document_nesting_under_a_live_column_is_refused() {
         )
         .expect("create");
 
+    docs.append_rows(&[json!({"title": "x", "a": {"b": 1}})])
+        .expect("the document fills the struct it names");
+
+    // No shadow column was created, and the value reads back where the
+    // natural name resolves.
+    let doc = db.schema(TABLE).expect("schema");
+    let names: Vec<&str> = doc.fields().iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["title", "a"]);
+    // Unquoted, so SQL resolves it as the struct's field rather than a
+    // column whose name contains a dot — which is the read that used to
+    // return null while the value sat in the shadow column.
+    let batches = db
+        .query_sql(&format!("SELECT a.b FROM {TABLE}"))
+        .expect("query the struct field");
+    let field = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("b is Int64");
+    assert_eq!(field.value(0), 1);
+
+    // A key the struct does not declare is still refused: its fields are the
+    // table's, and storing the row without the key would lose the value.
     let err = docs
-        .append_rows(&[json!({"title": "x", "a": {"b": 1}})])
-        .expect_err("the document nests under a live column");
+        .append_rows(&[json!({"title": "z", "a": {"c": 2}})])
+        .expect_err("`c` is not a field of the struct");
+    assert!(
+        matches!(
+            &err,
+            InfinoError::Schema(SchemaError::UnknownStructField { column, field })
+                if column == "a" && field == "c"
+        ),
+        "{err:?}"
+    );
+
+    // A scalar column is still not filled by an object: there is no shape to
+    // put one in, so the flattening and its refusal stand.
+    let flat = db
+        .create_table(
+            "flat",
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)])),
+            IndexSpec::new(),
+        )
+        .expect("create");
+    let err = flat
+        .append_rows(&[json!({"a": {"b": 1}})])
+        .expect_err("an object does not fill a scalar column");
     assert!(
         matches!(
             &err,
@@ -430,11 +474,6 @@ fn a_document_nesting_under_a_live_column_is_refused() {
         ),
         "{err:?}"
     );
-
-    // The table is untouched: no shadow column was created.
-    let doc = db.schema(TABLE).expect("schema");
-    let names: Vec<&str> = doc.fields().iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, vec!["title", "a"]);
 
     // A path that nests under nothing is still free to join.
     docs.append_rows(&[json!({"title": "y", "meta": {"source": "s"}})])

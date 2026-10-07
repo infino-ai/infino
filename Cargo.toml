@@ -117,7 +117,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
 [dependencies]
 # Format / parquet
 arrow = "58"
-arrow-array = "58"
+# `chrono-tz` resolves a named time zone (`America/New_York`) to its
+# offsets. The JSON row mapper needs it to read a naive timestamp string
+# as the wall clock of its column's zone; without it such a string would
+# silently land hours away. Already in the graph through datafusion, named
+# here so a change there cannot take it away.
+arrow-array = { version = "58", features = ["chrono-tz"] }
 arrow-schema = "58"
 parquet = { version = "58", features = ["async", "object_store"] }
 

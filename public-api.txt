@@ -400,6 +400,9 @@ pub infino::SchemaError::TypeRequired
 pub infino::SchemaError::TypeRequired::column: alloc::string::String
 pub infino::SchemaError::UnknownFieldId
 pub infino::SchemaError::UnknownFieldId::id: infino::FieldId
+pub infino::SchemaError::UnknownStructField
+pub infino::SchemaError::UnknownStructField::column: alloc::string::String
+pub infino::SchemaError::UnknownStructField::field: alloc::string::String
 pub infino::SchemaError::ValueOutOfRange
 pub infino::SchemaError::ValueOutOfRange::column: alloc::string::String
 pub infino::SchemaError::ValueOutOfRange::data_type: alloc::string::String
