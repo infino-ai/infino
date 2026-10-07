@@ -190,6 +190,18 @@ impl ReadError {
             _ => None,
         }
     }
+
+    /// Whether this, or the read error a vector or FTS error wraps, is the
+    /// engine breaking its own invariant: a doc id past the superfile's end,
+    /// or a read called on a codec it does not support. Retrying cannot help.
+    pub(crate) fn is_internal(&self) -> bool {
+        match self {
+            ReadError::DocIdOutOfRange { .. } | ReadError::WrongCodecPath(_) => true,
+            ReadError::Vector(v) => matches!(v.as_ref(), VectorError::Read(r) if r.is_internal()),
+            ReadError::Fts(f) => matches!(f.as_ref(), FtsError::Read(r) if r.is_internal()),
+            _ => false,
+        }
+    }
 }
 
 impl From<FtsError> for ReadError {

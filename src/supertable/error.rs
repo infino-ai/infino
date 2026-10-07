@@ -708,7 +708,7 @@ impl From<QueryError> for DataFusionError {
 /// | over the connection's memory budget | `OverBudget` |
 /// | an FTS query the column cannot answer: a phrase without positions, nothing positive to rank | `InvalidQuery`: the caller's |
 /// | the store refused our credentials | `PermissionDenied` |
-/// | a local doc id past the superfile's end: our bug, retrying cannot help | `Internal` |
+/// | a local doc id past the superfile's end, or a read called on a codec it does not support: our bug, retrying cannot help | `Internal` |
 /// | anything else | `Parquet`: a read failed |
 impl From<ReadError> for QueryError {
     fn from(e: ReadError) -> Self {
@@ -726,10 +726,7 @@ impl From<ReadError> for QueryError {
         if permission_denied_in_chain(&e) {
             return QueryError::PermissionDenied(e.to_string());
         }
-        if matches!(
-            e,
-            ReadError::DocIdOutOfRange { .. } | ReadError::WrongCodecPath(_)
-        ) {
+        if e.is_internal() {
             return QueryError::Internal(e.to_string());
         }
         QueryError::Parquet(e.to_string())
@@ -914,9 +911,12 @@ mod tests {
             }),
             QueryError::Internal(_)
         ));
-        // So is asking a read path for a codec it does not support.
+        // So is asking a read path for a codec it does not support, which
+        // the vector reader raises wrapped in its own error.
         assert!(matches!(
-            QueryError::from(ReadError::WrongCodecPath("fp32 only".into())),
+            QueryError::from(VectorError::Read(ReadError::WrongCodecPath(
+                "fp32 only".into()
+            ))),
             QueryError::Internal(_)
         ));
     }

@@ -917,8 +917,7 @@ impl VectorReader {
             })?;
             if !rerank_codec.is_implemented() {
                 return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
-                    "rerank codec {} in column '{}'; this build reads `fp32`, \
-                     `sq8_residual`, `sq8_fixed_residual`, `sq16`, `sq16_adaptive`, `rabitq_only`",
+                    "rerank codec {} in column '{}'",
                     rerank_codec.name(),
                     cfg.column
                 ))));
