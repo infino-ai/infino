@@ -46,8 +46,6 @@ use crate::utils::{
 };
 
 pub(crate) mod value;
-/// [`DictEntry`] under the name the supertable FTS query path imports.
-pub(crate) use value::DictEntry as FstValue;
 pub(crate) use value::{DictEntry, INLINE_TF_MAX};
 
 /// Reserved separator byte inside dictionary keys (`<column>\x1F<term>`).

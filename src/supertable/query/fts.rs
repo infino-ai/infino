@@ -136,7 +136,7 @@ use crate::{
         tombstones::SidecarCache,
     },
     utils::{
-        terms::{FstValue, make_key},
+        terms::{DictEntry, make_key},
         trace::{self, detail_span, tiered_span},
     },
 };
@@ -513,7 +513,7 @@ pub(crate) async fn memo_from_locations(
     superfile: Uuid,
 ) -> Option<Arc<FetchedTermMemo>> {
     let located = locations.by_superfile.get(&superfile)?;
-    let pairs: Vec<(&str, u64, FstValue)> = located
+    let pairs: Vec<(&str, u64, DictEntry)> = located
         .iter()
         .filter_map(|(t, df, loc)| loc.to_dict_value().map(|v| (t.as_str(), *df, v)))
         .collect();
