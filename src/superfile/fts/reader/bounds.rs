@@ -151,10 +151,10 @@ impl BoundDecoder {
         }
     }
 
-    /// A decoder for a cursor that only counts matches and never scores: its
-    /// bounds are never compared, so it needs neither the idf nor the
-    /// column's bound scale, which on a file older than V6 is computed from
-    /// norms the count-only build must not read.
+    /// A decoder for an unscored cursor (built to match or count, never to
+    /// rank): its bounds are never compared, so it needs neither the idf nor
+    /// the column's bound scale, which on a file older than V6 is computed
+    /// from norms an unscored build must not read.
     pub(super) fn unscored(stored: StoredBound) -> Self {
         Self { stored, scale: 1.0 }
     }

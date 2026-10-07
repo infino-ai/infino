@@ -270,9 +270,11 @@ impl SuperfileReader {
     /// 2. **3-4 GETs** for the embedded vector subsection, via
     ///    `VectorReader::open_lazy` (outer header, directory + CRC,
     ///    subsection headers, and Sq8 codec_meta when present).
-    /// 3. **3 GETs** for the embedded FTS subsection, via
-    ///    `FtsReader::open_lazy` (header, FST dictionary, doc-length
-    ///    tail; postings stay lazy until search).
+    /// 3. **2-3 GETs** for the embedded FTS subsection, via
+    ///    `FtsReader::open_lazy` (header, doc-lengths directory, and the
+    ///    doc-id map when the file has one; the dictionary, each column's
+    ///    length array and the postings stay lazy until a query needs
+    ///    them).
     ///
     /// Total open budget is small exact metadata ranges rather than
     /// whole-subsection/speculative slabs. Subsequent vector queries

@@ -15,7 +15,7 @@ use rustc_hash::FxHashMap;
 use super::{
     bounds::BoundDecoder,
     core::*,
-    cursor::{SubindexKind, TermCursor, TermMeta},
+    cursor::{CursorUse, SubindexKind, TermCursor, TermMeta},
     filter::{AtomExcludeFilter, ExcludeFilter},
     options::BoolMode,
     phrase::AnyCursor,
@@ -586,6 +586,7 @@ impl FtsReader {
                     lists.must_phrases,
                     lists.global_idf,
                     lists.prefetched,
+                    CursorUse::Score,
                 )
                 .await?;
             if must_atoms.iter().any(Option::is_none) {
@@ -607,6 +608,7 @@ impl FtsReader {
                     lists.should_phrases,
                     lists.global_idf,
                     lists.prefetched,
+                    CursorUse::Score,
                 )
                 .await?;
             let should_atoms: Vec<AnyCursor> = should_built.into_iter().flatten().collect();
@@ -619,6 +621,7 @@ impl FtsReader {
                     lists.negative_phrases,
                     None,
                     None,
+                    CursorUse::Match,
                 )
                 .await?;
             let negative_atoms: Vec<AnyCursor> = negative_built.into_iter().flatten().collect();
@@ -663,12 +666,12 @@ impl FtsReader {
             });
         }
 
-        // Negatives are a hard exclusion filter, not scored, so their
-        // idf is irrelevant — always build them with local stats.
+        // Negatives are a hard exclusion filter that only seeks doc ids, so
+        // they are built to count: no tfs, idf or bounds.
         let neg_cursors = match lists.negatives {
             [] => Vec::new(),
             negatives => {
-                self.build_term_cursors(column_id, negatives, None, false, None, None)
+                self.build_term_cursors(column_id, negatives, None, CursorUse::Count, None, None)
                     .await?
             }
         };
@@ -744,7 +747,7 @@ impl FtsReader {
                     column_id,
                     &shoulds,
                     lists.global_idf,
-                    false,
+                    CursorUse::Score,
                     Some(&should_qtf),
                     lists.prefetched,
                 )
@@ -777,7 +780,7 @@ impl FtsReader {
                 column_id,
                 &musts,
                 lists.global_idf,
-                false,
+                CursorUse::Score,
                 Some(&must_qtf),
                 lists.prefetched,
             )
@@ -813,7 +816,7 @@ impl FtsReader {
                 column_id,
                 &shoulds,
                 lists.global_idf,
-                false,
+                CursorUse::Score,
                 Some(&should_qtf),
                 lists.prefetched,
             )
@@ -1011,8 +1014,15 @@ impl FtsReader {
         let cursors = if terms.is_empty() {
             Vec::new()
         } else {
-            self.build_term_cursors(column_id, terms, global_idf, false, None, prefetched)
-                .await?
+            self.build_term_cursors(
+                column_id,
+                terms,
+                global_idf,
+                CursorUse::Score,
+                None,
+                prefetched,
+            )
+            .await?
         };
         Ok(OrCursorSet { column_id, cursors })
     }
@@ -1558,14 +1568,12 @@ impl FtsReader {
         column_id: u32,
         terms: &[&str],
         global_idf: Option<&GlobalTermIdf>,
-        count_only: bool,
+        purpose: CursorUse,
         qtf: Option<&[u32]>,
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<Vec<TermCursor>, FtsError> {
         Ok(self
-            .build_term_cursors_opt(
-                column_id, terms, global_idf, count_only, qtf, prefetched, None,
-            )
+            .build_term_cursors_opt(column_id, terms, global_idf, purpose, qtf, prefetched, None)
             .await?
             .into_iter()
             .flatten()
@@ -1692,15 +1700,15 @@ impl FtsReader {
         column_id: u32,
         terms: &[&str],
         global_idf: Option<&GlobalTermIdf>,
-        count_only: bool,
+        purpose: CursorUse,
         qtf: Option<&[u32]>,
         prefetched: Option<&FetchedTermMemo>,
         dict_bytes: Option<&[u8]>,
     ) -> Result<Vec<Option<TermCursor>>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
-        // Scoring needs the column's norms; a match-only build does not,
+        // Scoring needs the column's norms; an unscored build does not,
         // and must not read the length array for them.
-        if !count_only {
+        if purpose.scores() {
             self.ensure_norms(column_id).await?;
         }
 
@@ -1800,18 +1808,8 @@ impl FtsReader {
                     gidf,
                 }) => {
                     let tf = col_meta.inline_tf(tf);
-                    // A match-only cursor never scores; a fixed idf keeps it
-                    // from consulting the column's statistics or norms.
-                    let (n_scored, dl_norm_k1, gidf) = match count_only {
-                        true => (0, 1.0, Some(0.0)),
-                        false => (
-                            col_meta.scored_doc_count(),
-                            col_meta.dl_norm_k1().get(doc_id),
-                            gidf,
-                        ),
-                    };
                     cursors.push(Some(TermCursor::new_inline(
-                        doc_id, tf, n_scored, dl_norm_k1, gidf, weight,
+                        doc_id, tf, col_meta, gidf, weight, purpose,
                     )));
                 }
                 Some(Resolved::Memo {
@@ -1832,7 +1830,7 @@ impl FtsReader {
                         gidf,
                         weight,
                         header_probed,
-                        count_only,
+                        purpose,
                     )?));
                 }
                 Some(Resolved::Inline { doc_id, tf, gidf }) => {
@@ -1840,18 +1838,8 @@ impl FtsReader {
                     // (Phrase members recover the position itself with
                     // their own FST lookup — see `build_atom_cursors`.)
                     let tf = col_meta.inline_tf(tf);
-                    // A match-only cursor never scores; a fixed idf keeps it
-                    // from consulting the column's statistics or norms.
-                    let (n_scored, dl_norm_k1, gidf) = match count_only {
-                        true => (0, 1.0, Some(0.0)),
-                        false => (
-                            col_meta.scored_doc_count(),
-                            col_meta.dl_norm_k1().get(doc_id),
-                            gidf,
-                        ),
-                    };
                     let cursor =
-                        TermCursor::new_inline(doc_id, tf, n_scored, dl_norm_k1, gidf, weight);
+                        TermCursor::new_inline(doc_id, tf, col_meta, gidf, weight, purpose);
                     cursors.push(Some(cursor));
                 }
                 Some(Resolved::Pfor {
@@ -1868,7 +1856,7 @@ impl FtsReader {
                         gidf,
                         weight,
                         header_probed,
-                        count_only,
+                        purpose,
                     )?));
                 }
             }
