@@ -576,8 +576,6 @@ impl SupertableReader {
     /// `pub(crate)` async kernel — the public surface is the sync
     /// [`SupertableReader::bm25_search`], which drives this via the
     /// sync→async bridge.
-    ///
-    /// [`AsciiLowerTokenizer`]: crate::superfile::fts::tokenize::AsciiLowerTokenizer
     /// Reject an out-of-range query-time override before the fan-out
     /// starts. A declared pair is validated at `create_table`; this is
     /// the same check for the per-search form, so a caller sees the
@@ -1388,7 +1386,7 @@ impl SupertableReader {
 
     /// Prefix-expanded BM25 search across the pinned manifest's
     /// superfiles. The prefix is ASCII-lowercased before expansion
-    /// (matching the v1 tokenizer) and expanded per-superfile to the
+    /// and expanded per-superfile to the
     /// concrete term list before `BoolMode::Or` BM25 scoring.
     ///
     /// Returns up to `k` highest-scoring hits, sorted descending
@@ -1426,8 +1424,8 @@ impl SupertableReader {
         let prefix_owned = prefix.to_owned();
 
         // ManifestSnapshot-level term-range skip uses the same
-        // lowercased prefix bytes the v1 tokenizer +
-        // FST-expansion path use, so the skip's
+        // lowercased prefix bytes the FST-expansion path
+        // uses, so the skip's
         // lex-range overlap test exactly matches the
         // tokenizer's interpretation of the prefix.
         let prefix_lower = prefix_owned.to_ascii_lowercase();

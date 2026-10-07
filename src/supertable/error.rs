@@ -104,12 +104,6 @@ pub enum BuildError {
     #[error("user column name {0:?} starts with reserved prefix 'inf.'")]
     ReservedPrefixInColumnName(String),
 
-    #[error(
-        "FTS column {column:?}: unknown analyzer {analyzer:?} (valid: \
-         \"ascii_lower\", \"standard\")"
-    )]
-    UnknownAnalyzer { column: String, analyzer: String },
-
     #[error("input RecordBatch schema does not match the supertable's declared schema")]
     BatchSchemaMismatch,
 
@@ -714,7 +708,7 @@ impl From<QueryError> for DataFusionError {
 /// |---|---|
 /// | over the connection's memory budget | `OverBudget` |
 /// | an FTS query the column cannot answer: a phrase without positions, nothing positive to rank | `InvalidQuery`: the caller's |
-/// | a full-text index older than this engine reads | `Unsupported` |
+/// | a full-text index older than this engine reads, or one under a removed analyzer | `Unsupported` |
 /// | the store refused our credentials | `PermissionDenied` |
 /// | a local doc id past the superfile's end, or a read called on a codec it does not support: our bug, retrying cannot help | `Internal` |
 /// | anything else | `Parquet`: a read failed |
@@ -731,9 +725,8 @@ impl From<ReadError> for QueryError {
         {
             return QueryError::InvalidQuery(e.to_string());
         }
-        if let ReadError::Fts(fts) = &e
-            && matches!(fts.as_ref(), FtsError::IndexTooOld { .. })
-        {
+        let index_too_old = matches!(&e, ReadError::Fts(fts) if matches!(fts.as_ref(), FtsError::IndexTooOld { .. }));
+        if index_too_old || matches!(e, ReadError::RemovedAnalyzer { .. }) {
             return QueryError::Unsupported(e.to_string());
         }
         if permission_denied_in_chain(&e) {
@@ -920,6 +913,13 @@ mod tests {
             QueryError::from(ReadError::Fts(Box::new(FtsError::IndexTooOld {
                 version: 5
             }))),
+            QueryError::Unsupported(_)
+        ));
+        assert!(matches!(
+            QueryError::from(ReadError::RemovedAnalyzer {
+                column: "body".into(),
+                analyzer: "ascii_lower".into(),
+            }),
             QueryError::Unsupported(_)
         ));
         // A local doc id past the end is our bug: retrying the read cannot help.

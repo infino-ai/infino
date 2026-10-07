@@ -66,10 +66,7 @@ use crate::{
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
-        fts::{
-            analysis::{Base, chain_tokenizer},
-            tokenize::{Tokenizer, tokenizer_for_name},
-        },
+        fts::{analysis::chain_tokenizer, tokenize::Tokenizer},
         vector::layout::VectorLayout,
     },
     supertable::{
@@ -753,23 +750,7 @@ impl SupertableOptions {
             }
         }
 
-        // 5. Each FTS column's base tokenizer name must resolve.
-        //    Validating here surfaces a typo at construction with a
-        //    typed error, instead of at the first commit's builder
-        //    construction. The stopword set and stemmer need no check:
-        //    they arrive as enums, so an unrepresentable one cannot be
-        //    constructed. (A *persisted* filter name is different and is
-        //    validated where it is read.)
-        for fc in &fts_columns {
-            if tokenizer_for_name(&fc.analyzer).is_none() {
-                return Err(BuildError::UnknownAnalyzer {
-                    column: fc.column.clone(),
-                    analyzer: fc.analyzer.clone(),
-                });
-            }
-        }
-
-        // 6. Shared thread pools + a fresh store.
+        // 5. Shared thread pools + a fresh store.
         let reader_pool = shared_reader_pool();
         let writer_pool = shared_writer_pool();
         let store: Arc<dyn SuperfileReaderCache> = Arc::new(InMemoryReaderCache::new());
@@ -924,18 +905,15 @@ impl SupertableOptions {
     /// Tokenizer configured for `column`, or `None` when `column` carries
     /// no full-text index — a `None` return is exactly the "column is not
     /// full-text-indexed" signal, which lets a search path reject up front
-    /// instead of failing deep in the scan. Resolves the column's analyzer
-    /// name from its `FtsConfig` (validated at construction, so the
-    /// resolution cannot fail for a registered column). The lookup is a
-    /// single pass over `fts_columns`.
+    /// instead of failing deep in the scan. The lookup is a single pass
+    /// over `fts_columns`.
     pub fn try_fts_tokenizer_for(&self, column: &str) -> Option<Arc<dyn Tokenizer>> {
         let cfg = self.fts_columns.iter().find(|c| c.column == column)?;
         // The whole chain, not the base: every caller here tokenizes
         // query-side text — search terms, an equality literal, a `LIKE`
         // fragment — and must produce the forms the column was indexed
         // under.
-        let base = Base::from_name(&cfg.analyzer)?;
-        Some(chain_tokenizer(base, cfg.stopwords, cfg.stemmer))
+        Some(chain_tokenizer(cfg.stopwords, cfg.stemmer))
     }
 
     /// Attach a disk cache for storage-backed reads.
@@ -1686,18 +1664,6 @@ mod tests {
         let err =
             SupertableOptions::new(s, vec![], vec![vc("inf.emb", 16)]).expect_err("expected error");
         assert!(matches!(err, BuildError::ReservedPrefixInColumnName(_)));
-    }
-
-    #[test]
-    fn fts_column_with_unknown_analyzer_rejected() {
-        let s = Arc::new(Schema::new(vec![Field::new(
-            "title",
-            DataType::LargeUtf8,
-            false,
-        )]));
-        let err = SupertableOptions::new(s, vec![fc("title").analyzer("nonesuch")], vec![])
-            .expect_err("expected error");
-        assert!(matches!(err, BuildError::UnknownAnalyzer { .. }));
     }
 
     #[test]

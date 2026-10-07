@@ -74,26 +74,12 @@ def test_memory_roundtrip():
 
 
 def test_fts_standard_analyzer_keeps_non_ascii():
-    # The `analyzer` kwarg selects the tokenizer. The default, standard
-    # (UAX #29 + lowercase), keeps non-ASCII; ascii_lower drops it, so
-    # "café" is unsearchable under it.
+    # Every column is analyzed by `standard` (UAX #29 + lowercase), which
+    # keeps non-ASCII, so "café" is searchable.
     db = infino.connect("memory://")
-
-    std_tbl = db.create_table(
-        "std", _title_schema(), infino.IndexSpec().fts("title", analyzer="standard")
-    )
-    std_tbl.append(_title_batch(["café latte"]))
-    assert std_tbl.bm25_search("title", "café", 10).num_rows == 1
-
-    ascii_tbl = db.create_table(
-        "ascii", _title_schema(), infino.IndexSpec().fts("title", analyzer="ascii_lower")
-    )
-    ascii_tbl.append(_title_batch(["café latte"]))
-    try:
-        ascii_hits = ascii_tbl.bm25_search("title", "café", 10).num_rows
-    except infino.InfinoError:
-        ascii_hits = 0
-    assert ascii_hits == 0
+    tbl = db.create_table("std", _title_schema(), infino.IndexSpec().fts("title"))
+    tbl.append(_title_batch(["café latte"]))
+    assert tbl.bm25_search("title", "café", 10).num_rows == 1
 
 
 def test_bm25_params_declared_and_overridden():
@@ -134,29 +120,24 @@ def test_fts_positional_arguments_keep_their_meaning():
     # repositions `stored` / `k1` / `b` for downstream positional callers
     # and no test fails. This pins the order so that change has to break
     # here first.
-    #
-    # It has happened: the stopwords/stemmer/positions options were first
-    # added *before* `stored`, which turned `fts("body", "standard",
-    # False)` into a `TypeError` — caught in review, not by CI.
     db = infino.connect("memory://")
     titles = ["the quick brown fox", "a lazy dog", "quick thinking about foxes"]
 
-    # Slot 3 is `stored`, so a bool is accepted there. Under the broken
-    # signature this raised TypeError before doing anything.
+    # Slot 2 is `stored`, so a bool is accepted there.
     index_only = db.create_table(
-        "index_only", _title_schema(), infino.IndexSpec().fts("title", "standard", False)
+        "index_only", _title_schema(), infino.IndexSpec().fts("title", False)
     )
     for title in titles:
         index_only.append(_title_batch([title]))
     # Searchable, since `stored` governs readback and not the index.
     assert index_only.bm25_search("title", "quick", 10).num_rows == 2
 
-    # Slots 4 and 5 are `k1` and `b`. Checked by ranking rather than by
+    # Slots 3 and 4 are `k1` and `b`. Checked by ranking rather than by
     # the call merely succeeding: two floats would be accepted by any
     # signature whose tail is float-shaped, so only the scores prove the
     # values landed on the parameters they were meant for.
     positional = db.create_table(
-        "positional", _title_schema(), infino.IndexSpec().fts("title", "standard", True, 1.6, 0.4)
+        "positional", _title_schema(), infino.IndexSpec().fts("title", True, 1.6, 0.4)
     )
     keyword = db.create_table(
         "keyword", _title_schema(), infino.IndexSpec().fts("title", k1=1.6, b=0.4)
@@ -203,7 +184,7 @@ def test_analysis_options_are_keyword_only():
     # as more options are added — the next one cannot repeat the
     # mid-signature insertion that broke it.
     with pytest.raises(TypeError):
-        infino.IndexSpec().fts("title", "standard", True, 1.6, 0.4, "english")
+        infino.IndexSpec().fts("title", True, 1.6, 0.4, "english")
     # And they still work by keyword, in any combination.
     spec = infino.IndexSpec().fts(
         "title", stopwords="english", stemmer="english", positions=True
@@ -258,13 +239,10 @@ def test_bm25_params_out_of_range_is_rejected():
             )
 
 
-def test_fts_unknown_analyzer_is_rejected():
-    # An unknown analyzer is a configuration error, surfaced as ValueError.
-    db = infino.connect("memory://")
-    with pytest.raises(ValueError):
-        db.create_table(
-            "bad", _title_schema(), infino.IndexSpec().fts("title", analyzer="nonesuch")
-        )
+def test_fts_takes_no_analyzer():
+    # There is no tokenizer to choose: `standard` analyzes every column.
+    with pytest.raises(TypeError):
+        infino.IndexSpec().fts("title", analyzer="standard")
 
 
 def test_connect_accepts_cache_options(tmp_path):

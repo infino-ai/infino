@@ -63,12 +63,12 @@
 //! `register_column_with_tokenizer` sets a per-column analyzer — and
 //! dispatches per (column, doc) at `add_doc` time.
 //!
-//! Two tokenizers ship: the Unicode-aware `StandardTokenizer` (the
-//! default) and `AsciiLowerTokenizer`, selectable per column. The
-//! `inf.fts.columns` JSON persists each column's tokenizer name, so a
-//! column is re-tokenized at rebuild / compaction with the analyzer it
-//! was indexed with. Further analyzers (language-specific stemmers, …)
-//! implement the `Tokenizer` trait and need no change to this plumbing.
+//! Every column is analyzed by the Unicode-aware `StandardTokenizer`
+//! plus its optional stopword set and stemmer. The `inf.fts.columns`
+//! JSON persists each column's filters, so a column is re-tokenized at
+//! rebuild / compaction with the analysis it was indexed with. Further
+//! analyzers implement the `Tokenizer` trait and need no change to this
+//! plumbing.
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
@@ -101,7 +101,7 @@ use crate::{
         },
         fts::{
             analysis::{
-                Base, Stemmer, Stopwords, UNKNOWN_ANALYSIS_REVISION, chain_name, chain_revision,
+                Stemmer, Stopwords, UNKNOWN_ANALYSIS_REVISION, chain_name, chain_revision,
                 chain_tokenizer,
             },
             bm25,
@@ -109,7 +109,7 @@ use crate::{
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
             reorder::{ForwardIndex, bisect_order},
             sorted_merge::SortedInput,
-            tokenize::{STANDARD_TOKENIZER, StandardTokenizer},
+            tokenize::StandardTokenizer,
         },
         id_space::{FtsDocId, RowId, StableId},
         ids,
@@ -306,14 +306,7 @@ impl CarryScope {
 #[derive(Debug, Clone)]
 pub struct FtsConfig {
     pub column: String,
-    /// **Base** analyzer (tokenizer) name applied to this column —
-    /// `"standard"` (the default) or `"ascii_lower"`. Resolved to a
-    /// tokenizer instance once, at builder construction, together with
-    /// [`FtsConfig::stopwords`] and [`FtsConfig::stemmer`]; an unknown
-    /// name is a build error. Per column: each FTS column is tokenized
-    /// with its own analyzer, so columns in one table may differ.
-    pub analyzer: String,
-    /// Stopword set removed after the base tokenizer and before the
+    /// Stopword set removed after the `standard` tokenizer and before the
     /// stemmer. Persisted in the column's `inf.fts.columns` entry as
     /// `"stopwords"`, emitted only when set — so a column with no
     /// stopwords keeps an entry byte-identical to one written before
@@ -371,12 +364,11 @@ pub struct FtsConfig {
 }
 
 impl FtsConfig {
-    /// Configuration with the defaults: `standard` analyzer, no
+    /// Configuration with the defaults: no analysis filters, no
     /// positions, text stored.
     pub fn new(column: impl Into<String>) -> Self {
         Self {
             column: column.into(),
-            analyzer: STANDARD_TOKENIZER.to_string(),
             stopwords: Stopwords::None,
             stemmer: Stemmer::None,
             positions: false,
@@ -384,12 +376,6 @@ impl FtsConfig {
             bm25: bm25::Bm25Params::STANDARD,
             carried_analysis_revision: None,
         }
-    }
-
-    /// Set the analyzer name (see the field docs).
-    pub fn analyzer(mut self, name: impl Into<String>) -> Self {
-        self.analyzer = name.into();
-        self
     }
 
     /// Set the stopword set (see the field docs).
@@ -407,8 +393,8 @@ impl FtsConfig {
     /// This column's analysis as one derived identity string — the
     /// value [`Tokenizer::name`] reports for its tokenizer. Never
     /// persisted; see [`crate::superfile::fts::analysis`].
-    pub(crate) fn chain_name(&self) -> Option<&'static str> {
-        Base::from_name(&self.analyzer).map(|b| chain_name(b, self.stopwords, self.stemmer))
+    pub(crate) fn chain_name(&self) -> &'static str {
+        chain_name(self.stopwords, self.stemmer)
     }
 
     /// Carry an existing file's analysis revision (see the field docs).
@@ -419,17 +405,9 @@ impl FtsConfig {
 
     /// The analysis revision this column records: whatever was carried
     /// in, else the revision this engine's chain emits.
-    ///
-    /// An analyzer name this engine cannot resolve yields `0` rather than
-    /// an error — the build fails on the unknown name elsewhere, with a
-    /// message that names the column, and returning a revision here would
-    /// only obscure it.
     pub(crate) fn analysis_revision(&self) -> u32 {
-        self.carried_analysis_revision.unwrap_or_else(|| {
-            Base::from_name(&self.analyzer)
-                .map(|b| chain_revision(b, self.stopwords, self.stemmer))
-                .unwrap_or(0)
-        })
+        self.carried_analysis_revision
+            .unwrap_or_else(|| chain_revision(self.stopwords, self.stemmer))
     }
 
     /// Record token positions (see the field docs).
@@ -747,7 +725,6 @@ impl BuilderOptions {
             fts.fts_columns_config()
                 .map(|c| {
                     FtsConfig::new(c.name.clone())
-                        .analyzer(c.base.name())
                         .stopwords(c.stopwords)
                         .stemmer(c.stemmer)
                         .positions(c.positions)
@@ -841,7 +818,7 @@ impl BuilderOptions {
             // sharing a base but differing in a filter hold different
             // terms, so carrying one's postings into the other silently
             // mixes two tokenizations.
-            let own_analysis = own.chain_name().unwrap_or(own.analyzer.as_str());
+            let own_analysis = own.chain_name();
             let other_analysis = other.tokenizer.name();
             if own_analysis != other_analysis {
                 return Err(BuildError::FTSSchemaMismatch(format!(
@@ -1070,11 +1047,8 @@ impl SuperfileBuilder {
             }
         }
 
-        // 4 + 5. Resolve each FTS column's analyzer name and wire up the
-        //        unified FTS + vector sub-builders. Resolution happens
-        //        once, here — `FtsConfig` carries the name (the same
-        //        record `inf.fts.columns` persists) and an unknown name
-        //        is a build error.
+        // 4 + 5. Build each FTS column's analysis chain and wire up the
+        //        unified FTS + vector sub-builders.
         let fts_builder = if opts.fts_columns.is_empty() {
             None
         } else {
@@ -1086,12 +1060,7 @@ impl SuperfileBuilder {
                 // declares a stopword set or a stemmer must be indexed
                 // through them, or the postings would hold unfiltered
                 // terms while every query filtered.
-                let base =
-                    Base::from_name(&fc.analyzer).ok_or_else(|| BuildError::UnknownAnalyzer {
-                        column: fc.column.clone(),
-                        analyzer: fc.analyzer.clone(),
-                    })?;
-                let tok = chain_tokenizer(base, fc.stopwords, fc.stemmer);
+                let tok = chain_tokenizer(fc.stopwords, fc.stemmer);
                 let id = fb.register_column_with_tokenizer(
                     fc.column.clone(),
                     fc.positions,
@@ -2978,8 +2947,7 @@ fn superfile_kvs(
         (kv::BUILDER.into(), crate::BUILDER_ID.to_string()),
     ];
     if !options.fts_columns.is_empty() {
-        // Each column records its own analyzer name (per-field analysis);
-        // `fts_tokenizers` is aligned 1:1 with `fts_columns`.
+        // Each column records its own analysis filters, in declaration order.
         kvs.push((
             kv::FTS_COLUMNS.into(),
             fts_columns_json(&options.fts_columns),
@@ -3259,35 +3227,6 @@ fn check_user_column_name(name: &str) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// Serialize `[FtsConfig]` to the JSON form stored in the
-/// Parquet KV metadata key `inf.fts.columns`. Hand-rolled
-/// because the shape is fixed + small and `serde_derive` on
-/// `FtsConfig` would add a derived `Serialize` impl across
-/// the format boundary purely to write five characters of
-/// JSON per column.
-///
-/// Output shape per column:
-/// `{"name":"<escaped>","tokenizer":"<name>","k1":<f>,"b":<f>}`.
-/// `tokenizer` holds the column's base tokenizer name (`"ascii_lower"`
-/// or `"standard"`), straight from `FtsConfig.analyzer` — whose field
-/// name says `analyzer` only because that is what the public option is
-/// called. A stopword set
-/// and a stemmer ride as `"stopwords"` / `"stemmer"`, each emitted only
-/// when set; the reader reconstructs the column's tokenizer from all
-/// three for query-time tokenization, and a missing filter field means
-/// the filter is off — the one thing a file written before it existed
-/// can mean.
-///
-/// `k1` / `b` are written **unconditionally, defaults included**,
-/// unlike `positions` and `stored`. Those two are booleans whose
-/// absence has exactly one possible meaning, so omitting them keeps a
-/// default column's JSON byte-identical to older files. A scoring
-/// parameter is different: it is the provenance of the stored
-/// block-max bounds, and a reader that has to infer it is a reader
-/// that will infer wrong the day the recommended default moves. The
-/// same lesson is recorded on `rerank_codec` in
-/// `supertable::manifest::options_hash` — a data-determined value
-/// belongs on disk, read back rather than re-derived.
 /// One BM25 parameter as JSON. `{:?}` on an `f32` is the shortest
 /// decimal that round-trips back to the same bits, and always carries a
 /// `.`, so the value the reader deserializes is bit-for-bit the value
@@ -3316,6 +3255,30 @@ pub(crate) fn merge_builder_opts(
     Ok(opts)
 }
 
+/// Serialize `[FtsConfig]` to the JSON form stored in the
+/// Parquet KV metadata key `inf.fts.columns`. Hand-rolled
+/// because the shape is fixed + small and `serde_derive` on
+/// `FtsConfig` would add a derived `Serialize` impl across
+/// the format boundary purely to write five characters of
+/// JSON per column.
+///
+/// Output shape per column:
+/// `{"name":"<escaped>","k1":<f>,"b":<f>}`. The base tokenizer is always
+/// `standard` and is not recorded. A stopword set and a stemmer ride as
+/// `"stopwords"` / `"stemmer"`, each emitted only when set; the reader
+/// reconstructs the column's tokenizer from them for query-time
+/// tokenization, and a missing filter field means the filter is off.
+///
+/// `k1` / `b` are written **unconditionally, defaults included**,
+/// unlike `positions` and `stored`. Those two are booleans whose
+/// absence has exactly one possible meaning, so omitting them keeps a
+/// default column's JSON byte-identical to older files. A scoring
+/// parameter is different: it is the provenance of the stored
+/// block-max bounds, and a reader that has to infer it is a reader
+/// that will infer wrong the day the recommended default moves. The
+/// same lesson is recorded on `rerank_codec` in
+/// `supertable::manifest::options_hash` — a data-determined value
+/// belongs on disk, read back rather than re-derived.
 fn fts_columns_json(cols: &[FtsConfig]) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
@@ -3324,8 +3287,6 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         }
         s.push_str(r#"{"name":""#);
         s.push_str(&escape_json(&c.column));
-        s.push_str(r#"","tokenizer":""#);
-        s.push_str(&escape_json(&c.analyzer));
         s.push('"');
         // Always emitted — see the function docs.
         s.push_str(r#","k1":"#);
@@ -3594,18 +3555,6 @@ mod tests {
         );
         let err = SuperfileBuilder::new(opts).expect_err("expected error");
         assert!(matches!(err, BuildError::ReservedPrefixInColumnName(_)));
-    }
-
-    #[test]
-    fn new_rejects_unknown_analyzer() {
-        let opts = BuilderOptions::new(
-            schema_with_fts(),
-            "doc_id",
-            vec![FtsConfig::new("title").analyzer("nonesuch")],
-            vec![],
-        );
-        let err = SuperfileBuilder::new(opts).expect_err("expected error");
-        assert!(matches!(err, BuildError::UnknownAnalyzer { .. }));
     }
 
     fn batch_two_rows(schema: &Arc<Schema>) -> RecordBatch {
@@ -3898,7 +3847,8 @@ mod tests {
         assert!(s.starts_with('['));
         assert!(s.contains(r#""name":"title""#));
         assert!(s.contains(r#""name":"body""#));
-        assert!(s.contains(r#""tokenizer":"standard""#));
+        // The base tokenizer is always `standard` and is not recorded.
+        assert!(!s.contains("tokenizer"));
         // Positionless columns emit no positions field at all — the
         // JSON stays byte-identical to files written before the flag
         // existed.
@@ -3917,39 +3867,36 @@ mod tests {
         let s = fts_columns_json(&cols);
         assert!(
             s.contains(
-                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true,"analysis_revision":1}"#
+                r#"{"name":"title","k1":1.2,"b":0.75,"positions":true,"analysis_revision":1}"#
             ),
             "positional column carries the flag: {s}"
         );
         assert!(
-            s.contains(
-                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
-            ),
+            s.contains(r#"{"name":"body","k1":1.2,"b":0.75,"analysis_revision":1}"#),
             "positionless column carries no positions key at all: {s}"
         );
     }
 
-    /// Per-column analyzers: each column records its own tokenizer name.
+    /// Per-column analysis: each column records its own filters, and an
+    /// unfiltered column records none.
     #[test]
-    fn fts_columns_json_per_column_analyzers() {
-        // Both analyzers named explicitly: the recorded name must be the
-        // column's own, independent of which one the engine defaults to.
+    fn fts_columns_json_per_column_filters() {
         let cols = vec![
-            FtsConfig::new("title").analyzer("standard"),
-            FtsConfig::new("body").analyzer("ascii_lower"),
+            FtsConfig::new("title"),
+            FtsConfig::new("body")
+                .stopwords(Stopwords::English)
+                .stemmer(Stemmer::English),
         ];
         let s = fts_columns_json(&cols);
         assert!(
-            s.contains(
-                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
-            ),
-            "title uses the standard analyzer: {s}"
+            s.contains(r#"{"name":"title","k1":1.2,"b":0.75,"analysis_revision":1}"#),
+            "title records no filter: {s}"
         );
         assert!(
             s.contains(
-                r#"{"name":"body","tokenizer":"ascii_lower","k1":1.2,"b":0.75,"analysis_revision":1}"#
+                r#"{"name":"body","k1":1.2,"b":0.75,"stopwords":"english","stemmer":"english","analysis_revision":1}"#
             ),
-            "body uses ascii_lower: {s}"
+            "body records its filters: {s}"
         );
     }
 
@@ -3963,15 +3910,11 @@ mod tests {
         ];
         let s = fts_columns_json(&cols);
         assert!(
-            s.contains(
-                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
-            ),
+            s.contains(r#"{"name":"title","k1":1.2,"b":0.75,"analysis_revision":1}"#),
             "stored column carries no stored key at all: {s}"
         );
         assert!(
-            s.contains(
-                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stored":false,"analysis_revision":1}"#
-            ),
+            s.contains(r#"{"name":"body","k1":1.2,"b":0.75,"stored":false,"analysis_revision":1}"#),
             "index-only column carries the flag: {s}"
         );
     }
@@ -7157,7 +7100,7 @@ mod tests {
             vec![],
         );
         // The derived identity the reader will report for that column.
-        let chain = chain_name(Base::Standard, Stopwords::English, Stemmer::English);
+        let chain = chain_name(Stopwords::English, Stemmer::English);
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
         b.add_batch(&batch_two_rows(&schema), &[])

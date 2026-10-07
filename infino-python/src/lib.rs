@@ -271,12 +271,11 @@ fn connect(
 }
 
 /// One declared FTS column, as its keyword arguments arrived.
-/// `analyzer` / `stopwords` / `stemmer` `None` mean the defaults;
+/// `stopwords` / `stemmer` `None` mean no filter;
 /// `k1` / `b` `None` mean the column takes the standard BM25 pair.
 #[derive(Clone)]
 struct FtsDecl {
     column: String,
-    analyzer: Option<String>,
     stopwords: Option<String>,
     stemmer: Option<String>,
     positions: bool,
@@ -324,11 +323,8 @@ impl IndexSpec {
         Self::default()
     }
 
-    /// Mark `column` (a UTF-8 string column) as full-text indexed.
-    /// `analyzer` selects the tokenizer: `"standard"` (the default —
-    /// the Unicode-aware UAX #29 tokenizer that keeps non-ASCII text)
-    /// or `"ascii_lower"` (ASCII split + lowercase, non-ASCII dropped).
-    /// It is recorded with the table and cannot be changed afterwards.
+    /// Mark `column` (a UTF-8 string column) as full-text indexed,
+    /// tokenized by the Unicode-aware UAX #29 `standard` tokenizer.
     /// `stored=False` makes the column index-only: searchable, but the
     /// raw text is never kept in the table, so it cannot be selected,
     /// projected, or filtered on (append/update batches still carry it).
@@ -366,16 +362,10 @@ impl IndexSpec {
     /// may still score with a different pair (see `bm25_search`), which
     /// is the shape to reach for while tuning; declare the pair here
     /// once it is settled.
-    // The three new options are appended **after** `b`, and behind `*`
-    // so they are keyword-only. Inserting them mid-signature would have
-    // silently changed what `fts("body", "standard", False)` means for
-    // every positional caller — every call site in this repo passes
-    // keywords past `column`, so no test here would have caught it.
-    // Keyword-only also means the next option added cannot repeat the
-    // mistake.
+    // The analysis options sit behind `*`, keyword-only, so a new option
+    // can never reposition `stored` / `k1` / `b` for a positional caller.
     #[pyo3(signature = (
         column,
-        analyzer = None,
         stored = true,
         k1 = None,
         b = None,
@@ -388,7 +378,6 @@ impl IndexSpec {
     fn fts(
         &self,
         column: String,
-        analyzer: Option<String>,
         stored: bool,
         k1: Option<f32>,
         b: Option<f32>,
@@ -399,7 +388,6 @@ impl IndexSpec {
         let mut next = self.clone();
         next.fts.push(FtsDecl {
             column,
-            analyzer,
             stopwords,
             stemmer,
             positions,
@@ -427,7 +415,6 @@ impl IndexSpec {
         for decl in &self.fts {
             let FtsDecl {
                 column,
-                analyzer,
                 stopwords,
                 stemmer,
                 positions,
@@ -438,9 +425,6 @@ impl IndexSpec {
             let mut field = infino::FtsField::new(column.clone())
                 .positions(*positions)
                 .stored(*stored);
-            if let Some(a) = analyzer {
-                field = field.analyzer(a.clone());
-            }
             if let Some(name) = stopwords {
                 field = field.stopwords(stopwords_from_name(name)?);
             }

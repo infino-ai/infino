@@ -103,10 +103,9 @@ the term dictionary (each literal fragment of the pattern is tokenized;
 a token the fragment closes on both sides is required as itself, and a
 token bordering a wildcard is widened to the indexed terms it heads,
 tails, or sits inside) — with the exact predicate re-checked over the
-candidate rows. The `ascii_lower` analyzer drops any token holding a
-non-ASCII byte, so under it only tokens the pattern closes on both
-sides can be required; the default `standard` analyzer supports prefix,
-suffix, and substring patterns. A suffix or substring token needs a walk
+candidate rows. A plain `standard` column supports prefix, suffix, and
+substring patterns; a column with a stopword set or stemmer leaves
+`LIKE` to the scan, since its terms are not substrings of the text. A suffix or substring token needs a walk
 of the column's whole dictionary, taken only where the superfile's
 stored text is large against its vocabulary; otherwise that token is
 left to the scan. `ILIKE` is bounded the same way for ASCII tokens,

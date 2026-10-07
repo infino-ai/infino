@@ -111,7 +111,6 @@ class IndexSpec:
     def fts(
         self,
         column: str,
-        analyzer: str | None = None,
         stored: bool = True,
         k1: float | None = None,
         b: float | None = None,

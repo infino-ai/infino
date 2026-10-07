@@ -750,11 +750,6 @@ struct FtsDecl {
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct FtsOptions {
-    /// Tokenizer: `"standard"` (the default — the Unicode-aware UAX #29
-    /// tokenizer that keeps non-ASCII text) or `"ascii_lower"` (ASCII
-    /// split + lowercase, non-ASCII dropped). It is recorded with the
-    /// table and cannot be changed afterwards.
-    pub analyzer: Option<String>,
     /// Remove this column's stopwords — the very common words whose
     /// presence says almost nothing about what a document is about.
     /// `"english"` is the only set; omit for none (the default).
@@ -841,7 +836,6 @@ impl IndexSpec {
         let mut spec = infino::IndexSpec::new();
         for FtsDecl { column, options } in &self.fts {
             let FtsOptions {
-                analyzer,
                 stopwords,
                 stemmer,
                 positions,
@@ -852,9 +846,6 @@ impl IndexSpec {
             let mut field = infino::FtsField::new(column.clone())
                 .positions(positions.unwrap_or(false))
                 .stored(stored.unwrap_or(true));
-            if let Some(a) = analyzer {
-                field = field.analyzer(a.clone());
-            }
             if let Some(name) = stopwords {
                 field = field.stopwords(stopwords_from_name(name)?);
             }

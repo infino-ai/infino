@@ -283,16 +283,14 @@ token, because stopword lists are written in surface forms (`are`,
 
 ### Base tokenizer
 
-Two ship today, named by `FtsField::analyzer` (the option is spelled
-"analyzer" but the value names a tokenizer; the chain is the analyzer).
-See [`src/superfile/fts/tokenize.rs`](../src/superfile/fts/tokenize.rs).
+Every column is tokenized by `standard`; there is no other base to
+choose. See [`src/superfile/fts/tokenize.rs`](../src/superfile/fts/tokenize.rs).
 
-| | `standard` (default) | `ascii_lower` |
-| --- | --- | --- |
-| Splitting | Unicode UAX #29 word boundaries; segments containing an alphanumeric are kept | Runs of `[A-Za-z0-9]`; every other ASCII byte separates |
-| Case | Full Unicode case folding | ASCII `A-Z` to `a-z` |
-| Non-ASCII | Preserved, so accented and non-Latin scripts stay searchable | Any token containing a non-ASCII byte is dropped silently |
-| Use it for | Natural language, anything multilingual, anything user-written | ASCII-only identifiers, codes, SKUs, log lines |
+| | `standard` |
+| --- | --- |
+| Splitting | Unicode UAX #29 word boundaries; segments containing an alphanumeric or an emoji are kept |
+| Case | Full Unicode lowercasing |
+| Non-ASCII | Preserved, so accented and non-Latin scripts stay searchable |
 
 Two details that surprise people:
 
@@ -391,7 +389,7 @@ from the relevance side:
   image of the text. With a stemmer it is not: `LIKE '%runni%'` matches
   the text `running`, whose indexed term is `run`. So a column carrying
   a chain keeps every superfile for such a predicate
-  ([`Analyzer::of` in `src/supertable/query/candidate.rs`](../src/supertable/query/candidate.rs)).
+  ([`is_plain_standard` in `src/supertable/query/candidate.rs`](../src/supertable/query/candidate.rs)).
   Results stay correct; the skip is what is lost.
 - **Analysis is part of the table's identity.** A merge refuses inputs
   whose per-column analysis differs, because a merged file records one
@@ -413,14 +411,14 @@ guess.
 
 ### Picking a chain
 
-| Column | Tokenizer | Stopwords | Stemmer | Typical `k1` / `b` |
-| --- | --- | --- | --- | --- |
-| Titles, product names | `standard` | off | off | 1.0 to 1.2 / 0.0 to 0.4 |
-| Long English prose | `standard` | `english` | `english` | 1.2 to 1.6 / 0.75 |
-| Multilingual or mixed-script text | `standard` | off | off | 1.2 / 0.75 |
-| Identifiers, SKUs, codes | `ascii_lower` | off | off | 1.2 / 0.0 |
-| Log lines, machine output | `ascii_lower` | off | off | 0.4 to 0.9 / 0.3 |
-| Code or symbol-heavy text | `ascii_lower` | off | off | 1.2 / 0.3 to 0.5 |
+| Column | Stopwords | Stemmer | Typical `k1` / `b` |
+| --- | --- | --- | --- |
+| Titles, product names | off | off | 1.0 to 1.2 / 0.0 to 0.4 |
+| Long English prose | `english` | `english` | 1.2 to 1.6 / 0.75 |
+| Multilingual or mixed-script text | off | off | 1.2 / 0.75 |
+| Identifiers, SKUs, codes | off | off | 1.2 / 0.0 |
+| Log lines, machine output | off | off | 0.4 to 0.9 / 0.3 |
+| Code or symbol-heavy text | off | off | 1.2 / 0.3 to 0.5 |
 
 Declaring a chain in each language:
 
@@ -467,7 +465,6 @@ text.
 
 | Lever | Where | Changeable later | What it does |
 | --- | --- | --- | --- |
-| Base tokenizer | `FtsField::analyzer` | No | `standard` or `ascii_lower`. See [Tokenizer, stopwords, and stemming](#tokenizer-stopwords-and-stemming). |
 | Stopwords | `FtsField::stopwords` | No | Drops very common words from index and query. See [Stopwords](#stopwords). |
 | Stemmer | `FtsField::stemmer` | No | Folds inflections onto one term, so one form finds the others. See [Stemming](#stemming). |
 | Positions | `FtsField::positions` | No | Required for exact phrase queries. Roughly doubles the column's index footprint. A phrase against a positionless column is a typed error, never a silent bag-of-words fallback. |
@@ -529,7 +526,7 @@ Two debugging helpers repay the time they take:
   lengths a chain produces. Its siblings
   [`standard_tokenizer.rs`](../tests/superfile/fts/standard_tokenizer.rs) and
   [`token_cap.rs`](../tests/superfile/fts/token_cap.rs) cover the base
-  tokenizers.
+  tokenizer.
 - Run the benches from the section above before and after any change that
   touches scoring, and report the comparison. A relevance win that costs
   latency is a trade to state explicitly, not to discover later.
@@ -554,10 +551,10 @@ Two debugging helpers repay the time they take:
 | Area | Path |
 | --- | --- |
 | Scoring math, `Bm25Params`, length quantization | [`src/superfile/fts/bm25.rs`](../src/superfile/fts/bm25.rs) |
-| Base tokenizers and query parsing | [`src/superfile/fts/tokenize.rs`](../src/superfile/fts/tokenize.rs) |
+| Base tokenizer and query parsing | [`src/superfile/fts/tokenize.rs`](../src/superfile/fts/tokenize.rs) |
 | Analysis chain (stopwords, stemmer, position holes) | [`src/superfile/fts/analysis.rs`](../src/superfile/fts/analysis.rs) |
 | Analysis compatibility on merge | [`src/superfile/builder.rs`](../src/superfile/builder.rs) |
-| `LIKE` lowering and analyzer recognition | [`src/supertable/query/candidate.rs`](../src/supertable/query/candidate.rs) |
+| `LIKE` lowering and plain-`standard` recognition | [`src/supertable/query/candidate.rs`](../src/supertable/query/candidate.rs) |
 | Per-search options (`Bm25SearchOptions`, `BoolMode`) | [`src/superfile/fts/reader/options.rs`](../src/superfile/fts/reader/options.rs) |
 | Column declaration (`FtsField`, `IndexSpec`) | [`src/catalog/index_spec.rs`](../src/catalog/index_spec.rs) |
 | Declared pair recorded in the catalog | [`src/catalog/manifest.rs`](../src/catalog/manifest.rs), [`src/catalog/mod.rs`](../src/catalog/mod.rs) |

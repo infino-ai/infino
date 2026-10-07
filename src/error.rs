@@ -347,7 +347,6 @@ impl From<SuperfileBuildError> for InfinoError {
             | SuperfileBuildError::WrongRowShape { .. }
             | SuperfileBuildError::BatchSchemaMismatch { .. }
             | SuperfileBuildError::FtsColumnMissing(_) => InfinoError::Schema,
-            SuperfileBuildError::UnknownAnalyzer { .. } => InfinoError::Config,
             SuperfileBuildError::VectorRerankCodecUnimplemented { .. } => InfinoError::Unsupported,
             // Decoding a superfile we wrote, a missing internal builder or an
             // empty merge input: never the caller's batch.
@@ -395,9 +394,6 @@ impl From<SupertableBuildError> for InfinoError {
             | SupertableBuildError::ReservedPrefixInColumnName(_)
             | SupertableBuildError::BatchSchemaMismatch
             | SupertableBuildError::PartitionColumnMissing(_) => InfinoError::Schema,
-            // A bad analyzer name is a configuration mistake, the same class a
-            // bad connect option gets.
-            SupertableBuildError::UnknownAnalyzer { .. } => InfinoError::Config,
             // A commit that found its table dropped and purged: the name no
             // longer resolves, the same answer the read path gives.
             SupertableBuildError::TableGone => InfinoError::NotFound,

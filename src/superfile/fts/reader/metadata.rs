@@ -18,7 +18,7 @@ use crate::superfile::{
     error::FtsError,
     format::{CRC_BYTES, checksum::crc32c},
     fts::{
-        analysis::{Base, Stemmer, Stopwords},
+        analysis::{Stemmer, Stopwords},
         bm25,
         reader::core::read_doc_length,
         tokenize::Tokenizer,
@@ -376,7 +376,6 @@ pub struct ColumnMeta {
     pub params: bm25::Bm25Params,
     pub positions: bool,
     pub tokenizer: Arc<dyn Tokenizer>,
-    pub(crate) base: Base,
     pub stopwords: Stopwords,
     pub stemmer: Stemmer,
     pub stored: bool,
@@ -621,11 +620,11 @@ impl ColumnMeta {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FtsColumnConfig {
     pub name: String,
-    /// The column's analyzer name: `"ascii_lower"` or `"standard"`.
-    /// Required — the builder has always emitted it, so a column entry
-    /// without it is a malformed footer and open fails rather than
-    /// guessing which analyzer produced the postings.
-    pub tokenizer: String,
+    /// Base tokenizer name an earlier writer recorded. Not written: the
+    /// base is always `standard`. Absent or `"standard"` opens; any other
+    /// name refuses the file (see `check_recorded_tokenizer`).
+    #[serde(default)]
+    pub tokenizer: Option<String>,
     /// Whether this column's index records token positions (phrase
     /// support). Files written before positions existed lack the
     /// field, which can only mean no positions — so a missing field
@@ -667,8 +666,8 @@ pub struct FtsColumnConfig {
     /// Revision of the analysis that produced this column's terms.
     ///
     /// Per column rather than per file, for two reasons. It is derived
-    /// from [`Self::tokenizer`], [`Self::stopwords`] and
-    /// [`Self::stemmer`], which a caller sets per field — two columns of
+    /// from [`Self::stopwords`] and [`Self::stemmer`], which a caller
+    /// sets per column — two columns of
     /// one table can be analyzed by different chains and so sit at
     /// different revisions. And a re-analysis can only rebuild columns
     /// whose text was stored, carrying the rest across untouched, so it
@@ -1005,21 +1004,6 @@ mod tests {
     #[test]
     fn default_open_options_verifies_crc() {
         assert!(OpenOptions::default().verify_crc);
-    }
-
-    #[test]
-    fn fts_column_config_without_tokenizer_is_rejected() {
-        // The analyzer name is load-bearing: query terms must be
-        // tokenized the way the postings were. A column entry missing it
-        // is a malformed footer, so open fails instead of picking an
-        // analyzer for the caller.
-        let (blob, _) = build_blob();
-        let json = r#"[{"name":"body"}]"#;
-        let err = FtsReader::open(blob, json).expect_err("missing tokenizer must fail open");
-        assert!(
-            err.to_string().contains("tokenizer"),
-            "error should name the missing field: {err}"
-        );
     }
 
     #[test]

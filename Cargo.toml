@@ -139,7 +139,7 @@ rustix = { version = "1", features = ["time"] }
 static_assertions = "1"
 
 # Tokenization: UAX#29 word segmentation for the Unicode-aware standard
-# analyzer (keeps non-ASCII text), alongside the built-in ASCII tokenizer.
+# analyzer (keeps non-ASCII text).
 unicode-segmentation = "1"
 # Snowball stemmers for the per-column analysis chain's `stem=` filter.
 # The de-facto Rust snowball port, dual MIT / BSD-3-Clause, and its only

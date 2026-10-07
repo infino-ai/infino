@@ -29,7 +29,7 @@ pub use core::*;
 pub(crate) use count::TermIndexFact;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use count::TermLayout;
-pub(crate) use expand::{ContainsRows, LONG_S_ASCII, TermPattern, has_fold_partner};
+pub(crate) use expand::{ContainsRows, LONG_S_ASCII, TermPattern};
 pub use metadata::{ColumnLengthStats, ColumnMeta, OpenOptions};
 pub use options::{Bm25SearchOptions, BoolMode};
 pub(crate) use search::FetchedTermMemo;

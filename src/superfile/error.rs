@@ -35,13 +35,6 @@ pub enum BuildError {
     #[error("duplicate column name {0:?}")]
     DuplicateColumnName(String),
 
-    #[error(
-        "FTS column {column:?}: unknown analyzer {analyzer:?} (valid: \
-         \"standard\", \"ascii_lower\"; stopwords and stemming are \
-         separate options, not part of this name)"
-    )]
-    UnknownAnalyzer { column: String, analyzer: String },
-
     #[error("logical name {0:?} duplicated across fts_columns and vector_columns")]
     DuplicateLogicalName(String),
 
@@ -145,6 +138,12 @@ pub enum ReadError {
     /// it: a caller bug, not a problem with the file.
     #[error("this read does not support the column's codec: {0}")]
     WrongCodecPath(String),
+
+    #[error(
+        "FTS column {column:?} uses the removed {analyzer:?} analyzer; \
+         re-create the table under \"standard\""
+    )]
+    RemovedAnalyzer { column: String, analyzer: String },
 
     #[error("io error during read: {0}")]
     Io(#[from] std::io::Error),

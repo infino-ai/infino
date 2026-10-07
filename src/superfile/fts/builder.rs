@@ -110,7 +110,7 @@ use crate::{
             reader::ColumnLengthStats,
             short::{SHORT_MAX_DF, encode_short},
             sorted_merge::{SortedInput, merge_column},
-            tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
+            tokenize::{StandardTokenizer, Tokenizer},
         },
         id_space::FtsDocId,
     },
@@ -2001,23 +2001,18 @@ impl FtsBuilder {
         // path is reachable. See the original `add_doc` for the
         // ~150M dyn-dispatch savings this buys on the 1M-doc bench.
         let tokenizer = &self.column_tokenizers[col_idx];
-        let ascii_tok = tokenizer
-            .as_ref()
-            .as_any()
-            .downcast_ref::<AsciiLowerTokenizer>();
-        // `standard` is the default analyzer, so it needs the same
-        // monomorphized scan the ASCII tokenizer gets — through the
-        // trait object every token costs an indirect call and the
-        // interning closure cannot inline into the scan loop.
+        // `standard` needs a monomorphized scan — through the trait
+        // object every token costs an indirect call and the interning
+        // closure cannot inline into the scan loop.
         let standard_tok = tokenizer
             .as_ref()
             .as_any()
             .downcast_ref::<StandardTokenizer>();
         // A column with a stopword set or a stemmer tokenizes through
-        // the chain, which wraps one of the two above. It gets its own
-        // monomorphized arm for the same reason they do, and it must be
-        // reached through the *chain's* scan — the base's would index
-        // the unfiltered tokens.
+        // the chain, which wraps `standard`. It gets its own
+        // monomorphized arm for the same reason, and it must be reached
+        // through the *chain's* scan — the base's would index the
+        // unfiltered tokens.
         let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
         let mut tokens_in_doc: u64 = 0;
 
@@ -2083,9 +2078,7 @@ impl FtsBuilder {
                 }
                 *slot += 1;
             };
-            if let Some(ascii) = ascii_tok {
-                ascii.tokenize_each_inline(text, &mut on_token);
-            } else if let Some(standard) = standard_tok {
+            if let Some(standard) = standard_tok {
                 standard.tokenize_each_inline(text, &mut on_token);
             } else if let Some(chain) = chain_tok {
                 chain.tokenize_each_inline(text, &mut on_token);
@@ -2135,14 +2128,7 @@ impl FtsBuilder {
                 doc_pos_chain.push((position as u32, *head));
                 *head = chain_idx;
             };
-            if let Some(ascii) = ascii_tok {
-                // Gap-aware: a dropped (non-ASCII) run advances the
-                // position ordinal but emits no token.
-                ascii.tokenize_each_inline_positioned(text, |tok, position| {
-                    record(tok, position);
-                    tokens_in_doc += 1;
-                });
-            } else if let Some(standard) = standard_tok {
+            if let Some(standard) = standard_tok {
                 // `standard` drops nothing — every segment carrying an
                 // alphanumeric is emitted — so an emission ordinal *is*
                 // the gap-inclusive position and no gap bookkeeping is
@@ -2271,23 +2257,18 @@ impl FtsBuilder {
         text: &str,
     ) -> Result<(), BuildError> {
         let tokenizer = &self.column_tokenizers[col_idx];
-        let ascii_tok = tokenizer
-            .as_ref()
-            .as_any()
-            .downcast_ref::<AsciiLowerTokenizer>();
-        // `standard` is the default analyzer, so it needs the same
-        // monomorphized scan the ASCII tokenizer gets — through the
-        // trait object every token costs an indirect call and the
-        // interning closure cannot inline into the scan loop.
+        // `standard` needs a monomorphized scan — through the trait
+        // object every token costs an indirect call and the interning
+        // closure cannot inline into the scan loop.
         let standard_tok = tokenizer
             .as_ref()
             .as_any()
             .downcast_ref::<StandardTokenizer>();
         // A column with a stopword set or a stemmer tokenizes through
-        // the chain, which wraps one of the two above. It gets its own
-        // monomorphized arm for the same reason they do, and it must be
-        // reached through the *chain's* scan — the base's would index
-        // the unfiltered tokens.
+        // the chain, which wraps `standard`. It gets its own
+        // monomorphized arm for the same reason, and it must be reached
+        // through the *chain's* scan — the base's would index the
+        // unfiltered tokens.
         let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
         let mut tokens_in_doc: u64 = 0;
         let positional = self.columns[col_idx].positions;
@@ -2331,9 +2312,7 @@ impl FtsBuilder {
                     }
                 }
             };
-            if let Some(ascii) = ascii_tok {
-                ascii.tokenize_each_inline(text, &mut on_token);
-            } else if let Some(standard) = standard_tok {
+            if let Some(standard) = standard_tok {
                 standard.tokenize_each_inline(text, &mut on_token);
             } else if let Some(chain) = chain_tok {
                 chain.tokenize_each_inline(text, &mut on_token);
@@ -2390,14 +2369,7 @@ impl FtsBuilder {
                 let prev = doc_pos_head.insert(key, idx).unwrap_or(CHAIN_END);
                 doc_pos_chain.push((position as u32, prev));
             };
-            if let Some(ascii) = ascii_tok {
-                // Gap-aware: a dropped (non-ASCII) run advances the
-                // position ordinal but emits no token.
-                ascii.tokenize_each_inline_positioned(text, |tok, position| {
-                    record(tok, position);
-                    tokens_in_doc += 1;
-                });
-            } else if let Some(standard) = standard_tok {
+            if let Some(standard) = standard_tok {
                 // `standard` drops nothing — every segment carrying an
                 // alphanumeric is emitted — so an emission ordinal *is*
                 // the gap-inclusive position and no gap bookkeeping is

@@ -166,7 +166,7 @@ use crate::{
                 PartitionStrategy, WIDTH_LAW_KS,
             },
             listed_once, options_hash,
-            part::{self as part_mod, ContentHash, PartId},
+            part::{self as part_mod, PartId},
             superfile_stem,
             term_index::{self, Contribution as TermContribution, TermIndexError},
             term_stats,
@@ -4144,16 +4144,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 remote_state.checkpoint.shard_count
             )));
         }
-        // Same acceptance rule as reopening the table: a checkpoint
-        // written before the engine's current options encoding still
-        // identifies this table, so a drain that spans an upgrade
-        // resumes instead of wedging on a re-encoded digest.
-        let checkpoint_hash = ContentHash::from_hex(&remote_state.checkpoint.options_hash);
-        let recognized = checkpoint_hash.is_some_and(|stored| {
-            options_hash::verify_options_hash(user_inner.options.as_ref(), &user_strategy, stored)
-                .is_ok()
-        });
-        if !recognized {
+        if remote_state.checkpoint.options_hash != current_options_hash {
             return Err(BuildError::Store(format!(
                 "drain checkpoint options hash {} != current {}",
                 remote_state.checkpoint.options_hash, current_options_hash
@@ -13351,7 +13342,7 @@ mod tests {
             .expect("title FTS summary present");
 
         // Each doc's title is "doc <i> alpha"; tokenized with
-        // ASCII-lower, distinct terms include "doc", "alpha",
+        // `standard`, distinct terms include "doc", "alpha",
         // and digits 0-3. The FST will dedupe; n_terms_distinct
         // is at least 3 (doc, alpha, plus some digit tokens).
         assert!(

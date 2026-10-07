@@ -1990,7 +1990,7 @@ mod tests {
         memory::ConnectionMemoryBudget,
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::{reader::Bm25SearchOptions, tokenize::STANDARD_TOKENIZER},
+            fts::reader::Bm25SearchOptions,
             reader::SuperfileReader,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
@@ -4127,14 +4127,10 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        let opts = SupertableOptions::new(
-            schema_id_title(),
-            vec![FtsConfig::new("title").analyzer(STANDARD_TOKENIZER)],
-            vec![],
-        )
-        .expect("options")
-        .with_writer_pool(pool)
-        .with_storage(Arc::clone(&storage));
+        let opts = SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
+            .expect("options")
+            .with_writer_pool(pool)
+            .with_storage(Arc::clone(&storage));
         let st = Supertable::create(opts).expect("create");
         let mut titles: Vec<String> = Vec::with_capacity(BATCHES * PER_BATCH);
         for b in 0..BATCHES {

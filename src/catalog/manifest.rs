@@ -53,17 +53,11 @@ pub(crate) struct TableEntry {
     pub(crate) schema_ipc: Vec<u8>,
     /// FTS-indexed column names.
     pub(crate) fts: Vec<String>,
-    /// FTS **base tokenizer** names, parallel to `fts` (`"ascii_lower"`
-    /// / `"standard"`). A column's analyzer is one of these plus the
-    /// filters in `fts_stopwords` / `fts_stemmers`.
-    ///
-    /// Every entry `create_table` writes carries one name per FTS
-    /// column; `open_table` requires the two lists to be the same
-    /// length rather than inferring a tokenizer for a column that lacks
-    /// one. `serde(default)` only keeps the *rest* of the catalog
-    /// decodable — an entry that decodes to a short list is rejected per
-    /// table, not silently patched.
-    #[serde(default)]
+    /// FTS base tokenizer names an earlier writer recorded, parallel to
+    /// `fts`. Not written: the base is always `standard`. `open_table`
+    /// accepts an absent list or `"standard"` entries and refuses a table
+    /// naming any other analyzer.
+    #[serde(default, skip_serializing)]
     pub(crate) fts_analyzers: Vec<String>,
     /// FTS stopword-set names, parallel to `fts`; an empty string
     /// means no set. Absent in catalogs written before the filter
@@ -220,7 +214,7 @@ mod tests {
             location: "docs".into(),
             schema_ipc: schema_to_ipc(&sample_schema()).expect("ipc"),
             fts: vec!["title".into()],
-            fts_analyzers: vec!["standard".into()],
+            fts_analyzers: Vec::new(),
             fts_stopwords: vec![String::new()],
             fts_stemmers: vec![String::new()],
             fts_positions: vec![false],

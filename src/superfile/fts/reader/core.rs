@@ -44,7 +44,7 @@ use crate::{
             fts::{HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, VERSION_MIN, hdr, term_meta},
         },
         fts::{
-            analysis::{Base, chain_tokenizer},
+            analysis::{chain_tokenizer, check_recorded_tokenizer},
             bm25,
             builder::DOC_LENGTHS_ENTRY_SIZE,
             positions::GroupIndex,
@@ -838,19 +838,15 @@ impl FtsReader {
             }
             let baked_avgdl = (avgdl_x1000 as f32) / format::fts::AVGDL_FIXED_POINT_SCALE;
             let params = col_cfg.params();
-            let base = Base::from_name(&col_cfg.tokenizer).ok_or_else(|| {
-                FtsError::Read(ReadError::Malformed(format!(
-                    "inf.fts.columns: unknown tokenizer {:?} for column {:?}",
-                    col_cfg.tokenizer, col_cfg.name
-                )))
-            })?;
+            check_recorded_tokenizer(&col_cfg.name, col_cfg.tokenizer.as_deref())
+                .map_err(FtsError::Read)?;
             let (stopwords, stemmer) = col_cfg.filters().map_err(|(field, value)| {
                 FtsError::Read(ReadError::Malformed(format!(
                     "inf.fts.columns: unknown {field} {value:?} for column {:?}",
                     col_cfg.name
                 )))
             })?;
-            let tokenizer = chain_tokenizer(base, stopwords, stemmer);
+            let tokenizer = chain_tokenizer(stopwords, stemmer);
             // The length array is not decoded here: the norms scoring
             // needs from it are built on first scored use
             // (`ColumnMeta::norms`), so a match-only query, or one a
@@ -867,7 +863,6 @@ impl FtsReader {
                 params,
                 positions: col_cfg.positions,
                 tokenizer,
-                base,
                 stopwords,
                 stemmer,
                 stored: col_cfg.stored,
@@ -1686,7 +1681,7 @@ impl FtsReader {
     ///
     /// `term_prefix` is the prefix as it appears in the FST — the
     /// caller is responsible for any tokenizer-level normalization
-    /// (e.g. ASCII-lowercasing for the v1 tokenizer). Returns an
+    /// (e.g. lowercasing). Returns an
     /// empty `Vec` if `column` is not registered or no terms match
     /// the prefix.
     pub fn iter_terms_with_prefix(
@@ -2102,6 +2097,27 @@ mod tests {
     /// resolver is where the decision is made, but the `map_err` that
     /// turns it into a read error is the part a caller actually sees,
     /// and a `?` dropped there would let the column open unfiltered.
+    /// A column entry with no `tokenizer` key, or one naming `standard`,
+    /// opens; one naming any other analyzer refuses the file with the
+    /// re-create instruction rather than querying it with `standard`.
+    #[test]
+    fn open_accepts_only_an_absent_or_standard_recorded_tokenizer() {
+        let (blob, json) = build_blob();
+        let absent = json.replace(r#","tokenizer":"standard""#, "");
+        assert_ne!(absent, json, "fixture did not patch");
+        FtsReader::open(blob.clone(), &absent).expect("an absent tokenizer opens");
+        FtsReader::open(blob.clone(), &json).expect("standard opens");
+
+        let removed = json.replace(r#""tokenizer":"standard""#, r#""tokenizer":"ascii_lower""#);
+        let msg = FtsReader::open(blob, &removed)
+            .expect_err("a removed analyzer must fail the open")
+            .to_string();
+        assert!(
+            msg.contains("ascii_lower") && msg.contains("re-create"),
+            "the error names the analyzer and the fix, got: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn open_refuses_a_column_naming_an_unreproducible_filter() {
         let (blob, json) = build_blob();

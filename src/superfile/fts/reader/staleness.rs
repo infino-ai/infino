@@ -111,10 +111,8 @@ impl FtsReader {
             .fts_columns_config()
             .filter_map(|c| {
                 // Compare against the revision of *this column's own*
-                // chain, not a single engine-wide number: a column
-                // analyzed with `ascii_lower` is not stale because
-                // `standard` moved.
-                let current = chain_revision(c.base, c.stopwords, c.stemmer);
+                // chain: a stemmer bump stales only the columns that stem.
+                let current = chain_revision(c.stopwords, c.stemmer);
                 let recorded = c.analysis_revision.unwrap_or(UNKNOWN_ANALYSIS_REVISION);
                 (recorded < current).then(|| StaleColumn {
                     name: c.name.clone(),

@@ -54,11 +54,6 @@ pub(crate) const FOLD_PAIRS: &[(char, char)] = &[(LONG_S, 's'), (KELVIN_SIGN, 'k
 /// matching row's term, so only a dictionary walk can find it.
 pub(crate) const LONG_S_ASCII: char = FOLD_PAIRS[0].1;
 
-/// Whether `c` is an ASCII letter with a non-ASCII fold partner.
-pub(crate) fn has_fold_partner(c: char) -> bool {
-    FOLD_PAIRS.iter().any(|&(_, ascii)| ascii == c)
-}
-
 /// Combining dot above (U+0307). `to_lowercase` turns `İ` (U+0130) into an
 /// `i` followed by this mark, so a term can hold an `i` its row spelled
 /// `İ` — a letter Arrow's `ILIKE` does not match against `i`. Written as

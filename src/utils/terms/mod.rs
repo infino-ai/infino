@@ -64,10 +64,9 @@ pub const FST_SEPARATOR: u8 = 0x1F;
 /// Callers must ensure `column_name` does not itself contain the
 /// separator byte — see [`validate_column_name`]. `term` may be any
 /// bytes a tokenizer produced; the separator `0x1F` is a C0 control
-/// byte, which no shipped tokenizer emits inside a token
-/// (`AsciiLowerTokenizer` keeps only `[a-z0-9]+`; `StandardTokenizer`
-/// emits UAX #29 word segments, which never contain a control byte),
-/// so the separator can never appear in a term.
+/// byte, which the shipped tokenizer never emits inside a token
+/// (`StandardTokenizer` emits UAX #29 word segments, which never
+/// contain a control byte), so the separator can never appear in a term.
 pub fn make_key(column_name: &str, term: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(column_name.len() + 1 + term.len());
     k.extend_from_slice(column_name.as_bytes());
@@ -821,9 +820,8 @@ mod tests {
 
     #[test]
     fn make_key_preserves_term_bytes() {
-        // AsciiLowerTokenizer drops non-ASCII tokens, but make_key itself
-        // is byte-transparent: multi-byte UTF-8 in a term (e.g. from the
-        // standard tokenizer) comes through exactly.
+        // make_key is byte-transparent: multi-byte UTF-8 in a term
+        // comes through exactly.
         let key = make_key("body", "café");
         assert_eq!(&key[0..4], b"body");
         assert_eq!(key[4], FST_SEPARATOR);

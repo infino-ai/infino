@@ -1275,7 +1275,7 @@ impl SuperfileReader {
         mode: BoolMode,
     ) -> Result<Vec<(RowId, f32)>, ReadError> {
         // Tokenize with the target column's configured tokenizer so query
-        // terms match how the column was indexed (ascii_lower / standard).
+        // terms match how the column was indexed (its analysis chain).
         // A column this superfile has no full-text index for fails here,
         // where the reason is still nameable, rather than after a pass with
         // some other column's analyzer.
@@ -1322,7 +1322,7 @@ impl SuperfileReader {
 
     /// Pre-tokenized variant of [`Self::bm25_hits_async`] — the caller
     /// supplies the already-tokenized term slice and we skip the
-    /// `AsciiLowerTokenizer` pass.
+    /// tokenizer pass.
     ///
     /// Used by the supertable layer's fan-out: the cross-superfile
     /// search tokenizes the query once at the orchestrator (to
@@ -1332,9 +1332,8 @@ impl SuperfileReader {
     /// a T-token query.
     ///
     /// Terms must already be tokenized to the column's FST key form —
-    /// e.g. `AsciiLowerTokenizer.tokenize(query)` for an `ascii_lower`
-    /// column (already-lowercased ASCII alphanumerics) or
-    /// `StandardTokenizer.tokenize(query)` for a `standard` column.
+    /// the column's own tokenizer, e.g. `StandardTokenizer.tokenize(query)`
+    /// for a plain `standard` column.
     pub async fn bm25_search_pretokenized(
         &self,
         column: &str,
@@ -1736,10 +1735,9 @@ impl SuperfileReader {
     ///
     /// Expands `prefix` to the lex-ordered list of indexed terms
     /// in `column` whose tokenized form begins with `prefix`,
-    /// then runs `BoolMode::Or` BM25 over that term set. Matches
-    /// the v1 tokenizer convention: the FST stores
-    /// AsciiLowerTokenizer-tokenized terms, so the prefix is
-    /// ASCII-lowercased before expansion. Whitespace inside
+    /// then runs `BoolMode::Or` BM25 over that term set. The FST
+    /// stores lowercased terms, so the prefix is ASCII-lowercased
+    /// before expansion. Whitespace inside
     /// `prefix` is **not** split — prefix search is a single
     /// term-level prefix, not a query parser.
     ///
@@ -1770,9 +1768,9 @@ impl SuperfileReader {
         if term_bytes.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
-        // FST keys are valid UTF-8 by construction (AsciiLower
-        // tokenizer only emits ASCII bytes); the from_utf8 below
-        // is a typed pass-through, not a re-validation cost.
+        // FST keys are valid UTF-8 by construction (a tokenizer
+        // emits `&str` terms); the from_utf8 below is a typed
+        // pass-through, not a re-validation cost.
         let term_strings: Vec<&str> = term_bytes
             .iter()
             .filter_map(|b| str::from_utf8(b).ok())
@@ -1878,9 +1876,9 @@ impl SuperfileReader {
         let term_bytes = fts
             .terms_with_prefix(column, lowered.as_bytes(), pool)
             .await?;
-        // FST keys are valid UTF-8 by construction (AsciiLower
-        // tokenizer only emits ASCII bytes); the from_utf8 below
-        // is a typed pass-through, not a re-validation cost.
+        // FST keys are valid UTF-8 by construction (a tokenizer
+        // emits `&str` terms); the from_utf8 below is a typed
+        // pass-through, not a re-validation cost.
         let term_strings: Vec<&str> = term_bytes
             .iter()
             .filter_map(|b| str::from_utf8(b).ok())
@@ -1909,7 +1907,7 @@ impl SuperfileReader {
     /// Prefix-expanded BM25 search restricted to a doc_id sub-range.
     ///
     /// Same expansion logic as [`Self::bm25_search_prefix`] —
-    /// AsciiLower the prefix, walk the FST for matching terms, run
+    /// lowercase the prefix, walk the FST for matching terms, run
     /// BM25 OR over the term set — but only docs in
     /// `[doc_id_start, doc_id_end)` are eligible. A single-call wrapper
     /// around [`Self::bm25_prefix_cursor_set`] +

@@ -18,16 +18,12 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
-    Bm25SearchOptions, ConnectOptions, Connection, FtsField, IndexSpec, Metric, connect,
-    connect_with,
+    Bm25SearchOptions, ConnectOptions, Connection, IndexSpec, Metric, connect, connect_with,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::{
-            reader::BoolMode,
-            tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER},
-        },
+        fts::{reader::BoolMode, tokenize::MAX_TOKEN_CHARS},
         vector::rerank_codec::RerankCodec,
     },
     supertable::{
@@ -1001,11 +997,7 @@ fn sql_like_fixture(dir: &TempDir, padded: bool, extra: &[String]) -> Connection
         Field::new("rating", DataType::Int64, false),
     ]));
     let docs = db
-        .create_table(
-            "docs",
-            schema.clone(),
-            IndexSpec::new().fts(FtsField::new("title").analyzer(STANDARD_TOKENIZER)),
-        )
+        .create_table("docs", schema.clone(), IndexSpec::new().fts("title"))
         .expect("create_table");
     let padding = if padded { LIKE_PADDING } else { "" };
     let titles: Vec<String> = (0..LIKE_ROWS)

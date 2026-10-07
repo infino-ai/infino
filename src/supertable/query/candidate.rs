@@ -46,8 +46,8 @@
 //! must be indexed as itself; a token bordering a wildcard may be the
 //! head or tail of a longer indexed term and is widened, per superfile,
 //! to every term that starts with / ends with / contains it. Which edges
-//! count as closed, and which open tokens can be used at all, depends on
-//! the analyzer — see `Analyzer`. `ILIKE` is bounded the same way for
+//! count as closed, and which open tokens can be used at all, follows the
+//! `standard` word rules — see `hard_separator` and `admits`. `ILIKE` is bounded the same way for
 //! ASCII tokens: Arrow folds case under Unicode simple case folding, so
 //! a matching row may spell `s` as `ſ` and `k` as `K`, and the expansion
 //! compares dictionary terms with those folded back (`fold_term`). Tokens
@@ -79,7 +79,7 @@
 //! starts or ends a value, nor the punctuation beside it), case-sensitive
 //! `LIKE` (terms are lowercased), `_` and several literals (order and
 //! gaps), a literal with a separator in it (a phrase), a non-ASCII literal,
-//! and other analyzers.
+//! and a column with a stopword set or stemmer.
 //!
 //! Why a tree of exact leaves is exact. Each leaf splits a superfile's rows
 //! into proven, doubtful and false; `AND` and `OR` combine those splits row
@@ -112,9 +112,8 @@ use crate::{
         fts::{
             reader::{
                 BoolMode, ContainsRows, FetchedTermMemo, LONG_S_ASCII, MatchWork, TermPattern,
-                has_fold_partner,
             },
-            tokenize::{ASCII_LOWER_TOKENIZER, MAX_TOKEN_CHARS, STANDARD_TOKENIZER, Tokenizer},
+            tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER, Tokenizer},
         },
         id_space::RowId,
     },
@@ -843,7 +842,7 @@ fn in_list_leaf(
 /// Lower `col LIKE 'pattern'` / `col ILIKE 'pattern'` on an FTS column.
 /// The pattern's literal fragments are tokenized with the column's
 /// analyzer; every token the analyzer can bound soundly becomes a
-/// constraint (see `Analyzer::admits`). All-complete tokens are the same
+/// constraint (see `admits`). All-complete tokens are the same
 /// term-AND an equality lowers to, unless an `ILIKE` token holds an `s`
 /// (its `ſ` spelling needs the dictionary); otherwise the leaf waits for
 /// a superfile's dictionary. `Unbounded` for `NOT LIKE`, a non-column or
@@ -860,14 +859,13 @@ fn like_leaf(
     let LikeParts {
         column,
         tok,
-        analyzer,
         pattern,
         fold,
     } = parts;
     let tokens: Vec<LikeToken> = pattern
         .fragments
         .iter()
-        .flat_map(|fragment| fragment.tokens(tok.as_ref(), analyzer, fold))
+        .flat_map(|fragment| fragment.tokens(tok.as_ref(), fold))
         .collect();
     if tokens.is_empty() {
         return CandidatePlan::Unbounded;
@@ -897,7 +895,6 @@ struct LikeParts<'a> {
     column: &'a str,
     /// The analyzer the table indexes that column with.
     tok: Arc<dyn Tokenizer>,
-    analyzer: Analyzer,
     pattern: LikePattern,
     /// `ILIKE`: Arrow compares under Unicode simple case folding (ASCII
     /// fast paths aside), so the analyzers' lowercasing does not reproduce
@@ -908,8 +905,9 @@ struct LikeParts<'a> {
 
 /// Parse `like` for the index, or `None` for a leaf it cannot bound:
 /// `NOT LIKE` (no term set bounds an exclusion), a non-column or
-/// non-literal operand, a non-FTS column, an escape other than `\`, an
-/// analyzer the lowering does not know, or a pattern the executor rejects.
+/// non-literal operand, a non-FTS column, an escape other than `\`, a
+/// column whose analysis is not plain `standard` (see
+/// [`is_plain_standard`]), or a pattern the executor rejects.
 fn like_parts<'a>(
     like: &'a Like,
     fts_cols: &HashSet<&str>,
@@ -927,11 +925,12 @@ fn like_parts<'a>(
     }
     let pattern = like_fragments(scalar_str(v)?)?;
     let tok = resolve(&c.name)?;
-    let analyzer = Analyzer::of(tok.as_ref())?;
+    if !is_plain_standard(tok.as_ref()) {
+        return None;
+    }
     Some(LikeParts {
         column: &c.name,
         tok,
-        analyzer,
         pattern,
         fold: like.case_insensitive,
     })
@@ -969,7 +968,7 @@ pub(crate) fn exact_contains(
         return None;
     };
     let parts = like_parts(like, fts_cols, resolve)?;
-    if !parts.fold || parts.analyzer != Analyzer::Standard || parts.pattern.any_one {
+    if !parts.fold || parts.pattern.any_one {
         return None;
     }
     let [fragment] = parts.pattern.fragments.as_slice() else {
@@ -1119,7 +1118,7 @@ impl Fragment {
     /// fragment, so its own cuts fall elsewhere. A token of exactly the cut
     /// length, and the token after it, are therefore dropped (a genuine
     /// word of that length goes too, which only loosens the bound).
-    fn tokens(&self, tok: &dyn Tokenizer, analyzer: Analyzer, fold: bool) -> Vec<LikeToken> {
+    fn tokens(&self, tok: &dyn Tokenizer, fold: bool) -> Vec<LikeToken> {
         let texts: Vec<String> = tok.tokenize(&self.text).collect();
         let n = texts.len();
         let cut_piece: Vec<bool> = texts
@@ -1128,24 +1127,14 @@ impl Fragment {
             .collect();
         // A cut piece, or the piece its cut edge runs into.
         let beside_cut = |i: usize| cut_piece[i] || (i > 0 && cut_piece[i - 1]);
-        let left_closed = self.at_start
-            || self
-                .text
-                .chars()
-                .next()
-                .is_some_and(|c| analyzer.hard_separator(c));
-        let right_closed = self.at_end
-            || self
-                .text
-                .chars()
-                .next_back()
-                .is_some_and(|c| analyzer.hard_separator(c));
+        let left_closed = self.at_start || self.text.chars().next().is_some_and(hard_separator);
+        let right_closed = self.at_end || self.text.chars().next_back().is_some_and(hard_separator);
         texts
             .into_iter()
             .enumerate()
             .filter(|&(i, _)| !beside_cut(i))
             .filter_map(|(i, text)| {
-                analyzer.admits(
+                admits(
                     LikeToken {
                         text,
                         open_left: i == 0 && !left_closed,
@@ -1206,83 +1195,50 @@ fn like_fragments(pattern: &str) -> Option<LikePattern> {
     Some(LikePattern { fragments, any_one })
 }
 
-/// Which shipped analyzer indexed a column. It decides which fragment
-/// edges are closed and which open tokens the index can bound at all; an
-/// analyzer this module does not know keeps `LIKE` `Unbounded`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Analyzer {
-    /// `ascii_lower`: `[A-Za-z0-9]` runs, every other ASCII byte a
-    /// separator, a run holding any non-ASCII byte dropped whole.
-    AsciiLower,
-    /// `standard`: UAX #29 words, lowercased with `to_lowercase`.
-    Standard,
+/// Whether a column's analysis is plain `standard`, the only one whose
+/// token rules this lowering reasons about; any other keeps `LIKE`
+/// `Unbounded`.
+///
+/// A column carrying an **analysis chain** is not plain, and must not be.
+/// The lowering bounds a `LIKE` fragment by the terms it tokenizes to,
+/// which is only sound while a term in the index is a
+/// substring-preserving image of the text: with a stemmer it is not.
+/// `LIKE '%runni%'` matches the text `running`, whose indexed term is
+/// `run` — so a prefix walk for `runni` finds nothing and would drop a
+/// superfile that really matches. A chain reports a composite name, so
+/// the name comparison excludes it.
+fn is_plain_standard(tok: &dyn Tokenizer) -> bool {
+    tok.name() == STANDARD_TOKENIZER
 }
 
-impl Analyzer {
-    /// Recognize a column's analyzer, or `None` for one whose token
-    /// rules this lowering cannot reason about — which drops the `LIKE`
-    /// constraint entirely and keeps every superfile.
-    ///
-    /// A column carrying an **analysis chain** lands in that `None`,
-    /// and must. The lowering bounds a `LIKE` fragment by the terms it
-    /// tokenizes to, which is only sound while a term in the index is a
-    /// substring-preserving image of the text: with a stemmer it is
-    /// not. `LIKE '%runni%'` matches the text `running`, whose indexed
-    /// term is `run` — so a prefix walk for `runni` finds nothing and
-    /// would drop a superfile that really matches. Nothing else here
-    /// needs to know about chains, because they never reach this
-    /// `match`: a chain's name is a composite one and no arm claims it.
-    fn of(tok: &dyn Tokenizer) -> Option<Analyzer> {
-        match tok.name() {
-            ASCII_LOWER_TOKENIZER => Some(Analyzer::AsciiLower),
-            STANDARD_TOKENIZER => Some(Analyzer::Standard),
-            _ => None,
-        }
-    }
+/// A character that ends a token wherever it appears, so a token next
+/// to it inside a fragment has the same boundary in any row's text.
+///
+/// UAX #29 may join a word across a `WORD_JOINERS` character (`don't`);
+/// every other ASCII non-alphanumeric always breaks. Non-ASCII
+/// punctuation is left open rather than classified.
+fn hard_separator(c: char) -> bool {
+    c.is_ascii() && !c.is_ascii_alphanumeric() && !WORD_JOINERS.contains(&c)
+}
 
-    /// A character that ends a token wherever it appears, so a token next
-    /// to it inside a fragment has the same boundary in any row's text.
-    fn hard_separator(self, c: char) -> bool {
-        match self {
-            // Every ASCII byte outside `[A-Za-z0-9]` splits a run; a
-            // non-ASCII byte extends (and poisons) one instead.
-            Analyzer::AsciiLower => c.is_ascii() && !c.is_ascii_alphanumeric(),
-            // UAX #29 may join a word across a `WORD_JOINERS` character
-            // (`don't`); every other ASCII non-alphanumeric always breaks.
-            // Non-ASCII punctuation is left open rather than classified.
-            Analyzer::Standard => {
-                c.is_ascii() && !c.is_ascii_alphanumeric() && !WORD_JOINERS.contains(&c)
-            }
-        }
+/// Whether the index can soundly require `token` of a matching row;
+/// `fold` is the `ILIKE` flag.
+fn admits(token: LikeToken, fold: bool) -> Option<LikeToken> {
+    // Under `ILIKE`, Arrow folds case with Unicode simple case folding
+    // (through a regex whenever the column or the pattern is not pure
+    // ASCII). A non-ASCII token then matches spellings `to_lowercase`
+    // never produces (`ς` for a medial `σ`, `ϐ` for `β`), so only an
+    // ASCII token can be required.
+    if fold && !token.text.is_ascii() {
+        return None;
     }
-
-    /// Whether the index can soundly require `token` of a matching row;
-    /// `fold` is the `ILIKE` flag.
-    fn admits(self, token: LikeToken, fold: bool) -> Option<LikeToken> {
-        // Under `ILIKE`, Arrow folds case with Unicode simple case folding
-        // (through a regex whenever the column or the pattern is not pure
-        // ASCII). A non-ASCII token then matches spellings `to_lowercase`
-        // never produces (`ς` for a medial `σ`, `ϐ` for `β`), so only an
-        // ASCII token can be required.
-        if fold && !token.text.is_ascii() {
-            return None;
-        }
-        match self {
-            // A run holding any non-ASCII byte is dropped whole, so a term
-            // that merely *contains* a fragment token may not exist
-            // (`Firefox—the` indexes nothing). Only a token the fragment
-            // closes on both sides is guaranteed indexed as itself.
-            Analyzer::AsciiLower if !token.is_complete() => None,
-            // …and under `ILIKE` a row may spell `s` as `ſ` or `k` as `K`
-            // — non-ASCII bytes that drop the whole run.
-            Analyzer::AsciiLower if fold && token.text.chars().any(has_fold_partner) => None,
-            // `to_lowercase` spells a word-final `Σ` as `ς` and a medial
-            // one as `σ`, so a token whose end may sit mid-word has two
-            // possible spellings in the dictionary.
-            Analyzer::Standard if token.open_right && token.text.ends_with(FINAL_SIGMA) => None,
-            _ => Some(token),
-        }
+    // `to_lowercase` spells a word-final `Σ` as `ς` and a medial one as
+    // `σ`, so a token whose end may sit mid-word has two possible
+    // spellings in the dictionary.
+    if token.open_right && token.text.ends_with(FINAL_SIGMA) {
+        return None;
     }
+    Some(token)
 }
 
 /// Build a `TermsAll` leaf for `column = value`, or `Unbounded` if the
@@ -1413,8 +1369,8 @@ mod tests {
     use super::*;
     use crate::superfile::{
         fts::{
-            analysis::{Base, Stemmer, Stopwords, chain_tokenizer},
-            tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER, StandardTokenizer},
+            analysis::{Stemmer, Stopwords, chain_tokenizer},
+            tokenize::{STANDARD_TOKENIZER, StandardTokenizer},
         },
         vector::layout::VectorLayout,
     };
@@ -1514,51 +1470,36 @@ mod tests {
         assert!(!unbounded.bounds_rows(&[partial]));
     }
 
-    /// Resolver for the `ascii_lower` tests: every column tokenizes with the
-    /// ASCII-lower analyzer.
-    fn ascii_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
-        Some(Arc::new(AsciiLowerTokenizer))
-    }
-
     /// Resolver whose column carries an analysis chain — the case the
     /// `LIKE` lowering must refuse to bound.
     fn stemming_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
-        Some(chain_tokenizer(
-            Base::Standard,
-            Stopwords::None,
-            Stemmer::English,
-        ))
+        Some(chain_tokenizer(Stopwords::None, Stemmer::English))
     }
 
     /// Resolver for a stopworded column.
     fn stopping_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
-        Some(chain_tokenizer(
-            Base::Standard,
-            Stopwords::English,
-            Stemmer::None,
-        ))
+        Some(chain_tokenizer(Stopwords::English, Stemmer::None))
     }
 
-    /// The guard is that a chain's *derived name* matches no arm of
-    /// `Analyzer::of`. Asserted directly, because every `LIKE` test
-    /// below would also pass if the resolver simply returned no
-    /// tokenizer at all — a false pass that would hide the guard
-    /// disappearing.
+    /// The guard is that a chain's *derived name* is not plain
+    /// `standard`. Asserted directly, because every `LIKE` test below
+    /// would also pass if the resolver simply returned no tokenizer at
+    /// all — a false pass that would hide the guard disappearing.
     #[test]
-    fn a_chains_name_is_recognized_by_no_analyzer_arm() {
-        let plain = chain_tokenizer(Base::Standard, Stopwords::None, Stemmer::None);
+    fn a_chains_name_is_not_plain_standard() {
+        let plain = chain_tokenizer(Stopwords::None, Stemmer::None);
         assert_eq!(plain.name(), STANDARD_TOKENIZER);
         assert!(
-            Analyzer::of(plain.as_ref()).is_some(),
+            is_plain_standard(plain.as_ref()),
             "a plain column must still be bounded"
         );
         for chained in [
-            chain_tokenizer(Base::Standard, Stopwords::English, Stemmer::None),
-            chain_tokenizer(Base::Standard, Stopwords::None, Stemmer::English),
-            chain_tokenizer(Base::AsciiLower, Stopwords::English, Stemmer::English),
+            chain_tokenizer(Stopwords::English, Stemmer::None),
+            chain_tokenizer(Stopwords::None, Stemmer::English),
+            chain_tokenizer(Stopwords::English, Stemmer::English),
         ] {
             assert!(
-                Analyzer::of(chained.as_ref()).is_none(),
+                !is_plain_standard(chained.as_ref()),
                 "{:?} must not be recognized as a bare analyzer",
                 chained.name()
             );
@@ -1619,10 +1560,6 @@ mod tests {
 
     fn plan(expr: Expr) -> CandidatePlan {
         CandidatePlan::from_filters(&[expr], &fts_cols(), &standard_resolver)
-    }
-
-    fn ascii_plan(expr: Expr) -> CandidatePlan {
-        CandidatePlan::from_filters(&[expr], &fts_cols(), &ascii_resolver)
     }
 
     /// Bloom-survival flattening: an `AND` of term-alls collapses to one
@@ -1946,32 +1883,6 @@ mod tests {
     }
 
     #[test]
-    fn like_under_ascii_lower_keeps_only_complete_tokens() {
-        // `ascii_lower` drops any run holding a non-ASCII byte, so
-        // a token that may be the head or tail of a longer run is not
-        // guaranteed indexed: open-edged tokens drop out, and a pattern
-        // made only of them is Unbounded.
-        assert_eq!(
-            ascii_plan(col("title").like(lit("%rust%"))),
-            CandidatePlan::Unbounded
-        );
-        assert_eq!(
-            ascii_plan(col("title").like(lit("rust%"))),
-            CandidatePlan::Unbounded
-        );
-        // A token closed by separators inside the fragment is exact.
-        assert_eq!(
-            ascii_plan(col("title").like(lit("%(rust)%"))),
-            terms_all(&["rust"])
-        );
-        // Mixed: the complete token stays, the open one drops.
-        assert_eq!(
-            ascii_plan(col("title").like(lit("rust async%"))),
-            terms_all(&["rust"])
-        );
-    }
-
-    #[test]
     fn like_escape_makes_a_wildcard_literal() {
         // `\%` is a literal percent sign: no wildcard, so the value must be
         // exactly `100% sure` and its tokens bound it.
@@ -2034,35 +1945,6 @@ mod tests {
         assert_eq!(
             plan(col("title").ilike(lit("%fox%süd%"))),
             terms_ilike(vec![like_token("fox", true, true)])
-        );
-    }
-
-    #[test]
-    fn ilike_under_ascii_lower_excludes_tokens_that_can_fold_to_non_ascii() {
-        // `ſ` / `K` in a matching row are non-ASCII bytes, which drop the
-        // run under `ascii_lower`; a complete token holding `s` or `k` is
-        // therefore not guaranteed indexed. Others still are.
-        assert_eq!(
-            ascii_plan(col("title").ilike(lit("% rust %"))),
-            CandidatePlan::Unbounded
-        );
-        assert_eq!(
-            ascii_plan(col("title").ilike(lit("% quick %"))),
-            CandidatePlan::Unbounded
-        );
-        assert_eq!(
-            ascii_plan(col("title").ilike(lit("% fox %"))),
-            terms_all(&["fox"])
-        );
-        // The drop is per token: a sibling without `s` or `k` stays
-        // required, so the leaf narrows instead of vanishing.
-        assert_eq!(
-            ascii_plan(col("title").ilike(lit("% rust fox %"))),
-            terms_all(&["fox"])
-        );
-        assert_eq!(
-            ascii_plan(col("title").ilike(lit("%fox%"))),
-            CandidatePlan::Unbounded
         );
     }
 
@@ -2136,18 +2018,6 @@ mod tests {
         assert!(matches!(
             &leaves[1],
             PruneLeaf::Prefix { column, prefix } if column == "title" && prefix == b"rust"
-        ));
-        // Under `ascii_lower` only the complete tokens survive.
-        let leaves = like_prune_leaves(
-            &[col("title").like(lit("rust% quick fox %tail"))],
-            &fts_cols(),
-            &ascii_resolver,
-        );
-        assert_eq!(leaves.len(), 1);
-        assert!(matches!(
-            &leaves[0],
-            PruneLeaf::TermPresence { terms, mode: BoolMode::And, .. }
-                if *terms == ["quick".to_owned(), "fox".to_owned()]
         ));
     }
 
@@ -2229,35 +2099,21 @@ mod tests {
 
     #[test]
     fn lowering_uses_the_per_column_tokenizer() {
-        // `title` is analyzed with the Unicode-aware standard tokenizer,
-        // which keeps non-ASCII letters; ascii_lower drops the whole
-        // token. The lowering must pick the column's own analyzer.
-        let resolve = |col: &str| -> Option<Arc<dyn Tokenizer>> {
-            if col == "title" {
-                Some(Arc::new(StandardTokenizer))
-            } else {
-                Some(Arc::new(AsciiLowerTokenizer))
-            }
+        // The same literal lowers to different terms under a plain and a
+        // stemming column: the lowering must pick the column's own chain.
+        let filters = [col("title").eq(lit("Running"))];
+        let terms = |tokens: &[&str]| CandidatePlan::TermsAll {
+            column: "title".to_owned(),
+            tokens: tokens.iter().map(|t| t.to_string()).collect(),
         };
-        let bounded =
-            CandidatePlan::from_filters(&[col("title").eq(lit("Süd"))], &fts_cols(), &resolve);
         assert_eq!(
-            bounded,
-            CandidatePlan::TermsAll {
-                column: "title".to_owned(),
-                tokens: vec!["süd".to_owned()],
-            }
+            CandidatePlan::from_filters(&filters, &fts_cols(), &standard_resolver),
+            terms(&["running"])
         );
-
-        // The same literal under ascii_lower drops the non-ASCII token,
-        // leaving nothing to bound with ⇒ Unbounded. Proves the result
-        // above came from the standard tokenizer, not a table-wide default.
-        let unbounded = CandidatePlan::from_filters(
-            &[col("title").eq(lit("Süd"))],
-            &fts_cols(),
-            &ascii_resolver,
+        assert_eq!(
+            CandidatePlan::from_filters(&filters, &fts_cols(), &stemming_resolver),
+            terms(&["run"])
         );
-        assert_eq!(unbounded, CandidatePlan::Unbounded);
     }
 
     /// `exact_contains` of `expr` over `title` under the standard analyzer.
@@ -2341,9 +2197,9 @@ mod tests {
         for expr in rejected {
             assert_eq!(exact(expr.clone()), None, "{expr}");
         }
-        // Other analyzers: the rule is the standard analyzer's.
+        // Analysis chains: the rule is plain `standard`'s.
         let expr = col("title").ilike(lit("%bbc%"));
-        for resolve in [ascii_resolver, stemming_resolver, stopping_resolver] {
+        for resolve in [stemming_resolver, stopping_resolver] {
             assert_eq!(exact_contains(&expr, &fts_cols(), &resolve), None);
         }
     }
