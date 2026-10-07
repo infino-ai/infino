@@ -104,6 +104,7 @@ use infino::{
     runtime_metrics::UsageMeter,
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
+        format::fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr},
         fts::reader::BoolMode,
         vector::distance::Metric,
     },
@@ -2083,15 +2084,18 @@ pub(crate) mod diag {
     }
 
     fn fts_open_ranges(bytes: &[u8], off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
-        const FTS_HEADER_SIZE: usize = 48;
         let start = off as usize;
         let end = start.checked_add(len as usize)?;
         let blob = bytes.get(start..end)?;
         if blob.len() < FTS_HEADER_SIZE {
             return None;
         }
-        let postings_offset = read_u64_le(blob.get(32..40)?) as usize;
-        let doc_lengths_offset = read_u64_le(blob.get(40..48)?) as usize;
+        let postings_offset =
+            read_u64_le(blob.get(hdr::POSTINGS_OFFSET_OFF..hdr::POSTINGS_OFFSET_OFF + U64_BYTES)?)
+                as usize;
+        let doc_lengths_offset =
+            read_u64_le(blob.get(hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES)?)
+                as usize;
         if postings_offset > blob.len()
             || doc_lengths_offset > blob.len()
             || postings_offset > doc_lengths_offset
