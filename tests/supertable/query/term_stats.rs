@@ -193,24 +193,21 @@ fn sidecar_covers_fragmented_table_and_composes_with_tail() {
 
     // Plan parity: with every superfile covered, a first query — AND
     // shapes included, whose gather would otherwise pay a dict-only
-    // residual — plans EXACTLY what its repeat plans once the idf cache
-    // serves every term, i.e. only the query's own work. (`green` is not
-    // yet cached and appears only in half the docs, so the AND prune and
+    // residual — plans EXACTLY the query's own work. The first query runs
+    // on a freshly opened handle, whose idf cache holds nothing; the
+    // reference is the same query on `st` once its cache serves every
+    // term. (`green` appears only in half the docs, so the AND prune and
     // presence set genuinely differ across shards.)
-    let and_q = "alpha green";
-    let first_and = planned_ranges(&st, and_q, BoolMode::And);
-    assert_eq!(
-        first_and,
-        planned_ranges(&st, and_q, BoolMode::And),
-        "sidecar-covered AND query plans only its own work"
-    );
-    let or_q = "beta";
-    let first_or = planned_ranges(&st, or_q, BoolMode::Or);
-    assert_eq!(
-        first_or,
-        planned_ranges(&st, or_q, BoolMode::Or),
-        "sidecar-covered OR query plans only its own work"
-    );
+    let cold = Supertable::create(options_with_storage(&dir)).expect("open a cold handle");
+    for (query, mode) in [("alpha green", BoolMode::And), ("beta", BoolMode::Or)] {
+        let first = planned_ranges(&cold, query, mode);
+        planned_ranges(&st, query, mode);
+        assert_eq!(
+            first,
+            planned_ranges(&st, query, mode),
+            "a sidecar-covered first query plans only its own work for {query:?}"
+        );
+    }
 
     // Appends carry the sidecar and compose with the uncovered tail:
     // segment 2 raises `alpha`'s corpus df, so global idf must reflect
@@ -226,14 +223,15 @@ fn sidecar_covers_fragmented_table_and_composes_with_tail() {
     }
 
     // A fresh maintenance pass re-covers the tail; plan parity returns
-    // for a term the earlier queries never cached.
+    // for a first query on a handle opened after it.
     st.optimize(&stats_only_optimize()).expect("re-optimize");
-    let fresh_q = "green";
-    let first_fresh = planned_ranges(&st, fresh_q, BoolMode::Or);
+    let cold = Supertable::create(options_with_storage(&dir)).expect("open a cold handle");
+    let first = planned_ranges(&cold, "green", BoolMode::Or);
+    planned_ranges(&st, "green", BoolMode::Or);
     assert_eq!(
-        first_fresh,
-        planned_ranges(&st, fresh_q, BoolMode::Or),
-        "re-covered table plans only the query's own work on a fresh term"
+        first,
+        planned_ranges(&st, "green", BoolMode::Or),
+        "re-covered table plans only the query's own work on a first query"
     );
 }
 
