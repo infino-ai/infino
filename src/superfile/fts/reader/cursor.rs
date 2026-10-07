@@ -149,7 +149,7 @@ impl TermMeta {
             false => TERM_META_SIZE,
         };
         if metadata_offset + term_meta_size > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "term metadata offset out of postings region".into(),
             )));
         }
@@ -184,14 +184,14 @@ impl TermMeta {
         // The last block's end offset comes straight from
         // `postings_length`; bound it now instead of slicing OOB later.
         if metadata_offset + postings_length > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "term postings length exceeds the fetched term range".into(),
             )));
         }
         let skip_start = metadata_offset + term_meta_size;
         let skip_end = skip_start + num_blocks * skip_entry_bytes;
         if skip_end > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "skip table runs past postings region".into(),
             )));
         }
@@ -204,7 +204,7 @@ impl TermMeta {
                 let subindex_end = skip_end
                     + num_blocks * POSITION_SUBINDEX_ENTRIES_PER_BLOCK * subindex.entry_bytes();
                 if subindex_end > postings.len() {
-                    return Err(FtsError::Read(ReadError::MalformedVersion(
+                    return Err(FtsError::Read(ReadError::Malformed(
                         "position sub-index runs past postings region".into(),
                     )));
                 }
@@ -225,12 +225,12 @@ impl TermMeta {
         // The length layout reaches a block through its span's start
         // offset, so it exists only alongside the coarse table.
         if skip == SkipLayout::Length && !has_coarse {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "length-coded skip table without a coarse table".into(),
             )));
         }
         if coarse_size > postings_length {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "coarse block-max table larger than the term region".into(),
             )));
         }
@@ -731,8 +731,8 @@ impl TermCursor {
             &mut block_tfs,
         )
         .ok_or_else(|| {
-            FtsError::Read(ReadError::MalformedVersion(
-                "malformed short-form term body".into(),
+            FtsError::Read(ReadError::Malformed(
+                "short-form term body does not decode".into(),
             ))
         })?;
         let n = decoded.n;

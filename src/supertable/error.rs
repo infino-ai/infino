@@ -726,7 +726,10 @@ impl From<ReadError> for QueryError {
         if permission_denied_in_chain(&e) {
             return QueryError::PermissionDenied(e.to_string());
         }
-        if matches!(e, ReadError::DocIdOutOfRange { .. }) {
+        if matches!(
+            e,
+            ReadError::DocIdOutOfRange { .. } | ReadError::WrongCodecPath(_)
+        ) {
             return QueryError::Internal(e.to_string());
         }
         QueryError::Parquet(e.to_string())
@@ -909,6 +912,11 @@ mod tests {
                 doc_id: 9,
                 n_docs: 4
             }),
+            QueryError::Internal(_)
+        ));
+        // So is asking a read path for a codec it does not support.
+        assert!(matches!(
+            QueryError::from(ReadError::WrongCodecPath("fp32 only".into())),
             QueryError::Internal(_)
         ));
     }

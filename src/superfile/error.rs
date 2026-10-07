@@ -134,8 +134,17 @@ pub enum ReadError {
         column: String, // empty if not column-scoped
     },
 
-    #[error("malformed format-version string {0:?}")]
-    MalformedVersion(String),
+    /// The superfile's bytes do not match its format: an offset or length out
+    /// of range, a region shorter than declared, a codec id it never defined,
+    /// or JSON or a format version that does not parse. Required KV keys that
+    /// are missing or mistyped are [`Self::MalformedKv`].
+    #[error("malformed superfile: {0}")]
+    Malformed(String),
+
+    /// A read that does not support the column's rerank codec was called on
+    /// it: a caller bug, not a problem with the file.
+    #[error("this read does not support the column's codec: {0}")]
+    WrongCodecPath(String),
 
     #[error("io error during read: {0}")]
     Io(#[from] std::io::Error),

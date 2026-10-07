@@ -1244,8 +1244,8 @@ impl FtsReader {
                 let decoded =
                     decode_short(bytes.as_ref(), col_meta.positions, &mut buf_d, &mut buf_t)
                         .ok_or_else(|| {
-                            FtsError::Read(ReadError::MalformedVersion(
-                                "malformed short-form term body".into(),
+                            FtsError::Read(ReadError::Malformed(
+                                "short-form term body does not decode".into(),
                             ))
                         })?;
                 let idf_weight = global_idf
@@ -1644,8 +1644,8 @@ impl FtsReader {
                     // varint (CPU-only, no extra read).
                     let df = match short {
                         true => u64::from(short_df(bytes.as_ref()).ok_or_else(|| {
-                            FtsError::Read(ReadError::MalformedVersion(
-                                "malformed short-form term body".into(),
+                            FtsError::Read(ReadError::Malformed(
+                                "short-form term body does not decode".into(),
                             ))
                         })?),
                         false => {

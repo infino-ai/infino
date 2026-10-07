@@ -215,7 +215,7 @@ impl RerankCodec {
 
     /// Inverse of [`Self::codec_id`]. Returns `None` for unknown
     /// discriminator bytes — the reader treats that as a
-    /// `MalformedVersion` failure so a corrupted / future superfile
+    /// `Malformed` failure so a corrupted / future superfile
     /// fails loud rather than mis-decoding.
     #[inline]
     pub const fn from_codec_id(id: u8) -> Option<Self> {
@@ -1085,7 +1085,7 @@ mod tests {
 
     /// Unknown discriminator bytes (any value not currently
     /// assigned, e.g. `6`, `255`) return `None`. The reader
-    /// upgrades that into a `MalformedVersion` error rather than
+    /// upgrades that into a `Malformed` error rather than
     /// guessing. Id `5` now maps to `Sq16Adaptive`.
     #[test]
     fn unknown_codec_id_is_none() {

@@ -122,7 +122,7 @@ pub struct ColumnReader {
     pub rot_seed: u64,
     /// — on-disk rerank codec for this column. Today
     /// admits Fp32, Sq8, and RabitqOnly; the parser rejects
-    /// every other codec at open time with a `MalformedVersion`
+    /// every other codec at open time with a `Malformed`
     /// until support for it is added (the `None` codec is not yet
     /// implemented).
     pub rerank_codec: RerankCodec,
@@ -492,7 +492,7 @@ impl VectorReader {
         ) as usize;
         let (dir_size, dir_end) = checked_dir_bounds(dir_offset, n_columns, DIR_ENTRY_SIZE)?;
         if dir_end > blob_size {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "lazy open: directory end {dir_end} exceeds blob size {blob_size}",
             ))));
         }
@@ -546,20 +546,20 @@ impl VectorReader {
                     ..entry_off + dir_entry::CODEC_META_SIZE_OFF + U32_BYTES],
             ) as usize;
             if subsection_len < SUB_HEADER_SIZE + format::CRC_BYTES {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "subsection {i} too short ({subsection_len} bytes)"
                 ))));
             }
             let sub_end = subsection_off + subsection_len;
             if sub_end > blob_size {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "subsection {i} runs past blob",
                 ))));
             }
             if dir_codec_meta_size > 0 {
                 let meta_end = dir_codec_meta_off + dir_codec_meta_size;
                 if dir_codec_meta_off < SUB_HEADER_SIZE || meta_end > subsection_len - 4 {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "subsection {i} directory codec_meta range [{dir_codec_meta_off}..\
                          {meta_end}) outside subsection body length {}",
                         subsection_len - 4
@@ -611,7 +611,7 @@ impl VectorReader {
             ) as usize;
             let open_time_abs_end = subsection_off + per_cluster_blocks_off;
             if open_time_abs_end > sub_end {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "subsection {i} per_cluster_blocks_off {per_cluster_blocks_off} \
                      exceeds subsection length {subsection_len}",
                 ))));
@@ -647,14 +647,14 @@ impl VectorReader {
                 if !stable_ids_gap
                     .is_some_and(|gap| gap.is_multiple_of(format::vec::STABLE_ID_BYTES))
                 {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "subsection {i} codec_meta_size {codec_meta_size} does not end at or a \
                          whole number of stable-`_id`s before per_cluster_blocks_off \
                          {per_cluster_blocks_off}"
                     ))));
                 }
                 if dir_codec_meta_off != codec_meta_off || dir_codec_meta_size != codec_meta_size {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "subsection {i} directory codec_meta range \
                          off={dir_codec_meta_off} len={dir_codec_meta_size} does not match \
                          subheader-derived off={codec_meta_off} len={codec_meta_size}"
@@ -662,7 +662,7 @@ impl VectorReader {
                 }
                 let _ = subsection_len;
             } else if dir_codec_meta_size != 0 || dir_codec_meta_off != 0 {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "subsection {i} has zero codec_meta_size but directory declares \
                      off={dir_codec_meta_off} len={dir_codec_meta_size}"
                 ))));
@@ -736,7 +736,7 @@ impl VectorReader {
         // subsection CRCs since we walk dir entries to find them).
         let (dir_size, dir_end) = checked_dir_bounds(dir_offset, n_columns, DIR_ENTRY_SIZE)?;
         if dir_end > source.len() {
-            return Err(VectorError::Read(ReadError::MalformedVersion(
+            return Err(VectorError::Read(ReadError::Malformed(
                 "vector directory runs past blob".into(),
             )));
         }
@@ -805,13 +805,13 @@ impl VectorReader {
                 ) as usize;
                 let sub_end = subsection_off + subsection_len;
                 if sub_end > source.len() {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "subsection {i} runs past blob"
                     ))));
                 }
                 let sub = fetch_sync(&source, subsection_off..sub_end, "subsection")?;
                 if sub.len() < SUB_HEADER_SIZE + format::CRC_BYTES {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "subsection {i} too short"
                     ))));
                 }
@@ -856,12 +856,10 @@ impl VectorReader {
         // Parse JSON.
         let cols_json: Vec<VectorColumnConfig> =
             serde_json::from_str(columns_json).map_err(|e| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
-                    "inf.vec.columns JSON: {e}"
-                )))
+                VectorError::Read(ReadError::Malformed(format!("inf.vec.columns JSON: {e}")))
             })?;
         if cols_json.len() != n_columns {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "inf.vec.columns has {} entries, header says {n_columns}",
                 cols_json.len()
             ))));
@@ -874,7 +872,7 @@ impl VectorReader {
             let entry_off = i * DIR_ENTRY_SIZE;
             let column_id = read_u32_le(&dir_bytes[entry_off..entry_off + U32_BYTES]);
             if column_id != i as u32 {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "vector dir entry {i} has column_id {column_id}"
                 ))));
             }
@@ -910,7 +908,7 @@ impl VectorReader {
             );
             let codec_id = dir_bytes[entry_off + dir_entry::CODEC_ID_OFF];
             let rerank_codec = RerankCodec::from_codec_id(codec_id).ok_or_else(|| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
+                VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' has unknown rerank-codec id {codec_id} \
                      (known ids: 0=fp32, 1=sq8_residual, 2=rabitq_only, \
                       3=sq8_fixed_residual, 4=sq16, 5=sq16_adaptive)",
@@ -918,24 +916,23 @@ impl VectorReader {
                 )))
             })?;
             if !rerank_codec.is_implemented() {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' uses rerank codec {} which is not implemented yet \
-                     (`fp32`, `sq8_residual`, `sq8_fixed_residual`, `sq16`, \
-                      `sq16_adaptive`, `rabitq_only` are the supported codecs)",
-                    cfg.column,
-                    rerank_codec.name()
+                return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
+                    "rerank codec {} in column '{}'; this build reads `fp32`, \
+                     `sq8_residual`, `sq8_fixed_residual`, `sq16`, `sq16_adaptive`, `rabitq_only`",
+                    rerank_codec.name(),
+                    cfg.column
                 ))));
             }
 
             // Validate against JSON.
             if dim != cfg.dim {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' dim mismatch: dir={dim} json={}",
                     cfg.column, cfg.dim
                 ))));
             }
             if rot_seed != cfg.rot_seed {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' rot_seed mismatch",
                     cfg.column
                 ))));
@@ -945,14 +942,14 @@ impl VectorReader {
                 format::vec::METRIC_ID_COSINE => Metric::Cosine,
                 format::vec::METRIC_ID_NEGDOT => Metric::NegDot,
                 _ => {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "unknown metric_id {metric_id} for column '{}'",
                         cfg.column
                     ))));
                 }
             };
             if !rerank_codec.supports_metric(metric) {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' codec {} supports cosine metric only",
                     cfg.column,
                     rerank_codec.name()
@@ -987,12 +984,12 @@ impl VectorReader {
             // underlying async `range` and round-trip per fetch.
             let sub_end = subsection_off + subsection_len;
             if sub_end > source.len() {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "subsection {i} runs past blob"
                 ))));
             }
             if subsection_len < SUB_HEADER_SIZE + format::CRC_BYTES {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "subsection {i} too short"
                 ))));
             }
@@ -1029,9 +1026,8 @@ impl VectorReader {
             let subsection_version =
                 read_u32_le(&sub_header[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]);
             if subsection_version != format::vec::SUBSECTION_VERSION {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' has unsupported subsection layout version \
-                     {subsection_version}; this build supports only {}",
+                return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
+                    "subsection layout {subsection_version} in column '{}'; this build reads {}",
                     cfg.column,
                     format::vec::SUBSECTION_VERSION
                 ))));
@@ -1040,7 +1036,7 @@ impl VectorReader {
             let quant = BitQuantizer::new(dim);
             let code_bytes = quant.code_bytes();
             if code_bytes == 0 {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' dim={dim} yields code_bytes=0",
                     cfg.column
                 ))));
@@ -1070,7 +1066,7 @@ impl VectorReader {
             ) as usize;
 
             if codec_meta_required_zero && codec_meta_size != 0 {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' has codec_meta_size={codec_meta_size} for codec {}; \
                      fp32/rabitq_only must write codec_meta_size=0",
                     cfg.column,
@@ -1100,7 +1096,7 @@ impl VectorReader {
             // from the offsets — no header flag.
             let stable_ids_region_bytes =
                 per_cluster_blocks_off.checked_sub(preceding_end).ok_or_else(|| {
-                    VectorError::Read(ReadError::MalformedVersion(format!(
+                    VectorError::Read(ReadError::Malformed(format!(
                         "column '{}' regions before per_cluster_blocks_off={per_cluster_blocks_off} \
                          overrun it (preceding_end={preceding_end})",
                         cfg.column
@@ -1116,7 +1112,7 @@ impl VectorReader {
             let blocks_region_size = sub_crc_pos - per_cluster_blocks_off;
             let per_doc_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
             if per_doc_stride == 0 || !blocks_region_size.is_multiple_of(per_doc_stride) {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' per_cluster_blocks region {blocks_region_size} bytes \
                      not divisible by per-doc stride {per_doc_stride}",
                     cfg.column
@@ -1127,7 +1123,7 @@ impl VectorReader {
             let expected_stable_ids_bytes = (col_n_docs as usize) * format::vec::STABLE_ID_BYTES;
             if stable_ids_region_bytes != 0 && stable_ids_region_bytes != expected_stable_ids_bytes
             {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' gap before per_cluster_blocks_off is {stable_ids_region_bytes} \
                      bytes; expected 0 or n_docs×16 = {expected_stable_ids_bytes}",
                     cfg.column
@@ -1144,7 +1140,7 @@ impl VectorReader {
             let expected_codec_meta_size =
                 rerank_codec.codec_meta_bytes(dim, col_n_docs as usize, n_cent as usize, metric);
             if actual_codec_meta_size != expected_codec_meta_size {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' codec_meta_size={actual_codec_meta_size} on disk but \
                      codec {} / metric {metric:?} expects {expected_codec_meta_size} bytes",
                     cfg.column,
@@ -1219,7 +1215,7 @@ impl VectorReader {
             // guards an off-by-one in the cluster_idx slot.
             let cluster_idx_end = cluster_idx_off + cluster_idx_size;
             if cluster_idx_end > sub_crc_pos {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' cluster index runs past subsection",
                     cfg.column
                 ))));
@@ -1235,7 +1231,7 @@ impl VectorReader {
             if let Some(m) = cfg_metric
                 && m != metric
             {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' metric mismatch: dir={metric:?} json={}",
                     cfg.column, cfg.metric
                 ))));
@@ -1292,7 +1288,7 @@ impl VectorReader {
                 as usize;
         let (dir_size, dir_end) = checked_dir_bounds(dir_offset, n_cells, CELL_DIR_ENTRY_SIZE)?;
         if dir_end > source.len() {
-            return Err(VectorError::Read(ReadError::MalformedVersion(
+            return Err(VectorError::Read(ReadError::Malformed(
                 "multi-cell directory runs past blob".into(),
             )));
         }
@@ -1312,12 +1308,10 @@ impl VectorReader {
 
         let cols_json: Vec<VectorColumnConfig> =
             serde_json::from_str(columns_json).map_err(|e| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
-                    "inf.vec.columns JSON: {e}"
-                )))
+                VectorError::Read(ReadError::Malformed(format!("inf.vec.columns JSON: {e}")))
             })?;
         if cols_json.len() != 1 {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "multi-cell blob requires exactly one logical column in inf.vec.columns, got {}",
                 cols_json.len()
             ))));
@@ -1328,7 +1322,7 @@ impl VectorReader {
             "cosine" => Metric::Cosine,
             "negdot" => Metric::NegDot,
             other => {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "unknown metric {other}"
                 ))));
             }
@@ -1370,7 +1364,7 @@ impl VectorReader {
                     RerankCodec::Sq16Adaptive
                 }
                 _ => {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "multi-cell directory has unknown rerank codec id {raw_codec}"
                     ))));
                 }
@@ -1378,19 +1372,19 @@ impl VectorReader {
             if let Some(expected) = packed_codec
                 && expected != rerank_codec
             {
-                return Err(VectorError::Read(ReadError::MalformedVersion(
+                return Err(VectorError::Read(ReadError::Malformed(
                     "multi-cell directory mixes rerank codecs".into(),
                 )));
             }
             packed_codec = Some(rerank_codec);
             if !rerank_codec.supports_metric(metric) {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "multi-cell codec {} supports cosine metric only",
                     rerank_codec.name()
                 ))));
             }
             if i > 0 && cell_id <= cell_ids[i - 1] {
-                return Err(VectorError::Read(ReadError::MalformedVersion(
+                return Err(VectorError::Read(ReadError::Malformed(
                     "multi-cell directory cell_ids must be strictly ascending".into(),
                 )));
             }
@@ -1408,7 +1402,7 @@ impl VectorReader {
             // every later cell onto the same flat base in
             // `resolve_flat_cluster`.
             flat_total = flat_total.checked_add(col.n_cent).ok_or_else(|| {
-                VectorError::Read(ReadError::MalformedVersion(
+                VectorError::Read(ReadError::Malformed(
                     "multi-cell directory total cluster count exceeds u32".into(),
                 ))
             })?;
@@ -1427,12 +1421,12 @@ impl VectorReader {
         // summed cell docs exceed that space would silently wrap routing
         // and bitmap remaps.
         if summed_docs > u64::from(u32::MAX) {
-            return Err(VectorError::Read(ReadError::MalformedVersion(
+            return Err(VectorError::Read(ReadError::Malformed(
                 "multi-cell blob doc count exceeds u32 local-doc-id space".into(),
             )));
         }
         if n_docs != summed_docs {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "multi-cell outer header n_docs={n_docs} != summed cell docs {summed_docs}"
             ))));
         }
@@ -1443,7 +1437,7 @@ impl VectorReader {
         if opts.verify_crc {
             let blob_len = source.len();
             if blob_len < format::CRC_BYTES {
-                return Err(VectorError::Read(ReadError::MalformedVersion(
+                return Err(VectorError::Read(ReadError::Malformed(
                     "multi-cell blob shorter than its trailing CRC".into(),
                 )));
             }
@@ -1497,7 +1491,7 @@ impl VectorReader {
         ) as usize;
         let (dir_size, dir_end) = checked_dir_bounds(dir_offset, n_cells, CELL_DIR_ENTRY_SIZE)?;
         if dir_end > blob_size {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "lazy multi-cell: directory end {dir_end} exceeds blob size {blob_size}",
             ))));
         }
@@ -1552,14 +1546,12 @@ impl VectorReader {
         // resident). The multi-cell contract is one logical column, whose
         // dim bounds the cluster index.
         let cols: Vec<VectorColumnConfig> = serde_json::from_str(columns_json).map_err(|e| {
-            VectorError::Read(ReadError::MalformedVersion(format!(
-                "inf.vec.columns JSON: {e}"
-            )))
+            VectorError::Read(ReadError::Malformed(format!("inf.vec.columns JSON: {e}")))
         })?;
         let dim = match cols.as_slice() {
             [only] if only.dim > 0 => only.dim,
             _ => {
-                return Err(VectorError::Read(ReadError::MalformedVersion(
+                return Err(VectorError::Read(ReadError::Malformed(
                     "multi-cell blob requires exactly one logical column".into(),
                 )));
             }
@@ -1575,7 +1567,7 @@ impl VectorReader {
                     ..entry_off + cell_dir_entry::SUBSECTION_LEN_OFF + U64_BYTES],
             );
             if subsection_len < SUB_HEADER_SIZE as u64 + format::CRC_BYTES as u64 {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "multi-cell subsection {i} too short ({subsection_len} bytes)"
                 ))));
             }
@@ -1595,12 +1587,12 @@ impl VectorReader {
                     [sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES],
             );
             let centroids_span = cluster_idx_off.checked_sub(centroids_off).ok_or_else(|| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
+                VectorError::Read(ReadError::Malformed(format!(
                     "multi-cell subsection {i}: cluster_idx_off precedes centroids_off"
                 )))
             })?;
             if !centroids_span.is_multiple_of(dim as u64 * 4) {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "multi-cell subsection {i}: centroids region not divisible by dim*4"
                 ))));
             }
@@ -1639,7 +1631,7 @@ impl VectorReader {
         let dim = cfg.dim;
         let rot_seed = cfg.rot_seed;
         if !rerank_codec.supports_metric(metric) {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "cell codec {} supports cosine metric only",
                 rerank_codec.name()
             ))));
@@ -1647,17 +1639,17 @@ impl VectorReader {
         // Checked: both values come from on-disk metadata, so the sum can
         // overflow before the bounds check and wrap to a bogus in-range end.
         let sub_end = subsection_off.checked_add(subsection_len).ok_or_else(|| {
-            VectorError::Read(ReadError::MalformedVersion(
+            VectorError::Read(ReadError::Malformed(
                 "cell subsection offset + length overflows".into(),
             ))
         })?;
         if sub_end > source.len() {
-            return Err(VectorError::Read(ReadError::MalformedVersion(
+            return Err(VectorError::Read(ReadError::Malformed(
                 "cell subsection runs past blob".into(),
             )));
         }
         if subsection_len < SUB_HEADER_SIZE + format::CRC_BYTES {
-            return Err(VectorError::Read(ReadError::MalformedVersion(
+            return Err(VectorError::Read(ReadError::Malformed(
                 "cell subsection too short".into(),
             )));
         }
@@ -1676,8 +1668,9 @@ impl VectorReader {
         let subsection_version =
             read_u32_le(&sub_header[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]);
         if subsection_version != format::vec::SUBSECTION_VERSION {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                "cell subsection unsupported layout version {subsection_version}"
+            return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
+                "cell subsection layout {subsection_version}; this build reads {}",
+                format::vec::SUBSECTION_VERSION
             ))));
         }
         if verify_crc {
@@ -1713,17 +1706,17 @@ impl VectorReader {
         ) as usize;
 
         // Untrusted sub-header offsets: validate ordering with checked
-        // arithmetic — inverted offsets must surface as MalformedVersion,
+        // arithmetic: inverted offsets must surface as Malformed,
         // not an integer underflow, because the CRC-off lazy open path
         // (object-store reads) skips the checksum that would otherwise
         // catch the corruption.
         let centroids_span = cluster_idx_off.checked_sub(centroids_off).ok_or_else(|| {
-            VectorError::Read(ReadError::MalformedVersion(
+            VectorError::Read(ReadError::Malformed(
                 "cell subsection offsets inverted: cluster_idx_off precedes centroids_off".into(),
             ))
         })?;
         if dim == 0 || !centroids_span.is_multiple_of(dim * 4) {
-            return Err(VectorError::Read(ReadError::MalformedVersion(
+            return Err(VectorError::Read(ReadError::Malformed(
                 "cell subsection centroids region not divisible by dim*4".into(),
             )));
         }
@@ -1744,7 +1737,7 @@ impl VectorReader {
         let stable_ids_region_bytes = per_cluster_blocks_off
             .checked_sub(preceding_end)
             .ok_or_else(|| {
-                VectorError::Read(ReadError::MalformedVersion(
+                VectorError::Read(ReadError::Malformed(
                     "cell subsection regions overrun per_cluster_blocks_off".into(),
                 ))
             })?;
@@ -1752,7 +1745,7 @@ impl VectorReader {
             sub_crc_pos
                 .checked_sub(per_cluster_blocks_off)
                 .ok_or_else(|| {
-                    VectorError::Read(ReadError::MalformedVersion(
+                    VectorError::Read(ReadError::Malformed(
                         "cell subsection offsets inverted: per_cluster_blocks_off past the \
                      subsection CRC"
                             .into(),
@@ -1760,14 +1753,14 @@ impl VectorReader {
                 })?;
         let per_doc_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
         if per_doc_stride == 0 || !blocks_region_size.is_multiple_of(per_doc_stride) {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "cell subsection blocks region {blocks_region_size} not divisible by stride {per_doc_stride}"
             ))));
         }
         let col_n_docs = (blocks_region_size / per_doc_stride) as u32;
         let expected_stable_ids_bytes = (col_n_docs as usize) * format::vec::STABLE_ID_BYTES;
         if stable_ids_region_bytes != 0 && stable_ids_region_bytes != expected_stable_ids_bytes {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "cell subsection stable-id gap {stable_ids_region_bytes}, expected 0 or {expected_stable_ids_bytes}"
             ))));
         }
@@ -1775,7 +1768,7 @@ impl VectorReader {
         let expected_codec_meta_size =
             rerank_codec.codec_meta_bytes(dim, col_n_docs as usize, n_cent, metric);
         if codec_meta_size != expected_codec_meta_size {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "cell subsection codec_meta_size={codec_meta_size}, expected {expected_codec_meta_size}"
             ))));
         }
@@ -2460,7 +2453,7 @@ impl VectorReader {
             bases.push(0);
             for col in &self.columns {
                 running = running.checked_add(col.n_docs).ok_or_else(|| {
-                    VectorError::Read(ReadError::MalformedVersion(
+                    VectorError::Read(ReadError::Malformed(
                         "inline stable_id region: cell doc counts overflow".into(),
                     ))
                 })?;
@@ -2470,7 +2463,7 @@ impl VectorReader {
             let mut cell_idx = 0usize;
             for (output_idx, &file_local) in locals.iter().enumerate() {
                 if file_local >= running {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "inline stable_id region: file-local {file_local} out of range \
                          (n_docs={})",
                         self.n_docs
@@ -2505,7 +2498,7 @@ impl VectorReader {
                     let p = (cell_local as usize) * format::vec::STABLE_ID_BYTES;
                     let end = p + format::vec::STABLE_ID_BYTES;
                     if end > region.len() {
-                        return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        return Err(VectorError::Read(ReadError::Malformed(format!(
                             "inline stable_id region: cell-local {cell_local} out of range \
                              ({} bytes, cell_idx={cell_idx})",
                             region.len()
@@ -2513,7 +2506,7 @@ impl VectorReader {
                     }
                     let arr: [u8; format::vec::STABLE_ID_BYTES] =
                         region[p..end].try_into().map_err(|_| {
-                            VectorError::Read(ReadError::MalformedVersion(
+                            VectorError::Read(ReadError::Malformed(
                                 "inline stable_id region slice".into(),
                             ))
                         })?;
@@ -2534,16 +2527,14 @@ impl VectorReader {
             let p = (local as usize) * format::vec::STABLE_ID_BYTES;
             let end = p + format::vec::STABLE_ID_BYTES;
             if end > region.len() {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "inline stable_id region: local {local} out of range ({} bytes)",
                     region.len()
                 ))));
             }
             let arr: [u8; format::vec::STABLE_ID_BYTES] =
                 region[p..end].try_into().map_err(|_| {
-                    VectorError::Read(ReadError::MalformedVersion(
-                        "inline stable_id region slice".into(),
-                    ))
+                    VectorError::Read(ReadError::Malformed("inline stable_id region slice".into()))
                 })?;
             out.push(i128::from_le_bytes(arr));
         }
@@ -2806,7 +2797,7 @@ impl VectorReader {
             // are wrong. Both are corruption — fail fast.
             let expected_len = (col.n_docs as usize) * format::vec::STABLE_ID_BYTES;
             if region.len() != expected_len {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "inline stable_id region for cell {cell_id}: {} bytes, expected {expected_len}",
                     region.len()
                 ))));
@@ -2814,9 +2805,7 @@ impl VectorReader {
             let mut ids = Vec::with_capacity(col.n_docs as usize);
             for chunk in region.as_ref().chunks_exact(format::vec::STABLE_ID_BYTES) {
                 let arr: [u8; format::vec::STABLE_ID_BYTES] = chunk.try_into().map_err(|_| {
-                    VectorError::Read(ReadError::MalformedVersion(
-                        "inline stable_id region slice".into(),
-                    ))
+                    VectorError::Read(ReadError::Malformed("inline stable_id region slice".into()))
                 })?;
                 ids.push(i128::from_le_bytes(arr));
             }
@@ -4379,8 +4368,8 @@ impl VectorReader {
         let col = &self.columns[cid as usize];
 
         if col.rerank_codec != RerankCodec::Fp32 {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                "column '{}' uses rerank codec {} instead of Fp32",
+            return Err(VectorError::Read(ReadError::WrongCodecPath(format!(
+                "column '{}' uses rerank codec {}; this read needs fp32",
                 col.name,
                 col.rerank_codec.name()
             ))));
@@ -4456,7 +4445,7 @@ impl VectorReader {
                     .collect();
 
                 if vec_f32.len() != col.dim {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "vector size mismatch: got {}, expected {}",
                         vec_f32.len(),
                         col.dim
@@ -4475,7 +4464,7 @@ impl VectorReader {
             .enumerate()
             .map(|(idx, vec_opt)| {
                 vec_opt.ok_or_else(|| {
-                    VectorError::Read(ReadError::MalformedVersion(format!(
+                    VectorError::Read(ReadError::Malformed(format!(
                         "missing vector for doc_id {}",
                         idx
                     )))
@@ -4498,14 +4487,14 @@ impl VectorReader {
         match col.rerank_codec {
             RerankCodec::Fp32 => self.get_vectors_fp32(column),
             RerankCodec::Sq8Residual | RerankCodec::Sq8FixedResidual => {
-                Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' uses {} — merge via build_from_sq8_ivf_readers",
+                Err(VectorError::Read(ReadError::WrongCodecPath(format!(
+                    "column '{}' uses {}; merge it with build_from_sq8_ivf_readers",
                     col.name,
                     col.rerank_codec.name()
                 ))))
             }
-            other => Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                "column '{}' uses rerank codec {} which cannot be merged",
+            other => Err(VectorError::Read(ReadError::WrongCodecPath(format!(
+                "column '{}' uses rerank codec {}, which cannot be merged",
                 col.name,
                 other.name()
             )))),
@@ -6256,7 +6245,7 @@ fn validate_quantizer_meta(
         .chain(offset.iter())
         .any(|value| !value.is_finite())
     {
-        return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+        return Err(VectorError::Read(ReadError::Malformed(format!(
             "column {column:?} has non-finite quantizer metadata"
         ))));
     }
@@ -6277,7 +6266,7 @@ fn validate_quantizer_meta(
     if valid {
         Ok(())
     } else {
-        Err(VectorError::Read(ReadError::MalformedVersion(format!(
+        Err(VectorError::Read(ReadError::Malformed(format!(
             "column {column:?} has non-fixed quantizer metadata for codec {}",
             rerank_codec.name()
         ))))
@@ -6327,7 +6316,7 @@ fn checked_dir_bounds(
     entry_size: usize,
 ) -> Result<(usize, usize), VectorError> {
     let dir_size = entry_count.checked_mul(entry_size).ok_or_else(|| {
-        VectorError::Read(ReadError::MalformedVersion(format!(
+        VectorError::Read(ReadError::Malformed(format!(
             "vector directory size overflow (entries={entry_count})",
         )))
     })?;
@@ -6335,7 +6324,7 @@ fn checked_dir_bounds(
         .checked_add(dir_size)
         .and_then(|x| x.checked_add(format::CRC_BYTES))
         .ok_or_else(|| {
-            VectorError::Read(ReadError::MalformedVersion(format!(
+            VectorError::Read(ReadError::Malformed(format!(
                 "vector directory offset+size overflow (dir_offset={dir_offset})",
             )))
         })?;
@@ -6531,7 +6520,7 @@ fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes,
     let start = range.start;
     let end = range.end;
     source.try_get_range_sync(range).ok_or_else(|| {
-        VectorError::Read(ReadError::MalformedVersion(format!(
+        VectorError::Read(ReadError::Malformed(format!(
             "vector {what} range {start}..{end} past blob"
         )))
     })
@@ -6769,7 +6758,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                VectorError::Read(ReadError::MalformedVersion(message))
+                VectorError::Read(ReadError::Malformed(message))
                     if message.contains("summed cell docs")
             ),
             "unexpected error: {error}"
@@ -6814,7 +6803,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                VectorError::Read(ReadError::MalformedVersion(message))
+                VectorError::Read(ReadError::Malformed(message))
                     if message.contains("cluster_idx_off precedes centroids_off")
             ),
             "unexpected error: {error}"
@@ -6835,7 +6824,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                VectorError::Read(ReadError::MalformedVersion(message))
+                VectorError::Read(ReadError::Malformed(message))
                     if message.contains("per_cluster_blocks_off past the subsection CRC")
             ),
             "unexpected error: {error}"
@@ -6866,7 +6855,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                VectorError::Read(ReadError::MalformedVersion(message))
+                VectorError::Read(ReadError::Malformed(message))
                     if message.contains("non-finite quantizer metadata")
             ),
             "unexpected error: {error}"
@@ -7170,10 +7159,7 @@ mod tests {
         // header says 1 column; pass 2-column JSON.
         let bad_json = r#"[{"column":"a","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"},{"column":"b","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#;
         let err = VectorReader::open(blob, bad_json).expect_err("expected error");
-        assert!(matches!(
-            err,
-            VectorError::Read(ReadError::MalformedVersion(_))
-        ));
+        assert!(matches!(err, VectorError::Read(ReadError::Malformed(_))));
     }
 
     // -----------------------------------------------------------------
@@ -7184,7 +7170,7 @@ mod tests {
     // directory entry; the codec_meta region offset rides as bytes
     // 12..16 of the sub-header. Both are zero on older fp32
     // superfiles. `Fp32` / `Sq8` / `RabitqOnly` are wired end-to-end;
-    // must still round-trip as a typed `MalformedVersion` at open
+    // must still round-trip as a typed `Malformed` at open
     // time so a future superfile built by a newer binary fails loud
     // against an older binary rather than mis-decoding.
 
@@ -7740,10 +7726,7 @@ mod tests {
             OpenOptions { verify_crc: false },
         )
         .expect_err("fixed codec must reject local quantizer metadata");
-        assert!(matches!(
-            error,
-            VectorError::Read(ReadError::MalformedVersion(_))
-        ));
+        assert!(matches!(error, VectorError::Read(ReadError::Malformed(_))));
     }
 
     #[test]
@@ -8365,7 +8348,7 @@ mod tests {
 
     /// a directory entry carrying an unknown codec id
     /// (anything outside `0..=3` — e.g. `255` from a corrupted /
-    /// future-format superfile) errors as `MalformedVersion`. The
+    /// future-format superfile) errors as `Malformed`. The
     /// safety net catches both forward-compat reads (future codec
     /// ids land in the gap) and on-disk corruption.
     #[test]
@@ -8388,8 +8371,8 @@ mod tests {
             VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: false })
                 .expect_err("unknown codec id must error at open");
         assert!(
-            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
-            "expected MalformedVersion for unknown codec id, got {err:?}"
+            matches!(err, VectorError::Read(ReadError::Malformed(_))),
+            "expected Malformed for unknown codec id, got {err:?}"
         );
         let msg = err.to_string();
         assert!(
@@ -10116,10 +10099,10 @@ mod tests {
         // Should error because codec is Sq8Residual, not Fp32
         let result = reader.get_vectors_fp32("embedding");
         assert!(result.is_err());
-        if let Err(VectorError::Read(ReadError::MalformedVersion(msg))) = result {
-            assert!(msg.contains("Fp32"));
+        if let Err(VectorError::Read(ReadError::WrongCodecPath(msg))) = result {
+            assert!(msg.contains("fp32"));
         } else {
-            panic!("expected MalformedVersion error, got {:?}", result);
+            panic!("expected WrongCodecPath error, got {:?}", result);
         }
     }
 
@@ -11388,7 +11371,7 @@ mod tests {
     // fetch_sync error arm
     // -----------------------------------------------------------------
 
-    /// `fetch_sync` surfaces a `MalformedVersion` whose message names
+    /// `fetch_sync` surfaces a `Malformed` whose message names
     /// the out-of-bounds range when the requested span runs past the
     /// blob.
     #[test]
@@ -11398,10 +11381,7 @@ mod tests {
         assert_eq!(ok.len(), 4);
         let err = fetch_sync(&src, 4..100, "directory").expect_err("oob fails");
         let msg = err.to_string();
-        assert!(matches!(
-            err,
-            VectorError::Read(ReadError::MalformedVersion(_))
-        ));
+        assert!(matches!(err, VectorError::Read(ReadError::Malformed(_))));
         assert!(
             msg.contains("directory") && msg.contains("4..100"),
             "message names the region and range, got: {msg}"
@@ -11870,7 +11850,7 @@ mod tests {
     }
 
     /// Malformed `inf.vec.columns` JSON is rejected at open with a
-    /// `MalformedVersion` read error — exercises the JSON-parse error
+    /// `Malformed` read error: exercises the JSON-parse error
     /// arm in `open_with_source`.
     #[test]
     fn open_rejects_malformed_columns_json() {
@@ -11878,8 +11858,8 @@ mod tests {
         let err = VectorReader::open(blob, "{ this is not valid json")
             .expect_err("malformed JSON must be rejected");
         assert!(
-            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
-            "expected MalformedVersion, got {err:?}"
+            matches!(err, VectorError::Read(ReadError::Malformed(_))),
+            "expected Malformed, got {err:?}"
         );
     }
 

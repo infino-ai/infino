@@ -330,7 +330,7 @@ impl Collected {
 /// output, so one that fails is a damaged dictionary; skipping it could
 /// drop the rows it indexes, so a walk fails instead.
 fn non_utf8_key() -> FtsError {
-    FtsError::Read(ReadError::MalformedVersion(
+    FtsError::Read(ReadError::Malformed(
         "fts dictionary key is not UTF-8".into(),
     ))
 }
@@ -762,7 +762,7 @@ impl FtsReader {
 
 /// A posting that names a document past the end of its blob.
 fn posting_past_documents() -> FtsError {
-    FtsError::Read(ReadError::MalformedVersion(
+    FtsError::Read(ReadError::Malformed(
         "fts posting names a document past the blob's end".into(),
     ))
 }
@@ -1445,7 +1445,7 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("{walk:?} / {keep:?} skipped the key"));
             assert!(
-                matches!(err, FtsError::Read(ReadError::MalformedVersion(_))),
+                matches!(err, FtsError::Read(ReadError::Malformed(_))),
                 "{walk:?}: {err}"
             );
         }

@@ -537,7 +537,7 @@ impl ColumnMeta {
         }
         let len = self.array_len();
         let Some(crc_bytes) = array_with_crc.get(len..len + CRC_BYTES) else {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "doc-lengths array shorter than its CRC".into(),
             )));
         };
