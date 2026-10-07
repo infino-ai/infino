@@ -506,7 +506,11 @@ mod tests {
     use super::*;
     use crate::{
         storage::StorageError,
-        superfile::{LazyByteSourceError, ReadError, error::FtsError},
+        superfile::{
+            LazyByteSourceError, ReadError,
+            error::FtsError,
+            format::fts::{REPAIR_RELEASE, VERSION_MIN_RELEASE},
+        },
         supertable::wal::{
             WalStoreError,
             pipeline::{AppendPhaseError, TombstonePhaseError},
@@ -663,7 +667,9 @@ mod tests {
         assert!(matches!(public, InfinoError::Unsupported(_)), "{public:?}");
         let message = public.to_string();
         assert!(
-            message.contains("infino < 0.8.4") && message.contains("reindex"),
+            message.contains(&format!("infino < {VERSION_MIN_RELEASE}"))
+                && message.contains(REPAIR_RELEASE)
+                && message.contains("ascii_lower"),
             "{message}"
         );
     }

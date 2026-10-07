@@ -11,7 +11,13 @@ use std::error::Error as StdError;
 
 use thiserror::Error;
 
-use crate::{storage::error_chain, superfile::LazyByteSourceError};
+use crate::{
+    storage::error_chain,
+    superfile::{
+        LazyByteSourceError,
+        format::fts::{REPAIR_RELEASE, VERSION_MIN_RELEASE},
+    },
+};
 
 /// Errors that can occur while building a superfile.
 #[derive(Debug, Error)]
@@ -306,8 +312,11 @@ pub enum FtsError {
     /// indexes with an engine that reads both versions brings it forward;
     /// nothing a query does can.
     #[error(
-        "full-text index (blob version {version}) was written by infino < 0.8.4; \
-         reindex the table with infino 0.9.1 before upgrading"
+        "full-text index (blob version {version}) was written by infino < {min_release}; \
+         reindex the table with infino {repair_release} before upgrading, and \
+         re-create any table that uses the `ascii_lower` analyzer under `standard`",
+        min_release = VERSION_MIN_RELEASE,
+        repair_release = REPAIR_RELEASE
     )]
     IndexTooOld { version: u32 },
 

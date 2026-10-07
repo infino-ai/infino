@@ -109,9 +109,16 @@ pub mod fts {
     pub const VERSION_V8: u32 = 8;
 
     /// The oldest blob version this crate reads. A blob below it was
-    /// written by infino < 0.8.4 and is refused on open with an error
-    /// that says to reindex it with infino 0.9.1.
+    /// written before [`VERSION_MIN_RELEASE`] and is refused on open with
+    /// an error that says to reindex it with [`REPAIR_RELEASE`].
     pub const VERSION_MIN: u32 = VERSION_V7;
+
+    /// The first infino release that writes [`VERSION_MIN`].
+    pub const VERSION_MIN_RELEASE: &str = "0.8.4";
+
+    /// The infino release whose `reindex` rewrites an older blob to
+    /// [`VERSION_MIN`] and reports a table under a removed analyzer.
+    pub const REPAIR_RELEASE: &str = "0.9.1";
 
     /// The blob version a file must carry to be current — what the
     /// staleness check compares against and what a migration plans from.
