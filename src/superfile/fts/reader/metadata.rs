@@ -638,18 +638,10 @@ pub struct FtsColumnConfig {
     #[serde(default = "default_stored")]
     pub stored: bool,
     /// BM25 term-frequency saturation this column's stored block-max
-    /// bounds were built with. Files written before the parameters were
-    /// recordable lack the field, and can only have been built with the
-    /// standard value — so the default here is frozen at
-    /// [`bm25::K1`] and must not follow a change to what the API
-    /// recommends. The writer emits it unconditionally, defaults
-    /// included, so no reader of a current file has to fall back on
-    /// this.
-    #[serde(default = "default_k1")]
+    /// bounds were built with. Required: the writer always records it.
     pub k1: f32,
-    /// BM25 length normalization, same provenance and same frozen
-    /// default ([`bm25::B`]) as [`FtsColumnConfig::k1`].
-    #[serde(default = "default_b")]
+    /// BM25 length normalization the bounds were built with; required
+    /// like [`FtsColumnConfig::k1`].
     pub b: f32,
     /// Stopword set applied to this column, by name. Absent means no
     /// set — the one thing a file written before the filter existed can
@@ -716,14 +708,6 @@ pub(super) fn default_stored() -> bool {
     true
 }
 
-pub(super) fn default_k1() -> f32 {
-    bm25::K1
-}
-
-pub(super) fn default_b() -> f32 {
-    bm25::B
-}
-
 /// Per-open knobs for [`FtsReader::open_with`]. Mirrors the
 /// vector reader's `OpenOptions` so the superfile layer can
 /// pass a single `verify_crc` flag through to both
@@ -768,7 +752,8 @@ mod tests {
     #[test]
     fn absent_analysis_fields_mean_off_and_unknown_values_are_refused() {
         let entry: FtsColumnConfig =
-            serde_json::from_str(r#"{"name":"body","tokenizer":"standard"}"#).expect("parse");
+            serde_json::from_str(r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}"#)
+                .expect("parse");
         assert_eq!(entry.stopwords, None);
         assert_eq!(entry.stemmer, None);
         assert_eq!(
@@ -777,7 +762,7 @@ mod tests {
         );
 
         let entry: FtsColumnConfig = serde_json::from_str(
-            r#"{"name":"body","tokenizer":"standard","stopwords":"english","stemmer":"english"}"#,
+            r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stopwords":"english","stemmer":"english"}"#,
         )
         .expect("parse");
         assert_eq!(
@@ -786,13 +771,15 @@ mod tests {
         );
 
         // A filter this engine does not ship, in either field.
-        let entry: FtsColumnConfig =
-            serde_json::from_str(r#"{"name":"body","tokenizer":"standard","stopwords":"german"}"#)
-                .expect("the field parses; resolving it is what fails");
+        let entry: FtsColumnConfig = serde_json::from_str(
+            r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stopwords":"german"}"#,
+        )
+        .expect("the field parses; resolving it is what fails");
         assert_eq!(entry.filters(), Err(("stopwords", "german")));
-        let entry: FtsColumnConfig =
-            serde_json::from_str(r#"{"name":"body","tokenizer":"standard","stemmer":"porter"}"#)
-                .expect("parse");
+        let entry: FtsColumnConfig = serde_json::from_str(
+            r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stemmer":"porter"}"#,
+        )
+        .expect("parse");
         assert_eq!(entry.filters(), Err(("stemmer", "porter")));
     }
 
@@ -869,7 +856,7 @@ mod tests {
     }
 
     fn sparse_reader() -> FtsReader {
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         FtsReader::open(
             Bytes::from(sparse_builder().finish().expect("finish")),
             json,
@@ -970,7 +957,7 @@ mod tests {
         for row in 0..4 {
             b.add_doc(0, row, "").expect("null row");
         }
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let col = &r.columns[0];
         assert_eq!(col.length_stats().n_scored_docs, 0);
@@ -1038,7 +1025,7 @@ mod tests {
             b.add_doc(0, d, text.trim()).expect("add doc");
         }
         let bytes = b.finish().expect("finish");
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
         let nt = r.columns[0].dl_norm_k1();
 

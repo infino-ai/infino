@@ -3849,6 +3849,7 @@ mod tests {
         assert!(s.contains(r#""name":"body""#));
         // The base tokenizer is always `standard` and is not recorded.
         assert!(!s.contains("tokenizer"));
+        assert!(s.contains(r#""k1":1.2,"b":0.75"#));
         // Positionless columns emit no positions field at all — the
         // JSON stays byte-identical to files written before the flag
         // existed.
@@ -5525,7 +5526,7 @@ mod tests {
             builder::FtsBuilder, reader::FtsReader, tokenize::StandardTokenizer,
         };
 
-        const JSON: &str = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        const JSON: &str = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         /// `map[blob doc id] = row`, a permutation that moves every
         /// document.
         const MAP: [u32; 8] = [3, 1, 7, 0, 5, 2, 6, 4];

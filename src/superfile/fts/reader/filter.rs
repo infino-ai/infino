@@ -338,7 +338,7 @@ mod tests {
             let text = if doc % 2 == 0 { "pos neg" } else { "pos" };
             b.add_doc(0, doc, text).expect("add doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 
@@ -356,7 +356,7 @@ mod tests {
             };
             b.add_doc(0, doc, text).expect("add doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"standard","positions":true}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 

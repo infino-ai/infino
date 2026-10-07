@@ -4573,8 +4573,11 @@ mod tests {
         b.add_doc(0, 0, "rust rust rust async").expect("add doc");
 
         let blob = Bytes::from(b.finish().expect("finish"));
-        let r =
-            FtsReader::open(blob, r#"[{"name":"title","tokenizer":"standard"}]"#).expect("open");
+        let r = FtsReader::open(
+            blob,
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}]"#,
+        )
+        .expect("open");
         let rust_hits = r
             .search("title", &["rust"], 10, BoolMode::Or)
             .await
@@ -4622,8 +4625,7 @@ mod tests {
         // is the strict on-disk equivalent of "two columns share a
         // term — does each see its own postings?"
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json =
-            r#"[{"name":"title","tokenizer":"standard"},{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75},{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         // "rust" in title returns title's docs (0, 1) and no others.
@@ -4791,7 +4793,7 @@ mod tests {
         let blob = fs::read(&path).expect("read blob");
         let r = FtsReader::open(
             Bytes::from(blob),
-            r#"[{"name":"title","tokenizer":"standard"}]"#,
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}]"#,
         )
         .expect("open FTS reader");
         let hits = r
@@ -5059,7 +5061,7 @@ mod tests {
         let blob = b.finish().expect("finish");
         let r = FtsReader::open(
             Bytes::from(blob),
-            r#"[{"name":"body","tokenizer":"standard"}]"#,
+            r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#,
         )
         .expect("open reader");
         let hits = r
@@ -5328,8 +5330,10 @@ mod tests {
     /// positions flag — matching what `fts_columns_json` emits.
     fn title_json(positional: bool) -> &'static str {
         match positional {
-            true => r#"[{"name":"title","tokenizer":"standard","positions":true}]"#,
-            false => r#"[{"name":"title","tokenizer":"standard"}]"#,
+            true => {
+                r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#
+            }
+            false => r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}]"#,
         }
     }
 
@@ -5480,7 +5484,7 @@ mod tests {
             u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
             format::fts::VERSION_V7
         );
-        let json = r#"[{"name":"body","tokenizer":"standard"},{"name":"title","tokenizer":"standard","positions":true}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75},{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let body_hits = r
             .search("body", &["bodyterm"], 10, BoolMode::Or)

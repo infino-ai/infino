@@ -691,7 +691,8 @@ mod tests {
             );
             b.add_doc(0, i, &text).expect("doc");
         }
-        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let phrases = phrase(&["alpha", "beta"]);
         let hits = r
@@ -763,7 +764,8 @@ mod tests {
             }
         }
         b.append_prebuilt_doc_lengths(0, &vec![(1 << 20) + 8; N_DOCS as usize]);
-        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
 
         let hits = r
@@ -827,7 +829,8 @@ mod tests {
             };
             b.add_doc(0, d, text).expect("add doc");
         }
-        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let phrases = phrase(&["the", "movement"]);
         let clauses = || ClauseLists {
@@ -895,7 +898,8 @@ mod tests {
             };
             b.add_doc(0, d, text).expect("add doc");
         }
-        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let phrases = phrase(&["the", "mid", "rare"]);
         let build = || async {
@@ -1026,7 +1030,8 @@ mod tests {
                 .expect("filler");
         }
         b.append_prebuilt_doc_lengths(0, &vec![2 * TF + OUTLIER_GAP; N_DOCS as usize]);
-        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
 
         let phrases = phrase(&["alpha", "filler"]);
@@ -1088,7 +1093,8 @@ mod tests {
         b.add_doc(0, 0, "cat 🙂 dog").expect("doc 0");
         b.add_doc(0, 1, "cat dog").expect("doc 1");
         b.add_doc(0, 2, "cat, dog").expect("doc 2");
-        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let phrases = phrase(&["cat", "dog"]);
         let hits = r
@@ -1190,8 +1196,11 @@ mod tests {
         b.register_column("title".into(), false).expect("register");
         b.add_doc(0, 0, "new york").expect("add doc");
         let blob = Bytes::from(b.finish().expect("finish"));
-        let r =
-            FtsReader::open(blob, r#"[{"name":"title","tokenizer":"standard"}]"#).expect("open");
+        let r = FtsReader::open(
+            blob,
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}]"#,
+        )
+        .expect("open");
         let phrases = phrase(&["new", "york"]);
         let err = r
             .search_excluding(
@@ -1237,7 +1246,8 @@ mod tests {
         for (i, text) in docs.enumerate() {
             b.add_doc(0, i as u32, &text).expect("add doc");
         }
-        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 

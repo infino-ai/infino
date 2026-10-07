@@ -1552,7 +1552,7 @@ mod tests {
             }
             b.add_doc(0, doc_id, text.trim_end()).expect("add doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 
@@ -1580,7 +1580,7 @@ mod tests {
             b.add_doc(0, doc_id, text.trim_end()).expect("add pos");
             b.add_doc(1, doc_id, text.trim_end()).expect("add flat");
         }
-        let json = r#"[{"name":"pos","tokenizer":"standard","positions":true},{"name":"flat","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"pos","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true},{"name":"flat","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 
@@ -1599,7 +1599,7 @@ mod tests {
             }
             b.add_doc(0, doc_id, text.trim_end()).expect("add");
         }
-        let json = r#"[{"name":"flat","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"flat","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let cursors = view
             .build_term_cursors(0, &["common"], None, false, None, None)
@@ -1653,7 +1653,7 @@ mod tests {
             };
             b.add_doc(0, doc_id, &text).expect("add");
         }
-        let json = r#"[{"name":"flat","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"flat","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let cursors = view
             .build_term_cursors(0, &["sparse"], None, false, None, None)
@@ -1981,7 +1981,7 @@ mod tests {
             };
             b.add_doc(0, doc, text).expect("add doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let reader = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         assert_eq!(reader.columns[0].avgdl(), bm25::stored_avgdl(1.002));
         for (i, (bound, max)) in block_bounds_and_maxima(&reader)
@@ -2040,7 +2040,7 @@ mod tests {
             b.add_doc(0, doc_id, text.trim_end()).expect("add doc");
         }
         let bytes = Bytes::from(b.finish().expect("finish builder"));
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let reader = FtsReader::open(bytes, json).expect("open FtsReader");
 
         let mut cursors = reader
@@ -2124,7 +2124,7 @@ mod tests {
         for (t, list) in planted.iter().enumerate() {
             assert_eq!(at[t], list.len(), "term {t}: every planted doc emitted");
         }
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 

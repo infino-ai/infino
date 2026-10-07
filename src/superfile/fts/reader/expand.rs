@@ -880,7 +880,7 @@ mod tests {
 
     /// A `body` column analyzed by `standard` plus the English stemmer.
     const STEMMED_BODY_JSON: &str =
-        r#"[{"name":"body","tokenizer":"standard","stemmer":"english"}]"#;
+        r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stemmer":"english"}]"#;
 
     fn expand_all(
         r: &FtsReader,

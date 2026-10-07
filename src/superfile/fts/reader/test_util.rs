@@ -35,7 +35,7 @@ pub(super) fn build_standard_blob_with(docs: &[&str], order: Option<&[u32]>) -> 
         b.doc_map = Some(rows);
     }
     let bytes = b.finish().expect("finish");
-    let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     (Bytes::from(bytes), json.to_string())
 }
 
@@ -57,7 +57,7 @@ pub(super) fn build_blob() -> (Bytes, String) {
     b.add_doc(0, 1, "tokio is a rust runtime").expect("add doc");
     b.add_doc(0, 2, "java spring boot").expect("add doc");
     let bytes = b.finish().expect("finish");
-    let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     (Bytes::from(bytes), json.to_string())
 }
 
@@ -76,7 +76,7 @@ pub(super) fn build_mixed_df_blob() -> (Bytes, String) {
     b.add_doc(0, 1, "common rust").expect("add doc");
     b.add_doc(0, 2, "common uniqtwo").expect("add doc");
     let bytes = b.finish().expect("finish");
-    let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     (Bytes::from(bytes), json.to_string())
 }
 
@@ -101,6 +101,6 @@ pub(super) fn build_phrase_blob() -> (Bytes, &'static str) {
     }
     (
         Bytes::from(b.finish().expect("finish")),
-        r#"[{"name":"title","tokenizer":"standard","positions":true}]"#,
+        r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#,
     )
 }

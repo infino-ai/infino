@@ -542,7 +542,7 @@ mod tests {
             }
             b.add_doc(0, i, &text).expect("doc");
         }
-        let json = r#"[{"name":"text","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"text","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let s = r.size_breakdown().expect("breakdown");
         let c = &s.columns[0];
@@ -602,7 +602,7 @@ mod tests {
             };
             b.add_doc(0, i, text).expect("doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"standard","positions":true}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let s = r.size_breakdown().expect("breakdown");
         assert_eq!(s.columns.len(), 1);

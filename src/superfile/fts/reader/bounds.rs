@@ -76,7 +76,7 @@ mod tests {
         b.register_column("body".into(), false).expect("register");
         b.add_doc(0, 0, "a b").expect("doc");
         b.add_doc(0, 1, "a b c d e f").expect("doc");
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         // At the declared parameters the stored bounds are exact.
         let declared = &r.columns[0];

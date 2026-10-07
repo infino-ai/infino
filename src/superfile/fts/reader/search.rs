@@ -2140,8 +2140,7 @@ mod tests {
         b.add_doc(0, 2, "go").expect("add");
         b.add_doc(1, 2, "concurrency").expect("add");
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json =
-            r#"[{"name":"title","tokenizer":"standard"},{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75},{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let hits = r
             .search_multi(&[("title", 1.0), ("body", 1.0)], "rust", 10, BoolMode::Or)
@@ -2164,7 +2163,7 @@ mod tests {
             b.add_doc(0, i, "alpha beta").expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         // Restrict to [2, 5): only docs 2,3,4 are eligible.
         let hits = r
@@ -2219,7 +2218,7 @@ mod tests {
             b.add_doc(0, i, &text).expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         // Two shapes through the one ranged union kernel: a uniform OR
@@ -2322,7 +2321,7 @@ mod tests {
             b.add_doc(0, i, &text).expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         let terms: &[&str] = &["alpha", "beta", "gamma", "delta"];
@@ -2387,7 +2386,7 @@ mod tests {
             b.add_doc(0, i, "alpha beta").expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let hits = r
             .search_or_range_pretokenized_with_floor(

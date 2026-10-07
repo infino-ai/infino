@@ -69,8 +69,7 @@ fn build_with_two_columns() -> (Bytes, String) {
     b.add_doc(1, 3, "filler only here").expect("add doc");
 
     let bytes = b.finish().expect("finish fts");
-    let json =
-        r#"[{"name":"title","tokenizer":"standard"},{"name":"body","tokenizer":"standard"}]"#;
+    let json = r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75},{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     (Bytes::from(bytes), json.to_string())
 }
 
@@ -266,7 +265,7 @@ async fn bmw_single_term_matches_brute_force() {
         b.add_doc(0, i, &text).expect("add doc");
     }
     let bytes = b.finish().expect("finish fts");
-    let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     let r = FtsReader::open(Bytes::from(bytes), json).expect("open FtsReader");
 
     // Single term → BMW path.
@@ -350,7 +349,7 @@ async fn bmw_single_term_multispan_matches_brute_force() {
         b.add_doc(0, i, &toks.join(" ")).expect("add doc");
     }
     let bytes = b.finish().expect("finish fts");
-    let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     let r = FtsReader::open(Bytes::from(bytes), json).expect("open FtsReader");
 
     // Single term → coarse-skip BMW path.
