@@ -267,9 +267,8 @@ impl SuperfileList {
 
     /// One FTS column's length statistics over the whole table — the
     /// documents that carry tokens and their token total — folded from
-    /// every superfile's summary. `None` while any superfile's summary
-    /// predates the totals: a partial sum would describe some other
-    /// corpus, so the caller falls back rather than mixing.
+    /// every superfile's summary. `None` when any summary's totals are
+    /// unknown: a partial sum would describe some other corpus.
     pub fn fts_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
         Self::fts_length_stats_over(self.superfiles.iter(), column)
     }

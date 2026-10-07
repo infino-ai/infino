@@ -1212,8 +1212,8 @@ impl SupertableReader {
         // over, so the two have to come from the same corpus — a row
         // that is null here can never contribute to a `df`, and counting
         // it in `N` would weight the column's common terms too heavily
-        // against its rare ones. Falls back to the row count for a
-        // manifest whose summaries predate the totals.
+        // against its rare ones. Falls back to the row count when the
+        // totals are unknown.
         let global_n = corpus.map_or_else(|| manifest.n_docs_total(), |c| c.n_scored_docs);
         if terms.is_empty() || global_n == 0 {
             return Ok((map, None));

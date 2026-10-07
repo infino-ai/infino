@@ -128,9 +128,9 @@ impl ColumnLengthStats {
     /// Fold two contributions where either may be unknown. Statistics
     /// exist to be summed — the whole point of rolling them up is that
     /// the table's average and collection size come out as they would
-    /// for one unfragmented file — and a contributor that predates the
-    /// totals has nothing to add: folding it in as zero would silently
-    /// shrink both. So an unknown side makes the result unknown.
+    /// for one unfragmented file — and folding an unknown contributor in
+    /// as zero would silently shrink both. So an unknown side makes the
+    /// result unknown.
     pub fn fold(acc: Option<Self>, next: Option<Self>) -> Option<Self> {
         let (mut acc, next) = (acc?, next?);
         acc.merge_with(&next);

@@ -512,18 +512,14 @@ pub(crate) fn decode_length1_array(bytes: &[u8]) -> Result<ArrayRef, DecodeError
 //   [min_term bytes]
 //   u32 max_term_len
 //   [max_term bytes]               (empty min+max ⇒ no range, i.e. None)
-//   u64 total_tokens               ┐ optional tail: present together or
-//   u64 n_scored_docs              ┘ not at all (⇒ length_stats None)
+//   u64 total_tokens
+//   u64 n_scored_docs
 //
-// The trailing pair is a compatible extension in both directions, and
-// both directions are exercised by the round-trip tests. A summary
-// written before it existed simply ends after `max_term`, and the
-// decoder reads the absent tail as "no totals recorded"; a decoder that
-// predates it stops after `max_term` and ignores what follows, because
-// each summary is a length-delimited blob inside the manifest's binary
-// column rather than a stream this shares with anything else. That
-// second property is what makes appending safe here, so it is load
-// bearing: do not add a trailing-bytes rejection to this decoder.
+// A payload that ends after `max_term` carries no totals and is
+// rejected. Each summary is a length-delimited blob inside the
+// manifest's binary column, so a field appended after the totals is
+// invisible to a decoder that stops reading here — which is what makes
+// appending safe, so do not add a trailing-bytes rejection.
 //
 // ---------------------------------------------------------
 
@@ -587,17 +583,10 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
     } else {
         return Err(DecodeError::InvalidTermRange);
     };
-    // The totals are optional and go together: a summary that predates
-    // them ends here. Read both or neither — a tail carrying only one is
-    // a truncated write, not an older writer, so it is rejected rather
-    // than half-believed.
-    let length_stats = match c.get_ref().len() - c.position() as usize {
-        0 => None,
-        _ => Some(ColumnLengthStats {
-            total_tokens: read_u64(&mut c, "total_tokens")?,
-            n_scored_docs: read_u64(&mut c, "n_scored_docs")?,
-        }),
-    };
+    let length_stats = Some(ColumnLengthStats {
+        total_tokens: read_u64(&mut c, "total_tokens")?,
+        n_scored_docs: read_u64(&mut c, "n_scored_docs")?,
+    });
     Ok(FtsSummaryAgg {
         term_bloom,
         n_terms_distinct,
@@ -962,9 +951,22 @@ mod decode_error_tests {
     use crate::{superfile::fts::reader::ColumnLengthStats, supertable::manifest::FtsSummaryAgg};
 
     /// Hand-build a `decode_fts_summary` payload: no bloom, a given
-    /// distinct count, then the `(min_term, max_term)` pair verbatim.
-    /// Lets a test plant a half-empty range the encoder would never emit.
+    /// distinct count, the `(min_term, max_term)` pair verbatim, then the
+    /// totals. Lets a test plant a half-empty range the encoder would
+    /// never emit.
     fn fts_summary_bytes(n_terms_distinct: u32, min_term: &[u8], max_term: &[u8]) -> Vec<u8> {
+        let mut out = fts_summary_bytes_without_totals(n_terms_distinct, min_term, max_term);
+        out.extend_from_slice(&TEST_TOTAL_TOKENS.to_le_bytes());
+        out.extend_from_slice(&TEST_SCORED_DOCS.to_le_bytes());
+        out
+    }
+
+    /// [`fts_summary_bytes`] ending after `max_term`, with no totals.
+    fn fts_summary_bytes_without_totals(
+        n_terms_distinct: u32,
+        min_term: &[u8],
+        max_term: &[u8],
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&0u32.to_le_bytes()); // bloom_len = 0 ⇒ no bloom
         out.extend_from_slice(&n_terms_distinct.to_le_bytes());
@@ -975,23 +977,19 @@ mod decode_error_tests {
         out
     }
 
-    // ---- FtsSummaryAgg length totals: an optional wire tail ----
+    // ---- FtsSummaryAgg length totals: the wire tail ----
 
     /// Totals a test can recognise on the way back out.
     const TEST_TOTAL_TOKENS: u64 = 4_242;
     const TEST_SCORED_DOCS: u64 = 707;
 
     #[test]
-    fn fts_summary_without_totals_decodes_as_absent() {
-        // Exactly what a writer that predates the totals emits: the
-        // payload ends after `max_term`. It must decode cleanly, with
-        // the totals reported as unknown rather than as zero — zero
-        // would claim a column with no documents and silently shrink
-        // the table-wide average and collection size.
-        let bytes = fts_summary_bytes(3, b"a", b"z");
-        let got = decode_fts_summary(&bytes).expect("legacy payload decodes");
-        assert_eq!(got.length_stats, None);
-        assert_eq!(got.n_terms_distinct, 3);
+    fn fts_summary_without_totals_is_rejected() {
+        // Reading a missing tail as zero would claim a column with no
+        // documents and silently shrink the table-wide average and
+        // collection size.
+        let bytes = fts_summary_bytes_without_totals(3, b"a", b"z");
+        decode_fts_summary(&bytes).expect_err("a payload without totals must not decode");
     }
 
     #[test]
@@ -1010,44 +1008,8 @@ mod decode_error_tests {
     }
 
     #[test]
-    fn a_decoder_without_the_tail_still_reads_a_payload_carrying_one() {
-        // Forward compatibility, and the reason appending is safe here:
-        // each summary is a length-delimited blob, and a decoder that
-        // stops after `max_term` simply never looks at what follows.
-        // Modelled by decoding a payload with the tail using the
-        // field-by-field reads an older decoder performed.
-        let agg = FtsSummaryAgg {
-            term_bloom: None,
-            n_terms_distinct: 5,
-            term_range: Some((b"aa".to_vec(), b"zz".to_vec())),
-            length_stats: Some(ColumnLengthStats {
-                total_tokens: TEST_TOTAL_TOKENS,
-                n_scored_docs: TEST_SCORED_DOCS,
-            }),
-        };
-        let bytes = encode_fts_summary(&agg);
-        let mut c = Cursor::new(bytes.as_slice());
-        let bloom_len = read_u32(&mut c, "bloom_len").expect("bloom_len") as usize;
-        assert_eq!(bloom_len, 0);
-        assert_eq!(read_u32(&mut c, "n_terms").expect("n_terms"), 5);
-        let min_len = read_u32(&mut c, "min_len").expect("min_len") as usize;
-        assert_eq!(read_n(&mut c, min_len, "min").expect("min"), b"aa");
-        let max_len = read_u32(&mut c, "max_len").expect("max_len") as usize;
-        assert_eq!(read_n(&mut c, max_len, "max").expect("max"), b"zz");
-        // An older decoder returns here; the trailing bytes are simply
-        // the ones it never consumed.
-        assert_eq!(
-            bytes.len() - c.position() as usize,
-            2 * size_of::<u64>(),
-            "the tail must be exactly the two totals"
-        );
-    }
-
-    #[test]
     fn fts_summary_truncated_tail_is_rejected() {
-        // Half a tail is a truncated write, not an older writer. Reading
-        // it as "no totals" would let corruption pass as a legacy
-        // payload.
+        // Half a tail is a truncated write.
         let agg = FtsSummaryAgg {
             term_bloom: None,
             n_terms_distinct: 1,
