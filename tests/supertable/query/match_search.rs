@@ -26,7 +26,7 @@ use std::{collections::HashSet, sync::Arc};
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
-    Bm25SearchOptions,
+    Bm25SearchOptions, Stemmer,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{builder::FtsConfig, fts::reader::BoolMode},
     supertable::{
@@ -434,21 +434,23 @@ fn filtered_knn_finds_sparse_matches_outside_the_probed_cells() {
 }
 
 /// Notes text for [`title_notes_table`], parallel to [`SEG1_TITLES`].
-/// `café` appears in exactly two docs and in no title.
+/// `café` appears in exactly two docs and in no title; so do the two
+/// inflections of `brew`, which the stemmed `notes` column indexes as one
+/// term.
 const NOTES: &[&str] = &[
-    "café menu",     // 0
-    "tea list",      // 1
-    "café hours",    // 2
-    "water only",    // 3
-    "juice board",   // 4
-    "espresso shot", // 5
-    "matcha bowl",   // 6
-    "cold brew",     // 7
+    "café menu",      // 0
+    "tea list",       // 1
+    "café hours",     // 2
+    "water only",     // 3
+    "juice board",    // 4
+    "espresso brews", // 5
+    "matcha bowl",    // 6
+    "cold brew",      // 7
 ];
 
-/// Schema `[title (FTS), notes (FTS), emb (vector)]` over [`SEG1_TITLES`]
-/// × [`NOTES`]: two FTS columns next to a vector column, one commit,
-/// one-hot embeddings.
+/// Schema `[title (FTS), notes (FTS, English stemmer), emb (vector)]`
+/// over [`SEG1_TITLES`] × [`NOTES`]: two FTS columns analyzed differently
+/// next to a vector column, one commit, one-hot embeddings.
 fn title_notes_table() -> Supertable {
     let writer_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
@@ -464,7 +466,10 @@ fn title_notes_table() -> Supertable {
     let st = Supertable::create(
         SupertableOptions::new(
             schema.clone(),
-            vec![FtsConfig::new("title"), FtsConfig::new("notes")],
+            vec![
+                FtsConfig::new("title"),
+                FtsConfig::new("notes").stemmer(Stemmer::English),
+            ],
             vec![default_vector_config("emb", VECTOR_ROT_SEED)],
         )
         .expect("valid options")
@@ -552,6 +557,41 @@ fn vector_filter_matches_against_the_filter_column() {
     assert!(
         hits.is_empty(),
         "no title holds café, so the predicate matches nothing there"
+    );
+}
+
+/// A `VectorFilter` query is analyzed with its column's own chain:
+/// `brewing` reaches the stemmed `notes` rows indexed as `brew`, which an
+/// unstemmed analysis of the query would miss.
+#[test]
+fn vector_filter_analyzes_with_the_filter_columns_chain() {
+    let st = title_notes_table();
+    let reader = st.reader().expect("reader");
+
+    let allowed = stable_ids(
+        &reader
+            .token_match("notes", "brew", BoolMode::Or)
+            .expect("token_match on notes"),
+    );
+    assert_eq!(allowed.len(), 2, "two notes inflect brew");
+
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &one_hot(QUERY_DIM),
+            TOP_K,
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "notes",
+                query: "brewing",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search on notes");
+    assert_eq!(
+        stable_ids(&hits),
+        allowed,
+        "the filter stemmed brewing with the notes column's chain"
     );
 }
 
