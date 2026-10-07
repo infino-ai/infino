@@ -34,8 +34,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use infino::{
-    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
-    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
+    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, GcError,
+    InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
     ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions, Stemmer, Stopwords,
     VectorFilter,
 };
@@ -111,7 +111,10 @@ fn py_err(e: CoreError) -> PyErr {
 }
 
 fn optimize_err(e: OptimizeError) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
+    match e {
+        OptimizeError::Unsupported(m) => PyNotImplementedError::new_err(m),
+        other => PyRuntimeError::new_err(other.to_string()),
+    }
 }
 
 fn gc_err(e: GcError) -> PyErr {
@@ -131,6 +134,8 @@ fn reindex_err(e: ReindexError) -> PyErr {
         ReindexError::AlreadyRunning => {
             AlreadyRunningError::new_err(ReindexError::AlreadyRunning.to_string())
         }
+        // An index this engine cannot read: raised as `InfinoError::Unsupported` is.
+        ReindexError::Unsupported(m) => PyNotImplementedError::new_err(m),
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }

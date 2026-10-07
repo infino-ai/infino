@@ -47,10 +47,9 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError,
-    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
-    RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions, Stemmer,
-    Stopwords,
+    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError, InfinoError, Metric,
+    OptimizeError, OptimizeOptions as InfinoOptimizeOptions, RecalibratePolicy, ReindexError,
+    ReindexMode, ReindexOptions as InfinoReindexOptions, Stemmer, Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -114,6 +113,9 @@ fn optimize_err(e: OptimizeError) -> Error {
             Status::InvalidArg,
             "optimize requires durable storage (not memory://)",
         ),
+        OptimizeError::Unsupported(m) => {
+            Error::new(Status::GenericFailure, format!("Unsupported: {m}"))
+        }
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
 }
@@ -145,6 +147,11 @@ fn reindex_err(e: ReindexError) -> Error {
             Status::GenericFailure,
             format!("AlreadyRunningError: {}", ReindexError::AlreadyRunning),
         ),
+        // An index this engine cannot read: the caller's to fix, prefixed as
+        // `InfinoError::Unsupported` is so one check covers every surface.
+        ReindexError::Unsupported(m) => {
+            Error::new(Status::GenericFailure, format!("Unsupported: {m}"))
+        }
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
 }
