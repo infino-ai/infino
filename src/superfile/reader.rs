@@ -1759,25 +1759,39 @@ impl SuperfileReader {
         if k == 0 {
             return Ok((Vec::new(), MatchWork::default()));
         }
+        let terms = self.prefix_terms(column, prefix, pool).await?;
+        if terms.is_empty() {
+            return Ok((Vec::new(), MatchWork::default()));
+        }
+        let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        Ok(fts
+            .search_with_work(column, &term_refs, k, BoolMode::Or)
+            .await?)
+    }
+
+    /// The indexed terms of `column` that begin with `prefix`, ASCII-
+    /// lowercased first — the expansion a prefix search scores.
+    pub(crate) async fn prefix_terms(
+        &self,
+        column: &str,
+        prefix: &str,
+        pool: Option<&ThreadPool>,
+    ) -> Result<Vec<String>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         let lowered = prefix.to_ascii_lowercase();
         // The dictionary walk is CPU work and runs on the reader pool; the
         // FST fetch it needs stays on this runtime.
         let term_bytes = fts
             .terms_with_prefix(column, lowered.as_bytes(), pool)
             .await?;
-        if term_bytes.is_empty() {
-            return Ok((Vec::new(), MatchWork::default()));
-        }
-        // FST keys are valid UTF-8 by construction (a tokenizer
-        // emits `&str` terms); the from_utf8 below is a typed
-        // pass-through, not a re-validation cost.
-        let term_strings: Vec<&str> = term_bytes
-            .iter()
-            .filter_map(|b| str::from_utf8(b).ok())
-            .collect();
-        Ok(fts
-            .search_with_work(column, &term_strings, k, BoolMode::Or)
-            .await?)
+        // FST keys are valid UTF-8 by construction (a tokenizer emits
+        // `&str` terms), so the conversion drops nothing.
+        Ok(term_bytes
+            .into_iter()
+            .filter_map(|b| String::from_utf8(b).ok())
+            .collect())
     }
 
     /// Multi-term OR BM25 search restricted to a doc_id sub-range.
@@ -1869,23 +1883,10 @@ impl SuperfileReader {
         prefix: &str,
         pool: Option<&ThreadPool>,
     ) -> Result<OrCursorSet, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts
-            .terms_with_prefix(column, lowered.as_bytes(), pool)
-            .await?;
-        // FST keys are valid UTF-8 by construction (a tokenizer
-        // emits `&str` terms); the from_utf8 below is a typed
-        // pass-through, not a re-validation cost.
-        let term_strings: Vec<&str> = term_bytes
-            .iter()
-            .filter_map(|b| str::from_utf8(b).ok())
-            .collect();
-        Ok(fts
-            .build_or_cursor_set(column, &term_strings, None, None)
-            .await?)
+        let terms = self.prefix_terms(column, prefix, pool).await?;
+        let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        self.bm25_or_cursor_set(column, &term_refs, None, None)
+            .await
     }
 
     /// Ranged multi-term OR against prebuilt cursors — see

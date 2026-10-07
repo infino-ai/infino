@@ -17,7 +17,7 @@
 //!     loads nothing.
 //!   - **List-level term-range prune (prefix BM25).**
 //!     `bm25_search_prefix` for a prefix that overlaps
-//!     one part's range loads only that part.
+//!     one part's range scores only that part's superfile.
 //!   - **Lazy and eager opens score alike.** Term and
 //!     prefix searches, and the average a writer bakes,
 //!     are the same whichever way the manifest was opened.
@@ -224,7 +224,7 @@ fn bm25_term_in_no_part_loads_nothing() {
 }
 
 #[test]
-fn bm25_prefix_with_narrow_prefix_loads_one_part() {
+fn bm25_prefix_with_narrow_prefix_scores_one_part() {
     let dir = TempDir::new().expect("tempdir");
     build_5_parts_with_distinct_terms(dir.path());
 
@@ -252,21 +252,13 @@ fn bm25_prefix_with_narrow_prefix_loads_one_part() {
         "prefix search must find 'echo'-rooted terms"
     );
 
-    let r = consumer.reader().expect("reader");
-    let m = r.manifest();
-    let list_entries = m.get_all_list_entries();
-    let n_loaded = list_entries
-        .iter()
-        .filter(|e| m.get_cached_part_by_id(&e.part_id).is_some())
-        .count();
-    // Term-range prune is range-based — a part survives
-    // iff [prefix, prefix_upper_bound) overlaps the
-    // part's [min_term, max_term]. With 5 disjoint
-    // vocabularies the prefix "ech" lands in exactly one
-    // part's range.
+    // Scoring is confined to the one superfile whose term range
+    // overlaps the prefix; idf still reads every part's totals.
+    assert_single_superfile(&hits);
     assert_eq!(
-        n_loaded, 1,
-        "prefix-prune should load exactly 1 of 5 parts; got {n_loaded}"
+        parts_loaded(&consumer),
+        (HIERARCHICAL_PART_COUNT, HIERARCHICAL_PART_COUNT),
+        "corpus-wide idf reads every part"
     );
 }
 
@@ -1024,6 +1016,36 @@ fn lazy_open_scores_like_an_eager_open() {
             )
         };
         assert_same_hits(prefix, &search(&lazy), &search(&eager));
+    }
+}
+
+/// A prefix that expands to a single term is that term's query: every
+/// expanded term is weighted by its table-wide idf, as an exact-term
+/// search weights it, so the two return the same hits at the same
+/// scores — eager or lazy.
+#[test]
+fn prefix_with_one_expansion_scores_like_the_term() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    build_shared_term_parts(&storage);
+
+    for threshold in [
+        EAGER_LOAD_THRESHOLD_FORCE_EAGER,
+        EAGER_LOAD_THRESHOLD_FORCE_LAZY,
+    ] {
+        let cache_dir = TempDir::new().expect("cache");
+        let st = open_with_threshold(&storage, cache_dir.path(), threshold);
+        let r = st.reader().expect("reader");
+        let term = by_position(
+            r.bm25_hits("title", "alpha", ALL_MATCHES_K, Bm25SearchOptions::new())
+                .expect("bm25"),
+        );
+        let prefix = by_position(
+            r.bm25_search_prefix("title", "alph", ALL_MATCHES_K)
+                .expect("prefix"),
+        );
+        assert_same_hits(&format!("threshold {threshold}"), &prefix, &term);
     }
 }
 

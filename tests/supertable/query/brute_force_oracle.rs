@@ -140,6 +140,9 @@ const ORACLE_TOP_K_SMALL: usize = 5;
 const RAYON_POOL_THREADS: usize = 1;
 /// Top-k for the larger zipfian-corpus agreement test.
 const ZIPFIAN_TOP_K: usize = 20;
+/// Score tolerance between a prefix search and the reference OR over its
+/// expansion (f32 accumulation order).
+const PREFIX_SCORE_TOLERANCE: f32 = 1e-3;
 
 /// Plant `N_PREFIX_TERMS` unique-prefix terms (`alphafox00`..)
 /// across distinct superfiles for prefix-search testing.
@@ -263,12 +266,29 @@ fn supertable_prefix_global(
     k: usize,
     chunk_size: usize,
 ) -> Vec<u64> {
+    supertable_prefix_scored(st, prefix, k, chunk_size)
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect()
+}
+
+/// [`supertable_prefix_global`] with each hit's score.
+fn supertable_prefix_scored(
+    st: &Supertable,
+    prefix: &str,
+    k: usize,
+    chunk_size: usize,
+) -> Vec<(u64, f32)> {
     let hits = st
         .reader()
         .expect("reader")
         .bm25_search_prefix("title", prefix, k)
         .expect("supertable bm25_prefix");
+    let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
     supertable_to_global_ids(st, hits, chunk_size)
+        .into_iter()
+        .zip(scores)
+        .collect()
 }
 
 // ---- Brute-force oracle (per-superfile + global merge) ---------------
@@ -383,11 +403,16 @@ fn brute_force_and_top_k(oracles: &[FileOracle], query: &str, k: usize) -> Vec<u
 /// Same as [`brute_force_top_k`] but for a multi-term explicit
 /// OR query (used to mirror the supertable's prefix expansion).
 fn brute_force_terms_top_k(oracles: &[FileOracle], terms: &[String], k: usize) -> Vec<u64> {
-    let all = oracles
+    merge_global_top_k(brute_force_terms_scored(oracles, terms), k)
+}
+
+/// Every row an explicit OR over `terms` matches, with its reference
+/// score.
+fn brute_force_terms_scored(oracles: &[FileOracle], terms: &[String]) -> Vec<(u64, f32)> {
+    oracles
         .iter()
         .flat_map(|o| o.own(o.scorer.top_k_terms(terms, usize::MAX)))
-        .collect();
-    merge_global_top_k(all, k)
+        .collect()
 }
 
 fn assert_top_k_sets_match(label: &str, supertable: Vec<u64>, oracle: Vec<u64>, head_size: usize) {
@@ -782,6 +807,23 @@ fn oracle_prefix_query_matches_explicit_term_or() {
     let ora_set: HashSet<u64> = ora_hits.iter().take(N_PREFIX_TERMS).copied().collect();
     assert_eq!(inf_set, want, "supertable prefix hits = {inf_hits:?}");
     assert_eq!(ora_set, want, "oracle explicit-OR hits = {ora_hits:?}");
+
+    // Every expanded term is weighted by its table-wide idf, as the
+    // reference does, so each match scores the same on both sides.
+    let inf_scored = supertable_prefix_scored(&f.infino, prefix, N_PLANTED, CHUNK_SIZE);
+    let ora_scored: HashMap<u64, f32> = brute_force_terms_scored(&f.oracles, &expanded)
+        .into_iter()
+        .collect();
+    assert_eq!(inf_scored.len(), ora_scored.len(), "match count");
+    for (d, s) in inf_scored {
+        let w = ora_scored
+            .get(&d)
+            .unwrap_or_else(|| panic!("row {d} is not a reference match"));
+        assert!(
+            (s - w).abs() <= PREFIX_SCORE_TOLERANCE,
+            "row {d} scored {s}, reference {w}"
+        );
+    }
 }
 
 #[test]
