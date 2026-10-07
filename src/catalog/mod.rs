@@ -43,7 +43,11 @@ use datafusion::{
     sql::{
         parser::{DFParserBuilder, Statement as DFStatement},
         sqlparser::{
-            ast::{Statement as SqlStatement, visit_statements},
+            ast::{
+                CastKind, DataType as SqlDataType, ExactNumberInfo, Expr as SqlExpr,
+                Statement as SqlStatement, Value as SqlValue, visit_expressions_mut,
+                visit_statements,
+            },
             dialect::GenericDialect,
             keywords::Keyword,
             tokenizer::{Token, Tokenizer as SqlTokenizer},
@@ -69,6 +73,10 @@ pub(crate) const MAX_PREDICATE_CONNECTIVES: usize = 1024;
 /// Fewest bytes one connective can occupy in SQL text; text shorter than
 /// `MIN_BYTES_PER_CONNECTIVE * MAX_PREDICATE_CONNECTIVES` cannot reach the cap and skips the scan.
 const MIN_BYTES_PER_CONNECTIVE: usize = 3;
+
+/// Most digits a whole-number literal can carry and still be read exactly: `Decimal128`'s
+/// precision, which is also the `_id` column's (`DECIMAL(38, 0)`).
+const MAX_EXACT_INTEGER_DIGITS: usize = 38;
 
 /// What `query_sql` answers a write with, from either read-only check.
 const READ_ONLY_REFUSAL: &str =
@@ -1134,7 +1142,7 @@ fn read_only_statement(state: &SessionState, sql: &str) -> Result<DFStatement, I
         .and_then(|mut parser| parser.parse_statements())
         .map_err(|e| datafusion_planning_error(&e))?;
 
-    let (Some(statement), true) = (statements.pop_front(), statements.is_empty()) else {
+    let (Some(mut statement), true) = (statements.pop_front(), statements.is_empty()) else {
         return Err(InfinoError::Query(
             "query_sql runs exactly one SQL statement".to_string(),
         ));
@@ -1144,7 +1152,56 @@ fn read_only_statement(state: &SessionState, sql: &str) -> Result<DFStatement, I
         return Err(InfinoError::Query(READ_ONLY_REFUSAL.to_string()));
     }
 
+    exact_wide_integers(&mut statement);
     Ok(statement)
+}
+
+/// Read every whole-number literal too wide for 64 bits as the exact decimal it spells.
+///
+/// DataFusion reads a number literal as an `i64`, else a `u64`, else a `Float64`. A row's `_id`
+/// is a 32-digit `DECIMAL(38, 0)`, so `WHERE _id = 3304...` compared the column with a float:
+/// the comparison is coerced to `Decimal128(38, 15)`, which overflows and fails the query, and a
+/// float would not hold the 32 digits anyway. Each such literal becomes
+/// `CAST('<digits>' AS DECIMAL(38, 0))`, which compares with the column exactly. A literal that
+/// fits 64 bits, has a fraction or an exponent, or is past `MAX_EXACT_INTEGER_DIGITS` is left as
+/// DataFusion reads it.
+fn exact_wide_integers(statement: &mut DFStatement) {
+    match statement {
+        DFStatement::Statement(statement) => {
+            let _ = visit_expressions_mut(statement.as_mut(), |expr| {
+                if let Some(digits) = wide_integer_digits(expr) {
+                    *expr = SqlExpr::Cast {
+                        kind: CastKind::Cast,
+                        expr: Box::new(SqlExpr::Value(SqlValue::SingleQuotedString(digits).into())),
+                        data_type: SqlDataType::Decimal(ExactNumberInfo::PrecisionAndScale(
+                            MAX_EXACT_INTEGER_DIGITS as u64,
+                            0,
+                        )),
+                        array: false,
+                        format: None,
+                    };
+                }
+                ControlFlow::<()>::Continue(())
+            });
+        }
+        DFStatement::Explain(explain) => exact_wide_integers(&mut explain.statement),
+        _ => {}
+    }
+}
+
+/// The digits of `expr` when it is a whole-number literal DataFusion would read as a float: past
+/// `u64` and within `MAX_EXACT_INTEGER_DIGITS`. A sign is a separate unary operator in the AST, so
+/// the literal itself is digits alone.
+fn wide_integer_digits(expr: &SqlExpr) -> Option<String> {
+    let SqlExpr::Value(value) = expr else {
+        return None;
+    };
+    let SqlValue::Number(text, _) = &value.value else {
+        return None;
+    };
+    let whole = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    (whole && text.len() <= MAX_EXACT_INTEGER_DIGITS && text.parse::<u64>().is_err())
+        .then(|| text.clone())
 }
 
 /// Whether `statement`, and every statement nested in it, only reads: an `INSERT` can hide in a
@@ -1555,7 +1612,8 @@ mod tests {
 
     use arrow::util::pretty::pretty_format_batches;
     use arrow_array::{
-        Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, StringViewArray,
+        Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
+        StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
@@ -5063,6 +5121,34 @@ mod tests {
         let sql = format!("SELECT title FROM docs WHERE title = '{literal}'");
         conn.query_sql(&sql)
             .expect("literal ORs are not connectives");
+    }
+
+    #[test]
+    fn query_sql_compares_a_full_width_id_literal_exactly() {
+        // A row's `_id` is wider than 64 bits, so DataFusion would read it unquoted as a float and
+        // fail the comparison on a Decimal128 overflow. Equality and IN both find the row.
+        let conn = conn_with_docs();
+        let ids = conn.query_sql("SELECT _id FROM docs").expect("read _id");
+        let id = ids[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id is Decimal128")
+            .value(0)
+            .to_string();
+        assert!(
+            id.parse::<u64>().is_err(),
+            "_id {id} must be past u64 to exercise the fix"
+        );
+        for sql in [
+            format!("SELECT title FROM docs WHERE _id = {id}"),
+            format!("SELECT title FROM docs WHERE _id IN ({id}, 1)"),
+        ] {
+            let rows = conn
+                .query_sql(&sql)
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert_eq!(n_rows(&rows), 1, "{sql}");
+        }
     }
 
     #[test]
