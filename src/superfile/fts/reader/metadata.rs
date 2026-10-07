@@ -380,7 +380,8 @@ pub struct ColumnMeta {
     pub stemmer: Stemmer,
     pub stored: bool,
     /// Revision of the analysis that produced this column's terms (from
-    /// `inf.fts.columns`), or `None` when the file predates the field.
+    /// `inf.fts.columns`), or `None` when the file records no revision
+    /// (always stale).
     ///
     /// Below what this engine's chain emits, the column's terms and a
     /// query's terms can disagree for the same text, so the column is
@@ -620,21 +621,17 @@ impl ColumnMeta {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FtsColumnConfig {
     pub name: String,
-    /// Base tokenizer name an earlier writer recorded. Not written: the
+    /// Recorded base tokenizer name, if any. Not written: the
     /// base is always `standard`. Absent or `"standard"` opens; any other
     /// name refuses the file (see `check_recorded_tokenizer`).
     #[serde(default)]
     pub tokenizer: Option<String>,
     /// Whether this column's index records token positions (phrase
-    /// support). Files written before positions existed lack the
-    /// field, which can only mean no positions — so a missing field
-    /// deserializes to `false`.
+    /// support). Absent means `false`.
     #[serde(default)]
     pub positions: bool,
-    /// Whether the raw text is kept in the Parquet body. Files written
-    /// before index-only columns existed lack the field, which can only
-    /// mean the text is stored — so a missing field deserializes to
-    /// `true` (the writer emits it only when `false`).
+    /// Whether the raw text is kept in the Parquet body. Absent means
+    /// `true`; the writer emits it only when `false`.
     #[serde(default = "default_stored")]
     pub stored: bool,
     /// BM25 term-frequency saturation this column's stored block-max
@@ -644,8 +641,7 @@ pub struct FtsColumnConfig {
     /// like [`FtsColumnConfig::k1`].
     pub b: f32,
     /// Stopword set applied to this column, by name. Absent means no
-    /// set — the one thing a file written before the filter existed can
-    /// mean, so a missing field needs no guess. A *present* name this
+    /// set. A *present* name this
     /// engine does not ship is a different matter and fails the open:
     /// there is no sound way to analyze without a set the index was
     /// built with.
@@ -667,11 +663,9 @@ pub struct FtsColumnConfig {
     /// file-level field would have to claim one of them for columns it
     /// did not repair.
     ///
-    /// `None` on every file written before revisions were recorded, and
-    /// only on those: this engine emits the field unconditionally, zero
-    /// included. That is what keeps "written by an engine that did not
-    /// record revisions" distinguishable from "recorded as stale", which
-    /// otherwise both read as zero and mean different things.
+    /// `None` only when the file records no revision: the writer emits
+    /// the field unconditionally, zero included, so "unrecorded" stays
+    /// distinguishable from "recorded as stale".
     ///
     /// Unlike the other defaults here, a missing field is not "the
     /// feature was off": it is "unknown". Treating it as the oldest
@@ -743,9 +737,8 @@ mod tests {
     /// the deserializer directly because both are invisible in a
     /// round-trip through our own writer.
     ///
-    /// Absent means off: a file written before the filters existed has
-    /// no such field, and that can only mean it was built unfiltered —
-    /// so a current reader infers the right analysis with no guess. An
+    /// Absent means off: a file with no such field was built
+    /// unfiltered. An
     /// unrecognized *value* is the opposite case and must not be
     /// tolerated: analyzing without a set the postings were built with
     /// is a different index, not a degraded one.

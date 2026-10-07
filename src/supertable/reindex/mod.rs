@@ -808,8 +808,8 @@ mod tests {
             .sum()
     }
 
-    /// A migration of a one-superfile table written before the term index
-    /// existed leaves an index that lists that superfile, and marks it so.
+    /// A migration of a one-superfile table whose term index is absent
+    /// leaves an index that lists that superfile, and marks it so.
     ///
     /// The rewrite publishes the table's first index, from this commit's
     /// postings alone, which is exactly what a full rebuild over the new

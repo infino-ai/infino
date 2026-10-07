@@ -452,8 +452,7 @@ pub(crate) fn unique_tokens<'a>(
 /// lets the verifier subtract an offset from a position without
 /// underflowing near the start of a document.
 ///
-/// Without a chain every offset is its term's index, so a phrase
-/// behaves exactly as it did before offsets existed.
+/// Without a chain every offset is its term's index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Phrase<T> {
     /// The phrase's terms, in query order.

@@ -287,9 +287,8 @@ k-th score — the in-superfile block-max reasoning lifted one level. And
 its cursors are built from the index's recorded postings locations, so
 the superfile's own dictionary is not read on that path.
 
-A table written before the index existed keeps working: its entries
-carry their blooms and the reader routes by them, and its first commit
-under the current writer publishes an index that covers only the new
+A table whose term index is absent or incomplete routes by its entries'
+blooms, and its next commit publishes an index that covers only the new
 superfiles — the manifest marks it incomplete, and part loading keeps
 the summary-based choice until a maintenance pass rebuilds the index
 over every superfile. Nothing requires old code to read a new manifest.
@@ -428,7 +427,7 @@ superfile is irrelevant, the superfile is kept. The pruning inputs are:
 
 - **Term queries** use the table-level term index, which names the
   superfiles holding each term exactly (a superfile the index does not
-  list — one written before it existed, or on a table with no storage —
+  list — on an incomplete index, or on a table with no storage —
   is tested against its own term presence filter instead).
 - **Prefix queries** scan the term index's slices for the prefix; a
   superfile the index does not list is tested against its lexicographic

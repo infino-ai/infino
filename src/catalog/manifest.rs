@@ -53,28 +53,22 @@ pub(crate) struct TableEntry {
     pub(crate) schema_ipc: Vec<u8>,
     /// FTS-indexed column names.
     pub(crate) fts: Vec<String>,
-    /// FTS base tokenizer names an earlier writer recorded, parallel to
-    /// `fts`. Not written: the base is always `standard`. `open_table`
+    /// Recorded FTS base tokenizer names, parallel to `fts`. Not written: the base is always `standard`. `open_table`
     /// accepts an absent list or `"standard"` entries and refuses a table
     /// naming any other analyzer.
     #[serde(default, skip_serializing)]
     pub(crate) fts_analyzers: Vec<String>,
     /// FTS stopword-set names, parallel to `fts`; an empty string
-    /// means no set. Absent in catalogs written before the filter
-    /// existed, and a missing or short entry means no set — the only
-    /// thing such a catalog can describe, since nothing could have
-    /// asked for one.
+    /// means no set, and a missing or short list reads as no set.
     #[serde(default)]
     pub(crate) fts_stopwords: Vec<String>,
     /// FTS stemmer names, parallel to `fts`; same empty-means-none and
-    /// same back-compat rule as `fts_stopwords`.
+    /// same missing-reads-as-none rule as `fts_stopwords`.
     #[serde(default)]
     pub(crate) fts_stemmers: Vec<String>,
     /// FTS positions flags, parallel to `fts` (`true` = token positions
-    /// recorded, which exact-phrase queries need). Absent in catalogs
-    /// written before positions were declarable; a missing or short
-    /// entry defaults to `false` on reopen — the only value such a
-    /// table can have been built with, since nothing could turn them on.
+    /// recorded, which exact-phrase queries need). A missing or short
+    /// list reads as `false`.
     ///
     /// Load-bearing on reopen beyond the query path: the flag joins the
     /// table's options-hash, so losing it here would make a positional
@@ -83,15 +77,12 @@ pub(crate) struct TableEntry {
     #[serde(default)]
     pub(crate) fts_positions: Vec<bool>,
     /// FTS stored flags, parallel to `fts` (`false` = index-only, the
-    /// raw text is not kept in the table). Absent in catalogs written
-    /// before index-only columns existed; a missing or short entry
-    /// defaults to stored on reopen.
+    /// raw text is not kept in the table). A missing or short list
+    /// reads as stored.
     #[serde(default)]
     pub(crate) fts_stored: Vec<bool>,
-    /// FTS BM25 `k1` values, parallel to `fts`. Absent in catalogs
-    /// written before the parameters were declarable; a missing or
-    /// short entry defaults to the standard `1.2` on reopen — the only
-    /// value such a table can have been built with. Frozen, like the
+    /// FTS BM25 `k1` values, parallel to `fts`. A missing or short list
+    /// reads as the standard `1.2`. Frozen, like the
     /// superfile-side default: it must not follow a later change to
     /// what the API recommends.
     #[serde(default)]
@@ -230,17 +221,15 @@ mod tests {
         }
     }
 
-    /// A catalog entry written before `fts_stored` existed (the key is
-    /// absent from its JSON) deserializes to an empty vec — which the
-    /// open path reads as "every FTS column stored". Pins the serde
-    /// default, so old catalogs keep opening.
+    /// A catalog entry without the `fts_stored` key deserializes to an
+    /// empty vec, which the open path reads as every FTS column stored.
     #[test]
     fn table_entry_without_fts_stored_defaults_to_all_stored() {
         let mut v = serde_json::to_value(sample_table_entry()).expect("encode");
         let obj = v.as_object_mut().expect("object");
         obj.remove("fts_stored");
         assert!(!obj.contains_key("fts_stored"));
-        let entry: TableEntry = serde_json::from_value(v).expect("legacy entry decodes");
+        let entry: TableEntry = serde_json::from_value(v).expect("entry decodes");
         assert!(entry.fts_stored.is_empty(), "missing key ⇒ empty ⇒ stored");
     }
 

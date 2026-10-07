@@ -26,9 +26,7 @@
 //!
 //! A column that declares no filter is not wrapped at all
 //! ([`chain_tokenizer`] hands back the bare base tokenizer), keeps its
-//! plain tokenizer name, and takes the same monomorphized ingest scan
-//! it always did. So the default column is byte-identical and
-//! code-path-identical to one declared before chains existed.
+//! plain tokenizer name, and takes the plain monomorphized ingest scan.
 //!
 //! That matters because the default is the parity surface, and it is
 //! not this module's to move. `standard` — tokenize and lowercase,
@@ -43,13 +41,10 @@
 //!
 //! A column persists, only when set, a `stopwords` and a `stemmer`
 //! field; the base is not recorded because there is only one. A
-//! `tokenizer` name recorded by an earlier writer is still checked on
-//! read ([`check_recorded_tokenizer`]): absent or `standard` opens, any
-//! other name refuses the table. Both are ordinary additive
-//! fields: absent means the filter is off, which is the one thing a
-//! file written before the filter existed can mean, so a current
-//! reader infers the right analysis from an old file with no special
-//! handling.
+//! recorded `tokenizer` name is checked on read
+//! ([`check_recorded_tokenizer`]): absent or `standard` opens, any
+//! other name refuses the table. Absent `stopwords` / `stemmer` means
+//! the filter is off.
 //!
 //! The chain also has a **name** — `"standard+stop=english+stem=english"`
 //! from [`chain_name`] — but it is derived in memory and never written.

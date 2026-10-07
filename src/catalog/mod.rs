@@ -595,18 +595,10 @@ impl Connection {
                     .map_err(|e| {
                         InfinoError::Config(e.to_string()).with_context("open_table", Some(name))
                     })?;
-                    // `fts_stored` keeps its back-compat rule: a catalog
-                    // written before index-only columns existed can only
-                    // mean the text is stored.
+                    // A missing or short list reads as the default.
                     let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
-                    // Same rule for positions: a catalog written before
-                    // they were declarable describes a table built
-                    // without them, because nothing could have asked
-                    // for them.
                     let positions = entry.fts_positions.get(i).copied().unwrap_or(false);
-                    // Same rule for the analysis filters: a catalog
-                    // written before they existed, or one whose entry
-                    // is empty, describes a column with no filter. A
+                    // A missing or empty filter name means no filter; a
                     // name that does not resolve is different — the
                     // recorded analysis cannot be reproduced, so the
                     // table is unusable rather than usable-with-a-guess.
@@ -630,10 +622,8 @@ impl Connection {
                             .with_context("open_table", Some(name))
                         })?,
                     };
-                    // And again for the BM25 pair: a catalog written before
-                    // it was declarable can only describe a table built with
-                    // the standard values, so the fallback is frozen there
-                    // rather than tracking the crate default.
+                    // The BM25 fallback is the frozen standard pair, not
+                    // the crate default.
                     let k1 = entry.fts_k1.get(i).copied().unwrap_or(bm25::K1);
                     let b = entry.fts_b.get(i).copied().unwrap_or(bm25::B);
                     spec = spec.fts(

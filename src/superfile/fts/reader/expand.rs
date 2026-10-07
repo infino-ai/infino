@@ -1105,7 +1105,7 @@ mod tests {
         // Too short to be a cut piece.
         assert!(!straddles_cut("xb", "xb", "bbc"));
         // One character past the cut length is not a piece either (a
-        // superfile built before the cut existed can hold such a term).
+        // dictionary may still hold such a term).
         let long = format!("{}b", "x".repeat(MAX_TOKEN_CHARS));
         assert!(!straddles_cut(&long, &long, "bbc"));
         // Counted in characters: 254 two-byte letters and a `b`.

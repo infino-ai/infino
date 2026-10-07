@@ -86,12 +86,10 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
     for c in &opts.fts_columns {
         push_str(&mut buf, &c.column);
     }
-    // 3b. positions flags — appended as a tagged block, and ONLY when
-    //     some column opts in. An all-false table's stream stays
-    //     byte-identical to hashes stamped before positions existed,
-    //     so pre-positions manifests keep verifying; a positional
-    //     table hashes differently from its positionless twin (the
-    //     built superfiles differ, so the options identity must too).
+    // 3b. positions flags — a tagged block emitted only when some
+    //     column opts in, so a positional table hashes apart from its
+    //     positionless twin. The stream is persisted in every manifest
+    //     list; changing it breaks verification of existing tables.
     if opts.fts_columns.iter().any(|c| c.positions) {
         push_tag(&mut buf, b"fts_positions");
         for c in &opts.fts_columns {
@@ -109,12 +107,8 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
             push_str(&mut buf, c.chain_name());
         }
     }
-    // 3d. stored flags — same only-when-non-default rule: an all-stored
-    //     table's stream stays byte-identical to hashes stamped before
-    //     index-only columns existed, so pre-existing manifests keep
-    //     verifying; a table with an index-only column hashes
-    //     differently (its superfiles' Parquet bodies differ, so the
-    //     options identity must too).
+    // 3d. stored flags — emitted only when some column is index-only,
+    //     whose superfiles' Parquet bodies differ, so its hash must too.
     if opts.fts_columns.iter().any(|c| !c.stored) {
         push_tag(&mut buf, b"fts_stored");
         for c in &opts.fts_columns {
@@ -713,8 +707,8 @@ mod tests {
     /// differently-analyzed index. The second: the filters ride the
     /// *derived* analyzer identity rather than a block of their own, and
     /// a column with no filter derives to its plain tokenizer name — so
-    /// the byte stream for every table that predates the filters is
-    /// unchanged and its stored hash still verifies.
+    /// a filterless table's stream is unchanged and its persisted hash
+    /// still verifies.
     #[test]
     fn analysis_filters_join_the_hash_and_a_filterless_table_is_unchanged() {
         let strategy = time_range();

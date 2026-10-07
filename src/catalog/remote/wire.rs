@@ -227,8 +227,7 @@ mod tests {
 
     /// The analysis filters cross as their own keys, only when set, so
     /// the server builds the index the client declared. A column with
-    /// no filter sends neither key, which is what keeps a default
-    /// request byte-identical to one from before the filters existed.
+    /// no filter sends neither key; a missing key reads as the default.
     ///
     /// A server that does not implement a named filter has to reject
     /// the request — that is the request schema's job

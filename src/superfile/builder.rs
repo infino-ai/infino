@@ -308,10 +308,8 @@ pub struct FtsConfig {
     pub column: String,
     /// Stopword set removed after the `standard` tokenizer and before the
     /// stemmer. Persisted in the column's `inf.fts.columns` entry as
-    /// `"stopwords"`, emitted only when set — so a column with no
-    /// stopwords keeps an entry byte-identical to one written before
-    /// the filter existed, and a reader of such an entry correctly
-    /// infers that no set was applied.
+    /// `"stopwords"`, emitted only when set; readers treat absence as
+    /// no set.
     pub stopwords: Stopwords,
     /// Stemmer applied to what survives the stopword set. Persisted as
     /// `"stemmer"` under the same only-when-set rule as
@@ -342,9 +340,7 @@ pub struct FtsConfig {
     /// parameters a bound belongs to. A query may score at a different
     /// pair; the reader corrects the bounds for the difference.
     ///
-    /// Defaults to the standard pair (`k1 = 1.2`, `b = 0.75`), which
-    /// keeps the built bytes identical to a file written before the
-    /// parameters were declarable.
+    /// Defaults to the standard pair (`k1 = 1.2`, `b = 0.75`).
     pub bm25: bm25::Bm25Params,
     /// The analysis revision of postings **carried in** from an existing
     /// file, when they were not produced by this build.
@@ -3271,8 +3267,8 @@ pub(crate) fn merge_builder_opts(
 ///
 /// `k1` / `b` are written **unconditionally, defaults included**,
 /// unlike `positions` and `stored`. Those two are booleans whose
-/// absence has exactly one possible meaning, so omitting them keeps a
-/// default column's JSON byte-identical to older files. A scoring
+/// absence has exactly one possible meaning, so they are omitted at
+/// their default. A scoring
 /// parameter is different: it is the provenance of the stored
 /// block-max bounds, and a reader that has to infer it is a reader
 /// that will infer wrong the day the recommended default moves. The
@@ -3293,11 +3289,8 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         s.push_str(&fts_param_json(c.bm25.k1));
         s.push_str(r#","b":"#);
         s.push_str(&fts_param_json(c.bm25.b));
-        // Analysis filters, each emitted only when set, so a column
-        // with neither keeps JSON byte-identical to a file written
-        // before they existed. A reader that does not know the field
-        // treats the filter as off, which degrades that column's
-        // results rather than making the file unreadable.
+        // Analysis filters, each omitted when unset; readers treat
+        // absence as the filter being off.
         if let Some(name) = c.stopwords.as_str() {
             s.push_str(r#","stopwords":""#);
             s.push_str(name);
@@ -3308,15 +3301,11 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
             s.push_str(name);
             s.push('"');
         }
-        // Emitted only when set: a positionless column's JSON stays
-        // byte-identical to files written before positions existed
-        // (the reader defaults a missing field to false).
+        // Omitted at its default; readers treat absence as false.
         if c.positions {
             s.push_str(r#","positions":true"#);
         }
-        // Same only-when-set rule, inverted default: a stored column's
-        // JSON stays byte-identical to files written before index-only
-        // columns existed (the reader defaults a missing field to true).
+        // Omitted at its default; readers treat absence as true.
         if !c.stored {
             s.push_str(r#","stored":false"#);
         }
@@ -3850,15 +3839,12 @@ mod tests {
         // The base tokenizer is always `standard` and is not recorded.
         assert!(!s.contains("tokenizer"));
         assert!(s.contains(r#""k1":1.2,"b":0.75"#));
-        // Positionless columns emit no positions field at all — the
-        // JSON stays byte-identical to files written before the flag
-        // existed.
+        // Positionless columns emit no positions field at all.
         assert!(!s.contains("positions"));
     }
 
     /// The positions field appears only on the columns that opt in,
-    /// and a mixed declaration keeps the positionless column's entry
-    /// in the legacy shape.
+    /// and a mixed declaration omits it from the positionless column.
     #[test]
     fn fts_columns_json_positions_emitted_only_when_true() {
         let cols = vec![
@@ -3902,7 +3888,7 @@ mod tests {
     }
 
     /// The stored field appears only on index-only columns, and a mixed
-    /// declaration keeps the stored column's entry in the legacy shape.
+    /// declaration omits it from the stored column.
     #[test]
     fn fts_columns_json_stored_emitted_only_when_false() {
         let cols = vec![
