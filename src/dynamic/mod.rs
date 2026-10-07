@@ -932,28 +932,25 @@ fn build_array(
             }
             let child = build_scalar_array(&column.path, &flat, item.data_type())?;
             let validity = NullBuffer::from(nulls);
-            let array: ArrayRef = if matches!(data_type, DataType::List(_)) {
+            // `try_new`, not `new`: every one of these panics on a shape it
+            // will not build, and the shape comes from a request body.
+            let built = if matches!(data_type, DataType::List(_)) {
                 let offsets = OffsetBuffer::<i32>::new(
                     offsets.iter().map(|&o| o as i32).collect::<Vec<_>>().into(),
                 );
-                Arc::new(ListArray::new(
-                    Arc::clone(item),
-                    offsets,
-                    child,
-                    Some(validity),
-                ))
+                ListArray::try_new(Arc::clone(item), offsets, child, Some(validity))
+                    .map(|a| Arc::new(a) as ArrayRef)
             } else {
                 let offsets = OffsetBuffer::<i64>::new(
                     offsets.iter().map(|&o| o as i64).collect::<Vec<_>>().into(),
                 );
-                Arc::new(LargeListArray::new(
-                    Arc::clone(item),
-                    offsets,
-                    child,
-                    Some(validity),
-                ))
+                LargeListArray::try_new(Arc::clone(item), offsets, child, Some(validity))
+                    .map(|a| Arc::new(a) as ArrayRef)
             };
-            Ok(array)
+            built.map_err(|e| SchemaError::InvalidRow {
+                row: 0,
+                reason: format!("column `{}`: {e}", column.path),
+            })
         }
         DataType::FixedSizeList(item, dim) => {
             let mut flat: Vec<Option<&Value>> = Vec::new();
@@ -987,12 +984,17 @@ fn build_array(
                 }
             }
             let child = build_scalar_array(&column.path, &flat, item.data_type())?;
-            Ok(Arc::new(FixedSizeListArray::new(
+            FixedSizeListArray::try_new(
                 Arc::clone(item),
                 *dim,
                 child,
                 Some(NullBuffer::from(nulls)),
-            )))
+            )
+            .map(|a| Arc::new(a) as ArrayRef)
+            .map_err(|e| SchemaError::InvalidRow {
+                row: 0,
+                reason: format!("column `{}`: {e}", column.path),
+            })
         }
         DataType::Struct(fields) => {
             let values: Vec<Option<&Value>> = column
@@ -1062,13 +1064,26 @@ fn build_struct_array(
                 Some(value) => Some(value),
             })
             .collect();
+        // A field the struct takes no nulls in, absent from an object that is
+        // itself present: arrow refuses to build that and panics doing it, so
+        // a request body must not reach it. The same refusal a top-level
+        // non-nullable column gets from the resolver, which never sees in
+        // here.
+        if !field.is_nullable()
+            && let Some(row) = (0..values.len()).find(|row| nulls[*row] && child[*row].is_none())
+        {
+            return Err(SchemaError::NullInNonNullable {
+                column: format!("{child_path} (row {row})"),
+            });
+        }
         children.push(build_field_array(&child_path, &child, field.data_type())?);
     }
-    Ok(Arc::new(StructArray::new(
-        fields.clone(),
-        children,
-        Some(NullBuffer::from(nulls)),
-    )))
+    StructArray::try_new(fields.clone(), children, Some(NullBuffer::from(nulls)))
+        .map(|array| Arc::new(array) as ArrayRef)
+        .map_err(|e| SchemaError::InvalidRow {
+            row: 0,
+            reason: format!("column `{path}`: {e}"),
+        })
 }
 
 /// One field of a struct, held to the declared type the same way a top-level
@@ -2324,5 +2339,233 @@ mod tests {
             types(&batch)["at"],
             DataType::Timestamp(TimeUnit::Millisecond, None)
         );
+    }
+
+    /// A field the struct takes no nulls in, absent from an object that is
+    /// itself present, is refused. Arrow will not build that struct and
+    /// panics rather than returning an error, so a request body must not
+    /// reach it — the same crash shape as a null inside a vector.
+    #[test]
+    fn a_null_in_a_non_nullable_struct_field_is_refused_rather_than_panicked() {
+        let t = table(vec![(
+            "s",
+            DataType::Struct(Fields::from(vec![Field::new("n", DataType::Int64, false)])),
+        )]);
+        for row in [json!({"s": {}}), json!({"s": {"n": null}})] {
+            let err = rows_to_batch(std::slice::from_ref(&row), &t)
+                .expect_err("the field takes no nulls");
+            assert!(
+                matches!(&err, SchemaError::NullInNonNullable { column } if column.contains("s.n")),
+                "{row}: {err:?}"
+            );
+        }
+        // The struct itself being absent is fine: the null is masked by the
+        // struct's own null, which is what the field's nullability is about.
+        rows_to_batch(&[json!({"other": 1})], &t).expect("an absent struct is a null struct");
+    }
+
+    /// A struct column sent as something that is not an object is the type
+    /// disagreement it looks like, not a panic and not a silent null.
+    #[test]
+    fn a_struct_column_sent_as_a_scalar_or_an_array_is_refused() {
+        let t = table(vec![(
+            "s",
+            DataType::Struct(Fields::from(vec![Field::new("n", DataType::Int64, true)])),
+        )]);
+        for row in [json!({"s": 5}), json!({"s": [1, 2]})] {
+            let batch = rows_to_batch(std::slice::from_ref(&row), &t).expect("map");
+            assert!(
+                matches!(
+                    resolve_batch(&batch, &t, "_id"),
+                    Err(SchemaError::TypeMismatch { column, .. }) if column == "s"
+                ),
+                "{row}"
+            );
+        }
+    }
+
+    /// A struct holds the same types a top-level column does, and each is
+    /// built the same way: the field machinery dispatches on the declared
+    /// type rather than knowing a fixed list of scalars.
+    #[test]
+    fn a_struct_field_may_be_a_vector_a_decimal_or_a_nested_struct() {
+        let t = table(vec![(
+            "s",
+            DataType::Struct(Fields::from(vec![
+                Field::new(
+                    "emb",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        3,
+                    ),
+                    true,
+                ),
+                Field::new("d", DataType::Decimal128(10, 2), true),
+                Field::new(
+                    "in",
+                    DataType::Struct(Fields::from(vec![Field::new(
+                        "deep",
+                        DataType::Int64,
+                        true,
+                    )])),
+                    true,
+                ),
+            ])),
+        )]);
+        let batch = rows_to_batch(
+            &[json!({"s": {"emb": [0.1, 0.2, 0.3], "d": "1.5", "in": {"deep": 7}}})],
+            &t,
+        )
+        .expect("every field builds in its own type");
+        let s = col(&batch, "s").as_struct();
+        assert_eq!(
+            s.column_by_name("emb")
+                .expect("emb")
+                .as_fixed_size_list()
+                .value(0)
+                .len(),
+            3
+        );
+        assert_eq!(
+            s.column_by_name("d")
+                .expect("d")
+                .as_primitive::<Decimal128Type>()
+                .value(0),
+            150
+        );
+        assert_eq!(
+            s.column_by_name("in")
+                .expect("in")
+                .as_struct()
+                .column_by_name("deep")
+                .expect("deep")
+                .as_primitive::<Int64Type>()
+                .value(0),
+            7
+        );
+    }
+
+    /// A key a nested struct does not declare is named by its full path, so
+    /// the message says which struct is missing the field.
+    #[test]
+    fn an_unknown_field_in_a_nested_struct_names_its_path() {
+        let t = table(vec![(
+            "s",
+            DataType::Struct(Fields::from(vec![Field::new(
+                "in",
+                DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int64, true)])),
+                true,
+            )])),
+        )]);
+        let err = rows_to_batch(&[json!({"s": {"in": {"b": 1}}})], &t)
+            .expect_err("`b` is not a field of the inner struct");
+        assert!(
+            matches!(
+                &err,
+                SchemaError::UnknownStructField { column, field }
+                    if column == "s.in" && field == "b"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A vector of the wrong width is a type disagreement, not a truncation
+    /// and not a null.
+    #[test]
+    fn a_vector_of_the_wrong_width_is_refused() {
+        let t = table(vec![(
+            "emb",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3),
+        )]);
+        let batch = rows_to_batch(&[json!({"emb": [0.1, 0.2]})], &t).expect("map");
+        assert!(matches!(
+            resolve_batch(&batch, &t, "_id"),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "emb"
+        ));
+    }
+
+    /// A zone the build cannot resolve refuses the value rather than falling
+    /// back to UTC, which would be the silent hours-off write the zone
+    /// handling exists to prevent.
+    #[test]
+    fn a_zone_that_cannot_be_resolved_refuses_the_value() {
+        let t = table(vec![(
+            "at",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("Mars/Olympus".into())),
+        )]);
+        let batch = rows_to_batch(&[json!({"at": "2024-01-15T10:30:00"})], &t).expect("map");
+        assert_eq!(types(&batch)["at"], DataType::LargeUtf8);
+        assert!(matches!(
+            resolve_batch(&batch, &t, "_id"),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "at"
+        ));
+    }
+
+    /// The new readers work inside a list, since a list resolves its element
+    /// against the column's item type and builds through the same path.
+    #[test]
+    fn a_list_carries_the_element_types_the_column_declares() {
+        for (item, sent, label) in [
+            (DataType::Float32, json!([0.1]), "f32 rounds"),
+            (
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                json!(["2024-01-15"]),
+                "a bare date",
+            ),
+            (
+                DataType::Decimal128(10, 2),
+                json!(["1.5"]),
+                "a quoted decimal",
+            ),
+        ] {
+            let t = table(vec![(
+                "xs",
+                DataType::List(Arc::new(Field::new("item", item.clone(), true))),
+            )]);
+            let batch = rows_to_batch(&[json!({"xs": sent})], &t)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(
+                types(&batch)["xs"],
+                DataType::List(Arc::new(Field::new("item", item, true))),
+                "{label}"
+            );
+        }
+    }
+
+    /// The decimal reader's edges, each refused rather than stored as a
+    /// different number: more digits than `precision`, a scale the column
+    /// does not keep, an exponent the digits would have to be shifted by,
+    /// and a negative scale, which this reader does not spell.
+    #[test]
+    fn the_decimal_reader_refuses_what_it_cannot_store_exactly() {
+        for (column, sent, label) in [
+            (
+                DataType::Decimal128(5, 2),
+                json!("99999999.99"),
+                "past precision",
+            ),
+            (DataType::Decimal128(10, 2), json!("12.345"), "past scale"),
+            (DataType::Decimal128(10, 2), json!("1.5e2"), "an exponent"),
+            (
+                DataType::Decimal128(10, -2),
+                json!("1500"),
+                "a negative scale",
+            ),
+        ] {
+            let t = table(vec![("d", column)]);
+            let batch = rows_to_batch(&[json!({"d": sent})], &t).expect("map");
+            assert!(
+                matches!(
+                    resolve_batch(&batch, &t, "_id"),
+                    Err(SchemaError::TypeMismatch { column, .. }) if column == "d"
+                ),
+                "{label}"
+            );
+        }
+        // Decimal256 and a zero scale are read on the same terms.
+        let wide = table(vec![("d", DataType::Decimal256(40, 3))]);
+        rows_to_batch(&[json!({"d": "1.5"})], &wide).expect("Decimal256 reads");
+        let whole = table(vec![("d", DataType::Decimal128(10, 0))]);
+        rows_to_batch(&[json!({"d": 12})], &whole).expect("scale 0 reads");
     }
 }
