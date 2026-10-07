@@ -7,9 +7,11 @@
 //! type without circular imports; the constructors are in the
 //! modules that produce each error.
 
+use std::error::Error as StdError;
+
 use thiserror::Error;
 
-use crate::superfile::LazyByteSourceError;
+use crate::{storage::error_chain, superfile::LazyByteSourceError};
 
 /// Errors that can occur while building a superfile.
 #[derive(Debug, Error)]
@@ -201,6 +203,31 @@ impl ReadError {
             _ => false,
         }
     }
+
+    /// Whether this, or the read error an FTS error wraps, is a superfile in
+    /// a format this engine does not read: a full-text index older than it
+    /// reads, or one under a removed analyzer. Neither a retry nor a
+    /// different query can help; the message says what does.
+    pub(crate) fn is_unreadable_format(&self) -> bool {
+        match self {
+            ReadError::RemovedAnalyzer { .. } => true,
+            ReadError::Fts(f) => match f.as_ref() {
+                FtsError::IndexTooOld { .. } => true,
+                FtsError::Read(r) => r.is_unreadable_format(),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+/// Whether a [`ReadError`] anywhere under `e` is
+/// [unreadable](ReadError::is_unreadable_format), for classifying a failure
+/// that wrapped a superfile read (a cache or compaction open) by its cause.
+pub(crate) fn unreadable_format_in_chain(e: &(dyn StdError + 'static)) -> bool {
+    error_chain(e)
+        .filter_map(|link| link.downcast_ref::<ReadError>())
+        .any(ReadError::is_unreadable_format)
 }
 
 impl From<FtsError> for ReadError {

@@ -20,7 +20,10 @@ use thiserror::Error;
 
 use crate::{
     storage::{StorageError, error_chain, permission_denied_in_chain},
-    superfile::error::{BuildError as SuperfileBuildError, FtsError, ReadError, VectorError},
+    superfile::error::{
+        BuildError as SuperfileBuildError, FtsError, ReadError, VectorError,
+        unreadable_format_in_chain,
+    },
     supertable::{
         ManifestLoadError,
         manifest::{part, term_stats::TermStatsError},
@@ -661,10 +664,11 @@ pub enum QueryError {
     #[error("failed to run the query: {0}")]
     Internal(String),
 
-    /// A superfile the query read is in a format this engine no longer
-    /// reads (an index written by a release it dropped support for).
-    /// Neither the query nor a retry can fix it; rewriting the table's
-    /// indexes can. Maps to the public `Unsupported`.
+    /// A superfile the query read is in a format this engine does not read:
+    /// a full-text index older than the oldest version it reads, or one
+    /// under a removed analyzer, found however the read was wrapped. Neither
+    /// the query nor a retry can fix it; the message says what does. Maps to
+    /// the public `Unsupported`.
     #[error("{0}")]
     Unsupported(String),
 
@@ -708,7 +712,7 @@ impl From<QueryError> for DataFusionError {
 /// |---|---|
 /// | over the connection's memory budget | `OverBudget` |
 /// | an FTS query the column cannot answer: a phrase without positions, nothing positive to rank | `InvalidQuery`: the caller's |
-/// | a full-text index older than this engine reads, or one under a removed analyzer | `Unsupported` |
+/// | a full-text index older than this engine reads, or one under a removed analyzer, at any depth | `Unsupported` |
 /// | the store refused our credentials | `PermissionDenied` |
 /// | a local doc id past the superfile's end, or a read called on a codec it does not support: our bug, retrying cannot help | `Internal` |
 /// | anything else | `Parquet`: a read failed |
@@ -725,8 +729,7 @@ impl From<ReadError> for QueryError {
         {
             return QueryError::InvalidQuery(e.to_string());
         }
-        let index_too_old = matches!(&e, ReadError::Fts(fts) if matches!(fts.as_ref(), FtsError::IndexTooOld { .. }));
-        if index_too_old || matches!(e, ReadError::RemovedAnalyzer { .. }) {
+        if e.is_unreadable_format() {
             return QueryError::Unsupported(e.to_string());
         }
         if permission_denied_in_chain(&e) {
@@ -794,10 +797,14 @@ impl QueryError {
     }
 
     /// Classify a storage-backed query failure whose source is about to be
-    /// stringified: refused credentials get their own variant, everything else
-    /// stays a [`Self::Store`]. `message` is the text the caller would have
-    /// used either way, so no message changes shape.
+    /// stringified: a superfile this engine cannot read and refused
+    /// credentials get their own variants, everything else stays a
+    /// [`Self::Store`]. `message` is the text the caller would have used
+    /// either way, so no message changes shape.
     pub(crate) fn build(message: String, source: &(dyn Error + 'static)) -> Self {
+        if unreadable_format_in_chain(source) {
+            return QueryError::Unsupported(message);
+        }
         if permission_denied_in_chain(source) {
             return QueryError::PermissionDenied(message);
         }
@@ -920,6 +927,16 @@ mod tests {
                 column: "body".into(),
                 analyzer: "ascii_lower".into(),
             }),
+            QueryError::Unsupported(_)
+        ));
+        // Also when the FTS reader raised it while opening the column.
+        assert!(matches!(
+            QueryError::from(ReadError::Fts(Box::new(FtsError::Read(
+                ReadError::RemovedAnalyzer {
+                    column: "body".into(),
+                    analyzer: "ascii_lower".into(),
+                }
+            )))),
             QueryError::Unsupported(_)
         ));
         // A local doc id past the end is our bug: retrying the read cannot help.

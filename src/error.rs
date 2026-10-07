@@ -114,9 +114,10 @@ pub enum InfinoError {
     Config(String),
 
     /// The request is valid but uses something the engine does not support:
-    /// a SQL feature DataFusion does not implement, or a table whose index
-    /// files were written in a format this engine no longer reads (the
-    /// message says how to bring them forward).
+    /// a SQL feature DataFusion does not implement, or a superfile the
+    /// request read whose full-text index is older than this engine reads or
+    /// was built under a removed analyzer (the message says how to bring it
+    /// forward). Retrying cannot help.
     #[error("unsupported: {0}")]
     Unsupported(String),
 }
@@ -195,7 +196,7 @@ impl From<StorageError> for InfinoError {
 /// | `Store`, `Parquet` | `Io` | a read failed; retrying can succeed |
 /// | `ManifestLoad` | as a [`ManifestLoadError`] would | same failure, same answer |
 /// | `Internal` | `Backend` | the engine broke its own invariant: a bug |
-/// | `Unsupported` | `Unsupported` | a file in a format this engine no longer reads |
+/// | `Unsupported` | `Unsupported` | a superfile whose full-text index is older than this engine reads, or under a removed analyzer, however the read was wrapped |
 /// | `OverBudget`, `PermissionDenied` | the same names | |
 impl From<QueryError> for InfinoError {
     fn from(e: QueryError) -> Self {
