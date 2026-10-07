@@ -15,6 +15,35 @@ export const BUILDER_ID: string = builderId();
 
 const STREAM = "stream";
 
+// Options the engine no longer takes, with what replaces each. The addon
+// drops unknown keys, so these throw rather than be silently ignored.
+const REMOVED_FTS_OPTIONS: Record<string, string> = {
+  analyzer: "every column uses the standard analyzer; tune it with `stopwords` and `stemmer`",
+};
+const REMOVED_SEARCH_OPTIONS: Record<string, string> = {
+  stats: "BM25 statistics are always table-wide",
+};
+const REMOVED_REINDEX_OPTIONS: Record<string, string> = {
+  trustWriterAnalysis: "every superfile records its analysis revision",
+};
+
+/** Throws a `TypeError` naming the first removed option `opts` carries. */
+function rejectRemovedOptions(call: string, opts: object | null | undefined, removed: Record<string, string>): void {
+  if (opts == null) return;
+  for (const key of Object.keys(opts)) {
+    if (Object.hasOwn(removed, key)) {
+      throw new TypeError(`${call}: option \`${key}\` is not supported: ${removed[key]}`);
+    }
+  }
+}
+
+// `IndexSpec` is the addon's class, so its option check wraps the native method.
+const nativeFts = IndexSpec.prototype.fts;
+IndexSpec.prototype.fts = function (this: IndexSpec, column: string, options?: Parameters<typeof nativeFts>[1]) {
+  rejectRemovedOptions("IndexSpec.fts", options, REMOVED_FTS_OPTIONS);
+  return nativeFts.call(this, column, options);
+};
+
 // --- public types ---
 
 /** Vector distance metric. `l2` and `dot` are accepted spellings of `l2sq`
@@ -464,6 +493,7 @@ export class Table {
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions & { arrow: true }): arrow.Table;
   bm25Search(column: string, query: string, k: number, opts?: Bm25SearchOptions): RowRecord[];
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions = {}): RowRecord[] | arrow.Table {
+    rejectRemovedOptions("bm25Search", opts, REMOVED_SEARCH_OPTIONS);
     const buf = guard(this.remote, () =>
       this.inner.bm25Search(column, query, k, opts.mode, opts.projection, opts.k1, opts.b),
     );
@@ -563,18 +593,21 @@ export class Table {
    * and `reindexPlan` / `indexStaleness` — throws with `code` `"InvalidArg"`.
    */
   reindex(options?: ReindexOptions): ReindexReport {
+    rejectRemovedOptions("reindex", options, REMOVED_REINDEX_OPTIONS);
     return guard(this.remote, () => this.inner.reindex(options));
   }
 
   /** The superfiles {@link Table.reindex} would repair under `options`, and
    * the repair each gets — without repairing anything. Writes nothing. */
   reindexPlan(options?: ReindexOptions): PlannedRepair[] {
+    rejectRemovedOptions("reindexPlan", options, REMOVED_REINDEX_OPTIONS);
     return guard(this.remote, () => this.inner.reindexPlan(options));
   }
 
   /** What is behind and what repairing it would cost. Writes nothing, so it is
    * safe against a live table. */
   indexStaleness(options?: ReindexOptions): StalenessReport {
+    rejectRemovedOptions("indexStaleness", options, REMOVED_REINDEX_OPTIONS);
     return guard(this.remote, () => this.inner.indexStaleness(options));
   }
 }

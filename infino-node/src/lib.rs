@@ -814,8 +814,8 @@ impl IndexSpec {
     }
 
     /// Mark `column` (a UTF-8 string column) as full-text indexed, with
-    /// optional per-column `options` (analyzer, stopwords, stemmer,
-    /// positions, stored, k1/b).
+    /// optional per-column `options` (stopwords, stemmer, positions,
+    /// stored, k1/b).
     #[napi]
     pub fn fts(&self, column: String, options: Option<FtsOptions>) -> Self {
         let mut next = self.clone();
