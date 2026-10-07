@@ -315,7 +315,8 @@ fn build_hydrate_shard(
     SuperfileBuilder::build_no_blob_from_batches_to(base_opts.clone(), &ided, &mut bytes)?;
 
     // Per-scalar-column min/max for skip pruning, over the id-prepended batches.
-    let scalar_schema = ided[0].schema();
+    // Stats are keyed by the field ids on the table's schema; the batches carry none.
+    let scalar_schema = manifest.scalar_schema();
     let scalar_refs: Vec<&RecordBatch> = ided.iter().collect();
     let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &scalar_refs);
 
@@ -397,7 +398,7 @@ impl<I: Iterator<Item = Result<RecordBatch, ArrowError>>> Iterator for CoalesceC
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use arrow_array::{
         Array, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
@@ -415,6 +416,7 @@ mod tests {
             hydrate::{
                 Chunk, CoalesceChunks, batch_data_bytes, hydrate_from_reader, hydrate_with_budget,
             },
+            schema::{FieldId, field_id_of},
         },
     };
 
@@ -647,6 +649,34 @@ mod tests {
         let none = hydrate(&hydrated, user_schema(), Vec::new(), HYDRATE_TARGET_ROWS)
             .expect("hydrate empty");
         assert_eq!(none, 0);
+    }
+
+    /// Every hydrated superfile carries min/max for `_id` and each column, keyed
+    /// by field id like `append`, so SQL can prune files and answer MIN/MAX from stats.
+    #[test]
+    fn hydrate_records_stats_for_every_column() {
+        let (_dir, _db, table) = table_with(user_schema());
+        hydrate(
+            &table,
+            user_schema(),
+            vec![rows_batch(1, BATCH_ROWS)],
+            HYDRATE_TARGET_ROWS,
+        )
+        .expect("hydrate");
+
+        let manifest = table.inner().manifest.load();
+        let want: HashSet<FieldId> = manifest
+            .scalar_schema()
+            .fields()
+            .iter()
+            .filter_map(|f| field_id_of(f))
+            .collect();
+        // `_id`, `n` and `s`.
+        assert_eq!(want.len(), 3);
+        for entry in manifest.get_all_superfiles() {
+            let got: HashSet<FieldId> = entry.scalar_stats.keys().copied().collect();
+            assert_eq!(got, want);
+        }
     }
 
     /// Hydrate on an indexed table is rejected, not run with the index dropped:
