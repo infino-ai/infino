@@ -105,9 +105,9 @@ impl MeteredExec {
     /// predicate's statistics prove "fully matching" — returning deleted
     /// rows. With a `FilterExec` above the scan the fetch lives there. An
     /// exact filter leaves no `FilterExec`, so this node refuses the fetch
-    /// and the limit node above keeps it. The
-    /// provider pushes its own scan-level limit only for filter-less
-    /// scans, where no predicate can mark a row group fully matching.
+    /// and the limit node above keeps it. The provider pushes its own
+    /// scan-level limit only for filter-less scans, where no predicate can
+    /// mark a row group fully matching.
     pub(crate) fn without_limit_pushdown(
         input: Arc<dyn ExecutionPlan>,
         op_stats: Option<Arc<OpStatsCollector>>,

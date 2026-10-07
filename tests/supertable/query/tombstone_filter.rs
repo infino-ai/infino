@@ -84,6 +84,9 @@ const LIMIT_FIXTURE_TITLE_LEN: usize = 128;
 const LIMIT_FIXTURE_FETCH: usize = 3;
 /// Seed of the LCG that draws the `LIMIT` fixture's titles.
 const LIMIT_FIXTURE_SEED: u64 = 7;
+/// Letter the exact-filter `LIMIT` test matches with `ILIKE '%c%'`. The
+/// deleted title must contain it, so the deleted row is a match.
+const LIMIT_FIXTURE_LETTER: char = 'c';
 /// Multiplier of the LCG that draws the `LIMIT` fixture's titles.
 const TITLE_LCG_MULT: u64 = 6_364_136_223_846_793_005;
 /// Alphabet the `LIMIT` fixture's titles are drawn from: one token per
@@ -404,10 +407,12 @@ async fn sql_limit_over_an_exact_filter_keeps_deleted_rows_out() {
     // This test pins the fetch above the scan and the deleted row out.
     let (_dir, st, deleted) = limit_fixture();
 
-    // A letter from the deleted title, so the deleted row is a match.
-    let letter = deleted.chars().next().expect("non-empty title");
+    assert!(
+        deleted.contains(LIMIT_FIXTURE_LETTER),
+        "the deleted title {deleted} must match the filter"
+    );
     let sql = format!(
-        "SELECT title FROM supertable WHERE title ILIKE '%{letter}%' LIMIT {LIMIT_FIXTURE_FETCH}"
+        "SELECT title FROM supertable WHERE title ILIKE '%{LIMIT_FIXTURE_LETTER}%' LIMIT {LIMIT_FIXTURE_FETCH}"
     );
     let got = title_values(&st.reader().expect("reader").query_sql(&sql).expect("sql"));
     assert_eq!(got.len(), LIMIT_FIXTURE_FETCH);
