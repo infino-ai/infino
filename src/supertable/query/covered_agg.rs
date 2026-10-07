@@ -231,6 +231,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         && superfiles
             .iter()
             .all(|entry| provider.entry_is_clean(entry))
+        && counts_describe_column(manifest, &range.column, superfiles)
         && let Some(value_counts) = provider.exact_value_counts(&range.column)
         && let Some(count) = count_range_from_value_counts(&value_counts, &range)
     {
@@ -406,6 +407,9 @@ fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Op
     let Some(superfiles) = provider.manifest().complete_flat_superfiles() else {
         return Ok(None);
     };
+    if !counts_describe_column(provider.manifest(), &group_column.name, superfiles) {
+        return Ok(None);
+    }
     if !superfiles.iter().all(|entry| {
         provider.entry_is_clean(entry)
             && provider
@@ -854,6 +858,28 @@ fn classify(
     } else {
         Class::Boundary
     }
+}
+
+/// Whether `column`'s recorded counts describe what its rows read as, across
+/// every one of `superfiles`.
+///
+/// A count shortcut answers from per-file `value_counts`, recorded in whatever
+/// type each file was written in. While a column is converting, its files hold
+/// two types, so counts taken from them key values that are now one value
+/// apart and order them as the old type did: a `Utf8` `"7"` and a retyped `7`
+/// are separate keys, and `"7" >= "10"` holds as text where `7 >= 10` does
+/// not. The scan sees the column as the table now holds it, so a shortcut has
+/// to decline exactly where [`has_required_stats`] does.
+fn counts_describe_column(
+    manifest: &ManifestSnapshot,
+    column: &str,
+    superfiles: &[Arc<SuperfileEntry>],
+) -> bool {
+    let Some(id) = manifest.field_id(column) else {
+        return false;
+    };
+    let guard = ColumnTypeGuard::new(manifest, id);
+    !guard.aggregates_mix_types() && !superfiles.iter().any(|e| guard.stats_are_stale(e))
 }
 
 /// Do the manifest stats cover everything `kinds` needs from a

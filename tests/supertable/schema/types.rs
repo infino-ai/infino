@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    LargeStringArray, RecordBatch,
+    LargeStringArray, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
@@ -968,4 +968,70 @@ fn a_table_created_from_a_document_keeps_the_vector_index_it_describes() {
         "the seed the document named, not the default: {index:?}"
     );
     assert_eq!(recorded["rerank_codec"].as_str(), Some("sq16"));
+}
+
+/// Rows of the SQL `sql` as `col1|col2|...`, in the order they come back.
+fn every_cell_of(db: &Connection, sql: &str) -> Vec<String> {
+    let batches = db.query_sql(sql).expect("query");
+    let mut out = Vec::new();
+    for b in &batches {
+        for row in 0..b.num_rows() {
+            let cells: Vec<String> = (0..b.num_columns())
+                .map(|c| {
+                    let a = b.column(c);
+                    if a.is_null(row) {
+                        "null".to_string()
+                    } else {
+                        arrow::util::display::array_value_to_string(a, row).expect("display")
+                    }
+                })
+                .collect();
+            out.push(cells.join("|"));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The count shortcuts answer from per-file value counts, which are recorded
+/// in the type each file was written in. A column mid-conversion has files in
+/// two types, so a grouped count keys `"7"` apart from `7`, and a range count
+/// compares `"7" >= "10"` as text. Both must decline to the scan, which reads
+/// the column as the table now holds it.
+#[test]
+fn the_count_shortcuts_decline_while_a_column_is_converting() {
+    let (_dir, db, table) = storage_table(
+        Arc::new(Schema::new(vec![Field::new("tag", DataType::Utf8, true)])),
+        IndexSpec::new(),
+    );
+    table
+        .append(&batch(vec![(
+            "tag",
+            Arc::new(StringArray::from(vec![
+                Some("7"),
+                Some("7"),
+                Some("7"),
+                Some("07"),
+                Some("07"),
+                Some("x"),
+            ])) as ArrayRef,
+        )]))
+        .expect("append");
+
+    db.apply_schema(TABLE, &retype("tag", DataType::Int64), None)
+        .expect("flip to Int64");
+
+    // "7" and "07" are one value now, and "x" casts to null.
+    assert_eq!(
+        every_cell_of(&db, "SELECT tag, COUNT(*) FROM t GROUP BY tag"),
+        vec!["7|5".to_string(), "null|1".to_string()],
+        "the grouped count must read the column as the table holds it"
+    );
+
+    // Compared as text "7" >= "10"; compared as integers it is not.
+    assert_eq!(
+        every_cell_of(&db, "SELECT COUNT(*) FROM t WHERE tag >= 10"),
+        vec!["0".to_string()],
+        "the range count must compare as integers"
+    );
 }
