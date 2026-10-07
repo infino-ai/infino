@@ -46,18 +46,20 @@ use crate::utils::{
 };
 
 pub(crate) mod value;
-pub(crate) use value::{FstValue, INLINE_TF_MAX};
+/// [`DictEntry`] under the name the supertable FTS query path imports.
+pub(crate) use value::DictEntry as FstValue;
+pub(crate) use value::{DictEntry, INLINE_TF_MAX};
 
 /// Reserved separator byte inside dictionary keys (`<column>\x1F<term>`).
 /// User column names must not contain this byte. ASCII Unit Separator
 /// (U+001F) is below every printable ASCII char, so prefix iteration over a
 /// column's terms works via a plain range scan.
-pub const FST_SEPARATOR: u8 = 0x1F;
+pub const KEY_SEPARATOR: u8 = 0x1F;
 
-/// Build a canonical FST key from `(column_name, term)`.
+/// Build a canonical dictionary key from `(column_name, term)`.
 ///
 /// Encoding: `<column_name_utf8> | 0x1F | <term_utf8>`. The separator
-/// byte ([`FST_SEPARATOR`], ASCII Unit Separator) is below every printable
+/// byte ([`KEY_SEPARATOR`], ASCII Unit Separator) is below every printable
 /// ASCII byte, so prefix iteration `column_name\x1F` cleanly captures
 /// every term in that column.
 ///
@@ -70,20 +72,20 @@ pub const FST_SEPARATOR: u8 = 0x1F;
 pub fn make_key(column_name: &str, term: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(column_name.len() + 1 + term.len());
     k.extend_from_slice(column_name.as_bytes());
-    k.push(FST_SEPARATOR);
+    k.push(KEY_SEPARATOR);
     k.extend_from_slice(term.as_bytes());
     k
 }
 
 /// Returns `true` if `column_name` is safe to use as the column part of
-/// an FST key: it must not contain the FST separator byte (otherwise
+/// a dictionary key: it must not contain the separator byte (otherwise
 /// prefix iteration could return cross-column matches).
 ///
 /// All other bytes are allowed; format-level naming rules (no `inf.`
 /// prefix, etc.) are enforced elsewhere.
 #[inline]
 pub fn validate_column_name(column_name: &str) -> bool {
-    !column_name.as_bytes().contains(&FST_SEPARATOR)
+    !column_name.as_bytes().contains(&KEY_SEPARATOR)
 }
 
 /// Stages keys for FST construction.
@@ -281,7 +283,7 @@ impl<W: Write> TermBlockWriter<W> {
     }
 
     /// Append one term. Keys must arrive strictly ascending.
-    pub(crate) fn insert_sorted(&mut self, key: &[u8], entry: FstValue) -> std::io::Result<()> {
+    pub(crate) fn insert_sorted(&mut self, key: &[u8], entry: DictEntry) -> std::io::Result<()> {
         debug_assert!(
             self.in_block == 0 || self.prev_key.as_slice() < key,
             "term-block dictionary keys must be strictly ascending"
@@ -304,12 +306,12 @@ impl<W: Write> TermBlockWriter<W> {
         push_varint(&mut self.block, (key.len() - lcp) as u32);
         self.block.extend_from_slice(&key[lcp..]);
         match entry {
-            FstValue::Inline { doc_id, tf } => {
+            DictEntry::Inline { doc_id, tf } => {
                 self.block.push(FORM_INLINE);
                 push_varint(&mut self.block, doc_id);
                 push_varint(&mut self.block, tf);
             }
-            FstValue::Pfor {
+            DictEntry::Pfor {
                 metadata_offset,
                 postings_length,
                 short,
@@ -476,7 +478,7 @@ impl<'a> TermBlocks<'a> {
     }
 
     /// Exact lookup.
-    pub(crate) fn lookup(&self, key: &[u8]) -> Option<FstValue> {
+    pub(crate) fn lookup(&self, key: &[u8]) -> Option<DictEntry> {
         let b = self.block_for(key)?;
         let mut cur = BlockCursor::new(&self.bytes[self.block_range(b)?]);
         while let Some(entry) = cur.next() {
@@ -490,7 +492,7 @@ impl<'a> TermBlocks<'a> {
     }
 
     /// Every `(key, entry)` whose key starts with `prefix`, in order.
-    pub(crate) fn iter_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, FstValue)> {
+    pub(crate) fn iter_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, DictEntry)> {
         let mut out = Vec::new();
         self.for_each_prefix(prefix, |key, value| {
             out.push((key.to_vec(), value));
@@ -504,7 +506,7 @@ impl<'a> TermBlocks<'a> {
     pub(crate) fn for_each_prefix(
         &self,
         prefix: &[u8],
-        visit: impl FnMut(&[u8], FstValue) -> bool,
+        visit: impl FnMut(&[u8], DictEntry) -> bool,
     ) {
         self.for_each_from(prefix, prefix, visit);
     }
@@ -516,7 +518,7 @@ impl<'a> TermBlocks<'a> {
         &self,
         prefix: &[u8],
         from: &[u8],
-        mut visit: impl FnMut(&[u8], FstValue) -> bool,
+        mut visit: impl FnMut(&[u8], DictEntry) -> bool,
     ) {
         let mut b = self.block_for(from).unwrap_or(0);
         while b < self.n_blocks {
@@ -559,7 +561,7 @@ impl<'a> BlockCursor<'a> {
     /// Decode the next entry into `self.key` and return its value;
     /// `None` at the block's end. A malformed block ends the walk early
     /// (the region is CRC-checked at open, so this is defensive).
-    fn next(&mut self) -> Option<FstValue> {
+    fn next(&mut self) -> Option<DictEntry> {
         if self.at >= self.bytes.len() {
             return None;
         }
@@ -578,14 +580,14 @@ impl<'a> BlockCursor<'a> {
             FORM_INLINE => {
                 let doc_id = read_varint(self.bytes, &mut self.at)?;
                 let tf = read_varint(self.bytes, &mut self.at)?;
-                Some(FstValue::Inline { doc_id, tf })
+                Some(DictEntry::Inline { doc_id, tf })
             }
             FORM_SHORT | FORM_LONG => {
                 let delta = read_u64_varint(self.bytes, &mut self.at)?;
                 let length = read_varint(self.bytes, &mut self.at)?;
                 let offset = self.prev_offset.wrapping_add(delta);
                 self.prev_offset = offset;
-                Some(FstValue::Pfor {
+                Some(DictEntry::Pfor {
                     metadata_offset: offset,
                     postings_length: length,
                     short: form == FORM_SHORT,
@@ -600,7 +602,7 @@ impl<'a> BlockCursor<'a> {
 /// (any insertion order) and finished to bytes.
 #[derive(Default)]
 pub(crate) struct TermDictBuilder {
-    sorted: BTreeMap<Vec<u8>, FstValue>,
+    sorted: BTreeMap<Vec<u8>, DictEntry>,
 }
 
 impl TermDictBuilder {
@@ -608,7 +610,7 @@ impl TermDictBuilder {
         Self::default()
     }
 
-    pub(crate) fn insert(&mut self, key: &[u8], entry: FstValue) {
+    pub(crate) fn insert(&mut self, key: &[u8], entry: DictEntry) {
         self.sorted.insert(key.to_vec(), entry);
     }
 
@@ -625,23 +627,23 @@ impl TermDictBuilder {
 mod tests {
     use super::*;
 
-    fn entries(n: u32) -> Vec<(Vec<u8>, FstValue)> {
+    fn entries(n: u32) -> Vec<(Vec<u8>, DictEntry)> {
         // Sorted keys with realistic shapes: shared prefixes, a block
         // boundary in the middle of a run, inline and both postings forms.
-        let mut v: Vec<(Vec<u8>, FstValue)> = (0..n)
+        let mut v: Vec<(Vec<u8>, DictEntry)> = (0..n)
             .map(|i| {
                 let key = make_key("body", &format!("term{i:05}x{}", i % 7));
                 let value = match i % 3 {
-                    0 => FstValue::Inline {
+                    0 => DictEntry::Inline {
                         doc_id: i * 7,
                         tf: 1 + i % 4,
                     },
-                    1 => FstValue::Pfor {
+                    1 => DictEntry::Pfor {
                         metadata_offset: u64::from(i) * 13,
                         postings_length: 9 + i % 5,
                         short: true,
                     },
-                    _ => FstValue::Pfor {
+                    _ => DictEntry::Pfor {
                         metadata_offset: u64::from(i) * 13 + 4,
                         postings_length: 1000 + i,
                         short: false,
@@ -824,7 +826,7 @@ mod tests {
         // comes through exactly.
         let key = make_key("body", "café");
         assert_eq!(&key[0..4], b"body");
-        assert_eq!(key[4], FST_SEPARATOR);
+        assert_eq!(key[4], KEY_SEPARATOR);
         assert_eq!(&key[5..], "café".as_bytes());
     }
 

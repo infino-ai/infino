@@ -40,7 +40,7 @@ use crate::{
         },
         id_space::{FtsDocId, RowId, RowSet},
     },
-    utils::terms::{FstValue, make_key},
+    utils::terms::{DictEntry, make_key},
 };
 
 /// One scored term's open-wave fetch result: the dictionary resolution
@@ -149,21 +149,21 @@ impl FtsReader {
     /// postings ranges those values name, never the dictionary.
     pub(crate) async fn memo_from_dict_values(
         &self,
-        terms: &[(&str, u64, FstValue)],
+        terms: &[(&str, u64, DictEntry)],
     ) -> Result<FetchedTermMemo, FtsError> {
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         let mut order: Vec<(usize, u64, bool)> = Vec::new();
         let mut slots: Vec<(Box<str>, Option<FetchedTermSlot>)> = Vec::with_capacity(terms.len());
         for (i, (term, df, value)) in terms.iter().enumerate() {
             match value {
-                FstValue::Inline { doc_id, tf } => slots.push((
+                DictEntry::Inline { doc_id, tf } => slots.push((
                     Box::from(*term),
                     Some(FetchedTermSlot::Inline {
                         doc_id: *doc_id,
                         tf: *tf,
                     }),
                 )),
-                FstValue::Pfor {
+                DictEntry::Pfor {
                     metadata_offset,
                     postings_length,
                     short,
@@ -653,7 +653,7 @@ impl FtsReader {
                     .await?
             }
         };
-        // FST-dictionary ranges the builds below request — one per
+        // term-dictionary ranges the builds below request — one per
         // `build_term_cursors` call (the dictionary fetch is a real
         // byte-source range on every query, warm or cold).
         let mut dict_ranges = u64::from(!lists.negatives.is_empty());
@@ -1114,14 +1114,14 @@ impl FtsReader {
                 }
             }
         } else {
-            let fst_bytes = self.dict_bytes_async().await?;
-            let dict = Self::open_dict(&fst_bytes)?;
+            let dict_bytes = self.dict_bytes_async().await?;
+            let dict = Self::open_dict(&dict_bytes)?;
             let key = make_key(&col_meta.name, term);
             match dict.lookup(&key) {
                 None => SingleSource::Absent,
                 Some(packed) => match packed {
-                    FstValue::Inline { doc_id, tf } => SingleSource::Inline { doc_id, tf },
-                    FstValue::Pfor {
+                    DictEntry::Inline { doc_id, tf } => SingleSource::Inline { doc_id, tf },
+                    DictEntry::Pfor {
                         metadata_offset,
                         postings_length,
                         short,
@@ -1487,8 +1487,8 @@ impl FtsReader {
         ))
     }
 
-    /// Build one `TermCursor` per term that resolves in the FST.
-    /// Missing terms (FST miss) are silently dropped — fine for OR
+    /// Build one `TermCursor` per term that resolves in the term dictionary.
+    /// Missing terms (dictionary miss) are silently dropped — fine for OR
     /// semantics where a missing term contributes nothing. Returned
     /// `Vec` may be empty (all terms missed) or shorter than `terms`.
     ///
@@ -1536,8 +1536,8 @@ impl FtsReader {
     ) -> Result<FetchedTermMemo, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         let col_meta = &self.columns[column_id as usize];
-        let fst_bytes = self.dict_bytes_async().await?;
-        let dict = Self::open_dict(&fst_bytes)?;
+        let dict_bytes = self.dict_bytes_async().await?;
+        let dict = Self::open_dict(&dict_bytes)?;
 
         // Resolve every term, collecting the PFOR ranges for one
         // coalesced fetch (mirrors `build_term_cursors_opt`).
@@ -1550,8 +1550,8 @@ impl FtsReader {
         for term in terms {
             let key = make_key(&col_meta.name, term);
             let pre = dict.lookup(&key).map(|packed| match packed {
-                FstValue::Inline { doc_id, tf } => Pre::Inline { doc_id, tf },
-                FstValue::Pfor {
+                DictEntry::Inline { doc_id, tf } => Pre::Inline { doc_id, tf },
+                DictEntry::Pfor {
                     metadata_offset,
                     postings_length,
                     short,
@@ -1593,18 +1593,17 @@ impl FtsReader {
     }
 
     /// Build a `TermCursor` for every term, **preserving input order and
-    /// arity**: the result has one slot per input term, `None` where the
-    /// term is absent from the FST. One FST open and one parallel postings
-    /// fan-out for the whole batch — so a multi-term build costs a single
-    /// dictionary fetch and a single overlapped range wave, not one of each
-    /// per term.
-    /// `qtf`, when present, is a per-term query-term-frequency weight (parallel to
-    /// `terms`): each built cursor folds its weight into the effective idf, which
-    /// scales both the score and the BlockMaxWAND skip ceilings, so a deduplicated
-    /// repeated term ranks identically to the duplicates it replaced (BM25 is
-    /// linear in idf). `None` leaves idf unweighted.
-    /// `dict_bytes`, when present, is this reader's dictionary already fetched
-    /// by the caller, so it is not fetched again.
+    /// arity**: the result has one slot per input term, `None` where the term
+    /// is absent from the term dictionary. One dictionary open and one parallel
+    /// postings fan-out for the whole batch — so a multi-term build costs a
+    /// single dictionary fetch and a single overlapped range wave, not one of
+    /// each per term. `qtf`, when present, is a per-term query-term-frequency
+    /// weight (parallel to `terms`): each built cursor folds its weight into
+    /// the effective idf, which scales both the score and the BlockMaxWAND skip
+    /// ceilings, so a deduplicated repeated term ranks identically to the
+    /// duplicates it replaced (BM25 is linear in idf). `None` leaves idf
+    /// unweighted. `dict_bytes`, when present, is this reader's dictionary
+    /// already fetched by the caller, so it is not fetched again.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn build_term_cursors_opt(
         &self,
@@ -1675,10 +1674,10 @@ impl FtsReader {
                 continue;
             };
             match packed {
-                FstValue::Inline { doc_id, tf } => {
+                DictEntry::Inline { doc_id, tf } => {
                     resolved.push(Some(Resolved::Inline { doc_id, tf, gidf }));
                 }
-                FstValue::Pfor {
+                DictEntry::Pfor {
                     metadata_offset,
                     postings_length,
                     short,
@@ -1731,9 +1730,9 @@ impl FtsReader {
                     )?));
                 }
                 Some(Resolved::Inline { doc_id, tf, gidf }) => {
-                    // Scoring must use the implied tf, never the slot.
-                    // (Phrase members recover the position itself with
-                    // their own FST lookup — see `build_atom_cursors`.)
+                    // Scoring must use the implied tf, never the slot. (Phrase
+                    // members recover the position itself with their own
+                    // dictionary lookup — see `build_atom_cursors`.)
                     let tf = col_meta.inline_tf(tf);
                     // A match-only cursor never scores; a fixed idf keeps it
                     // from consulting the column's statistics or norms.

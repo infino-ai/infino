@@ -36,7 +36,7 @@ use super::{
 use crate::{
     supertable::manifest::part::ContentHash,
     utils::{
-        terms::{FstValue, TermBlockWriter},
+        terms::{DictEntry, TermBlockWriter},
         varint::{CONTINUATION_BIT, push_varint, read_u64_varint, read_varint},
     },
 };
@@ -321,7 +321,7 @@ impl SliceBuilder {
         self.dict
             .insert_sorted(
                 key,
-                FstValue::Pfor {
+                DictEntry::Pfor {
                     metadata_offset: self.postings.len() as u64,
                     postings_length: run.len() as u32,
                     short: false,

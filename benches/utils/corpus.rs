@@ -132,7 +132,7 @@ pub const TOKENS_PER_DOC: usize = 200;
 /// Vocabulary size — controls term-frequency distribution. Small
 /// enough that common terms appear in many docs (exercising long
 /// posting lists); large enough that rare terms exist (exercising the
-/// FST + skip-table cold path).
+/// term dictionary + skip-table cold path).
 pub const VOCAB_SIZE: usize = 10_000;
 
 // ─── Parallel corpus-generation constants ─────────────────────────────

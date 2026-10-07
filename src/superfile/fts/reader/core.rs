@@ -39,7 +39,7 @@ use crate::{
         ReadError,
         error::FtsError,
         format::{
-            self, FST_SEPARATOR,
+            self, KEY_SEPARATOR,
             checksum::crc32c,
             fts::{HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, VERSION_MIN, hdr, term_meta},
         },
@@ -55,7 +55,7 @@ use crate::{
         id_space::{DocMap, FtsDocId, RowId},
         lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
     },
-    utils::terms::{FstValue, TermBlocks, make_key},
+    utils::terms::{DictEntry, TermBlocks, make_key},
 };
 
 /// Largest gap worth overfetching when adjacent term postings share a request.
@@ -139,7 +139,7 @@ pub(crate) enum PreparedClauses {
         hits: Vec<(FtsDocId, f32)>,
         postings_bytes: u64,
         /// Byte-source ranges the inline walk requested (0 for the df=1
-        /// inline-FST and empty-resolution paths).
+        /// inline-entry and empty-resolution paths).
         planned_ranges: u64,
         /// On-CPU nanoseconds of the walk that produced `hits` inside
         /// `prepare_clauses` (single-term BMW, atoms search) — the
@@ -154,7 +154,7 @@ pub(crate) enum PreparedClauses {
         filter: Option<ExcludeFilter>,
         k: usize,
         floor_eff: f32,
-        /// FST-dictionary ranges the builds requested (one per
+        /// term-dictionary ranges the builds requested (one per
         /// `build_term_cursors` call — must / should / negation lists).
         dict_ranges: u64,
     },
@@ -474,7 +474,7 @@ pub struct FtsReader {
     pub(super) source: Source,
     pub(super) n_docs: u32,
     pub(super) n_terms_total: u32,
-    pub(super) fst_range: Range<usize>,
+    pub(super) dict_range: Range<usize>,
     pub(super) postings_range: Range<usize>,
     /// Byte range of the positions region (CRC stripped). Phrase queries
     /// fetch per-term group ranges out of it via
@@ -639,8 +639,8 @@ impl FtsReader {
             read_u32_le(&header[hdr::N_COLUMNS_OFF..hdr::N_COLUMNS_OFF + U32_BYTES]) as usize;
         let n_docs = read_u32_le(&header[hdr::N_DOCS_OFF..hdr::N_DOCS_OFF + U32_BYTES]);
         let n_terms_total = read_u32_le(&header[hdr::N_TERMS_OFF..hdr::N_TERMS_OFF + U32_BYTES]);
-        let fst_offset =
-            read_u64_le(&header[hdr::FST_OFFSET_OFF..hdr::FST_OFFSET_OFF + U64_BYTES]) as usize;
+        let dict_offset =
+            read_u64_le(&header[hdr::DICT_OFFSET_OFF..hdr::DICT_OFFSET_OFF + U64_BYTES]) as usize;
         let postings_offset =
             read_u64_le(&header[hdr::POSTINGS_OFFSET_OFF..hdr::POSTINGS_OFFSET_OFF + U64_BYTES])
                 as usize;
@@ -674,14 +674,14 @@ impl FtsReader {
         // before the CRC verification can reject the corruption.
         //
         // The `< +4` checks (rather than `<= +4`) admit the legal
-        // empty-region case: when every term takes the df=1 inline-FST
+        // empty-region case: when every term takes the df=1 inline-entry
         // short-circuit, the postings region body is zero bytes and
         // only the trailing 4-byte CRC32C(empty) sits between
         // `postings_offset` and `doc_lengths_table_offset`.
         let regions_end = doc_map_offset.unwrap_or(doc_lengths_table_offset);
         let postings_end = positions_offset;
-        if fst_offset < HEADER_SIZE
-            || postings_offset < fst_offset + 4
+        if dict_offset < HEADER_SIZE
+            || postings_offset < dict_offset + 4
             || postings_end < postings_offset + 4
             || regions_end < postings_end
             || doc_lengths_table_offset < regions_end
@@ -690,7 +690,7 @@ impl FtsReader {
             || doc_map_offset.is_some_and(|mo| doc_lengths_table_offset < mo + format::CRC_BYTES)
         {
             return Err(FtsError::Read(ReadError::Malformed(format!(
-                "fts header offsets out of range: fst={fst_offset}, postings={postings_offset}, \
+                "fts header offsets out of range: dict={dict_offset}, postings={postings_offset}, \
                  positions={positions_offset}, doc_lengths={doc_lengths_table_offset}, \
                  blob_len={}",
                 source_len
@@ -701,21 +701,21 @@ impl FtsReader {
         // with its CRC32C). Compute from the surrounding offsets —
         // postings end where the positions region begins, positions end
         // where the doc-id map or the doc-lengths directory begins.
-        let fst_range = fst_offset..postings_offset.saturating_sub(4); // strip CRC
+        let dict_range = dict_offset..postings_offset.saturating_sub(4); // strip CRC
         let postings_range = postings_offset..postings_end.saturating_sub(4); // strip CRC
         let positions_range = positions_offset..regions_end.saturating_sub(4); // strip CRC
 
-        // Verify FST CRC32C (4 bytes after fst body).
+        // Verify dictionary CRC32C (4 bytes after the dictionary body).
         if opts.verify_crc {
-            let fst_crc_bytes = fetch_source_range(
+            let dict_crc_bytes = fetch_source_range(
                 &source,
                 postings_offset.saturating_sub(4)..postings_offset,
                 "fts/dict crc",
             )?;
-            let fst_crc_expected = read_u32_le(&fst_crc_bytes);
-            let fst_bytes = fetch_source_range(&source, fst_range.clone(), "fts/dict")?;
-            let fst_crc_actual = crc32c(&fst_bytes);
-            if fst_crc_expected != fst_crc_actual {
+            let dict_crc_expected = read_u32_le(&dict_crc_bytes);
+            let dict_bytes = fetch_source_range(&source, dict_range.clone(), "fts/dict")?;
+            let dict_crc_actual = crc32c(&dict_bytes);
+            if dict_crc_expected != dict_crc_actual {
                 return Err(FtsError::Read(ReadError::ChecksumMismatch {
                     section: "fts/dict",
                     column: String::new(),
@@ -926,7 +926,7 @@ impl FtsReader {
             source,
             n_docs,
             n_terms_total,
-            fst_range,
+            dict_range,
             postings_range,
             positions_range,
             version,
@@ -1012,16 +1012,16 @@ impl FtsReader {
     }
 
     pub(crate) fn dict_bytes(&self) -> Result<Bytes, FtsError> {
-        fetch_source_range(&self.source, self.fst_range.clone(), "fts/dict")
+        fetch_source_range(&self.source, self.dict_range.clone(), "fts/dict")
     }
 
     /// Most postings the term at `value` holds: exact for a long term,
     /// read from its header, and the form's limit for a short one.
-    pub(crate) fn term_postings_at_most(&self, value: FstValue) -> Result<u32, FtsError> {
+    pub(crate) fn term_postings_at_most(&self, value: DictEntry) -> Result<u32, FtsError> {
         match value {
-            FstValue::Inline { .. } => Ok(1),
-            FstValue::Pfor { short: true, .. } => Ok(SHORT_MAX_DF as u32),
-            FstValue::Pfor {
+            DictEntry::Inline { .. } => Ok(1),
+            DictEntry::Pfor { short: true, .. } => Ok(SHORT_MAX_DF as u32),
+            DictEntry::Pfor {
                 metadata_offset, ..
             } => {
                 let start =
@@ -1070,13 +1070,13 @@ impl FtsReader {
         Ok(())
     }
 
-    /// Async FST-dictionary fetch for the query path. Resolves
+    /// Async term-dictionary fetch for the query path. Resolves
     /// zero-copy for in-memory / warm sources; for a cold `Lazy`
     /// source it `await`s the object-store range on the caller's
     /// runtime (no sync bridge).
     pub(crate) async fn dict_bytes_async(&self) -> Result<Bytes, FtsError> {
         self.source
-            .range_async(self.fst_range.clone())
+            .range_async(self.dict_range.clone())
             .await
             .map_err(|e| FtsError::RangeFetch {
                 what: "fts/dict",
@@ -1088,7 +1088,7 @@ impl FtsReader {
     /// header + skip table + encoded posting blocks, or a short-form
     /// body — in parallel, coalescing adjacent ranges. `terms` are
     /// `(metadata_offset, postings_length)` pairs from the dictionary
-    /// (`FstValue::Pfor`); the
+    /// (`DictEntry::Pfor`); the
     /// returned `Bytes` for term `i` starts at that term's metadata
     /// header (offset 0) and runs to the end of its last block, so a
     /// `TermCursor` can index it directly.
@@ -1180,7 +1180,7 @@ impl FtsReader {
     ///
     /// Multi-token phrases require the column to be positional;
     /// otherwise [`FtsError::PositionsUnavailable`].
-    /// The second element counts the FST-dictionary ranges the builds
+    /// The second element counts the term-dictionary ranges the builds
     /// requested (one per `build_term_cursors` call plus one per inline
     /// phrase member's position recovery) — real byte-source ranges on
     /// every query, tallied by the caller into the planned count.
@@ -1203,7 +1203,7 @@ impl FtsReader {
         }
         let mut dict_ranges = 0u64;
         let mut out: Vec<Option<AnyCursor>> = Vec::with_capacity(terms.len() + phrases.len());
-        // All bare terms in one FST open + one parallel postings fan-out
+        // All bare terms in one dictionary open + one parallel postings fan-out
         // (arity-preserving: each term maps to its own slot, `None` when
         // absent), rather than a serial per-term build that re-fetched the
         // dictionary and issued a separate range wave for each. One planned
@@ -1236,7 +1236,7 @@ impl FtsReader {
             // (whose footprint the term-only kernels depend on): PFOR
             // members re-parse their metadata header from their own
             // bytes; an inline (df=1) member recovers its single
-            // position from the FST slot the tf-reinterpretation
+            // position from the dictionary entry the tf-reinterpretation
             // dropped during cursor build.
             let mut positional: Vec<(Option<TermMeta>, Option<u32>)> =
                 Vec::with_capacity(cursors.len());
@@ -1273,16 +1273,16 @@ impl FtsReader {
                     }
                     (true, true) => {
                         dict_ranges += 1;
-                        let fst_bytes = self.dict_bytes_async().await?;
-                        let dict = Self::open_dict(&fst_bytes)?;
+                        let dict_bytes = self.dict_bytes_async().await?;
+                        let dict = Self::open_dict(&dict_bytes)?;
                         let key = make_key(&col_meta.name, term);
                         let packed = dict
                             .lookup(&key)
                             .expect("inline member cursor was built from this dict");
                         let position = match packed {
-                            FstValue::Inline { tf: slot, .. } => slot,
-                            FstValue::Pfor { .. } => {
-                                unreachable!("inline cursor from a PFOR FST value")
+                            DictEntry::Inline { tf: slot, .. } => slot,
+                            DictEntry::Pfor { .. } => {
+                                unreachable!("inline cursor from a PFOR dictionary entry")
                             }
                         };
                         positional.push((None, Some(position)));
@@ -1311,37 +1311,37 @@ impl FtsReader {
         Ok((out, dict_ranges))
     }
 
-    /// Walk the FST and collect every term registered under
+    /// Walk the term dictionary and collect every term registered under
     /// `column`, in lex order. Used to populate per-superfile FTS
     /// skip-pruning summaries (term-presence bloom + lex term
     /// range) at commit time.
     ///
     /// Returns an empty `Vec` if `column` is not registered as
     /// an FTS column in this superfile. Cost is O(terms in column)
-    /// FST decodes; intended to be called once per (superfile,
+    /// dictionary decodes; intended to be called once per (superfile,
     /// column) at commit time, not on the query hot path.
     pub fn iter_column_terms(&self, column: &str) -> Result<Vec<Vec<u8>>, FtsError> {
         self.iter_terms_with_prefix(column, b"")
     }
 
-    /// [`Self::iter_column_terms`] over `fst_bytes`, this reader's
+    /// [`Self::iter_column_terms`] over `dict_bytes`, this reader's
     /// dictionary already fetched by the caller.
     pub(crate) fn iter_column_terms_with(
         &self,
-        fst_bytes: &[u8],
+        dict_bytes: &[u8],
         column: &str,
     ) -> Result<Vec<Vec<u8>>, FtsError> {
-        self.debug_assert_own_dict(fst_bytes);
+        self.debug_assert_own_dict(dict_bytes);
         // An unregistered column has no keys, so the walk is empty.
-        collect_terms_with_prefix(fst_bytes, column, b"")
+        collect_terms_with_prefix(dict_bytes, column, b"")
     }
 
     /// Catches a caller handing in a dictionary of the wrong size, such as
     /// another reader's. A same-sized one is not caught.
-    pub(super) fn debug_assert_own_dict(&self, fst_bytes: &[u8]) {
+    pub(super) fn debug_assert_own_dict(&self, dict_bytes: &[u8]) {
         debug_assert_eq!(
-            fst_bytes.len(),
-            self.fst_range.len(),
+            dict_bytes.len(),
+            self.dict_range.len(),
             "dictionary bytes are not the size of this reader's"
         );
     }
@@ -1365,10 +1365,10 @@ impl FtsReader {
         emit: impl FnMut(&[u8], u32, u32, &[u32]) -> Result<(), FtsError>,
     ) -> Result<(), FtsError> {
         let column_name = &self.columns[column_id as usize].name;
-        let fst_bytes = self.dict_bytes()?;
-        let dict = Self::open_dict(&fst_bytes)?;
+        let dict_bytes = self.dict_bytes()?;
+        let dict = Self::open_dict(&dict_bytes)?;
 
-        // Column-scoped FST keys are `column_name <FST_SEPARATOR> term`;
+        // Column-scoped dictionary keys are `column_name <KEY_SEPARATOR> term`;
         // `iter_prefix` yields `(key, packed_value)` in lex term order, so we
         // read the posting metadata straight from the value — no re-lookup.
         let column_prefix = make_key(column_name, "");
@@ -1388,16 +1388,16 @@ impl FtsReader {
     /// Up to `limit` of a column's terms that are `>= from`, in lex order,
     /// each with its dictionary value. Lets a merge walk many inputs'
     /// vocabularies side by side without loading any of them whole.
-    /// `fst_bytes` is this reader's [`Self::dict_bytes`], fetched once by
+    /// `dict_bytes` is this reader's [`Self::dict_bytes`], fetched once by
     /// the caller: on a lazy source each fetch is a full-dictionary read.
     pub(crate) fn column_terms_from(
         &self,
-        fst_bytes: &[u8],
+        dict_bytes: &[u8],
         column_id: u32,
         from: &[u8],
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, FstValue)>, FtsError> {
-        let dict = Self::open_dict(fst_bytes)?;
+    ) -> Result<Vec<(Vec<u8>, DictEntry)>, FtsError> {
+        let dict = Self::open_dict(dict_bytes)?;
         let prefix = make_key(&self.columns[column_id as usize].name, "");
         let mut start = prefix.clone();
         start.extend_from_slice(from);
@@ -1416,7 +1416,7 @@ impl FtsReader {
     pub(crate) fn for_each_posting_in<'t>(
         &self,
         column_id: u32,
-        entries: impl Iterator<Item = (&'t [u8], FstValue)>,
+        entries: impl Iterator<Item = (&'t [u8], DictEntry)>,
         positions_buf: &mut Vec<u32>,
         mut emit: impl FnMut(&[u8], u32, u32, &[u32]) -> Result<(), FtsError>,
     ) -> Result<(), FtsError> {
@@ -1426,7 +1426,7 @@ impl FtsReader {
 
         for (term, packed) in entries {
             match packed {
-                FstValue::Inline { doc_id, tf } => {
+                DictEntry::Inline { doc_id, tf } => {
                     // A positional column only inlines tf == 1 postings; the
                     // slot then carries the term's single position and tf is
                     // implied 1. Non-positional: `tf` is the frequency, no
@@ -1437,7 +1437,7 @@ impl FtsReader {
                         emit(term, doc_id, tf, &[])?;
                     }
                 }
-                FstValue::Pfor {
+                DictEntry::Pfor {
                     metadata_offset,
                     postings_length,
                     short,
@@ -1573,8 +1573,8 @@ impl FtsReader {
         mut on_doc: impl FnMut(&K, u32),
     ) -> Result<(), FtsError> {
         let col_meta = &self.columns[column_id as usize];
-        let fst_bytes = self.dict_bytes()?;
-        let dict = Self::open_dict(&fst_bytes)?;
+        let dict_bytes = self.dict_bytes()?;
+        let dict = Self::open_dict(&dict_bytes)?;
         let prefix = make_key(&col_meta.name, "");
         let mut doc_ids = [0u32; BLOCK_LEN];
         let mut tfs = [0u32; BLOCK_LEN];
@@ -1584,11 +1584,11 @@ impl FtsReader {
                 return true;
             };
             let docs = match packed {
-                FstValue::Inline { doc_id, .. } => {
+                DictEntry::Inline { doc_id, .. } => {
                     on_doc(&carry, doc_id);
                     Ok(())
                 }
-                FstValue::Pfor {
+                DictEntry::Pfor {
                     metadata_offset,
                     postings_length,
                     short,
@@ -1669,7 +1669,7 @@ impl FtsReader {
         Ok((0..n).map(|d| read_doc_length(region, d)).collect())
     }
 
-    /// Walk the FST and collect every term registered under
+    /// Walk the term dictionary and collect every term registered under
     /// `column` whose bytes begin with `term_prefix`, in lex order.
     ///
     /// Mirrors [`Self::iter_column_terms`] but bounds the walk to a
@@ -1679,7 +1679,7 @@ impl FtsReader {
     /// [`Self::terms_with_prefix`], which walks the same dictionary on the
     /// reader pool.
     ///
-    /// `term_prefix` is the prefix as it appears in the FST — the
+    /// `term_prefix` is the prefix as it appears in the term dictionary — the
     /// caller is responsible for any tokenizer-level normalization
     /// (e.g. lowercasing). Returns an
     /// empty `Vec` if `column` is not registered or no terms match
@@ -1692,8 +1692,8 @@ impl FtsReader {
         if !self.has_column(column) {
             return Ok(Vec::new());
         }
-        let fst_bytes = self.dict_bytes()?;
-        collect_terms_with_prefix(&fst_bytes, column, term_prefix)
+        let dict_bytes = self.dict_bytes()?;
+        collect_terms_with_prefix(&dict_bytes, column, term_prefix)
     }
 
     /// Whether `column` is registered as an FTS column in this superfile.
@@ -1707,15 +1707,15 @@ impl FtsReader {
 /// the sync commit-time walk ([`FtsReader::iter_terms_with_prefix`]) and
 /// the query path's pooled one (`FtsReader::terms_with_prefix`).
 pub(super) fn collect_terms_with_prefix(
-    fst_bytes: &[u8],
+    dict_bytes: &[u8],
     column: &str,
     term_prefix: &[u8],
 ) -> Result<Vec<Vec<u8>>, FtsError> {
     let mut full_prefix = column.as_bytes().to_vec();
-    full_prefix.push(FST_SEPARATOR);
+    full_prefix.push(KEY_SEPARATOR);
     let column_prefix_len = full_prefix.len();
     full_prefix.extend_from_slice(term_prefix);
-    let dict = FtsReader::open_dict(fst_bytes)?;
+    let dict = FtsReader::open_dict(dict_bytes)?;
     let pairs = dict.iter_prefix(&full_prefix);
     Ok(pairs
         .into_iter()
@@ -3310,22 +3310,22 @@ mod tests {
         // are postings-form entries (short here — they fit one block).
         let (blob, json) = build_mixed_df_blob();
         let r = FtsReader::open(blob, &json).expect("open");
-        let fst_bytes = r.dict_bytes().expect("dict");
-        let dict = FtsReader::open_dict(&fst_bytes).expect("open dict");
+        let dict_bytes = r.dict_bytes().expect("dict");
+        let dict = FtsReader::open_dict(&dict_bytes).expect("open dict");
 
         for term in ["common", "rust"] {
             match dict.lookup(&make_key("body", term)).expect("in dict") {
-                FstValue::Pfor { short, .. } => assert!(short, "{term}: df ≥ 2 in one block"),
-                FstValue::Inline { .. } => panic!("{term}: df ≥ 2 must not inline"),
+                DictEntry::Pfor { short, .. } => assert!(short, "{term}: df ≥ 2 in one block"),
+                DictEntry::Inline { .. } => panic!("{term}: df ≥ 2 must not inline"),
             }
         }
         for (term, doc_id) in [("uniqzero", 0u32), ("uniqtwo", 2u32)] {
             match dict.lookup(&make_key("body", term)).expect("in dict") {
-                FstValue::Inline { doc_id: d, tf } => {
+                DictEntry::Inline { doc_id: d, tf } => {
                     assert_eq!(d, doc_id);
                     assert_eq!(tf, 1);
                 }
-                FstValue::Pfor { .. } => panic!("{term}: df=1 must inline"),
+                DictEntry::Pfor { .. } => panic!("{term}: df=1 must inline"),
             }
         }
     }
@@ -3414,7 +3414,7 @@ mod tests {
             .into_iter()
             .map(|b| String::from_utf8(b).expect("utf8"))
             .collect();
-        // FST iteration is lex-ordered.
+        // Dictionary iteration is lex-ordered.
         let mut sorted = terms.clone();
         sorted.sort();
         assert_eq!(terms, sorted, "terms must be in lex order");
@@ -3611,7 +3611,7 @@ mod tests {
         let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
             .await
             .expect("open_lazy");
-        let dictionary = r.fst_range.clone();
+        let dictionary = r.dict_range.clone();
         let lengths = r.columns[0].doc_lengths_range.clone();
         let opened = recording.len();
         assert_eq!(
@@ -3690,22 +3690,24 @@ mod tests {
         let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
             .await
             .expect("open_lazy");
-        let dictionary = r.fst_range.clone();
+        let dictionary = r.dict_range.clone();
         let opened = recording.len();
-        let fst_bytes = r.dict_bytes_async().await.expect("dict");
+        let dict_bytes = r.dict_bytes_async().await.expect("dict");
 
-        let terms = r.iter_column_terms_with(&fst_bytes, "body").expect("terms");
+        let terms = r
+            .iter_column_terms_with(&dict_bytes, "body")
+            .expect("terms");
         let names: Vec<&str> = terms.iter().map(|t| from_utf8(t).expect("utf8")).collect();
         assert!(names.len() > BATCH, "the walk spans several batches");
         for chunk in names.chunks(BATCH) {
-            r.term_dfs_with(&fst_bytes, "body", chunk)
+            r.term_dfs_with(&dict_bytes, "body", chunk)
                 .await
                 .expect("df batch");
         }
         let mut after: Option<Vec<u8>> = None;
         loop {
             let chunk = r
-                .term_index_facts_after(&fst_bytes, "body", after.as_deref(), BATCH)
+                .term_index_facts_after(&dict_bytes, "body", after.as_deref(), BATCH)
                 .await
                 .expect("facts batch");
             let done = chunk.len() < BATCH;

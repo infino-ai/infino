@@ -39,7 +39,7 @@ use crate::superfile::{
 /// read-side mirror and must stay in sync with that doc.
 ///
 /// [`TermMeta::parse`] is the single place that validates untrusted
-/// offsets (the FST value points here) against the postings region:
+/// offsets (the dictionary entry points here) against the postings region:
 /// both the fixed 20-byte header and the skip table it declares are
 /// bounds-checked before any caller touches a byte. Both the
 /// single-term BMW path and [`TermCursor::new`] go through here, so
@@ -610,7 +610,7 @@ impl TermCursor {
 
     /// Synthesize a cursor for a df=1 inline-encoded term. Skips the
     /// postings-region read entirely — the caller already has
-    /// (doc_id, tf) from unpacking the FST value, and BMW upper bound
+    /// (doc_id, tf) from unpacking the dictionary entry, and BMW upper bound
     /// for a 1-doc term equals that doc's actual BM25 score (only one
     /// doc means min_dl = dl and max_tf = tf, so the per-block UB
     /// formula collapses to the score itself). Computed at query time

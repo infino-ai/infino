@@ -458,7 +458,7 @@ pub struct BuilderOptions {
     /// predicates like `WHERE title LIKE …`) AND is indexed
     /// into the embedded FTS blob for BM25 ranking
     /// (`bm25_search(column, …)`). Storage cost is mild
-    /// double-storage: raw text in Parquet plus the FST +
+    /// double-storage: raw text in Parquet plus the term dictionary +
     /// PFOR-delta posting structures in the FTS blob, which
     /// dedupe terms.
     ///
@@ -1109,7 +1109,7 @@ impl SuperfileBuilder {
     /// `SuperfileBuilder` was constructed without any FTS columns.
     ///
     /// Primarily useful for tests that need to force the spill +
-    /// streaming-FST finish path on a corpus too small to cross the
+    /// streaming-dictionary finish path on a corpus too small to cross the
     /// default 256 MiB threshold; production callers should leave
     /// the default in place.
     pub fn set_fts_spill_threshold_bytes(&mut self, threshold: usize) {
@@ -3201,9 +3201,9 @@ fn finish_index_blobs_streamed<Wf: Write + Send, Wv: Write + Send>(
 /// Reject user-supplied column names that would collide with
 /// infino's internal byte-protocol or KV-key conventions:
 ///
-/// - `\x1F` (ASCII Unit Separator) is the FST dictionary's
+/// - `\x1F` (ASCII Unit Separator) is the term dictionary's
 ///   `(column_id, term)` separator. A column name containing
-///   it would break the FST decode path that splits on it.
+///   it would break the term dictionary decode path that splits on it.
 /// - The `inf.` prefix is reserved for the infino-managed
 ///   Parquet KV metadata keys (`inf.format`, `inf.fts.columns`,
 ///   etc.). Allowing a user column to start with it would risk
@@ -3407,7 +3407,7 @@ mod tests {
             vector::rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
         },
         test_helpers::{decimal128_ids, default_vector_config},
-        utils::terms::FstValue,
+        utils::terms::DictEntry,
     };
 
     fn schema_with_fts() -> Arc<Schema> {
@@ -3427,12 +3427,12 @@ mod tests {
         )
     }
 
-    /// User column names may not contain the FST separator byte or the
-    /// reserved `inf.` prefix.
+    /// User column names may not contain the dictionary key separator byte or
+    /// the reserved `inf.` prefix.
     #[test]
     fn check_user_column_name_rejects_reserved_names() {
         assert!(check_user_column_name("user_id").is_ok());
-        let with_sep = format!("a{}b", format::FST_SEPARATOR as char);
+        let with_sep = format!("a{}b", format::KEY_SEPARATOR as char);
         assert!(matches!(
             check_user_column_name(&with_sep),
             Err(BuildError::ReservedSeparatorInColumnName(_))
@@ -6035,16 +6035,16 @@ mod tests {
                 .expect("postings");
                 let at_most = fts.term_postings_at_most(value).expect("postings bound");
                 match value {
-                    FstValue::Inline { .. } => {
+                    DictEntry::Inline { .. } => {
                         inline += 1;
                         assert_eq!((at_most, postings), (1, 1), "inline {term:?}");
                     }
-                    FstValue::Pfor { short: true, .. } => {
+                    DictEntry::Pfor { short: true, .. } => {
                         short += 1;
                         assert_eq!(at_most, SHORT_MAX_DF as u32, "short {term:?}");
                         assert!(postings <= at_most, "short {term:?} over its limit");
                     }
-                    FstValue::Pfor { .. } => {
+                    DictEntry::Pfor { .. } => {
                         long += 1;
                         assert_eq!(at_most, postings, "long {term:?}");
                     }
@@ -6289,7 +6289,7 @@ mod tests {
     }
 
     /// Merged `df` for a shared term here is well past the point
-    /// where its postings outgrow the FST value's 21-bit length slot.
+    /// where its postings outgrow the dictionary entry's 21-bit length slot.
     #[tokio::test(flavor = "multi_thread")]
     async fn build_from_readers_merges_common_term_past_pfor_length_slot() {
         const NUM_FILES: usize = 12;

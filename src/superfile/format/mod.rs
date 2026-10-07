@@ -199,7 +199,7 @@ pub mod fts {
         /// `[20..24]` total distinct `(column, term)` pairs (`u32` LE).
         pub const N_TERMS_OFF: usize = 20;
         /// `[24..32]` term dictionary offset (`u64` LE).
-        pub const FST_OFFSET_OFF: usize = 24;
+        pub const DICT_OFFSET_OFF: usize = 24;
         /// `[32..40]` postings region offset (`u64` LE).
         pub const POSTINGS_OFFSET_OFF: usize = 32;
         /// `[40..48]` doc-lengths directory offset (`u64` LE).
@@ -612,7 +612,7 @@ pub(crate) use crate::utils::bytes::{u32_le_at, u64_le_at};
 /// The key separator is owned by the term dictionary (`utils::terms`) and
 /// re-exported here because the format layer validates column names
 /// against it.
-pub use crate::utils::terms::FST_SEPARATOR;
+pub use crate::utils::terms::KEY_SEPARATOR;
 
 /// Parsed (major, minor, patch) representation of a semver string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -850,9 +850,9 @@ mod tests {
     }
 
     #[test]
-    fn fst_separator_is_below_printable_ascii() {
-        const _: () = assert!(FST_SEPARATOR < b' ');
-        assert_eq!(FST_SEPARATOR, 0x1F);
+    fn key_separator_is_below_printable_ascii() {
+        const _: () = assert!(KEY_SEPARATOR < b' ');
+        assert_eq!(KEY_SEPARATOR, 0x1F);
     }
 
     #[test]

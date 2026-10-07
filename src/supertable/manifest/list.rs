@@ -1110,8 +1110,9 @@ pub struct FtsSummaryAgg {
     /// HyperLogLog-estimated distinct term count. `0` for the `Default`
     /// shape and currently for the part-level rollup (deferred).
     pub n_terms_distinct: u64,
-    /// `(min, max)` lex term range. `None` if the FST was empty for this
-    /// column (per-superfile) or every superfile's FST was empty (part).
+    /// `(min, max)` lex term range. `None` if the term dictionary was empty for
+    /// this column (per-superfile) or every superfile's term dictionary was
+    /// empty (part).
     pub term_range: Option<(Vec<u8>, Vec<u8>)>,
     /// This column's token total and count of documents carrying
     /// tokens. Unlike the rest of this struct these drive *scoring*,
@@ -1256,9 +1257,9 @@ impl FtsSummaryAgg {
 
     /// Whether this summary's lex term range *could* contain a term starting
     /// with `prefix` (i.e. `[prefix, prefix_upper_bound)` overlaps the range).
-    /// A `None` range means the FST was empty for this column — nothing
-    /// matches, so this returns `false` (prune). The per-term-range primitive
-    /// both the superfile-level (`fts_prefix_skip`) and list-level
+    /// A `None` range means the term dictionary was empty for this column —
+    /// nothing matches, so this returns `false` (prune). The per-term-range
+    /// primitive both the superfile-level (`fts_prefix_skip`) and list-level
     /// (`part_overlaps_prefix`) prefix skips build on.
     pub fn may_match_prefix(&self, prefix: &[u8]) -> bool {
         match self.term_range.as_ref() {
@@ -3796,7 +3797,7 @@ mod tests {
         );
         assert!(!agg.may_match_prefix(b"zulu"), "above max → no overlap");
         assert!(!agg.may_match_prefix(b"alpha"), "below min → no overlap");
-        // No range (empty FST) → nothing matches → prune.
+        // No range (empty dictionary) → nothing matches → prune.
         assert!(!FtsSummaryAgg::default().may_match_prefix(b"echo"));
     }
 

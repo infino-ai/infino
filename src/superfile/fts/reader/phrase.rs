@@ -41,7 +41,7 @@ pub(super) struct PhraseMember {
     /// structures must not grow for the phrase path's benefit.
     pub(super) term_meta: Option<TermMeta>,
     /// The single position of an inline (df=1, tf=1) member — the
-    /// inline FST value's slot carries it instead of a tf. `None` for
+    /// inline dictionary entry's slot carries it instead of a tf. `None` for
     /// PFOR members.
     pub(super) inline_position: Option<u32>,
     /// Scratch for the member's decoded positions at the aligned doc.

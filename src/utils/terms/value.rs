@@ -11,7 +11,7 @@ pub(crate) const INLINE_TF_MAX: u32 = (1 << 30) - 1;
 
 /// One term's dictionary entry.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub(crate) enum FstValue {
+pub(crate) enum DictEntry {
     /// df ≥ 2 (or a df = 1 posting that could not inline) — fetch
     /// `postings_length` bytes from `metadata_offset`. `short` says
     /// which body those bytes hold: the long form (metadata header, skip

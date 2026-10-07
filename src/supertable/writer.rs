@@ -363,8 +363,8 @@ const BUILD_SCALAR_NUM: usize = 5;
 // f32 vector payload, rebuilt as quantized + rerank codecs alongside the raw input: ~6.5x.
 const BUILD_VECTOR_NUM: usize = 13;
 
-// FTS text, ~1.5x for the FST + postings structures. Added on top of the scalar factor, not
-// instead of it: the same text bytes are held as a column and drive the index build at once.
+// FTS text, ~1.5x for the term dictionary + postings structures. Added on top of the scalar factor,
+// not instead of it: the same text bytes are held as a column and drive the index build at once.
 const BUILD_FTS_NUM: usize = 3;
 
 /// Single-writer append + commit handle.
@@ -2056,15 +2056,15 @@ impl SupertableWriter {
         }
 
         // The commit's payload, read off the taken buffer before either
-        // shard-count helper is consulted, so both arms price the same
-        // number. Deliberately not the sealed output: every shard carries
-        // its own dictionary, FST and index headers, so sealed bytes scale
-        // with the shard split — and the split follows the writer pool's
-        // width. On a shared-vocabulary corpus the same input seals to
-        // roughly four times more bytes at width 16 than at width 1, so
-        // pricing off sealed bytes makes an identical append plan more
-        // requests on a wider host, which is precisely what the write-side
-        // determinism contract forbids.
+        // shard-count helper is consulted, so both arms price the same number.
+        // Deliberately not the sealed output: every shard carries its own
+        // Parquet dictionaries, term dictionary and index headers, so sealed
+        // bytes scale with the shard split — and the split follows the writer
+        // pool's width. On a shared-vocabulary corpus the same input seals to
+        // roughly four times more bytes at width 16 than at width 1, so pricing
+        // off sealed bytes makes an identical append plan more requests on a
+        // wider host, which is precisely what the write-side determinism
+        // contract forbids.
         let payload_bytes = buffered_payload_bytes(buffer);
 
         let list_metadata = CommitListMetadata {
@@ -3098,7 +3098,7 @@ async fn write_superfile_terms(
     };
     let mut columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
     columns.sort();
-    let fst_bytes = fts
+    let dict_bytes = fts
         .dict_bytes_async()
         .await
         .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
@@ -3107,7 +3107,7 @@ async fn write_superfile_terms(
         loop {
             let chunk = fts
                 .term_index_facts_after(
-                    &fst_bytes,
+                    &dict_bytes,
                     column,
                     after.as_deref(),
                     TERM_INDEX_BATCH_TERMS,
@@ -13367,7 +13367,7 @@ mod tests {
 
         // Each doc's title is "doc <i> alpha"; tokenized with
         // `standard`, distinct terms include "doc", "alpha",
-        // and digits 0-3. The FST will dedupe; n_terms_distinct
+        // and digits 0-3. The term dictionary will dedupe; n_terms_distinct
         // is at least 3 (doc, alpha, plus some digit tokens).
         assert!(
             fts.n_terms_distinct >= 3,
@@ -13378,7 +13378,10 @@ mod tests {
         assert!(fts.may_contain(b"alpha"));
         assert!(fts.may_contain(b"doc"));
         // Lex range should be present and consistent.
-        let (min_term, max_term) = fts.term_range.as_ref().expect("non-empty FST has a range");
+        let (min_term, max_term) = fts
+            .term_range
+            .as_ref()
+            .expect("non-empty dictionary has a range");
         assert!(!min_term.is_empty());
         assert!(!max_term.is_empty());
         assert!(min_term <= max_term, "min_term <= max_term invariant");

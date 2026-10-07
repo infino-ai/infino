@@ -612,8 +612,8 @@ impl CandidatePlan {
                     if tokens.is_empty() {
                         return Ok((n_docs, MatchWork::default()));
                     }
-                    // Intersection ≤ the rarest token's df — resolved with
-                    // one batched df lookup (single FST parse + coalesced
+                    // Intersection ≤ the rarest token's df — resolved with one
+                    // batched df lookup (single dictionary parse + coalesced
                     // header fetch) rather than one parse + fetch per token.
                     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
                     let (dfs, work) = reader.term_dfs(column, &refs).await?;

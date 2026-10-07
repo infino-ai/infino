@@ -148,21 +148,20 @@ fn assert_corruption_rejected(mut bytes: Vec<u8>, position: usize, label: &str) 
 }
 
 #[test]
-fn corrupt_fts_fst_body_rejected() {
-    // Flip a byte well inside the FTS FST. The FST sits right after
-    // the 48-byte header, so byte (fts_off + 100) is firmly inside
-    // FST data — guaranteed to be CRC-protected.
+fn corrupt_fts_dict_body_rejected() {
+    // The term dictionary starts right after the 56-byte FTS header,
+    // so byte (fts_off + 100) lands in its CRC-protected body.
     let bytes = build_corruptable_superfile();
     let ((fts_off, _), _) = locate_blobs(&bytes);
     let target = fts_off + 100;
-    assert_corruption_rejected(bytes, target, "fts/fst body");
+    assert_corruption_rejected(bytes, target, "fts/dict body");
 }
 
 #[test]
 fn corrupt_fts_postings_region_rejected() {
-    // The postings region follows the FST. Read the FTS header at
-    // bytes [fts_off+32..+40] for postings_offset (relative to blob
-    // start). Flip a byte inside postings.
+    // The postings region follows the term dictionary. Read the FTS
+    // header at bytes [fts_off+32..+40] for postings_offset (relative
+    // to blob start). Flip a byte inside postings.
     let bytes = build_corruptable_superfile();
     let ((fts_off, _), _) = locate_blobs(&bytes);
     let postings_offset_rel = u64::from_le_bytes(

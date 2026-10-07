@@ -107,7 +107,7 @@ pub fn fts_bloom_skip(
 /// cannot contain any term beginning with `prefix` and is pruned.
 ///
 /// `prefix` is the same lowercased byte sequence the prefix search uses
-/// against the FST.
+/// against the term dictionary.
 ///
 /// An empty `prefix` (every term matches) short-circuits to
 /// all-keep.

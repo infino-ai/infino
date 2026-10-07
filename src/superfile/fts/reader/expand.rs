@@ -27,7 +27,7 @@ use crate::{
         },
         id_space::{DocMap, FtsDocId},
     },
-    utils::terms::{make_key, value::FstValue},
+    utils::terms::{make_key, value::DictEntry},
 };
 
 /// Long s (U+017F). Simple case folding puts it in `s`'s class;
@@ -273,10 +273,10 @@ struct Collected {
     /// Admitted terms' text, in lex order ([`Keep::Terms`]).
     terms: Vec<String>,
     /// Values of admitted terms whose rows match ([`Keep::Values`]).
-    proven: Vec<FstValue>,
+    proven: Vec<DictEntry>,
     /// Values of admitted terms whose rows may not match
     /// ([`Keep::Values`]).
-    doubtful: Vec<FstValue>,
+    doubtful: Vec<DictEntry>,
     too_many: bool,
 }
 
@@ -295,7 +295,7 @@ impl Collected {
     fn admit(
         &mut self,
         term: &str,
-        value: FstValue,
+        value: DictEntry,
         doubtful: bool,
         keep: Keep,
         max_terms: usize,
@@ -373,7 +373,7 @@ impl ValueCharge {
     fn cover(&mut self, values: usize) -> Result<(), FtsError> {
         while self.covered < values {
             self.held
-                .try_grow(VALUE_CHARGE_STEP * size_of::<FstValue>())
+                .try_grow(VALUE_CHARGE_STEP * size_of::<DictEntry>())
                 .map_err(|refusal| exact_over_budget("term values", refusal))?;
             self.covered += VALUE_CHARGE_STEP;
         }
@@ -427,17 +427,17 @@ impl FtsReader {
     /// is off (the caller judged that walk dearer than the scan it would
     /// replace). The caller falls back to scanning for that token.
     ///
-    /// An [`TermPattern::Exact`] token is its own expansion. A prefix
-    /// token walks only its own subtree. Every suffix or infix token is
-    /// tested against each key of one shared walk over the column's whole
-    /// range, so a multi-fragment `LIKE` pays for the vocabulary once, not
-    /// once per token. Under `fold` (`ILIKE`) terms are compared with `ſ`
-    /// and `K` folded to `s` and `k`, and an exact or prefix token holding
-    /// an `s` joins the shared walk (its `ſ` spelling sorts elsewhere).
-    /// The FST is fetched once when any pattern needs it (one planned
-    /// range, like a match's build).
+    /// An [`TermPattern::Exact`] token is its own expansion. A prefix token
+    /// walks only its own subtree. Every suffix or infix token is tested
+    /// against each key of one shared walk over the column's whole range, so a
+    /// multi-fragment `LIKE` pays for the vocabulary once, not once per token.
+    /// Under `fold` (`ILIKE`) terms are compared with `ſ` and `K` folded to `s`
+    /// and `k`, and an exact or prefix token holding an `s` joins the shared
+    /// walk (its `ſ` spelling sorts elsewhere). The term dictionary is fetched
+    /// once when any pattern needs it (one planned range, like a match's
+    /// build).
     ///
-    /// The FST fetch is I/O and stays on the calling runtime; the walk
+    /// The dictionary fetch is I/O and stays on the calling runtime; the walk
     /// itself is CPU — up to the column's whole vocabulary — and runs on
     /// `pool` (the configured reader pool, or rayon's global pool when
     /// `None`) behind a oneshot, so no tokio worker sits under it.
@@ -460,14 +460,14 @@ impl FtsReader {
             .iter()
             .any(|w| *w == Walk::Subtree || (*w == Walk::Full && allow_full_walk));
         let collected = if needs_dict {
-            let fst_bytes = self.dict_bytes_async().await?;
+            let dict_bytes = self.dict_bytes_async().await?;
             work.planned_ranges += 1;
             let column = column.to_owned();
             let owned: Vec<OwnedPattern> = patterns.iter().map(|p| p.into_owned()).collect();
             let walks = walks.clone();
             run_on_pool(pool, "like expansion", move || {
                 walk_dictionary(
-                    &fst_bytes,
+                    &dict_bytes,
                     &column,
                     &owned,
                     &walks,
@@ -496,12 +496,12 @@ impl FtsReader {
     }
 
     /// Every indexed term of `column` that begins with `term_prefix` (the
-    /// prefix as it appears in the FST — the caller lowercases it for the
-    /// column's analyzer), in lex order, without the column key prefix.
-    /// The prefix search's expansion. The FST fetch stays on the calling
+    /// prefix as it appears in the term dictionary — the caller lowercases it
+    /// for the column's analyzer), in lex order, without the column key prefix.
+    /// The prefix search's expansion. The dictionary fetch stays on the calling
     /// runtime; the subtree walk runs on `pool` behind a oneshot, like
-    /// [`Self::expand_terms`]. Empty when `column` is not FTS-indexed here
-    /// or no term matches.
+    /// [`Self::expand_terms`]. Empty when `column` is not FTS-indexed here or
+    /// no term matches.
     pub(crate) async fn terms_with_prefix(
         &self,
         column: &str,
@@ -511,11 +511,11 @@ impl FtsReader {
         if !self.has_column(column) {
             return Ok(Vec::new());
         }
-        let fst_bytes = self.dict_bytes_async().await?;
+        let dict_bytes = self.dict_bytes_async().await?;
         let column = column.to_owned();
         let term_prefix = term_prefix.to_vec();
         run_on_pool(pool, "prefix expansion", move || {
-            collect_terms_with_prefix(&fst_bytes, &column, &term_prefix)
+            collect_terms_with_prefix(&dict_bytes, &column, &term_prefix)
         })
         .await
         .map_err(|_| FtsError::TaskDropped("prefix expansion"))?
@@ -566,7 +566,7 @@ impl FtsReader {
         if needles.is_empty() {
             return Ok((Vec::new(), work));
         }
-        let fst_bytes = self.dict_bytes_async().await?;
+        let dict_bytes = self.dict_bytes_async().await?;
         work.planned_ranges += 1;
         let owned_column = column.to_owned();
         let patterns: Vec<OwnedPattern> = needles
@@ -579,7 +579,7 @@ impl FtsReader {
         let (walked, walk_ns) = run_on_pool(pool, "contains walk", move || {
             timed_section(|| {
                 walk_dictionary(
-                    &fst_bytes,
+                    &dict_bytes,
                     &owned_column,
                     &patterns,
                     &walks,
@@ -622,7 +622,7 @@ impl FtsReader {
     async fn union_rows(
         &self,
         col: &ColumnMeta,
-        values: Vec<FstValue>,
+        values: Vec<DictEntry>,
         pool: Option<&ThreadPool>,
         budget: Option<&Arc<ConnectionMemoryBudget>>,
         work: &mut MatchWork,
@@ -635,8 +635,8 @@ impl FtsReader {
         let mut bodies: Vec<TermBody> = Vec::new();
         for value in values {
             match value {
-                FstValue::Inline { doc_id, .. } => inline.push(doc_id),
-                FstValue::Pfor {
+                DictEntry::Inline { doc_id, .. } => inline.push(doc_id),
+                DictEntry::Pfor {
                     metadata_offset,
                     postings_length,
                     short,
@@ -774,7 +774,7 @@ fn charge_admitted(
 /// with `FtsError::OverBudget`), and the charge comes back with the
 /// collectors for the caller to hold while it uses them.
 fn walk_dictionary(
-    fst_bytes: &[u8],
+    dict_bytes: &[u8],
     column: &str,
     patterns: &[OwnedPattern],
     walks: &[Walk],
@@ -784,7 +784,7 @@ fn walk_dictionary(
     keep: Keep,
     mut charge: Option<ValueCharge>,
 ) -> Result<(Vec<Collected>, Option<ValueCharge>), FtsError> {
-    let dict = FtsReader::open_dict(fst_bytes)?;
+    let dict = FtsReader::open_dict(dict_bytes)?;
     let mut collected: Vec<Collected> = patterns.iter().map(|_| Collected::new()).collect();
     // Every key in the column's range starts with `<column>\x1F`; the
     // term is what follows. `for_each_prefix` only visits keys carrying
@@ -937,8 +937,8 @@ mod tests {
 
     #[test]
     fn several_patterns_expand_in_one_dictionary_pass() {
-        // Two open-left tokens, a prefix and an exact token: one FST fetch,
-        // each slot exactly what the single-pattern calls return.
+        // Two open-left tokens, a prefix and an exact token: one dictionary
+        // fetch, each slot exactly what the single-pattern calls return.
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let (out, work) = expand_all(
@@ -961,15 +961,18 @@ mod tests {
                 owned(&["java"]),
             ]
         );
-        assert_eq!(work.planned_ranges, 1, "one FST fetch for the whole leaf");
+        assert_eq!(
+            work.planned_ranges, 1,
+            "one dictionary fetch for the whole leaf"
+        );
     }
 
     #[test]
     fn a_disallowed_full_walk_leaves_the_pattern_unanswered() {
         // The caller judged the whole-column walk dearer than the scan: the
         // suffix and infix tokens come back `None`, the prefix token still
-        // walks its subtree, the exact token is untouched, and the FST is
-        // still fetched once for the subtree walk.
+        // walks its subtree, the exact token is untouched, and the term
+        // dictionary is still fetched once for the subtree walk.
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let rt = Runtime::new().expect("runtime");
@@ -1143,7 +1146,7 @@ mod tests {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let (_, walked) = expand_all(&r, &[TermPattern::Prefix("ru")], false, MAX_TERMS);
-        assert_eq!(walked.planned_ranges, 1, "one FST fetch per walk");
+        assert_eq!(walked.planned_ranges, 1, "one dictionary fetch per walk");
         let (_, exact) = expand_all(&r, &[TermPattern::Exact("rust")], false, MAX_TERMS);
         assert_eq!(exact.planned_ranges, 0, "no dictionary needed");
     }
@@ -1354,12 +1357,12 @@ mod tests {
         let mut dict = TermDictBuilder::new();
         dict.insert(
             &make_key("body", "rust"),
-            FstValue::Inline { doc_id: 0, tf: 1 },
+            DictEntry::Inline { doc_id: 0, tf: 1 },
         );
         let mut bad = make_key("body", "r");
         bad.push(NOT_UTF8_BYTE);
-        dict.insert(&bad, FstValue::Inline { doc_id: 1, tf: 1 });
-        let fst = dict.finish();
+        dict.insert(&bad, DictEntry::Inline { doc_id: 1, tf: 1 });
+        let dict_bytes = dict.finish();
         let walks = [
             // The LIKE expansion's shared walk and a prefix's subtree walk.
             (OwnedPattern::Contains("us".into()), Walk::Full, Keep::Terms),
@@ -1373,7 +1376,7 @@ mod tests {
         ];
         for (pattern, walk, keep) in walks {
             let err = walk_dictionary(
-                &fst,
+                &dict_bytes,
                 "body",
                 &[pattern],
                 &[walk],
@@ -1394,7 +1397,7 @@ mod tests {
 
     #[test]
     fn a_value_charge_grows_a_step_ahead_and_refuses_past_the_budget() {
-        let step_bytes = VALUE_CHARGE_STEP * size_of::<FstValue>();
+        let step_bytes = VALUE_CHARGE_STEP * size_of::<DictEntry>();
         let measured = ConnectionMemoryBudget::measured();
         let mut charge = ValueCharge::new(&measured).expect("measured");
         charge.cover(1).expect("measured");
@@ -1423,10 +1426,10 @@ mod tests {
         let (blob, json) = build_standard_blob(&refs);
         let r = FtsReader::open(blob, &json).expect("open");
         let rt = Runtime::new().expect("runtime");
-        let fst = rt.block_on(r.dict_bytes_async()).expect("dictionary");
+        let dict_bytes = rt.block_on(r.dict_bytes_async()).expect("dictionary");
         let walk = |charge: Option<ValueCharge>| {
             walk_dictionary(
-                &fst,
+                &dict_bytes,
                 "body",
                 &[OwnedPattern::Contains("common".into())],
                 &[Walk::Full],
@@ -1451,7 +1454,7 @@ mod tests {
         drop(charge);
         assert_eq!(measured.used_bytes(), 0);
         // Below one step, the first value admitted ends the walk.
-        let step_bytes = (VALUE_CHARGE_STEP * size_of::<FstValue>()) as u64;
+        let step_bytes = (VALUE_CHARGE_STEP * size_of::<DictEntry>()) as u64;
         let bounded = ConnectionMemoryBudget::with_limit(step_bytes);
         let err = walk(Some(ValueCharge::new(&bounded).expect("empty")))
             .err()

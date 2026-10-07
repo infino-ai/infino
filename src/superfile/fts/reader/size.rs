@@ -21,7 +21,7 @@ use crate::{
         bits::width_of,
         error::FtsError,
         format::{
-            self, FST_SEPARATOR,
+            self, KEY_SEPARATOR,
             fts::{coarse_slot, skip_entry},
         },
         fts::{
@@ -33,7 +33,7 @@ use crate::{
             short::{decode_short, short_df},
         },
     },
-    utils::terms::FstValue,
+    utils::terms::DictEntry,
 };
 
 /// Upper edges of the document-frequency bands a term is filed under.
@@ -171,7 +171,7 @@ pub struct ColumnSizeBreakdown {
 pub struct FtsSizeBreakdown {
     pub n_docs: u64,
     pub n_terms: u64,
-    pub fst_bytes: u64,
+    pub dict_bytes: u64,
     pub postings_region_bytes: u64,
     pub positions_region_bytes: u64,
     pub columns: Vec<ColumnSizeBreakdown>,
@@ -202,13 +202,13 @@ impl FtsReader {
     /// Walks the whole dictionary and fetches every term range; a
     /// report, not a query.
     pub fn size_breakdown(&self) -> Result<FtsSizeBreakdown, FtsError> {
-        let fst_bytes = self.dict_bytes()?;
-        let dict = Self::open_dict(&fst_bytes)?;
+        let dict_bytes = self.dict_bytes()?;
+        let dict = Self::open_dict(&dict_bytes)?;
         let mut columns = Vec::with_capacity(self.columns.len());
         for col in &self.columns {
             let positional = col.positions;
             let mut prefix = col.name.as_bytes().to_vec();
-            prefix.push(FST_SEPARATOR);
+            prefix.push(KEY_SEPARATOR);
             let mut buckets: Vec<DfBucket> = DF_BAND_LABELS
                 .iter()
                 .map(|&label| DfBucket {
@@ -221,14 +221,14 @@ impl FtsReader {
             for (key, packed) in dict.iter_prefix(&prefix) {
                 let key_bytes = (key.len() - prefix.len()) as u64;
                 match packed {
-                    FstValue::Inline { .. } => {
+                    DictEntry::Inline { .. } => {
                         let b = &mut buckets[band_of(1)];
                         b.terms += 1;
                         b.postings += 1;
                         b.key_bytes += key_bytes;
                         b.inline_terms += 1;
                     }
-                    FstValue::Pfor {
+                    DictEntry::Pfor {
                         metadata_offset,
                         postings_length,
                         short,
@@ -362,7 +362,7 @@ impl FtsReader {
         Ok(FtsSizeBreakdown {
             n_docs: u64::from(self.n_docs),
             n_terms: u64::from(self.n_terms_total),
-            fst_bytes: self.fst_range.len() as u64,
+            dict_bytes: self.dict_range.len() as u64,
             postings_region_bytes: self.postings_range.len() as u64,
             positions_region_bytes: self.positions_range.len() as u64,
             columns,
@@ -379,9 +379,9 @@ impl fmt::Display for FtsSizeBreakdown {
         writeln!(f, "fts blob: {} docs, {} terms", self.n_docs, self.n_terms)?;
         writeln!(
             f,
-            "  fst        {:>12} B  {:>9.2} MiB",
-            self.fst_bytes,
-            mib(self.fst_bytes)
+            "  dict       {:>12} B  {:>9.2} MiB",
+            self.dict_bytes,
+            mib(self.dict_bytes)
         )?;
         writeln!(
             f,

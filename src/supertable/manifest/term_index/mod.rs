@@ -796,7 +796,7 @@ mod tests {
             fault_storage::{FaultOp, FaultStorage},
             old_format_fts_fixture, open_old_format_fts_fixture,
         },
-        utils::terms::{FstValue, make_key},
+        utils::terms::{DictEntry, make_key},
     };
 
     fn contribution(dir: &TempDir, id: u128, terms: &[(&str, &str, u64)]) -> Contribution {
@@ -2177,7 +2177,7 @@ mod tests {
             let by_sf = rt
                 .block_on(index.locations("title", terms, &entries))
                 .expect("locations");
-            let pairs: Vec<(&str, u64, FstValue)> = by_sf[&entries[0].superfile_id]
+            let pairs: Vec<(&str, u64, DictEntry)> = by_sf[&entries[0].superfile_id]
                 .iter()
                 .filter_map(|(t, df, l)| l.to_dict_value().map(|v| (t.as_str(), *df, v)))
                 .collect();
@@ -2560,7 +2560,7 @@ mod tests {
             let bytes =
                 std::fs::read(dir.path().join(e.uri.storage_path())).expect("superfile bytes");
             let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
-            let pairs: Vec<(&str, u64, FstValue)> = by_sf[&e.superfile_id]
+            let pairs: Vec<(&str, u64, DictEntry)> = by_sf[&e.superfile_id]
                 .iter()
                 .filter_map(|(t, df, l)| l.to_dict_value().map(|v| (t.as_str(), *df, v)))
                 .collect();
@@ -3127,7 +3127,7 @@ mod tests {
                 locs.iter().all(|(t, _, _)| t != "absent"),
                 "an absent term has no location"
             );
-            let pairs: Vec<(&str, u64, FstValue)> = locs
+            let pairs: Vec<(&str, u64, DictEntry)> = locs
                 .iter()
                 .filter_map(|(t, df, l)| l.to_dict_value().map(|v| (t.as_str(), *df, v)))
                 .collect();
@@ -3151,13 +3151,13 @@ mod tests {
                 match (slot, fact.entry) {
                     (
                         FetchedTermSlot::Inline { doc_id, tf },
-                        FstValue::Inline { doc_id: d, tf: t },
+                        DictEntry::Inline { doc_id: d, tf: t },
                     ) => {
                         assert_eq!((doc_id, tf), (d, t));
                     }
                     (
                         FetchedTermSlot::Pfor { bytes, short, .. },
-                        FstValue::Pfor {
+                        DictEntry::Pfor {
                             postings_length,
                             short: s,
                             ..

@@ -8,7 +8,7 @@
 //!
 //! ```text
 //!   header (48 bytes)
-//!   FST term dictionary  + CRC32C
+//!   term dictionary  + CRC32C
 //!   postings region      + CRC32C
 //!   doc-lengths directory   + CRC32C
 //!   per-column doc-lengths arrays  (each + its own CRC32C)
@@ -39,7 +39,7 @@
 //!
 //! - **In-RAM finish**: no column spilled. Per-column maps are
 //!   drained, sorted, encoded into a posting-region scratch file,
-//!   and the FST is built in RAM (small).
+//!   and the term dictionary is built in RAM (small).
 //! - **Spilled finish**: at least one column has spilled. The
 //!   spilled column's `id_to_term` builds a lex-rank lookup
 //!   (`term_id → rank in lex order`, one `Vec<u32>` per column,
@@ -47,16 +47,16 @@
 //!   are read as fixed-size triples, sorted by
 //!   `(lex_rank[term_id], doc_id)` (pdqsort over `[(u32, u32,
 //!   u32)]` — pure u32 compares, no `&[u8]` chasing), then
-//!   k-way-merged into global lex order. The FST is built
+//!   k-way-merged into global lex order. The term dictionary is built
 //!   *streaming* via [`StreamingDictBuilder`] writing to a scratch
 //!   file, using `id_to_term[term_id]` to recover the term bytes
-//!   per emission. Final blob assembly is `header → FST scratch →
+//!   per emission. Final blob assembly is `header → dictionary scratch →
 //!   posting scratch → doc-lengths`, all streamed through `W`.
 //!
 //! Mirror of vector: vector spills its input corpus as raw f32
 //! bytes past 256 MiB and streams its centroid+code layout to
 //! scratch; FTS spills its posting accumulator as fixed 12-byte
-//! triples past 256 MiB and streams its FST + posting region to
+//! triples past 256 MiB and streams its term dictionary + posting region to
 //! scratch. Both bound peak resident memory by a formula that does
 //! not include `n_docs`, and both use fixed-size, no-framing record
 //! formats so the spill IO is allocator-free on the read side.
@@ -98,7 +98,7 @@ use crate::{
         BuildError,
         bits::PackScratch,
         format::{
-            self, FST_SEPARATOR,
+            self, KEY_SEPARATOR,
             checksum::{crc32c, crc32c_append},
             fts::{coarse_slot, skip_entry},
         },
@@ -115,7 +115,7 @@ use crate::{
         id_space::FtsDocId,
     },
     utils::{
-        terms::{FstValue, INLINE_TF_MAX, TermBlockWriter, TermDictBuilder, validate_column_name},
+        terms::{DictEntry, INLINE_TF_MAX, TermBlockWriter, TermDictBuilder, validate_column_name},
         trace::{detail_span, record},
     },
 };
@@ -189,7 +189,7 @@ struct FinishProfile {
     encode_meta_write: Duration,
     encode_skip_write: Duration,
     encode_block_write: Duration,
-    fst_insert: Duration,
+    dict_insert: Duration,
     // Per-column phase totals (summed across columns; printed in the
     // [fts-finish] summary line at the end of finish_to).
     partition_flush: Duration,
@@ -198,7 +198,7 @@ struct FinishProfile {
     mmap_open: Duration,
     scratch_cleanup: Duration,
     // Whole-finish phase totals (printed once at end of finish_to).
-    fst_close: Duration,
+    dict_close: Duration,
     postings_close: Duration,
     doc_lengths_emit: Duration,
     blob_copy: Duration,
@@ -228,7 +228,7 @@ impl FinishProfile {
 
 /// Per-(column, term) metadata header — 20 bytes, written immediately
 /// before the term's skip table + posting blocks in the postings region.
-/// `term_metadata_offset` (referenced from the FST value) points at the
+/// `term_metadata_offset` (referenced from the dictionary entry) points at the
 /// start of this struct.
 ///
 /// Layout:
@@ -437,14 +437,14 @@ enum ColumnPostings {
     /// the first time it's seen (during the threshold flush, then
     /// during subsequent `add_doc` calls). `id_to_term` is the
     /// reverse map used at `finish_to` time to recover the term
-    /// bytes for FST emission. Both are bounded by the column's
+    /// bytes for dictionary emission. Both are bounded by the column's
     /// vocabulary, which is typically O(10^4 - 10^6) even on 10M-
     /// doc corpora — millions of bytes, not gigabytes.
     Spilled {
         partitions: SpillStore,
         term_to_id: TermIdMap,
         /// Per-id reverse lookup used by `finish_to` to recover term
-        /// bytes for FST emit. Entries are `&'static str` slices
+        /// bytes for dictionary emit. Entries are `&'static str` slices
         /// borrowing from `term_arena` (see [`TermIdMap`] doc for
         /// the lifetime-extension invariant — same arena, same
         /// drop-order rules).
@@ -1299,7 +1299,7 @@ pub struct FtsBuilder {
     /// once when its accumulated bytes cross `spill_threshold_bytes`.
     /// Mirror of `VectorBuilder`'s `pre_spill_buffer` + `spill`.
     postings: Vec<ColumnPostings>,
-    /// Scratch directory that owns all posting + FST spill files.
+    /// Scratch directory that owns all posting + term dictionary spill files.
     /// Lazily populated — small builds (every column stays in RAM)
     /// never write here. Dropped after `finish_to` copies its
     /// contents into the output writer.
@@ -2560,7 +2560,7 @@ impl FtsBuilder {
     /// Finalise and emit the FTS blob bytes. Consumes the builder.
     ///
     /// Returns `BuildError::Io` for scratch IO failures that can
-    /// occur on the spill path (partition write/read, streaming-FST
+    /// occur on the spill path (partition write/read, streaming-dictionary
     /// scratch file, posting region scratch file). Mirror of
     /// `VectorBuilder::finish`, which has the same return type for
     /// the same reason.
@@ -2577,16 +2577,17 @@ impl FtsBuilder {
     ///
     /// - **In-RAM finish** (no column spilled): per-column term maps
     ///   are sorted and drained term-by-term, encoded postings flow
-    ///   to a posting-region scratch file, and the FST is built in
-    ///   RAM via `DictBuilder`. Small-build path; mirrors the
-    ///   in-RAM `VectorBuilder` finish.
+    ///   to a posting-region scratch file, and the term dictionary is
+    ///   built in RAM via `TermDictBuilder`. Small-build path; mirrors
+    ///   the in-RAM `VectorBuilder` finish.
     ///
     /// - **Spilled finish** (any column spilled): every column's
     ///   posting source — in-RAM map (for columns that stayed below
     ///   threshold) or partition files (for spilled columns) — is
     ///   normalised into a sorted record stream, then column-by-
-    ///   column those streams feed a *streaming* FST builder writing
-    ///   to a scratch file. The FST never lives entirely in RAM.
+    ///   column those streams feed a `TermBlockWriter` streaming the
+    ///   term dictionary to a scratch file, so it never lives entirely
+    ///   in RAM.
     ///   Mirrors the spilled `VectorBuilder` finish.
     ///
     /// Final blob assembly is byte-identical between the two paths
@@ -2614,8 +2615,8 @@ impl FtsBuilder {
     }
 
     /// In-RAM finish path: every column's accumulated `terms` map
-    /// stayed under `spill_threshold_bytes`, so the FST is built in
-    /// one shot via [`DictBuilder`] (no scratch FST file), no
+    /// stayed under `spill_threshold_bytes`, so the term dictionary is
+    /// built in one shot via [`TermDictBuilder`] (no scratch file), no
     /// partition flush runs, and the per-column emit loop only ever
     /// sees the `InRam` variant.
     ///
@@ -2683,10 +2684,10 @@ impl FtsBuilder {
         let mut term_scratch = TermScratch::default();
         let mut finish_profile = FinishProfile::from_config();
 
-        // The in-RAM path's FST sink: collect (key, value) into a
-        // `DictBuilder` and serialise once at assembly time. No
+        // The in-RAM path's dictionary sink: collect (key, value) into a
+        // `TermDictBuilder` and serialise once at assembly time. No
         // scratch file, no streaming.
-        let mut fst_inram = TermDictBuilder::new();
+        let mut dict_inram = TermDictBuilder::new();
 
         let mut doc_lengths_by_orig_col: Vec<Option<Vec<u32>>> =
             (0..n_columns as usize).map(|_| None).collect();
@@ -2759,7 +2760,7 @@ impl FtsBuilder {
                     &mut postings_writer,
                     &mut postings_crc_acc,
                     &mut postings_len,
-                    Some(&mut fst_inram),
+                    Some(&mut dict_inram),
                     None,
                     term_positions,
                     &mut finish_profile,
@@ -2778,7 +2779,7 @@ impl FtsBuilder {
                 postings_crc_acc,
                 postings_len,
                 positions_sink,
-                fst_sink: FstSinkFinish::InRam(fst_inram),
+                dict_sink: DictSinkFinish::InRam(dict_inram),
                 n_columns,
                 n_docs,
                 n_terms_total_usize,
@@ -2794,7 +2795,7 @@ impl FtsBuilder {
 
     /// Spilled finish path: at least one column transitioned to
     /// `Spilled` during `add_doc`. Uses a streaming `MapBuilder`
-    /// (FST bytes go to a scratch file as we go, never resident in
+    /// (dictionary bytes go to a scratch file as we go, never resident in
     /// RAM in full), drains every spilled column's per-partition
     /// batch buffers + closes their `BufWriter`s before the merge
     /// reads them, and the per-column emit loop handles both
@@ -2856,14 +2857,14 @@ impl FtsBuilder {
         let mut term_scratch = TermScratch::default();
         let mut finish_profile = FinishProfile::from_config();
 
-        // Streaming FST: bytes flow to a scratch file as we insert
-        // sorted keys, so the FST never lives in RAM in full.
+        // Streaming term dictionary: bytes flow to a scratch file as we insert
+        // sorted keys, so the term dictionary never lives in RAM in full.
         // Assembly reopens the file, CRCs it, and copies it into the
         // output writer.
-        let fst_streaming_path = scratch_path.join("infino_fts_dict.bin");
-        let mut fst_streaming = {
-            let fst_file = File::create(&fst_streaming_path)?;
-            let bw = BufWriter::new(fst_file);
+        let dict_streaming_path = scratch_path.join("infino_fts_dict.bin");
+        let mut dict_streaming = {
+            let dict_file = File::create(&dict_streaming_path)?;
+            let bw = BufWriter::new(dict_file);
             TermBlockWriter::new(bw)
         };
 
@@ -2994,7 +2995,7 @@ impl FtsBuilder {
                             &mut postings_crc_acc,
                             &mut postings_len,
                             None,
-                            Some(&mut fst_streaming),
+                            Some(&mut dict_streaming),
                             col_positions.then_some(&mut positions_sink),
                             &mut finish_profile,
                         )
@@ -3049,7 +3050,7 @@ impl FtsBuilder {
                                 &mut postings_crc_acc,
                                 &mut postings_len,
                                 None,
-                                Some(&mut fst_streaming),
+                                Some(&mut dict_streaming),
                                 term_positions,
                                 &mut finish_profile,
                                 &mut term_scratch,
@@ -3066,18 +3067,18 @@ impl FtsBuilder {
                         updated_terms: _,
                         term_arena,
                     } => {
-                        // Term interner is finished being written to;
-                        // drop the forward map (`term_to_id`) immediately
-                        // — the rest of the spilled finish only needs
-                        // the reverse map (`id_to_term`) for FST emit and
-                        // the lex-rank table built from it.
+                        // Term interner is finished being written to; drop the
+                        // forward map (`term_to_id`) immediately — the rest of
+                        // the spilled finish only needs the reverse map
+                        // (`id_to_term`) for dictionary emit and the lex-rank
+                        // table built from it.
                         //
                         // Lifetime sanity: `term_to_id` and `id_to_term`
                         // hold `&'static str` keys/entries that actually
                         // borrow from `term_arena`. We must keep
                         // `term_arena` alive until the **last
                         // dereference** of those keys/entries, which is
-                        // the FST emit loop's `id_to_term[term_id]`
+                        // the dictionary emit loop's `id_to_term[term_id]`
                         // index below. End-of-scope `Drop` order does
                         // not matter for soundness — neither `&str` nor
                         // its container's `Drop` impls dereference the
@@ -3190,7 +3191,7 @@ impl FtsBuilder {
                         let encode_meta_write_before = finish_profile.encode_meta_write;
                         let encode_skip_write_before = finish_profile.encode_skip_write;
                         let encode_block_write_before = finish_profile.encode_block_write;
-                        let fst_insert_before = finish_profile.fst_insert;
+                        let dict_insert_before = finish_profile.dict_insert;
                         let emit_span = detail_span!(
                             "fts_emit",
                             column = col_name.as_str(),
@@ -3199,7 +3200,7 @@ impl FtsBuilder {
                             gather_ms = tracing::field::Empty,
                             block_build_ms = tracing::field::Empty,
                             block_write_ms = tracing::field::Empty,
-                            fst_insert_ms = tracing::field::Empty,
+                            dict_insert_ms = tracing::field::Empty,
                         )
                         .entered();
                         let n_emitted = match &partitions {
@@ -3214,7 +3215,7 @@ impl FtsBuilder {
                                 &mut postings_writer,
                                 &mut postings_crc_acc,
                                 &mut postings_len,
-                                &mut fst_streaming,
+                                &mut dict_streaming,
                                 &mut positions_sink,
                                 &mut finish_profile,
                                 &mut term_scratch,
@@ -3249,7 +3250,7 @@ impl FtsBuilder {
                                     &mut postings_writer,
                                     &mut postings_crc_acc,
                                     &mut postings_len,
-                                    &mut fst_streaming,
+                                    &mut dict_streaming,
                                     &mut positions_sink,
                                     &mut finish_profile,
                                     &mut term_scratch,
@@ -3275,11 +3276,12 @@ impl FtsBuilder {
                                     .as_millis() as u64,
                             );
                             record(
-                                "fst_insert_ms",
-                                (finish_profile.fst_insert - fst_insert_before).as_millis() as u64,
+                                "dict_insert_ms",
+                                (finish_profile.dict_insert - dict_insert_before).as_millis()
+                                    as u64,
                             );
                             debug!(
-                                "[fts-profile] col='{}' merge_total={:.3}s non_encode_merge={:.3}s encode_total={:.3}s calls={} df1={} pfor={} block_build={:.3}s meta_write={:.3}s skip_write={:.3}s block_write={:.3}s fst_insert={:.3}s",
+                                "[fts-profile] col='{}' merge_total={:.3}s non_encode_merge={:.3}s encode_total={:.3}s calls={} df1={} pfor={} block_build={:.3}s meta_write={:.3}s skip_write={:.3}s block_write={:.3}s dict_insert={:.3}s",
                                 col_name,
                                 merge_total.as_secs_f64(),
                                 non_encode.as_secs_f64(),
@@ -3295,7 +3297,7 @@ impl FtsBuilder {
                                     .as_secs_f64(),
                                 (finish_profile.encode_block_write - encode_block_write_before)
                                     .as_secs_f64(),
-                                (finish_profile.fst_insert - fst_insert_before).as_secs_f64(),
+                                (finish_profile.dict_insert - dict_insert_before).as_secs_f64(),
                             );
                         }
                         drop(emit_span);
@@ -3321,7 +3323,7 @@ impl FtsBuilder {
                         // Explicit drop sequence: `id_to_term` first
                         // (its `&'static str` entries borrow from
                         // `term_arena`; we've finished the last read
-                        // at the FST emit loop above), then
+                        // at the dictionary emit loop above), then
                         // `term_arena` itself releases the term-byte
                         // backing store. Soundness does not strictly
                         // require this order (neither `Vec<&str>::
@@ -3355,9 +3357,9 @@ impl FtsBuilder {
                 postings_crc_acc,
                 postings_len,
                 positions_sink,
-                fst_sink: FstSinkFinish::Streaming {
-                    builder: fst_streaming,
-                    path: fst_streaming_path,
+                dict_sink: DictSinkFinish::Streaming {
+                    builder: dict_streaming,
+                    path: dict_streaming_path,
                 },
                 n_columns,
                 n_docs,
@@ -3424,9 +3426,9 @@ struct BlobAssemblyInputs {
     /// its CRC-of-empty trailer) sits between the postings and the
     /// doc-lengths directory.
     positions_sink: PositionsSink,
-    /// Whichever FST sink was used during the per-column emit loop
+    /// Whichever dictionary sink was used during the per-column emit loop
     /// (exactly one of the two variants).
-    fst_sink: FstSinkFinish,
+    dict_sink: DictSinkFinish,
     n_columns: u32,
     n_docs: u32,
     /// Pre-cast checked downstream against `u32::MAX`.
@@ -3437,7 +3439,7 @@ struct BlobAssemblyInputs {
     /// emit-loop iteration.
     doc_lengths_by_orig_col: Vec<Option<Vec<u32>>>,
     /// Scratch dir owning every spill file. Dropped after the
-    /// streamed regions (FST + postings) have been copied into `w`.
+    /// streamed regions (term dictionary + postings) have been copied into `w`.
     scratch_dir: TempDir,
     /// Profile accumulator — final block of `[fts-finish]` timings
     /// is emitted at the bottom of assembly.
@@ -3446,10 +3448,10 @@ struct BlobAssemblyInputs {
     doc_map: Option<Vec<u32>>,
 }
 
-/// FST emission sink picked by the active finish path.
-enum FstSinkFinish {
-    /// In-RAM build: hand the populated `DictBuilder` to assembly,
-    /// which calls `finish()` to produce the FST bytes in one shot.
+/// Dictionary emission sink picked by the active finish path.
+enum DictSinkFinish {
+    /// In-RAM build: hand the populated `TermDictBuilder` to assembly,
+    /// which calls `finish()` to produce the dictionary bytes in one shot.
     InRam(TermDictBuilder),
     /// Spilled build: hand the open `TermBlockWriter` (and the
     /// scratch path it's been writing to) to assembly, which finishes
@@ -3462,11 +3464,11 @@ enum FstSinkFinish {
 }
 
 /// Common tail of every finish path: close the posting body, finalise
-/// the FST, build the doc-lengths directory + arrays, and write
-/// `[header | fst | postings | dir | arrays]` to `w`. Lifted out of
-/// `FtsBuilder::finish_to` so the in-RAM and spilled paths share one
-/// regression target instead of two — every byte the reader observes
-/// passes through here.
+/// the term dictionary, build the doc-lengths directory + arrays, and
+/// write `[header | dict | postings | positions | doc map | dir |
+/// arrays]` to `w`. Lifted out of `FtsBuilder::finish_to` so the in-RAM
+/// and spilled paths share one regression target instead of two — every
+/// byte the reader observes passes through here.
 fn assemble_and_write_blob<W: Write>(
     inputs: BlobAssemblyInputs,
     w: &mut W,
@@ -3477,7 +3479,7 @@ fn assemble_and_write_blob<W: Write>(
         postings_crc_acc,
         mut postings_len,
         positions_sink,
-        fst_sink,
+        dict_sink,
         n_columns,
         n_docs,
         n_terms_total_usize,
@@ -3520,27 +3522,27 @@ fn assemble_and_write_blob<W: Write>(
         (sink.path, sink.len + crc_le.len() as u64)
     };
 
-    // Finalise the FST. Either path produces "FST bytes followed
-    // by 4 trailing CRC bytes"; the source differs.
-    enum FstSource {
+    // Finalise the term dictionary. Either path produces "dictionary bytes
+    // followed by 4 trailing CRC bytes"; the source differs.
+    enum DictSource {
         InRam(Vec<u8>),
         Streamed { path: PathBuf, len: u64, crc: u32 },
     }
-    let fst_close_start = finish_profile.enabled.then(Instant::now);
-    let fst_source = match fst_sink {
-        FstSinkFinish::InRam(db) => {
+    let dict_close_start = finish_profile.enabled.then(Instant::now);
+    let dict_source = match dict_sink {
+        DictSinkFinish::InRam(db) => {
             let mut bytes = db.finish();
             let crc = crc32c(&bytes);
             bytes.extend_from_slice(&crc.to_le_bytes());
-            FstSource::InRam(bytes)
+            DictSource::InRam(bytes)
         }
-        FstSinkFinish::Streaming {
+        DictSinkFinish::Streaming {
             builder,
-            path: fst_streaming_path,
+            path: dict_streaming_path,
         } => {
             let mut bw = builder.finish()?;
             bw.flush()?;
-            // Close the write side of the FST scratch file. The
+            // Close the write side of the dictionary scratch file. The
             // returned `File` is `File::create`-opened (write-only),
             // so we must reopen for reading to compute the CRC and
             // later stream into `w`.
@@ -3549,10 +3551,10 @@ fn assemble_and_write_blob<W: Write>(
                 .map_err(|e| BuildError::Io(e.into_error()))?;
             drop(write_file);
 
-            // Stream the FST scratch file with bounded memory to
+            // Stream the dictionary scratch file with bounded memory to
             // compute its CRC.
-            let mut read_file = File::open(&fst_streaming_path)?;
-            let fst_body_len = read_file.metadata()?.len();
+            let mut read_file = File::open(&dict_streaming_path)?;
+            let dict_body_len = read_file.metadata()?.len();
             read_file.seek(SeekFrom::Start(0))?;
             let mut reader = BufReader::with_capacity(PARTITION_BUF_SIZE, read_file);
             let mut crc: u32 = 0;
@@ -3567,27 +3569,27 @@ fn assemble_and_write_blob<W: Write>(
                 crc = crc32c_append(crc, &buf[..n]);
             }
             drop(reader);
-            FstSource::Streamed {
-                path: fst_streaming_path,
-                len: fst_body_len + 4, /* trailing CRC */
+            DictSource::Streamed {
+                path: dict_streaming_path,
+                len: dict_body_len + 4, /* trailing CRC */
                 crc,
             }
         }
     };
-    if let Some(t) = fst_close_start {
-        finish_profile.fst_close += t.elapsed();
+    if let Some(t) = dict_close_start {
+        finish_profile.dict_close += t.elapsed();
     }
 
     // Compute final-blob offsets now that both region lengths are known.
     let dl_emit_start = finish_profile.enabled.then(Instant::now);
-    let fst_total_len: u64 = match &fst_source {
-        FstSource::InRam(bytes) => bytes.len() as u64,
-        FstSource::Streamed { len, .. } => *len,
+    let dict_total_len: u64 = match &dict_source {
+        DictSource::InRam(bytes) => bytes.len() as u64,
+        DictSource::Streamed { len, .. } => *len,
     };
     let fts_version = blob_version(&doc_map);
     let header_size = format::fts::HEADER_SIZE as u64;
-    let fst_offset: u64 = header_size;
-    let postings_offset: u64 = fst_offset + fst_total_len;
+    let dict_offset: u64 = header_size;
+    let postings_offset: u64 = dict_offset + dict_total_len;
     // The positions region sits between the postings and the
     // doc-lengths directory (keeping the lazy-open doc-lengths tail
     // fetch small); absent, the directory follows postings directly.
@@ -3640,7 +3642,7 @@ fn assemble_and_write_blob<W: Write>(
     header.extend_from_slice(&n_columns.to_le_bytes()); // 4
     header.extend_from_slice(&n_docs.to_le_bytes()); // 4
     header.extend_from_slice(&n_terms_total.to_le_bytes()); // 4
-    header.extend_from_slice(&fst_offset.to_le_bytes()); // 8
+    header.extend_from_slice(&dict_offset.to_le_bytes()); // 8
     header.extend_from_slice(&postings_offset.to_le_bytes()); // 8
     header.extend_from_slice(&doc_lengths_table_offset.to_le_bytes()); // 8
     header.extend_from_slice(&positions_offset.to_le_bytes()); // 8
@@ -3657,9 +3659,9 @@ fn assemble_and_write_blob<W: Write>(
     );
 
     w.write_all(&header)?;
-    match fst_source {
-        FstSource::InRam(bytes) => w.write_all(&bytes)?,
-        FstSource::Streamed { path, crc, .. } => {
+    match dict_source {
+        DictSource::InRam(bytes) => w.write_all(&bytes)?,
+        DictSource::Streamed { path, crc, .. } => {
             let mut reader = BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(&path)?);
             io::copy(&mut reader, w)?;
             w.write_all(&crc.to_le_bytes())?;
@@ -3676,7 +3678,7 @@ fn assemble_and_write_blob<W: Write>(
     }
 
     // Drop the scratch tempdir as soon as the streamed source
-    // files (FST + posting body) have been copied into `w`. The
+    // files (term dictionary + posting body) have been copied into `w`. The
     // remaining writes (`dir_buf`, `arrays_buf`) are
     // already-resident `Vec<u8>` and don't touch the disk.
     // Mirror of vector's `drop(scratch_dir);` at the bottom of
@@ -3706,14 +3708,14 @@ fn assemble_and_write_blob<W: Write>(
 
     if finish_profile.enabled {
         debug!(
-            "[fts-finish] partition_flush={:.3}s lex_rank={:.3}s partition_sort={:.3}s mmap_open={:.3}s scratch_cleanup={:.3}s postings_close={:.3}s fst_close={:.3}s doc_lengths_emit={:.3}s blob_copy={:.3}s",
+            "[fts-finish] partition_flush={:.3}s lex_rank={:.3}s partition_sort={:.3}s mmap_open={:.3}s scratch_cleanup={:.3}s postings_close={:.3}s dict_close={:.3}s doc_lengths_emit={:.3}s blob_copy={:.3}s",
             finish_profile.partition_flush.as_secs_f64(),
             finish_profile.lex_rank_build.as_secs_f64(),
             finish_profile.partition_sort.as_secs_f64(),
             finish_profile.mmap_open.as_secs_f64(),
             finish_profile.scratch_cleanup.as_secs_f64(),
             finish_profile.postings_close.as_secs_f64(),
-            finish_profile.fst_close.as_secs_f64(),
+            finish_profile.dict_close.as_secs_f64(),
             finish_profile.doc_lengths_emit.as_secs_f64(),
             finish_profile.blob_copy.as_secs_f64(),
         );
@@ -3789,7 +3791,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     postings_writer: &mut W,
     postings_crc_acc: &mut u32,
     postings_len: &mut u64,
-    fst_streaming: &mut TermBlockWriter<BufWriter<File>>,
+    dict_streaming: &mut TermBlockWriter<BufWriter<File>>,
     positions_sink: &mut PositionsSink,
     finish_profile: &mut FinishProfile,
     term_scratch: &mut TermScratch,
@@ -3898,7 +3900,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             postings_crc_acc,
             postings_len,
             None,
-            Some(fst_streaming),
+            Some(dict_streaming),
             term_positions,
             finish_profile,
             term_scratch,
@@ -3918,9 +3920,9 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     Ok(n_emitted)
 }
 
-/// Encode one term's posting list and emit the resulting FST entry
+/// Encode one term's posting list and emit the resulting dictionary entry
 /// into whichever sink the finish path uses. Exactly one of
-/// `fst_entries_inram` / `fst_streaming` is `Some`; the function
+/// `dict_entries_inram` / `dict_streaming` is `Some`; the function
 /// dispatches accordingly.
 ///
 /// Owns the per-term encoding policy (df=1 inline value, df≥2 PFOR
@@ -3936,8 +3938,8 @@ fn encode_and_emit_term<W: Write>(
     postings_writer: &mut W,
     postings_crc_acc: &mut u32,
     postings_len: &mut u64,
-    fst_entries_inram: Option<&mut TermDictBuilder>,
-    fst_streaming: Option<&mut TermBlockWriter<BufWriter<File>>>,
+    dict_entries_inram: Option<&mut TermDictBuilder>,
+    dict_streaming: Option<&mut TermBlockWriter<BufWriter<File>>>,
     term_positions: Option<(&mut PositionsSink, TermRuns<'_>)>,
     profile: &mut FinishProfile,
     scratch: &mut TermScratch,
@@ -3957,8 +3959,8 @@ fn encode_and_emit_term<W: Write>(
         postings_writer,
         postings_crc_acc,
         postings_len,
-        fst_entries_inram,
-        fst_streaming,
+        dict_entries_inram,
+        dict_streaming,
         sink,
         profile,
     )
@@ -4003,7 +4005,7 @@ struct MergedTerm {
 #[derive(Clone, Copy)]
 enum EncodedTerm {
     /// The whole posting fits the dictionary value; no bytes.
-    Inline(FstValue),
+    Inline(DictEntry),
     /// A short-form body, positions inside it.
     Short,
     /// A long-form body whose header still needs its two offsets.
@@ -4036,20 +4038,20 @@ fn encode_term(
 
     let df = pairs.len() as u64;
 
-    // A df=1 posting inlines into the FST value when the WHOLE
+    // A df=1 posting inlines into the dictionary entry when the WHOLE
     // posting fits: a positionless column always does (doc_id + tf);
     // a positional column only when tf == 1 and the single position
     // fits the 30-bit slot — the position rides where tf normally
     // lives, tf implied 1 (one position is exactly what a phrase
     // check needs). Otherwise even a df=1 term takes the PFOR form so
     // its positions land in the region.
-    let inline_value: Option<FstValue> = if df == 1 {
+    let inline_value: Option<DictEntry> = if df == 1 {
         let (doc_id, tf) = pairs[0];
         match &term_positions {
-            None => Some(FstValue::Inline { doc_id, tf }),
+            None => Some(DictEntry::Inline { doc_id, tf }),
             Some(runs) if tf == 1 => {
                 let pos = runs.first_value();
-                (pos <= INLINE_TF_MAX).then_some(FstValue::Inline { doc_id, tf: pos })
+                (pos <= INLINE_TF_MAX).then_some(DictEntry::Inline { doc_id, tf: pos })
             }
             Some(_) => None,
         }
@@ -4323,18 +4325,18 @@ fn write_term<W: Write>(
     postings_writer: &mut W,
     postings_crc_acc: &mut u32,
     postings_len: &mut u64,
-    fst_entries_inram: Option<&mut TermDictBuilder>,
-    mut fst_streaming: Option<&mut TermBlockWriter<BufWriter<File>>>,
+    dict_entries_inram: Option<&mut TermDictBuilder>,
+    mut dict_streaming: Option<&mut TermBlockWriter<BufWriter<File>>>,
     positions_sink: Option<&mut PositionsSink>,
     profile: &mut FinishProfile,
 ) -> Result<(), BuildError> {
     let write_start = profile.enabled.then(Instant::now);
     key_buf.clear();
     key_buf.extend_from_slice(col_name_bytes);
-    key_buf.push(FST_SEPARATOR);
+    key_buf.push(KEY_SEPARATOR);
     key_buf.extend_from_slice(term.as_bytes());
 
-    let fst_value = match encoded {
+    let dict_entry = match encoded {
         EncodedTerm::Inline(value) => value,
         EncodedTerm::Short | EncodedTerm::Long => {
             let metadata_offset = *postings_len;
@@ -4353,7 +4355,7 @@ fn write_term<W: Write>(
             if let Some(start) = block_write_start {
                 profile.encode_block_write += start.elapsed();
             }
-            FstValue::Pfor {
+            DictEntry::Pfor {
                 metadata_offset,
                 postings_length: body.len() as u32,
                 short: !long,
@@ -4361,14 +4363,14 @@ fn write_term<W: Write>(
         }
     };
 
-    let fst_insert_start = profile.enabled.then(Instant::now);
-    if let Some(db) = fst_entries_inram {
-        db.insert(key_buf, fst_value);
-    } else if let Some(sb) = fst_streaming.as_mut() {
-        sb.insert_sorted(key_buf, fst_value)?;
+    let dict_insert_start = profile.enabled.then(Instant::now);
+    if let Some(db) = dict_entries_inram {
+        db.insert(key_buf, dict_entry);
+    } else if let Some(sb) = dict_streaming.as_mut() {
+        sb.insert_sorted(key_buf, dict_entry)?;
     }
-    if let Some(start) = fst_insert_start {
-        profile.fst_insert += start.elapsed();
+    if let Some(start) = dict_insert_start {
+        profile.dict_insert += start.elapsed();
     }
     if let Some(start) = write_start {
         profile.encode_total += start.elapsed();
@@ -4595,10 +4597,10 @@ mod tests {
     #[tokio::test]
     async fn cross_column_same_term_stays_isolated_through_round_trip() {
         // A term that appears in two different columns must keep
-        // its posting lists scoped per column in the emitted FST +
+        // its posting lists scoped per column in the emitted term dictionary +
         // posting region. This also exercises the spill-backed
         // accumulator: column id is implicit in the selected partition
-        // set, while the final FST key remains `<col>\x1F<term>`.
+        // set, while the final dictionary key remains `<col>\x1F<term>`.
         use bytes::Bytes;
 
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
@@ -4729,11 +4731,11 @@ mod tests {
         // n_terms_total = 2 ("hello", "world") (u32 at 20..24).
         let n_terms = u32::from_le_bytes([blob[20], blob[21], blob[22], blob[23]]);
         assert_eq!(n_terms, 2);
-        // fst_offset == the header size (u64 at 24..32).
+        // dict_offset == the header size (u64 at 24..32).
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&blob[24..32]);
-        let fst_off = u64::from_le_bytes(buf);
-        assert_eq!(fst_off, format::fts::HEADER_SIZE as u64);
+        let dict_off = u64::from_le_bytes(buf);
+        assert_eq!(dict_off, format::fts::HEADER_SIZE as u64);
     }
 
     /// Determinism gate: two independent in-RAM builds over the
@@ -4866,10 +4868,10 @@ mod tests {
         // Threshold mode = real test: a low spill threshold forces
         // the same corpus to take the spilled finish_to path; result
         // must match the in-RAM finish byte-for-byte. This is the
-        // streaming-FST regression gate — the spilled path uses
-        // `StreamingDictBuilder` writing to a scratch file, while
-        // the in-RAM path uses the in-memory `DictBuilder`. Both
-        // must produce identical FST bytes.
+        // streaming-dictionary regression gate — the spilled path uses
+        // `TermBlockWriter` writing to a scratch file, while
+        // the in-RAM path uses the in-memory `TermDictBuilder`. Both
+        // must produce identical dictionary bytes.
         fn build_corpus(b: &mut FtsBuilder) {
             b.register_column("body".into(), false)
                 .expect("register col");
@@ -4925,7 +4927,7 @@ mod tests {
 
         assert_eq!(
             spilled_blob, baseline_blob,
-            "streaming-FST + spill path must produce byte-identical blob"
+            "streaming-dictionary + spill path must produce byte-identical blob"
         );
     }
 
@@ -5082,18 +5084,18 @@ mod tests {
         }
         let blob = b.finish().expect("finish");
 
-        // Header layout post-u32-narrowing: fst_offset at 24..32,
+        // Header layout post-u32-narrowing: dict_offset at 24..32,
         // postings_offset at 32..40, doc_lengths_table_offset at 40..48.
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&blob[24..32]);
-        let fst_off = u64::from_le_bytes(buf) as usize;
+        let dict_off = u64::from_le_bytes(buf) as usize;
         buf.copy_from_slice(&blob[32..40]);
         let postings_off = u64::from_le_bytes(buf) as usize;
         buf.copy_from_slice(&blob[40..48]);
         let dir_off = u64::from_le_bytes(buf) as usize;
 
-        assert_eq!(fst_off, format::fts::HEADER_SIZE);
-        assert!(postings_off > fst_off, "postings after FST");
+        assert_eq!(dict_off, format::fts::HEADER_SIZE);
+        assert!(postings_off > dict_off, "postings after term dictionary");
         assert!(dir_off > postings_off, "directory after postings");
         assert!(dir_off <= blob.len(), "directory offset within blob");
         buf.copy_from_slice(&blob[48..56]);

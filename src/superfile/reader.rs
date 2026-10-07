@@ -77,7 +77,7 @@ use crate::{
         },
     },
     supertable::query::provider::tombstone_access_plan,
-    utils::terms::FstValue,
+    utils::terms::DictEntry,
 };
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
@@ -99,7 +99,7 @@ pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorL
 pub struct OpenOptions {
     /// Verify all CRC32C checksums on open: the embedded
     /// vector blob's whole-blob + per-subsection CRCs, and
-    /// the embedded FTS blob's four per-section CRCs (FST,
+    /// the embedded FTS blob's four per-section CRCs (term dictionary,
     /// postings region, doc-lengths directory, per-column
     /// doc-lengths arrays). Defaults to `true`; the
     /// argumentless [`SuperfileReader::open`] uses this
@@ -254,7 +254,7 @@ impl SuperfileReader {
     ///    `VectorReader::open_lazy` (outer header, directory + CRC,
     ///    subsection headers, and Sq8 codec_meta when present).
     /// 3. **3 GETs** for the embedded FTS subsection, via
-    ///    `FtsReader::open_lazy` (header, FST dictionary, doc-length
+    ///    `FtsReader::open_lazy` (header, term dictionary, doc-length
     ///    tail; postings stay lazy until search).
     ///
     /// Total open budget is small exact metadata ranges rather than
@@ -1331,7 +1331,7 @@ impl SuperfileReader {
     /// `(N+1)·T` redundant tokenizations across N superfiles and
     /// a T-token query.
     ///
-    /// Terms must already be tokenized to the column's FST key form —
+    /// Terms must already be tokenized to the column's dictionary key form —
     /// the column's own tokenizer, e.g. `StandardTokenizer.tokenize(query)`
     /// for a plain `standard` column.
     pub async fn bm25_search_pretokenized(
@@ -1529,7 +1529,7 @@ impl SuperfileReader {
     /// [`FtsReader::memo_from_dict_values`].
     pub(crate) async fn term_memo_from_dict_values(
         &self,
-        terms: &[(&str, u64, FstValue)],
+        terms: &[(&str, u64, DictEntry)],
     ) -> Result<FetchedTermMemo, ReadError> {
         let fts = self
             .fts()
@@ -1552,10 +1552,10 @@ impl SuperfileReader {
         Ok(fts.term_index_facts(column, tokens).await?)
     }
 
-    /// Document frequency of each of `tokens` in `column`, in input order
-    /// (0 for any absent token). Batched sibling of [`Self::term_df`]:
-    /// resolves the whole set with one FST parse and one coalesced header
-    /// fetch. Delegates to [`FtsReader::term_dfs`].
+    /// Document frequency of each of `tokens` in `column`, in input order (0
+    /// for any absent token). Batched sibling of [`Self::term_df`]: resolves
+    /// the whole set with one dictionary parse and one coalesced header fetch.
+    /// Delegates to [`FtsReader::term_dfs`].
     pub async fn term_dfs(
         &self,
         column: &str,
@@ -1735,7 +1735,7 @@ impl SuperfileReader {
     ///
     /// Expands `prefix` to the lex-ordered list of indexed terms
     /// in `column` whose tokenized form begins with `prefix`,
-    /// then runs `BoolMode::Or` BM25 over that term set. The FST
+    /// then runs `BoolMode::Or` BM25 over that term set. The term dictionary
     /// stores lowercased terms, so the prefix is ASCII-lowercased
     /// before expansion. Whitespace inside
     /// `prefix` is **not** split — prefix search is a single
@@ -1782,11 +1782,11 @@ impl SuperfileReader {
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         let lowered = prefix.to_ascii_lowercase();
         // The dictionary walk is CPU work and runs on the reader pool; the
-        // FST fetch it needs stays on this runtime.
+        // dictionary fetch it needs stays on this runtime.
         let term_bytes = fts
             .terms_with_prefix(column, lowered.as_bytes(), pool)
             .await?;
-        // FST keys are valid UTF-8 by construction (a tokenizer emits
+        // Dictionary keys are valid UTF-8 by construction (a tokenizer emits
         // `&str` terms), so the conversion drops nothing.
         Ok(term_bytes
             .into_iter()
@@ -1874,7 +1874,7 @@ impl SuperfileReader {
             .await?)
     }
 
-    /// Expand `prefix` via the FST and build its OR cursor set, for
+    /// Expand `prefix` via the term dictionary and build its OR cursor set, for
     /// reuse across this superfile's doc-id sub-ranges via
     /// [`Self::bm25_search_or_range_prebuilt`].
     pub(crate) async fn bm25_prefix_cursor_set(
@@ -1908,7 +1908,7 @@ impl SuperfileReader {
     /// Prefix-expanded BM25 search restricted to a doc_id sub-range.
     ///
     /// Same expansion logic as [`Self::bm25_search_prefix`] —
-    /// lowercase the prefix, walk the FST for matching terms, run
+    /// lowercase the prefix, walk the term dictionary for matching terms, run
     /// BM25 OR over the term set — but only docs in
     /// `[doc_id_start, doc_id_end)` are eligible. A single-call wrapper
     /// around [`Self::bm25_prefix_cursor_set`] +

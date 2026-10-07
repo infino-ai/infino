@@ -124,7 +124,7 @@ pub(crate) struct GappedIdPlacementCache {
 const VECTOR_DIM_MIN: usize = 16;
 const VECTOR_DIM_MAX: usize = 4096;
 
-/// Reserved separator inside FTS FST keys (`<col>\x1F<term>`); user
+/// Reserved separator inside FTS dictionary keys (`<col>\x1F<term>`); user
 /// column names must not contain it. Mirrors superfile's
 /// `check_user_column_name`.
 const RESERVED_SEPARATOR: char = '\x1F';

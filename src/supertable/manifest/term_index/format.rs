@@ -57,7 +57,7 @@ use crate::{
     supertable::manifest::{part::ContentHash, term_range::prefix_upper_bound},
     utils::{
         bytes::{u32_le_at, u64_le_at},
-        terms::{FstValue, TermBlocks},
+        terms::{DictEntry, TermBlocks},
         varint::{push_u64_varint, push_varint, read_u64_varint, read_varint},
     },
 };
@@ -123,10 +123,10 @@ pub(crate) enum Location {
 
 impl Location {
     /// The location a superfile dictionary entry describes.
-    pub(crate) fn from_dict_value(value: FstValue) -> Self {
+    pub(crate) fn from_dict_value(value: DictEntry) -> Self {
         match value {
-            FstValue::Inline { doc_id, tf } => Self::Inline { doc_id, tf },
-            FstValue::Pfor {
+            DictEntry::Inline { doc_id, tf } => Self::Inline { doc_id, tf },
+            DictEntry::Pfor {
                 metadata_offset,
                 postings_length: len,
                 short: true,
@@ -134,7 +134,7 @@ impl Location {
                 offset: metadata_offset,
                 len,
             },
-            FstValue::Pfor {
+            DictEntry::Pfor {
                 metadata_offset,
                 postings_length: len,
                 short: false,
@@ -149,20 +149,20 @@ impl Location {
 impl Location {
     /// The superfile dictionary value this location stands for, or `None`
     /// when no location was carried.
-    pub(crate) fn to_dict_value(self) -> Option<FstValue> {
+    pub(crate) fn to_dict_value(self) -> Option<DictEntry> {
         match self {
             Self::None => None,
-            Self::Pfor { offset, len } => Some(FstValue::Pfor {
+            Self::Pfor { offset, len } => Some(DictEntry::Pfor {
                 metadata_offset: offset,
                 postings_length: len,
                 short: false,
             }),
-            Self::Short { offset, len } => Some(FstValue::Pfor {
+            Self::Short { offset, len } => Some(DictEntry::Pfor {
                 metadata_offset: offset,
                 postings_length: len,
                 short: true,
             }),
-            Self::Inline { doc_id, tf } => Some(FstValue::Inline { doc_id, tf }),
+            Self::Inline { doc_id, tf } => Some(DictEntry::Inline { doc_id, tf }),
         }
     }
 }
@@ -513,8 +513,8 @@ impl<'a> Slice<'a> {
         Ok(Self { dict, postings })
     }
 
-    fn run_at(&self, value: FstValue) -> Result<Vec<Posting>, TermIndexError> {
-        let FstValue::Pfor {
+    fn run_at(&self, value: DictEntry) -> Result<Vec<Posting>, TermIndexError> {
+        let DictEntry::Pfor {
             metadata_offset,
             postings_length: len,
             ..
@@ -632,11 +632,11 @@ mod tests {
     #[test]
     fn location_mirrors_dictionary_value() {
         assert_eq!(
-            Location::from_dict_value(FstValue::Inline { doc_id: 1, tf: 2 }),
+            Location::from_dict_value(DictEntry::Inline { doc_id: 1, tf: 2 }),
             Location::Inline { doc_id: 1, tf: 2 }
         );
         assert_eq!(
-            Location::from_dict_value(FstValue::Pfor {
+            Location::from_dict_value(DictEntry::Pfor {
                 metadata_offset: 10,
                 postings_length: 20,
                 short: true
@@ -647,7 +647,7 @@ mod tests {
             }
         );
         assert_eq!(
-            Location::from_dict_value(FstValue::Pfor {
+            Location::from_dict_value(DictEntry::Pfor {
                 metadata_offset: 10,
                 postings_length: 20,
                 short: false
@@ -825,7 +825,7 @@ mod tests {
             let bytes = encode_run(run);
             dict.insert(
                 &make_key(col, term),
-                FstValue::Pfor {
+                DictEntry::Pfor {
                     metadata_offset: postings.len() as u64,
                     postings_length: bytes.len() as u32,
                     short: false,

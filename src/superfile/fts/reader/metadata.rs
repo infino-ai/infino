@@ -708,7 +708,7 @@ pub(super) fn default_stored() -> bool {
 /// sub-readers.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
-    /// Verify the four per-section CRC32C checks (FST,
+    /// Verify the four per-section CRC32C checks (term dictionary,
     /// postings region, doc-lengths directory, per-column
     /// doc-lengths arrays). Defaults to `true`; flip to
     /// `false` only when the underlying storage already

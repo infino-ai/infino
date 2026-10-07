@@ -36,7 +36,7 @@ use tempfile::TempDir;
 
 /// Docs per committed segment. Commits row-shard across the writer
 /// pool, so this must keep every term's per-superfile df ≥ 2 —
-/// df=1 terms store inline in the FST with genuinely zero
+/// df=1 terms store inline in the term dictionary with genuinely zero
 /// postings-region bytes, which would make the assertions vacuous.
 const DOCS_PER_SEGMENT: usize = 40;
 /// Rayon pool size for deterministic builds (two shards per commit).
@@ -422,10 +422,10 @@ fn a_reader_minted_outside_the_scope_records_nothing() {
 
 #[test]
 fn an_inline_df1_term_plans_no_posting_range() {
-    // "filler0x0" is unique to one doc: inline in the FST of its home
-    // superfile (zero fetches planned), absent everywhere else. Adding
-    // it to a query must not change the planned range count — a phantom
-    // range per inline term was the old behavior.
+    // "filler0x0" is unique to one doc: inline in the term dictionary of its
+    // home superfile (zero fetches planned), absent everywhere else. Adding it
+    // to a query must not change the planned range count — a phantom range per
+    // inline term was the old behavior.
     let st = demo_two_superfiles();
     let (_, base) = with_op_stats(|| {
         st.reader()
