@@ -1661,6 +1661,13 @@ async fn lookup_user_placements_by_id(
         // not a duplicate one); the CPU inversion runs on the reader pool, not
         // the tokio blocking pool. `try_join_all` preserves `cells` order, so
         // the probe below stays deterministic in manifest order.
+        // `unbuilt` is how many of those maps this call waits on: every gapped
+        // file on a freshly started process, none once the cache is warm.
+        let span = detail_span!(
+            "vector.resolve_placement",
+            gapped = cells.len(),
+            unbuilt = cells.iter().filter(|(_, cell)| !cell.initialized()).count(),
+        );
         let built: Vec<(Arc<SuperfileEntry>, Arc<GappedPlacementIndex>)> =
             try_join_all(cells.into_iter().map(|(entry, cell)| async move {
                 let index = cell
@@ -1670,6 +1677,7 @@ async fn lookup_user_placements_by_id(
                     .await?;
                 Ok::<_, QueryError>((entry, Arc::clone(index)))
             }))
+            .instrument(span)
             .await?;
         // Probe in manifest (gapped) order: if an id is resident in two live
         // superfiles — an updated row's tombstoned-old copy plus its live copy,
@@ -1733,7 +1741,10 @@ async fn build_gapped_placement_index(
     op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Arc<GappedPlacementIndex>, QueryError> {
     let locals = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
-    let ids = read_ids_for_locals(manifest, entry, &locals, id_column, true, op_stats).await?;
+    // Every row, so the scalar `_id` column: one contiguous chunk per row
+    // group. The inline region is stored per cell, so reading all of it costs
+    // one small read per cell, each rounded up to a whole cache block.
+    let ids = read_ids_for_locals(manifest, entry, &locals, id_column, false, op_stats).await?;
     // Build scratch only, released the moment the sorted arrays are extracted.
     // The transient peak holds all three vectors at once — the decoded `ids`
     // and `locals` are still alive while the `(i128, u32)` pairs they zip into
@@ -1831,11 +1842,17 @@ pub(crate) async fn stable_ids_by_local_for_routing(
 /// superfile. Routed through the disk cache as a resident (mmap) read when a
 /// cache is attached; falls back to object-store range GETs on lazy readers.
 ///
-/// `allow_inline_region` selects the resolution source:
+/// Both sources hold the same ids in the same row order; `allow_inline_region`
+/// picks the cheaper one for the rows asked for:
 ///
-///   - `true` — prefer the IVF blob's inline `_id` region (hidden cells).
-///   - `false` — never use the inline region; read the scalar `_id` column
-///     (user superfiles after compaction — inline region is cluster-ordered).
+///   - `true`: the vector blob's inline `_id` region, stored once per cell.
+///     Free when resident; cold, it costs one read per cell the rows touch,
+///     so it suits a few rows.
+///   - `false`: the scalar `_id` column, one contiguous chunk per row group,
+///     so it suits many rows or a whole file.
+///
+/// A file whose vector blob carries rows the Parquet body does not (boundary
+/// stubs) always reads the scalar column; the inline order would not match.
 async fn read_ids_for_locals(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
@@ -7607,11 +7624,13 @@ mod tests {
         decode_centroid_router_section, encode_centroid_router_section, free_column_slot,
         free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_prepare_for_metric,
         gfc_unit_normalize, hidden_hits_user_ids, id_score_projection_indices,
-        is_hidden_vector_manifest, law_floor_serve_selection, postings_by_cell_from_summaries,
-        rerank_mult_from_law, score_fine_candidates, select_global_shortlist, union_cell_selection,
+        is_hidden_vector_manifest, law_floor_serve_selection, lookup_user_placements_by_id,
+        postings_by_cell_from_summaries, read_ids_for_locals, rerank_mult_from_law,
+        score_fine_candidates, select_global_shortlist, union_cell_selection,
     };
     use crate::{
         BoolMode, InfinoError,
+        config::{CompactionSettings, OptimizeOptions},
         superfile::{
             SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
@@ -7621,6 +7640,7 @@ mod tests {
                 distance::Metric,
                 flat::Sq4FlatIndex,
                 hnsw::{PayloadKind, encode_resident_envelope},
+                layout::VectorLayout,
                 rerank_codec::RerankCodec,
             },
         },
@@ -7635,7 +7655,7 @@ mod tests {
             slow_vector_state::{ResidentIndexKind, write_resident_index_blob},
             writer::{recalibrate_probe_laws, split_overflow_cell},
         },
-        test_helpers::distinct_unit_vectors,
+        test_helpers::{distinct_unit_vectors, lazy_foreground_disk_cache},
     };
 
     /// Drive an async future to completion on a throwaway current-thread
@@ -8734,6 +8754,144 @@ mod tests {
             vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
             subsection_offsets: None,
         })
+    }
+
+    /// Rows in the cold placement-build test's one user superfile: enough
+    /// that its cells' inline `_id` regions sit more than a cache block apart.
+    const COLD_PLACEMENT_ROWS: usize = 16_384;
+    /// Vector width in the cold placement-build test; wide vectors spread the
+    /// cells' inline `_id` regions across the blob.
+    const COLD_PLACEMENT_DIM: usize = 128;
+    /// GETs the cold placement build may take: the `_id` chunk of the one row
+    /// group, plus its page index if the open did not already fetch it.
+    const COLD_PLACEMENT_MAX_GETS: u64 = 2;
+
+    #[test]
+    fn a_cold_placement_build_reads_the_id_column_not_every_cell() {
+        let dim = COLD_PLACEMENT_DIM;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let local = Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let storage: Arc<dyn StorageProvider> = local.clone();
+        {
+            let st = Supertable::create(
+                options_one_superfile_per_commit(dim).with_storage(Arc::clone(&storage)),
+            )
+            .expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(0, COLD_PLACEMENT_ROWS, dim, schema))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+
+        let cache_dir = TempDir::new().expect("cache dir");
+        let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
+        let st = Supertable::open(
+            options_one_superfile_per_commit(dim)
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(cache),
+        )
+        .expect("open cold");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = Arc::clone(&manifest.superfiles[0]);
+        assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
+        let before = local.usage_meter().snapshot();
+        block_on(lookup_user_placements_by_id(
+            manifest,
+            &[entry.id_min, entry.id_max],
+            &None,
+        ))
+        .expect("placements");
+        let io = local.usage_meter().snapshot().since(&before);
+        // The `_id` chunk of the file's one row group. Reading the cells'
+        // inline regions instead took 109 GETs and 56 MB here.
+        assert!(
+            io.get_count <= COLD_PLACEMENT_MAX_GETS,
+            "a cold placement build must read the `_id` column, not every cell: {io:?}"
+        );
+
+        assert_places_every_row(manifest);
+    }
+
+    /// Rows per commit in the merged-file placement test.
+    const MERGED_PLACEMENT_ROWS: usize = 500;
+    /// Commits the merged-file placement test compacts into one file.
+    const MERGED_PLACEMENT_COMMITS: u64 = 4;
+    /// Fragment count that triggers a merge: as soon as there are two.
+    const MERGE_AT_FRAGMENTS: u64 = 2;
+
+    #[test]
+    fn a_merged_cell_packed_file_places_every_row() {
+        // Compaction rewrites the commits into one cell-packed file, the shape
+        // a long-lived table's files have.
+        let dim = 16;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(options_one_superfile_per_commit(dim).with_storage(storage))
+            .expect("create");
+        for c in 0..MERGED_PLACEMENT_COMMITS {
+            let mut w = st.writer().expect("writer");
+            let start = c * MERGED_PLACEMENT_ROWS as u64;
+            w.append(&build_vector_batch(
+                start,
+                MERGED_PLACEMENT_ROWS,
+                dim,
+                schema.clone(),
+            ))
+            .expect("append");
+            w.commit().expect("commit");
+        }
+        st.optimize(&OptimizeOptions::compact(CompactionSettings {
+            min_superfiles_for_merge: MERGE_AT_FRAGMENTS,
+            ..CompactionSettings::default()
+        }))
+        .expect("optimize");
+
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        assert_eq!(
+            manifest.superfiles.len(),
+            1,
+            "the commits merged into one file"
+        );
+        let entry = &manifest.superfiles[0];
+        assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
+        assert_eq!(
+            entry.n_docs,
+            MERGED_PLACEMENT_COMMITS * MERGED_PLACEMENT_ROWS as u64
+        );
+        assert_places_every_row(manifest);
+    }
+
+    /// Place every id in the table and check each lands on its own row. The
+    /// rows' ids are read from the cells' inline `_id` regions, the source the
+    /// map no longer reads, so the two must agree on row order.
+    fn assert_places_every_row(manifest: &ManifestSnapshot) {
+        let id_column = manifest.options.id_column.as_str();
+        for entry in manifest.superfiles.iter() {
+            let locals = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
+            let ids = block_on(read_ids_for_locals(
+                manifest, entry, &locals, id_column, true, &None,
+            ))
+            .expect("inline ids");
+            let placed =
+                block_on(lookup_user_placements_by_id(manifest, &ids, &None)).expect("placements");
+            for (local, (owner, placed_local)) in placed.iter().enumerate() {
+                assert_eq!(
+                    owner.uri, entry.uri,
+                    "id {} placed in the wrong file",
+                    ids[local]
+                );
+                assert_eq!(
+                    *placed_local as usize, local,
+                    "id {} placed on the wrong row",
+                    ids[local]
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
