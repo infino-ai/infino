@@ -21,9 +21,11 @@ the scoring math and the parameter type.
   score(t, d)        = idf(t) * tf / ( tf + k1 * norm(dl, avgdl) )
 ```
 
-`N` and `df` are table-wide: every search scores each superfile against
-the document count and document frequencies summed across the whole table,
-so a fragmented table ranks like one corpus.
+`N` and `df` are table-wide for a term search on a fully loaded manifest:
+each superfile scores against the document count and document frequencies
+summed across the whole table, so a fragmented table ranks like one corpus.
+Prefix search, and a table opened with a lazily loaded manifest, score each
+superfile with its own `N` and `df`.
 
 A document's score for a query is the sum over its matching terms. Higher
 is better (the opposite direction from `vector_search`, which returns a

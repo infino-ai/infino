@@ -27,10 +27,11 @@ pub enum BoolMode {
 /// similarity override. Set fields with the `with_*` builders;
 /// [`Default`] is [`BoolMode::Or`] with each column's declared parameters.
 ///
-/// Scoring always uses table-wide statistics: every superfile scores a
-/// term against the document count and document frequency aggregated
-/// across the query's manifest snapshot, so a fragmented table ranks
-/// like one corpus.
+/// A term search scores every superfile against the document count and
+/// document frequency aggregated across the superfiles resident in the
+/// query's manifest snapshot, so a fragmented, fully loaded table ranks
+/// like one corpus. Prefix search, and a lazily loaded manifest with no
+/// resident superfiles, score each superfile with its own statistics.
 ///
 /// ```ignore
 /// // OR mode (the default):

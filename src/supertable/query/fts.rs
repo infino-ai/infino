@@ -50,11 +50,15 @@
 //! This is the classical sharded-BM25 problem: IDF computed from each
 //! superfile's own `n_docs` and `df` makes a rare term in a small
 //! superfile score higher than the same term in a larger one, so ranking
-//! would drift as the table fragments. Every query therefore gathers the
+//! would drift as the table fragments. A term search therefore gathers the
 //! corpus-wide document count and per-term document-frequencies once (a
 //! dictionary-only df pass fused with the query's own reads, cached per
 //! manifest generation) and scores every superfile against that single
 //! table-wide IDF, so a fragmented table ranks like one unified corpus.
+//! The count comes from the superfiles resident in the snapshot: on a
+//! lazily loaded manifest with none resident it is zero, and each
+//! superfile falls back to its own statistics, as prefix search always
+//! does.
 //!
 //! Oracle tests assert that a fragmented table reproduces the
 //! single-superfile ranking.

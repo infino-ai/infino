@@ -283,9 +283,10 @@ impl Supertable {
     ///
     /// `opts` ([`Bm25SearchOptions`]) carries the boolean `mode` and an
     /// optional similarity override; `Bm25SearchOptions::new()` is `Or` mode
-    /// with each column's declared parameters. Every segment scores against
-    /// one table-wide idf, so a fragmented table ranks like a single unified
-    /// corpus.
+    /// with each column's declared parameters. On a fully loaded manifest
+    /// every segment scores against one table-wide idf, so a fragmented
+    /// table ranks like a single unified corpus; a lazily loaded manifest
+    /// scores each segment with its own statistics.
     pub fn bm25_search(
         &self,
         column: &str,
