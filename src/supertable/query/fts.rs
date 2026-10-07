@@ -114,8 +114,8 @@ use crate::{
             bm25,
             bm25::Bm25Params,
             reader::{
-                Bm25SearchOptions, ClauseLists, ColumnLengthStats, FetchedTermMemo, GlobalTermIdf,
-                LiveFloor, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses,
+                Bm25SearchOptions, ClauseLists, FetchedTermMemo, GlobalTermIdf, LiveFloor,
+                OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses,
             },
             tokenize::Phrase,
         },
@@ -636,11 +636,6 @@ impl SupertableReader {
             Self::validate_bm25_params(p)?;
         }
         let manifest = self.manifest();
-        // The table-wide collection size for idf. The average document
-        // length needs no such fold: every current-version superfile was
-        // baked at the table-wide average as of its commit and is scored
-        // at what it declares.
-        let corpus = manifest.fts_length_stats(column);
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
 
@@ -766,7 +761,7 @@ impl SupertableReader {
                 true => (None, None),
                 false => {
                     let (map, memos) = self
-                        .global_idf_open_wave(manifest.as_ref(), column, &scored, &kept, corpus)
+                        .global_idf_open_wave(manifest.as_ref(), column, &scored, &kept)
                         .instrument(trace::phase(phases, || {
                             tiered_span!("fts.global_idf", terms = scored.len())
                         }))
@@ -1203,19 +1198,9 @@ impl SupertableReader {
         column: &str,
         terms: &[String],
         kept: &[Arc<SuperfileEntry>],
-        corpus: Option<ColumnLengthStats>,
     ) -> Result<(GlobalTermIdf, PrefetchMemos), QueryError> {
         let mut map = GlobalTermIdf::with_capacity(terms.len());
-        // The collection size idf is computed against: documents that
-        // carry tokens in this column, summed table-wide. It is the
-        // population the per-term document frequencies below are counted
-        // over, so the two have to come from the same corpus — a row
-        // that is null here can never contribute to a `df`, and counting
-        // it in `N` would weight the column's common terms too heavily
-        // against its rare ones. Falls back to the row count when the
-        // totals are unknown.
-        let global_n = corpus.map_or_else(|| manifest.n_docs_total(), |c| c.n_scored_docs);
-        if terms.is_empty() || global_n == 0 {
+        if terms.is_empty() {
             return Ok((map, None));
         }
         // Idf is a pure function of the snapshot, so serve repeat terms
@@ -1235,6 +1220,38 @@ impl SupertableReader {
             .map(|(t, _)| t.clone())
             .collect();
         if misses.is_empty() {
+            return Ok((map, None));
+        }
+        // The collection size idf is computed against: documents that
+        // carry tokens in this column, summed table-wide. It is the
+        // population the per-term document frequencies below are counted
+        // over, so the two have to come from the same corpus — a row
+        // that is null here can never contribute to a `df`, and counting
+        // it in `N` would weight the column's common terms too heavily
+        // against its rare ones. The average document length needs no such
+        // fold: every superfile was baked at the table-wide average as of
+        // its commit and is scored at what it declares.
+        let global_n = manifest
+            .fts_collection_size(column)
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        if global_n == 0 {
+            // No document carries a token in this column, so no term can
+            // match. A kept superfile that declares one contradicts the
+            // total, and scoring it would fall back to its own statistics.
+            let declares_tokens = kept.iter().any(|e| {
+                e.n_docs > 0
+                    && e.fts_summary
+                        .get(column)
+                        .and_then(|s| s.length_stats)
+                        .is_none_or(|ls| ls.n_scored_docs > 0)
+            });
+            if declares_tokens {
+                return Err(QueryError::Internal(format!(
+                    "corpus statistics for column {column:?} count no documents, \
+                     but a searched superfile holds some"
+                )));
+            }
             return Ok((map, None));
         }
 
@@ -5367,7 +5384,7 @@ mod tests {
         let owned: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
         let ((idf, memos), opened) = with_op_stats(|| {
             let (map, memos) = rt
-                .block_on(reader.global_idf_open_wave(manifest, "title", &owned, &entries, None))
+                .block_on(reader.global_idf_open_wave(manifest, "title", &owned, &entries))
                 .expect("wave");
             let opened = crate::runtime_metrics::op_stats::current()
                 .expect("metered")

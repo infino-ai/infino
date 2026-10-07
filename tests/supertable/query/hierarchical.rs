@@ -9,12 +9,18 @@
 //!   - **List-level bloom-union prune.** With a
 //!     storage-backed multi-part manifest, an exact-term
 //!     BM25 query that hits exactly one part's bloom
-//!     union loads only that one part — the others stay
-//!     cold (`OnceCell::get()` is `None`). Term that's
-//!     not in any union prunes everything.
+//!     union scores only that part's superfile. Every
+//!     part is still loaded, because idf weighs terms
+//!     against the whole table's collection size, which
+//!     is summed from every superfile's own summary. A
+//!     term that's not in any union prunes everything and
+//!     loads nothing.
 //!   - **List-level term-range prune (prefix BM25).**
 //!     `bm25_search_prefix` for a prefix that overlaps
 //!     one part's range loads only that part.
+//!   - **Lazy and eager opens score alike.** Term and
+//!     prefix searches, and the average a writer bakes,
+//!     are the same whichever way the manifest was opened.
 //!   - **Vector list-prune deferred but path still
 //!     functional.** `vector_search` loads all
 //!     parts (iterative-cutoff prune is a follow-up); it
@@ -40,6 +46,8 @@ use infino::{
     superfile::{builder::FtsConfig, fts::reader::BoolMode},
     supertable::{
         Supertable, SupertableOptions,
+        manifest::SuperfileUri,
+        query::SuperfileHit,
         storage::{LocalFsStorageProvider, StorageProvider},
     },
     test_helpers::{build_title_batch, default_disk_cache, default_supertable_options},
@@ -88,7 +96,7 @@ fn build_5_parts_with_distinct_terms(storage_dir: &std::path::Path) {
 }
 
 #[test]
-fn bm25_exact_term_loads_only_the_matching_part() {
+fn bm25_exact_term_scores_only_the_matching_part() {
     let dir = TempDir::new().expect("tempdir");
     build_5_parts_with_distinct_terms(dir.path());
 
@@ -122,18 +130,16 @@ fn bm25_exact_term_loads_only_the_matching_part() {
     }
 
     // Search a term that exists only in commit #2's batch
-    // ("echo"). The list-level bloom-union should prune
-    // four parts; we expect exactly one part loaded post-
-    // query.
+    // ("echo"). The list-level bloom-union prunes the four
+    // other parts from scoring.
     let hits = consumer
         .reader()
         .expect("reader")
-        .bm25_search(
+        .bm25_hits(
             "title",
             "echo",
             BM25_TOP_K,
             Bm25SearchOptions::new().with_mode(BoolMode::Or),
-            None,
         )
         .expect("bm25");
     assert!(
@@ -141,17 +147,23 @@ fn bm25_exact_term_loads_only_the_matching_part() {
         "bm25 search should find 'echo' in one of the parts"
     );
 
-    // Post-condition: exactly one OnceCell populated.
-    let r = consumer.reader().expect("reader");
-    let m = r.manifest();
-    let list_entries = m.get_all_list_entries();
-    let n_loaded = list_entries
-        .iter()
-        .filter(|e| m.get_cached_part_by_id(&e.part_id).is_some())
-        .count();
+    // Scoring is confined to the one superfile holding the term.
+    assert_single_superfile(&hits);
+    // The collection size idf weighs the term against is summed from
+    // every superfile's summary, so every part is loaded.
     assert_eq!(
-        n_loaded, 1,
-        "high-selectivity bm25 must load exactly 1 of 5 parts; got {n_loaded}"
+        parts_loaded(&consumer),
+        (HIERARCHICAL_PART_COUNT, HIERARCHICAL_PART_COUNT),
+        "corpus-wide idf reads every part"
+    );
+}
+
+/// Every hit comes from one superfile.
+fn assert_single_superfile(hits: &[SuperfileHit]) {
+    let first = hits.first().expect("at least one hit").superfile;
+    assert!(
+        hits.iter().all(|h| h.superfile == first),
+        "the prune must confine scoring to one superfile"
     );
 }
 
@@ -880,4 +892,183 @@ fn eager_mode_query_paths_observationally_unchanged() {
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("sql");
     assert_eq!(batches.len(), 1);
+}
+
+/// Eager-load threshold above every fixture's part count.
+const EAGER_LOAD_THRESHOLD_FORCE_EAGER: u32 = 100;
+/// Top-k wide enough to return every match in the shared-term fixture.
+const ALL_MATCHES_K: usize = 64;
+/// Score tolerance between two runs over the same table (f32
+/// accumulation order).
+const SCORE_TOLERANCE: f32 = 1e-5;
+
+/// One commit, and so one superfile and one part, per entry. `alpha`
+/// sits in every superfile at a different document frequency and the
+/// files differ in average length, so a superfile weighting terms by its
+/// own statistics scores differently from the table.
+const SHARED_TERM_COMMITS: [&[&str]; 3] = [
+    &["alpha one", "beta two", "gamma three"],
+    &["alpha alpha", "alpha four"],
+    &["delta", "epsilon", "zeta", "eta alpha theta"],
+];
+
+fn build_shared_term_parts(storage: &Arc<dyn StorageProvider>) {
+    let producer = Supertable::create(
+        default_supertable_options()
+            .with_storage(Arc::clone(storage))
+            .with_target_superfiles_per_part(TARGET_SUPERFILES_PER_PART),
+    )
+    .expect("create");
+    for titles in SHARED_TERM_COMMITS {
+        let mut w = producer.writer().expect("writer");
+        w.append(&build_title_batch(titles)).expect("append");
+        w.commit().expect("commit");
+    }
+}
+
+fn open_with_threshold(
+    storage: &Arc<dyn StorageProvider>,
+    cache_dir: &std::path::Path,
+    threshold: u32,
+) -> Supertable {
+    let cache = default_disk_cache(Arc::clone(storage), cache_dir);
+    Supertable::open(
+        default_supertable_options()
+            .with_storage(Arc::clone(storage))
+            .with_eager_load_threshold(threshold)
+            .with_disk_cache(cache),
+    )
+    .expect("open")
+}
+
+/// `(superfile, row, score)` per hit, ordered by position so two runs
+/// compare hit for hit whatever order equal scores came back in.
+fn by_position(hits: Vec<SuperfileHit>) -> Vec<(SuperfileUri, u32, f32)> {
+    let mut out: Vec<_> = hits
+        .into_iter()
+        .map(|h| (h.superfile, h.local_doc_id, h.score))
+        .collect();
+    out.sort_by_key(|(uri, row, _)| (uri.storage_path(), *row));
+    out
+}
+
+fn assert_same_hits(
+    label: &str,
+    got: &[(SuperfileUri, u32, f32)],
+    want: &[(SuperfileUri, u32, f32)],
+) {
+    assert!(!want.is_empty(), "{label}: the fixture must match");
+    assert_eq!(got.len(), want.len(), "{label}: hit count");
+    for (g, w) in got.iter().zip(want) {
+        assert_eq!((g.0, g.1), (w.0, w.1), "{label}: hit identity");
+        assert!(
+            (g.2 - w.2).abs() <= SCORE_TOLERANCE,
+            "{label}: row {:?} scored {}, eager open {}",
+            (g.0, g.1),
+            g.2,
+            w.2
+        );
+    }
+}
+
+/// Every score a search returns, highest first.
+fn ranked_scores(hits: &[SuperfileHit]) -> Vec<f32> {
+    hits.iter().map(|h| h.score).collect()
+}
+
+/// A lazy open holds no superfile entries until a query loads their
+/// parts, yet idf is a table-wide statistic: term and prefix searches
+/// must return the same hits at the same scores as an eager open.
+#[test]
+fn lazy_open_scores_like_an_eager_open() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    build_shared_term_parts(&storage);
+
+    let eager_cache = TempDir::new().expect("cache");
+    let lazy_cache = TempDir::new().expect("cache");
+    let eager = open_with_threshold(
+        &storage,
+        eager_cache.path(),
+        EAGER_LOAD_THRESHOLD_FORCE_EAGER,
+    );
+    let lazy = open_with_threshold(&storage, lazy_cache.path(), EAGER_LOAD_THRESHOLD_FORCE_LAZY);
+    assert!(
+        lazy.reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .is_empty(),
+        "the lazy open holds no entries before the first query"
+    );
+
+    for query in ["alpha", "alpha theta", "+alpha one"] {
+        let search = |st: &Supertable| {
+            by_position(
+                st.reader()
+                    .expect("reader")
+                    .bm25_hits("title", query, ALL_MATCHES_K, Bm25SearchOptions::new())
+                    .expect("bm25"),
+            )
+        };
+        assert_same_hits(query, &search(&lazy), &search(&eager));
+    }
+    for prefix in ["alph", "e"] {
+        let search = |st: &Supertable| {
+            by_position(
+                st.reader()
+                    .expect("reader")
+                    .bm25_search_prefix("title", prefix, ALL_MATCHES_K)
+                    .expect("prefix"),
+            )
+        };
+        assert_same_hits(prefix, &search(&lazy), &search(&eager));
+    }
+}
+
+/// A writer on a lazy open bakes the same table-wide average into its
+/// new superfile as one on an eager open, so the two tables score alike.
+#[test]
+fn lazy_writer_bakes_the_table_wide_average() {
+    let new_commit = ["alpha kappa lambda mu nu xi omicron pi", "rho"];
+    let mut scores = Vec::new();
+    for threshold in [
+        EAGER_LOAD_THRESHOLD_FORCE_EAGER,
+        EAGER_LOAD_THRESHOLD_FORCE_LAZY,
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        build_shared_term_parts(&storage);
+        let writer_cache = TempDir::new().expect("cache");
+        let writer_table = open_with_threshold(&storage, writer_cache.path(), threshold);
+        let mut w = writer_table.writer().expect("writer");
+        w.append(&build_title_batch(&new_commit)).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        drop(writer_table);
+
+        let reader_cache = TempDir::new().expect("cache");
+        let st = open_with_threshold(
+            &storage,
+            reader_cache.path(),
+            EAGER_LOAD_THRESHOLD_FORCE_EAGER,
+        );
+        let hits = st
+            .reader()
+            .expect("reader")
+            .bm25_hits("title", "alpha", ALL_MATCHES_K, Bm25SearchOptions::new())
+            .expect("bm25");
+        scores.push(ranked_scores(&hits));
+    }
+    let (eager, lazy) = (&scores[0], &scores[1]);
+    assert!(!eager.is_empty(), "the fixture must match");
+    assert_eq!(lazy.len(), eager.len(), "hit count");
+    for (l, e) in lazy.iter().zip(eager) {
+        assert!(
+            (l - e).abs() <= SCORE_TOLERANCE,
+            "lazy-written table scored {lazy:?}, eager-written {eager:?}"
+        );
+    }
 }

@@ -49,6 +49,7 @@ use crate::{
     storage::{PrefixedStorageProvider, StorageError},
     superfile::{
         builder::{BuilderOptions, VectorConfig},
+        fts::reader::ColumnLengthStats,
         vector::{kmeans::kmeans, rerank_codec::RerankCodec},
     },
     supertable::{
@@ -259,13 +260,28 @@ pub(super) struct SupertableInner {
 
 impl SupertableInner {
     /// Builder options for a superfile this table is about to commit: the
-    /// static configuration plus the table-wide FTS length statistics as
-    /// of the current manifest, so the new file bakes — and is scored at
-    /// — the corpus average rather than its own.
-    pub(super) fn builder_options(&self) -> BuilderOptions {
+    /// static configuration plus the table-wide FTS length statistics
+    /// `fts_corpus`, so the new file bakes — and is scored at — the corpus
+    /// average rather than its own. Resolve `fts_corpus` with
+    /// [`Self::fts_corpus_stats`].
+    pub(super) fn builder_options(
+        &self,
+        fts_corpus: HashMap<String, ColumnLengthStats>,
+    ) -> BuilderOptions {
         self.options
             .builder_options()
-            .with_fts_corpus_stats(self.manifest.load().fts_corpus_stats(&HashSet::new()))
+            .with_fts_corpus_stats(fts_corpus)
+    }
+
+    /// Table-wide FTS length statistics over every superfile the current
+    /// manifest lists, loading the parts a lazy open left cold.
+    pub(super) async fn fts_corpus_stats(
+        &self,
+    ) -> Result<HashMap<String, ColumnLengthStats>, ManifestLoadError> {
+        self.manifest
+            .load_full()
+            .fts_corpus_stats_loaded(&HashSet::new())
+            .await
     }
 
     /// Runtime driving the sync API's async kernels when the caller
