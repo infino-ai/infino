@@ -4502,10 +4502,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 .get(&entry.storage_path())
                                 .await
                                 .map_err(|e| BuildError::Store(e.to_string()))?;
-                            Arc::new(
-                                SuperfileReader::open(bytes)
-                                    .map_err(|e| BuildError::Store(e.to_string()))?,
-                            )
+                            Arc::new(SuperfileReader::open(bytes).map_err(BuildError::from)?)
                         }
                     };
                     // Write-path materialization: no per-query collector.
@@ -5500,7 +5497,7 @@ async fn open_ivf_reader_with_tombstones(
         ReadIntent::Warm,
     )
     .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
+    .map_err(BuildError::from)?;
     Ok((reader, bitmap))
 }
 
@@ -5622,7 +5619,7 @@ async fn cell_doc_counts_via_reader(
         ReadIntent::Warm,
     )
     .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
+    .map_err(BuildError::from)?;
     let v = reader
         .vec()
         .ok_or_else(|| BuildError::Store("IVF entry missing vector index".into()))?;
@@ -8858,7 +8855,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 entry,
             )
             .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+            .map_err(BuildError::from)?;
             let mut bases = HashMap::new();
             if let Some(vr) = reader.vec() {
                 if let Some(cluster_vecs) = vr.resident_fine_cluster_vectors(column.as_str()) {
@@ -9044,7 +9041,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             entry,
         )
         .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+        .map_err(BuildError::from)?;
         // `None` here is a legacy single-cell layout — skip its depth
         // observation; the finish fallback keeps the previous depth law
         // rather than shallowing it on partial evidence.

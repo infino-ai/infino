@@ -144,6 +144,7 @@ pub infino::OptimizeError::SidecarConflict
 pub infino::OptimizeError::SidecarConflict::existing_compaction_id: uuid::Uuid
 pub infino::OptimizeError::SidecarConflict::superfile_id: uuid::Uuid
 pub infino::OptimizeError::SuperfileNotFound(uuid::Uuid)
+pub infino::OptimizeError::Unsupported(alloc::string::String)
 pub infino::OptimizeError::WalGc(infino::supertable::wal::gc::GcError)
 impl core::convert::From<infino::GcError> for infino::OptimizeError
 pub fn infino::OptimizeError::from(infino::GcError) -> Self
@@ -193,6 +194,7 @@ pub infino::ReindexError::NoStorage
 pub infino::ReindexError::Rewrite
 pub infino::ReindexError::Rewrite::cause: alloc::string::String
 pub infino::ReindexError::Rewrite::superfile_id: uuid::Uuid
+pub infino::ReindexError::Unsupported(alloc::string::String)
 impl core::error::Error for infino::ReindexError
 impl core::fmt::Debug for infino::ReindexError
 pub fn infino::ReindexError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

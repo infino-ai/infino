@@ -128,6 +128,13 @@ pub enum BuildError {
     #[error("superfile store: {0}")]
     Store(String),
 
+    /// A superfile the build reads is in a format this engine does not read
+    /// (see [`QueryError::Unsupported`]). Carried as its own variant rather
+    /// than folded into [`Self::Store`] so the public mapping reports
+    /// `Unsupported` with the message that says how to fix it.
+    #[error("{0}")]
+    Unsupported(String),
+
     /// The storage backend refused the credentials in use. Carried as its own
     /// variant rather than folded into [`Self::Store`] for the same reason as
     /// [`Self::TableGone`] and [`Self::WriteContention`]: a stringified error
@@ -216,10 +223,38 @@ impl BuildError {
 impl From<TermStatsError> for BuildError {
     /// The term-stats pass reaches the build path as `Store` carrying the
     /// message, except a refused credential under it, which keeps its own
-    /// variant so the caller is told to fix the credentials, not to retry.
+    /// variant so the caller is told to fix the credentials, not to retry,
+    /// and a superfile in a format this engine does not read, which keeps
+    /// `Unsupported`.
     fn from(e: TermStatsError) -> Self {
         if e.is_permission_denied() {
             return BuildError::PermissionDenied(e.to_string());
+        }
+        if let TermStatsError::Open(QueryError::Unsupported(m)) = e {
+            return BuildError::Unsupported(m);
+        }
+        BuildError::Store(e.to_string())
+    }
+}
+
+/// A superfile open under a build (a compaction or drain input):
+/// `Unsupported` for a superfile this engine does not read, anything else a
+/// `Store` failure carrying the message.
+impl From<QueryError> for BuildError {
+    fn from(e: QueryError) -> Self {
+        match e {
+            QueryError::Unsupported(m) => BuildError::Unsupported(m),
+            other => BuildError::Store(other.to_string()),
+        }
+    }
+}
+
+/// A superfile a build opened itself: `Unsupported` for a format this engine
+/// does not read, anything else a `Store` failure carrying the message.
+impl From<ReadError> for BuildError {
+    fn from(e: ReadError) -> Self {
+        if e.is_unreadable_format() {
+            return BuildError::Unsupported(e.to_string());
         }
         BuildError::Store(e.to_string())
     }
@@ -463,6 +498,12 @@ pub enum ReindexError {
     /// Reading a superfile to decide whether it is stale failed.
     #[error("failed to assess superfiles: {0}")]
     Assess(String),
+    /// A superfile is in a format this engine does not read, so it can
+    /// neither assess nor rewrite it: a full-text index older than the oldest
+    /// version it reads, or one under a removed analyzer. The message says how
+    /// to bring it forward; retrying cannot help.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
     /// Rewriting one superfile failed. The migration stops here; the
     /// superfiles already rewritten stay rewritten, and re-running picks
     /// up what is left.
@@ -478,6 +519,17 @@ pub enum ReindexError {
         /// What went wrong underneath.
         cause: String,
     },
+}
+
+impl ReindexError {
+    /// An assessment that failed: [`Self::Unsupported`] when a superfile is in
+    /// a format this engine does not read, otherwise [`Self::Assess`].
+    pub(crate) fn assess(e: CompactionError) -> Self {
+        match e {
+            CompactionError::Unsupported(m) => ReindexError::Unsupported(m),
+            other => ReindexError::Assess(other.to_string()),
+        }
+    }
 }
 
 /// Errors raised by [`crate::Supertable::optimize`].
@@ -511,6 +563,12 @@ pub enum OptimizeError {
     /// Building a merged superfile failed.
     #[error("failed to build superfile: {0}")]
     Build(String),
+    /// A superfile to compact is in a format this engine does not read: a
+    /// full-text index older than the oldest version it reads, or one under a
+    /// removed analyzer. The message says how to bring it forward; retrying
+    /// cannot help.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
     /// Committing the compaction to the manifest failed.
     #[error("failed to commit: {0}")]
     Commit(String),
@@ -526,6 +584,14 @@ pub enum OptimizeError {
     /// The post-compaction WAL sweep failed.
     #[error("wal sweep failed during optimize: {0}")]
     WalGc(#[from] crate::supertable::wal::gc::GcError),
+}
+
+/// A build step of optimize that failed, classified as a compaction build
+/// failure is.
+impl From<BuildError> for OptimizeError {
+    fn from(e: BuildError) -> Self {
+        OptimizeError::from(CompactionError::from(e))
+    }
 }
 
 impl From<CompactionError> for OptimizeError {
@@ -549,6 +615,7 @@ impl From<CompactionError> for OptimizeError {
             }
             CompactionError::Seal(s) => OptimizeError::Seal(s),
             CompactionError::Build(s) => OptimizeError::Build(s),
+            CompactionError::Unsupported(s) => OptimizeError::Unsupported(s),
             CompactionError::Commit(s) => OptimizeError::Commit(s),
             CompactionError::Refresh(s) => OptimizeError::Refresh(s),
             CompactionError::AlreadyCompacting => OptimizeError::AlreadyRunning,
@@ -610,6 +677,11 @@ pub(crate) enum CompactionError {
     #[error("failed to build superfile: {0}")]
     Build(String),
 
+    /// An input superfile is in a format this engine does not read (see
+    /// [`QueryError::Unsupported`]); the message says how to fix it.
+    #[error("{0}")]
+    Unsupported(String),
+
     /// Error when committing the compacted superfile. Carries the
     /// rendered cause as a string (see `Build`).
     #[error("failed to commit compaction: {0}")]
@@ -622,6 +694,26 @@ pub(crate) enum CompactionError {
     /// Another compaction is already running on this supertable handle.
     #[error("compaction already in progress on this supertable handle")]
     AlreadyCompacting,
+}
+
+/// A compaction input that failed to build: [`CompactionError::Unsupported`]
+/// for a superfile this engine does not read, otherwise
+/// [`CompactionError::Build`] carrying the message.
+impl From<BuildError> for CompactionError {
+    fn from(e: BuildError) -> Self {
+        match e {
+            BuildError::Unsupported(m) => CompactionError::Unsupported(m),
+            other => CompactionError::Build(other.to_string()),
+        }
+    }
+}
+
+/// A compaction input that failed to open, classified as
+/// `From<BuildError>` classifies it.
+impl From<QueryError> for CompactionError {
+    fn from(e: QueryError) -> Self {
+        CompactionError::from(BuildError::from(e))
+    }
 }
 
 /// Errors raised by [`crate::Supertable::gc`].

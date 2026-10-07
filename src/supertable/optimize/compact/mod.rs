@@ -660,7 +660,7 @@ impl Supertable {
                 false => tombstones.get(&superfile_id).map(Arc::clone),
             };
 
-            let reader = reader.map_err(|e| BuildError::Store(e.to_string()))?;
+            let reader = reader.map_err(BuildError::from)?;
             let superseded = superseded_map
                 .and_then(|m| m.get(&superfile_id))
                 .cloned()
@@ -858,7 +858,7 @@ impl Supertable {
             Err(BuildError::NoDocsToBuild) => None,
             Err(e) => {
                 unseal_all(&wal_store, sealed).await;
-                return Err(CompactionError::Build(e.to_string()));
+                return Err(CompactionError::from(e));
             }
         };
 

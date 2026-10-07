@@ -395,6 +395,8 @@ impl From<SupertableBuildError> for InfinoError {
             | SupertableBuildError::ReservedPrefixInColumnName(_)
             | SupertableBuildError::BatchSchemaMismatch
             | SupertableBuildError::PartitionColumnMissing(_) => InfinoError::Schema,
+            // An input superfile in a format this engine does not read.
+            SupertableBuildError::Unsupported(_) => InfinoError::Unsupported,
             // A commit that found its table dropped and purged: the name no
             // longer resolves, the same answer the read path gives.
             SupertableBuildError::TableGone => InfinoError::NotFound,

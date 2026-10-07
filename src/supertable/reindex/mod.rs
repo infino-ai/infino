@@ -453,7 +453,7 @@ impl Supertable {
                 }
             });
             for (entry, reader) in join_all(opens).await {
-                let reader = reader.map_err(|e| CompactionError::Build(e.to_string()))?;
+                let reader = reader.map_err(CompactionError::from)?;
                 let offsets = entry.subsection_offsets.as_ref();
                 let has_duplicated_region_keys = match footer_state(&reader, offsets) {
                     FooterState::Sound => false,
@@ -515,7 +515,7 @@ impl Supertable {
         let assessment = self
             .stale_superfiles()
             .await
-            .map_err(|e| ReindexError::Assess(e.to_string()))?;
+            .map_err(ReindexError::assess)?;
         // The same planner the run drives, so the two cannot disagree.
         Ok(plan_jobs(&assessment.stale, opts.mode)
             .into_iter()
@@ -570,7 +570,7 @@ impl Supertable {
         } = self
             .stale_superfiles()
             .await
-            .map_err(|e| ReindexError::Assess(e.to_string()))?;
+            .map_err(ReindexError::assess)?;
 
         let mut report = StalenessReport {
             superfiles,
@@ -662,7 +662,7 @@ impl Supertable {
         } = self
             .stale_superfiles()
             .await
-            .map_err(|e| ReindexError::Assess(e.to_string()))?;
+            .map_err(ReindexError::assess)?;
         if !inconsistent_footers.is_empty() {
             warn!(
                 "[supertable reindex] {} superfile(s) have a footer that places a \
@@ -735,6 +735,7 @@ impl Supertable {
                 // and the job. Its staleness went with it, so there is
                 // nothing here to repair and nothing to report.
                 Err(CompactionError::SuperfileNotFound(_)) => continue,
+                Err(CompactionError::Unsupported(m)) => return Err(ReindexError::Unsupported(m)),
                 Err(e) => {
                     return Err(ReindexError::Rewrite {
                         superfile_id,
