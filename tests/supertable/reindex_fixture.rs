@@ -160,6 +160,23 @@ pub(crate) fn append_docs(table: &Supertable, docs: Range<u32>) {
         .expect("append one superfile");
 }
 
+/// Create the fixture table, empty, in `db`.
+pub(crate) fn create_fixture_table(db: &Connection) -> Supertable {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("body", DataType::LargeUtf8, false),
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("notes", DataType::LargeUtf8, true),
+        embedding_field(),
+    ]));
+    let spec = IndexSpec::new()
+        .fts(FtsField::new("body"))
+        .fts(FtsField::new("title").positions(true))
+        .fts(FtsField::new("notes"))
+        .vector("emb", EMBEDDING_DIM, Metric::Cosine);
+    db.create_table(TABLE, schema, spec)
+        .expect("create the fixture table")
+}
+
 /// Write the fixture table under `root`, make it stale as `staleness`
 /// says, and return how many superfiles it holds.
 pub(crate) fn write_stale_table(root: &Path, staleness: Staleness) -> usize {
@@ -172,21 +189,8 @@ pub(crate) fn write_stale_table(root: &Path, staleness: Staleness) -> usize {
 
 /// Write the fixture table, current, under `root`.
 pub(crate) fn write_table(root: &Path) {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("body", DataType::LargeUtf8, false),
-        Field::new("title", DataType::LargeUtf8, false),
-        Field::new("notes", DataType::LargeUtf8, true),
-        embedding_field(),
-    ]));
-    let spec = IndexSpec::new()
-        .fts(FtsField::new("body"))
-        .fts(FtsField::new("title").positions(true))
-        .fts(FtsField::new("notes"))
-        .vector("emb", EMBEDDING_DIM, Metric::Cosine);
     let db = connect(root.to_str().expect("utf-8 path")).expect("connect");
-    let table = db
-        .create_table(TABLE, Arc::clone(&schema), spec)
-        .expect("create the fixture table");
+    let table = create_fixture_table(&db);
     // One append per superfile, so the count never depends on how a
     // single append splits on this machine.
     let per_append = N_DOCS / MIN_SUPERFILES as u32;

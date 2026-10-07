@@ -14,15 +14,16 @@ use std::{collections::HashMap, fs, time::Duration};
 use bytes::Bytes;
 use futures::executor::block_on;
 use infino::{
-    ReindexMode, ReindexOptions, ReindexTarget, SuperfileIndex,
+    ReindexMode, ReindexOptions, ReindexTarget, SuperfileIndex, Supertable, connect,
     superfile::{SuperfileReader, VectorSearchOptions, format::kv},
     supertable::manifest::SuperfileEntry,
 };
+use tempfile::TempDir;
 
 use crate::reindex_fixture::{
-    N_DOCS, Staleness, append_docs, assert_scores_equivalent, file_revisions, first_region, hits,
-    hits_k, open_stale, probe_embedding, raw_footer_kvs, repairing, scores_by_id, table_dir,
-    vector_hits,
+    N_DOCS, Staleness, TABLE, append_docs, assert_scores_equivalent, create_fixture_table,
+    file_revisions, first_region, hits, hits_k, open_stale, probe_embedding, raw_footer_kvs,
+    repairing, scores_by_id, table_dir, vector_hits,
 };
 
 /// Neighbours a footer-only open is probed for, matching the table-level
@@ -31,6 +32,41 @@ const FOOTER_PROBE_NEIGHBOURS: usize = 16;
 
 /// Documents appended beside the fixture's own to make a mixed table.
 const APPENDED_DOCS: u32 = 2;
+
+/// Asserts `table` has nothing to repair under any mode: staleness reports
+/// it current and every plan is empty.
+fn assert_nothing_to_repair(table: &Supertable, when: &str) {
+    for options in [
+        ReindexOptions::default(),
+        ReindexOptions::rewriting(),
+        ReindexOptions::reanalyzing(),
+    ] {
+        let staleness = table.index_staleness(&options).expect("assess the table");
+        assert!(staleness.is_current(), "{when}: {staleness:?}");
+        let plan = table.reindex_plan(&options).expect("plan");
+        assert!(plan.is_empty(), "{when}: {plan:?}");
+    }
+}
+
+/// A table this engine writes is current from creation on, and stays so
+/// across appends and a fresh open.
+#[test]
+fn a_freshly_written_table_has_nothing_to_repair() {
+    let dir = TempDir::new().expect("tempdir");
+    let uri = dir.path().to_str().expect("utf-8 path");
+    let table = create_fixture_table(&connect(uri).expect("connect"));
+    assert_nothing_to_repair(&table, "created");
+
+    append_docs(&table, 0..N_DOCS / 2);
+    append_docs(&table, N_DOCS / 2..N_DOCS);
+    assert_nothing_to_repair(&table, "appended");
+
+    let reopened = connect(uri)
+        .expect("connect again")
+        .open_table(TABLE)
+        .expect("reopen");
+    assert_nothing_to_repair(&reopened, "reopened");
+}
 
 /// A repair brings every superfile current, changes no answer, and a
 /// second run has nothing to do.
