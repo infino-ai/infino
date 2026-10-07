@@ -1380,20 +1380,21 @@ impl TableProvider for SupertableProvider {
         // limit agree.
         let effective_limit = if filters.is_empty() { limit } else { None };
 
-        // Tier 2 - DataFusion's row-group and page pruning. Per superfile, each
-        // `WHERE` conjunct takes one of three paths, decided by the plan above,
-        // not by column kind:
+        // Tier 2 - DataFusion's row-group and page pruning. How a `WHERE`
+        // reaches the rows, per superfile:
         //
-        //   bounded                  scanned                      exact
-        //   the index bounds its     the index cannot bound it,   the term dictionary
-        //   rows within the gate     or the bound is over the     answers it in full
-        //                            gate (a dense FTS `IN`)
-        //        │                          │                            │
-        //   access plan selects      scan decodes every row       access plan selects
-        //   the candidate rows       statistics could not prune   exactly its rows
-        //        │                          │                            │
-        //   FilterExec re-checks     FilterExec checks it         nothing checks it
-        //   the predicate                                         again
+        //   exact predicates                  the rest
+        //   (`title ILIKE '%rust%'`)          (`title = 'rust'`, `price > 5`)
+        //          │                                  │
+        //   provider picks exactly           index narrows the rows enough?
+        //   their rows                         yes: only the candidate rows
+        //          │                           no:  every row the statistics keep
+        //          └──────────────┬───────────────────┘
+        //                         ▼
+        //               scan decodes those rows
+        //                         ▼
+        //               FilterExec checks the rest
+        //               (exact ones are not checked again)
         //
         // No predicate is attached to the source. DataFusion hands it the
         // `FilterExec` predicate for statistics pruning only; it never runs as
