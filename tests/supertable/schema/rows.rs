@@ -219,19 +219,20 @@ fn every_refusal_names_the_schema_write_that_admits_the_rows() {
     docs.append_rows(&[json!({"title": "a", "n": 1})])
         .expect("n is Int64 from here");
 
-    // A fraction is refused on an Int64 path, and a retype to Float64 admits
-    // it. `5.0` and `"42"` are not fractions: JSON has one number type, so a
-    // producer that round-trips through a double writes the first and one
-    // avoiding a double's precision loss writes the second. Both name the
-    // integer they wrote, and are stored as it.
+    // A fraction, `5.0` and a string are all refused on an Int64 path, and
+    // a retype to Float64 admits the numbers.
     schema_error(
         docs.append_rows(&[json!({"title": "b", "n": 1.5})]),
         "Int64",
     );
-    docs.append_rows(&[json!({"title": "i", "n": 5.0})])
-        .expect("`5.0` names the integer 5");
-    docs.append_rows(&[json!({"title": "j", "n": "42"})])
-        .expect("`\"42\"` names the integer 42");
+    schema_error(
+        docs.append_rows(&[json!({"title": "b", "n": 5.0})]),
+        "Int64",
+    );
+    schema_error(
+        docs.append_rows(&[json!({"title": "b", "n": "42"})]),
+        "Int64",
+    );
     db.apply_schema(
         TABLE,
         &SchemaPatch::new(vec![FieldPatch::named("n").with_type(DataType::Float64)]),
@@ -243,7 +244,7 @@ fn every_refusal_names_the_schema_write_that_admits_the_rows() {
         json!({"title": "c", "n": 5}),
     ])
     .expect("floats and integral literals fit a Float64 column");
-    assert_eq!(column(&db, "n"), vec!["1", "5", "42", "1.5", "5"]);
+    assert_eq!(column(&db, "n"), vec!["1", "1.5", "5"]);
 
     // A mixed array is refused outright.
     schema_error(

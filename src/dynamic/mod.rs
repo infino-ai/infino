@@ -580,13 +580,7 @@ fn resolve_type(column: &Column<'_>, kind: Kind, target: Option<&DataType>) -> D
     }
     let values = || column.values();
     let element = match (kind, scalar_target) {
-        // `Kind::Float` and `Kind::Str` reach an integer column too: `1.0` and
-        // `"42"` name integers, and `int_fits` reads all three spellings.
-        (Kind::Int | Kind::Float | Kind::Str, Some(t))
-            if is_integer_type(t) && values().all(|v| int_fits(v, t)) =>
-        {
-            t.clone()
-        }
+        (Kind::Int, Some(t)) if is_integer_type(t) && values().all(|v| int_fits(v, t)) => t.clone(),
         (Kind::Int, Some(DataType::Float64)) if values().all(int_exact_in_f64) => DataType::Float64,
         // A float literal into an `f32` column is a request to round: that is
         // what the narrower column is for, and refusing `0.1` because it is
@@ -612,13 +606,6 @@ fn resolve_type(column: &Column<'_>, kind: Kind, target: Option<&DataType>) -> D
             if values().all(|v| decimal_fits(v, *precision, *scale, DECIMAL256_DIGITS)) =>
         {
             t.clone()
-        }
-        // After the text arm above, so a number in a text column stays text.
-        (Kind::Str, Some(DataType::Float64)) if values().all(|v| as_number(v).is_some()) => {
-            DataType::Float64
-        }
-        (Kind::Str, Some(DataType::Float32)) if values().all(float_in_f32_range) => {
-            DataType::Float32
         }
         (Kind::Str, Some(t @ DataType::Timestamp(_, _)))
             if values().all(|v| parses_as_time_in(v, timestamp_zone(Some(t)))) =>
@@ -668,33 +655,6 @@ fn as_i128(value: &Value) -> Option<i128> {
     n.as_i64()
         .map(i128::from)
         .or_else(|| n.as_u64().map(i128::from))
-}
-
-/// The integer `value` names: an integer literal, a float literal with no
-/// fractional part, or a string spelling one.
-///
-/// JSON has one number type, so a producer that round-trips through a double
-/// writes `1.0` where it means `1`, and one avoiding a double's precision
-/// loss writes `"9007199254740993"`. Both named the integer they wrote. A
-/// float past the mantissa is not an exact integer at all and is left to the
-/// float path.
-fn as_integer(value: &Value) -> Option<i128> {
-    if let Some(n) = as_i128(value) {
-        return Some(n);
-    }
-    if let Some(text) = value.as_str() {
-        return text.trim().parse::<i128>().ok();
-    }
-    let float = value.as_f64()?;
-    (float.fract() == 0.0 && float.abs() <= F64_EXACT_INT_BOUND as f64).then_some(float as i128)
-}
-
-/// The number `value` names: a numeric literal, or a string spelling one.
-fn as_number(value: &Value) -> Option<f64> {
-    match value.as_f64() {
-        Some(float) => Some(float),
-        None => value.as_str()?.trim().parse::<f64>().ok(),
-    }
 }
 
 /// The unscaled integer `value` names in a decimal column of `scale`, as a
@@ -766,7 +726,7 @@ fn decimal_fits(value: &Value, precision: u8, scale: i8, max_digits: u32) -> boo
 }
 
 fn int_fits(value: &Value, t: &DataType) -> bool {
-    let Some(v) = as_integer(value) else {
+    let Some(v) = as_i128(value) else {
         return false;
     };
     match t {
@@ -783,14 +743,14 @@ fn int_fits(value: &Value, t: &DataType) -> bool {
 }
 
 fn int_exact_in_f64(value: &Value) -> bool {
-    as_integer(value).is_some_and(|v| v.abs() <= F64_EXACT_INT_BOUND)
+    as_i128(value).is_some_and(|v| v.abs() <= F64_EXACT_INT_BOUND)
 }
 
 /// The integer `value` holds when it is one `f64` cannot carry exactly.
 /// A float literal is not an integer and is left alone: it arrived as an
 /// `f64` and is stored as the one it arrived as.
 fn inexact_in_f64(value: &Value) -> Option<i128> {
-    as_integer(value).filter(|v| v.abs() > F64_EXACT_INT_BOUND)
+    as_i128(value).filter(|v| v.abs() > F64_EXACT_INT_BOUND)
 }
 
 /// The element type of a list type, or the type itself when it is not a
@@ -807,7 +767,7 @@ fn element_of(data_type: &DataType) -> &DataType {
 /// Whether the integer `value` holds is one `f32` carries exactly. The
 /// mantissa is 24 bits, so this is the `f32` twin of [`int_exact_in_f64`].
 fn int_exact_in_f32(value: &Value) -> bool {
-    as_integer(value).is_some_and(|v| v.abs() <= F32_EXACT_INT_BOUND)
+    as_i128(value).is_some_and(|v| v.abs() <= F32_EXACT_INT_BOUND)
 }
 
 /// Whether `value` survives narrowing to `f32`. Rounding a coordinate to
@@ -816,7 +776,7 @@ fn int_exact_in_f32(value: &Value) -> bool {
 /// nonzero value collapses to zero. Either one is a different number
 /// rather than a coarser one, so the column does not take it.
 fn float_in_f32_range(value: &Value) -> bool {
-    as_number(value).is_some_and(|v| {
+    value.as_f64().is_some_and(|v| {
         let narrowed = v as f32;
         narrowed.is_finite() && (narrowed != 0.0 || v == 0.0)
     })
@@ -1065,7 +1025,7 @@ fn build_scalar_array(
         ($array:ty, $native:ty) => {{
             let mut out: Vec<Option<$native>> = Vec::with_capacity(values.len());
             for value in values {
-                match value.and_then(as_integer) {
+                match value.and_then(as_i128) {
                     None => out.push(None),
                     Some(n) => match <$native>::try_from(n) {
                         Ok(n) => out.push(Some(n)),
@@ -1100,13 +1060,13 @@ fn build_scalar_array(
         DataType::Float32 => Arc::new(Float32Array::from(
             values
                 .iter()
-                .map(|v| (*v).and_then(as_number).map(|f| f as f32))
+                .map(|v| v.and_then(Value::as_f64).map(|f| f as f32))
                 .collect::<Vec<_>>(),
         )),
         DataType::Float64 => Arc::new(Float64Array::from(
             values
                 .iter()
-                .map(|v| (*v).and_then(as_number))
+                .map(|v| v.and_then(Value::as_f64))
                 .collect::<Vec<_>>(),
         )),
         DataType::Utf8 => Arc::new(StringArray::from(
@@ -1382,21 +1342,14 @@ mod tests {
         );
         resolve_batch(&batch, &t, "_id").expect("stored");
 
-        // A fractional literal on an Int64 path is typed Float64, and the
-        // resolver refuses it.
-        let batch = rows_to_batch(&[json!({"n": 1.5})], &t).expect("map");
-        assert!(matches!(
-            resolve_batch(&batch, &t, "_id"),
-            Err(SchemaError::TypeMismatch { column, .. }) if column == "n"
-        ));
-        // `5.0` and `"42"` name the integer 5 and the integer 42: JSON has
-        // one number type, so a producer that round-trips through a double
-        // writes the first and one avoiding a double's precision loss writes
-        // the second. Both are stored as the integer they name.
-        for row in [json!({"n": 5.0}), json!({"n": "42"})] {
+        // A float literal on an Int64 path is typed Float64, and the
+        // resolver refuses it; so is `5.0`, and a string on a numeric path.
+        for row in [json!({"n": 1.5}), json!({"n": 5.0}), json!({"n": "42"})] {
             let batch = rows_to_batch(&[row], &t).expect("map");
-            assert_eq!(types(&batch)["n"], DataType::Int64);
-            resolve_batch(&batch, &t, "_id").expect("stored");
+            assert!(matches!(
+                resolve_batch(&batch, &t, "_id"),
+                Err(SchemaError::TypeMismatch { column, .. }) if column == "n"
+            ));
         }
         // 2^53 + 1 is not exact in Float64, so it stays an integer and is
         // refused on a Float64 path; 2^53 is stored.
@@ -1861,40 +1814,6 @@ mod tests {
         ));
     }
 
-    /// JSON has one number type, so a producer that round-trips through a
-    /// double writes `1.0` where it means `1`, and one avoiding a double's
-    /// precision loss quotes the integer. Both name the integer they wrote.
-    #[test]
-    fn an_integer_column_takes_the_float_and_string_spellings() {
-        let t = table(vec![("n", DataType::Int64)]);
-        for sent in [json!(1.0), json!("42"), json!(7)] {
-            let batch = rows_to_batch(&[json!({"n": sent})], &t)
-                .unwrap_or_else(|e| panic!("{sent} should map: {e}"));
-            assert_eq!(types(&batch)["n"], DataType::Int64, "{sent}");
-        }
-        let batch = rows_to_batch(&[json!({"n": "42"})], &t).expect("maps");
-        assert_eq!(col(&batch, "n").as_primitive::<Int64Type>().value(0), 42);
-    }
-
-    /// Quoting an integer is how a producer avoids a double's precision
-    /// loss, so a quoted one past the mantissa is held to the same bar an
-    /// unquoted one is: storing it in a float column would round it, which
-    /// is the loss the quoting was avoiding.
-    #[test]
-    fn a_quoted_integer_past_the_mantissa_is_refused_by_a_float_column() {
-        let t = table(vec![("f", DataType::Float64)]);
-        let err = rows_to_batch(&[json!({"f": "9007199254740993"})], &t)
-            .expect_err("the integer would be rounded");
-        assert!(
-            matches!(
-                &err,
-                SchemaError::IntegerNotExactInFloat { column, value, .. }
-                    if column == "f" && *value == 9_007_199_254_740_993
-            ),
-            "{err:?}"
-        );
-    }
-
     /// A fractional literal is not an integer, and is left to be refused as
     /// the type disagreement it is rather than truncated.
     #[test]
@@ -1915,6 +1834,34 @@ mod tests {
         let t = table(vec![("s", DataType::LargeUtf8)]);
         let batch = rows_to_batch(&[json!({"s": "42"})], &t).expect("maps");
         assert_eq!(types(&batch)["s"], DataType::LargeUtf8);
+    }
+
+    /// A quoted number is a string, on a numeric column as anywhere else.
+    /// The engine stores the literal kind the caller wrote; the exceptions
+    /// are the types JSON cannot spell at all, where a string is the only
+    /// transport there is: a timestamp, a date, and a decimal.
+    #[test]
+    fn a_quoted_number_is_not_a_number() {
+        for column in [DataType::Int64, DataType::Float64, DataType::Float32] {
+            let t = table(vec![("n", column.clone())]);
+            let batch = rows_to_batch(&[json!({"n": "42"})], &t).expect("map");
+            assert_eq!(types(&batch)["n"], DataType::LargeUtf8, "{column}");
+            assert!(
+                matches!(
+                    resolve_batch(&batch, &t, "_id"),
+                    Err(SchemaError::TypeMismatch { column: c, .. }) if c == "n"
+                ),
+                "{column}"
+            );
+        }
+        // The exceptions: a quoted decimal and a quoted timestamp are read.
+        let decimal = table(vec![("d", DataType::Decimal128(10, 2))]);
+        rows_to_batch(&[json!({"d": "12.34"})], &decimal).expect("a quoted decimal is read");
+        let stamp = table(vec![(
+            "at",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        )]);
+        rows_to_batch(&[json!({"at": "2024-01-15"})], &stamp).expect("a quoted date is read");
     }
 
     /// A string on a path the table does not have is still a string: the
