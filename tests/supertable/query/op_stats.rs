@@ -43,6 +43,11 @@ const DOCS_PER_SEGMENT: usize = 40;
 const RAYON_POOL_THREADS: usize = 2;
 /// Top-k ≥ the corpus size so no assertion depends on ranking cutoffs.
 const TOP_K: usize = 128;
+/// Ranges a query plans per superfile for its term dictionary: one fetch.
+const DICT_RANGES_PER_SUPERFILE: u64 = 1;
+/// Ranges a one-term query plans per superfile: the dictionary fetch
+/// plus the term's posting range.
+const ONE_TERM_RANGES_PER_SUPERFILE: u64 = DICT_RANGES_PER_SUPERFILE + 1;
 
 /// Schema `[title (FTS, no positions)]` — the smallest corpus that
 /// exercises the full multi-superfile BM25 fan-out.
@@ -214,7 +219,7 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
     // Per superfile: one dictionary fetch + one PFOR posting range.
     assert_eq!(
         one_term.planned_read_ranges,
-        2 * n_superfiles,
+        ONE_TERM_RANGES_PER_SUPERFILE * n_superfiles,
         "single term = dict + posting range per superfile"
     );
     let (_, three_terms) = with_op_stats(|| {
@@ -231,7 +236,7 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
     // Per superfile: one dictionary fetch + three PFOR posting ranges.
     assert_eq!(
         three_terms.planned_read_ranges,
-        4 * n_superfiles,
+        (DICT_RANGES_PER_SUPERFILE + 3) * n_superfiles,
         "three PFOR terms = dict + three posting ranges per superfile"
     );
 }
@@ -282,7 +287,7 @@ fn planned_ranges(st: &Supertable, q: &str, mode: BoolMode) -> u64 {
 fn or_query_df_gather_plans_no_extra_ranges() {
     let st = demo_two_superfiles();
     let n_superfiles = st.reader().expect("reader").n_superfiles() as u64;
-    let own_work = 2 * n_superfiles;
+    let own_work = ONE_TERM_RANGES_PER_SUPERFILE * n_superfiles;
 
     assert_eq!(
         planned_ranges(&st, "rust", BoolMode::Or),
@@ -304,7 +309,8 @@ fn or_query_df_gather_plans_no_extra_ranges() {
     w.commit().expect("commit seg3");
     drop(w);
 
-    let own_work_after = 2 * st.reader().expect("reader").n_superfiles() as u64;
+    let own_work_after =
+        ONE_TERM_RANGES_PER_SUPERFILE * st.reader().expect("reader").n_superfiles() as u64;
     assert_eq!(
         planned_ranges(&st, "rust", BoolMode::Or),
         own_work_after,
