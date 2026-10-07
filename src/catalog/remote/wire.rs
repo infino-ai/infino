@@ -67,9 +67,10 @@ fn param_as_f64(v: f32) -> f64 {
 /// the stored score bounds, and a server that filled in its own default
 /// would build bounds the client never asked for.
 ///
-/// Every column is analyzed by `standard`; a stopword set and a stemmer
-/// ride as their own `stopwords` / `stemmer` keys, each emitted only when
-/// set. A server that does not implement a named filter must reject the
+/// Every column is analyzed by `standard`, the only analyzer, so no
+/// `analyzer` key is sent and the server has none other to fill in. A
+/// stopword set and a stemmer ride as their own `stopwords` / `stemmer`
+/// keys, each emitted only when set. A server that does not implement a named filter must reject the
 /// request rather than build a table analyzed differently than the
 /// client asked for — which is the request schema's job
 /// (`additionalProperties: false`), not something an encoding trick in

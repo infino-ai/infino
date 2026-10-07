@@ -7,14 +7,17 @@
 //! columns and on `finish_to<W>` emits the on-disk FTS blob:
 //!
 //! ```text
-//!   header (48 bytes)
-//!   term dictionary  + CRC32C
-//!   postings region      + CRC32C
-//!   doc-lengths directory   + CRC32C
+//!   header (56 bytes)
+//!   term dictionary                + CRC32C
+//!   postings region                + CRC32C
+//!   positions region               + CRC32C  (empty without positions)
+//!   doc-id map                     + CRC32C  (V8 only)
+//!   doc-lengths directory          + CRC32C
 //!   per-column doc-lengths arrays  (each + its own CRC32C)
 //! ```
 //!
-//! See `docs/architecture/superfile.md` for the full byte-level spec.
+//! `format::fts` documents each region; `docs/architecture/superfile.md`
+//! has the full byte-level spec.
 //!
 //! ## Build architecture
 //!
@@ -47,17 +50,18 @@
 //!   are read as fixed-size triples, sorted by
 //!   `(lex_rank[term_id], doc_id)` (pdqsort over `[(u32, u32,
 //!   u32)]` — pure u32 compares, no `&[u8]` chasing), then
-//!   k-way-merged into global lex order. The term dictionary is built
-//!   *streaming* via [`StreamingDictBuilder`] writing to a scratch
-//!   file, using `id_to_term[term_id]` to recover the term bytes
-//!   per emission. Final blob assembly is `header → dictionary scratch →
-//!   posting scratch → doc-lengths`, all streamed through `W`.
+//!   k-way-merged into global lex order. The term dictionary is
+//!   streamed by a `TermBlockWriter` to a scratch file, using
+//!   `id_to_term[term_id]` to recover the term bytes per emission.
+//!   Final blob assembly is `header → dictionary scratch → posting
+//!   scratch → positions → doc-id map → doc-lengths`, all streamed
+//!   through `W`.
 //!
 //! Mirror of vector: vector spills its input corpus as raw f32
 //! bytes past 256 MiB and streams its centroid+code layout to
 //! scratch; FTS spills its posting accumulator as fixed 12-byte
-//! triples past 256 MiB and streams its term dictionary + posting region to
-//! scratch. Both bound peak resident memory by a formula that does
+//! triples past 256 MiB and streams its term dictionary + posting
+//! region to scratch. Both bound peak resident memory by a formula that does
 //! not include `n_docs`, and both use fixed-size, no-framing record
 //! formats so the spill IO is allocator-free on the read side.
 //!
