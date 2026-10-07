@@ -53,22 +53,18 @@
 //!
 //! ## Tokenizer scope: per-column
 //!
-//! `BuilderOptions` carries a default `tokenizer: Option<Arc<dyn
-//! Tokenizer>>` (required when any FTS column exists) plus a
-//! per-column `fts_tokenizers` vec aligned to `fts_columns`; the
-//! default seeds every column unless an entry overrides it.
-//! `FtsConfig` itself carries only the column name and its positions
-//! flag. `FtsBuilder` holds the default tokenizer and a parallel
-//! `column_tokenizers` vec — `register_column` uses the default,
-//! `register_column_with_tokenizer` sets a per-column analyzer — and
-//! dispatches per (column, doc) at `add_doc` time.
+//! Each `FtsConfig` in `BuilderOptions::fts_columns` names its column's
+//! stopword set and stemmer. The builder turns that into the column's
+//! analysis chain — the Unicode-aware `StandardTokenizer` plus those
+//! filters — and registers it with `register_column_with_tokenizer`;
+//! `FtsBuilder` keeps one tokenizer per column and dispatches per
+//! (column, doc) at `add_doc` time.
 //!
-//! Every column is analyzed by the Unicode-aware `StandardTokenizer`
-//! plus its optional stopword set and stemmer. The `inf.fts.columns`
-//! JSON persists each column's filters, so a column is re-tokenized at
-//! rebuild / compaction with the analysis it was indexed with. Further
-//! analyzers implement the `Tokenizer` trait and need no change to this
-//! plumbing.
+//! The `inf.fts.columns` JSON persists each column's filters, so a
+//! column is re-tokenized at rebuild / compaction with the analysis it
+//! was indexed with. Further analyzers implement the `Tokenizer` trait
+//! and need no change to this plumbing.
+
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
@@ -109,7 +105,6 @@ use crate::{
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
             reorder::{ForwardIndex, bisect_order},
             sorted_merge::SortedInput,
-            tokenize::StandardTokenizer,
         },
         id_space::{FtsDocId, RowId, StableId},
         ids,
@@ -1048,9 +1043,7 @@ impl SuperfileBuilder {
         let fts_builder = if opts.fts_columns.is_empty() {
             None
         } else {
-            // The constructor's default tokenizer is irrelevant: every
-            // column below registers its own analyzer explicitly.
-            let mut fb = FtsBuilder::new(Arc::new(StandardTokenizer));
+            let mut fb = FtsBuilder::new();
             for fc in &opts.fts_columns {
                 // The whole chain, not just the base: a column that
                 // declares a stopword set or a stemmer must be indexed
@@ -5508,9 +5501,7 @@ mod tests {
     /// document. The failure is silent: every id involved is in range.
     #[test]
     fn remap_by_blob_id_rekeys_a_row_remap_by_the_inputs_own_doc_ids() {
-        use crate::superfile::fts::{
-            builder::FtsBuilder, reader::FtsReader, tokenize::StandardTokenizer,
-        };
+        use crate::superfile::fts::{builder::FtsBuilder, reader::FtsReader};
 
         const JSON: &str = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         /// `map[blob doc id] = row`, a permutation that moves every
@@ -5518,7 +5509,7 @@ mod tests {
         const MAP: [u32; 8] = [3, 1, 7, 0, 5, 2, 6, 4];
 
         let reader_over = |doc_map: Option<Vec<u32>>| {
-            let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+            let mut b = FtsBuilder::new();
             b.register_column("body".into(), false).expect("register");
             for id in 0..MAP.len() as u32 {
                 b.add_doc(0, id, "alpha").expect("add doc");
@@ -5898,7 +5889,7 @@ mod tests {
         );
         let docs = SORTED_MERGE_INPUT_DOCS[1];
         let input = merge_input(&opts, 0, &sorted_merge_docs(0, 0, docs));
-        let mut fb = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut fb = FtsBuilder::new();
         fb.register_column("title".into(), false).expect("register");
         fb.add_doc(0, 0, "hello").expect("add doc");
         fb.set_sorted_inputs(vec![SortedInput {

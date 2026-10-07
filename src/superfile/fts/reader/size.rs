@@ -512,12 +512,11 @@ impl fmt::Display for FtsSizeBreakdown {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use bytes::Bytes;
 
     use super::*;
-    use crate::superfile::fts::{builder::FtsBuilder, tokenize::StandardTokenizer};
+    use crate::superfile::fts::builder::FtsBuilder;
 
     #[test]
     fn patched_form_is_granted_only_under_the_posting_cap() {
@@ -526,7 +525,7 @@ mod tests {
         // carry one large delta among small ones, exactly the shape the
         // patched form is for. `rare` sits under the cap and takes it;
         // `common` is over it and stays plain, the histograms tally.
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("text".into(), false).expect("register");
         for i in 0..24_000u32 {
             let in_hole = i % 4_000 >= 3_000;
@@ -590,7 +589,7 @@ mod tests {
 
     #[test]
     fn every_postings_byte_is_attributed_and_forms_are_told_apart() {
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), true).expect("register");
         // `only` inlines (df=1, tf=1); `pair` is short (df=2); `every`
         // spans two blocks (long form).

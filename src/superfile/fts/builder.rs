@@ -63,7 +63,7 @@
 //!
 //! ## Builder lifecycle
 //!
-//! 1. `FtsBuilder::new(tokenizer)` — empty builder.
+//! 1. `FtsBuilder::new()` — empty builder.
 //! 2. `register_column(name, false)` per FTS column, in declaration order.
 //! 3. `add_doc(column_id, local_doc_id, text)` per `(doc, column)` pair.
 //!    Caller passes monotonically-increasing `local_doc_id`s.
@@ -1285,10 +1285,6 @@ fn open_partition_sorted<const N: usize>(
 }
 
 pub struct FtsBuilder {
-    /// Tokenizer applied to columns registered via
-    /// [`Self::register_column`] (the default). Per-column overrides go
-    /// through [`Self::register_column_with_tokenizer`].
-    default_tokenizer: Arc<dyn Tokenizer>,
     /// Tokenizer for each registered column, indexed by column_id — the
     /// analyzer that column's text is tokenized with at index time.
     /// Grown in lockstep with `columns`.
@@ -1370,6 +1366,12 @@ pub struct FtsBuilder {
     sorted_inputs: Vec<SortedInput>,
 }
 
+impl Default for FtsBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FtsBuilder {
     /// Construct a builder with the scratch directory at `storage.scratch_root`
     /// (defaults to the system temp dir when unset) and the
@@ -1381,7 +1383,7 @@ impl FtsBuilder {
     /// API). Operators running large builds should prefer
     /// [`Self::with_scratch`] pointing at an instance-store NVMe
     /// partition.
-    pub fn new(tokenizer: Arc<dyn Tokenizer>) -> Self {
+    pub fn new() -> Self {
         let scratch_root = scratch_root();
 
         let scratch_dir = Builder::new()
@@ -1389,7 +1391,7 @@ impl FtsBuilder {
             .tempdir_in(&scratch_root)
             .expect("create FtsBuilder scratch tempdir");
 
-        Self::from_parts(tokenizer, scratch_dir)
+        Self::from_parts(scratch_dir)
     }
 
     /// Construct a builder with `scratch` as the scratch root. The
@@ -1401,17 +1403,13 @@ impl FtsBuilder {
     ///
     /// Mirror of `VectorBuilder::with_scratch`, same return type
     /// (`Result<Self, BuildError>`).
-    pub fn with_scratch(
-        tokenizer: Arc<dyn Tokenizer>,
-        scratch: PathBuf,
-    ) -> Result<Self, BuildError> {
+    pub fn with_scratch(scratch: PathBuf) -> Result<Self, BuildError> {
         let scratch_dir = Builder::new().prefix("infino-fts-").tempdir_in(&scratch)?;
-        Ok(Self::from_parts(tokenizer, scratch_dir))
+        Ok(Self::from_parts(scratch_dir))
     }
 
-    fn from_parts(tokenizer: Arc<dyn Tokenizer>, scratch_dir: TempDir) -> Self {
+    fn from_parts(scratch_dir: TempDir) -> Self {
         Self {
-            default_tokenizer: tokenizer,
             column_tokenizers: Vec::new(),
             columns: Vec::new(),
             postings: Vec::new(),
@@ -1499,20 +1497,22 @@ impl FtsBuilder {
         self.max_partition_bytes = bytes;
     }
 
-    /// Register an FTS column up-front, tokenized with the builder's
-    /// default tokenizer. Returns its `column_id` (its index in
-    /// declaration order).
-    /// Scores with the standard BM25 pair; use
-    /// [`FtsBuilder::register_column_with_tokenizer`] to declare
-    /// another.
+    /// Register an FTS column up-front with the standard analyzer and
+    /// BM25 pair. Returns its `column_id` (its index in declaration
+    /// order). Use [`FtsBuilder::register_column_with_tokenizer`] to
+    /// declare a column's filters or BM25 pair.
     pub fn register_column(&mut self, name: String, positions: bool) -> Result<u32, BuildError> {
-        let tokenizer = Arc::clone(&self.default_tokenizer);
-        self.register_column_with_tokenizer(name, positions, tokenizer, bm25::Bm25Params::STANDARD)
+        self.register_column_with_tokenizer(
+            name,
+            positions,
+            Arc::new(StandardTokenizer),
+            bm25::Bm25Params::STANDARD,
+        )
     }
 
-    /// Register an FTS column tokenized with an explicit `tokenizer`,
-    /// overriding the builder default. Returns its `column_id`. Lets
-    /// each column carry its own analyzer (per-field analysis).
+    /// Register an FTS column tokenized with an explicit `tokenizer`.
+    /// Returns its `column_id`. Lets each column carry its own analyzer
+    /// (per-field analysis).
     pub fn register_column_with_tokenizer(
         &mut self,
         name: String,
@@ -2625,7 +2625,6 @@ impl FtsBuilder {
     /// 1M-doc Zipfian bench measures.
     fn finish_to_inram<W: Write>(self, mut w: W) -> Result<(), BuildError> {
         let FtsBuilder {
-            default_tokenizer: _,
             column_tokenizers: _,
             columns,
             postings,
@@ -2804,7 +2803,6 @@ impl FtsBuilder {
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     fn finish_to_spilled<W: Write>(self, mut w: W) -> Result<(), BuildError> {
         let FtsBuilder {
-            default_tokenizer: _,
             column_tokenizers: _,
             columns,
             postings,
@@ -4452,7 +4450,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::test_helpers::default_tokenizer as tokenizer;
+
     /// The radix path (n >= `RADIX_SORT_MIN_TRIPLES`) must deliver
     /// `(lex_rank, doc_id)` order even when a term's docs arrive out of
     /// order — the compaction carry paths feed postings remapped through
@@ -4487,7 +4485,7 @@ mod tests {
 
     #[test]
     fn register_column_returns_sequential_ids() {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         assert_eq!(
             b.register_column("title".into(), false)
                 .expect("register column"),
@@ -4507,7 +4505,7 @@ mod tests {
 
     #[test]
     fn register_column_rejects_separator_byte() {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         let bad = String::from("ti\x1Ftle");
         let err = b.register_column(bad, false).expect_err("expected error");
         assert!(matches!(err, BuildError::ReservedSeparatorInColumnName(_)));
@@ -4515,7 +4513,7 @@ mod tests {
 
     #[test]
     fn register_column_rejects_reserved_prefix() {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         let err = b
             .register_column("inf.title".into(), false)
             .expect_err("expected error");
@@ -4524,7 +4522,7 @@ mod tests {
 
     #[test]
     fn register_column_rejects_duplicates() {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), false)
             .expect("register column");
         let err = b
@@ -4535,7 +4533,7 @@ mod tests {
 
     #[test]
     fn add_doc_unknown_column_id_errors() {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), false)
             .expect("register column");
         let err = b.add_doc(99, 0, "text").expect_err("expected error");
@@ -4544,7 +4542,7 @@ mod tests {
 
     #[test]
     fn add_doc_reuses_term_frequency_table_capacity() {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), false)
             .expect("register column");
         b.add_doc(0, 0, "alpha beta gamma delta epsilon zeta eta theta")
@@ -4569,7 +4567,7 @@ mod tests {
 
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
 
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), false)
             .expect("register column");
         b.add_doc(0, 0, "rust rust rust async").expect("add doc");
@@ -4605,7 +4603,7 @@ mod tests {
 
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
 
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         let title_id = b
             .register_column("title".into(), false)
             .expect("register title");
@@ -4675,7 +4673,7 @@ mod tests {
 
     #[test]
     fn add_doc_tracks_doc_lengths_clamped() {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false)
             .expect("register column");
         b.add_doc(0, 0, "alpha beta gamma").expect("add doc");
@@ -4688,7 +4686,7 @@ mod tests {
 
     #[test]
     fn add_doc_updates_n_docs_per_call() {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false)
             .expect("register column");
         // Contract: local_doc_id is consecutive from 0 (per column).
@@ -4711,7 +4709,7 @@ mod tests {
 
     #[test]
     fn finish_emits_valid_header() {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), false)
             .expect("register column");
         b.add_doc(0, 0, "hello world").expect("add doc");
@@ -4744,7 +4742,7 @@ mod tests {
     #[test]
     fn finish_to_matches_finish_byte_for_byte() {
         fn build() -> FtsBuilder {
-            let mut b = FtsBuilder::new(tokenizer());
+            let mut b = FtsBuilder::new();
             b.register_column("title".into(), false)
                 .expect("register title");
             for (i, text) in [
@@ -4777,7 +4775,7 @@ mod tests {
 
         use crate::superfile::fts::reader::{BoolMode, FtsReader};
 
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), false)
             .expect("register title");
         for i in 0..256u32 {
@@ -4807,7 +4805,7 @@ mod tests {
 
     #[test]
     fn finish_with_no_docs_still_produces_valid_blob() {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), false)
             .expect("register column");
         let blob = b.finish().expect("finish");
@@ -4829,8 +4827,7 @@ mod tests {
         // during add_doc" gate. With the default spill threshold
         // (256 MiB) a 100-doc build can never cross it.
         let parent = tempdir().expect("parent");
-        let mut b = FtsBuilder::with_scratch(tokenizer(), parent.path().to_path_buf())
-            .expect("with_scratch");
+        let mut b = FtsBuilder::with_scratch(parent.path().to_path_buf()).expect("with_scratch");
         b.register_column("body".into(), false)
             .expect("register col");
         for i in 0..100u32 {
@@ -4887,7 +4884,7 @@ mod tests {
             }
         }
 
-        let mut baseline = FtsBuilder::new(tokenizer());
+        let mut baseline = FtsBuilder::new();
         build_corpus(&mut baseline);
         // Baseline must stay in RAM.
         for cp in &baseline.postings {
@@ -4901,8 +4898,8 @@ mod tests {
         // files mid-build (counterpart to the negative assertion in
         // `small_build_stays_in_ram_no_spill_files_created`).
         let parent = tempdir().expect("parent");
-        let mut spilled = FtsBuilder::with_scratch(tokenizer(), parent.path().to_path_buf())
-            .expect("with_scratch");
+        let mut spilled =
+            FtsBuilder::with_scratch(parent.path().to_path_buf()).expect("with_scratch");
         spilled.set_spill_threshold_bytes(16 * 1024);
         build_corpus(&mut spilled);
         let any_spilled = spilled.postings.iter().any(|c| c.is_spilled());
@@ -4986,7 +4983,7 @@ mod tests {
         // branch. This isolates the variable under test (in-memory
         // partition sort vs external merge) from the baseline's
         // identity (the spilled finish path).
-        let mut baseline = FtsBuilder::new(tokenizer());
+        let mut baseline = FtsBuilder::new();
         baseline.set_spill_threshold_bytes(1);
         build_corpus(&mut baseline);
         let baseline_blob = baseline.finish().expect("finish baseline");
@@ -4997,7 +4994,7 @@ mod tests {
         // well below the dominant partition's on-disk size, so the
         // merge path is exercised on at least one partition.
         finish_debug::reset();
-        let mut tight = FtsBuilder::new(tokenizer());
+        let mut tight = FtsBuilder::new();
         tight.set_spill_threshold_bytes(1);
         tight.set_max_partition_bytes(1024);
         build_corpus(&mut tight);
@@ -5030,8 +5027,7 @@ mod tests {
         let parent = tempdir().expect("parent tempdir");
         let dir_count_before = fs::read_dir(parent.path()).expect("read parent").count();
 
-        let mut b = FtsBuilder::with_scratch(tokenizer(), parent.path().to_path_buf())
-            .expect("with_scratch");
+        let mut b = FtsBuilder::with_scratch(parent.path().to_path_buf()).expect("with_scratch");
         b.register_column("body".into(), false)
             .expect("register col");
         b.add_doc(0, 0, "alpha beta gamma").expect("add doc");
@@ -5052,7 +5048,7 @@ mod tests {
 
         // Higher partition count: more files, smaller per-partition
         // working set. Must still produce a queryable blob.
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.set_spill_partitions(256).expect("set partitions");
         b.register_column("body".into(), false)
             .expect("register col");
@@ -5075,7 +5071,7 @@ mod tests {
 
     #[test]
     fn finish_offsets_are_consistent() {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false)
             .expect("register column");
         for i in 0..10 {
@@ -5107,7 +5103,7 @@ mod tests {
     #[test]
     fn set_spill_partitions_rejects_after_register_column() {
         // Must be called before the first `register_column`.
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false)
             .expect("register col");
         let err = b.set_spill_partitions(16).expect_err("expected error");
@@ -5121,7 +5117,7 @@ mod tests {
 
     #[test]
     fn set_spill_partitions_rejects_zero() {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         let err = b.set_spill_partitions(0).expect_err("expected error");
         match err {
             BuildError::Io(e) => assert!(e.to_string().contains("must be ≥ 1")),
@@ -5134,7 +5130,7 @@ mod tests {
         // Partition selection is `term_id & (n - 1)`, only correct for
         // power-of-two `n`.
         const NON_PO2: usize = 7;
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         let err = b.set_spill_partitions(NON_PO2).expect_err("expected error");
         match err {
             BuildError::Io(e) => assert!(e.to_string().contains("power of two")),
@@ -5237,7 +5233,7 @@ mod tests {
         positional: bool,
         max_partition_bytes: Option<u64>,
     ) -> bytes::Bytes {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.set_spill_threshold_bytes(1);
         if let Some(m) = max_partition_bytes {
             b.set_max_partition_bytes(m);
@@ -5341,7 +5337,7 @@ mod tests {
 
     /// Build a one-column blob from `docs`, positional or not.
     fn build_title_blob(docs: &[String], positional: bool) -> bytes::Bytes {
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), positional)
             .expect("register column");
         for (i, text) in docs.iter().enumerate() {
@@ -5473,7 +5469,7 @@ mod tests {
 
         // Two columns, one positional: both keep answering queries, each
         // with its own term-meta stride.
-        let mut b = FtsBuilder::new(tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         b.register_column("title".into(), true).expect("register");
         for i in 0..(BLOCK_LEN as u32 + 9) {

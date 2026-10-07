@@ -61,18 +61,15 @@ impl BoundDecoder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use bytes::Bytes;
 
     use super::*;
-    use crate::superfile::fts::{
-        bm25, builder::FtsBuilder, reader::FtsReader, tokenize::StandardTokenizer,
-    };
+    use crate::superfile::fts::{bm25, builder::FtsBuilder, reader::FtsReader};
 
     #[test]
     fn a_decoded_bound_takes_the_idf_ratio_and_the_column_scale() {
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         b.add_doc(0, 0, "a b").expect("doc");
         b.add_doc(0, 1, "a b c d e f").expect("doc");

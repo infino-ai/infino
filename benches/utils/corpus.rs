@@ -59,7 +59,6 @@ use infino::{
             rerank_codec::RerankCodec,
         },
     },
-    test_helpers::default_tokenizer,
 };
 use memmap2::Mmap;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -2571,7 +2570,7 @@ pub fn calibrate_superfile(
 /// Build a stand-alone FTS index from a token corpus. Wrapper exists so
 /// both bench harnesses construct the index identically.
 pub fn build_fts_index(docs: &[String]) -> FtsBuilder {
-    let mut b = FtsBuilder::new(default_tokenizer());
+    let mut b = FtsBuilder::new();
     b.register_column("title".to_string(), true)
         .expect("register column");
     for (i, text) in docs.iter().enumerate() {

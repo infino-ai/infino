@@ -727,7 +727,6 @@ pub struct TermLayout {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use bytes::Bytes;
 
@@ -735,7 +734,6 @@ mod tests {
     use crate::superfile::fts::{
         builder::FtsBuilder,
         posting::{self, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
-        tokenize::StandardTokenizer,
     };
 
     #[tokio::test]
@@ -837,8 +835,7 @@ mod tests {
         // length) is the reference. Tied to OR_WINDOW so it keeps crossing
         // the boundary if the window size changes.
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha "); // every doc
@@ -904,8 +901,7 @@ mod tests {
         // reference from either count kernel.
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
         const RARE_STRIDE: u32 = 371; // sparse ⇒ below the density gate
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha "); // every doc → dense
@@ -973,8 +969,7 @@ mod tests {
         const DENSE_END: u32 = 256; // docs 0..256 hold `mix` every doc → BITSET
         const SPARSE_STRIDE: u32 = 30; // docs after that every 30th → PACKED
         const N_DOCS: u32 = 4200;
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("common "); // every doc → dense partner
@@ -1060,8 +1055,7 @@ mod tests {
         // union (`or_cursor_into_bitset` inline branch). All cross-checked
         // against `token_match`'s independent flat-merge length.
         const N_DOCS: u32 = 4096; // max doc id 4095
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("common"); // every doc
@@ -1177,8 +1171,7 @@ mod tests {
         const RARE_STRIDE: u32 = 250; // rare term hits ~1/250 docs
         const RAREB_STRIDE: u32 = 400;
         const HOLE_STRIDE: u32 = 300; // docs missing the dominant term
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::new();
@@ -1287,8 +1280,7 @@ mod tests {
     #[tokio::test]
     async fn a_column_with_no_scored_documents_walks_without_scoring() {
         const N_DOCS: u32 = 8;
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("filled".into(), false).expect("register");
         b.register_column("empty".into(), false).expect("register");
         for i in 0..N_DOCS {
@@ -1326,8 +1318,7 @@ mod tests {
     async fn facts_from_the_walk_match_facts_from_lookups() {
         const N_DOCS: u32 = 600;
         const CHUNK: usize = 5;
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("pos".into(), true).expect("register");
         b.register_column("flat".into(), false).expect("register");
         for i in 0..N_DOCS {

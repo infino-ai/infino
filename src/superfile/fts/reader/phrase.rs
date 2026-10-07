@@ -652,14 +652,13 @@ impl AnyCursor {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use super::{super::test_util::*, *};
     use crate::superfile::{
         fts::{
             builder::FtsBuilder,
             reader::{FtsReader, core::ClauseLists},
-            tokenize::{Phrase, StandardTokenizer},
+            tokenize::Phrase,
         },
         id_space::FtsDocId,
     };
@@ -677,11 +676,9 @@ mod tests {
     /// path.
     #[tokio::test]
     async fn grouped_positions_reach_every_pair_across_blocks() {
-        use std::sync::Arc;
-
-        use crate::superfile::fts::{builder::FtsBuilder, tokenize::StandardTokenizer};
+        use crate::superfile::fts::builder::FtsBuilder;
         let n_docs = 300u32;
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         for i in 0..n_docs {
             let text = format!(
@@ -738,13 +735,9 @@ mod tests {
     /// every doc through both decode paths.
     #[tokio::test]
     async fn position_groups_verify_phrases_in_long_and_short_terms() {
-        use std::sync::Arc;
-
-        use crate::superfile::fts::{
-            builder::FtsBuilder, posting::BLOCK_LEN, tokenize::StandardTokenizer,
-        };
+        use crate::superfile::fts::{builder::FtsBuilder, posting::BLOCK_LEN};
         const N_DOCS: u32 = 200;
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         for d in 0..N_DOCS {
             let alpha: Vec<u32> = match d < BLOCK_LEN as u32 {
@@ -811,13 +804,9 @@ mod tests {
     /// verify. Every k must match the unpruned walk's top-k.
     #[tokio::test]
     async fn ranked_phrase_block_pruning_agrees_with_the_unpruned_walk() {
-        use std::sync::Arc;
-
-        use crate::superfile::fts::{
-            builder::FtsBuilder, posting::BLOCK_LEN, tokenize::StandardTokenizer,
-        };
+        use crate::superfile::fts::{builder::FtsBuilder, posting::BLOCK_LEN};
         const N_DOCS: u32 = BLOCK_LEN as u32 * 40;
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         for d in 0..N_DOCS {
             let hot = (d / (8 * BLOCK_LEN as u32)).is_multiple_of(5);
@@ -878,15 +867,11 @@ mod tests {
     /// above it.
     #[tokio::test]
     async fn batched_ranked_phrase_walk_matches_the_unranked_walk() {
-        use std::sync::Arc;
-
         use rand::{RngExt, SeedableRng, rngs::StdRng};
 
-        use crate::superfile::fts::{
-            bm25, builder::FtsBuilder, posting::BLOCK_LEN, tokenize::StandardTokenizer,
-        };
+        use crate::superfile::fts::{bm25, builder::FtsBuilder, posting::BLOCK_LEN};
         const N_DOCS: u32 = BLOCK_LEN as u32 * 60;
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         for d in 0..N_DOCS {
             let text = match (d % 53, d % 2, d % 3) {
@@ -1008,13 +993,11 @@ mod tests {
     /// directly so the fixture costs no tokenization.
     #[tokio::test]
     async fn a_block_with_very_long_runs_verifies_phrases() {
-        use std::sync::Arc;
-
-        use crate::superfile::fts::{builder::FtsBuilder, tokenize::StandardTokenizer};
+        use crate::superfile::fts::builder::FtsBuilder;
         const N_DOCS: u32 = 129;
         const TF: u32 = 600;
         const OUTLIER_GAP: u32 = 1 << 25;
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         let alpha: Vec<u32> = (0..TF)
             .map(|j| match j + 1 == TF {
@@ -1083,12 +1066,8 @@ mod tests {
     /// and breaks adjacency: `"cat dog"` must not match `cat 🙂 dog`.
     #[tokio::test]
     async fn an_emoji_between_two_words_breaks_the_phrase() {
-        use std::sync::Arc;
-
-        use crate::superfile::fts::{
-            builder::FtsBuilder, reader::BoolMode, tokenize::StandardTokenizer,
-        };
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        use crate::superfile::fts::{builder::FtsBuilder, reader::BoolMode};
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         b.add_doc(0, 0, "cat 🙂 dog").expect("doc 0");
         b.add_doc(0, 1, "cat dog").expect("doc 1");
@@ -1192,7 +1171,7 @@ mod tests {
     #[tokio::test]
     async fn phrase_on_positionless_column_is_typed_error() {
         use crate::superfile::fts::builder::FtsBuilder;
-        let mut b = FtsBuilder::new(crate::test_helpers::default_tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), false).expect("register");
         b.add_doc(0, 0, "new york").expect("add doc");
         let blob = Bytes::from(b.finish().expect("finish"));
@@ -1241,7 +1220,7 @@ mod tests {
     }
 
     fn open_positional(docs: impl Iterator<Item = String>) -> FtsReader {
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         for (i, text) in docs.enumerate() {
             b.add_doc(0, i as u32, &text).expect("add doc");

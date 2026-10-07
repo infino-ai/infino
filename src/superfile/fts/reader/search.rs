@@ -1768,10 +1768,7 @@ mod tests {
     use roaring::RoaringBitmap;
 
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::{
-        builder::FtsBuilder,
-        tokenize::{Phrase, StandardTokenizer},
-    };
+    use crate::superfile::fts::{builder::FtsBuilder, tokenize::Phrase};
 
     #[tokio::test]
     async fn search_returns_exact_doc_ids_for_known_term() {
@@ -2127,8 +2124,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_multi_weights_and_combines_columns() {
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), false).expect("register");
         b.register_column("body".into(), false).expect("register");
         // doc 0: title "rust"; doc 1: body "rust"; doc 2: neither.
@@ -2155,8 +2151,7 @@ mod tests {
     async fn search_or_range_restricts_to_doc_id_window() {
         // Larger corpus so an OR query spans several doc ids and the
         // ranged path actually clips some out.
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..8u32 {
             b.add_doc(0, i, "alpha beta").expect("add");
@@ -2193,8 +2188,7 @@ mod tests {
         /// Top-k size for the truncated comparison.
         const K_TOP: usize = 10;
 
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             // Deterministic mixed-df corpus: four uniform terms with
@@ -2302,8 +2296,7 @@ mod tests {
         /// Ask for every match so whole result sets are compared.
         const K_ALL: usize = N_DOCS as usize;
 
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::new();
@@ -2378,8 +2371,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_or_range_with_floor_prunes() {
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..8u32 {
             b.add_doc(0, i, "alpha beta").expect("add");

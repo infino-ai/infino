@@ -777,9 +777,7 @@ mod tests {
     }
 
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::{
-        builder::FtsBuilder, reader::FtsReader, tokenize::StandardTokenizer,
-    };
+    use crate::superfile::fts::{builder::FtsBuilder, reader::FtsReader};
 
     // ── Column length totals ──────────────────────────────────────────
 
@@ -837,7 +835,7 @@ mod tests {
     /// Two documents of two tokens each, then rows this column is null
     /// for: four tokens over two documents, eight rows.
     fn sparse_builder() -> FtsBuilder {
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         b.add_doc(0, 0, "alpha beta").expect("doc 0");
         b.add_doc(0, 1, "alpha gamma").expect("doc 1");
@@ -945,7 +943,7 @@ mod tests {
         // Every row null: no document carries a token, so there is no
         // average to normalize against and the table stays empty rather
         // than dividing by zero.
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for row in 0..4 {
             b.add_doc(0, row, "").expect("null row");
@@ -1006,8 +1004,7 @@ mod tests {
         // 4-byte-per-doc `f32` table it replaced. Build enough
         // varied-length docs that the per-doc term dominates the LUT.
         const N: u32 = 5_000;
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false)
             .expect("register column");
         for d in 0..N {

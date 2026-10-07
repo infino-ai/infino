@@ -193,10 +193,7 @@ mod tests {
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
-        builder::FtsBuilder,
-        posting::BLOCK_LEN,
-        reader::FtsReader,
-        tokenize::{Phrase, StandardTokenizer},
+        builder::FtsBuilder, posting::BLOCK_LEN, reader::FtsReader, tokenize::Phrase,
     };
 
     // ── ExcludeFilter (negation gate) ─────────────────────────────────
@@ -332,7 +329,7 @@ mod tests {
     /// `pos` in every row: `neg`'s list is 500 postings, four blocks
     /// with a partial last one.
     fn edge_reader() -> FtsReader {
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for doc in 0..EDGE_DOCS {
             let text = if doc % 2 == 0 { "pos neg" } else { "pos" };
@@ -346,7 +343,7 @@ mod tests {
     /// in order except every `REVERSED_EVERY`th row, which holds them
     /// reversed.
     fn phrase_edge_reader() -> FtsReader {
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), true).expect("register");
         for doc in 0..EDGE_DOCS {
             let text = if doc % REVERSED_EVERY == 0 {

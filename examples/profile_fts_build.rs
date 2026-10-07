@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 
-use infino::{superfile::fts::builder::FtsBuilder, test_helpers::default_tokenizer};
+use infino::superfile::fts::builder::FtsBuilder;
 use infino_bench_utils::corpus;
 
 const N_DOCS: usize = 1_000_000;
@@ -40,7 +40,7 @@ fn main() {
         avg_bytes,
     );
 
-    let mut builder = FtsBuilder::new(default_tokenizer());
+    let mut builder = FtsBuilder::new();
     builder
         .register_column("title".to_string(), false)
         .expect("register column");

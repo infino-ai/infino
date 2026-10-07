@@ -1499,7 +1499,6 @@ impl TermCursor {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use bytes::Bytes;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -1511,7 +1510,6 @@ mod tests {
         builder::FtsBuilder,
         posting::{ENCODING_PACKED, ENCODING_PATCHED},
         reader::FtsReader,
-        tokenize::StandardTokenizer,
     };
 
     /// The per-block BM25 upper bound stored in the skip table must be a
@@ -1537,7 +1535,7 @@ mod tests {
     fn realistic_reader(n_docs: u32) -> FtsReader {
         let mut rng = StdRng::seed_from_u64(114);
         let lengths = LogNormal::new(4.4886, 1.55).expect("log-normal params");
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         let mut text = String::new();
         for doc_id in 0..n_docs {
@@ -1560,7 +1558,7 @@ mod tests {
     /// many blocks whose gaps vary, so the length-coded skip table has
     /// to be right in both entry widths.
     fn two_column_reader() -> FtsReader {
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("pos".into(), true).expect("register");
         b.register_column("flat".into(), false).expect("register");
         let mut text = String::new();
@@ -1590,7 +1588,7 @@ mod tests {
     /// whole-block unpack would show a different doc's tf.
     #[tokio::test]
     async fn same_block_tf_probes_leave_the_lazy_doc_intact() {
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("flat".into(), false).expect("register");
         for doc_id in 0..6000u32 {
             let mut text = String::new();
@@ -1643,7 +1641,7 @@ mod tests {
     #[tokio::test]
     async fn packed_block_tf_probes_match_the_walk() {
         use crate::superfile::fts::posting::{ENCODING_BITSET, block_encoding};
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("flat".into(), false).expect("register");
         let tf_of = |doc: u32| doc.is_multiple_of(37).then(|| 1 + doc % 5);
         for doc_id in 0..60_000u32 {
@@ -1970,7 +1968,7 @@ mod tests {
     /// leaves every bound one ULP above its block's maximum.
     #[tokio::test]
     async fn bounds_stay_exact_when_the_average_is_not_exactly_representable() {
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         // 501 tokens over 500 documents: an average of 1.002.
         for doc in 0..500u32 {
@@ -2015,8 +2013,7 @@ mod tests {
         // clear of `f32` rounding and the assertion is decisive.
         const N_DOCS: u32 = 1300;
 
-        let tok = Arc::new(StandardTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false)
             .expect("register column");
         for doc_id in 0..N_DOCS {
@@ -2099,7 +2096,7 @@ mod tests {
     /// with `n_docs` rows (rows no term mentions carry a filler token so
     /// every row is a document). Doc ids are the row indices.
     fn planted_reader(planted: &[Planted], n_docs: u32) -> FtsReader {
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         let mut at = vec![0usize; planted.len()];
         let mut text = String::new();
