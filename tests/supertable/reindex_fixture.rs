@@ -163,35 +163,46 @@ pub(crate) fn append_docs(table: &Supertable, docs: Range<u32>) {
 /// Write the fixture table under `root`, make it stale as `staleness`
 /// says, and return how many superfiles it holds.
 pub(crate) fn write_stale_table(root: &Path, staleness: Staleness) -> usize {
-    {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("body", DataType::LargeUtf8, false),
-            Field::new("title", DataType::LargeUtf8, false),
-            Field::new("notes", DataType::LargeUtf8, true),
-            embedding_field(),
-        ]));
-        let spec = IndexSpec::new()
-            .fts(FtsField::new("body"))
-            .fts(FtsField::new("title").positions(true))
-            .fts(FtsField::new("notes"))
-            .vector("emb", EMBEDDING_DIM, Metric::Cosine);
-        let db = connect(root.to_str().expect("utf-8 path")).expect("connect");
-        let table = db
-            .create_table(TABLE, Arc::clone(&schema), spec)
-            .expect("create the fixture table");
-        // One append per superfile, so the count never depends on how a
-        // single append splits on this machine.
-        let per_append = N_DOCS / MIN_SUPERFILES as u32;
-        for i in 0..MIN_SUPERFILES as u32 {
-            let end = if i + 1 == MIN_SUPERFILES as u32 {
-                N_DOCS
-            } else {
-                (i + 1) * per_append
-            };
-            append_docs(&table, i * per_append..end);
-        }
-    }
+    write_table(root);
+    edit_superfiles(root, |bytes| match staleness {
+        Staleness::Analysis => lower_recorded_revisions(bytes),
+        Staleness::DuplicatedFooter => duplicate_vector_region_key(bytes),
+    })
+}
 
+/// Write the fixture table, current, under `root`.
+pub(crate) fn write_table(root: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("body", DataType::LargeUtf8, false),
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("notes", DataType::LargeUtf8, true),
+        embedding_field(),
+    ]));
+    let spec = IndexSpec::new()
+        .fts(FtsField::new("body"))
+        .fts(FtsField::new("title").positions(true))
+        .fts(FtsField::new("notes"))
+        .vector("emb", EMBEDDING_DIM, Metric::Cosine);
+    let db = connect(root.to_str().expect("utf-8 path")).expect("connect");
+    let table = db
+        .create_table(TABLE, Arc::clone(&schema), spec)
+        .expect("create the fixture table");
+    // One append per superfile, so the count never depends on how a
+    // single append splits on this machine.
+    let per_append = N_DOCS / MIN_SUPERFILES as u32;
+    for i in 0..MIN_SUPERFILES as u32 {
+        let end = if i + 1 == MIN_SUPERFILES as u32 {
+            N_DOCS
+        } else {
+            (i + 1) * per_append
+        };
+        append_docs(&table, i * per_append..end);
+    }
+}
+
+/// Rewrite every superfile of the fixture table under `root` through
+/// `edit`, and return how many there are.
+pub(crate) fn edit_superfiles(root: &Path, edit: impl Fn(&[u8]) -> Vec<u8>) -> usize {
     let paths = superfile_paths(root);
     assert!(
         paths.len() >= MIN_SUPERFILES,
@@ -200,11 +211,7 @@ pub(crate) fn write_stale_table(root: &Path, staleness: Staleness) -> usize {
     );
     for path in &paths {
         let bytes = fs::read(path).expect("read superfile");
-        let edited = match staleness {
-            Staleness::Analysis => lower_recorded_revisions(&bytes),
-            Staleness::DuplicatedFooter => duplicate_vector_region_key(&bytes),
-        };
-        fs::write(path, edited).expect("write the stale superfile");
+        fs::write(path, edit(&bytes)).expect("write the edited superfile");
     }
     paths.len()
 }

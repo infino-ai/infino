@@ -30,6 +30,9 @@
 //!   duplicating them to keep the file at the top level would cost
 //!   more than it buys. `--exact` names the one test the child
 //!   re-enters.
+//! - **unreadable_index**: a table whose full-text index is too
+//!   old to read refuses every public read and maintenance path
+//!   as `Unsupported`, over the same fixture.
 //!
 //! Spawn-self tests
 //! (`supertable_commit_crash_localfs.rs`,
@@ -52,6 +55,7 @@ mod reindex_crash;
 mod reindex_fixture;
 mod reindex_invariance;
 mod storage;
+mod unreadable_index;
 mod update_crash_property;
 mod vector_cosine_normalize;
 mod vector_law_serving;
