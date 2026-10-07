@@ -40,6 +40,19 @@ pub enum SchemaError {
         /// The column's name.
         column: String,
     },
+    /// A value does not fit the column's type. The mapper picks a type the
+    /// values fit, so this is a value the type was not picked from: one the
+    /// table already froze, or one a wider value shares a column with.
+    #[error("field `{column}` cannot hold {value} as `{data_type}`")]
+    ValueOutOfRange {
+        /// The field's path.
+        column: String,
+        /// The value, as it was written.
+        value: String,
+        /// The type the column holds.
+        data_type: String,
+    },
+
     /// A column holds an integer too large to be exact in `f64` beside a
     /// value that makes the column a float.
     #[error(

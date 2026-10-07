@@ -400,6 +400,10 @@ pub infino::SchemaError::TypeRequired
 pub infino::SchemaError::TypeRequired::column: alloc::string::String
 pub infino::SchemaError::UnknownFieldId
 pub infino::SchemaError::UnknownFieldId::id: infino::FieldId
+pub infino::SchemaError::ValueOutOfRange
+pub infino::SchemaError::ValueOutOfRange::column: alloc::string::String
+pub infino::SchemaError::ValueOutOfRange::data_type: alloc::string::String
+pub infino::SchemaError::ValueOutOfRange::value: alloc::string::String
 impl core::clone::Clone for infino::SchemaError
 pub fn infino::SchemaError::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::SchemaError

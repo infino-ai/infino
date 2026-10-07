@@ -623,8 +623,9 @@ fn epoch_days(date: NaiveDate) -> i32 {
 }
 
 /// `column`'s values as an array of `data_type`, null where a row lacks
-/// the path. The type was chosen from these values, so every one of them
-/// fits.
+/// the path. The type is chosen from these values, so they fit it; a value
+/// that does not is refused rather than stored as a null, since a null is
+/// what the caller reads back for a key it never sent.
 fn build_array(
     column: &Column<'_>,
     rows: usize,
@@ -646,7 +647,7 @@ fn build_array(
                 }
                 offsets.push(flat.len());
             }
-            let child = build_scalar_array(&flat, item.data_type())?;
+            let child = build_scalar_array(&column.path, &flat, item.data_type())?;
             let validity = NullBuffer::from(nulls);
             let array: ArrayRef = if matches!(data_type, DataType::List(_)) {
                 let offsets = OffsetBuffer::<i32>::new(
@@ -686,7 +687,7 @@ fn build_array(
                     }
                 }
             }
-            let child = build_scalar_array(&flat, item.data_type())?;
+            let child = build_scalar_array(&column.path, &flat, item.data_type())?;
             Ok(Arc::new(FixedSizeListArray::new(
                 Arc::clone(item),
                 *dim,
@@ -702,27 +703,39 @@ fn build_array(
                     _ => None,
                 })
                 .collect();
-            build_scalar_array(&values, scalar)
+            build_scalar_array(&column.path, &values, scalar)
         }
     }
 }
 
 fn build_scalar_array(
+    column: &str,
     values: &[Option<&Value>],
     data_type: &DataType,
 ) -> Result<ArrayRef, SchemaError> {
+    // A value outside the column's range is refused, not narrowed to a null:
+    // the caller sent a number, and reading back a null would say they sent
+    // nothing. `None` stays `None`, which is the key a row did not carry.
     macro_rules! ints {
-        ($array:ty, $native:ty) => {
-            Arc::new(<$array>::from(
-                values
-                    .iter()
-                    .map(|v| {
-                        v.and_then(as_i128)
-                            .and_then(|n| <$native>::try_from(n).ok())
-                    })
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef
-        };
+        ($array:ty, $native:ty) => {{
+            let mut out: Vec<Option<$native>> = Vec::with_capacity(values.len());
+            for value in values {
+                match value.and_then(as_i128) {
+                    None => out.push(None),
+                    Some(n) => match <$native>::try_from(n) {
+                        Ok(n) => out.push(Some(n)),
+                        Err(_) => {
+                            return Err(SchemaError::ValueOutOfRange {
+                                column: column.to_owned(),
+                                value: n.to_string(),
+                                data_type: data_type.to_string(),
+                            });
+                        }
+                    },
+                }
+            }
+            Arc::new(<$array>::from(out)) as ArrayRef
+        }};
     }
     let array: ArrayRef = match data_type {
         DataType::Boolean => Arc::new(BooleanArray::from(
@@ -891,6 +904,35 @@ mod tests {
         let batch = rows_to_batch(&[json!({"n": 3}), json!({"n": 1.5})], &table(Vec::new()))
             .expect("an exact integer is fine beside a float");
         assert_eq!(types(&batch)["n"], DataType::Float64);
+    }
+
+    /// A number past the column's range is refused. It used to be narrowed
+    /// to a null, so `append_rows([{"n": u64::MAX}])` returned `Ok` and `n`
+    /// read back as though the row had never carried it.
+    #[test]
+    fn a_number_the_column_cannot_hold_is_refused_not_nulled() {
+        let past_i64 = json!(u64::MAX);
+        let err = rows_to_batch(&[json!({"n": past_i64})], &table(Vec::new()))
+            .expect_err("u64::MAX does not fit the Int64 the values infer");
+        assert!(
+            matches!(
+                &err,
+                SchemaError::ValueOutOfRange { column, value, .. }
+                    if column == "n" && value == &u64::MAX.to_string()
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A key a row simply does not carry is still a null, which is the one
+    /// thing the refusal above must not swallow.
+    #[test]
+    fn a_missing_key_is_still_null() {
+        let batch = rows_to_batch(&[json!({"n": 1}), json!({"other": 2})], &table(Vec::new()))
+            .expect("a row that omits a key maps");
+        let n = col(&batch, "n").as_primitive::<Int64Type>();
+        assert_eq!(n.value(0), 1);
+        assert!(n.is_null(1), "the row that omitted `n` reads null");
     }
 
     /// Column types by name. Columns come out in key order, which
@@ -1126,11 +1168,9 @@ mod tests {
             "at",
             DataType::Timestamp(TimeUnit::Millisecond, None),
         )]);
-        let batch = rows_to_batch(&[json!({"at": u64::MAX})], &t).expect("map");
-        assert_eq!(types(&batch)["at"], DataType::Int64);
         assert!(matches!(
-            resolve_batch(&batch, &t, "_id"),
-            Err(SchemaError::TypeMismatch { column, .. }) if column == "at"
+            rows_to_batch(&[json!({"at": u64::MAX})], &t),
+            Err(SchemaError::ValueOutOfRange { column, .. }) if column == "at"
         ));
         // Beside a time string it is refused outright, rather than joining
         // the string's column and reading back as a null.
