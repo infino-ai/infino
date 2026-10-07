@@ -3380,7 +3380,7 @@ fn escape_json(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, iter::once, sync::Arc};
+    use std::{collections::HashMap, io::empty, iter::once, slice, sync::Arc};
 
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, UInt64Array};
     use arrow_schema::Field;
@@ -6330,6 +6330,107 @@ mod tests {
             hits.len() as u64,
             total_docs,
             "every doc matches \"common\""
+        );
+    }
+
+    // ---- Raw stable-id sidecar: read, then repacked on carry ----
+
+    /// Rows in the raw-sidecar fixture.
+    const RAW_SIDECAR_ROWS: u64 = 64;
+
+    /// `bytes` re-spliced with its stable-id sidecar in the raw layout — one
+    /// little-endian `i128` per row of `batch`, and no layout key — the form
+    /// a writer that predates the packed layout left.
+    fn with_raw_id_sidecar(bytes: &Bytes, batch: &RecordBatch) -> Bytes {
+        let source = SuperfileReader::open(bytes.clone()).expect("open packed superfile");
+        let src_kv = extract_kv_map(source.parquet_metadata()).expect("footer kvs");
+        let at = |key: &str| -> usize { src_kv[key].parse().expect("numeric region key") };
+        let fts = at(kv::FTS_OFFSET)..at(kv::FTS_OFFSET) + at(kv::FTS_LENGTH);
+        let raw_ids = stable_id_sidecar_bytes(slice::from_ref(batch), "doc_id");
+        assert_eq!(
+            raw_ids.len(),
+            batch.num_rows() * format::ID_SIDECAR_ENTRY_BYTES
+        );
+        let kvs: Vec<(String, String)> = src_kv
+            .iter()
+            .filter(|(k, _)| k.as_str() != kv::IDS_LAYOUT)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut out = Vec::new();
+        splice_carried_body_to(
+            &bytes[..fts.start],
+            fts.start as u64,
+            source.parquet_metadata().as_ref().clone(),
+            &bytes[fts.clone()],
+            fts.len() as u64,
+            empty(),
+            0,
+            raw_ids.as_slice(),
+            raw_ids.len() as u64,
+            &kvs,
+            &mut out,
+        )
+        .expect("splice the raw sidecar");
+        Bytes::from(out)
+    }
+
+    /// A superfile whose id sidecar is in the raw layout resolves `_id`
+    /// through it, and a carried rewrite repacks it without moving an id.
+    #[test]
+    fn a_raw_id_sidecar_reads_and_is_repacked_on_carry() {
+        let opts = opts_minimal();
+        let titles: Vec<String> = (0..RAW_SIDECAR_ROWS).map(|i| format!("row {i}")).collect();
+        let title = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
+        let body = LargeStringArray::from(vec!["x"; RAW_SIDECAR_ROWS as usize]);
+        let batch = RecordBatch::try_new(
+            opts.schema.clone(),
+            vec![
+                Arc::new(decimal128_ids(0..RAW_SIDECAR_ROWS)),
+                Arc::new(title),
+                Arc::new(body),
+            ],
+        )
+        .expect("build RecordBatch");
+        let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let packed = Bytes::from(b.finish().expect("finish builder"));
+        let raw = with_raw_id_sidecar(&packed, &batch);
+
+        // Every row, out of order, so a mis-strided raw read cannot pass.
+        let locals: Vec<u32> = (0..RAW_SIDECAR_ROWS as u32).rev().collect();
+        let expected = SuperfileReader::open(packed)
+            .expect("open packed superfile")
+            .take_by_local_doc_ids(&locals, &["doc_id"])
+            .expect("ids via the packed sidecar");
+
+        let raw_reader = SuperfileReader::open(raw).expect("open raw superfile");
+        assert!(!raw_reader.id_sidecar_is_packed(), "the fixture is raw");
+        assert_eq!(
+            raw_reader
+                .take_by_local_doc_ids(&locals, &["doc_id"])
+                .expect("ids via the raw sidecar"),
+            expected
+        );
+
+        let mut carry = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        carry
+            .carry_fts_from_reader_scoped(&raw_reader, None, CarryScope::AllColumns)
+            .expect("carry the FTS blob");
+        carry.set_carried_doc_count(RAW_SIDECAR_ROWS);
+        let mut out = Vec::new();
+        carry
+            .finish_carrying_body_to(&raw_reader, &mut out)
+            .expect("carry the body");
+        let repacked = SuperfileReader::open(Bytes::from(out)).expect("open the rewrite");
+        assert!(
+            repacked.id_sidecar_is_packed(),
+            "the carry repacks the sidecar"
+        );
+        assert_eq!(
+            repacked
+                .take_by_local_doc_ids(&locals, &["doc_id"])
+                .expect("ids via the repacked sidecar"),
+            expected
         );
     }
 
