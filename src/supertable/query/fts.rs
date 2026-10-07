@@ -3145,14 +3145,13 @@ mod tests {
         // never appears in a query, so it moves no term's weight — it
         // only changes document length, and therefore the average.
         //
-        // The lengths matter, and they used to be uniform on purpose:
-        // with every document the same size the per-superfile average
-        // equals the table-wide one no matter how the commits fall, so
-        // the test could not tell a globalized length normalizer from a
-        // per-superfile one. Varying them is what makes this an
-        // assertion about the normalizer and not only about idf. The
-        // filler is front-loaded so the four commits below get visibly
-        // different local averages.
+        // The lengths vary on purpose: with every document the same size
+        // each superfile's average equals the table-wide one no matter
+        // how the commits fall, so the test could not tell a table-wide
+        // length normalizer from a superfile-local one. Varying them is
+        // what makes this an assertion about the normalizer and not only
+        // about idf. The filler is front-loaded so the four commits below
+        // get visibly different local averages.
         let titles: Vec<String> = (0..24)
             .map(|i| {
                 let topic = ["alpha", "beta", "gamma"][i % 3];
@@ -3874,14 +3873,10 @@ mod tests {
 
     #[test]
     fn bm25_search_oracle_top_k_set_matches_single_superfile() {
-        // Plant a corpus where the top-k under BM25 is unambiguous
-        // regardless of per-superfile-vs-global IDF variation: 3 docs
-        // contain the rare term `nimblefox`, distributed across 3
-        // superfiles; the other 9 docs share only generic terms with
-        // each other and with the query, so they score zero against
-        // `nimblefox`. The set membership check survives even
-        // though per-superfile IDF for `nimblefox` differs from
-        // global IDF (it's `df=1` in each superfile vs `df=3` global).
+        // Plant a corpus where the top-k under BM25 is unambiguous: 3
+        // docs contain the rare term `nimblefox`, one in each of 3
+        // superfiles; the other 9 docs never contain it, so they score
+        // zero against `nimblefox`.
         let titles = vec![
             "lookup nimblefox special token",   // 0  — match
             "ordinary common everyday text",    // 1
@@ -5318,9 +5313,7 @@ mod tests {
     /// Under global statistics on a table whose term index is complete,
     /// each scored term's corpus-wide df is summed from the index and no
     /// superfile is opened for it: the idf is exactly what summing every
-    /// superfile's own dictionary gives, at zero opens — where the wave
-    /// used to open every superfile the term may live in for its
-    /// dictionary, free only while the manifest inlined the dictionaries.
+    /// superfile's own dictionary gives, at zero opens.
     #[test]
     fn global_idf_comes_from_a_complete_term_index_without_opening_a_superfile() {
         use crate::{

@@ -529,8 +529,8 @@ fn a_scoped_exact_match_reports_posting_work() {
 
 #[test]
 fn a_scoped_prefix_search_reports_posting_work() {
-    // Prefix expansion used to flush nothing at all — a prefix widening
-    // to many terms billed as zero FTS work.
+    // Prefix expansion bills its posting work: a prefix widening to many
+    // terms must not report zero FTS work.
     let st = demo_two_superfiles();
     let (hits, stats) = with_op_stats(|| {
         st.reader()
@@ -834,8 +834,7 @@ fn a_full_width_probe_scans_every_row_exactly_once() {
 fn a_filtered_vector_query_meters_its_predicate_leg() {
     // Filtered kNN first resolves the text predicate on the user table
     // (posting walks), then ranks among matching rows. Both legs are
-    // real work and both must land in the counters — the predicate leg
-    // used to be invisible.
+    // real work and both must land in the counters.
     let dir = TempDir::new().expect("tempdir");
     let st = drained_vector_table(&dir);
     let query = row_vec(3);

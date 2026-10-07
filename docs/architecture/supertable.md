@@ -245,14 +245,12 @@ structure rather than by anything carried per superfile. For every
 `(column, term)` the term index records the superfiles that hold it and,
 for each, the term's document frequency there, an upper bound on the
 BM25 score the term can reach there, and where the term's postings sit
-in that superfile's bytes. One artifact therefore answers the three
-questions the manifest used to answer with three structures: where a
-term lives (formerly a bloom filter per superfile and a union per part,
-both of which saturate on a large table and then prune nothing), how
-often it occurs table-wide (the term-stats sidecar's summed frequency),
-and where its postings are (formerly a copy of every superfile's term
-dictionary inlined into its manifest entry, which was most of a decoded
-manifest's bytes).
+in that superfile's bytes. One artifact therefore answers three
+questions: where a term lives, how often it occurs table-wide, and where
+its postings are. Per-superfile bloom filters would saturate on a large
+table and then prune nothing, and inlining every superfile's term
+dictionary into its manifest entry would make it most of a decoded
+manifest's bytes; the term index keeps both out of the manifest.
 
 The index is looked into, not loaded. A small *root* stays resident: the
 superfiles it covers, each with its smallest document id, and per

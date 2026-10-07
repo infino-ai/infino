@@ -3693,9 +3693,8 @@ mod tests {
     async fn exact_match_on_a_column_without_a_full_text_index_errors() {
         // `exact_match` prunes through the column's own term dictionary,
         // so a column with no full-text index — here the Decimal128
-        // `doc_id` — is rejected by name. It used to tokenize the value
-        // with a fallback analyzer and fail later on the text downcast,
-        // which said nothing about the real problem.
+        // `doc_id` — is rejected by name rather than failing later on a
+        // text downcast that says nothing about the real problem.
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
         let err = r

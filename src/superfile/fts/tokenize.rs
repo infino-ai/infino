@@ -2180,8 +2180,8 @@ mod tests {
     }
 
     #[test]
-    fn into_clauses_legacy_shapes_unchanged() {
-        // Sigil-less queries resolve exactly as the pre-clause model:
+    fn into_clauses_without_sigils_follow_the_bool_mode() {
+        // Sigil-less queries resolve by mode:
         // Or ⇒ all shoulds (union), And ⇒ all musts (intersection).
         let c = parse("rust async").into_clauses(BoolMode::Or);
         assert!(c.musts.is_empty());
