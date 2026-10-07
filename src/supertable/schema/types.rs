@@ -25,11 +25,19 @@ pub type TypeKeys = Map<String, Value>;
 /// The name of a type's spelling when it needs no spelling of its own.
 const ARROW_FALLBACK: &str = "arrow";
 
+/// The inner field name Arrow gives a list's element by convention, and the
+/// one the compact `vector` spelling rebuilds. A fixed-size list of `f32`
+/// whose element is named anything else is spelled `fixed_size_list`, which
+/// carries the element's own field and so survives the round trip.
+const LIST_ITEM: &str = "item";
+
 /// `data_type` as the keys a field object carries for it.
 pub fn type_keys(data_type: &DataType) -> TypeKeys {
     let mut out = TypeKeys::new();
     let tag: &str = match data_type {
-        DataType::FixedSizeList(item, dim) if item.data_type() == &DataType::Float32 => {
+        DataType::FixedSizeList(item, dim)
+            if item.data_type() == &DataType::Float32 && item.name() == LIST_ITEM =>
+        {
             out.insert("dim".into(), Value::from(*dim));
             if !item.is_nullable() {
                 out.insert("item_nullable".into(), Value::from(false));
@@ -130,7 +138,7 @@ pub fn data_type_from_keys(keys: &Map<String, Value>) -> Result<DataType, String
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
             DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, nullable)),
+                Arc::new(Field::new(LIST_ITEM, DataType::Float32, nullable)),
                 dim(keys)?,
             )
         }
@@ -535,6 +543,63 @@ mod tests {
                 .expect("decode")
                 .is_nullable(),
             "nullable defaults to true"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vector_spelling_tests {
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field};
+
+    use super::*;
+
+    /// Dimension of the vectors here; any fixed width does.
+    const DIM: i32 = 384;
+
+    /// The compact `vector` spelling rebuilds the element field, so it is
+    /// only usable for the element name it rebuilds. A column whose element
+    /// carries another name, which is what a Parquet source commonly hands
+    /// over, takes the general spelling and keeps it.
+    #[test]
+    fn a_vector_whose_element_is_named_otherwise_keeps_its_name() {
+        let conventional = DataType::FixedSizeList(
+            Arc::new(Field::new(LIST_ITEM, DataType::Float32, true)),
+            DIM,
+        );
+        let keys = type_keys(&conventional);
+        assert_eq!(keys.get("type").and_then(Value::as_str), Some("vector"));
+        assert_eq!(
+            data_type_from_keys(&keys).expect("decode"),
+            conventional,
+            "the conventional element still takes the compact spelling"
+        );
+
+        let named = DataType::FixedSizeList(
+            Arc::new(Field::new("element", DataType::Float32, true)),
+            DIM,
+        );
+        let keys = type_keys(&named);
+        assert_eq!(
+            keys.get("type").and_then(Value::as_str),
+            Some("fixed_size_list"),
+            "an element named otherwise cannot use a spelling that renames it"
+        );
+        assert_eq!(
+            data_type_from_keys(&keys).expect("decode"),
+            named,
+            "and the name survives, so a reopened table takes the same batches"
+        );
+
+        // The element's nullability survives either way.
+        let not_null = DataType::FixedSizeList(
+            Arc::new(Field::new(LIST_ITEM, DataType::Float32, false)),
+            DIM,
+        );
+        assert_eq!(
+            data_type_from_keys(&type_keys(&not_null)).expect("decode"),
+            not_null
         );
     }
 }
