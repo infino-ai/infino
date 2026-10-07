@@ -432,17 +432,9 @@ async fn do_apply(
     // carries the collector into `fanout_shards_metered`, which already
     // brackets each shard on its own pool worker — bracketing the pool
     // closure as well would count that CPU twice.
-    let fts_corpus =
-        inner
-            .fts_corpus_stats()
-            .await
-            .map_err(|e| AppendPhaseError::SuperfileBuild {
-                message: format!("corpus length statistics: {e}"),
-            })?;
     let bytes = if inner.options.vector_columns.is_empty() {
-        let builder_options = inner.builder_options(fts_corpus);
         timed_kernel(&op_stats, || {
-            let mut builder = SuperfileBuilder::new(builder_options).map_err(|e| {
+            let mut builder = SuperfileBuilder::new(inner.builder_options()).map_err(|e| {
                 AppendPhaseError::SuperfileBuild {
                     message: format!("builder construction: {e}"),
                 }
@@ -471,15 +463,7 @@ async fn do_apply(
         run_on_pool(
             Some(&inner.options.writer_pool),
             "update packed superfile build",
-            move || {
-                build_packed_update_superfile(
-                    &pool_inner,
-                    pool_batch,
-                    vectors,
-                    &pool_stats,
-                    &fts_corpus,
-                )
-            },
+            move || build_packed_update_superfile(&pool_inner, pool_batch, vectors, &pool_stats),
         )
         .await
         .map_err(|e| AppendPhaseError::SuperfileBuild {

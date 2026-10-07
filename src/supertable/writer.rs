@@ -122,7 +122,7 @@ use crate::{
                 sub_hdr,
             },
         },
-        fts::{builder::DOC_LENGTHS_ENTRY_SIZE, reader::ColumnLengthStats},
+        fts::builder::DOC_LENGTHS_ENTRY_SIZE,
         reader::vector_layout_from_kv,
         vector::{
             builder::{
@@ -2014,11 +2014,6 @@ impl SupertableWriter {
         buffer: &[BufferedBatch],
         stem: Option<&str>,
     ) -> Result<(), BuildError> {
-        // Every superfile this commit builds bakes the table-wide length
-        // statistics, resolved once over the whole manifest.
-        let fts_corpus =
-            bridge_on_runtime(self.inner.fts_corpus_stats(), &self.inner.query_runtime())
-                .map_err(|e| BuildError::Store(e.to_string()))?;
         // Phase A — train the global cell grid from the FIRST committed batch
         // into pending OCC metadata (not a bare ArcSwap.store). The pack path
         // below reads the same local `pending_gvi` / existing manifest grid;
@@ -2131,7 +2126,6 @@ impl SupertableWriter {
                     metric,
                     packed_cell_shard_count(&self.inner.options),
                     &self.op_stats,
-                    &fts_corpus,
                     Some(&tx),
                     stem,
                 );
@@ -2192,7 +2186,6 @@ impl SupertableWriter {
                     metric,
                     packed_cell_shard_count(&self.inner.options),
                     &self.op_stats,
-                    &fts_corpus,
                     None,
                     stem,
                 )?;
@@ -2359,7 +2352,6 @@ impl SupertableWriter {
             build_one_shard_with_layout(
                 slice.as_slice(),
                 &user_inner,
-                &fts_corpus,
                 user_options.vector_layout,
                 user_global_centroids.clone(),
             )
@@ -2482,14 +2474,13 @@ fn reserve_build_scratch(
 fn build_one_shard_with_layout(
     slice: &[BufferedBatch],
     inner: &SupertableInner,
-    fts_corpus: &HashMap<String, ColumnLengthStats>,
     vector_layout: crate::superfile::vector::layout::VectorLayout,
     provided_centroids: Option<std::sync::Arc<[f32]>>,
 ) -> Result<ShardOutput, BuildError> {
     let options = &inner.options;
     let mut builder = SuperfileBuilder::new(
         inner
-            .builder_options(fts_corpus.clone())
+            .builder_options()
             .with_vector_layout(vector_layout)
             .with_vector_centroids(provided_centroids),
     )?;
@@ -6240,10 +6231,8 @@ fn build_one_shard_from_packed_cells(
     .map_err(|_| BuildError::BatchSchemaMismatch)?;
 
     let mut builder = SuperfileBuilder::new(
-        // The hidden vector index carries no full-text columns, so there
-        // are no corpus length statistics to bake.
         inner
-            .builder_options(HashMap::new())
+            .builder_options()
             .with_vector_layout(VectorLayout::MultiCellIvf),
     )?;
     builder.add_batch_ids_only(&scalar)?;
@@ -6324,10 +6313,8 @@ fn build_prepared_from_spilled_cells(
     let scalar_schema = inner.options.scalar_schema();
     let mut scalar_stats = HashMap::new();
     let mut builder = SuperfileBuilder::new(
-        // The hidden vector index carries no full-text columns, so there
-        // are no corpus length statistics to bake.
         inner
-            .builder_options(HashMap::new())
+            .builder_options()
             .with_vector_layout(VectorLayout::MultiCellIvf),
     )?;
     let mut id_min = i128::MAX;
@@ -6519,7 +6506,6 @@ fn commit_shards_via_drain(
     metric: Metric,
     n_packed_shards: usize,
     op_stats: &Option<Arc<OpStatsCollector>>,
-    fts_corpus: &HashMap<String, ColumnLengthStats>,
     pipeline: Option<&PipelinedShardTx>,
     stem: Option<&str>,
 ) -> Result<(Vec<ShardOutput>, Vec<Option<u32>>), BuildError> {
@@ -6625,7 +6611,6 @@ fn commit_shards_via_drain(
                 &vector_views,
                 &local_by_id,
                 inner,
-                fts_corpus,
                 &vc,
             )?;
             let Some(tx) = pipeline else {
@@ -6704,7 +6689,6 @@ pub(in crate::supertable) fn build_packed_update_superfile(
     scalar_with_id: RecordBatch,
     vectors: Vec<Arc<Float32Array>>,
     op_stats: &Option<Arc<OpStatsCollector>>,
-    fts_corpus: &HashMap<String, ColumnLengthStats>,
 ) -> Result<Bytes, BuildError> {
     let pack_grid = inner
         .manifest
@@ -6735,7 +6719,6 @@ pub(in crate::supertable) fn build_packed_update_superfile(
         metric,
         UPDATE_PACKED_SHARDS,
         op_stats,
-        fts_corpus,
         None,
         // An update's replacement rows come from a caller batch, not a
         // source file: the superfile is unnamed.
@@ -6770,7 +6753,6 @@ fn build_one_packed_shard_via_drain(
     vector_views: &[VectorColumnView<'_>],
     local_by_id: &HashMap<i128, u32>,
     inner: &SupertableInner,
-    fts_corpus: &HashMap<String, ColumnLengthStats>,
     vc: &VectorConfig,
 ) -> Result<Option<ShardOutput>, BuildError> {
     let mut ordered_locals: Vec<u32> = Vec::new();
@@ -6805,15 +6787,7 @@ fn build_one_packed_shard_via_drain(
                 })
                 .collect::<Result<Vec<_>, BuildError>>()
         },
-        || {
-            build_shard_parquet_and_fts(
-                source_scalar,
-                vector_views,
-                &ordered_locals,
-                inner,
-                fts_corpus,
-            )
-        },
+        || build_shard_parquet_and_fts(source_scalar, vector_views, &ordered_locals, inner),
     );
     let packed_groups = packed_groups?;
     let (mut builder, id_min, id_max, n_docs, scalar_stats) = body_and_fts?;
@@ -6860,7 +6834,6 @@ fn build_shard_parquet_and_fts(
     vector_views: &[VectorColumnView<'_>],
     ordered_locals: &[u32],
     inner: &SupertableInner,
-    fts_corpus: &HashMap<String, ColumnLengthStats>,
 ) -> Result<
     (
         SuperfileBuilder,
@@ -6897,7 +6870,7 @@ fn build_shard_parquet_and_fts(
 
     let mut builder = SuperfileBuilder::new(
         inner
-            .builder_options(fts_corpus.clone())
+            .builder_options()
             .with_vector_layout(VectorLayout::MultiCellIvf),
     )?;
     builder.add_batch(&scalar, &vector_slices)?;

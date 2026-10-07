@@ -674,10 +674,7 @@ impl Supertable {
         // its own documents — the same statistic a fresh append bakes, and
         // what lets a compacted table score like an unfragmented one.
         let replaced: HashSet<Uuid> = superfiles.iter().map(|e| e.superfile_id).collect();
-        let fts_corpus = manifest
-            .fts_corpus_stats_loaded(&replaced)
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+        let fts_corpus = manifest.fts_corpus_stats(&replaced);
         // The build is long, synchronous CPU work, so it runs on the
         // maintenance pool rather than the thread driving this future.
         // `run_on_pool` needs a `'static` closure, so everything it reads —

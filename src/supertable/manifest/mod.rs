@@ -260,18 +260,15 @@ impl SuperfileList {
         }
     }
 
-    /// Total documents across the resident superfiles. Under a lazy open
-    /// the resident view is partial; see [`ManifestSnapshot::fts_collection_size`].
+    /// Total documents across all superfiles.
     pub fn n_docs_total(&self) -> u64 {
         self.superfiles.iter().map(|s| s.n_docs).sum()
     }
 
-    /// One FTS column's length statistics over the resident superfiles —
-    /// the documents that carry tokens and their token total — folded from
+    /// One FTS column's length statistics over the whole table — the
+    /// documents that carry tokens and their token total — folded from
     /// every superfile's summary. `None` when any summary's totals are
-    /// unknown: a partial sum would describe some other corpus. Under a
-    /// lazy open the resident view is partial; scoring reads
-    /// [`ManifestSnapshot::fts_collection_size`] instead.
+    /// unknown: a partial sum would describe some other corpus.
     pub fn fts_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
         Self::fts_length_stats_over(self.superfiles.iter(), column)
     }
@@ -287,21 +284,14 @@ impl SuperfileList {
             })
     }
 
-    /// [`Self::fts_length_stats`] for every FTS column, over the resident
-    /// superfiles a new file will sit beside — all of them for an append,
-    /// all but the inputs a compaction `replaces` — keyed by column; columns
-    /// without complete totals are absent. Writers read
-    /// [`ManifestSnapshot::fts_corpus_stats_loaded`], which is complete
-    /// under a lazy open too.
+    /// [`Self::fts_length_stats`] for every FTS column, over the superfiles
+    /// a new file will sit beside — all of them for an append, all but the
+    /// inputs a compaction `replaces` — keyed by column; columns without
+    /// complete totals are absent. What a writer hands the new file's
+    /// builder so it bakes the table-wide average rather than its own.
     pub fn fts_corpus_stats(&self, replaces: &HashSet<Uuid>) -> HashMap<String, ColumnLengthStats> {
-        Self::fts_corpus_stats_over(&self.superfiles, replaces)
-    }
-
-    fn fts_corpus_stats_over(
-        superfiles: &[Arc<SuperfileEntry>],
-        replaces: &HashSet<Uuid>,
-    ) -> HashMap<String, ColumnLengthStats> {
-        let kept: Vec<&Arc<SuperfileEntry>> = superfiles
+        let kept: Vec<&Arc<SuperfileEntry>> = self
+            .superfiles
             .iter()
             .filter(|sf| !replaces.contains(&sf.superfile_id))
             .collect();
@@ -1319,30 +1309,6 @@ impl ManifestSnapshot {
             }
             None => Ok(hierarchical_iter::fallback_to_flat_superfiles(self)),
         }
-    }
-
-    /// The collection size BM25 weights `column`'s terms against: the
-    /// documents carrying tokens in it across every listed superfile, or the
-    /// row count when any superfile's totals are unknown. Reads every
-    /// superfile's own summary, loading the parts a lazy open left cold —
-    /// part-level length aggregates are not used, because engines that
-    /// dropped a part's column aggregate on a bloom-less merge left later
-    /// parts carrying only their newest superfiles' totals.
-    pub(crate) async fn fts_collection_size(&self, column: &str) -> Result<u64, ManifestLoadError> {
-        let all = self.get_all_superfiles_loaded().await?;
-        Ok(SuperfileList::fts_length_stats_over(all.iter(), column)
-            .map_or_else(|| all.iter().map(|s| s.n_docs).sum(), |c| c.n_scored_docs))
-    }
-
-    /// [`SuperfileList::fts_corpus_stats`] over every listed superfile,
-    /// loading the parts a lazy open left cold, so a new file bakes the
-    /// table-wide average however the manifest was opened.
-    pub(crate) async fn fts_corpus_stats_loaded(
-        &self,
-        replaces: &HashSet<Uuid>,
-    ) -> Result<HashMap<String, ColumnLengthStats>, ManifestLoadError> {
-        let all = self.get_all_superfiles_loaded().await?;
-        Ok(SuperfileList::fts_corpus_stats_over(&all, replaces))
     }
 
     /// User superfiles whose logical birth version is not covered by the
