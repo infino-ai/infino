@@ -990,7 +990,9 @@ impl SupertableReader {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc, &legacy).to_owned();
+                let column_arc = r
+                    .column_alias(column_field_id, &column_arc, &legacy)
+                    .to_owned();
 
                 // This superfile's open-wave fetches (global stats): the
                 // cursor builds below serve the scored terms from the memo
@@ -1380,7 +1382,9 @@ impl SupertableReader {
                     // A file written before a rename labels the column as it was
                     // then, and its dictionary is keyed by that label; the id is
                     // what finds the column in either file.
-                    let column_arc = r.column_alias(column_field_id, &column_arc, &legacy).to_owned();
+                    let column_arc = r
+                        .column_alias(column_field_id, &column_arc, &legacy)
+                        .to_owned();
 
                     let refs: Vec<&str> = terms_arc.iter().map(String::as_str).collect();
                     if full {
@@ -1542,7 +1546,9 @@ impl SupertableReader {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc, &legacy).to_owned();
+                let column_arc = r
+                    .column_alias(column_field_id, &column_arc, &legacy)
+                    .to_owned();
 
                 match range {
                     Some((start, end)) => {
@@ -1846,7 +1852,9 @@ impl SupertableReader {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc, &legacy).to_owned();
+                let column_arc = r
+                    .column_alias(column_field_id, &column_arc, &legacy)
+                    .to_owned();
 
                 let memo = memo_from_locations(&r, &locations, suid).await;
                 let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
@@ -2061,7 +2069,9 @@ impl SupertableReader {
                     // A file written before a rename labels the column as it was
                     // then, and its dictionary is keyed by that label; the id is
                     // what finds the column in either file.
-                    let column_arc = r.column_alias(column_field_id, &column_arc, &legacy).to_owned();
+                    let column_arc = r
+                        .column_alias(column_field_id, &column_arc, &legacy)
+                        .to_owned();
 
                     let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                     // Tombstone bitmap for this superfile (None = no deletes).
@@ -2266,7 +2276,9 @@ impl SupertableReader {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc, &legacy).to_owned();
+                let column_arc = r
+                    .column_alias(column_field_id, &column_arc, &legacy)
+                    .to_owned();
 
                 let candidates: Vec<u32> = if tokens_arc.is_empty() {
                     (0..r.n_docs() as u32).collect()

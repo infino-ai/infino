@@ -980,7 +980,9 @@ fn a_search_projecting_only_a_newer_column_reads_it_as_null() {
 
     db.apply_schema(
         TABLE,
-        &SchemaPatch::new(vec![FieldPatch::named("title").with_type(DataType::LargeUtf8)]),
+        &SchemaPatch::new(vec![
+            FieldPatch::named("title").with_type(DataType::LargeUtf8),
+        ]),
         None,
     )
     .expect("add a column the written file cannot hold");
@@ -1087,8 +1089,16 @@ fn a_document_from_a_table_that_dropped_a_column_clones() {
         .apply_schema("clone", &SchemaPatch::from(&source), None)
         .expect("a document clones onto an absent table");
     assert_eq!(
-        cloned.fields().iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
-        source.fields().iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        cloned
+            .fields()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
+        source
+            .fields()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
         "the same columns, by name"
     );
 

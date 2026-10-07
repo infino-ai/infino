@@ -5631,7 +5631,9 @@ impl SupertableReader {
                     // A file written before a rename labels its vector
                     // blob with the name the column had then; the id is what
                     // finds the column in either file.
-                    let column = reader.column_alias(column_field_id, &column, &legacy).to_owned();
+                    let column = reader
+                        .column_alias(column_field_id, &column, &legacy)
+                        .to_owned();
                     // Unfiltered user path on row-addressable locals: resolve the
                     // bitmap once (warm after the orchestrator's prefetch) and
                     // push it down. Filtered search leaves it `None` — its
@@ -5918,7 +5920,9 @@ impl SupertableReader {
                         // A file written before a rename labels its vector
                         // blob with the name the column had then; the id is what
                         // finds the column in either file.
-                        let column = reader.column_alias(column_field_id, &column, &legacy).to_owned();
+                        let column = reader
+                            .column_alias(column_field_id, &column, &legacy)
+                            .to_owned();
                         // Hidden-path invariants: no tombstone sidecars (the
                         // manifest's deletes apply after the stable-id
                         // remap upstream), replica slack mirrors phase A.
