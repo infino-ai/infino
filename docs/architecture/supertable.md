@@ -103,10 +103,9 @@ the term dictionary (each literal fragment of the pattern is tokenized;
 a token the fragment closes on both sides is required as itself, and a
 token bordering a wildcard is widened to the indexed terms it heads,
 tails, or sits inside) — with the exact predicate re-checked over the
-candidate rows. The `ascii_lower` analyzer drops any token holding a
-non-ASCII byte, so under it only tokens the pattern closes on both
-sides can be required; the default `standard` analyzer supports prefix,
-suffix, and substring patterns. A suffix or substring token needs a walk
+candidate rows. A plain `standard` column supports prefix, suffix, and
+substring patterns; a column with a stopword set or stemmer leaves
+`LIKE` to the scan, since its terms are not substrings of the text. A suffix or substring token needs a walk
 of the column's whole dictionary, taken only where the superfile's
 stored text is large against its vocabulary; otherwise that token is
 left to the scan. `ILIKE` is bounded the same way for ASCII tokens,
@@ -246,14 +245,12 @@ structure rather than by anything carried per superfile. For every
 `(column, term)` the term index records the superfiles that hold it and,
 for each, the term's document frequency there, an upper bound on the
 BM25 score the term can reach there, and where the term's postings sit
-in that superfile's bytes. One artifact therefore answers the three
-questions the manifest used to answer with three structures: where a
-term lives (formerly a bloom filter per superfile and a union per part,
-both of which saturate on a large table and then prune nothing), how
-often it occurs table-wide (the term-stats sidecar's summed frequency),
-and where its postings are (formerly a copy of every superfile's term
-dictionary inlined into its manifest entry, which was most of a decoded
-manifest's bytes).
+in that superfile's bytes. One artifact therefore answers three
+questions: where a term lives, how often it occurs table-wide, and where
+its postings are. Per-superfile bloom filters would saturate on a large
+table and then prune nothing, and inlining every superfile's term
+dictionary into its manifest entry would make it most of a decoded
+manifest's bytes; the term index keeps both out of the manifest.
 
 The index is looked into, not loaded. A small *root* stays resident: the
 superfiles it covers, each with its smallest document id, and per
@@ -290,9 +287,8 @@ k-th score — the in-superfile block-max reasoning lifted one level. And
 its cursors are built from the index's recorded postings locations, so
 the superfile's own dictionary is not read on that path.
 
-A table written before the index existed keeps working: its entries
-carry their blooms and the reader routes by them, and its first commit
-under the current writer publishes an index that covers only the new
+A table whose term index is absent or incomplete routes by its entries'
+blooms, and its next commit publishes an index that covers only the new
 superfiles — the manifest marks it incomplete, and part loading keeps
 the summary-based choice until a maintenance pass rebuilds the index
 over every superfile. Nothing requires old code to read a new manifest.
@@ -321,8 +317,14 @@ published atomically.
 A superfile's indexes can fall behind what the engine writes today on two
 independent axes, and they need different repairs:
 
-- **The layout** — the index blob's version. Copying the postings into a
-current blob fixes it; the terms themselves are fine.
+- **The layout** — the index blob's version, or a footer that stores a
+region key more than once. A blob below the current version, or with a
+duplicated key, is rewritten by copying its postings into a current blob;
+the terms themselves are fine. Every blob version the engine reads is
+current, so a stale version arises only once the current version moves
+past one the engine still reads. A blob older than the oldest version the
+engine reads is not repaired: it fails to open, with an error that names
+the release to reindex it with.
 - **The analysis** — which revision of a named analysis chain produced the
 terms. Copying postings cannot fix this, so only re-analyzing the stored
 text does, and a column whose text was never stored cannot be repaired at
@@ -425,7 +427,7 @@ superfile is irrelevant, the superfile is kept. The pruning inputs are:
 
 - **Term queries** use the table-level term index, which names the
   superfiles holding each term exactly (a superfile the index does not
-  list — one written before it existed, or on a table with no storage —
+  list — on an incomplete index, or on a table with no storage —
   is tested against its own term presence filter instead).
 - **Prefix queries** scan the term index's slices for the prefix; a
   superfile the index does not list is tested against its lexicographic

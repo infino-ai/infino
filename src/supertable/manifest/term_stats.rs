@@ -17,7 +17,7 @@
 //! `ManifestSnapshot::update_inner`).
 //!
 //! Layout: a fixed header (magic, version, covered-superfile ids) then a
-//! standard FST map keyed `field_id <FST_SEPARATOR> term → u64`
+//! standard FST map keyed `field_id <KEY_SEPARATOR> term → u64`
 //! ([`FieldId::term_key`]) — a superfile dictionary's shape with the
 //! column named by its id, so a rename leaves the artifact valid — values
 //! holding summed gross df. The build translates each superfile's
@@ -205,7 +205,7 @@ where
             continue;
         }
         // Fetched once: the term walk and every df batch read it.
-        let fst_bytes = fts
+        let dict_bytes = fts
             .dict_bytes_async()
             .await
             .map_err(|source| TermStatsError::Read {
@@ -214,7 +214,7 @@ where
             })?;
         for (column, column_id) in &columns {
             let term_bytes = fts
-                .iter_column_terms_with(&fst_bytes, column)
+                .iter_column_terms_with(&dict_bytes, column)
                 .map_err(|source| TermStatsError::Read {
                     what: "term walk",
                     source,
@@ -224,13 +224,13 @@ where
                 .map(|t| from_utf8(t).map_err(|_| TermStatsError::NonUtf8Term(column.clone())))
                 .collect::<Result<_, _>>()?;
             for chunk in terms.chunks(BUILD_DF_BATCH_TERMS) {
-                let (dfs, _work) =
-                    fts.term_dfs_with(&fst_bytes, column, chunk)
-                        .await
-                        .map_err(|source| TermStatsError::Read {
-                            what: "df batch",
-                            source,
-                        })?;
+                let (dfs, _work) = fts
+                    .term_dfs_with(&dict_bytes, column, chunk)
+                    .await
+                    .map_err(|source| TermStatsError::Read {
+                        what: "df batch",
+                        source,
+                    })?;
                 for (term, df) in chunk.iter().zip(dfs) {
                     *merged.entry(column_id.term_key(term)).or_insert(0) += df;
                 }

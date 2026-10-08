@@ -22,7 +22,7 @@ def quickstart() -> None:
         ]
     )
     # Every per-column FTS option the runtime accepts must type-check.
-    spec = infino.IndexSpec().fts("title").fts("body", analyzer="standard", stored=False)
+    spec = infino.IndexSpec().fts("title").fts("body", stored=False)
     docs: infino.Table = db.create_table("docs", schema, spec)
 
     docs.append(

@@ -260,7 +260,7 @@ mod tests {
     use crate::{
         storage::{LocalFsStorageProvider, StorageError},
         superfile::{
-            ReadError,
+            FtsError, ReadError,
             builder::{BuilderOptions, SuperfileBuilder},
         },
         supertable::{
@@ -625,5 +625,18 @@ mod tests {
             QueryError::store(refused),
             QueryError::PermissionDenied(_)
         ));
+    }
+
+    /// A superfile the disk cache could not open because its index is too
+    /// old to read stays `Unsupported` under the cache's own wrapping, with
+    /// the message that says to reindex.
+    #[test]
+    fn an_index_too_old_under_the_disk_cache_stays_unsupported() {
+        let too_old = ReadError::Fts(Box::new(FtsError::IndexTooOld { version: 6 }));
+        let wrapped = cache_open_failed(DiskCacheError::SuperfileOpenRead(too_old));
+        match QueryError::store(wrapped) {
+            QueryError::Unsupported(m) => assert!(m.contains("reindex"), "{m}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }

@@ -43,12 +43,8 @@ pub const B: f32 = 0.75;
 
 /// A column's BM25 similarity parameters.
 ///
-/// [`Default`] is the standard pair (`k1 = 1.2`, `b = 0.75`) — the values every
-/// superfile written before the parameters were recordable was built
-/// with, and the values a column that declares nothing still uses. That
-/// meaning is frozen: a file whose column entry carries no parameters
-/// can only have been built with this pair, so the default here must
-/// never track a change to what the *API* recommends.
+/// [`Default`] is the standard pair (`k1 = 1.2`, `b = 0.75`), the values a
+/// column that declares nothing uses.
 ///
 /// `#[non_exhaustive]`: build with [`Bm25Params::new`] so a further
 /// similarity parameter can be added without breaking callers.

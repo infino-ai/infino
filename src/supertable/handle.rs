@@ -189,7 +189,7 @@ pub(super) struct SupertableInner {
     pub(super) decoded_scalar_cache: DecodedScalarCache,
     /// Per-generation cache of global BM25 idf per (column, term),
     /// shared by every reader minted from this handle so repeat
-    /// queries under `Bm25Stats::Global` skip the dictionary gather
+    /// queries skip the dictionary gather
     /// fan — see [`GlobalIdfCache`].
     pub(super) global_idf_cache: GlobalIdfCache,
     /// Lazily loaded + verified global term-stats sidecar. `None` until
@@ -4565,15 +4565,13 @@ mod tests {
 
         // Exercise the lazy FTS path before optimize (mirrors the SQL bench's
         // pre-compact warm/cold queries against a disk-cache consumer).
-        use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
+        use crate::superfile::fts::reader::BoolMode;
         let hits = consumer
             .bm25_search(
                 "title",
                 "doc",
                 5,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 pre-optimize");
@@ -4588,9 +4586,7 @@ mod tests {
                 "title",
                 "doc",
                 5,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 post-optimize");
@@ -8934,15 +8930,13 @@ mod tests {
     }
 
     fn bm25_title_hits(table: &Supertable, query: &str) -> usize {
-        use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
+        use crate::superfile::fts::reader::BoolMode;
         table
             .bm25_search(
                 "title",
                 query,
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 search")

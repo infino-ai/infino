@@ -3,15 +3,12 @@
 
 //! BM25 oracle for the `standard` (UAX#29) analyzer.
 //!
-//! Every other oracle in this suite builds and queries under the
-//! `ascii_lower` tokenizer. This module builds the superfile
-//! *and* indexes the brute-force reference under [`StandardTokenizer`],
-//! over a corpus whose text (non-ASCII letters, punctuation, digits)
-//! the two analyzers segment differently — so the reader's standard
-//! query+doc tokenization and scoring are pinned against a reference
-//! that tokenizes the same way, and a bug specific to the standard path
-//! (wrong analyzer selected, query tokenized under a different analyzer
-//! than the docs) diverges from the oracle.
+//! Builds the superfile *and* indexes the brute-force reference under
+//! [`StandardTokenizer`], over a corpus of non-ASCII letters,
+//! punctuation and digits — so the reader's query+doc tokenization and
+//! scoring are pinned against a reference that tokenizes the same way,
+//! and a query tokenized differently than the docs diverges from the
+//! oracle.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -43,7 +40,7 @@ fn build_standard(corpus: &[(u64, &str)]) -> SuperfileReader {
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
-        vec![FtsConfig::new("title").analyzer("standard")],
+        vec![FtsConfig::new("title")],
         vec![],
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
@@ -56,12 +53,12 @@ fn build_standard(corpus: &[(u64, &str)]) -> SuperfileReader {
     SuperfileReader::open(bytes).expect("open superfile")
 }
 
-/// Corpus with text the `standard` analyzer segments differently from
-/// `ascii_lower`: accented letters, apostrophes, digits, punctuation.
+/// Corpus exercising Unicode segmentation: accented letters,
+/// apostrophes, digits, punctuation.
 fn corpus() -> Vec<(u64, &'static str)> {
     vec![
         (0, "rust async runtime"),
-        (1, "café résumé naïve 🚀"), // non-ASCII: dropped entirely by ascii_lower; emoji is a token
+        (1, "café résumé naïve 🚀"), // non-ASCII letters; the emoji is a token
         (2, "the rust programming café"), // "café" co-occurs with "rust"
         (3, "version 2 point 0 release"),
         (4, "rust systems programming"),
@@ -136,12 +133,8 @@ async fn standard_tokenizer_agrees_with_oracle() {
 
 #[tokio::test]
 async fn standard_tokenizer_indexes_non_ascii_terms() {
-    // Discriminating check that the standard analyzer is actually in
-    // force: "café" and "naïve" contain non-ASCII bytes that the default
-    // `ascii_lower` tokenizer drops entirely. Under `standard` they are
-    // real, searchable terms — so a non-empty result here proves the
-    // build/query path used the standard analyzer, not a silent
-    // ascii_lower fallback.
+    // "café" and "naïve" contain non-ASCII bytes; under `standard` they
+    // are real, searchable terms.
     let corp = corpus();
     let reader = build_standard(&corp);
 

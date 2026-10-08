@@ -36,8 +36,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 
 use infino::{
-    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
-    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
+    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, GcError,
+    InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
     ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions,
     SchemaError as SchemaCause, SchemaPatch, Stemmer,
     Stopwords, VectorFilter,
@@ -149,7 +149,10 @@ fn schema_err(e: &SchemaCause) -> PyErr {
 }
 
 fn optimize_err(e: OptimizeError) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
+    match e {
+        OptimizeError::Unsupported(m) => PyNotImplementedError::new_err(m),
+        other => PyRuntimeError::new_err(other.to_string()),
+    }
 }
 
 fn gc_err(e: GcError) -> PyErr {
@@ -169,6 +172,8 @@ fn reindex_err(e: ReindexError) -> PyErr {
         ReindexError::AlreadyRunning => {
             AlreadyRunningError::new_err(ReindexError::AlreadyRunning.to_string())
         }
+        // An index this engine cannot read: raised as `InfinoError::Unsupported` is.
+        ReindexError::Unsupported(m) => PyNotImplementedError::new_err(m),
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
@@ -309,8 +314,8 @@ fn connect(
 }
 
 /// One declared FTS column, as its keyword arguments arrived.
-/// `analyzer` / `stopwords` / `stemmer` `None` mean the defaults;
-/// `k1` / `b` `None` mean the column takes the standard BM25 pair.
+/// `analyzer` `None` means `standard`; `stopwords` / `stemmer` `None`
+/// mean no filter; `k1` / `b` `None` mean the standard BM25 pair.
 #[derive(Clone)]
 struct FtsDecl {
     column: String,
@@ -362,11 +367,9 @@ impl IndexSpec {
         Self::default()
     }
 
-    /// Mark `column` (a UTF-8 string column) as full-text indexed.
-    /// `analyzer` selects the tokenizer: `"standard"` (the default —
-    /// the Unicode-aware UAX #29 tokenizer that keeps non-ASCII text)
-    /// or `"ascii_lower"` (ASCII split + lowercase, non-ASCII dropped).
-    /// It is recorded with the table and cannot be changed afterwards.
+    /// Mark `column` (a UTF-8 string column) as full-text indexed,
+    /// tokenized by the Unicode-aware UAX #29 `standard` tokenizer.
+    /// `analyzer` names it; `"standard"`, the default, is the only one.
     /// `stored=False` makes the column index-only: searchable, but the
     /// raw text is never kept in the table, so it cannot be selected,
     /// projected, or filtered on (append/update batches still carry it).
@@ -404,13 +407,9 @@ impl IndexSpec {
     /// may still score with a different pair (see `bm25_search`), which
     /// is the shape to reach for while tuning; declare the pair here
     /// once it is settled.
-    // The three new options are appended **after** `b`, and behind `*`
-    // so they are keyword-only. Inserting them mid-signature would have
-    // silently changed what `fts("body", "standard", False)` means for
-    // every positional caller — every call site in this repo passes
-    // keywords past `column`, so no test here would have caught it.
-    // Keyword-only also means the next option added cannot repeat the
-    // mistake.
+    // `analyzer` keeps its original slot so positional calls still bind.
+    // The analysis options sit behind `*`, keyword-only, so a new option
+    // can never reposition `stored` / `k1` / `b` for a positional caller.
     #[pyo3(signature = (
         column,
         analyzer = None,
@@ -476,8 +475,8 @@ impl IndexSpec {
             let mut field = infino::FtsField::new(column.clone())
                 .positions(*positions)
                 .stored(*stored);
-            if let Some(a) = analyzer {
-                field = field.analyzer(a.clone());
+            if let Some(name) = analyzer {
+                field = field.analyzer(name.clone());
             }
             if let Some(name) = stopwords {
                 field = field.stopwords(stopwords_from_name(name)?);
@@ -717,22 +716,16 @@ impl CompactOptions {
 struct ReindexOptions {
     mode: Option<String>,
     stale_seal_timeout_ms: Option<u64>,
-    trust_writer_analysis: bool,
 }
 
 #[pymethods]
 impl ReindexOptions {
     #[new]
-    #[pyo3(signature = (*, mode=None, stale_seal_timeout_ms=None, trust_writer_analysis=false))]
-    fn new(
-        mode: Option<String>,
-        stale_seal_timeout_ms: Option<u64>,
-        trust_writer_analysis: bool,
-    ) -> Self {
+    #[pyo3(signature = (*, mode=None, stale_seal_timeout_ms=None))]
+    fn new(mode: Option<String>, stale_seal_timeout_ms: Option<u64>) -> Self {
         Self {
             mode,
             stale_seal_timeout_ms,
-            trust_writer_analysis,
         }
     }
 }
@@ -747,9 +740,6 @@ impl ReindexOptions {
         }
         if let Some(ms) = self.stale_seal_timeout_ms {
             out = out.with_stale_seal_timeout_ms(ms);
-        }
-        if self.trust_writer_analysis {
-            out = out.trusting_writer_analysis();
         }
         Ok(out)
     }
@@ -965,15 +955,11 @@ impl Table {
     /// keep belongs on the column (`IndexSpec.fts`), where the bounds
     /// are built with it and the correction disappears.
     ///
-    /// `stats` selects the BM25 corpus statistics: `"global"` (default)
-    /// scores against table-wide statistics gathered across all segments,
-    /// so a fragmented table ranks like a single unified corpus, at the
-    /// cost of a document-frequency gather before scoring.
-    /// `"per_superfile"` scores each segment against its own local
-    /// document count and term frequencies — fastest, and it skips that
-    /// gather, but a term's idf depends on which segment a document
-    /// landed in, so ranking drifts as the table fragments.
-    #[pyo3(signature = (column, query, k, mode=None, projection=None, stats=None, k1=None, b=None))]
+    /// A term search on a fully loaded table scores every segment against
+    /// table-wide statistics, so a fragmented table ranks like one corpus.
+    /// Prefix search, and a table opened with a lazily loaded manifest,
+    /// score each segment with its own statistics.
+    #[pyo3(signature = (column, query, k, mode=None, projection=None, *, k1=None, b=None))]
     #[allow(clippy::too_many_arguments)]
     fn bm25_search<'py>(
         &self,
@@ -983,13 +969,10 @@ impl Table {
         k: usize,
         mode: Option<&str>,
         projection: Option<Vec<String>>,
-        stats: Option<&str>,
         k1: Option<f32>,
         b: Option<f32>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mut opts = Bm25SearchOptions::new()
-            .with_mode(parse_mode(mode)?)
-            .with_stats(parse_stats(stats)?);
+        let mut opts = Bm25SearchOptions::new().with_mode(parse_mode(mode)?);
         // Both or neither: overriding one parameter and silently
         // keeping the engine default for the other is a footgun, since
         // the two interact through the length norm.
@@ -1492,20 +1475,6 @@ fn parse_filter<'a>(
         _ => Err(PyValueError::new_err(
             "filter_column and filter_query must be provided together",
         )),
-    }
-}
-
-fn parse_stats(stats: Option<&str>) -> PyResult<Bm25Stats> {
-    let Some(stats) = stats else {
-        // Omitted means the engine default.
-        return Ok(Bm25Stats::default());
-    };
-    match stats.to_ascii_lowercase().as_str() {
-        "per_superfile" => Ok(Bm25Stats::PerSuperfile),
-        "global" => Ok(Bm25Stats::Global),
-        other => Err(PyValueError::new_err(format!(
-            "stats must be 'per_superfile' or 'global', got {other:?}"
-        ))),
     }
 }
 

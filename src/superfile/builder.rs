@@ -53,22 +53,18 @@
 //!
 //! ## Tokenizer scope: per-column
 //!
-//! `BuilderOptions` carries a default `tokenizer: Option<Arc<dyn
-//! Tokenizer>>` (required when any FTS column exists) plus a
-//! per-column `fts_tokenizers` vec aligned to `fts_columns`; the
-//! default seeds every column unless an entry overrides it.
-//! `FtsConfig` itself carries only the column name and its positions
-//! flag. `FtsBuilder` holds the default tokenizer and a parallel
-//! `column_tokenizers` vec — `register_column` uses the default,
-//! `register_column_with_tokenizer` sets a per-column analyzer — and
-//! dispatches per (column, doc) at `add_doc` time.
+//! Each `FtsConfig` in `BuilderOptions::fts_columns` names its column's
+//! stopword set and stemmer. The builder turns that into the column's
+//! analysis chain — the Unicode-aware `StandardTokenizer` plus those
+//! filters — and registers it with `register_column_with_tokenizer`;
+//! `FtsBuilder` keeps one tokenizer per column and dispatches per
+//! (column, doc) at `add_doc` time.
 //!
-//! Two tokenizers ship: the Unicode-aware `StandardTokenizer` (the
-//! default) and `AsciiLowerTokenizer`, selectable per column. The
-//! `inf.fts.columns` JSON persists each column's tokenizer name, so a
-//! column is re-tokenized at rebuild / compaction with the analyzer it
-//! was indexed with. Further analyzers (language-specific stemmers, …)
-//! implement the `Tokenizer` trait and need no change to this plumbing.
+//! The `inf.fts.columns` JSON persists each column's filters, so a
+//! column is re-tokenized at rebuild / compaction with the analysis it
+//! was indexed with. Further analyzers implement the `Tokenizer` trait
+//! and need no change to this plumbing.
+
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
@@ -101,7 +97,7 @@ use crate::{
         },
         fts::{
             analysis::{
-                Base, Stemmer, Stopwords, UNKNOWN_ANALYSIS_REVISION, chain_name, chain_revision,
+                Stemmer, Stopwords, UNKNOWN_ANALYSIS_REVISION, chain_name, chain_revision,
                 chain_tokenizer,
             },
             bm25,
@@ -109,7 +105,7 @@ use crate::{
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
             reorder::{ForwardIndex, bisect_order},
             sorted_merge::SortedInput,
-            tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
+            tokenize::STANDARD_TOKENIZER,
         },
         id_space::{FtsDocId, RowId, StableId},
         ids,
@@ -315,19 +311,10 @@ impl CarryScope {
 #[derive(Debug, Clone)]
 pub struct FtsConfig {
     pub column: String,
-    /// **Base** analyzer (tokenizer) name applied to this column —
-    /// `"standard"` (the default) or `"ascii_lower"`. Resolved to a
-    /// tokenizer instance once, at builder construction, together with
-    /// [`FtsConfig::stopwords`] and [`FtsConfig::stemmer`]; an unknown
-    /// name is a build error. Per column: each FTS column is tokenized
-    /// with its own analyzer, so columns in one table may differ.
-    pub analyzer: String,
-    /// Stopword set removed after the base tokenizer and before the
+    /// Stopword set removed after the `standard` tokenizer and before the
     /// stemmer. Persisted in the column's `inf.fts.columns` entry as
-    /// `"stopwords"`, emitted only when set — so a column with no
-    /// stopwords keeps an entry byte-identical to one written before
-    /// the filter existed, and a reader of such an entry correctly
-    /// infers that no set was applied.
+    /// `"stopwords"`, emitted only when set; readers treat absence as
+    /// no set.
     pub stopwords: Stopwords,
     /// Stemmer applied to what survives the stopword set. Persisted as
     /// `"stemmer"` under the same only-when-set rule as
@@ -358,9 +345,7 @@ pub struct FtsConfig {
     /// parameters a bound belongs to. A query may score at a different
     /// pair; the reader corrects the bounds for the difference.
     ///
-    /// Defaults to the standard pair (`k1 = 1.2`, `b = 0.75`), which
-    /// keeps the built bytes identical to a file written before the
-    /// parameters were declarable.
+    /// Defaults to the standard pair (`k1 = 1.2`, `b = 0.75`).
     pub bm25: bm25::Bm25Params,
     /// The analysis revision of postings **carried in** from an existing
     /// file, when they were not produced by this build.
@@ -380,12 +365,11 @@ pub struct FtsConfig {
 }
 
 impl FtsConfig {
-    /// Configuration with the defaults: `standard` analyzer, no
+    /// Configuration with the defaults: no analysis filters, no
     /// positions, text stored.
     pub fn new(column: impl Into<String>) -> Self {
         Self {
             column: column.into(),
-            analyzer: STANDARD_TOKENIZER.to_string(),
             stopwords: Stopwords::None,
             stemmer: Stemmer::None,
             positions: false,
@@ -393,12 +377,6 @@ impl FtsConfig {
             bm25: bm25::Bm25Params::STANDARD,
             carried_analysis_revision: None,
         }
-    }
-
-    /// Set the analyzer name (see the field docs).
-    pub fn analyzer(mut self, name: impl Into<String>) -> Self {
-        self.analyzer = name.into();
-        self
     }
 
     /// Set the stopword set (see the field docs).
@@ -416,8 +394,8 @@ impl FtsConfig {
     /// This column's analysis as one derived identity string — the
     /// value [`Tokenizer::name`] reports for its tokenizer. Never
     /// persisted; see [`crate::superfile::fts::analysis`].
-    pub(crate) fn chain_name(&self) -> Option<&'static str> {
-        Base::from_name(&self.analyzer).map(|b| chain_name(b, self.stopwords, self.stemmer))
+    pub(crate) fn chain_name(&self) -> &'static str {
+        chain_name(self.stopwords, self.stemmer)
     }
 
     /// Carry an existing file's analysis revision (see the field docs).
@@ -428,17 +406,9 @@ impl FtsConfig {
 
     /// The analysis revision this column records: whatever was carried
     /// in, else the revision this engine's chain emits.
-    ///
-    /// An analyzer name this engine cannot resolve yields `0` rather than
-    /// an error — the build fails on the unknown name elsewhere, with a
-    /// message that names the column, and returning a revision here would
-    /// only obscure it.
     pub(crate) fn analysis_revision(&self) -> u32 {
-        self.carried_analysis_revision.unwrap_or_else(|| {
-            Base::from_name(&self.analyzer)
-                .map(|b| chain_revision(b, self.stopwords, self.stemmer))
-                .unwrap_or(0)
-        })
+        self.carried_analysis_revision
+            .unwrap_or_else(|| chain_revision(self.stopwords, self.stemmer))
     }
 
     /// Record token positions (see the field docs).
@@ -493,7 +463,7 @@ pub struct BuilderOptions {
     /// predicates like `WHERE title LIKE …`) AND is indexed
     /// into the embedded FTS blob for BM25 ranking
     /// (`bm25_search(column, …)`). Storage cost is mild
-    /// double-storage: raw text in Parquet plus the FST +
+    /// double-storage: raw text in Parquet plus the term dictionary +
     /// PFOR-delta posting structures in the FTS blob, which
     /// dedupe terms.
     ///
@@ -806,7 +776,6 @@ impl BuilderOptions {
             fts.fts_columns_config()
                 .map(|c| {
                     FtsConfig::new(c.name.clone())
-                        .analyzer(c.base.name())
                         .stopwords(c.stopwords)
                         .stemmer(c.stemmer)
                         .positions(c.positions)
@@ -987,7 +956,7 @@ impl BuilderOptions {
             // sharing a base but differing in a filter hold different
             // terms, so carrying one's postings into the other silently
             // mixes two tokenizations.
-            let own_analysis = own.chain_name().unwrap_or(own.analyzer.as_str());
+            let own_analysis = own.chain_name();
             let other_analysis = other.tokenizer.name();
             if own_analysis != other_analysis {
                 return Err(BuildError::FTSSchemaMismatch(format!(
@@ -1162,28 +1131,18 @@ impl SuperfileBuilder {
             }
         }
 
-        // 4 + 5. Resolve each FTS column's analyzer name and wire up the
-        //        unified FTS + vector sub-builders. Resolution happens
-        //        once, here — `FtsConfig` carries the name (the same
-        //        record `inf.fts.columns` persists) and an unknown name
-        //        is a build error.
+        // 4 + 5. Build each FTS column's analysis chain and wire up the
+        //        unified FTS + vector sub-builders.
         let fts_builder = if opts.fts_columns.is_empty() {
             None
         } else {
-            // The constructor's default tokenizer is irrelevant: every
-            // column below registers its own analyzer explicitly.
-            let mut fb = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            let mut fb = FtsBuilder::new();
             for fc in &opts.fts_columns {
                 // The whole chain, not just the base: a column that
                 // declares a stopword set or a stemmer must be indexed
                 // through them, or the postings would hold unfiltered
                 // terms while every query filtered.
-                let base =
-                    Base::from_name(&fc.analyzer).ok_or_else(|| BuildError::UnknownAnalyzer {
-                        column: fc.column.clone(),
-                        analyzer: fc.analyzer.clone(),
-                    })?;
-                let tok = chain_tokenizer(base, fc.stopwords, fc.stemmer);
+                let tok = chain_tokenizer(fc.stopwords, fc.stemmer);
                 let id = fb.register_column_with_tokenizer(
                     fc.column.clone(),
                     fc.positions,
@@ -1236,7 +1195,7 @@ impl SuperfileBuilder {
     /// `SuperfileBuilder` was constructed without any FTS columns.
     ///
     /// Primarily useful for tests that need to force the spill +
-    /// streaming-FST finish path on a corpus too small to cross the
+    /// streaming-dictionary finish path on a corpus too small to cross the
     /// default 256 MiB threshold; production callers should leave
     /// the default in place.
     pub fn set_fts_spill_threshold_bytes(&mut self, threshold: usize) {
@@ -3241,8 +3200,7 @@ fn superfile_kvs(
         (kv::SCHEMA_ID.into(), options.schema_id.to_string()),
     ];
     if !options.fts_columns.is_empty() {
-        // Each column records its own analyzer name (per-field analysis);
-        // `fts_tokenizers` is aligned 1:1 with `fts_columns`.
+        // Each column records its own analysis filters, in declaration order.
         kvs.push((
             kv::FTS_COLUMNS.into(),
             fts_columns_json(&options.fts_columns, |c| options.field_id_of_column(c)),
@@ -3526,9 +3484,9 @@ fn finish_index_blobs_streamed<Wf: Write + Send, Wv: Write + Send>(
 /// Reject user-supplied column names that would collide with
 /// infino's internal byte-protocol or KV-key conventions:
 ///
-/// - `\x1F` (ASCII Unit Separator) is the FST dictionary's
+/// - `\x1F` (ASCII Unit Separator) is the term dictionary's
 ///   `(column_id, term)` separator. A column name containing
-///   it would break the FST decode path that splits on it.
+///   it would break the term dictionary decode path that splits on it.
 /// - The `inf.` prefix is reserved for the infino-managed
 ///   Parquet KV metadata keys (`inf.format`, `inf.fts.columns`,
 ///   etc.). Allowing a user column to start with it would risk
@@ -3548,35 +3506,6 @@ fn check_user_column_name(name: &str) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// Serialize `[FtsConfig]` to the JSON form stored in the
-/// Parquet KV metadata key `inf.fts.columns`. Hand-rolled
-/// because the shape is fixed + small and `serde_derive` on
-/// `FtsConfig` would add a derived `Serialize` impl across
-/// the format boundary purely to write five characters of
-/// JSON per column.
-///
-/// Output shape per column:
-/// `{"name":"<escaped>","tokenizer":"<name>","k1":<f>,"b":<f>}`.
-/// `tokenizer` holds the column's base tokenizer name (`"ascii_lower"`
-/// or `"standard"`), straight from `FtsConfig.analyzer` — whose field
-/// name says `analyzer` only because that is what the public option is
-/// called. A stopword set
-/// and a stemmer ride as `"stopwords"` / `"stemmer"`, each emitted only
-/// when set; the reader reconstructs the column's tokenizer from all
-/// three for query-time tokenization, and a missing filter field means
-/// the filter is off — the one thing a file written before it existed
-/// can mean.
-///
-/// `k1` / `b` are written **unconditionally, defaults included**,
-/// unlike `positions` and `stored`. Those two are booleans whose
-/// absence has exactly one possible meaning, so omitting them keeps a
-/// default column's JSON byte-identical to older files. A scoring
-/// parameter is different: it is the provenance of the stored
-/// block-max bounds, and a reader that has to infer it is a reader
-/// that will infer wrong the day the recommended default moves. The
-/// same lesson is recorded on `rerank_codec` in
-/// `supertable::manifest::options_hash` — a data-determined value
-/// belongs on disk, read back rather than re-derived.
 /// One BM25 parameter as JSON. `{:?}` on an `f32` is the shortest
 /// decimal that round-trips back to the same bits, and always carries a
 /// `.`, so the value the reader deserializes is bit-for-bit the value
@@ -3709,10 +3638,34 @@ fn adapted_batch(
     }
 }
 
-/// The per-column FTS config the footer carries. `field_id_of` supplies
-/// each column's stable id; a column without one (a builder over a schema
-/// that was never stamped) is written without the key, which readers
-/// treat as "resolve by name".
+/// Serialize `[FtsConfig]` to the JSON form stored in the
+/// Parquet KV metadata key `inf.fts.columns`. Hand-rolled
+/// because the shape is fixed + small and `serde_derive` on
+/// `FtsConfig` would add a derived `Serialize` impl across
+/// the format boundary purely to write five characters of
+/// JSON per column.
+///
+/// Output shape per column:
+/// `{"name":"<escaped>","field_id":<n>,"tokenizer":"standard","k1":<f>,"b":<f>}`.
+/// `field_id` is the column's stable id, omitted when the builder's
+/// schema was never stamped; readers then resolve the column by name.
+/// `tokenizer` is always `standard` today; recording it lets a future
+/// tokenizer be added without a format change. A stopword set and a
+/// stemmer ride as
+/// `"stopwords"` / `"stemmer"`, each emitted only when set; the reader
+/// reconstructs the column's tokenizer from them for query-time
+/// tokenization, and a missing filter field means the filter is off.
+///
+/// `k1` / `b` are written **unconditionally, defaults included**,
+/// unlike `positions` and `stored`. Those two are booleans whose
+/// absence has exactly one possible meaning, so they are omitted at
+/// their default. A scoring
+/// parameter is different: it is the provenance of the stored
+/// block-max bounds, and a reader that has to infer it is a reader
+/// that will infer wrong the day the recommended default moves. The
+/// same lesson is recorded on `rerank_codec` in
+/// `supertable::manifest::options_hash` — a data-determined value
+/// belongs on disk, read back rather than re-derived.
 fn fts_columns_json(cols: &[FtsConfig], field_id_of: impl Fn(&str) -> Option<FieldId>) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
@@ -3727,18 +3680,15 @@ fn fts_columns_json(cols: &[FtsConfig], field_id_of: impl Fn(&str) -> Option<Fie
             s.push_str(&id.to_string());
         }
         s.push_str(r#","tokenizer":""#);
-        s.push_str(&escape_json(&c.analyzer));
+        s.push_str(STANDARD_TOKENIZER);
         s.push('"');
         // Always emitted — see the function docs.
         s.push_str(r#","k1":"#);
         s.push_str(&fts_param_json(c.bm25.k1));
         s.push_str(r#","b":"#);
         s.push_str(&fts_param_json(c.bm25.b));
-        // Analysis filters, each emitted only when set, so a column
-        // with neither keeps JSON byte-identical to a file written
-        // before they existed. A reader that does not know the field
-        // treats the filter as off, which degrades that column's
-        // results rather than making the file unreadable.
+        // Analysis filters, each omitted when unset; readers treat
+        // absence as the filter being off.
         if let Some(name) = c.stopwords.as_str() {
             s.push_str(r#","stopwords":""#);
             s.push_str(name);
@@ -3749,23 +3699,16 @@ fn fts_columns_json(cols: &[FtsConfig], field_id_of: impl Fn(&str) -> Option<Fie
             s.push_str(name);
             s.push('"');
         }
-        // Emitted only when set: a positionless column's JSON stays
-        // byte-identical to files written before positions existed
-        // (the reader defaults a missing field to false).
+        // Omitted at its default; readers treat absence as false.
         if c.positions {
             s.push_str(r#","positions":true"#);
         }
-        // Same only-when-set rule, inverted default: a stored column's
-        // JSON stays byte-identical to files written before index-only
-        // columns existed (the reader defaults a missing field to true).
+        // Omitted at its default; readers treat absence as true.
         if !c.stored {
             s.push_str(r#","stored":false"#);
         }
-        // Always emitted, zero included: a missing field is reserved for
-        // files written before revisions existed, whose analysis this
-        // engine can only infer from the writer's version. Omitting a
-        // known zero would put a carried-stale column in that same
-        // bucket and let it be credited with terms it does not hold.
+        // Always emitted, zero included, so every column names the
+        // analysis revision its terms were produced at.
         s.push_str(r#","analysis_revision":"#);
         s.push_str(&c.analysis_revision().to_string());
         s.push('}');
@@ -3850,7 +3793,7 @@ fn escape_json(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, iter::once, sync::Arc};
+    use std::{collections::HashMap, io::empty, iter::once, slice, sync::Arc};
 
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, UInt64Array};
     use arrow_schema::Field;
@@ -3864,15 +3807,13 @@ mod tests {
         superfile::{
             format::footer::read_kv_metadata,
             fts::{
-                builder::{BlobEra, RADIX_SORT_MIN_TRIPLES},
-                reader::BoolMode,
-                short::SHORT_MAX_DF,
+                builder::RADIX_SORT_MIN_TRIPLES, reader::BoolMode, short::SHORT_MAX_DF,
                 sorted_merge::TERMS_PER_CHUNK,
             },
             vector::rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
         },
         test_helpers::{decimal128_ids, default_vector_config},
-        utils::terms::FstValue,
+        utils::terms::DictEntry,
     };
 
     fn schema_with_fts() -> Arc<Schema> {
@@ -3931,12 +3872,12 @@ mod tests {
         assert_eq!(reader.n_docs(), n as u64, "all rows present");
     }
 
-    /// User column names may not contain the FST separator byte or the
-    /// reserved `inf.` prefix.
+    /// User column names may not contain the dictionary key separator byte or
+    /// the reserved `inf.` prefix.
     #[test]
     fn check_user_column_name_rejects_reserved_names() {
         assert!(check_user_column_name("user_id").is_ok());
-        let with_sep = format!("a{}b", format::FST_SEPARATOR as char);
+        let with_sep = format!("a{}b", format::KEY_SEPARATOR as char);
         assert!(matches!(
             check_user_column_name(&with_sep),
             Err(BuildError::ReservedSeparatorInColumnName(_))
@@ -4048,18 +3989,6 @@ mod tests {
         );
         let err = SuperfileBuilder::new(opts).expect_err("expected error");
         assert!(matches!(err, BuildError::ReservedPrefixInColumnName(_)));
-    }
-
-    #[test]
-    fn new_rejects_unknown_analyzer() {
-        let opts = BuilderOptions::new(
-            schema_with_fts(),
-            "doc_id",
-            vec![FtsConfig::new("title").analyzer("nonesuch")],
-            vec![],
-        );
-        let err = SuperfileBuilder::new(opts).expect_err("expected error");
-        assert!(matches!(err, BuildError::UnknownAnalyzer { .. }));
     }
 
     fn batch_two_rows(schema: &Arc<Schema>) -> RecordBatch {
@@ -4289,13 +4218,8 @@ mod tests {
         assert!(!kv.contains_key("inf.fts.offset"));
     }
 
-    /// Every column records a revision, zero included.
-    ///
-    /// Omitting a zero would make a carried-from-pre-revision column
-    /// indistinguishable from one written before the field existed, and
-    /// those mean different things: the first is known-stale, the second
-    /// is unknown. Only a reader that can tell them apart may credit an
-    /// unrecorded column with the revision its writer would have emitted.
+    /// Every column records a revision, zero included, so no file this
+    /// engine writes leaves its analysis unknown.
     #[test]
     fn every_column_records_its_analysis_revision() {
         let fresh = fts_columns_json(&[FtsConfig::new("title")], |_| None);
@@ -4450,16 +4374,15 @@ mod tests {
         assert!(s.starts_with('['));
         assert!(s.contains(r#""name":"title""#));
         assert!(s.contains(r#""name":"body""#));
-        assert!(s.contains(r#""tokenizer":"standard""#));
-        // Positionless columns emit no positions field at all — the
-        // JSON stays byte-identical to files written before the flag
-        // existed.
+        // Every column records its base tokenizer.
+        assert_eq!(s.matches(r#""tokenizer":"standard""#).count(), cols.len());
+        assert!(s.contains(r#""k1":1.2,"b":0.75"#));
+        // Positionless columns emit no positions field at all.
         assert!(!s.contains("positions"));
     }
 
     /// The positions field appears only on the columns that opt in,
-    /// and a mixed declaration keeps the positionless column's entry
-    /// in the legacy shape.
+    /// and a mixed declaration omits it from the positionless column.
     #[test]
     fn fts_columns_json_positions_emitted_only_when_true() {
         let cols = vec![
@@ -4481,32 +4404,33 @@ mod tests {
         );
     }
 
-    /// Per-column analyzers: each column records its own tokenizer name.
+    /// Per-column analysis: each column records its own filters, and an
+    /// unfiltered column records none.
     #[test]
-    fn fts_columns_json_per_column_analyzers() {
-        // Both analyzers named explicitly: the recorded name must be the
-        // column's own, independent of which one the engine defaults to.
+    fn fts_columns_json_per_column_filters() {
         let cols = vec![
-            FtsConfig::new("title").analyzer("standard"),
-            FtsConfig::new("body").analyzer("ascii_lower"),
+            FtsConfig::new("title"),
+            FtsConfig::new("body")
+                .stopwords(Stopwords::English)
+                .stemmer(Stemmer::English),
         ];
         let s = fts_columns_json(&cols, |_| None);
         assert!(
             s.contains(
                 r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
             ),
-            "title uses the standard analyzer: {s}"
+            "title records no filter: {s}"
         );
         assert!(
             s.contains(
-                r#"{"name":"body","tokenizer":"ascii_lower","k1":1.2,"b":0.75,"analysis_revision":1}"#
+                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stopwords":"english","stemmer":"english","analysis_revision":1}"#
             ),
-            "body uses ascii_lower: {s}"
+            "body records its filters: {s}"
         );
     }
 
     /// The stored field appears only on index-only columns, and a mixed
-    /// declaration keeps the stored column's entry in the legacy shape.
+    /// declaration omits it from the stored column.
     #[test]
     fn fts_columns_json_stored_emitted_only_when_false() {
         let cols = vec![
@@ -4521,9 +4445,7 @@ mod tests {
             "stored column carries no stored key at all: {s}"
         );
         assert!(
-            s.contains(
-                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stored":false,"analysis_revision":1}"#
-            ),
+            s.contains(r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stored":false,"analysis_revision":1}"#),
             "index-only column carries the flag: {s}"
         );
     }
@@ -6130,17 +6052,15 @@ mod tests {
     /// document. The failure is silent: every id involved is in range.
     #[test]
     fn remap_by_blob_id_rekeys_a_row_remap_by_the_inputs_own_doc_ids() {
-        use crate::superfile::fts::{
-            builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
-        };
+        use crate::superfile::fts::{builder::FtsBuilder, reader::FtsReader};
 
-        const JSON: &str = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        const JSON: &str = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         /// `map[blob doc id] = row`, a permutation that moves every
         /// document.
         const MAP: [u32; 8] = [3, 1, 7, 0, 5, 2, 6, 4];
 
         let reader_over = |doc_map: Option<Vec<u32>>| {
-            let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            let mut b = FtsBuilder::new();
             b.register_column("body".into(), false).expect("register");
             for id in 0..MAP.len() as u32 {
                 b.add_doc(0, id, "alpha").expect("add doc");
@@ -6299,13 +6219,11 @@ mod tests {
         )
     }
 
-    /// One merge input over `(title, body)` docs with ids from `first_id`,
-    /// its FTS blob written in `era`.
+    /// One merge input over `(title, body)` docs with ids from `first_id`.
     fn merge_input(
         opts: &BuilderOptions,
         first_id: u32,
         docs: &[(String, String)],
-        era: BlobEra,
     ) -> Arc<SuperfileReader> {
         let ids = decimal128_ids((first_id..first_id + docs.len() as u32).map(u64::from));
         let (titles, bodies): (Vec<&str>, Vec<&str>) =
@@ -6320,7 +6238,6 @@ mod tests {
         )
         .expect("build RecordBatch");
         let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
-        b.fts_builder.as_mut().expect("fts builder").era = era;
         b.add_batch(&batch, &[]).expect("add_batch");
         let bytes = b.finish().expect("finish input");
         Arc::new(SuperfileReader::open(Bytes::from(bytes)).expect("open input"))
@@ -6476,7 +6393,7 @@ mod tests {
         for (i, &docs) in sizes.iter().enumerate() {
             let docs_text = make_docs(i as u32, first_id, docs);
             inputs.push((
-                merge_input(&opts, first_id, &docs_text, BlobEra::V7),
+                merge_input(&opts, first_id, &docs_text),
                 tombstones(deletes.get(i).copied().unwrap_or(&[])),
             ));
             first_id += docs;
@@ -6499,10 +6416,7 @@ mod tests {
 
     /// Inputs of the given vocabulary sizes, every `EDGE_DELETE_STEP`th doc
     /// of the last one tombstoned.
-    fn vocab_inputs(
-        sizes: &[usize],
-        era: BlobEra,
-    ) -> Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> {
+    fn vocab_inputs(sizes: &[usize]) -> Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> {
         let opts = sorted_merge_opts(true);
         let mut first_id = 0;
         let mut inputs = Vec::new();
@@ -6512,10 +6426,7 @@ mod tests {
                 true => (0..docs.len() as u32).step_by(EDGE_DELETE_STEP).collect(),
                 false => Vec::new(),
             };
-            inputs.push((
-                merge_input(&opts, first_id, &docs, era),
-                tombstones(&deleted),
-            ));
+            inputs.push((merge_input(&opts, first_id, &docs), tombstones(&deleted)));
             first_id += docs.len() as u32;
         }
         inputs
@@ -6530,8 +6441,8 @@ mod tests {
             vec![],
         );
         let docs = SORTED_MERGE_INPUT_DOCS[1];
-        let input = merge_input(&opts, 0, &sorted_merge_docs(0, 0, docs), BlobEra::V7);
-        let mut fb = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let input = merge_input(&opts, 0, &sorted_merge_docs(0, 0, docs));
+        let mut fb = FtsBuilder::new();
         fb.register_column("title".into(), false).expect("register");
         fb.add_doc(0, 0, "hello").expect("add doc");
         fb.set_sorted_inputs(vec![SortedInput {
@@ -6647,58 +6558,54 @@ mod tests {
         const DOCS: u32 = 300;
         const MAX_TERMS: usize = 1 << 16;
         let opts = sorted_merge_opts(true);
-        for era in [BlobEra::V7, BlobEra::V2ToV4] {
-            let reader = merge_input(&opts, 0, &sorted_merge_docs(0, 0, DOCS), era);
-            let fts = reader.fts().expect("fts");
-            let dict = fts.dict_bytes().expect("dict");
-            let (mut inline, mut short, mut long) = (0, 0, 0);
-            for column_id in 0..2 {
-                let terms = fts
-                    .column_terms_from(&dict, column_id, b"", MAX_TERMS)
-                    .expect("terms");
-                assert!(terms.len() < MAX_TERMS, "premise: every term listed");
-                for (term, value) in terms {
-                    let mut postings = 0u32;
-                    fts.for_each_posting_in(
-                        column_id,
-                        once((term.as_slice(), value)),
-                        &mut Vec::new(),
-                        |_, _, _, _| {
-                            postings += 1;
-                            Ok(())
-                        },
-                    )
-                    .expect("postings");
-                    let at_most = fts.term_postings_at_most(value).expect("postings bound");
-                    match value {
-                        FstValue::Inline { .. } => {
-                            inline += 1;
-                            assert_eq!((at_most, postings), (1, 1), "inline {term:?}");
-                        }
-                        FstValue::Pfor { short: true, .. } => {
-                            short += 1;
-                            assert_eq!(at_most, SHORT_MAX_DF as u32, "short {term:?}");
-                            assert!(postings <= at_most, "short {term:?} over its limit");
-                        }
-                        FstValue::Pfor { .. } => {
-                            long += 1;
-                            assert_eq!(at_most, postings, "long {term:?}");
-                        }
+        let reader = merge_input(&opts, 0, &sorted_merge_docs(0, 0, DOCS));
+        let fts = reader.fts().expect("fts");
+        let dict = fts.dict_bytes().expect("dict");
+        let (mut inline, mut short, mut long) = (0, 0, 0);
+        for column_id in 0..2 {
+            let terms = fts
+                .column_terms_from(&dict, column_id, b"", MAX_TERMS)
+                .expect("terms");
+            assert!(terms.len() < MAX_TERMS, "premise: every term listed");
+            for (term, value) in terms {
+                let mut postings = 0u32;
+                fts.for_each_posting_in(
+                    column_id,
+                    once((term.as_slice(), value)),
+                    &mut Vec::new(),
+                    |_, _, _, _| {
+                        postings += 1;
+                        Ok(())
+                    },
+                )
+                .expect("postings");
+                let at_most = fts.term_postings_at_most(value).expect("postings bound");
+                match value {
+                    DictEntry::Inline { .. } => {
+                        inline += 1;
+                        assert_eq!((at_most, postings), (1, 1), "inline {term:?}");
+                    }
+                    DictEntry::Pfor { short: true, .. } => {
+                        short += 1;
+                        assert_eq!(at_most, SHORT_MAX_DF as u32, "short {term:?}");
+                        assert!(postings <= at_most, "short {term:?} over its limit");
+                    }
+                    DictEntry::Pfor { .. } => {
+                        long += 1;
+                        assert_eq!(at_most, postings, "long {term:?}");
                     }
                 }
             }
-            assert!(
-                inline > 0 && long > 0,
-                "{era:?} holds inline and long terms"
-            );
-            // Only the current layout has the short form.
-            assert_eq!(short > 0, era == BlobEra::V7, "{era:?} short terms");
         }
+        assert!(
+            inline > 0 && short > 0 && long > 0,
+            "holds inline, short and long terms"
+        );
     }
 
     /// Vocabularies one short of a chunk, exactly one and two chunks, one
     /// past, and more than three, in a positional and a non-positional
-    /// column, in both dictionary layouts (`V2ToV4` writes the FST one).
+    /// column.
     #[test]
     fn sorted_merge_handles_vocabularies_on_and_across_chunk_edges() {
         let sizes = [
@@ -6708,29 +6615,27 @@ mod tests {
             2 * TERMS_PER_CHUNK,
             3 * TERMS_PER_CHUNK + 1,
         ];
-        for era in [BlobEra::V7, BlobEra::V2ToV4] {
-            let inputs = vocab_inputs(&sizes, era);
-            for ((reader, _), &n) in inputs.iter().zip(&sizes) {
-                let fts = reader.fts().expect("fts");
-                let dict = fts.dict_bytes().expect("dict");
-                for column_id in 0..2 {
-                    let terms = fts
-                        .column_terms_from(&dict, column_id, b"", n + 1)
-                        .expect("terms");
-                    assert_eq!(
-                        terms.len(),
-                        n,
-                        "premise: column {column_id} holds {n} terms"
-                    );
-                }
+        let inputs = vocab_inputs(&sizes);
+        for ((reader, _), &n) in inputs.iter().zip(&sizes) {
+            let fts = reader.fts().expect("fts");
+            let dict = fts.dict_bytes().expect("dict");
+            for column_id in 0..2 {
+                let terms = fts
+                    .column_terms_from(&dict, column_id, b"", n + 1)
+                    .expect("terms");
+                assert_eq!(
+                    terms.len(),
+                    n,
+                    "premise: column {column_id} holds {n} terms"
+                );
             }
-            assert_merges_agree(&inputs);
         }
+        assert_merges_agree(&inputs);
     }
 
     #[test]
     fn sorted_merge_handles_a_single_input() {
-        assert_merges_agree(&vocab_inputs(&[2 * TERMS_PER_CHUNK + 1], BlobEra::V7));
+        assert_merges_agree(&vocab_inputs(&[2 * TERMS_PER_CHUNK + 1]));
     }
 
     /// `mid` is the last term of input 0's first chunk, so its next chunk
@@ -6751,11 +6656,8 @@ mod tests {
         let first = input_docs(TERMS_PER_CHUNK - 1);
         let second = input_docs(TAIL_TERMS);
         let inputs = vec![
-            (merge_input(&opts, 0, &first, BlobEra::V7), None),
-            (
-                merge_input(&opts, first.len() as u32, &second, BlobEra::V7),
-                None,
-            ),
+            (merge_input(&opts, 0, &first), None),
+            (merge_input(&opts, first.len() as u32, &second), None),
         ];
         let fts = inputs[0].0.fts().expect("fts");
         let chunk = fts
@@ -6932,10 +6834,9 @@ mod tests {
         assert_eq!(results_merged.len(), 2);
     }
 
-    /// Merged `df` for a shared term here is well past the point
-    /// where its postings outgrow the FST value's 21-bit length slot.
+    /// A term common to millions of merged docs keeps every posting.
     #[tokio::test(flavor = "multi_thread")]
-    async fn build_from_readers_merges_common_term_past_pfor_length_slot() {
+    async fn build_from_readers_merges_a_term_common_to_millions_of_docs() {
         const NUM_FILES: usize = 12;
         const DOCS_PER_FILE: usize = 450_000;
 
@@ -6984,6 +6885,107 @@ mod tests {
             hits.len() as u64,
             total_docs,
             "every doc matches \"common\""
+        );
+    }
+
+    // ---- Raw stable-id sidecar: read, then repacked on carry ----
+
+    /// Rows in the raw-sidecar fixture.
+    const RAW_SIDECAR_ROWS: u64 = 64;
+
+    /// `bytes` re-spliced with its stable-id sidecar in the raw layout — one
+    /// little-endian `i128` per row of `batch`, and no layout key — the form
+    /// a writer that predates the packed layout left.
+    fn with_raw_id_sidecar(bytes: &Bytes, batch: &RecordBatch) -> Bytes {
+        let source = SuperfileReader::open(bytes.clone()).expect("open packed superfile");
+        let src_kv = extract_kv_map(source.parquet_metadata()).expect("footer kvs");
+        let at = |key: &str| -> usize { src_kv[key].parse().expect("numeric region key") };
+        let fts = at(kv::FTS_OFFSET)..at(kv::FTS_OFFSET) + at(kv::FTS_LENGTH);
+        let raw_ids = stable_id_sidecar_bytes(slice::from_ref(batch), "doc_id");
+        assert_eq!(
+            raw_ids.len(),
+            batch.num_rows() * format::ID_SIDECAR_ENTRY_BYTES
+        );
+        let kvs: Vec<(String, String)> = src_kv
+            .iter()
+            .filter(|(k, _)| k.as_str() != kv::IDS_LAYOUT)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut out = Vec::new();
+        splice_carried_body_to(
+            &bytes[..fts.start],
+            fts.start as u64,
+            source.parquet_metadata().as_ref().clone(),
+            &bytes[fts.clone()],
+            fts.len() as u64,
+            empty(),
+            0,
+            raw_ids.as_slice(),
+            raw_ids.len() as u64,
+            &kvs,
+            &mut out,
+        )
+        .expect("splice the raw sidecar");
+        Bytes::from(out)
+    }
+
+    /// A superfile whose id sidecar is in the raw layout resolves `_id`
+    /// through it, and a carried rewrite repacks it without moving an id.
+    #[test]
+    fn a_raw_id_sidecar_reads_and_is_repacked_on_carry() {
+        let opts = opts_minimal();
+        let titles: Vec<String> = (0..RAW_SIDECAR_ROWS).map(|i| format!("row {i}")).collect();
+        let title = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
+        let body = LargeStringArray::from(vec!["x"; RAW_SIDECAR_ROWS as usize]);
+        let batch = RecordBatch::try_new(
+            opts.schema.clone(),
+            vec![
+                Arc::new(decimal128_ids(0..RAW_SIDECAR_ROWS)),
+                Arc::new(title),
+                Arc::new(body),
+            ],
+        )
+        .expect("build RecordBatch");
+        let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let packed = Bytes::from(b.finish().expect("finish builder"));
+        let raw = with_raw_id_sidecar(&packed, &batch);
+
+        // Every row, out of order, so a mis-strided raw read cannot pass.
+        let locals: Vec<u32> = (0..RAW_SIDECAR_ROWS as u32).rev().collect();
+        let expected = SuperfileReader::open(packed)
+            .expect("open packed superfile")
+            .take_by_local_doc_ids(&locals, &["doc_id"])
+            .expect("ids via the packed sidecar");
+
+        let raw_reader = SuperfileReader::open(raw).expect("open raw superfile");
+        assert!(!raw_reader.id_sidecar_is_packed(), "the fixture is raw");
+        assert_eq!(
+            raw_reader
+                .take_by_local_doc_ids(&locals, &["doc_id"])
+                .expect("ids via the raw sidecar"),
+            expected
+        );
+
+        let mut carry = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        carry
+            .carry_fts_from_reader_scoped(&raw_reader, None, CarryScope::AllColumns)
+            .expect("carry the FTS blob");
+        carry.set_carried_doc_count(RAW_SIDECAR_ROWS);
+        let mut out = Vec::new();
+        carry
+            .finish_carrying_body_to(&raw_reader, &mut out)
+            .expect("carry the body");
+        let repacked = SuperfileReader::open(Bytes::from(out)).expect("open the rewrite");
+        assert!(
+            repacked.id_sidecar_is_packed(),
+            "the carry repacks the sidecar"
+        );
+        assert_eq!(
+            repacked
+                .take_by_local_doc_ids(&locals, &["doc_id"])
+                .expect("ids via the repacked sidecar"),
+            expected
         );
     }
 
@@ -7946,7 +7948,7 @@ mod tests {
             vec![],
         );
         // The derived identity the reader will report for that column.
-        let chain = chain_name(Base::Standard, Stopwords::English, Stemmer::English);
+        let chain = chain_name(Stopwords::English, Stemmer::English);
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
         b.add_batch(&batch_two_rows(&schema), &[])

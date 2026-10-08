@@ -335,12 +335,12 @@ impl Supertable {
 
     /// Ranked BM25 full-text search over one FTS column.
     ///
-    /// `opts` ([`Bm25SearchOptions`]) carries the boolean `mode` and the
-    /// corpus-statistics selector: [`Bm25Stats::Global`](crate::Bm25Stats::Global)
-    /// (the default, each segment scored against its own local statistics) or
-    /// [`Bm25Stats::Global`](crate::Bm25Stats::Global) (one table-wide idf
-    /// across all segments, so a fragmented table ranks like a single unified
-    /// corpus). `Bm25SearchOptions::new()` is `Or` mode + per-superfile stats.
+    /// `opts` ([`Bm25SearchOptions`]) carries the boolean `mode` and an
+    /// optional similarity override; `Bm25SearchOptions::new()` is `Or` mode
+    /// with each column's declared parameters. On a fully loaded manifest
+    /// every segment scores against one table-wide idf, so a fragmented
+    /// table ranks like a single unified corpus; a lazily loaded manifest
+    /// scores each segment with its own statistics.
     pub fn bm25_search(
         &self,
         column: &str,
@@ -389,31 +389,31 @@ impl Supertable {
     /// asks the index how it reads them rather than comparing spellings: a
     /// slash, an underscore or a case difference is not a token, and its own
     /// copy of the rule drifts from the index the moment a column is declared
-    /// with another analyzer. `column` must carry a full-text index; the
+    /// with another filter. `column` must carry a full-text index; the
     /// error for one that does not names the columns that do.
     ///
     /// ```
     /// # use std::sync::Arc;
     /// # use infino::arrow_schema::{DataType, Field, Schema};
-    /// # use infino::{connect, FtsField, IndexSpec};
+    /// # use infino::{connect, FtsField, IndexSpec, Stemmer};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![
     /// #     Field::new("body", DataType::LargeUtf8, false),
-    /// #     Field::new("code", DataType::LargeUtf8, false),
+    /// #     Field::new("notes", DataType::LargeUtf8, false),
     /// # ]));
     /// # let posts = db.create_table(
     /// #     "posts",
     /// #     schema,
     /// #     IndexSpec::new()
     /// #         .fts("body")
-    /// #         .fts(FtsField::new("code").analyzer("ascii_lower")),
+    /// #         .fts(FtsField::new("notes").stemmer(Stemmer::English)),
     /// # )?;
-    /// // The standard analyzer keeps a word whatever its script; the ASCII
-    /// // analyzer splits on every other byte and drops the accented word.
+    /// // The standard analyzer keeps a word whatever its script; a stemmed
+    /// // column also folds each word onto its stem.
     /// assert_eq!(posts.tokenize("body", "Hello, World! Café")?, ["hello", "world", "café"]);
     /// assert_eq!(
-    ///     posts.tokenize("code", "left/failed write_pointer Café")?,
-    ///     ["left", "failed", "write", "pointer"]
+    ///     posts.tokenize("notes", "Running studies")?,
+    ///     ["run", "studi"]
     /// );
     /// assert!(posts.tokenize("nope", "anything").is_err());
     /// # Ok::<(), Box<dyn std::error::Error>>(())

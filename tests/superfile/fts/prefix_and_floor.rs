@@ -4,7 +4,7 @@
 //! Oracle tests for two reader surfaces the single-column term/phrase
 //! oracles don't exercise:
 //!
-//! * **Prefix search** (`bm25_search_prefix`): the FST expands the
+//! * **Prefix search** (`bm25_search_prefix`): the term dictionary expands the
 //!   prefix to every indexed term that starts with it and runs an OR
 //!   over the expansion. Cross-checked against the brute-force OR of the
 //!   same expansion computed from corpus truth.
@@ -50,7 +50,7 @@ fn prefix_corpus() -> Vec<(u64, &'static str)> {
 }
 
 /// Distinct indexed terms (whitespace tokens, lowercased) beginning with
-/// `prefix` — the set the FST expansion must reproduce.
+/// `prefix` — the set the dictionary expansion must reproduce.
 fn expansion(corp: &[(u64, &str)], prefix: &str) -> Vec<String> {
     let mut terms: HashSet<String> = HashSet::new();
     for (_, text) in corp {
@@ -116,8 +116,8 @@ async fn prefix_expansion_matches_brute_force_or() {
 
 #[tokio::test]
 async fn prefix_uppercase_is_normalized() {
-    // The prefix is lowercased before FST lookup, so "RU" and "ru" expand
-    // to the same terms.
+    // The prefix is lowercased before dictionary lookup, so "RU" and "ru"
+    // expand to the same terms.
     let corp = prefix_corpus();
     let reader = build_infino_superfile(&corp);
     let upper = reader

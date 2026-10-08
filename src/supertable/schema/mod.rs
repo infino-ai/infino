@@ -43,10 +43,11 @@ use crate::{
     catalog::DEFAULT_ROT_SEED,
     superfile::{
         builder::FtsConfig,
+        format::fts::REPAIR_RELEASE,
         fts::{
-            analysis::{Base, Stemmer, Stopwords, chain_tokenizer},
+            analysis::{Stemmer, Stopwords, chain_tokenizer},
             bm25::Bm25Params,
-            tokenize::Tokenizer,
+            tokenize::{STANDARD_TOKENIZER, Tokenizer},
         },
         vector::{builder::VectorConfig, distance::Metric, rerank_codec::RerankCodec},
     },
@@ -131,8 +132,6 @@ impl fmt::Display for FieldId {
 pub enum ColumnIndex {
     /// A full-text index over a string column.
     Fts {
-        /// The base tokenizer's name.
-        analyzer: String,
         /// The stopword filter applied after tokenizing.
         stopwords: Stopwords,
         /// The stemmer applied after tokenizing.
@@ -354,7 +353,6 @@ impl TableSchema {
             .iter()
             .filter_map(|f| match &f.index {
                 Some(ColumnIndex::Fts {
-                    analyzer,
                     stopwords,
                     stemmer,
                     positions,
@@ -362,7 +360,6 @@ impl TableSchema {
                     bm25,
                 }) => Some(FtsConfig {
                     column: f.name.clone(),
-                    analyzer: analyzer.clone(),
                     stopwords: *stopwords,
                     stemmer: *stemmer,
                     positions: *positions,
@@ -407,15 +404,8 @@ impl TableSchema {
         let field = self.fields.iter().find(|f| f.name == column)?;
         match &field.index {
             Some(ColumnIndex::Fts {
-                analyzer,
-                stopwords,
-                stemmer,
-                ..
-            }) => Some(chain_tokenizer(
-                Base::from_name(analyzer)?,
-                *stopwords,
-                *stemmer,
-            )),
+                stopwords, stemmer, ..
+            }) => Some(chain_tokenizer(*stopwords, *stemmer)),
             _ => None,
         }
     }
@@ -594,7 +584,6 @@ impl TableSchema {
 fn column_index(name: &str, fts: &[FtsConfig], vectors: &[VectorConfig]) -> Option<ColumnIndex> {
     if let Some(fc) = fts.iter().find(|fc| fc.column == name) {
         return Some(ColumnIndex::Fts {
-            analyzer: fc.analyzer.clone(),
             stopwords: fc.stopwords,
             stemmer: fc.stemmer,
             positions: fc.positions,
@@ -616,7 +605,6 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
     let mut out = Map::new();
     match index {
         ColumnIndex::Fts {
-            analyzer,
             stopwords,
             stemmer,
             positions,
@@ -624,7 +612,8 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
             bm25,
         } => {
             out.insert("kind".into(), Value::from("fts"));
-            out.insert("analyzer".into(), Value::from(analyzer.as_str()));
+            // Recorded so a future tokenizer needs no format change.
+            out.insert("analyzer".into(), Value::from(STANDARD_TOKENIZER));
             if let Some(name) = stopwords.as_str() {
                 out.insert("stopwords".into(), Value::from(name));
             }
@@ -692,10 +681,18 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
     match str_of("kind")? {
         "fts" => {
             let defaults = FtsConfig::new("");
+            // Only `standard` is reproducible; a list naming another base
+            // refuses rather than query an index split another way.
+            if let Some(name) = obj.get("analyzer").and_then(Value::as_str)
+                && name != STANDARD_TOKENIZER
+            {
+                return Err(format!(
+                    "index uses the removed analyzer '{name}'; copy the table's rows out \
+                     with infino {REPAIR_RELEASE} before upgrading, then re-create it \
+                     under \"standard\""
+                ));
+            }
             Ok(ColumnIndex::Fts {
-                analyzer: str_of("analyzer")
-                    .map(str::to_owned)
-                    .unwrap_or(defaults.analyzer),
                 stopwords: named(obj, "stopwords", Stopwords::from_name)?
                     .unwrap_or(defaults.stopwords),
                 stemmer: named(obj, "stemmer", Stemmer::from_name)?.unwrap_or(defaults.stemmer),
@@ -916,7 +913,6 @@ mod tests {
             Field::new("score", DataType::Int64, true),
         ]);
         let mut fts = FtsConfig::new("title")
-            .analyzer("ascii_lower")
             .stopwords(Stopwords::English)
             .stemmer(Stemmer::English);
         fts.positions = true;
@@ -947,7 +943,6 @@ mod tests {
         assert_eq!(
             (
                 d.column.as_str(),
-                d.analyzer.as_str(),
                 d.stopwords,
                 d.stemmer,
                 d.positions,
@@ -956,7 +951,6 @@ mod tests {
             ),
             (
                 "title",
-                "ascii_lower",
                 Stopwords::English,
                 Stemmer::English,
                 true,

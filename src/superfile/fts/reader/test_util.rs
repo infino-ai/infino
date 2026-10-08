@@ -4,31 +4,21 @@
 //! Shared test fixtures for the `reader/` submodule tests: blob builders that
 //! plant small, known corpora so each test asserts against a fixed layout.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 
-use crate::superfile::fts::{
-    builder::{BlobEra, FtsBuilder},
-    tokenize::{AsciiLowerTokenizer, StandardTokenizer},
-};
+use crate::superfile::fts::builder::FtsBuilder;
 
 /// A one-column (`body`) `standard`-analyzer blob holding `docs`, doc `i`
 /// being `docs[i]`.
 pub(super) fn build_standard_blob(docs: &[&str]) -> (Bytes, String) {
-    build_standard_blob_with(docs, BlobEra::V7, None)
+    build_standard_blob_with(docs, None)
 }
 
-/// [`build_standard_blob`] written in `era`'s format, and, when `order` is
-/// given, storing its documents in that order: blob position `i` holds
-/// `docs[order[i]]`, the way a merge that reorders writes a blob.
-pub(super) fn build_standard_blob_with(
-    docs: &[&str],
-    era: BlobEra,
-    order: Option<&[u32]>,
-) -> (Bytes, String) {
-    let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
-    b.era = era;
+/// [`build_standard_blob`], when `order` is given storing its documents in
+/// that order: blob position `i` holds `docs[order[i]]`, the way a merge
+/// that reorders writes a blob.
+pub(super) fn build_standard_blob_with(docs: &[&str], order: Option<&[u32]>) -> (Bytes, String) {
+    let mut b = FtsBuilder::new();
     b.register_column("body".into(), false)
         .expect("register column");
     let rows: Vec<u32> = match order {
@@ -43,7 +33,7 @@ pub(super) fn build_standard_blob_with(
         b.doc_map = Some(rows);
     }
     let bytes = b.finish().expect("finish");
-    let json = r#"[{"name":"body","tokenizer":"standard"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     (Bytes::from(bytes), json.to_string())
 }
 
@@ -57,23 +47,21 @@ pub(super) fn build_standard_fold_blob() -> (Bytes, String) {
 
 pub(super) fn build_blob() -> (Bytes, String) {
     // 3 docs, 1 column.
-    let tok = Arc::new(AsciiLowerTokenizer);
-    let mut b = FtsBuilder::new(tok);
+    let mut b = FtsBuilder::new();
     b.register_column("body".into(), false)
         .expect("register column");
     b.add_doc(0, 0, "rust async runtime").expect("add doc");
     b.add_doc(0, 1, "tokio is a rust runtime").expect("add doc");
     b.add_doc(0, 2, "java spring boot").expect("add doc");
     let bytes = b.finish().expect("finish");
-    let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     (Bytes::from(bytes), json.to_string())
 }
 
 /// Build a corpus that exercises both the df=1 inline-encoded
 /// path and the df ≥ 2 PFOR path side-by-side.
 pub(super) fn build_mixed_df_blob() -> (Bytes, String) {
-    let tok = Arc::new(AsciiLowerTokenizer);
-    let mut b = FtsBuilder::new(tok);
+    let mut b = FtsBuilder::new();
     b.register_column("body".into(), false)
         .expect("register column");
     // `common`     → df = 3 (PFOR form)
@@ -84,7 +72,7 @@ pub(super) fn build_mixed_df_blob() -> (Bytes, String) {
     b.add_doc(0, 1, "common rust").expect("add doc");
     b.add_doc(0, 2, "common uniqtwo").expect("add doc");
     let bytes = b.finish().expect("finish");
-    let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     (Bytes::from(bytes), json.to_string())
 }
 
@@ -95,7 +83,7 @@ pub(super) fn build_mixed_df_blob() -> (Bytes, String) {
 /// adjacent in order.
 pub(super) fn build_phrase_blob() -> (Bytes, &'static str) {
     use crate::superfile::fts::builder::FtsBuilder;
-    let mut b = FtsBuilder::new(crate::test_helpers::default_tokenizer());
+    let mut b = FtsBuilder::new();
     b.register_column("title".into(), true).expect("register");
     let docs = [
         "new york city",
@@ -109,6 +97,6 @@ pub(super) fn build_phrase_blob() -> (Bytes, &'static str) {
     }
     (
         Bytes::from(b.finish().expect("finish")),
-        r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#,
+        r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#,
     )
 }

@@ -78,7 +78,6 @@ use crate::{
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
-        fts::tokenize::tokenizer_for_name,
         vector::layout::VectorLayout,
     },
     supertable::{
@@ -137,7 +136,7 @@ pub(crate) struct GappedIdPlacementCache {
 const VECTOR_DIM_MIN: usize = 16;
 const VECTOR_DIM_MAX: usize = 4096;
 
-/// Reserved separator inside FTS FST keys (`<col>\x1F<term>`); user
+/// Reserved separator inside FTS dictionary keys (`<col>\x1F<term>`); user
 /// column names must not contain it. Mirrors superfile's
 /// `check_user_column_name`.
 const RESERVED_SEPARATOR: char = '\x1F';
@@ -753,23 +752,7 @@ impl SupertableOptions {
             }
         }
 
-        // 5. Each FTS column's base tokenizer name must resolve.
-        //    Validating here surfaces a typo at construction with a
-        //    typed error, instead of at the first commit's builder
-        //    construction. The stopword set and stemmer need no check:
-        //    they arrive as enums, so an unrepresentable one cannot be
-        //    constructed. (A *persisted* filter name is different and is
-        //    validated where it is read.)
-        for fc in &fts_columns {
-            if tokenizer_for_name(&fc.analyzer).is_none() {
-                return Err(BuildError::UnknownAnalyzer {
-                    column: fc.column.clone(),
-                    analyzer: fc.analyzer.clone(),
-                });
-            }
-        }
-
-        // 6. Shared thread pools + a fresh store.
+        // 5. Shared thread pools + a fresh store.
         let reader_pool = shared_reader_pool();
         let writer_pool = shared_writer_pool();
         let store: Arc<dyn SuperfileReaderCache> = Arc::new(InMemoryReaderCache::new());
@@ -1615,18 +1598,6 @@ mod tests {
         let err =
             SupertableOptions::new(s, vec![], vec![vc("inf.emb", 16)]).expect_err("expected error");
         assert!(matches!(err, BuildError::ReservedPrefixInColumnName(_)));
-    }
-
-    #[test]
-    fn fts_column_with_unknown_analyzer_rejected() {
-        let s = Arc::new(Schema::new(vec![Field::new(
-            "title",
-            DataType::LargeUtf8,
-            false,
-        )]));
-        let err = SupertableOptions::new(s, vec![fc("title").analyzer("nonesuch")], vec![])
-            .expect_err("expected error");
-        assert!(matches!(err, BuildError::UnknownAnalyzer { .. }));
     }
 
     #[test]

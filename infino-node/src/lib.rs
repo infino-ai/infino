@@ -47,10 +47,9 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
-    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
-    RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions,
-    SchemaPatch, Stemmer, Stopwords,
+    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError, InfinoError, Metric,
+    OptimizeError, OptimizeOptions as InfinoOptimizeOptions, RecalibratePolicy, ReindexError,
+    ReindexMode, ReindexOptions as InfinoReindexOptions, SchemaPatch, Stemmer, Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -84,12 +83,8 @@ fn map_err(e: InfinoError) -> Error {
         // The schema cause is typed on the Rust side, so the variant leads
         // the message here as every other typed cause does: a caller telling
         // a cap breach from a type mismatch reads the name, not the prose.
-        InfinoError::Schema(e) => {
-            Error::new(Status::InvalidArg, format!("{}: {e}", e.kind()))
-        }
-        InfinoError::Cardinality(m) | InfinoError::Query(m) => {
-            Error::new(Status::InvalidArg, m)
-        }
+        InfinoError::Schema(e) => Error::new(Status::InvalidArg, format!("{}: {e}", e.kind())),
+        InfinoError::Cardinality(m) | InfinoError::Query(m) => Error::new(Status::InvalidArg, m),
         InfinoError::Io(m) | InfinoError::Backend(m) => Error::new(Status::GenericFailure, m),
         // A recoverable connection-memory-budget refusal. Prefixed with the same
         // name Python raises (`ConnectionMemoryBudgetError`) so the concept reads
@@ -126,6 +121,9 @@ fn optimize_err(e: OptimizeError) -> Error {
             Status::InvalidArg,
             "optimize requires durable storage (not memory://)",
         ),
+        OptimizeError::Unsupported(m) => {
+            Error::new(Status::GenericFailure, format!("Unsupported: {m}"))
+        }
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
 }
@@ -157,6 +155,11 @@ fn reindex_err(e: ReindexError) -> Error {
             Status::GenericFailure,
             format!("AlreadyRunningError: {}", ReindexError::AlreadyRunning),
         ),
+        // An index this engine cannot read: the caller's to fix, prefixed as
+        // `InfinoError::Unsupported` is so one check covers every surface.
+        ReindexError::Unsupported(m) => {
+            Error::new(Status::GenericFailure, format!("Unsupported: {m}"))
+        }
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
 }
@@ -204,9 +207,6 @@ fn reindex_options(opts: Option<ReindexOptions>) -> Result<InfinoReindexOptions>
             )
         })?;
         out = out.with_stale_seal_timeout_ms(ms);
-    }
-    if o.trust_writer_analysis == Some(true) {
-        out = out.trusting_writer_analysis();
     }
     Ok(out)
 }
@@ -517,23 +517,6 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
     }
 }
 
-/// Parse a BM25 statistics-scope string: `"global"` (corpus-wide IDF, the
-/// default when omitted) or `"per_superfile"` (segment-local IDF).
-fn parse_stats(stats: Option<&str>) -> Result<Bm25Stats> {
-    let Some(stats) = stats else {
-        // Omitted means the engine default.
-        return Ok(Bm25Stats::default());
-    };
-    match stats.to_ascii_lowercase().as_str() {
-        "per_superfile" => Ok(Bm25Stats::PerSuperfile),
-        "global" => Ok(Bm25Stats::Global),
-        other => Err(Error::new(
-            Status::InvalidArg,
-            format!("stats must be 'per_superfile' or 'global', got {other:?}"),
-        )),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -648,13 +631,6 @@ pub struct ReindexOptions {
     // `i64`, not `u32`: a JS number carries any timeout up to 2^53 ms, and a
     // `u32` would wrap the ones past ~49 days instead of passing them on.
     pub stale_seal_timeout_ms: Option<i64>,
-    /// Credit a superfile that records no analysis revision with the one its
-    /// writer emitted (default `false`). **Only sound when the table never held
-    /// superfiles older than that writer**: an older compaction can have folded
-    /// stale terms into a newer-stamped file, and crediting it reports the
-    /// table migrated with those terms still in place. Leave unset unless the
-    /// table's whole history is known.
-    pub trust_writer_analysis: Option<bool>,
 }
 
 /// What a `reindex` did.
@@ -789,10 +765,7 @@ struct FtsDecl {
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct FtsOptions {
-    /// Tokenizer: `"standard"` (the default — the Unicode-aware UAX #29
-    /// tokenizer that keeps non-ASCII text) or `"ascii_lower"` (ASCII
-    /// split + lowercase, non-ASCII dropped). It is recorded with the
-    /// table and cannot be changed afterwards.
+    /// Base tokenizer: `"standard"`, the default, is the only one.
     pub analyzer: Option<String>,
     /// Remove this column's stopwords — the very common words whose
     /// presence says almost nothing about what a document is about.
@@ -851,8 +824,8 @@ impl IndexSpec {
     }
 
     /// Mark `column` (a UTF-8 string column) as full-text indexed, with
-    /// optional per-column `options` (analyzer, stopwords, stemmer,
-    /// positions, stored, k1/b).
+    /// optional per-column `options` (stopwords, stemmer, positions,
+    /// stored, k1/b).
     #[napi]
     pub fn fts(&self, column: String, options: Option<FtsOptions>) -> Self {
         let mut next = self.clone();
@@ -891,8 +864,8 @@ impl IndexSpec {
             let mut field = infino::FtsField::new(column.clone())
                 .positions(positions.unwrap_or(false))
                 .stored(stored.unwrap_or(true));
-            if let Some(a) = analyzer {
-                field = field.analyzer(a.clone());
+            if let Some(name) = analyzer {
+                field = field.analyzer(name.clone());
             }
             if let Some(name) = stopwords {
                 field = field.stopwords(stopwords_from_name(name)?);
@@ -1159,14 +1132,11 @@ impl Table {
         query: String,
         k: u32,
         mode: Option<String>,
-        stats: Option<String>,
         projection: Option<Vec<String>>,
         k1: Option<f64>,
         b: Option<f64>,
     ) -> Result<Buffer> {
-        let mut opts = Bm25SearchOptions::new()
-            .with_mode(parse_mode(mode.as_deref())?)
-            .with_stats(parse_stats(stats.as_deref())?);
+        let mut opts = Bm25SearchOptions::new().with_mode(parse_mode(mode.as_deref())?);
         opts = match (k1, b) {
             (Some(k1), Some(b)) => opts.with_bm25(k1 as f32, b as f32),
             (None, None) => opts,

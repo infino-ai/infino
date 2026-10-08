@@ -120,8 +120,11 @@ pub enum InfinoError {
     #[error("config: {0}")]
     Config(String),
 
-    /// The query is valid but uses something the engine does not support
-    /// yet, such as a SQL feature DataFusion does not implement.
+    /// The request is valid but uses something the engine does not support:
+    /// a SQL feature DataFusion does not implement, or a superfile the
+    /// request read whose full-text index is older than this engine reads or
+    /// was built under a removed analyzer (the message says how to bring it
+    /// forward). Retrying cannot help.
     #[error("unsupported: {0}")]
     Unsupported(String),
 }
@@ -170,6 +173,7 @@ impl InfinoError {
             QueryError::Store(_) | QueryError::Parquet(_) => InfinoError::Io,
             QueryError::ManifestLoad(load) => manifest_load_variant(load),
             QueryError::Internal(_) => InfinoError::Backend,
+            QueryError::Unsupported(_) => InfinoError::Unsupported,
             QueryError::OverBudget(_) => InfinoError::OverBudget,
             QueryError::PermissionDenied(_) => InfinoError::PermissionDenied,
         };
@@ -203,6 +207,7 @@ impl From<StorageError> for InfinoError {
 /// | `Store`, `Parquet` | `Io` | a read failed; retrying can succeed |
 /// | `ManifestLoad` | as a [`ManifestLoadError`] would | same failure, same answer |
 /// | `Internal` | `Backend` | the engine broke its own invariant: a bug |
+/// | `Unsupported` | `Unsupported` | a superfile whose full-text index is older than this engine reads, or under a removed analyzer, however the read was wrapped |
 /// | `OverBudget`, `PermissionDenied` | the same names | |
 impl From<QueryError> for InfinoError {
     fn from(e: QueryError) -> Self {
@@ -358,7 +363,6 @@ impl From<SuperfileBuildError> for InfinoError {
                     reason: e.to_string(),
                 })
             }
-            SuperfileBuildError::UnknownAnalyzer { .. } => InfinoError::Config(e.to_string()),
             SuperfileBuildError::VectorRerankCodecUnimplemented { .. } => {
                 InfinoError::Unsupported(e.to_string())
             }
@@ -418,10 +422,10 @@ impl From<SupertableBuildError> for InfinoError {
             | SupertableBuildError::HydrateChunkTooLarge { .. } => {
                 InfinoError::Schema(SchemaError::Invalid { reason: message })
             }
-            // A bad setting: an unknown analyzer name (the same class a bad
-            // connect option gets), or a zero hydrate `target_rows`.
-            SupertableBuildError::UnknownAnalyzer { .. }
-            | SupertableBuildError::HydrateZeroTargetRows => InfinoError::Config(message),
+            // A bad setting: a zero hydrate `target_rows`.
+            SupertableBuildError::HydrateZeroTargetRows => InfinoError::Config(message),
+            // An input superfile in a format this engine does not read.
+            SupertableBuildError::Unsupported(_) => InfinoError::Unsupported(message),
             // The caller's input reader failing during hydrate: I/O on their side.
             SupertableBuildError::HydrateInputRead(_) => InfinoError::Io(message),
             // A commit that found its table dropped and purged: the name no
@@ -540,7 +544,11 @@ mod tests {
     use super::*;
     use crate::{
         storage::StorageError,
-        superfile::LazyByteSourceError,
+        superfile::{
+            LazyByteSourceError, ReadError,
+            error::FtsError,
+            format::fts::{REPAIR_RELEASE, VERSION_MIN_RELEASE},
+        },
         supertable::wal::{
             WalStoreError,
             pipeline::{AppendPhaseError, TombstonePhaseError},
@@ -688,6 +696,23 @@ mod tests {
         for (got, expected) in cases {
             assert!(expected(&got), "got {got:?}");
         }
+    }
+
+    /// A full-text index too old to read is the caller's to fix by
+    /// reindexing, not an engine fault or a retryable read, and the message
+    /// that reaches them says how.
+    #[test]
+    fn an_index_too_old_to_read_is_unsupported_and_says_to_reindex() {
+        let too_old = ReadError::Fts(Box::new(FtsError::IndexTooOld { version: 6 }));
+        let public = InfinoError::from(QueryError::from(too_old));
+        assert!(matches!(public, InfinoError::Unsupported(_)), "{public:?}");
+        let message = public.to_string();
+        assert!(
+            message.contains(&format!("infino < {VERSION_MIN_RELEASE}"))
+                && message.contains(REPAIR_RELEASE)
+                && message.contains("ascii_lower"),
+            "{message}"
+        );
     }
 
     #[test]
