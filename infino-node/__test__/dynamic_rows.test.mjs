@@ -59,3 +59,36 @@ test("documents grow the schema and disagreements are refused", () => {
     ],
   );
 });
+
+test("a schema refusal leads with its kind", () => {
+  // The message names the column, cap or version at fault and is written to
+  // be read; the variant leads it so a caller can tell a cap breach from a
+  // type mismatch without matching on prose, as every other typed cause here
+  // already does (`NotFound:`, `ConflictError:`).
+  const db = connect("memory://");
+  const docs = db.createTable("docs", titleSchema(), new IndexSpec());
+  docs.append([{ title: "a", n: 1 }]);
+
+  // Asserted on `message`, not on the error's string form, which `assert`
+  // renders with an `Error: ` prefix of its own.
+  const kindOf = (fn) => {
+    try {
+      fn();
+    } catch (e) {
+      return e.message.split(":")[0];
+    }
+    throw new Error("expected a refusal");
+  };
+  assert.equal(
+    kindOf(() => docs.append([{ title: "b", n: "x" }])),
+    "TypeMismatch",
+    "a type disagreement names itself",
+  );
+  assert.equal(
+    kindOf(() => docs.append([{ title: "c", xs: [1, "a"] }])),
+    "MixedArray",
+    "an array of more than one type names itself",
+  );
+  // The message is still there behind the name.
+  assert.throws(() => docs.append([{ title: "d", n: "x" }]), /Int64/);
+});

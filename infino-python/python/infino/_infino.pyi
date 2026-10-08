@@ -78,6 +78,19 @@ class ConflictError(InfinoError):
     retries were exhausted. Recoverable: nothing partial is visible, so catch it,
     back off, and reissue the append / update / delete."""
 
+class SchemaError(ValueError):
+    """Raised when the schema refuses a write: a batch whose types disagree with
+    the table, a row document the mapper cannot map, or a schema change the table
+    will not take. ``kind`` names the cause (``TypeMismatch``,
+    ``FieldCapExceeded``, ``SchemaConflict``, …) for code that has to tell one
+    from another; ``str(e)`` is the message, which names the column, cap or
+    version at fault and is written to be read rather than matched on.
+
+    Based on ``ValueError``, which is what every schema refusal raised before it
+    had a class of its own, so existing ``except ValueError`` keeps working."""
+
+    kind: str
+
 class AlreadyRunningError(InfinoError):
     """Raised by ``reindex`` when an ``optimize`` or another reindex already holds
     the table. Recoverable: nothing was changed, so catch it and try again once

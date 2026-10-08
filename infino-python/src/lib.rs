@@ -15,6 +15,7 @@
 //! `test-helpers`), so it is also a public-surface consumer test.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,12 +32,13 @@ use pyo3::exceptions::{
     PyException, PyKeyError, PyNotImplementedError, PyRuntimeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyModule};
 
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
     GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
-    ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions, SchemaPatch, Stemmer,
+    ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions,
+    SchemaError as SchemaCause, SchemaPatch, Stemmer,
     Stopwords, VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
@@ -87,6 +89,22 @@ create_exception!(
      again once the other run has finished."
 );
 
+create_exception!(
+    infino,
+    SchemaError,
+    PyValueError,
+    "Raised when the schema refuses a write: a batch whose types disagree \
+     with the table, a row document the mapper cannot map, or a schema \
+     change the table will not take. `kind` names the cause (`TypeMismatch`, \
+     `FieldCapExceeded`, `SchemaConflict`, …) for code that has to tell one \
+     from another; `str(e)` is the message, which names the column, cap or \
+     version at fault and is written to be read rather than matched on. \
+     \
+     Based on `ValueError`, which is what every schema refusal raised before \
+     it had a class of its own, so existing `except ValueError` keeps \
+     working."
+);
+
 /// Map a core engine error to the Python exception the caller sees.
 fn py_err(e: CoreError) -> PyErr {
     match e {
@@ -95,9 +113,11 @@ fn py_err(e: CoreError) -> PyErr {
         | CoreError::Cardinality(m)
         | CoreError::Config(m)
         | CoreError::Query(m) => PyValueError::new_err(m),
-        // The schema cause is typed on the Rust side; Python gets its
-        // message, which names the column, cap or version at fault.
-        CoreError::Schema(e) => PyValueError::new_err(e.to_string()),
+        // The schema cause is typed on the Rust side, so it is typed here
+        // too: one class for "the schema refused this", with the variant on
+        // `kind` so a caller can tell a cap breach from a type mismatch
+        // without reading the prose.
+        CoreError::Schema(e) => schema_err(&e),
         CoreError::Io(m) | CoreError::Backend(m) => PyRuntimeError::new_err(m),
         // A connection-memory-budget refusal: recoverable, so raise the typed
         // ConnectionMemoryBudgetError the caller can catch and back off on.
@@ -110,6 +130,21 @@ fn py_err(e: CoreError) -> PyErr {
         // to a generic runtime error carrying the message.
         other => PyRuntimeError::new_err(other.to_string()),
     }
+}
+
+/// A schema refusal as [`SchemaError`], carrying its variant on `kind`.
+///
+/// Setting the attribute needs the GIL, which every caller of this already
+/// holds — it is reached from a `#[pymethods]` body. If attaching it ever
+/// fails, the exception is still raised with its message: a missing `kind`
+/// is worth less than the error, and losing the error to report a failure to
+/// decorate it would be the wrong trade.
+fn schema_err(e: &SchemaCause) -> PyErr {
+    let err = SchemaError::new_err(e.to_string());
+    Python::attach(|py| {
+        let _ = err.value(py).setattr("kind", e.kind());
+    });
+    err
 }
 
 fn optimize_err(e: OptimizeError) -> PyErr {
@@ -1544,7 +1579,17 @@ fn append_input(
     } else {
         data.clone()
     };
-    match py.import("json")?.call_method1("dumps", (&records,)) {
+    // `allow_nan=False` so a non-finite float raises here rather than being
+    // written as a bare `NaN`, which is not JSON and which the parser below
+    // would reject with a message about the text rather than the value. A
+    // raise is also how a value JSON cannot spell at all reaches the typed
+    // path, so the two cases share one route out.
+    let dumps = PyDict::new(py);
+    dumps.set_item("allow_nan", false)?;
+    match py
+        .import("json")?
+        .call_method("dumps", (&records,), Some(&dumps))
+    {
         Ok(text) => {
             let text: String = text.extract()?;
             let rows: Vec<serde_json::Value> = serde_json::from_str(&text)
@@ -1555,8 +1600,72 @@ fn append_input(
                 AppendInput::Rows(rows)
             })
         }
-        Err(_) => typed_batch_input(py, data, schema, is_frame, &table_cls),
+        Err(_) => {
+            // A missing value in a pandas frame is a non-finite float, and
+            // it means the row carries nothing there — the same as a key a
+            // dict leaves out. Writing it as null keeps that meaning, keeps
+            // the document path (which grows the schema, where the typed
+            // path only fills columns the table already declares), and
+            // agrees with Node, whose `JSON.stringify` nulls a NaN before
+            // the binding ever sees it.
+            match nulled_non_finite(py, &records) {
+                Ok(cleaned) => {
+                    let text: String = py
+                        .import("json")?
+                        .call_method("dumps", (cleaned,), Some(&dumps))?
+                        .extract()?;
+                    let rows: Vec<serde_json::Value> = serde_json::from_str(&text)
+                        .map_err(|e| PyValueError::new_err(format!("rows: {e}")))?;
+                    Ok(if rows.is_empty() {
+                        AppendInput::Empty
+                    } else {
+                        AppendInput::Rows(rows)
+                    })
+                }
+                // Not a non-finite float, then: a value JSON has no spelling
+                // for at all (bytes, Decimal, datetime, a numpy scalar), which
+                // only the typed path carries.
+                Err(_) => typed_batch_input(py, data, schema, is_frame, &table_cls),
+            }
+        }
     }
+}
+
+/// `records` with every non-finite float replaced by `None`, leaving
+/// everything else as it is.
+///
+/// Returns an error when the result still cannot be serialized, which is the
+/// signal that the obstacle was never `NaN`.
+fn nulled_non_finite<'py>(
+    py: Python<'py>,
+    records: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    const SANITIZE: &str = r#"
+import math
+
+def nulled(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: nulled(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [nulled(v) for v in value]
+    return value
+"#;
+    let module = PyModule::from_code(
+        py,
+        &CString::new(SANITIZE)?,
+        &CString::new("infino_nan.py")?,
+        &CString::new("infino_nan")?,
+    )?;
+    let cleaned = module.getattr("nulled")?.call1((records,))?;
+    // Prove it serializes now; otherwise the caller falls through to the
+    // typed path rather than failing on a value this never addressed.
+    let strict = PyDict::new(py);
+    strict.set_item("allow_nan", false)?;
+    py.import("json")?
+        .call_method("dumps", (&cleaned,), Some(&strict))?;
+    Ok(cleaned)
 }
 
 /// Rows carrying values JSON cannot spell, as one batch typed by the table's
@@ -1667,6 +1776,7 @@ fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<ConnectionMemoryBudgetError>(),
     )?;
     m.add("ConflictError", m.py().get_type::<ConflictError>())?;
+    m.add("SchemaError", m.py().get_type::<SchemaError>())?;
     m.add(
         "AlreadyRunningError",
         m.py().get_type::<AlreadyRunningError>(),

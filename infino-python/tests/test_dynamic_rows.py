@@ -110,3 +110,63 @@ def test_declared_columns_keep_the_types_json_cannot_carry():
     # rather than quietly changing it.
     with pytest.raises(ValueError, match="(?i)data loss|truncat"):
         t.append([{"title": "d", "price": decimal.Decimal("1.234"), "payload": b"\x01"}])
+
+
+def test_a_schema_refusal_names_its_kind():
+    """Every schema refusal raises one class carrying the variant on `kind`.
+
+    The message names the column, cap or version at fault and is written to
+    be read; `kind` is what a program matches on, so a caller can tell a cap
+    breach from a type mismatch without parsing prose.
+    """
+    db = infino.connect("memory://")
+    docs = db.create_table("docs", _title_schema(), infino.IndexSpec())
+    docs.append([{"title": "a", "n": 1}])
+
+    with pytest.raises(infino.SchemaError) as caught:
+        docs.append([{"title": "b", "n": "x"}])
+    assert caught.value.kind == "TypeMismatch"
+    assert "n" in str(caught.value)
+
+    with pytest.raises(infino.SchemaError) as caught:
+        docs.append([{"title": "c", "xs": [1, "a"]}])
+    assert caught.value.kind == "MixedArray"
+
+
+def test_a_schema_refusal_is_still_a_value_error():
+    """`SchemaError` is based on `ValueError`, which is what these refusals
+    raised before they had a class of their own, so code catching the old
+    thing keeps working."""
+    db = infino.connect("memory://")
+    docs = db.create_table("docs", _title_schema(), infino.IndexSpec())
+    docs.append([{"title": "a", "n": 1}])
+    with pytest.raises(ValueError):
+        docs.append([{"title": "b", "n": "x"}])
+    assert issubclass(infino.SchemaError, ValueError)
+
+
+def test_a_missing_value_in_a_frame_is_stored_as_null():
+    """A pandas frame marks a missing number with NaN, which JSON cannot
+    spell. It means the row carries nothing there, so it is written as null —
+    the same as a key a dict leaves out, and the same as Node, whose
+    `JSON.stringify` nulls it before the binding sees it."""
+    import math
+
+    import pandas as pd
+
+    db = infino.connect("memory://")
+    docs = db.create_table("docs", _title_schema(), infino.IndexSpec())
+    frame = pd.DataFrame(
+        {"title": ["a", "b"], "score": [1.5, float("nan")]}
+    )
+    docs.append(frame)
+    rows = db.query_sql("SELECT title, score FROM docs ORDER BY _id").to_pylist()
+    assert rows[0]["score"] == 1.5
+    assert rows[1]["score"] is None, "NaN is the absence of a value, so null"
+
+    # A list of dicts carrying NaN reads the same way, and so does an
+    # infinity, which JSON cannot spell either.
+    docs.append([{"title": "c", "score": float("nan")}, {"title": "d", "score": math.inf}])
+    rows = db.query_sql("SELECT title, score FROM docs ORDER BY _id").to_pylist()
+    assert rows[2]["score"] is None
+    assert rows[3]["score"] is None

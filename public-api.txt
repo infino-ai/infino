@@ -407,6 +407,8 @@ pub infino::SchemaError::ValueOutOfRange
 pub infino::SchemaError::ValueOutOfRange::column: alloc::string::String
 pub infino::SchemaError::ValueOutOfRange::data_type: alloc::string::String
 pub infino::SchemaError::ValueOutOfRange::value: alloc::string::String
+impl infino::SchemaError
+pub fn infino::SchemaError::kind(&self) -> &'static str
 impl core::clone::Clone for infino::SchemaError
 pub fn infino::SchemaError::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::SchemaError

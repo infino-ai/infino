@@ -1213,11 +1213,18 @@ impl PhysicalSchema {
 ///   file's column to the new id, so the dropped column's values read as
 ///   the new column's.
 ///
-/// Both clear once compaction has rewritten every file that predates ids,
-/// since a rewritten file carries ids and is resolved by id. Closing them
-/// outright needs a retired name to carry the id it belonged to, so a
-/// stored name resolves to the column that wrote it rather than to
-/// whatever holds the name today.
+/// A rewritten file carries ids and is resolved by id, so both go away for
+/// any file compaction happens to rewrite. **Nothing makes that rewrite
+/// happen on account of a rename or a drop**: compaction forces a rewrite
+/// for a file whose columns are mid-type-conversion, and a rename is not a
+/// type change, so a small pre-id file under the size thresholds can sit
+/// unrewritten indefinitely and keep reading null under the new name.
+///
+/// Closing this needs one of two changes, neither of them here: force a
+/// rewrite of every pre-id file once the schema retires or renames a name it
+/// could hold, or have a retired name carry the id it belonged to, so a
+/// stored name resolves to the column that wrote it rather than to whatever
+/// holds the name today.
 #[derive(Debug, Clone)]
 pub struct LegacyNames {
     schema: Arc<TableSchema>,
