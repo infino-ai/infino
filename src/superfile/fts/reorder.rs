@@ -41,6 +41,8 @@ use std::{
 
 use rayon::{join, prelude::*};
 
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
 /// Documents below this per-partition size are left in the order they
 /// already have. Splitting further costs more than the grouping is
 /// worth, and the gaps inside a group this small are already short.
@@ -61,6 +63,49 @@ pub(crate) struct BisectParams {
     pub(crate) convergence: f32,
     /// Ceiling on a split's move rounds whatever `convergence` says.
     pub(crate) max_rounds: usize,
+}
+
+/// A bisection in progress: the configured limits, plus the reference the
+/// convergence test measures rounds against.
+///
+/// The reference is the gain per document of the first split's first round —
+/// the root's, since it is processed first — so the bar is taken from the
+/// corpus rather than chosen. Measuring a round against it, rather than
+/// against the first round of the split the round belongs to, is what stops
+/// large partitions being cut short: a big partition banks most of its
+/// available gain in round one, so a bar set by that round rejects later
+/// rounds that are still worth more than anything happening deep in the tree.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Bisect<'a> {
+    params: BisectParams,
+    /// `f64` bits of the reference gain per document; `0` until a round sets it.
+    reference: &'a AtomicU64,
+}
+
+impl Bisect<'_> {
+    /// Whether a round that realised `gain` over `len` documents means this
+    /// split has stopped paying.
+    fn converged(&self, gain: f64, len: usize) -> bool {
+        if self.params.convergence <= 0.0 {
+            return false;
+        }
+        let reference = f64::from_bits(self.reference.load(Relaxed));
+        // No reference yet means the first split made no move at all; there is
+        // nothing to measure against, so the ceiling is the only limit.
+        reference > 0.0
+            && gain / (len.max(1) as f64) < f64::from(self.params.convergence) * reference
+    }
+
+    /// Offer a first round's result as the reference. The first to arrive wins
+    /// and later splits leave it alone.
+    fn offer_reference(&self, gain: f64, len: usize) {
+        let per_doc = gain / (len.max(1) as f64);
+        if per_doc > 0.0 {
+            let _ = self
+                .reference
+                .compare_exchange(0, per_doc.to_bits(), Relaxed, Relaxed);
+        }
+    }
 }
 
 impl Default for BisectParams {
@@ -171,7 +216,12 @@ pub(crate) fn bisect_order(fwd: &ForwardIndex, params: BisectParams) -> Vec<u32>
         n_terms: fwd.n_terms,
         free: Mutex::new(Vec::new()),
     };
-    split_parallel(fwd, &mut order, 0, &pool, params);
+    let reference = AtomicU64::new(0);
+    let run = Bisect {
+        params,
+        reference: &reference,
+    };
+    split_parallel(fwd, &mut order, 0, &pool, run);
     order
 }
 
@@ -182,7 +232,7 @@ fn split_parallel(
     order: &mut [u32],
     depth: u32,
     pool: &StatePool,
-    params: BisectParams,
+    run: Bisect<'_>,
 ) {
     if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
         return;
@@ -194,20 +244,20 @@ fn split_parallel(
             n_terms: local.n_terms,
             free: Mutex::new(Vec::new()),
         };
-        split_parallel(&local, &mut inner, depth, &inner_pool, params);
+        split_parallel(&local, &mut inner, depth, &inner_pool, run);
         apply_inner_order(order, &inner);
         return;
     }
     if order.len() < PARALLEL_MIN_PARTITION {
-        pool.with_state(|state| state.split(fwd, order, depth, params));
+        pool.with_state(|state| state.split(fwd, order, depth, run));
         return;
     }
     let mid = order.len() / 2;
-    pool.with_state(|state| state.refine(fwd, order, mid, true, params));
+    pool.with_state(|state| state.refine(fwd, order, mid, true, run));
     let (left, right) = order.split_at_mut(mid);
     join(
-        || split_parallel(fwd, left, depth + 1, pool, params),
-        || split_parallel(fwd, right, depth + 1, pool, params),
+        || split_parallel(fwd, left, depth + 1, pool, run),
+        || split_parallel(fwd, right, depth + 1, pool, run),
     );
 }
 
@@ -356,22 +406,22 @@ impl BisectState {
         }
     }
 
-    fn split(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, params: BisectParams) {
+    fn split(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, run: Bisect<'_>) {
         if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
             return;
         }
         if localizing_pays(fwd, order) {
             let local = self.localize(fwd, order);
             let mut inner: Vec<u32> = (0..order.len() as u32).collect();
-            BisectState::new(local.n_terms).split(&local, &mut inner, depth, params);
+            BisectState::new(local.n_terms).split(&local, &mut inner, depth, run);
             apply_inner_order(order, &inner);
             return;
         }
         let mid = order.len() / 2;
-        self.refine(fwd, order, mid, false, params);
+        self.refine(fwd, order, mid, false, run);
         let (left, right) = order.split_at_mut(mid);
-        self.split(fwd, left, depth + 1, params);
-        self.split(fwd, right, depth + 1, params);
+        self.split(fwd, left, depth + 1, run);
+        self.split(fwd, right, depth + 1, run);
     }
 
     /// Move documents across the split while it lowers the cost, then
@@ -383,7 +433,7 @@ impl BisectState {
         order: &mut [u32],
         mid: usize,
         parallel: bool,
-        params: BisectParams,
+        run: Bisect<'_>,
     ) {
         self.count_degrees(fwd, order, mid);
         let n_left = mid as f32;
@@ -401,9 +451,7 @@ impl BisectState {
         // in the units of the cost this is minimising. The swap loop already
         // computes them, so the convergence test is a running total and a
         // comparison.
-        let mut first_gain = 0.0f64;
-
-        for round in 0..params.max_rounds {
+        for round in 0..run.params.max_rounds {
             // A document's gain is what the cost drops by if it moves:
             // its terms get one rarer on this side and one commoner on
             // the other. Positive means the move is worth making.
@@ -464,12 +512,12 @@ impl BisectState {
                 break;
             }
             if round == 0 {
-                first_gain = round_gain;
-            } else if params.convergence > 0.0
-                && round_gain < f64::from(params.convergence) * first_gain
-            {
-                // The returns have fallen off far enough that the rounds still
-                // available are not worth their pass over the partition.
+                run.offer_reference(round_gain, order.len());
+            } else if run.converged(round_gain, order.len()) {
+                // This round bought less per document than the corpus showed
+                // was available, so the rounds still to come are not worth
+                // their pass over the partition — and the work they would take
+                // is better spent on a split that is still paying.
                 break;
             }
         }
@@ -1001,7 +1049,12 @@ mod tests {
     fn the_parallel_order_matches_the_serial_one() {
         let (fwd, _) = clustered(3 * PARALLEL_MIN_PARTITION, 20, 13);
         let mut serial: Vec<u32> = (0..fwd.len() as u32).collect();
-        BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0, exhaustive());
+        let reference = AtomicU64::new(0);
+        let run = Bisect {
+            params: exhaustive(),
+            reference: &reference,
+        };
+        BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0, run);
         assert_eq!(bisect_order(&fwd, exhaustive()), serial);
     }
 }

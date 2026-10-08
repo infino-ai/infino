@@ -319,14 +319,19 @@ pub struct CompactionSettings {
     /// the host's free memory.
     pub max_memory_mb: u64,
     /// Stop a split's document-reordering move loop once a round improves the
-    /// layout by less than this fraction of what that split's own first round
-    /// improved it.
+    /// layout, per document, by less than this fraction of what the corpus
+    /// showed was available — the gain per document of the first split's first
+    /// round.
     ///
     /// A ratio rather than a round count on purpose: how many rounds are worth
     /// running depends on how much structure a corpus has, so a count tuned on
-    /// one body of text does not transfer, while "keep going until the
-    /// returns have fallen off by this much" does. `0.0` disables the test and
-    /// runs every split to `reorder_max_rounds`.
+    /// one body of text does not transfer, while "keep going until the returns
+    /// have fallen off by this much" does. Measuring per document against one
+    /// bar for the whole run, rather than against each split's own first
+    /// round, is what keeps rounds going to the splits where they buy the most
+    /// — a large partition banks most of its gain in round one, so a bar set
+    /// by that round cuts it off while cheap deep splits keep running.
+    /// `0.0` disables the test and runs every split to `reorder_max_rounds`.
     pub reorder_convergence: f32,
     /// Hard ceiling on a split's move rounds, whatever the convergence test
     /// says. A backstop against a corpus whose rounds keep paying, not the
@@ -362,10 +367,12 @@ impl Default for CompactionSettings {
     }
 }
 
-/// Default reorder convergence ratio. Measured on a 5M-document body of text:
-/// at this value a build spends about a tenth less time compacting and lands a
-/// marginally smaller index, with no query-latency difference the measurement
-/// could resolve.
+/// Default reorder convergence ratio. Measured on a 5M-document body of text
+/// against three alternatives (against each split's own first round, against
+/// the gain accumulated so far, and on the fraction of documents a round
+/// moves): the alternatives bought 7-8% more compaction speed by reordering
+/// less, for indexes 1-2% larger, while this one lands the smallest index of
+/// the four at the same cost as the baseline it replaced.
 const DEFAULT_REORDER_CONVERGENCE: f32 = 0.05;
 
 /// Default ceiling on a split's move rounds. Equal to the fixed count the
