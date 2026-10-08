@@ -140,6 +140,7 @@ use crate::{
             superfile_reader::OpenTierCounts,
         },
         reader_cache::ReadIntent,
+        schema::FieldId,
         slow_vector_state::{
             CentroidSection, ResidentIndexKind, ResidentVectorIndex, WalkPlaneRequest,
             fetch_centroid_section, fetch_resident_index_blob, hydrate_resident_index,
@@ -494,7 +495,7 @@ fn cells_ranked_by_fine_score(
 /// before fine centroid scoring.
 fn postings_by_cell_from_summaries(
     superfiles: &[Arc<SuperfileEntry>],
-    column: &str,
+    column: FieldId,
     allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
     superseded: &BTreeMap<Uuid, BTreeSet<u32>>,
 ) -> (HashMap<u32, u64>, bool) {
@@ -504,7 +505,7 @@ fn postings_by_cell_from_summaries(
         if allow.is_some_and(|m| !m.contains_key(&entry.uri)) {
             continue;
         }
-        let Some(vs) = entry.vector_summary.get(column) else {
+        let Some(vs) = entry.vector_summary.get(&column) else {
             continue;
         };
         for cell in &vs.cells {
@@ -643,9 +644,16 @@ struct DeferredCellRescore {
 fn eligible_summary<'e>(
     entry: &'e SuperfileEntry,
     column: &str,
+    column_id: Option<FieldId>,
     query_dim: usize,
-) -> Result<&'e VectorSummary, QueryError> {
-    match entry.vector_summary.get(column) {
+) -> Result<Option<&'e VectorSummary>, QueryError> {
+    // A file written before the column existed holds no vectors for it
+    // and contributes nothing; a file that declares the column and has no
+    // summary is a malformed build.
+    if column_id.is_some_and(|id| !entry.holds_vector_column(id)) {
+        return Ok(None);
+    }
+    match column_id.and_then(|id| entry.vector_summary.get(&id)) {
         Some(vs) if !vs.cells.is_empty() => {
             for cell in &vs.cells {
                 if cell.clusters.dim as usize != query_dim {
@@ -656,7 +664,7 @@ fn eligible_summary<'e>(
                     )));
                 }
             }
-            Ok(vs)
+            Ok(Some(vs))
         }
         Some(_) => Err(QueryError::Internal(format!(
             "superfile {} has no cluster centroids in its vector summary for \
@@ -683,6 +691,7 @@ fn eligible_summary<'e>(
 fn estimate_admit_ranking(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
+    column_id: Option<FieldId>,
     query_len: usize,
     metric: Metric,
     admit_q: &RabitqAdmitQuery,
@@ -697,7 +706,9 @@ fn estimate_admit_ranking(
     };
     let mut cell_best: HashMap<u32, f32> = HashMap::new();
     for entry in superfiles.iter().filter(|e| eligible(e)) {
-        let vs = eligible_summary(entry, column, query_len)?;
+        let Some(vs) = eligible_summary(entry, column, column_id, query_len)? else {
+            continue;
+        };
         for cell in &vs.cells {
             let Some(cell_id) = cell.cell_id else {
                 continue;
@@ -740,6 +751,7 @@ fn estimate_admit_ranking(
 fn score_fine_candidates(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
+    column_id: Option<FieldId>,
     query: &[f32],
     metric: Metric,
     admit: Option<&HashSet<u32>>,
@@ -766,7 +778,9 @@ fn score_fine_candidates(
         if !eligible(entry) {
             continue;
         }
-        let vs = eligible_summary(entry, column, query.len())?;
+        let Some(vs) = eligible_summary(entry, column, column_id, query.len())? else {
+            continue;
+        };
         let mut flat_base = 0u32;
         for cell in &vs.cells {
             // Flat cluster ids must stay identical whether or not a cell is
@@ -996,10 +1010,13 @@ fn resolve_ivf_router(
 /// concentrated subset of the routable clusters. Counting only cells with at
 /// least one indexed doc realigns the denominator with the calibration input.
 fn total_fine_clusters(manifest: &ManifestSnapshot, column: &str) -> usize {
+    let Some(id) = manifest.field_id(column) else {
+        return 0;
+    };
     manifest
         .get_all_superfiles()
         .iter()
-        .filter_map(|e| e.vector_summary.get(column))
+        .filter_map(|e| e.vector_summary.get(&id))
         .flat_map(|s| s.cells.iter())
         .filter(|c| c.clusters.n_cent > 0 && c.clusters.counts.iter().any(|&n| n > 0))
         .map(|c| c.clusters.n_cent as usize)
@@ -1043,6 +1060,7 @@ fn centroid_router_walk(
     superfiles: &[Arc<SuperfileEntry>],
     readers: &[Arc<SuperfileReader>],
     column: &str,
+    column_id: FieldId,
     section: &crate::supertable::slow_vector_state::CentroidSection,
     metric: Metric,
 ) -> Result<(Vec<Vec<f32>>, Vec<(usize, u32)>), QueryError> {
@@ -1056,7 +1074,7 @@ fn centroid_router_walk(
             continue;
         };
         let sfid = sf.superfile_id;
-        for (flat, mut vec) in vr.global_fine_cluster_vectors(column, section, sfid)? {
+        for (flat, mut vec) in vr.global_fine_cluster_vectors(column, column_id, section, sfid)? {
             gfc_prepare_for_metric(metric, &mut vec);
             vecs.push(vec);
             node_map.push((si, flat));
@@ -1074,12 +1092,14 @@ fn build_centroid_router(
     superfiles: &[Arc<SuperfileEntry>],
     readers: &[Arc<SuperfileReader>],
     column: &str,
+    column_id: FieldId,
     section: &crate::supertable::slow_vector_state::CentroidSection,
     dim: usize,
     metric: Metric,
 ) -> Result<CentroidRouterGraph, QueryError> {
     use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
-    let (vecs, node_map) = centroid_router_walk(superfiles, readers, column, section, metric)?;
+    let (vecs, node_map) =
+        centroid_router_walk(superfiles, readers, column, column_id, section, metric)?;
     let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
     let graph = Hnsw::build(&scorer, HnswParams::default());
     Ok(CentroidRouterGraph {
@@ -1143,6 +1163,7 @@ fn decode_centroid_router_section(
     superfiles: &[Arc<SuperfileEntry>],
     readers: &[Arc<SuperfileReader>],
     column: &str,
+    column_id: FieldId,
     section: &crate::supertable::slow_vector_state::CentroidSection,
     dim: usize,
     metric: Metric,
@@ -1193,7 +1214,10 @@ fn decode_centroid_router_section(
             continue;
         };
         let sfid = sf.superfile_id;
-        for (flat, mut vec) in vr.global_fine_cluster_vectors(column, section, sfid).ok()? {
+        for (flat, mut vec) in vr
+            .global_fine_cluster_vectors(column, column_id, section, sfid)
+            .ok()?
+        {
             gfc_prepare_for_metric(metric, &mut vec);
             cluster_vecs.insert((sfid, flat), vec);
         }
@@ -1231,7 +1255,7 @@ fn decode_centroid_router_section(
 /// drain/compaction settle so the graph is published once per generation,
 /// `mmap`-loaded identically on every node and after a restart.
 pub(crate) async fn compose_centroid_router_section(
-    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
     section: &crate::supertable::slow_vector_state::CentroidSection,
     column: &str,
@@ -1240,7 +1264,8 @@ pub(crate) async fn compose_centroid_router_section(
     if entries.is_empty() {
         return None;
     }
-    let metric = column_metric(&options.vector_columns, column)?;
+    let options = &manifest.options;
+    let metric = column_metric(&manifest.vector_configs(), column)?;
     let readers = match open_readers_from_options(options, entries).await {
         Ok(readers) => readers,
         Err(error) => {
@@ -1248,13 +1273,15 @@ pub(crate) async fn compose_centroid_router_section(
             return None;
         }
     };
-    let router = match build_centroid_router(entries, &readers, column, section, dim, metric) {
-        Ok(router) => router,
-        Err(error) => {
-            tracing::warn!(%error, "centroid-router publish: build failed");
-            return None;
-        }
-    };
+    let column_id = manifest.field_id(column)?;
+    let router =
+        match build_centroid_router(entries, &readers, column, column_id, section, dim, metric) {
+            Ok(router) => router,
+            Err(error) => {
+                tracing::warn!(%error, "centroid-router publish: build failed");
+                return None;
+            }
+        };
     Some(encode_centroid_router_section(&router, entries, dim))
 }
 
@@ -2161,7 +2188,7 @@ pub(crate) async fn user_placement_for_scalar_resolve(
 /// fallback wave).
 fn score_cell_fp32(
     superfiles: &[Arc<SuperfileEntry>],
-    column: &str,
+    column: FieldId,
     d: &DeferredCellRescore,
     fp32: &[f32],
     query: &[f32],
@@ -2171,7 +2198,7 @@ fn score_cell_fp32(
     let entry = &superfiles[d.si];
     let Some(cell) = entry
         .vector_summary
-        .get(column)
+        .get(&column)
         .and_then(|vs| vs.cells.iter().find(|cell| cell.cell_id == d.cell_id))
     else {
         return false;
@@ -2304,8 +2331,14 @@ async fn collect_hnsw_plane(
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
+        // A file written before a rename labels its vector blob with the name
+        // the column had then; the id is what finds the column in either file.
+        let file_column = reader.column_alias(manifest.field_id(column), column);
         let Some(rows) = vr
-            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .materialized_index_rows_excluding_async(
+                file_column,
+                superseded.get(&entry.superfile_id),
+            )
             .await
         else {
             continue;
@@ -2364,7 +2397,8 @@ async fn count_hnsw_rows(manifest: &ManifestSnapshot, column: &str) -> Result<us
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
-        if !vr.has_index_column(column) {
+        // The file's own label for the column; see the fan-out sites.
+        if !vr.has_index_column(reader.column_alias(manifest.field_id(column), column)) {
             continue;
         }
         let sup = superseded.get(&entry.superfile_id);
@@ -2701,8 +2735,14 @@ async fn gather_sq16_rows(
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
+        // A file written before a rename labels its vector blob with the name
+        // the column had then; the id is what finds the column in either file.
+        let file_column = reader.column_alias(manifest.field_id(column), column);
         let Some(rows) = vr
-            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .materialized_index_rows_excluding_async(
+                file_column,
+                superseded.get(&entry.superfile_id),
+            )
             .await
         else {
             continue;
@@ -3334,8 +3374,14 @@ pub(crate) async fn assemble_hnsw_incremental(
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
+        // A file written before a rename labels its vector blob with the name
+        // the column had then; the id is what finds the column in either file.
+        let file_column = reader.column_alias(manifest.field_id(column), column);
         let Some(rows) = vr
-            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .materialized_index_rows_excluding_async(
+                file_column,
+                superseded.get(&entry.superfile_id),
+            )
             .await
         else {
             continue;
@@ -3790,7 +3836,7 @@ impl SupertableReader {
         // right latency. The resident scorer knows which metric it serves (the
         // fixed grid serves Cosine; a fitted ruler serves its own metric).
         let served = data.scorer.served_metric();
-        let declared = column_metric(&self.manifest().options.vector_columns, column);
+        let declared = column_metric(&self.manifest().vector_configs(), column);
         if declared != Some(served) {
             return Ok(IndexOutcome::Unavailable(
                 IndexUnavailable::MetricMismatch {
@@ -4026,6 +4072,10 @@ impl SupertableReader {
         candidates: &mut Vec<FineCandidate>,
         deferred: Vec<DeferredCellRescore>,
     ) -> Result<(), QueryError> {
+        // A column the table does not have has no cells to rescore.
+        let Some(column_id) = self.manifest().field_id(column) else {
+            return Ok(());
+        };
         let deferred = if deferred.is_empty() {
             deferred
         } else if let Some(section) = self.centroid_section().await {
@@ -4040,7 +4090,7 @@ impl SupertableReader {
                 for d in deferred {
                     let entry = &superfiles[d.si];
                     let read = section
-                        .read_cell(entry.superfile_id, column, d.cell_id)
+                        .read_cell(entry.superfile_id, column_id, d.cell_id)
                         .map_err(|e| {
                             QueryError::Internal(format!("centroid section spill read: {e}"))
                         })?;
@@ -4049,7 +4099,8 @@ impl SupertableReader {
                         continue;
                     };
                     cells_read += 1;
-                    if !score_cell_fp32(superfiles, column, &d, &fp32, query, metric, candidates) {
+                    if !score_cell_fp32(superfiles, column_id, &d, &fp32, query, metric, candidates)
+                    {
                         leftovers.push(d);
                     }
                 }
@@ -4075,13 +4126,13 @@ impl SupertableReader {
                 let mut leftovers = Vec::new();
                 for d in deferred {
                     let entry = &superfiles[d.si];
-                    let Some(fp32) = cache.cell(entry.superfile_id, column, d.cell_id) else {
+                    let Some(fp32) = cache.cell(entry.superfile_id, column_id, d.cell_id) else {
                         leftovers.push(d);
                         continue;
                     };
                     if !score_cell_fp32(
                         superfiles,
-                        column,
+                        column_id,
                         &d,
                         fp32.as_slice(),
                         query,
@@ -4153,6 +4204,9 @@ impl SupertableReader {
         fanout: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
+        // A file written before a rename labels its vector blob with the name
+        // the column had then; the id is what finds the column in either file.
+        let column_field_id = manifest.field_id(column);
         let section = self.centroid_section().await.ok_or_else(|| {
             QueryError::Internal("global-fine: centroid section unavailable".into())
         })?;
@@ -4251,6 +4305,10 @@ impl SupertableReader {
             let Some(vr) = readers[si].as_ref().vec() else {
                 continue;
             };
+            let file_column = readers[si]
+                .as_ref()
+                .column_alias(column_field_id, column)
+                .to_owned();
             let pool = Arc::clone(&scan_pool);
             let budget = Arc::clone(&scan_budget);
             scan_futs.push(async move {
@@ -4266,7 +4324,7 @@ impl SupertableReader {
                 };
                 let scan = vr
                     .search_clusters_scan_async(
-                        column,
+                        &file_column,
                         query,
                         k,
                         &fetch,
@@ -4344,8 +4402,9 @@ impl SupertableReader {
             for (si, selected) in by_seg {
                 let entry = &superfiles[si];
                 let reader = readers[si].as_ref();
+                let file_column = reader.column_alias(column_field_id, column);
                 let (hits, rerank_ns) = reader
-                    .vector_rerank_selected(column, query, k, selected, None)
+                    .vector_rerank_selected(file_column, query, k, selected, None)
                     .await?;
                 if let Some(stats) = &self.op_stats {
                     stats.add_kernel_cpu_ns(rerank_ns);
@@ -4392,7 +4451,8 @@ impl SupertableReader {
         readers: &[Arc<SuperfileReader>],
         section: &CentroidSection,
     ) -> Result<Arc<StampedCentroidRouter>, QueryError> {
-        let options = &self.manifest().options;
+        let manifest = self.manifest();
+        let options = &manifest.options;
         let is_fresh = |entry: &StampedCentroidRouter| {
             entry.generation == generation && entry.column == column
         };
@@ -4412,7 +4472,12 @@ impl SupertableReader {
             .await
         {
             Some(graph) => graph,
-            None => build_centroid_router(superfiles, readers, column, section, dim, metric)?,
+            None => {
+                let column_id = manifest.field_id(column).ok_or_else(|| {
+                    QueryError::Internal(format!("unknown vector column `{column}`"))
+                })?;
+                build_centroid_router(superfiles, readers, column, column_id, section, dim, metric)?
+            }
         };
         let entry = Arc::new(StampedCentroidRouter {
             generation,
@@ -4455,6 +4520,7 @@ impl SupertableReader {
             superfiles,
             readers,
             column,
+            manifest.field_id(column)?,
             section,
             dim,
             metric,
@@ -4543,12 +4609,8 @@ impl SupertableReader {
         // column check but is reached first), while an undrained table rejects
         // it later at the grid lookup, and a wrong length would surface deep in
         // the probe as if the stored index were at fault.
-        let Some(vector_config) = manifest
-            .options
-            .vector_columns
-            .iter()
-            .find(|vc| vc.column == column)
-        else {
+        let vector_configs = manifest.vector_configs();
+        let Some(vector_config) = vector_configs.iter().find(|vc| vc.column == column) else {
             return Err(QueryError::InvalidQuery(format!(
                 "unknown vector column `{column}`"
             )));
@@ -4772,8 +4834,11 @@ impl SupertableReader {
         let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
         // A pass over every superfile's per-cell summaries — the routing
         // input, and pure CPU this query asked for.
+        let Some(column_id) = manifest.field_id(column) else {
+            return Ok(Vec::new());
+        };
         let (postings_by_cell, any_tagged) = op_stats::timed_kernel(&self.op_stats, || {
-            postings_by_cell_from_summaries(&superfiles, column, allow_ref, superseded)
+            postings_by_cell_from_summaries(&superfiles, column_id, allow_ref, superseded)
         });
 
         let mut gated = Vec::new();
@@ -5002,6 +5067,7 @@ impl SupertableReader {
                 estimate_admit_ranking(
                     &superfiles,
                     column,
+                    manifest.field_id(column),
                     query.len(),
                     metric,
                     &admit_q,
@@ -5024,6 +5090,7 @@ impl SupertableReader {
                 score_fine_candidates(
                     &superfiles,
                     column,
+                    manifest.field_id(column),
                     query,
                     metric,
                     Some(&admitted),
@@ -5104,6 +5171,7 @@ impl SupertableReader {
                             score_fine_candidates(
                                 &superfiles,
                                 column,
+                                manifest.field_id(column),
                                 query,
                                 metric,
                                 Some(&delta),
@@ -5288,6 +5356,7 @@ impl SupertableReader {
                 score_fine_candidates(
                     &superfiles,
                     column,
+                    manifest.field_id(column),
                     query,
                     metric,
                     None,
@@ -5504,6 +5573,7 @@ impl SupertableReader {
             }
             _ => options,
         };
+        let column_field_id = manifest.field_id(column);
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
         let column_arc2 = Arc::clone(&column_arc);
@@ -5547,6 +5617,10 @@ impl SupertableReader {
                 let max_replica_overhead = Arc::clone(&max_replica_overhead_body);
                 let op_stats = op_stats_scan.clone();
                 async move {
+                    // A file written before a rename labels its vector
+                    // blob with the name the column had then; the id is what
+                    // finds the column in either file.
+                    let column = reader.column_alias(column_field_id, &column).to_owned();
                     // Unfiltered user path on row-addressable locals: resolve the
                     // bitmap once (warm after the orchestrator's prefetch) and
                     // push it down. Filtered search leaves it `None` — its
@@ -5828,6 +5902,10 @@ impl SupertableReader {
                     let reader_pool = Arc::clone(&reader_pool);
                     let op_stats = op_stats_c.clone();
                     async move {
+                        // A file written before a rename labels its vector
+                        // blob with the name the column had then; the id is what
+                        // finds the column in either file.
+                        let column = reader.column_alias(column_field_id, &column).to_owned();
                         // Hidden-path invariants: no tombstone sidecars (the
                         // manifest's deletes apply after the stable-id
                         // remap upstream), replica slack mirrors phase A.
@@ -5916,7 +5994,7 @@ impl SupertableReader {
         // postings AND the manifest term blooms). A non-FTS filter column
         // matches nothing; no tokens (empty / punctuation-only) ⇒
         // nothing matches.
-        let Some(tokenizer) = manifest.options.try_fts_tokenizer_for(filter.column) else {
+        let Some(tokenizer) = manifest.try_fts_tokenizer_for(filter.column) else {
             return Ok(Vec::new());
         };
         let tokens: Vec<String> = tokenizer.tokenize(filter.query).collect();
@@ -6114,8 +6192,7 @@ impl SupertableReader {
         plan: &CandidatePlan,
     ) -> Result<CandidateScope, QueryError> {
         let manifest = self.manifest();
-        let leaves =
-            prune_leaves_for_filters(&manifest.options, &self.options().scalar_schema(), filters);
+        let leaves = prune_leaves_for_filters(manifest, &self.manifest().scalar_schema(), filters);
         let mut superfiles = select_superfiles(manifest, &leaves).await?;
         if let Some(surviving) = plan.surviving_superfile_ids(manifest).await? {
             superfiles.retain(|e| surviving.contains(&e.superfile_id.as_u128()));
@@ -6424,7 +6501,10 @@ impl SupertableReader {
                         &routing_stats,
                     )
                     .await?;
-                    if let Some(vs) = entry.vector_summary.get(&column) {
+                    if let Some(vs) = manifest_for_ids
+                        .field_id(&column)
+                        .and_then(|id| entry.vector_summary.get(&id))
+                    {
                         let mut idx = 0usize;
                         let mut guard = map.lock().expect("diag cell-map lock");
                         for cell in &vs.cells {
@@ -7500,7 +7580,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::IndexOutcome;
-    use crate::superfile::fts::reader::Bm25SearchOptions;
+    use crate::{superfile::fts::reader::Bm25SearchOptions, test_helpers::fid};
 
     /// Cosine columns normalize the query; every other metric passes the
     /// caller's slice through untouched, by reference (no copy, no scale).
@@ -8476,8 +8556,8 @@ mod tests {
             Field::new(
                 "_id",
                 DataType::Decimal128(
-                    crate::supertable::options::DECIMAL128_PRECISION,
-                    crate::supertable::options::DECIMAL128_SCALE,
+                    crate::supertable::schema::DECIMAL128_PRECISION,
+                    crate::supertable::schema::DECIMAL128_SCALE,
                 ),
                 false,
             ),
@@ -8500,8 +8580,8 @@ mod tests {
 
         let ids = arrow_array::Decimal128Array::from((0..n_total as i128).collect::<Vec<_>>())
             .with_precision_and_scale(
-                crate::supertable::options::DECIMAL128_PRECISION,
-                crate::supertable::options::DECIMAL128_SCALE,
+                crate::supertable::schema::DECIMAL128_PRECISION,
+                crate::supertable::schema::DECIMAL128_SCALE,
             )
             .expect("decimal128");
         let titles =
@@ -8552,8 +8632,8 @@ mod tests {
             Field::new(
                 "_id",
                 DataType::Decimal128(
-                    crate::supertable::options::DECIMAL128_PRECISION,
-                    crate::supertable::options::DECIMAL128_SCALE,
+                    crate::supertable::schema::DECIMAL128_PRECISION,
+                    crate::supertable::schema::DECIMAL128_SCALE,
                 ),
                 false,
             ),
@@ -8575,8 +8655,8 @@ mod tests {
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         let id_arr = Decimal128Array::from(ids.to_vec())
             .with_precision_and_scale(
-                crate::supertable::options::DECIMAL128_PRECISION,
-                crate::supertable::options::DECIMAL128_SCALE,
+                crate::supertable::schema::DECIMAL128_PRECISION,
+                crate::supertable::schema::DECIMAL128_SCALE,
             )
             .expect("decimal128");
         let titles = LargeStringArray::from(
@@ -8613,6 +8693,7 @@ mod tests {
             .insert(uri, superfile_bytes_with_ids(ids, dim))
             .expect("insert superfile bytes");
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -8636,6 +8717,7 @@ mod tests {
     fn contiguous_entry(id_min: i128, n_docs: u64, seed: u128) -> Arc<SuperfileEntry> {
         let id = Uuid::from_u128(seed);
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -9023,6 +9105,7 @@ mod tests {
 
     fn synthetic_entry(superfile_id: Uuid) -> SuperfileEntry {
         SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id,
@@ -9175,7 +9258,7 @@ mod tests {
         let sf_id = Uuid::from_u128(0xC0FFEE);
         let mut entry = synthetic_entry(sf_id);
         entry.vector_summary.insert(
-            column.into(),
+            fid(column),
             VectorSummary {
                 centroid: vec![0.0; DIM as usize],
                 cells: vec![cell(1, 10), cell(2, 20), cell(3, 30)],
@@ -9186,7 +9269,7 @@ mod tests {
         // No supersessions: every tagged cell is routable.
         let empty = BTreeMap::new();
         let (postings, any_tagged) =
-            postings_by_cell_from_summaries(&entries, column, None, &empty);
+            postings_by_cell_from_summaries(&entries, fid(column), None, &empty);
         assert!(any_tagged);
         assert_eq!(postings.get(&1), Some(&10));
         assert_eq!(postings.get(&2), Some(&20));
@@ -9196,7 +9279,7 @@ mod tests {
         let mut superseded = BTreeMap::new();
         superseded.insert(sf_id, BTreeSet::from([2u32]));
         let (postings, any_tagged) =
-            postings_by_cell_from_summaries(&entries, column, None, &superseded);
+            postings_by_cell_from_summaries(&entries, fid(column), None, &superseded);
         assert!(any_tagged, "surviving cells still tag");
         assert!(!postings.contains_key(&2), "superseded cell is skipped");
         assert_eq!(postings.get(&1), Some(&10));
@@ -9206,7 +9289,7 @@ mod tests {
         // this one.
         let mut other = BTreeMap::new();
         other.insert(Uuid::from_u128(0xDEAD), BTreeSet::from([1u32]));
-        let (postings, _) = postings_by_cell_from_summaries(&entries, column, None, &other);
+        let (postings, _) = postings_by_cell_from_summaries(&entries, fid(column), None, &other);
         assert_eq!(postings.get(&1), Some(&10));
         assert_eq!(postings.get(&2), Some(&20));
         assert_eq!(postings.get(&3), Some(&30));
@@ -9237,9 +9320,12 @@ mod tests {
         };
 
         let sf_id = Uuid::from_u128(0xB0BA);
+        let opts = Arc::new(options_one_superfile_per_commit(DIM as usize));
         let mut entry = synthetic_entry(sf_id);
         entry.vector_summary.insert(
-            column.into(),
+            ManifestSnapshot::empty(Arc::clone(&opts))
+                .field_id(column)
+                .expect("the table declares the column"),
             VectorSummary {
                 centroid: vec![0.0; DIM as usize],
                 cells: vec![
@@ -9252,7 +9338,6 @@ mod tests {
             },
         );
 
-        let opts = Arc::new(options_one_superfile_per_commit(DIM as usize));
         let manifest = ManifestSnapshot::new(1, opts, vec![Arc::new(entry)], None, None);
 
         assert_eq!(
@@ -9287,7 +9372,7 @@ mod tests {
         let sf_id = Uuid::from_u128(0xC0FFEE);
         let mut entry = synthetic_entry(sf_id);
         entry.vector_summary.insert(
-            column.into(),
+            fid(column),
             VectorSummary {
                 centroid: vec![0.0; DIM as usize],
                 cells: vec![cell(1, 10), cell(2, 20), cell(3, 30)],
@@ -9302,6 +9387,7 @@ mod tests {
             let (cands, deferred) = score_fine_candidates(
                 &entries,
                 column,
+                Some(fid(column)),
                 &query,
                 Metric::L2Sq,
                 None,
@@ -9454,9 +9540,17 @@ mod tests {
             // NegDot/L2Sq section must route identically to its freshly-built
             // graph, not just a Cosine one.
             for metric in [Metric::Cosine, Metric::NegDot, Metric::L2Sq] {
-                let built =
-                    build_centroid_router(&entries, &readers, "emb", section.as_ref(), dim, metric)
-                        .expect("build_centroid_router");
+                let emb = hr.manifest().field_id("emb").expect("emb id");
+                let built = build_centroid_router(
+                    &entries,
+                    &readers,
+                    "emb",
+                    emb,
+                    section.as_ref(),
+                    dim,
+                    metric,
+                )
+                .expect("build_centroid_router");
                 assert!(!built.node_map.is_empty(), "fixture must produce a router");
 
                 // Real storage round trip: serialize -> PUT -> fetch+mmap -> decode.
@@ -9479,6 +9573,7 @@ mod tests {
                     &entries,
                     &readers,
                     "emb",
+                    emb,
                     section.as_ref(),
                     dim,
                     metric,
@@ -9541,10 +9636,12 @@ mod tests {
                 .expect("entries");
             let readers = hr.open_superfile_readers(&entries).await.expect("readers");
 
+            let emb = hr.manifest().field_id("emb").expect("emb id");
             let built = build_centroid_router(
                 &entries,
                 &readers,
                 "emb",
+                emb,
                 section.as_ref(),
                 dim,
                 Metric::Cosine,
@@ -9563,6 +9660,7 @@ mod tests {
                 &entries_rev,
                 &readers_rev,
                 "emb",
+                emb,
                 section.as_ref(),
                 dim,
                 Metric::Cosine,
@@ -12294,7 +12392,7 @@ mod tests {
         let fts_cols: HashSet<&str> = HashSet::from(["title"]);
         let filters = [col("title").eq(lit("doc"))];
         let plan = CandidatePlan::from_filters(&filters, &fts_cols, &|col| {
-            manifest.options.try_fts_tokenizer_for(col)
+            manifest.try_fts_tokenizer_for(col)
         });
 
         let mut q = vec![0.0f32; dim];

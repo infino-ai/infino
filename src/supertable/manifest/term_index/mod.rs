@@ -16,7 +16,9 @@
 //!
 //! **Shape.** A small *root* stays resident: the covered superfiles (postings
 //! name them by ordinal) and, per segment, the key range and content hash of
-//! every *slice*. A slice is one contiguous range of `column \x1F term` keys,
+//! every *slice*. A slice is one contiguous range of `field_id \x1F term`
+//! keys ([`FieldId::term_key`]; columns are named by id so a rename leaves
+//! the index valid),
 //! a few MB, holding a front-coded block dictionary (`utils::terms`) over a
 //! postings region; a lookup binary-searches the root for the one slice that
 //! can hold the key, fetches it, and reads one block. Prefix scans touch one
@@ -56,10 +58,13 @@ use crate::{
     storage::{StorageError, StorageProvider},
     superfile::fts::{bm25::idf as bm25_idf, reader::BoolMode},
     supertable::{
-        manifest::{RoutingRef, SuperfileEntry, disk_cache::ManifestDiskCache, part::ContentHash},
+        manifest::{
+            ManifestSnapshot, RoutingRef, SuperfileEntry, disk_cache::ManifestDiskCache,
+            part::ContentHash,
+        },
         query::prune::PruneLeaf,
+        schema::FieldId,
     },
-    utils::terms::make_key,
 };
 
 /// Object-store directory prefix for term-index objects, sibling to the
@@ -412,19 +417,25 @@ impl TermIndex {
 
     /// The superfiles a term or prefix leaf routes to, or `None` when the
     /// leaf is not one the index answers — a scalar leaf, an empty term
-    /// list, a non-UTF-8 prefix — or the lookup failed; the caller then
-    /// keeps its summary-based answer.
-    pub(crate) async fn route_leaf(&self, leaf: &PruneLeaf) -> Option<HashSet<Uuid>> {
+    /// list, a non-UTF-8 prefix, a column the table does not have — or the
+    /// lookup failed; the caller then keeps its summary-based answer.
+    pub(crate) async fn route_leaf(
+        &self,
+        leaf: &PruneLeaf,
+        snapshot: &ManifestSnapshot,
+    ) -> Option<HashSet<Uuid>> {
         match leaf {
             PruneLeaf::TermPresence {
                 column,
                 terms,
                 mode,
             } if !terms.is_empty() => {
+                let column = snapshot.field_id(column)?;
                 let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
                 self.route(column, &refs, *mode).await.ok()
             }
             PruneLeaf::Prefix { column, prefix } => {
+                let column = snapshot.field_id(column)?;
                 let prefix = std::str::from_utf8(prefix).ok()?;
                 self.route_prefix(column, prefix).await.ok()
             }
@@ -439,7 +450,7 @@ impl TermIndex {
     /// longer resolve are skipped.
     pub(crate) async fn route(
         &self,
-        column: &str,
+        column: FieldId,
         terms: &[&str],
         mode: BoolMode,
     ) -> Result<HashSet<Uuid>, TermIndexError> {
@@ -477,7 +488,7 @@ impl TermIndex {
     /// caller must do the same or rescale first.
     pub(crate) async fn query_ceilings(
         &self,
-        column: &str,
+        column_id: FieldId,
         terms: &[&str],
         phrases: &[Vec<&str>],
         entries: &[Arc<SuperfileEntry>],
@@ -488,7 +499,7 @@ impl TermIndex {
             .map(|e| {
                 let n = e
                     .fts_summary
-                    .get(column)
+                    .get(&column_id)
                     .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
                     .unwrap_or(e.n_docs);
                 (e.superfile_id, n)
@@ -500,7 +511,7 @@ impl TermIndex {
         all_terms.extend(phrases.iter().flatten().copied());
         all_terms.sort_unstable();
         all_terms.dedup();
-        let runs = self.postings_many(column, &all_terms).await?;
+        let runs = self.postings_many(column_id, &all_terms).await?;
         for (term, run) in all_terms.into_iter().zip(runs) {
             let mut by_sf = HashMap::new();
             for p in run.iter() {
@@ -581,7 +592,7 @@ impl TermIndex {
     /// to build its cursors without reading the superfile's dictionary.
     pub(crate) async fn locations(
         &self,
-        column: &str,
+        column: FieldId,
         terms: &[&str],
         entries: &[Arc<SuperfileEntry>],
     ) -> Result<HashMap<Uuid, Vec<(String, u64, Location)>>, TermIndexError> {
@@ -610,7 +621,7 @@ impl TermIndex {
     /// The superfiles holding any term with `prefix` in `column`.
     pub(crate) async fn route_prefix(
         &self,
-        column: &str,
+        column: FieldId,
         prefix: &str,
     ) -> Result<HashSet<Uuid>, TermIndexError> {
         let mut out = HashSet::new();
@@ -652,7 +663,7 @@ impl TermIndex {
     /// term. The caller filters to superfiles live in its manifest.
     pub(crate) async fn postings(
         &self,
-        column: &str,
+        column: FieldId,
         term: &str,
     ) -> Result<Arc<Vec<Posting>>, TermIndexError> {
         let mut runs = self.postings_many(column, &[term]).await?;
@@ -672,10 +683,10 @@ impl TermIndex {
     /// the batch holds at most the in-flight slices beyond the resident set.
     pub(crate) async fn postings_many(
         &self,
-        column: &str,
+        column: FieldId,
         terms: &[&str],
     ) -> Result<Vec<Arc<Vec<Posting>>>, TermIndexError> {
-        let keys: Vec<Vec<u8>> = terms.iter().map(|t| make_key(column, t)).collect();
+        let keys: Vec<Vec<u8>> = terms.iter().map(|t| column.term_key(t)).collect();
         let mut out: Vec<Option<Arc<Vec<Posting>>>> = {
             let mut resident = self.runs.lock().expect("resident runs lock");
             keys.iter().map(|k| resident.get(k)).collect()
@@ -746,11 +757,11 @@ impl TermIndex {
     /// `visit` returns `false`. Terms arrive in key order within a segment.
     pub(crate) async fn for_each_prefix(
         &self,
-        column: &str,
+        column: FieldId,
         prefix: &str,
         mut visit: impl FnMut(&[u8], Vec<Posting>) -> bool,
     ) -> Result<(), TermIndexError> {
-        let key_prefix = make_key(column, prefix);
+        let key_prefix = column.term_key(prefix);
         let refs: Vec<_> = self.root.slices_for_prefix(&key_prefix).cloned().collect();
         let mut keep_going = true;
         for r in refs {
@@ -790,13 +801,17 @@ mod tests {
     use crate::{
         CompactionSettings, OptimizeOptions,
         storage::{LocalFsStorageProvider, ObjectMeta},
-        supertable::query::prune::select_superfiles,
+        supertable::{
+            manifest::{commit::read_pointer, list, options_hash::compute_options_hash},
+            query::prune::select_superfiles,
+            schema::{LegacyNames, TableSchema},
+        },
         test_helpers::{
             copy_dir_recursive,
             fault_storage::{FaultOp, FaultStorage},
-            old_format_fts_fixture, open_old_format_fts_fixture,
+            fid, old_format_fts_fixture, open_old_format_fts_fixture,
         },
-        utils::terms::{DictEntry, make_key},
+        utils::terms::DictEntry,
     };
 
     fn contribution(dir: &TempDir, id: u128, terms: &[(&str, &str, u64)]) -> Contribution {
@@ -804,7 +819,7 @@ mod tests {
             .expect("create");
         let mut keyed: Vec<(Vec<u8>, u64)> = terms
             .iter()
-            .map(|(c, t, df)| (make_key(c, t), *df))
+            .map(|(c, t, df)| (fid(c).term_key(t), *df))
             .collect();
         keyed.sort();
         for (i, (key, df)) in keyed.iter().enumerate() {
@@ -872,7 +887,7 @@ mod tests {
         let slice = Slice::open(&built.slices[0].1).expect("open");
 
         let alpha = slice
-            .postings(&make_key("body", "alpha"))
+            .postings(&fid("body").term_key("alpha"))
             .expect("ok")
             .expect("present");
         assert_eq!(
@@ -889,7 +904,7 @@ mod tests {
         );
 
         let beta = slice
-            .postings(&make_key("body", "beta"))
+            .postings(&fid("body").term_key("beta"))
             .expect("ok")
             .expect("present");
         assert_eq!(beta.len(), 1);
@@ -899,25 +914,32 @@ mod tests {
             "below the threshold: location kept"
         );
 
-        let zed = slice
-            .postings(&make_key("title", "zed"))
-            .expect("ok")
-            .expect("present");
+        // `contribution` places a term's postings by its rank among the
+        // contribution's keys, so the expectation ranks the same keys.
+        let mut a_keys = vec![
+            fid("body").term_key("alpha"),
+            fid("body").term_key("beta"),
+            fid("title").term_key("zed"),
+        ];
+        a_keys.sort();
+        let zed_key = fid("title").term_key("zed");
+        let zed_rank = a_keys.iter().position(|k| *k == zed_key).expect("zed") as u64;
+        let zed = slice.postings(&zed_key).expect("ok").expect("present");
         assert!(matches!(
             zed[0].location,
-            Location::Pfor {
-                offset: 2000,
-                len: 800
-            }
+            Location::Pfor { offset, len: 800 } if offset == zed_rank * 1000
         ));
 
         assert_eq!(
-            slice.postings(&make_key("body", "delta")).expect("ok"),
+            slice.postings(&fid("body").term_key("delta")).expect("ok"),
             None
         );
         let s = &built.root.segments[0].slices[0];
-        assert_eq!(s.first_key, make_key("body", "alpha"));
-        assert_eq!(s.last_key, make_key("title", "zed"));
+        let mut all_keys = a_keys;
+        all_keys.push(fid("body").term_key("gamma"));
+        all_keys.sort();
+        assert_eq!(s.first_key, all_keys[0]);
+        assert_eq!(s.last_key, all_keys[3]);
         assert_eq!(s.content_hash, ContentHash::of(&built.slices[0].1));
         assert_eq!(s.len as usize, built.slices[0].1.len());
     }
@@ -954,7 +976,7 @@ mod tests {
         }
         let by_hash: HashMap<_, _> = built.slices.iter().cloned().collect();
         for (c, t, d) in &terms {
-            let key = make_key(c, t);
+            let key = fid(c).term_key(t);
             let hits: Vec<_> = built.root.slices_for_key(&key).collect();
             assert_eq!(hits.len(), 1, "exactly one slice can hold {t}");
             let slice = Slice::open(&by_hash[&hits[0].content_hash]).expect("open");
@@ -996,15 +1018,21 @@ mod tests {
             vec![Uuid::from_u128(7), Uuid::from_u128(8)]
         );
 
-        let run = index.postings("body", "ab005").await.expect("ok");
+        let run = index.postings(fid("body"), "ab005").await.expect("ok");
         assert_eq!(run.len(), 2, "both superfiles hold ab005");
         assert_eq!((run[0].superfile, run[0].df), (0, 2));
         assert_eq!((run[1].superfile, run[1].df), (1, 9));
         assert_eq!(index.superfile_id(1), Some(Uuid::from_u128(8)));
-        assert!(index.postings("body", "nope").await.expect("ok").is_empty());
         assert!(
             index
-                .postings("title", "ab005")
+                .postings(fid("body"), "nope")
+                .await
+                .expect("ok")
+                .is_empty()
+        );
+        assert!(
+            index
+                .postings(fid("title"), "ab005")
                 .await
                 .expect("ok")
                 .is_empty(),
@@ -1013,7 +1041,7 @@ mod tests {
 
         let mut seen = 0usize;
         index
-            .for_each_prefix("body", "ab", |_, _| {
+            .for_each_prefix(fid("body"), "ab", |_, _| {
                 seen += 1;
                 true
             })
@@ -1026,7 +1054,7 @@ mod tests {
 
         let mut seen = 0usize;
         index
-            .for_each_prefix("body", "ab", |_, _| {
+            .for_each_prefix(fid("body"), "ab", |_, _| {
                 seen += 1;
                 seen < 5
             })
@@ -1052,6 +1080,13 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]))
+    }
+
+    /// The id the table mints for `title_schema`'s one column.
+    fn title_id() -> FieldId {
+        TableSchema::from_user_schema(&title_schema())
+            .id_of("title")
+            .expect("title is a table column")
     }
 
     /// Options for an FTS table on `storage`, with a small writer pool.
@@ -1146,6 +1181,25 @@ mod tests {
     }
 
     /// The live superfile ids and the root's covered set, for comparison.
+    /// The list the table's pointer names right now, decoded.
+    fn current_list(
+        storage: &Arc<dyn StorageProvider>,
+        legacy: &LegacyNames,
+        rt: &tokio::runtime::Runtime,
+    ) -> list::Manifest {
+        rt.block_on(async {
+            let (pointer, _) = read_pointer(storage.as_ref())
+                .await
+                .expect("pointer")
+                .expect("the table has a pointer");
+            let (bytes, _) = storage
+                .get(&pointer.manifest_uri)
+                .await
+                .expect("list bytes");
+            list::decode(&bytes, legacy).expect("decode")
+        })
+    }
+
     fn live_and_covered(
         st: &crate::supertable::Supertable,
         storage: &Arc<dyn StorageProvider>,
@@ -1213,7 +1267,7 @@ mod tests {
             );
             let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
             let shared = rt
-                .block_on(index.postings("title", "shared"))
+                .block_on(index.postings(title_id(), "shared"))
                 .expect("lookup");
             assert_eq!(
                 shared.len(),
@@ -1240,7 +1294,7 @@ mod tests {
             let (_, root) = live_and_covered(&st, &storage, &rt);
             let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
             let mut v: Vec<u64> = rt
-                .block_on(index.postings("title", "alpha"))
+                .block_on(index.postings(title_id(), "alpha"))
                 .expect("lookup")
                 .iter()
                 .map(|p| p.df)
@@ -1260,7 +1314,7 @@ mod tests {
         );
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         let mut after: Vec<u64> = rt
-            .block_on(index.postings("title", "alpha"))
+            .block_on(index.postings(title_id(), "alpha"))
             .expect("lookup")
             .iter()
             .map(|p| p.df)
@@ -1301,7 +1355,7 @@ mod tests {
 
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         let shared = rt
-            .block_on(index.postings("title", "shared"))
+            .block_on(index.postings(title_id(), "shared"))
             .expect("lookup");
         assert_eq!(shared.len(), live.len(), "`shared` is in every superfile");
         let n_docs_by_id: HashMap<Uuid, u64> = manifest
@@ -1326,7 +1380,7 @@ mod tests {
             );
         }
         let mut alpha: Vec<u64> = rt
-            .block_on(index.postings("title", "alpha"))
+            .block_on(index.postings(title_id(), "alpha"))
             .expect("lookup")
             .iter()
             .map(|p| p.df)
@@ -1338,7 +1392,7 @@ mod tests {
             "per-superfile df for `alpha` matches the fixture"
         );
         assert!(
-            rt.block_on(index.postings("title", "absent"))
+            rt.block_on(index.postings(title_id(), "absent"))
                 .expect("lookup")
                 .is_empty()
         );
@@ -1447,7 +1501,7 @@ mod tests {
         // inputs' postings are still there to be filtered out by liveness.
         let index = TermIndex::new(root_after, String::new(), Arc::clone(&storage), None);
         let shared = rt
-            .block_on(index.postings("title", "shared"))
+            .block_on(index.postings(title_id(), "shared"))
             .expect("lookup");
         let n_docs: HashMap<Uuid, u64> = st
             .reader()
@@ -1608,6 +1662,7 @@ mod tests {
         use crate::supertable::manifest::{SuperfileUri, VectorLayout};
 
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
@@ -1902,6 +1957,7 @@ mod tests {
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         let reader = st.reader().expect("reader");
+        let title = reader.manifest().field_id("title").expect("title id");
         let entries = reader.manifest().get_all_superfiles().to_vec();
         let ranges: Vec<(Uuid, i128, i128)> = entries
             .iter()
@@ -1921,7 +1977,7 @@ mod tests {
             .iter()
             .map(|e| {
                 e.fts_summary
-                    .get("title")
+                    .get(&title)
                     .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
                     .unwrap_or(e.n_docs)
             })
@@ -1930,7 +1986,7 @@ mod tests {
             .into_iter()
             .map(|term| {
                 let df: u64 = rt
-                    .block_on(index.postings("title", term))
+                    .block_on(index.postings(title_id(), term))
                     .expect("postings")
                     .iter()
                     .map(|p| p.df)
@@ -1954,7 +2010,7 @@ mod tests {
             let phrases: Vec<Vec<&str>> = phrases.iter().map(|p| p.to_vec()).collect();
             let idf_used = |term: &str, _local: f32| global_idf[term];
             let ceilings = rt
-                .block_on(index.query_ceilings("title", terms, &phrases, &entries, &idf_used))
+                .block_on(index.query_ceilings(title, terms, &phrases, &entries, &idf_used))
                 .expect("ceilings");
             let batches = reader
                 .bm25_search(
@@ -2003,6 +2059,7 @@ mod tests {
             .block_on(TermIndex::load(Arc::clone(&storage), None, &reference))
             .expect("load");
         let entry = Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: Uuid::from_u128(1),
@@ -2020,9 +2077,12 @@ mod tests {
         });
         let entries = vec![entry];
         let local = |_: &str, idf: f32| idf;
+        // The contribution keyed `title` by the test's stable id; the entry
+        // has no summary, so that id reads the same as any other there.
+        let title = fid("title");
         let ceilings = rt
             .block_on(index.query_ceilings(
-                "title",
+                title,
                 &[],
                 &[vec!["alpha", "shared"]],
                 &entries,
@@ -2031,7 +2091,7 @@ mod tests {
             .expect("ceilings");
         assert_eq!(ceilings[&Uuid::from_u128(1)], f32::INFINITY);
         let ceilings = rt
-            .block_on(index.query_ceilings("title", &["alpha"], &[], &entries, &local))
+            .block_on(index.query_ceilings(title, &["alpha"], &[], &entries, &local))
             .expect("ceilings");
         assert_eq!(ceilings[&Uuid::from_u128(1)], f32::INFINITY);
     }
@@ -2175,7 +2235,7 @@ mod tests {
         let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
         let memo_for = |terms: &[&str]| {
             let by_sf = rt
-                .block_on(index.locations("title", terms, &entries))
+                .block_on(index.locations(title_id(), terms, &entries))
                 .expect("locations");
             let pairs: Vec<(&str, u64, DictEntry)> = by_sf[&entries[0].superfile_id]
                 .iter()
@@ -2302,7 +2362,7 @@ mod tests {
             Some(Arc::clone(&cache)),
         );
         let first = rt
-            .block_on(warm.postings("title", "shared"))
+            .block_on(warm.postings(title_id(), "shared"))
             .expect("fetch through storage");
         assert!(!first.is_empty());
         for slice in root.segments.iter().flat_map(|s| s.slices.iter()) {
@@ -2315,13 +2375,13 @@ mod tests {
             Some(cache),
         );
         let again = rt
-            .block_on(cached.postings("title", "shared"))
+            .block_on(cached.postings(title_id(), "shared"))
             .expect("served from the disk cache");
         assert_eq!(*again, *first);
         let uncached = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         assert!(
             matches!(
-                rt.block_on(uncached.postings("title", "shared")),
+                rt.block_on(uncached.postings(title_id(), "shared")),
                 Err(TermIndexError::Storage(_))
             ),
             "without the cache the missing object is a storage error"
@@ -2551,7 +2611,7 @@ mod tests {
         let entries = reader.manifest().get_all_superfiles().to_vec();
         let terms = ["alpha", "shared"];
         let by_sf = rt
-            .block_on(index.locations("title", &terms, &entries))
+            .block_on(index.locations(title_id(), &terms, &entries))
             .expect("locations");
 
         let mut planned_with_memo = 0u64;
@@ -2646,7 +2706,7 @@ mod tests {
         let index = rt.block_on(manifest.term_index()).expect("index");
         assert_eq!(index.root().segments.len(), 1, "one folded segment");
         let run = rt
-            .block_on(index.postings("title", "shared"))
+            .block_on(index.postings(title_id(), "shared"))
             .expect("postings");
         assert_eq!(run.len(), entries.len());
         assert!(
@@ -2755,7 +2815,7 @@ mod tests {
                     ContributionWriter::create(dir.path(), Uuid::from_u128(i as u128), i as i128)
                         .expect("create");
                 w.push(
-                    &make_key("body", "common"),
+                    &fid("body").term_key("common"),
                     7,
                     1.5,
                     Location::Pfor {
@@ -2774,7 +2834,7 @@ mod tests {
             .filter_map(|(_, bytes)| {
                 Slice::open(bytes)
                     .expect("open")
-                    .postings(&make_key("body", "common"))
+                    .postings(&fid("body").term_key("common"))
                     .expect("ok")
             })
             .flatten()
@@ -2810,7 +2870,7 @@ mod tests {
                 .map(|(i, terms)| {
                     let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(i as u128 + 1), i as i128).expect("create");
                     for t in terms {
-                        w.push(&make_key("body", &alphabet[*t]), 1 + *t as u64, f32::INFINITY, Location::None).expect("push");
+                        w.push(&fid("body").term_key(&alphabet[*t]), 1 + *t as u64, f32::INFINITY, Location::None).expect("push");
                     }
                     w.finish().expect("finish")
                 })
@@ -2827,20 +2887,20 @@ mod tests {
                 corpus.iter().enumerate().filter(|(_, s)| s.contains(&t)).map(|(i, _)| Uuid::from_u128(i as u128 + 1)).collect()
             };
             for a in 0..12 {
-                let single = rt.block_on(index.route("body", &[&alphabet[a]], BoolMode::Or)).expect("route");
+                let single = rt.block_on(index.route(fid("body"), &[&alphabet[a]], BoolMode::Or)).expect("route");
                 prop_assert_eq!(&single, &holders(a));
                 for b in 0..12 {
                     let pair = [alphabet[a].as_str(), alphabet[b].as_str()];
-                    let or = rt.block_on(index.route("body", &pair, BoolMode::Or)).expect("route");
-                    let and = rt.block_on(index.route("body", &pair, BoolMode::And)).expect("route");
+                    let or = rt.block_on(index.route(fid("body"), &pair, BoolMode::Or)).expect("route");
+                    let and = rt.block_on(index.route(fid("body"), &pair, BoolMode::And)).expect("route");
                     prop_assert_eq!(&or, &holders(a).union(&holders(b)).copied().collect::<HashSet<_>>());
                     prop_assert_eq!(&and, &holders(a).intersection(&holders(b)).copied().collect::<HashSet<_>>());
                 }
             }
-            let prefixed = rt.block_on(index.route_prefix("body", "t0")).expect("prefix");
+            let prefixed = rt.block_on(index.route_prefix(fid("body"), "t0")).expect("prefix");
             let expect: HashSet<Uuid> = (0..10).flat_map(holders).collect();
             prop_assert_eq!(prefixed, expect);
-            prop_assert!(rt.block_on(index.route("body", &["nope"], BoolMode::Or)).expect("route").is_empty());
+            prop_assert!(rt.block_on(index.route(fid("body"), &["nope"], BoolMode::Or)).expect("route").is_empty());
         });
     }
 
@@ -2940,7 +3000,9 @@ mod tests {
             })
             .collect();
         for term in ["shared", "alpha", "beta", "s1d00", "s2d04"] {
-            let postings = rt.block_on(index.postings("title", term)).expect("lookup");
+            let postings = rt
+                .block_on(index.postings(title_id(), term))
+                .expect("lookup");
             assert!(!postings.is_empty(), "{term} is indexed");
             let bounds: HashMap<Uuid, f32> = postings
                 .iter()
@@ -3111,7 +3173,7 @@ mod tests {
         let entries = reader.manifest().get_all_superfiles().to_vec();
         let terms = ["shared", "alpha", "beta", "s1d00", "absent"];
         let by_sf = rt
-            .block_on(index.locations("title", &terms, &entries))
+            .block_on(index.locations(title_id(), &terms, &entries))
             .expect("locations");
         assert_eq!(
             by_sf.len(),
@@ -3194,8 +3256,9 @@ mod tests {
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         let entries = manifest.get_all_superfiles();
+        let title = manifest.field_id("title").expect("title id");
         for e in entries {
-            let summary = e.fts_summary.get("title").expect("summary");
+            let summary = e.fts_summary.get(&title).expect("summary");
             assert!(
                 summary.term_bloom.is_none(),
                 "no per-superfile bloom is written"
@@ -3210,12 +3273,12 @@ mod tests {
             );
         }
         for part in manifest.get_all_list_entries() {
-            if let Some(agg) = part.fts_summary_agg.get("title") {
+            if let Some(agg) = part.fts_summary_agg.get(&title) {
                 assert!(agg.term_bloom.is_none(), "no per-part union bloom either");
             }
         }
         // The manifest-summary answer alone keeps everything (no information).
-        let all_kept = fts_bloom_skip(entries, "title", &["absent"], BoolMode::Or);
+        let all_kept = fts_bloom_skip(entries, title, &["absent"], BoolMode::Or);
         assert!(all_kept.iter().all(|k| *k));
         // The index makes it exact.
         let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -3306,6 +3369,84 @@ mod tests {
     /// (bloom-less) must keep no part-level bloom, or the part prune would
     /// treat the old superfiles' bloom as authoritative and drop terms that
     /// live only in the new superfiles.
+    /// A superfile written before field ids names its columns only by
+    /// name. The index keys by id, so the build resolves each such column
+    /// through the table's schema: the index built over the old fixture
+    /// answers for `title`'s id.
+    #[test]
+    fn superfiles_without_field_ids_are_keyed_by_the_id_their_name_resolves_to() {
+        let fixture = old_format_fts_fixture();
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&fixture, dir.path());
+        let (storage, st) = open_old_format(dir.path(), |o| o);
+        stats_only_optimize(&st);
+
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let title = manifest.field_id("title").expect("title is a table column");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let shared = rt
+            .block_on(index.postings(title, "shared"))
+            .expect("lookup");
+        assert_eq!(
+            shared.len(),
+            live.len(),
+            "`shared` is in every fixture superfile, filed under `title`'s id"
+        );
+    }
+
+    /// A table written before the list carried the schema leaves that
+    /// state on its first commit under this engine: the list it writes is
+    /// at the current format, carries the schema document (the fixture's
+    /// one column, minted id 1), bears a commit token, and is stamped with
+    /// the identity hash rather than the creation-record hash it opened
+    /// under.
+    #[test]
+    fn an_old_table_s_first_commit_writes_the_schema_into_the_list() {
+        let fixture = old_format_fts_fixture();
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&fixture, dir.path());
+        let (storage, st) = open_old_format(dir.path(), |o| o);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let options = Arc::clone(st.reader().expect("reader").options());
+        let legacy = options.legacy_names();
+
+        let before = current_list(&storage, &legacy, &rt);
+        assert!(
+            before.format_version.starts_with("1."),
+            "the fixture's list predates the schema slot: {}",
+            before.format_version
+        );
+        assert!(before.schema.is_none());
+        assert!(before.commit_token.is_nil());
+
+        commit_segment(&st, 3);
+
+        let after = current_list(&storage, &legacy, &rt);
+        assert!(
+            after.format_version.starts_with("2."),
+            "{}",
+            after.format_version
+        );
+        let schema = after
+            .schema
+            .as_ref()
+            .expect("the first commit fills the schema slot");
+        assert_eq!(schema.id_of("title"), Some(FieldId(1)));
+        assert_eq!(schema.schema_id(), 1);
+        assert!(!after.commit_token.is_nil());
+        assert_eq!(
+            after.options_hash,
+            compute_options_hash(&options, &after.partition_strategy)
+        );
+        assert_ne!(
+            after.options_hash, before.options_hash,
+            "the identity hash replaces the creation-record hash"
+        );
+    }
+
     #[test]
     fn upgraded_lazy_tables_find_terms_that_only_new_superfiles_hold() {
         use crate::Bm25SearchOptions;
@@ -3472,7 +3613,9 @@ mod tests {
             );
             for e in manifest.get_all_superfiles() {
                 assert!(
-                    e.fts_summary["title"].term_bloom.is_some(),
+                    e.fts_summary[&manifest.field_id("title").expect("title id")]
+                        .term_bloom
+                        .is_some(),
                     "old entries carry blooms"
                 );
             }
@@ -3630,18 +3773,18 @@ mod tests {
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         let a = rt
-            .block_on(index.postings("title", "shared"))
+            .block_on(index.postings(title_id(), "shared"))
             .expect("first");
         let b = rt
-            .block_on(index.postings("title", "shared"))
+            .block_on(index.postings(title_id(), "shared"))
             .expect("second");
         assert!(Arc::ptr_eq(&a, &b), "the second ask is the resident run");
         let absent = rt
-            .block_on(index.postings("title", "absent"))
+            .block_on(index.postings(title_id(), "absent"))
             .expect("absent");
         assert!(absent.is_empty());
         let again = rt
-            .block_on(index.postings("title", "absent"))
+            .block_on(index.postings(title_id(), "absent"))
             .expect("absent again");
         assert!(
             Arc::ptr_eq(&absent, &again),
@@ -3706,6 +3849,9 @@ mod tests {
         }
         async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
             self.inner.get_range(uri, range).await
+        }
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
         }
         async fn put_atomic(
             &self,
@@ -3779,15 +3925,21 @@ mod tests {
         let slow = SlowGets::wrap(Arc::clone(&local));
         let batched_index = TermIndex::new(root.clone(), String::new(), slow.clone(), None);
         let batched = batched_index
-            .postings_many("body", &asked)
+            .postings_many(fid("body"), &asked)
             .await
             .expect("batched");
         let single_index = TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None);
         for (term, run) in asked.iter().zip(&batched) {
-            let one = single_index.postings("body", term).await.expect("single");
+            let one = single_index
+                .postings(fid("body"), term)
+                .await
+                .expect("single");
             assert_eq!(run.as_slice(), one.as_slice(), "{term}");
         }
-        let spans_both = batched_index.postings("body", &terms[0]).await.expect("ok");
+        let spans_both = batched_index
+            .postings(fid("body"), &terms[0])
+            .await
+            .expect("ok");
         assert_eq!(
             spans_both.iter().map(|p| p.df).collect::<Vec<_>>(),
             vec![2, 5],
@@ -3798,7 +3950,7 @@ mod tests {
         let needed: HashSet<ContentHash> = asked
             .iter()
             .flat_map(|t| {
-                root.slices_for_key(&make_key("body", t))
+                root.slices_for_key(&fid("body").term_key(t))
                     .map(|r| r.content_hash)
                     .collect::<Vec<_>>()
             })

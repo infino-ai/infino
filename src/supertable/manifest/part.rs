@@ -30,14 +30,17 @@ use zstd::stream;
 
 use crate::{
     superfile::vector::layout::VectorLayout,
-    supertable::manifest::{
-        SubsectionOffsets, SuperfileEntry, SuperfileUri,
-        encoding::{
-            DecodeError, SummaryWireMode, decode_fts_summary_map, decode_scalar_stats,
-            decode_vector_summary_map, encode_fts_summary_map, encode_scalar_stats,
-            encode_vector_summary_map,
+    supertable::{
+        manifest::{
+            SubsectionOffsets, SuperfileEntry, SuperfileUri,
+            encoding::{
+                DecodeError, SummaryWireMode, decode_fts_summary_map, decode_scalar_stats,
+                decode_vector_summary_map, encode_fts_summary_map, encode_scalar_stats,
+                encode_vector_summary_map,
+            },
+            superfile_stem,
         },
-        superfile_stem,
+        schema::{LegacyNames, PhysicalSchema},
     },
 };
 
@@ -67,9 +70,17 @@ pub const FORMAT_VERSION: &str = "1.0";
 /// stays readable by every older binary.
 pub const FORMAT_VERSION_NAMED: &str = "2.0";
 
+/// Format version of every part this engine writes: summary keys are
+/// stable field ids rather than names, each entry carries the physical
+/// schema of its superfile, and `stem` is always on the wire. A part at
+/// this major is refused by every engine from before field ids existed,
+/// which is the intended effect of the bump: such an engine would read an
+/// id key as a column name.
+pub const FORMAT_VERSION_IDS: &str = "3.0";
+
 /// The format majors this reader decodes: the unnamed shape and the
 /// source-named one. Anything else is a part from a newer engine.
-const SUPPORTED_MAJORS: [&str; 2] = ["1", "2"];
+const SUPPORTED_MAJORS: [&str; 3] = ["1", "2", "3"];
 
 /// Blake3 digest width in bytes. Blake3 emits a 256-bit (32-byte)
 /// digest; this is the length of a [`ContentHash`]'s payload and the
@@ -284,6 +295,47 @@ fn schema() -> &'static AvroSchema {
     })
 }
 
+/// The record a [`FORMAT_VERSION_IDS`] part is written with: the named
+/// shape plus each entry's physical schema (Arrow IPC bytes of its stored
+/// schema, field ids in the metadata).
+fn schema_ids() -> &'static AvroSchema {
+    static SCHEMA: OnceLock<AvroSchema> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let schema_str = r#"
+        {
+          "type": "record",
+          "name": "ManifestPart",
+          "fields": [
+            {"name": "format_version", "type": "string"},
+            {"name": "part_id", "type": "string"},
+            {"name": "superfiles", "type": {"type": "array", "items": {
+              "type": "record",
+              "name": "SuperfileEntry",
+              "fields": [
+                {"name": "superfile_id", "type": "string"},
+                {"name": "uri", "type": "string"},
+                {"name": "n_docs", "type": "long"},
+                {"name": "id_min", "type": {"type": "fixed", "name": "IdMin", "size": 16}},
+                {"name": "id_max", "type": {"type": "fixed", "name": "IdMax", "size": 16}},
+                {"name": "partition_key", "type": "bytes"},
+                {"name": "partition_hint", "type": ["null", "int"], "default": null},
+                {"name": "scalar_stats", "type": "bytes"},
+                {"name": "fts_summary", "type": "bytes"},
+                {"name": "vector_summary", "type": "bytes"},
+                {"name": "subsection_offsets", "type": ["null", "bytes"], "default": null},
+                {"name": "vector_layout", "type": ["null", "string"], "default": null},
+                {"name": "birth_version", "type": "long", "default": 0},
+                {"name": "stem", "type": ["null", "string"], "default": null},
+                {"name": "physical_schema", "type": ["null", "bytes"], "default": null}
+              ]
+            }}}
+          ]
+        }
+        "#;
+        AvroSchema::parse_str(schema_str).expect("ManifestPart Avro schema with ids parses")
+    })
+}
+
 /// The same schema as it stood before `stem` was added.
 ///
 /// Datum bytes carry no schema, so a part written without `stem` can only
@@ -355,11 +407,10 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
     // blake3 → different URI. Iceberg manifest files take the
     // same approach for the same reason.
     //
-    // Stamp and wire shape are picked by the same predicate, so a part's
-    // `format_version` always names the schema that wrote its bytes — which
-    // is all a schemaless datum decode has to go on.
-    let has_stem = part.superfiles.iter().any(|seg| seg.stem.is_some());
-
+    // Every part this engine writes is a `FORMAT_VERSION_IDS` part: summary
+    // keys are field ids, and `stem` and `physical_schema` are always
+    // present, so the stamp names exactly the schema that wrote the bytes,
+    // which is all a schemaless datum decode has to go on.
     let superfile_records: Vec<AvroValue> = part
         .superfiles
         .iter()
@@ -422,38 +473,36 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
                     AvroValue::Long(seg.birth_version as i64),
                 ),
             ];
-            // Left off the wire entirely when no superfile is named, so the
-            // part keeps the shape a reader from before stems can read.
-            if has_stem {
-                fields.push((
-                    "stem".into(),
-                    match &seg.stem {
-                        Some(stem) => AvroValue::Union(
-                            AVRO_UNION_VALUE_INDEX,
-                            Box::new(AvroValue::String(stem.clone())),
-                        ),
-                        None => AvroValue::Union(AVRO_UNION_NULL_INDEX, Box::new(AvroValue::Null)),
-                    },
-                ));
-            }
+            fields.push((
+                "stem".into(),
+                match &seg.stem {
+                    Some(stem) => AvroValue::Union(
+                        AVRO_UNION_VALUE_INDEX,
+                        Box::new(AvroValue::String(stem.clone())),
+                    ),
+                    None => AvroValue::Union(AVRO_UNION_NULL_INDEX, Box::new(AvroValue::Null)),
+                },
+            ));
+            fields.push((
+                "physical_schema".into(),
+                match &seg.physical_schema {
+                    Some(ps) => AvroValue::Union(
+                        AVRO_UNION_VALUE_INDEX,
+                        Box::new(AvroValue::Bytes(ps.to_ipc())),
+                    ),
+                    None => AvroValue::Union(AVRO_UNION_NULL_INDEX, Box::new(AvroValue::Null)),
+                },
+            ));
             AvroValue::Record(fields)
         })
         .collect();
 
-    // A part holding a source-named superfile is a `FORMAT_VERSION_NAMED`
-    // part whatever the caller stamped: a reader from before stems must
-    // refuse it rather than derive the unnamed key for every entry and let
-    // its GC reclaim the live objects. Decided here, at the one wire exit,
-    // so no construction site can forget.
-    let format_version = if has_stem {
-        FORMAT_VERSION_NAMED
-    } else {
-        part.format_version.as_str()
-    };
+    // Stamped at the one wire exit, whatever the caller set, so no
+    // construction site can write an id-keyed part under an older major.
     let record = AvroValue::Record(vec![
         (
             "format_version".into(),
-            AvroValue::String(format_version.to_owned()),
+            AvroValue::String(FORMAT_VERSION_IDS.to_owned()),
         ),
         (
             "part_id".into(),
@@ -462,12 +511,7 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
         ("superfiles".into(), AvroValue::Array(superfile_records)),
     ]);
 
-    let writer_schema = if has_stem {
-        schema()
-    } else {
-        schema_pre_stem()
-    };
-    to_avro_datum(writer_schema, record).expect("avro datum encode")
+    to_avro_datum(schema_ids(), record).expect("avro datum encode")
 }
 
 /// Leading magic of a zstd frame (little-endian `0xFD2FB528`). Parts
@@ -531,14 +575,21 @@ impl OpenBlobBudget {
 }
 
 /// [`decode`] with no ceiling on retained `open_blob` bytes.
-pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
-    decode_with_blob_budget(bytes, &OpenBlobBudget::unlimited())
+pub fn decode(bytes: &[u8], legacy: &LegacyNames) -> Result<ManifestPart, PartParseError> {
+    decode_with_blob_budget(bytes, &OpenBlobBudget::unlimited(), legacy)
 }
 
 /// Decode a part, keeping inline open blobs only while `budget` allows.
+///
+/// A [`FORMAT_VERSION_IDS`] part stores summary keys as field ids and
+/// needs nothing else. An older part stores column names, which `legacy`
+/// resolves: they were the current names when the part was written and
+/// could not have changed since, because no engine before field ids could
+/// rename a column.
 pub fn decode_with_blob_budget(
     bytes: &[u8],
     budget: &OpenBlobBudget,
+    legacy: &LegacyNames,
 ) -> Result<ManifestPart, PartParseError> {
     let legacy_decompressed;
     let avro_bytes: &[u8] = if bytes.starts_with(&ZSTD_FRAME_MAGIC) {
@@ -555,10 +606,10 @@ pub fn decode_with_blob_budget(
     // names it: `1.0` is the record as it stood before `stem`.
     let format_version = peek_format_version(avro_bytes)?;
     check_major(&format_version)?;
-    let writer_schema = if major_of(&format_version) == major_of(FORMAT_VERSION) {
-        schema_pre_stem()
-    } else {
-        schema()
+    let (writer_schema, legacy) = match major_of(&format_version) {
+        m if m == major_of(FORMAT_VERSION) => (schema_pre_stem(), Some(legacy)),
+        m if m == major_of(FORMAT_VERSION_NAMED) => (schema(), Some(legacy)),
+        _ => (schema_ids(), None),
     };
     let mut cursor = Cursor::new(avro_bytes);
     let value = from_avro_datum(writer_schema, &mut cursor, None)
@@ -591,7 +642,7 @@ pub fn decode_with_blob_budget(
     };
     let mut superfiles = Vec::with_capacity(segs.len());
     for seg_val in segs {
-        superfiles.push(Arc::new(decode_superfile(seg_val, budget)?));
+        superfiles.push(Arc::new(decode_superfile(seg_val, budget, legacy)?));
     }
 
     Ok(ManifestPart {
@@ -619,6 +670,7 @@ fn peek_format_version(bytes: &[u8]) -> Result<String, PartParseError> {
 fn decode_superfile(
     v: AvroValue,
     budget: &OpenBlobBudget,
+    legacy: Option<&LegacyNames>,
 ) -> Result<SuperfileEntry, PartParseError> {
     let fields = match v {
         AvroValue::Record(r) => r,
@@ -678,17 +730,28 @@ fn decode_superfile(
     {
         return Err(PartParseError::UnnormalizedStem(value.to_string()));
     }
+    // Absent on every part written before the field existed.
+    let physical_schema = match map.remove("physical_schema") {
+        Some(AvroValue::Union(_, inner)) => match *inner {
+            AvroValue::Bytes(b) => Some(Arc::new(
+                PhysicalSchema::from_ipc(&b).map_err(PartParseError::SchemaMismatch)?,
+            )),
+            _ => None,
+        },
+        _ => None,
+    };
 
     Ok(SuperfileEntry {
         superfile_id,
         uri: SuperfileUri(uri),
         stem,
+        physical_schema,
         n_docs,
         id_min,
         id_max,
-        scalar_stats: decode_scalar_stats(&scalar_bytes)?,
-        fts_summary: decode_fts_summary_map(&fts_bytes)?,
-        vector_summary: decode_vector_summary_map(&vector_bytes)?,
+        scalar_stats: decode_scalar_stats(&scalar_bytes, legacy)?,
+        fts_summary: decode_fts_summary_map(&fts_bytes, legacy)?,
+        vector_summary: decode_vector_summary_map(&vector_bytes, legacy)?,
         partition_key,
         partition_hint,
         subsection_offsets,
@@ -707,7 +770,7 @@ fn check_major(fv: &str) -> Result<(), PartParseError> {
     if !SUPPORTED_MAJORS.contains(&got_major) {
         return Err(PartParseError::IncompatibleMajorVersion {
             got: fv.to_string(),
-            supported: FORMAT_VERSION_NAMED.to_string(),
+            supported: FORMAT_VERSION_IDS.to_string(),
         });
     }
     Ok(())
@@ -1020,7 +1083,13 @@ mod tests {
     //! surfaces a typed error.
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::superfile::fts::reader::ColumnLengthStats;
+    use arrow_schema::{DataType, Field, Schema};
+
+    use crate::{
+        superfile::fts::reader::ColumnLengthStats,
+        supertable::schema::{FieldId, LegacyNames},
+        test_helpers::fid,
+    };
 
     /// `from_hex` is the exact inverse of `to_hex` — the recovery path a
     /// content-addressed cache file name round-trips through — and
@@ -1068,6 +1137,7 @@ mod tests {
     fn fresh_superfile(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -1115,33 +1185,33 @@ mod tests {
         }
     }
 
-    fn make_scalar_stats() -> HashMap<String, ScalarStatsAgg> {
+    fn make_scalar_stats() -> HashMap<FieldId, ScalarStatsAgg> {
         // Cover Int64, Float64, Boolean, Utf8 — the four
         // shapes the existing skip path supports.
-        let mut cols: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        let mut cols: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
         cols.insert(
-            "ts".into(),
+            fid("ts"),
             ScalarStatsAgg::from_min_max(
                 Arc::new(Int64Array::from(vec![1_715_000_000_i64])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![1_715_086_400_i64])) as ArrayRef,
             ),
         );
         cols.insert(
-            "score".into(),
+            fid("score"),
             ScalarStatsAgg::from_min_max(
                 Arc::new(Float64Array::from(vec![0.0])) as ArrayRef,
                 Arc::new(Float64Array::from(vec![0.999_999])) as ArrayRef,
             ),
         );
         cols.insert(
-            "active".into(),
+            fid("active"),
             ScalarStatsAgg::from_min_max(
                 Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
                 Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
             ),
         );
         cols.insert(
-            "category".into(),
+            fid("category"),
             ScalarStatsAgg::from_min_max(
                 Arc::new(StringArray::from(vec!["alpha"])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["zulu"])) as ArrayRef,
@@ -1154,19 +1224,20 @@ mod tests {
         let id = Uuid::new_v4();
         let mut fts = HashMap::new();
         fts.insert(
-            "title".into(),
+            fid("title"),
             make_fts_summary(1, 50, (b"alpha".to_vec(), b"zulu".to_vec())),
         );
         fts.insert(
-            "body".into(),
+            fid("body"),
             make_fts_summary(2, 30, (b"".to_vec(), b"\xff\xff".to_vec())),
         );
 
         let mut vec_summary = HashMap::new();
-        vec_summary.insert("emb".into(), make_vector_summary(8, 0.5));
-        vec_summary.insert("img".into(), make_vector_summary(16, 1.25));
+        vec_summary.insert(fid("emb"), make_vector_summary(8, 0.5));
+        vec_summary.insert(fid("img"), make_vector_summary(16, 1.25));
 
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -1210,7 +1281,8 @@ mod tests {
 
         // Room for the first entry's blob and nothing after it.
         let budget = OpenBlobBudget::new(blob_bytes);
-        let decoded = decode_with_blob_budget(&encoded, &budget).expect("decode");
+        let decoded =
+            decode_with_blob_budget(&encoded, &budget, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.superfiles.len(), 3);
 
         let first = decoded.superfiles[0]
@@ -1246,7 +1318,7 @@ mod tests {
         // Skipping a payload must leave the cursor where the next field starts,
         // so a skipped entry decodes identically to the unbudgeted decode of the
         // same bytes apart from the inline blob itself.
-        let whole = decode(&encoded).expect("unbudgeted decode");
+        let whole = decode(&encoded, &LegacyNames::none()).expect("unbudgeted decode");
         for i in 1..decoded.superfiles.len() {
             assert_superfiles_equal(&decoded.superfiles[i], &whole.superfiles[i]);
             assert!(
@@ -1271,7 +1343,7 @@ mod tests {
             .expect("offsets")
             .open_blob
             .clone();
-        let decoded = decode(&encode(&fresh_part(entries))).expect("decode");
+        let decoded = decode(&encode(&fresh_part(entries)), &LegacyNames::none()).expect("decode");
         for (i, entry) in decoded.superfiles.iter().enumerate() {
             assert_eq!(
                 entry
@@ -1353,8 +1425,8 @@ mod tests {
     fn empty_part_roundtrip() {
         let part = fresh_part(vec![]);
         let bytes = encode(&part);
-        let decoded = decode(&bytes).expect("decode empty");
-        assert_eq!(decoded.format_version, FORMAT_VERSION);
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode empty");
+        assert_eq!(decoded.format_version, FORMAT_VERSION_IDS);
         assert_eq!(decoded.part_id, part.part_id);
         assert_eq!(decoded.superfiles.len(), 0);
     }
@@ -1363,7 +1435,7 @@ mod tests {
     fn single_minimal_superfile_roundtrip() {
         let part = fresh_part(vec![fresh_superfile(100)]);
         let bytes = encode(&part);
-        let decoded = decode(&bytes).expect("decode minimal");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode minimal");
         assert_eq!(decoded.superfiles.len(), 1);
         assert_superfiles_equal(&decoded.superfiles[0], &part.superfiles[0]);
     }
@@ -1373,7 +1445,7 @@ mod tests {
         let superfiles: Vec<Arc<SuperfileEntry>> = (0..5).map(|_| make_rich_superfile()).collect();
         let part = fresh_part(superfiles);
         let bytes = encode(&part);
-        let decoded = decode(&bytes).expect("decode rich");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode rich");
         assert_eq!(decoded.superfiles.len(), 5);
         for (a, b) in decoded.superfiles.iter().zip(part.superfiles.iter()) {
             assert_superfiles_equal(a, b);
@@ -1427,6 +1499,7 @@ mod tests {
     fn partition_hint_some_and_none_both_roundtrip() {
         let id = Uuid::new_v4();
         let seg_with = Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -1444,6 +1517,7 @@ mod tests {
         });
         let id2 = Uuid::new_v4();
         let seg_without = Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id2,
@@ -1461,7 +1535,7 @@ mod tests {
         });
         let part = fresh_part(vec![seg_with.clone(), seg_without.clone()]);
         let bytes = encode(&part);
-        let decoded = decode(&bytes).expect("decode mixed-hint");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode mixed-hint");
         assert_eq!(decoded.superfiles.len(), 2);
         assert_eq!(decoded.superfiles[0].partition_hint, Some(0xdead_beef));
         assert_eq!(decoded.superfiles[0].partition_key, vec![0xab, 0xcd]);
@@ -1471,25 +1545,29 @@ mod tests {
 
     #[test]
     fn incompatible_major_version_rejected() {
-        let mut part = fresh_part(vec![fresh_superfile(1)]);
-        // Majors 1 and 2 are both readable (2 only adds the nullable stem);
-        // the first unknown major is 3.
-        part.format_version = "3.0".into();
-        let bytes = encode(&part);
-        let err = decode(&bytes).expect_err("major 3 must reject");
+        let part = fresh_part(vec![fresh_superfile(1)]);
+        // The encoder always stamps the current major, so a newer part is
+        // simulated by patching the stamp on the wire: the datum opens with
+        // the length-prefixed `format_version` string.
+        let mut bytes = encode(&part);
+        assert_eq!(&bytes[1..4], FORMAT_VERSION_IDS.as_bytes());
+        bytes[1..4].copy_from_slice(b"4.0");
+        let err = decode(&bytes, &LegacyNames::none()).expect_err("major 4 must reject");
         assert!(
             matches!(err, PartParseError::IncompatibleMajorVersion { .. }),
-            "expected IncompatibleMajorVersion, got {err:?}"
+            "got {err:?}"
         );
     }
 
     #[test]
     fn minor_version_compatible() {
-        let mut part = fresh_part(vec![fresh_superfile(7)]);
-        part.format_version = "1.99".into();
-        let bytes = encode(&part);
-        let decoded = decode(&bytes).expect("minor 99 must accept");
-        assert_eq!(decoded.format_version, "1.99");
+        // A newer minor of the current major decodes: patch the stamp on the
+        // wire, since the encoder always writes the current minor.
+        let part = fresh_part(vec![fresh_superfile(1)]);
+        let mut bytes = encode(&part);
+        bytes[1..4].copy_from_slice(b"3.9");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("minor bump decodes");
+        assert_eq!(decoded.format_version, "3.9");
         assert_eq!(decoded.superfiles.len(), 1);
     }
 
@@ -1499,7 +1577,7 @@ mod tests {
         let mut bytes = encode(&part);
         bytes[0] ^= 0xff;
         bytes[1] ^= 0xff;
-        let err = decode(&bytes).expect_err("corrupt zstd must fail");
+        let err = decode(&bytes, &LegacyNames::none()).expect_err("corrupt zstd must fail");
         assert!(
             matches!(err, PartParseError::Zstd(_) | PartParseError::Avro(_)),
             "expected Zstd or Avro error, got {err:?}"
@@ -1518,14 +1596,15 @@ mod tests {
             legacy.starts_with(&ZSTD_FRAME_MAGIC),
             "legacy frame must carry the zstd magic"
         );
-        let decoded = decode(&legacy).expect("legacy zstd part must decode");
+        let decoded = decode(&legacy, &LegacyNames::none()).expect("legacy zstd part must decode");
         assert_eq!(decoded.part_id, part.part_id);
         assert_eq!(decoded.superfiles.len(), part.superfiles.len());
 
         let mut corrupt = legacy.clone();
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xff;
-        let err = decode(&corrupt).expect_err("corrupt legacy frame must fail");
+        let err =
+            decode(&corrupt, &LegacyNames::none()).expect_err("corrupt legacy frame must fail");
         assert!(
             matches!(err, PartParseError::Zstd(_)),
             "expected Zstd error for corrupt legacy frame, got {err:?}"
@@ -1539,7 +1618,7 @@ mod tests {
         let part = fresh_part(vec![make_rich_superfile()]);
         let raw = encode(&part);
         let wrapped = Bytes::from(raw.clone());
-        let decoded = decode(&wrapped).expect("decode from Bytes");
+        let decoded = decode(&wrapped, &LegacyNames::none()).expect("decode from Bytes");
         assert_eq!(decoded.superfiles.len(), 1);
     }
 
@@ -1598,6 +1677,7 @@ mod tests {
             open_blob: vec![(50, vec![1, 2, 3, 4]), (9000, vec![9, 9])],
         };
         let seg = Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -1614,7 +1694,7 @@ mod tests {
             subsection_offsets: Some(off.clone()),
         });
         let part = fresh_part(vec![seg]);
-        let decoded = decode(&encode(&part)).expect("decode");
+        let decoded = decode(&encode(&part), &LegacyNames::none()).expect("decode");
         let got = decoded.superfiles[0]
             .subsection_offsets
             .as_ref()
@@ -1629,6 +1709,7 @@ mod tests {
     fn vector_layout_cell_posting_roundtrip_through_part() {
         let id = Uuid::new_v4();
         let seg = Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -1645,7 +1726,7 @@ mod tests {
             subsection_offsets: None,
         });
         let part = fresh_part(vec![seg]);
-        let decoded = decode(&encode(&part)).expect("decode");
+        let decoded = decode(&encode(&part), &LegacyNames::none()).expect("decode");
         assert_eq!(
             decoded.superfiles[0].vector_layout,
             VectorLayout::CellPosting
@@ -1666,6 +1747,7 @@ mod tests {
             open_blob: vec![],
         };
         let seg = Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -1682,7 +1764,7 @@ mod tests {
             subsection_offsets: Some(off.clone()),
         });
         let part = fresh_part(vec![seg]);
-        let decoded = decode(&encode(&part)).expect("decode");
+        let decoded = decode(&encode(&part), &LegacyNames::none()).expect("decode");
         assert_eq!(
             *decoded.superfiles[0]
                 .subsection_offsets
@@ -1786,8 +1868,9 @@ mod tests {
         assert!(check_major("1.0").is_ok());
         assert!(check_major("1.42").is_ok());
         assert!(check_major("2.0").is_ok());
+        assert!(check_major("3.0").is_ok());
         assert!(matches!(
-            check_major("3.0"),
+            check_major("4.0"),
             Err(PartParseError::IncompatibleMajorVersion { .. })
         ));
         assert!(matches!(
@@ -1903,7 +1986,7 @@ mod tests {
     fn decode_superfile_rejects_non_record_value() {
         // A non-record Avro value where a SuperfileEntry record is
         // expected → SchemaMismatch.
-        let err = decode_superfile(AvroValue::Long(7), &OpenBlobBudget::unlimited())
+        let err = decode_superfile(AvroValue::Long(7), &OpenBlobBudget::unlimited(), None)
             .expect_err("non-record");
         assert!(
             matches!(err, PartParseError::SchemaMismatch(_)),
@@ -1919,7 +2002,7 @@ mod tests {
             "superfile_id".into(),
             AvroValue::String("not-a-uuid".into()),
         )]);
-        let err = decode_superfile(rec, &OpenBlobBudget::unlimited()).expect_err("bad uuid");
+        let err = decode_superfile(rec, &OpenBlobBudget::unlimited(), None).expect_err("bad uuid");
         assert!(
             matches!(err, PartParseError::BadSuperfileId(_)),
             "got {err:?}"
@@ -2016,80 +2099,137 @@ mod tests {
     /// so a reader from before stems refuses it instead of mis-deriving the
     /// key; a part with no stems keeps the version the caller set, so a
     /// table that never names a source is readable by every older binary.
+    /// Every part this engine writes is stamped with the id-keyed format,
+    /// whatever the caller set and whether or not any superfile is named,
+    /// and a stem round-trips when present.
     #[test]
-    fn a_source_named_superfile_round_trips_and_stamps_the_named_format_version() {
+    fn every_part_is_written_at_the_id_keyed_format_and_stems_round_trip() {
         let mut named = (*fresh_superfile(3)).clone();
         named.stem = Some("customers".into());
         let named_key = named.storage_path();
         let part = fresh_part(vec![Arc::new(named), fresh_superfile(2)]);
         assert_eq!(
             part.format_version, FORMAT_VERSION,
-            "the caller stamped the unnamed version"
+            "the caller stamped the oldest version"
         );
 
-        let decoded = decode(&encode(&part)).expect("decode");
-        assert_eq!(
-            decoded.format_version, FORMAT_VERSION_NAMED,
-            "one stem anywhere in the part makes it a named-format part"
-        );
+        let decoded = decode(&encode(&part), &LegacyNames::none()).expect("decode");
+        assert_eq!(decoded.format_version, FORMAT_VERSION_IDS);
         assert_eq!(decoded.superfiles[0].stem.as_deref(), Some("customers"));
         assert_eq!(decoded.superfiles[0].storage_path(), named_key);
         assert_eq!(decoded.superfiles[1].stem, None);
 
         let unnamed = fresh_part(vec![fresh_superfile(3)]);
-        let decoded = decode(&encode(&unnamed)).expect("decode");
-        assert_eq!(decoded.format_version, FORMAT_VERSION);
-        assert_eq!(decoded.superfiles[0].stem, None);
+        let decoded = decode(&encode(&unnamed), &LegacyNames::none()).expect("decode");
+        assert_eq!(decoded.format_version, FORMAT_VERSION_IDS);
+
+        // The bytes parse with the id-keyed record; the stamp, not the
+        // shape, is what refuses them to an older reader.
+        let bytes = encode(&unnamed);
+        let mut cursor = Cursor::new(bytes.as_slice());
+        from_avro_datum(schema_ids(), &mut cursor, None).expect("id-keyed reader parses");
+        assert_eq!(
+            peek_format_version(&bytes).expect("stamp"),
+            FORMAT_VERSION_IDS
+        );
     }
 
-    /// A part with no stems goes on the wire in the pre-stem shape under a
-    /// `1.0` stamp, so the stamp names the schema that wrote the bytes and a
-    /// reader from before the field can still read a table that never named
-    /// a source. Decoding those bytes with the current schema is what broke:
-    /// it takes the array's next byte for the stem union.
+    /// Summary keys and the physical schema survive the wire: the keys are
+    /// field ids on disk and come back as the same ids, with no name
+    /// resolution involved for a part written at the current format.
     #[test]
-    fn a_part_with_no_stems_uses_the_pre_stem_wire_shape() {
-        for n_superfiles in [1usize, 2, 5] {
-            let part = fresh_part(
-                (0..n_superfiles)
-                    .map(|i| fresh_superfile(i as u64 + 1))
-                    .collect(),
-            );
-            let bytes = encode(&part);
+    fn id_keyed_summaries_and_the_physical_schema_round_trip() {
+        use crate::supertable::schema::{FieldId, PhysicalSchema, TableSchema};
+        let mut entry = (*fresh_superfile(7)).clone();
+        let user = Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("score", DataType::Int64, true),
+        ]);
+        let ts = TableSchema::from_user_schema(&user);
+        let stored = ts.stamp_field_ids(
+            &Schema::new(vec![
+                Field::new("_id", DataType::Decimal128(38, 0), false),
+                Field::new("title", DataType::LargeUtf8, false),
+                Field::new("score", DataType::Int64, true),
+            ]),
+            "_id",
+        );
+        entry.physical_schema = Some(Arc::new(PhysicalSchema::of_stored_schema(&stored)));
+        entry.scalar_stats = make_scalar_stats();
+        let keys: Vec<FieldId> = entry.scalar_stats.keys().copied().collect();
+        assert!(!keys.is_empty(), "the fixture entry carries scalar stats");
 
-            let mut cursor = Cursor::new(bytes.as_slice());
-            from_avro_datum(schema_pre_stem(), &mut cursor, None)
-                .unwrap_or_else(|e| panic!("pre-stem reader must parse {n_superfiles}: {e:?}"));
-            let mut cursor = Cursor::new(bytes.as_slice());
-            assert!(
-                from_avro_datum(schema(), &mut cursor, None).is_err(),
-                "{n_superfiles}: the stem field is not on the wire"
-            );
-
-            let decoded = decode(&bytes).expect("decode");
-            assert_eq!(decoded.format_version, FORMAT_VERSION);
-            assert_eq!(decoded.superfiles.len(), n_superfiles);
-            for (got, want) in decoded.superfiles.iter().zip(part.superfiles.iter()) {
-                assert_eq!(got.superfile_id, want.superfile_id);
-                assert_eq!(got.stem, None);
-                assert_eq!(got.storage_path(), want.storage_path());
-            }
-        }
-
-        // And through the legacy zstd frame, which is how the oldest parts
-        // of all are stored.
-        let part = fresh_part(vec![fresh_superfile(3)]);
-        let framed = stream::encode_all(encode(&part).as_slice(), 3).expect("zstd");
-        let decoded = decode(&framed).expect("zstd-framed pre-stem part decodes");
-        assert_eq!(decoded.superfiles.len(), 1);
-        assert_eq!(decoded.superfiles[0].stem, None);
+        let part = fresh_part(vec![Arc::new(entry.clone())]);
+        // A resolver that knows nothing: an id-keyed part never consults it.
+        let decoded = decode(&encode(&part), &LegacyNames::none()).expect("decode");
+        let back = &decoded.superfiles[0];
+        let mut back_keys: Vec<FieldId> = back.scalar_stats.keys().copied().collect();
+        let mut want = keys.clone();
+        back_keys.sort();
+        want.sort();
+        assert_eq!(back_keys, want);
+        assert_eq!(back.fts_summary.len(), entry.fts_summary.len());
+        assert_eq!(back.vector_summary.len(), entry.vector_summary.len());
+        let ps = back
+            .physical_schema
+            .as_ref()
+            .expect("physical schema carried");
+        assert_eq!(ps.columns().len(), 3);
+        assert_eq!(ps.columns()[0].id, Some(FieldId::ID_COLUMN));
+        assert_eq!(ps.columns()[1].name, "title");
+        assert_eq!(ps.columns()[1].id, Some(FieldId(1)));
+        assert_eq!(ps.columns()[2].id, Some(FieldId(2)));
     }
 
-    /// A stem is concatenated into an object key by `storage_path()`, and that
-    /// key is what every read, every write and gc's keep-set use - so a decode
-    /// must not accept one the writer could not have produced. Under BYOB the
-    /// part sits in a bucket the customer owns and can edit, which is what
-    /// makes this a boundary rather than an internal invariant.
+    /// A part written before field ids keys its summaries by column name.
+    /// This one is a committed fixture, not re-encoded bytes: it was written
+    /// by an older engine over a table with one `title` column, and its
+    /// names resolve to the ids that table would mint today.
+    #[test]
+    fn a_committed_pre_id_part_decodes_through_legacy_names() {
+        use crate::supertable::schema::{FieldId, TableSchema};
+        let dir = crate::test_helpers::old_format_fts_fixture().join("manifest-parts");
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .expect("fixture parts dir")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        paths.sort();
+        assert!(!paths.is_empty(), "the fixture carries manifest parts");
+        let ts = Arc::new(TableSchema::from_user_schema(&Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+        ])));
+        let legacy = LegacyNames::new(Arc::clone(&ts), "_id");
+        for path in paths {
+            let bytes = std::fs::read(&path).expect("read part");
+            let part = decode(&bytes, &legacy).expect("old part decodes");
+            assert_ne!(
+                part.format_version, FORMAT_VERSION_IDS,
+                "the fixture predates ids"
+            );
+            for sf in &part.superfiles {
+                assert!(
+                    sf.physical_schema.is_none(),
+                    "written before the field existed"
+                );
+                assert!(
+                    sf.fts_summary.contains_key(&FieldId(1)),
+                    "the title FTS summary resolves to title's id"
+                );
+                assert!(
+                    sf.scalar_stats.contains_key(&FieldId::ID_COLUMN),
+                    "the id column's stats resolve to the reserved id"
+                );
+            }
+            // Without names to resolve, the same bytes carry no keys at all.
+            let dropped = decode(&bytes, &LegacyNames::none()).expect("decodes");
+            assert!(
+                dropped
+                    .superfiles
+                    .iter()
+                    .all(|sf| sf.fts_summary.is_empty())
+            );
+        }
+    }
     #[test]
     fn decode_refuses_a_stem_the_writer_could_not_have_written() {
         for hostile in [
@@ -2103,7 +2243,8 @@ mod tests {
             let mut named = (*fresh_superfile(3)).clone();
             named.stem = Some(hostile.into());
             let part = fresh_part(vec![Arc::new(named)]);
-            let err = decode(&encode(&part)).expect_err("must refuse: {hostile}");
+            let err =
+                decode(&encode(&part), &LegacyNames::none()).expect_err("must refuse: {hostile}");
             assert!(
                 matches!(err, PartParseError::UnnormalizedStem(ref s) if s == hostile),
                 "wrong error for {hostile}: {err:?}"
@@ -2116,8 +2257,8 @@ mod tests {
             let mut named = (*fresh_superfile(3)).clone();
             named.stem = Some(ok.into());
             let part = fresh_part(vec![Arc::new(named)]);
-            let decoded =
-                decode(&encode(&part)).unwrap_or_else(|e| panic!("{ok} must decode: {e:?}"));
+            let decoded = decode(&encode(&part), &LegacyNames::none())
+                .unwrap_or_else(|e| panic!("{ok} must decode: {e:?}"));
             assert_eq!(decoded.superfiles[0].stem.as_deref(), Some(ok));
         }
     }
@@ -2126,16 +2267,16 @@ mod tests {
     /// with the message naming the newest version this reader knows.
     #[test]
     fn check_major_accepts_both_supported_majors_and_refuses_a_newer_one() {
-        for ok in ["1.0", "1.7", "2.0", "2.3"] {
+        for ok in ["1.0", "1.7", "2.0", "2.3", "3.0", "3.3"] {
             check_major(ok).unwrap_or_else(|e| panic!("{ok} must be accepted: {e:?}"));
         }
-        for bad in ["3.0", "0.9", ""] {
+        for bad in ["4.0", "0.9", ""] {
             let err = check_major(bad).expect_err("newer or malformed major is refused");
             assert!(
                 matches!(
                     &err,
                     PartParseError::IncompatibleMajorVersion { got, supported }
-                        if got == bad && supported == FORMAT_VERSION_NAMED
+                        if got == bad && supported == FORMAT_VERSION_IDS
                 ),
                 "{bad}: {err:?}"
             );
@@ -2154,7 +2295,8 @@ mod tests {
             ),
             ("uri".into(), AvroValue::String("not-a-uuid".into())),
         ]);
-        let err = decode_superfile(rec, &OpenBlobBudget::unlimited()).expect_err("bad uri uuid");
+        let err =
+            decode_superfile(rec, &OpenBlobBudget::unlimited(), None).expect_err("bad uri uuid");
         assert!(
             matches!(err, PartParseError::BadSuperfileId(_)),
             "got {err:?}"
@@ -2177,7 +2319,7 @@ mod tests {
         ]);
         let avro_bytes = to_avro_datum(schema(), record).expect("avro encode");
         let bytes = stream::encode_all(avro_bytes.as_slice(), 3).expect("zstd");
-        let err = decode(&bytes).expect_err("bad part_id");
+        let err = decode(&bytes, &LegacyNames::none()).expect_err("bad part_id");
         assert!(
             matches!(err, PartParseError::BadSuperfileId(_)),
             "got {err:?}"
@@ -2257,13 +2399,14 @@ mod tests {
             .collect();
         let mut vec_summary = HashMap::new();
         vec_summary.insert(
-            "emb".to_string(),
+            fid("emb"),
             VectorSummary {
                 centroid: vec![0.5; TIMING_DIM],
                 cells,
             },
         );
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -2308,14 +2451,14 @@ mod tests {
         let t = Instant::now();
         let mut summaries = 0usize;
         for _ in 0..TIMING_ENTRIES_PER_PART {
-            summaries += decode_vector_summary_map(&summary_bytes_one)
+            summaries += decode_vector_summary_map(&summary_bytes_one, None)
                 .expect("summary")
                 .len();
         }
         let t_summary = t.elapsed();
 
         let t = Instant::now();
-        let decoded = decode(&encoded).expect("full decode");
+        let decoded = decode(&encoded, &LegacyNames::none()).expect("full decode");
         let t_full = t.elapsed();
 
         let gib = |b: usize| b as f64 / (1u64 << 30) as f64;

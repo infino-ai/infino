@@ -3,8 +3,8 @@
 
 //! In-memory manifest types: `ManifestSnapshot`, `SuperfileEntry`,
 //! `VectorSummary`. Per-column skip stats live on `SuperfileEntry` as
-//! `HashMap<String, ScalarStatsAgg>` (scalar) and
-//! `HashMap<String, FtsSummaryAgg>` (FTS).
+//! `HashMap<FieldId, ScalarStatsAgg>` (scalar) and
+//! `HashMap<FieldId, FtsSummaryAgg>` (FTS).
 //!
 //! `ManifestSnapshot` is the single immutable point-in-time view of which
 //! superfiles exist. `Supertable` holds the current manifest behind
@@ -34,7 +34,17 @@ pub mod options_hash;
 pub mod part;
 pub mod partition;
 pub(crate) mod term_index;
+use arrow_schema::Schema;
 use term_index::TermIndex;
+
+use crate::{
+    superfile::{
+        builder::{BuilderOptions, FtsConfig},
+        fts::tokenize::Tokenizer,
+        vector::builder::VectorConfig,
+    },
+    supertable::options::builder_options_for,
+};
 
 pub mod term_range;
 pub mod term_stats;
@@ -70,7 +80,6 @@ use crate::{
     runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
     superfile::{
-        builder::VectorConfig,
         fts::reader::ColumnLengthStats,
         vector::{
             distance::{
@@ -101,6 +110,7 @@ use crate::{
             partition::{assign_partition, encode_partition_key},
         },
         query::{hierarchical_iter, prune::PruneLeaf},
+        schema::{FieldId, LegacyNames, PhysicalKind, PhysicalSchema, TableSchema},
         slow_vector_state,
     },
     utils::trace::record,
@@ -264,49 +274,6 @@ impl SuperfileList {
     pub fn n_docs_total(&self) -> u64 {
         self.superfiles.iter().map(|s| s.n_docs).sum()
     }
-
-    /// One FTS column's length statistics over the whole table — the
-    /// documents that carry tokens and their token total — folded from
-    /// every superfile's summary. `None` when any summary's totals are
-    /// unknown: a partial sum would describe some other corpus.
-    pub fn fts_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
-        Self::fts_length_stats_over(self.superfiles.iter(), column)
-    }
-
-    fn fts_length_stats_over<'a>(
-        superfiles: impl Iterator<Item = &'a Arc<SuperfileEntry>>,
-        column: &str,
-    ) -> Option<ColumnLengthStats> {
-        superfiles
-            .filter_map(|sf| sf.fts_summary.get(column))
-            .try_fold(ColumnLengthStats::default(), |acc, summary| {
-                ColumnLengthStats::fold(Some(acc), summary.length_stats)
-            })
-    }
-
-    /// [`Self::fts_length_stats`] for every FTS column, over the superfiles
-    /// a new file will sit beside — all of them for an append, all but the
-    /// inputs a compaction `replaces` — keyed by column; columns without
-    /// complete totals are absent. What a writer hands the new file's
-    /// builder so it bakes the table-wide average rather than its own.
-    pub fn fts_corpus_stats(&self, replaces: &HashSet<Uuid>) -> HashMap<String, ColumnLengthStats> {
-        let kept: Vec<&Arc<SuperfileEntry>> = self
-            .superfiles
-            .iter()
-            .filter(|sf| !replaces.contains(&sf.superfile_id))
-            .collect();
-        let columns: BTreeSet<&str> = kept
-            .iter()
-            .flat_map(|sf| sf.fts_summary.keys().map(String::as_str))
-            .collect();
-        columns
-            .into_iter()
-            .filter_map(|c| {
-                let stats = Self::fts_length_stats_over(kept.iter().copied(), c)?;
-                Some((c.to_owned(), stats))
-            })
-            .collect()
-    }
 }
 
 /// Parts that hold at least one superfile the term index routes the
@@ -318,10 +285,11 @@ async fn parts_holding_routed_superfiles(
     index: &TermIndex,
     list: &Manifest,
     leaves: &[PruneLeaf],
+    snapshot: &ManifestSnapshot,
 ) -> Option<HashSet<PartId>> {
     let mut kept: Option<HashSet<PartId>> = None;
     for leaf in leaves {
-        let Some(routed) = index.route_leaf(leaf).await else {
+        let Some(routed) = index.route_leaf(leaf, snapshot).await else {
             continue;
         };
         let mut id_mins: Vec<i128> = routed
@@ -386,6 +354,9 @@ pub struct ManifestSnapshot {
     /// it back via [`ManifestSnapshot::get_drained_ranges`] to persist it. Hidden
     /// manifest only.
     stamped_drained_ranges: Option<list::DrainedVersionRanges>,
+    /// The schema a commit stamped before the first list write lands, and
+    /// the in-memory table's only schema slot. Mirrors the other stamps.
+    stamped_schema: Option<Arc<TableSchema>>,
 }
 
 impl fmt::Debug for ManifestSnapshot {
@@ -430,10 +401,12 @@ impl ManifestSnapshot {
             && let Some(list) = list
         {
             let manifest_cache = superfile_list.options.manifest_disk_cache.clone();
-            let loader = Arc::new(ManifestPartLoader::new_with_cache(
+            let loader = Arc::new(ManifestPartLoader::new_with_legacy_names(
                 Arc::clone(&storage),
                 &list,
                 manifest_cache,
+                false,
+                superfile_list.options.legacy_names(),
             ));
             Self {
                 superfile_list,
@@ -443,6 +416,7 @@ impl ManifestSnapshot {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_schema: None,
             }
         } else {
             Self {
@@ -453,6 +427,7 @@ impl ManifestSnapshot {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_schema: None,
             }
         }
     }
@@ -476,6 +451,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         }
     }
 
@@ -494,6 +470,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         }
     }
 
@@ -522,10 +499,12 @@ impl ManifestSnapshot {
             BTreeMap::new(),
         );
         let loader = options.storage.as_ref().map(|storage| {
-            Arc::new(ManifestPartLoader::new_with_cache(
+            Arc::new(ManifestPartLoader::new_with_legacy_names(
                 storage.clone(),
                 &list,
                 options.manifest_disk_cache.clone(),
+                false,
+                options.legacy_names(),
             ))
         });
         Self {
@@ -539,6 +518,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         }
     }
 
@@ -560,25 +540,9 @@ impl ManifestSnapshot {
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id,
             options_hash: options_hash::compute_options_hash(options, &strategy),
-            schema: Vec::new(),
+            schema: Some(Arc::clone(&options.table_schema)),
             id_column: options.id_column.clone(),
-            fts_columns: options
-                .fts_columns
-                .iter()
-                .map(|f| list::FtsColumnInfo {
-                    column: f.column.clone(),
-                })
-                .collect(),
-            vector_columns: options
-                .vector_columns
-                .iter()
-                .map(|v| list::VectorColumnInfo {
-                    column: v.column.clone(),
-                    dim: v.dim,
-                    rot_seed: v.rot_seed,
-                    metric: format!("{:?}", v.metric).to_lowercase(),
-                })
-                .collect(),
+            commit_token: Uuid::new_v4(),
             partition_strategy: strategy,
             vector_index_storage_prefix,
             global_vector_index: None,
@@ -605,6 +569,135 @@ impl ManifestSnapshot {
 
     pub fn get_next_manifest_id(&self) -> u64 {
         self.superfile_list.next_manifest_id()
+    }
+
+    /// The table's schema: the list's document when the list carries one,
+    /// else the one the options derive from the creation record.
+    pub(crate) fn table_schema(&self) -> Arc<TableSchema> {
+        self.list
+            .as_ref()
+            .and_then(|l| l.schema.clone())
+            .or_else(|| self.stamped_schema.clone())
+            .unwrap_or_else(|| Arc::clone(&self.superfile_list.options.table_schema))
+    }
+
+    /// This snapshot with `schema` as the table's schema. Mirrors
+    /// [`ManifestSnapshot::with_global_vector_index`]: the list's document
+    /// when a list exists, and the in-memory stamp before one does.
+    pub(crate) fn with_schema(&self, schema: Arc<TableSchema>) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.schema = Some(Arc::clone(&schema));
+            list
+        });
+        Self {
+            superfile_list: self.superfile_list.clone(),
+            list: new_list,
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: Some(schema),
+        }
+    }
+
+    /// The stable id of `column` in this snapshot's table: a user column's
+    /// id, or [`FieldId::ID_COLUMN`] for the injected id column. `None` for
+    /// a name the table does not have (callers treat that as "no stats").
+    pub(crate) fn field_id(&self, column: &str) -> Option<FieldId> {
+        if column == self.superfile_list.options.id_column {
+            Some(FieldId::ID_COLUMN)
+        } else {
+            self.table_schema().id_of(column)
+        }
+    }
+
+    /// Every live column in declared order, unstamped.
+    pub(crate) fn user_schema(&self) -> Arc<Schema> {
+        self.table_schema().user_schema()
+    }
+
+    /// The id column followed by every column the Parquet body may hold.
+    pub(crate) fn scalar_schema(&self) -> Arc<Schema> {
+        self.table_schema()
+            .scalar_schema(&self.superfile_list.options.id_column)
+    }
+
+    /// Exactly the columns a superfile's Parquet body holds.
+    pub(crate) fn stored_schema(&self) -> Arc<Schema> {
+        self.table_schema()
+            .stored_schema(&self.superfile_list.options.id_column)
+    }
+
+    /// The full-text index configs of this snapshot's schema.
+    pub(crate) fn fts_configs(&self) -> Vec<FtsConfig> {
+        self.table_schema().fts_configs()
+    }
+
+    /// The vector index configs of this snapshot's schema.
+    pub(crate) fn vector_configs(&self) -> Vec<VectorConfig> {
+        self.table_schema().vector_configs()
+    }
+
+    /// The analyzer chain of the full-text column `column`, or `None` when
+    /// the column carries no full-text index.
+    pub(crate) fn try_fts_tokenizer_for(&self, column: &str) -> Option<Arc<dyn Tokenizer>> {
+        self.table_schema().fts_tokenizer_for(column)
+    }
+
+    /// Builder options for a superfile written under this snapshot's
+    /// schema.
+    pub(crate) fn builder_options(&self) -> BuilderOptions {
+        builder_options_for(&self.table_schema(), &self.superfile_list.options)
+    }
+
+    /// One FTS column's length statistics over the whole table — the
+    /// documents that carry tokens and their token total — folded from
+    /// every superfile's summary. `None` when any summary's totals are
+    /// unknown: a partial sum would describe some other corpus.
+    pub fn fts_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
+        let id = self.field_id(column)?;
+        Self::fts_length_stats_over(self.superfiles.iter(), id)
+    }
+
+    fn fts_length_stats_over<'a>(
+        superfiles: impl Iterator<Item = &'a Arc<SuperfileEntry>>,
+        column: FieldId,
+    ) -> Option<ColumnLengthStats> {
+        superfiles
+            .filter_map(|sf| sf.fts_summary.get(&column))
+            .try_fold(ColumnLengthStats::default(), |acc, summary| {
+                ColumnLengthStats::fold(Some(acc), summary.length_stats)
+            })
+    }
+
+    /// [`Self::fts_length_stats`] for every FTS column, over the superfiles
+    /// a new file will sit beside — all of them for an append, all but the
+    /// inputs a compaction `replaces` — keyed by column; columns without
+    /// complete totals are absent. What a writer hands the new file's
+    /// builder so it bakes the table-wide average rather than its own.
+    pub fn fts_corpus_stats(&self, replaces: &HashSet<Uuid>) -> HashMap<String, ColumnLengthStats> {
+        let kept: Vec<&Arc<SuperfileEntry>> = self
+            .superfiles
+            .iter()
+            .filter(|sf| !replaces.contains(&sf.superfile_id))
+            .collect();
+        let columns: BTreeSet<FieldId> = kept
+            .iter()
+            .flat_map(|sf| sf.fts_summary.keys().copied())
+            .collect();
+        let schema = self.table_schema();
+        columns
+            .into_iter()
+            .filter_map(|id| {
+                // The builder consumes corpus stats by column name; a column
+                // the table no longer has contributes nothing.
+                let name = schema.name_of(id)?;
+                let stats = Self::fts_length_stats_over(kept.iter().copied(), id)?;
+                Some((name.to_owned(), stats))
+            })
+            .collect()
     }
 
     pub fn get_opts(&self) -> Arc<SupertableOptions> {
@@ -738,11 +831,8 @@ impl ManifestSnapshot {
         self.superfile_list.vector_index_storage_prefix.as_deref()
     }
 
-    fn stamp_vector_index_storage_prefix(
-        &self,
-        vector_columns: &[list::VectorColumnInfo],
-    ) -> Option<String> {
-        if vector_columns.is_empty() {
+    fn stamp_vector_index_storage_prefix(&self, has_vector_columns: bool) -> Option<String> {
+        if !has_vector_columns {
             return None;
         }
         if let Some(prefix) = self.vector_index_storage_prefix() {
@@ -828,7 +918,6 @@ impl ManifestSnapshot {
             .await
             .map_err(ManifestLoadError::Storage)?;
         record("list_bytes", list_bytes.len() as u64);
-        let list = list::decode(&list_bytes).map_err(ManifestLoadError::ListParse)?;
 
         let options = if let Some(options) = options {
             options
@@ -840,6 +929,8 @@ impl ManifestSnapshot {
                 actual: "None options".to_string(),
             });
         };
+        let list = list::decode(&list_bytes, &options.legacy_names())
+            .map_err(ManifestLoadError::ListParse)?;
 
         // Verify the caller's options match the
         // manifest's stamped digest. The all-zero stored
@@ -858,11 +949,12 @@ impl ManifestSnapshot {
         //    loads each part's routing sibling (counts + 1-bit slab, no
         //    fp32) when the list stamps one — the user table's centroid
         //    payload stays in storage, mirroring the slow-blob sibling.
-        let loader = Arc::new(ManifestPartLoader::new_with_cache_and_mode(
+        let loader = Arc::new(ManifestPartLoader::new_with_legacy_names(
             Arc::clone(&storage),
             &list,
             options.manifest_disk_cache.clone(),
             options.summary_centroids_from_superfiles,
+            options.legacy_names(),
         ));
         let parts: DashMap<_, _> = DashMap::new();
         let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
@@ -921,9 +1013,14 @@ impl ManifestSnapshot {
                     // (counts + 1-bit admit slab, no fp32 — GiBs → MiBs at
                     // 100M docs) and EVERYONE hydrates from it; exact
                     // centroid scores come from the section.
-                    let entries = slow_vector_state::load_state(storage.as_ref(), uri, &hash)
-                        .await
-                        .map_err(|e| ManifestLoadError::SlowStateHydration(e.to_string()))?;
+                    let entries = slow_vector_state::load_state(
+                        storage.as_ref(),
+                        uri,
+                        &hash,
+                        &options.legacy_names(),
+                    )
+                    .await
+                    .map_err(|e| ManifestLoadError::SlowStateHydration(e.to_string()))?;
                     if let Some(expected) = expected_n_superfiles
                         && entries.len() as u64 != expected
                     {
@@ -1062,14 +1159,17 @@ impl ManifestSnapshot {
                 list.partition_strategy,
                 PartitionStrategy::VectorCell { .. }
             );
-            let vector_columns = options.vector_columns.clone();
+            let schema = list
+                .schema
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&options.table_schema));
             let pool = Arc::clone(&options.reader_pool);
             let mut entries = all_superfiles;
             let prewarm = move || {
                 if strip {
-                    strip_summary_centroids(&mut entries, &vector_columns);
+                    strip_summary_centroids(&mut entries, &schema);
                 }
-                prewarm_summary_admit_slabs(&entries, &vector_columns, &pool);
+                prewarm_summary_admit_slabs(&entries, &schema, &pool);
                 entries
             };
             all_superfiles = match spawn_blocking(carry_span(prewarm)).await {
@@ -1093,6 +1193,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         };
 
         record("parts", new_manifest.parts.len() as u64);
@@ -1211,7 +1312,7 @@ impl ManifestSnapshot {
                 // with no part pruner (`None`) imposes no constraint.
                 let mut kept: Option<HashSet<PartId>> = None;
                 for leaf in leaves {
-                    if let Some(part_ids) = leaf.keep_parts(list) {
+                    if let Some(part_ids) = leaf.keep_parts(list, self) {
                         let set: HashSet<PartId> = part_ids.into_iter().collect();
                         kept = Some(match kept {
                             None => set,
@@ -1227,7 +1328,7 @@ impl ManifestSnapshot {
                 if list.term_index_complete
                     && let Some(index) = self.term_index().await
                     && let Some(routed) =
-                        parts_holding_routed_superfiles(&index, list, leaves).await
+                        parts_holding_routed_superfiles(&index, list, leaves, self).await
                 {
                     kept = Some(match kept {
                         None => routed,
@@ -1390,6 +1491,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1432,7 +1534,7 @@ impl ManifestSnapshot {
         let list = self.list.as_ref().map(|list| {
             let mut list = list.clone();
             if bump_id {
-                list.manifest_id = next_id;
+                list.start_generation(next_id);
             }
             edit(&mut list);
             list
@@ -1449,6 +1551,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1535,7 +1638,7 @@ impl ManifestSnapshot {
         let next_id = self.get_next_manifest_id();
         let new_list = self.list.as_ref().map(|list| {
             let mut list = list.clone();
-            list.manifest_id = next_id;
+            list.start_generation(next_id);
             list.deleted_user_ids_inline = Some(encoded.clone());
             list
         });
@@ -1549,6 +1652,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1570,7 +1674,7 @@ impl ManifestSnapshot {
         let next_id = self.get_next_manifest_id();
         let new_list = self.list.as_ref().map(|list| {
             let mut list = list.clone();
-            list.manifest_id = next_id;
+            list.start_generation(next_id);
             list.slow_vector_state_uri = Some(uri);
             list.slow_vector_state_content_hash = Some(hash);
             list.slow_vector_state_centroids = Some(centroids);
@@ -1588,6 +1692,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1644,6 +1749,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: Some(strategy),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1665,6 +1771,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: Some(index),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1687,6 +1794,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: Some(ranges),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1709,6 +1817,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1736,6 +1845,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1757,6 +1867,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         }
     }
 
@@ -1811,7 +1922,7 @@ impl ManifestSnapshot {
         let list = self.list.as_ref()?;
         let next_id = self.get_next_manifest_id();
         let mut new_list = list.clone();
-        new_list.manifest_id = next_id;
+        new_list.start_generation(next_id);
         for id in touched {
             new_list.tombstone_seqs.insert(*id, next_id);
         }
@@ -1831,6 +1942,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
         })
     }
 
@@ -2059,7 +2171,7 @@ impl ManifestSnapshot {
                         ),
                     });
                 }
-                let pk = assign_partition(e, &strategy)?;
+                let pk = assign_partition(e, &strategy, self)?;
                 let entry_birth_version = if preserve_birth_versions {
                     e.birth_version
                 } else {
@@ -2247,16 +2359,6 @@ impl ManifestSnapshot {
             .unwrap_or_default();
 
         let opts_hash = options_hash::compute_options_hash(opts.as_ref(), &strategy);
-        let vector_columns: Vec<list::VectorColumnInfo> = opts
-            .vector_columns
-            .iter()
-            .map(|v| list::VectorColumnInfo {
-                column: v.column.clone(),
-                dim: v.dim,
-                rot_seed: v.rot_seed,
-                metric: format!("{:?}", v.metric).to_lowercase(),
-            })
-            .collect();
         let new_list = Manifest {
             // Carry/advance the hidden drain watermark via the stamp (the drain
             // sets it with `with_drained_ranges` in the same commit). Empty on
@@ -2268,25 +2370,9 @@ impl ManifestSnapshot {
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: self.get_next_manifest_id(),
             options_hash: opts_hash,
-            schema: Vec::new(),
+            schema: Some(self.table_schema()),
             id_column: opts.id_column.clone(),
-            fts_columns: opts
-                .fts_columns
-                .iter()
-                .map(|f| list::FtsColumnInfo {
-                    column: f.column.clone(),
-                })
-                .collect(),
-            vector_columns: opts
-                .vector_columns
-                .iter()
-                .map(|v| list::VectorColumnInfo {
-                    column: v.column.clone(),
-                    dim: v.dim,
-                    rot_seed: v.rot_seed,
-                    metric: format!("{:?}", v.metric).to_lowercase(),
-                })
-                .collect(),
+            commit_token: Uuid::new_v4(),
             partition_strategy: strategy,
             // Never stamp a sibling prefix onto a hidden VectorCell manifest:
             // the prefix is only ever resolved off the USER manifest to locate
@@ -2298,7 +2384,7 @@ impl ManifestSnapshot {
             ) {
                 None
             } else {
-                self.stamp_vector_index_storage_prefix(&vector_columns)
+                self.stamp_vector_index_storage_prefix(!self.vector_configs().is_empty())
             },
             global_vector_index: self.get_global_vector_index(),
             deleted_user_ids_inline: self
@@ -2365,10 +2451,12 @@ impl ManifestSnapshot {
             next_manifest_id_floor: self.superfile_list.next_manifest_id_floor,
         };
         let loader = opts.storage.as_ref().map(|storage| {
-            Arc::new(ManifestPartLoader::new_with_cache(
+            Arc::new(ManifestPartLoader::new_with_legacy_names(
                 storage.clone(),
                 &new_list,
                 opts.manifest_disk_cache.clone(),
+                false,
+                opts.legacy_names(),
             ))
         });
         // Inherit only the cached parts the new list still references —
@@ -2422,6 +2510,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         };
 
         Ok((new_manifest, parts_to_write))
@@ -2584,6 +2673,9 @@ pub struct ManifestPartLoader {
     /// the same reference reuses it; a commit that published a delta has a
     /// new root and loads that instead.
     term_index: tokio::sync::Mutex<Option<Arc<TermIndex>>>,
+    /// Resolves the column names a part written before field ids used as
+    /// summary keys.
+    legacy: Arc<LegacyNames>,
 }
 
 impl ManifestPartLoader {
@@ -2609,6 +2701,25 @@ impl ManifestPartLoader {
         manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
         prefer_routing: bool,
     ) -> Self {
+        Self::new_with_legacy_names(
+            storage,
+            list,
+            manifest_disk_cache,
+            prefer_routing,
+            LegacyNames::none(),
+        )
+    }
+
+    /// A loader that can also read parts written before field ids, whose
+    /// summary keys are column names `legacy` resolves. Every table with
+    /// user columns opens this way.
+    pub fn new_with_legacy_names(
+        storage: Arc<dyn StorageProvider>,
+        list: &Manifest,
+        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+        prefer_routing: bool,
+        legacy: LegacyNames,
+    ) -> Self {
         let mut idx = HashMap::with_capacity(list.parts.len());
         for entry in &list.parts {
             idx.insert(
@@ -2623,6 +2734,7 @@ impl ManifestPartLoader {
             prefer_routing,
             open_blob_budget: Arc::new(OpenBlobBudget::new(DEFAULT_OPEN_BLOB_BUDGET_BYTES)),
             term_index: tokio::sync::Mutex::new(None),
+            legacy: Arc::new(legacy),
         }
     }
 
@@ -2710,9 +2822,12 @@ impl ManifestPartLoader {
         {
             record("cache_hit", true);
             record("bytes", bytes.len() as u64);
-            let parsed =
-                decode_part_off_thread(Bytes::from(bytes), Arc::clone(&self.open_blob_budget))
-                    .await?;
+            let parsed = decode_part_off_thread(
+                Bytes::from(bytes),
+                Arc::clone(&self.open_blob_budget),
+                Arc::clone(&self.legacy),
+            )
+            .await?;
             return Ok(Arc::new(parsed));
         }
         record("cache_hit", false);
@@ -2731,6 +2846,7 @@ impl ManifestPartLoader {
             bytes.clone(),
             *expected_hash,
             Arc::clone(&self.open_blob_budget),
+            Arc::clone(&self.legacy),
         )
         .await?;
         // Populate the cache for next time (best-effort; the hash was
@@ -2751,7 +2867,7 @@ impl ManifestPartLoader {
 pub(crate) struct UserCentroidCache {
     pub(crate) manifest_id: u64,
     /// `(superfile_id, column)` → per-cell `(cell_id, fp32 centroids)`.
-    pub(crate) cells: HashMap<(Uuid, String), Vec<(Option<u32>, Arc<Vec<f32>>)>>,
+    pub(crate) cells: HashMap<(Uuid, FieldId), Vec<(Option<u32>, Arc<Vec<f32>>)>>,
 }
 
 impl UserCentroidCache {
@@ -2759,11 +2875,11 @@ impl UserCentroidCache {
     pub(crate) fn cell(
         &self,
         superfile_id: Uuid,
-        column: &str,
+        column: FieldId,
         cell_id: Option<u32>,
     ) -> Option<Arc<Vec<f32>>> {
         self.cells
-            .get(&(superfile_id, column.to_owned()))?
+            .get(&(superfile_id, column))?
             .iter()
             .find(|(id, _)| *id == cell_id)
             .map(|(_, fp32)| Arc::clone(fp32))
@@ -2772,13 +2888,11 @@ impl UserCentroidCache {
     /// Build from fully-loaded parts: every entry's summary cells that
     /// carry resident fp32.
     pub(crate) fn from_parts(manifest_id: u64, parts: &[Arc<ManifestPart>]) -> Self {
-        let mut cells: HashMap<(Uuid, String), Vec<(Option<u32>, Arc<Vec<f32>>)>> = HashMap::new();
+        let mut cells: HashMap<(Uuid, FieldId), Vec<(Option<u32>, Arc<Vec<f32>>)>> = HashMap::new();
         for part in parts {
             for entry in &part.superfiles {
                 for (column, summary) in &entry.vector_summary {
-                    let list = cells
-                        .entry((entry.superfile_id, column.clone()))
-                        .or_default();
+                    let list = cells.entry((entry.superfile_id, *column)).or_default();
                     for cell in &summary.cells {
                         if cell.clusters.vectors_resident() && cell.clusters.n_cent > 0 {
                             list.push((cell.cell_id, Arc::new(cell.clusters.centroids.clone())));
@@ -2804,9 +2918,10 @@ impl UserCentroidCache {
 async fn decode_part_off_thread(
     bytes: Bytes,
     budget: Arc<OpenBlobBudget>,
+    legacy: Arc<LegacyNames>,
 ) -> Result<ManifestPart, ManifestLoadError> {
     match spawn_blocking(carry_span(move || {
-        part::decode_with_blob_budget(&bytes, &budget)
+        part::decode_with_blob_budget(&bytes, &budget, &legacy)
     }))
     .await
     {
@@ -2832,6 +2947,7 @@ async fn verify_and_decode_part_off_thread(
     bytes: Bytes,
     expected_hash: ContentHash,
     budget: Arc<OpenBlobBudget>,
+    legacy: Arc<LegacyNames>,
 ) -> Result<ManifestPart, ManifestLoadError> {
     let verify_then_decode = move || {
         let actual_hash = ContentHash::of(&bytes);
@@ -2841,7 +2957,7 @@ async fn verify_and_decode_part_off_thread(
                 actual: actual_hash.to_hex(),
             });
         }
-        part::decode_with_blob_budget(&bytes, &budget).map_err(ManifestLoadError::from)
+        part::decode_with_blob_budget(&bytes, &budget, &legacy).map_err(ManifestLoadError::from)
     };
     match spawn_blocking(carry_span(verify_then_decode)).await {
         Ok(result) => result,
@@ -2943,6 +3059,11 @@ pub struct SuperfileEntry {
     /// key: the manifest is the one source of it, which is what keeps the
     /// writer's PUT key and GC's keep-set the same string.
     pub stem: Option<String>,
+    /// What the file physically holds (its stored columns with names, ids
+    /// and types), derived once when it was built. `None` on an entry
+    /// written before the field existed; such a file holds the creation
+    /// schema's columns under their creation names.
+    pub physical_schema: Option<Arc<PhysicalSchema>>,
     /// Row count.
     pub n_docs: u64,
     /// id-column min and max (the supertable-injected
@@ -2956,18 +3077,18 @@ pub struct SuperfileEntry {
     /// Per-scalar-column aggregate (min/max + null count, exact sum, HLL),
     /// keyed by column name, for skip pruning of SQL filters. An absent
     /// column means "no usable stats" (the pruner keeps the superfile).
-    pub scalar_stats: HashMap<String, ScalarStatsAgg>,
+    pub scalar_stats: HashMap<FieldId, ScalarStatsAgg>,
     /// Per-FTS-column term-presence bloom + lex range. The bloom
     /// drives exact-term skip; the term-range drives prefix-query
     /// skip via `[prefix, prefix_upper_bound)` overlap. Keyed by
     /// FTS column name. Same per-column [`FtsSummaryAgg`] shape the
     /// list-level aggregate uses; built per superfile via
     /// [`FtsSummaryAgg::from_superfile`].
-    pub fts_summary: HashMap<String, FtsSummaryAgg>,
+    pub fts_summary: HashMap<FieldId, FtsSummaryAgg>,
     /// Per-vector-column summary centroid + per-cluster IVF centroids,
     /// driving global cluster selection at query time. Keyed by vector
     /// column name.
-    pub vector_summary: HashMap<String, VectorSummary>,
+    pub vector_summary: HashMap<FieldId, VectorSummary>,
     /// Partition assignment, encoded opaquely per the strategy
     /// (time_range = 8-byte LE u64 bucket index; hash = 4-byte LE
     /// u32 bucket id; column_range = 2-byte LE u16 boundary index).
@@ -3010,6 +3131,31 @@ pub struct SuperfileEntry {
     /// total order that's safe to watermark on. `0` on entries from before
     /// the field existed (treated as the genesis version).
     pub birth_version: u64,
+}
+
+impl SuperfileEntry {
+    /// Whether this superfile holds the full-text column with id `id`, in
+    /// its Parquet body or its FTS blob. A file written before field ids
+    /// recorded no physical schema; it is taken to hold every column the
+    /// table had when it was written, which is every column that can be
+    /// asked of it.
+    pub(crate) fn holds_fts_column(&self, id: FieldId) -> bool {
+        self.physical_schema.as_ref().is_none_or(|ps| {
+            ps.column_by_id(id).is_some_and(|c| {
+                matches!(c.kind, PhysicalKind::Stored | PhysicalKind::FtsIndexOnly)
+            })
+        })
+    }
+
+    /// Whether this superfile holds the vector column with id `id` in its
+    /// vector blob; see [`Self::holds_fts_column`] for files without a
+    /// physical schema.
+    pub(crate) fn holds_vector_column(&self, id: FieldId) -> bool {
+        self.physical_schema.as_ref().is_none_or(|ps| {
+            ps.column_by_id(id)
+                .is_some_and(|c| c.kind == PhysicalKind::Vector)
+        })
+    }
 }
 
 impl SuperfileEntry {
@@ -3726,20 +3872,19 @@ impl RabitqAdmitQuery {
 
 /// One shared rotation + sign quantizer per vector column, for
 /// hydration-time slab work over every summary instance.
-fn admit_encoders(
-    vector_columns: &[VectorConfig],
-) -> HashMap<&str, (RandomRotation, BitQuantizer, u64)> {
-    vector_columns
+fn admit_encoders(schema: &TableSchema) -> HashMap<FieldId, (RandomRotation, BitQuantizer, u64)> {
+    schema
+        .vector_configs()
         .iter()
-        .map(|vc| {
-            (
-                vc.column.as_str(),
+        .filter_map(|vc| {
+            Some((
+                schema.id_of(&vc.column)?,
                 (
                     RandomRotation::new(vc.dim, vc.rot_seed),
                     BitQuantizer::new(vc.dim),
                     vc.rot_seed,
                 ),
-            )
+            ))
         })
         .collect()
 }
@@ -3751,11 +3896,8 @@ fn admit_encoders(
 /// previous snapshot or a loaded manifest part also references them) are
 /// skipped — they were either stripped by the earlier load or belong to
 /// maintenance state that needs fp32.
-fn strip_summary_centroids(
-    superfiles: &mut [Arc<SuperfileEntry>],
-    vector_columns: &[VectorConfig],
-) {
-    let encoders = admit_encoders(vector_columns);
+fn strip_summary_centroids(superfiles: &mut [Arc<SuperfileEntry>], schema: &TableSchema) {
+    let encoders = admit_encoders(schema);
     if encoders.is_empty() {
         return;
     }
@@ -3764,7 +3906,7 @@ fn strip_summary_centroids(
             continue;
         };
         for (column, summary) in entry.vector_summary.iter_mut() {
-            let Some((rotation, quant, rot_seed)) = encoders.get(column.as_str()) else {
+            let Some((rotation, quant, rot_seed)) = encoders.get(column) else {
                 continue;
             };
             for cell in &mut summary.cells {
@@ -3787,17 +3929,17 @@ fn strip_summary_centroids(
 /// or already-warm instances are `OnceLock` no-ops.
 fn prewarm_summary_admit_slabs(
     superfiles: &[Arc<SuperfileEntry>],
-    vector_columns: &[VectorConfig],
+    schema: &TableSchema,
     pool: &ThreadPool,
 ) {
-    let encoders = admit_encoders(vector_columns);
+    let encoders = admit_encoders(schema);
     if encoders.is_empty() {
         return;
     }
     pool.install(|| {
         superfiles.par_iter().for_each(|entry| {
             for (column, summary) in &entry.vector_summary {
-                let Some((rotation, quant, rot_seed)) = encoders.get(column.as_str()) else {
+                let Some((rotation, quant, rot_seed)) = encoders.get(column) else {
                     continue;
                 };
                 for cell in &summary.cells {
@@ -4362,11 +4504,14 @@ mod tests {
     use crate::{
         storage::LocalFsStorageProvider,
         superfile::{builder::FtsConfig, vector::distance::distance},
-        supertable::manifest::{
-            commit::{PartWriteResult, write_manifest_part},
-            list::{Manifest, PartitionStrategy},
+        supertable::{
+            manifest::{
+                commit::{PartWriteResult, write_manifest_part},
+                list::{Manifest, PartitionStrategy},
+            },
+            schema::LegacyNames,
         },
-        test_helpers::default_tokenizer,
+        test_helpers::{default_tokenizer, fid},
     };
 
     /// Deterministic synthetic fp32 centroids for cluster-scoring tests.
@@ -4739,6 +4884,7 @@ mod tests {
     fn superfile_entry_storage_path_carries_the_stem() {
         let uri = SuperfileUri::new_v4();
         let unnamed = SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
@@ -4757,6 +4903,7 @@ mod tests {
         assert_eq!(unnamed.storage_path(), uri.storage_path());
 
         let named = SuperfileEntry {
+            physical_schema: None,
             stem: Some("customers".into()),
             ..unnamed.clone()
         };
@@ -4963,6 +5110,7 @@ mod tests {
 
     fn seg_entry(uuid: Uuid, n_docs: u64) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: uuid,
@@ -5257,6 +5405,10 @@ mod tests {
                 Err(permanent(uri, "put_atomic unimplemented for mock"))
             }
 
+            async fn put_overwrite(&self, uri: &str, _bytes: Bytes) -> Result<(), StorageError> {
+                Err(permanent(uri, "put_overwrite unimplemented for mock"))
+            }
+
             async fn put_if_match(
                 &self,
                 uri: &str,
@@ -5331,10 +5483,9 @@ mod tests {
                 format_version: LIST_FORMAT_VERSION.into(),
                 manifest_id: 1,
                 options_hash: ContentHash([0u8; 32]),
-                schema: Vec::new(),
+                schema: None,
                 id_column: "doc_id".into(),
-                fts_columns: vec![],
-                vector_columns: vec![],
+                commit_token: Uuid::nil(),
                 partition_strategy: PartitionStrategy::Hash {
                     column: "doc_id".into(),
                     n_buckets: 64,
@@ -5375,6 +5526,7 @@ mod tests {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_schema: None,
             }
         }
 
@@ -5483,6 +5635,7 @@ mod tests {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_schema: None,
             };
             assert_eq!(before.parts.len(), n_parts, "all parts start resident");
 
@@ -5836,10 +5989,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
-            schema: Vec::new(),
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -5875,6 +6027,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         };
         let dbg = format!("{m:?}");
         assert!(dbg.contains("n_parts: 1"), "{dbg}");
@@ -5958,6 +6111,7 @@ mod tests {
     /// destined for `update()`, which derives and stamps the key itself.
     fn make_entry(docs: u64, pk: Vec<u8>, hint: Option<u32>) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: uuid::Uuid::new_v4(),
@@ -6020,10 +6174,9 @@ mod tests {
                 format_version: list::FORMAT_VERSION.into(),
                 manifest_id: 0,
                 options_hash: ContentHash([0u8; 32]),
-                schema: vec![],
+                schema: None,
                 id_column: "_id".into(),
-                fts_columns: vec![],
-                vector_columns: vec![],
+                commit_token: Uuid::nil(),
                 partition_strategy: PartitionStrategy::Hash {
                     column: "_id".into(),
                     n_buckets: 1,
@@ -6045,6 +6198,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         })
     }
 
@@ -6162,10 +6316,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 2,
@@ -6201,6 +6354,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Remove every superfile from part A only → A is emptied, B untouched.
@@ -6242,10 +6396,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -6373,10 +6526,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -6482,7 +6634,7 @@ mod tests {
             ROUTING_TEST_ROT_SEED,
         );
         entry.vector_summary.insert(
-            "emb".into(),
+            fid("emb"),
             VectorSummary {
                 centroid: vec![0.5; ROUTING_TEST_DIM],
                 cells: vec![CellVectorSummary {
@@ -6524,7 +6676,7 @@ mod tests {
             m.superfiles
                 .iter()
                 .map(|e| {
-                    let clusters = &e.vector_summary["emb"].cells[0].clusters;
+                    let clusters = &e.vector_summary[&fid("emb")].cells[0].clusters;
                     assert!(clusters.admit_codes_built().is_some(), "slab always rides");
                     clusters.vectors_resident()
                 })
@@ -6588,10 +6740,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -6662,7 +6813,7 @@ mod tests {
             m.superfiles
                 .iter()
                 .map(|e| {
-                    let clusters = &e.vector_summary["emb"].cells[0].clusters;
+                    let clusters = &e.vector_summary[&fid("emb")].cells[0].clusters;
                     (
                         clusters.vectors_resident(),
                         clusters.admit_codes_built().is_some(),
@@ -6853,10 +7004,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -6905,6 +7055,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Add new entry to the SAME partition (not a new/cold partition)
@@ -7011,10 +7162,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 2,
@@ -7063,6 +7213,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Commit one new superfile. Keep `new_entry` around — the second
@@ -7227,10 +7378,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -7279,6 +7429,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Add 1 new superfile to same partition (2 + 1 = 3, within target)
@@ -7335,10 +7486,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -7387,6 +7537,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Add 2 new superfiles to same partition (2 + 2 = 4, exceeds target of 2)
@@ -7470,10 +7621,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -7524,6 +7674,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // 2 + 1 = 3 superfiles — far under the 10_000 count target, so only
@@ -7595,10 +7746,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -7661,6 +7811,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Add one new entry for the partition
@@ -7736,10 +7887,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 2,
@@ -7805,6 +7955,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let new_entries = vec![make_new_entry_hinted(50, 0), make_new_entry_hinted(80, 1)];
@@ -7887,10 +8038,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 2,
@@ -7956,6 +8106,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // Only touch partition A
@@ -8052,10 +8203,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 2,
@@ -8145,6 +8295,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let new_entries = vec![make_new_entry_hinted(75, 0), make_new_entry_hinted(90, 1)];
@@ -8279,10 +8430,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -8330,6 +8480,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -8384,10 +8535,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -8435,6 +8585,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let sf_new = make_new_entry(75);
@@ -8505,10 +8656,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 2,
@@ -8574,6 +8724,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -8649,10 +8800,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -8722,6 +8872,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -8790,10 +8941,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -8841,6 +8991,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -8885,10 +9036,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -8936,6 +9086,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         // sf_ghost was never added to any part; its superfile_id won't match anything
@@ -8999,10 +9150,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: vec![],
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -9072,6 +9222,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -9136,10 +9287,9 @@ mod tests {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
-            schema: Vec::new(),
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 1,
@@ -9167,6 +9317,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_schema: None,
         }
     }
 
@@ -9254,6 +9405,7 @@ mod tests {
     async fn decode_part_off_thread_roundtrips_and_rejects_garbage() {
         let id = Uuid::new_v4();
         let seg = Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -9276,10 +9428,13 @@ mod tests {
         };
         let bytes = part::encode(&part);
 
-        let decoded =
-            decode_part_off_thread(Bytes::from(bytes), Arc::new(OpenBlobBudget::unlimited()))
-                .await
-                .expect("valid part decodes off-thread");
+        let decoded = decode_part_off_thread(
+            Bytes::from(bytes),
+            Arc::new(OpenBlobBudget::unlimited()),
+            Arc::new(LegacyNames::none()),
+        )
+        .await
+        .expect("valid part decodes off-thread");
         assert_eq!(decoded.part_id, part.part_id, "part_id round-trips");
         assert_eq!(decoded.superfiles.len(), 1);
         assert_eq!(decoded.superfiles[0].superfile_id, id);
@@ -9290,6 +9445,7 @@ mod tests {
         let err = decode_part_off_thread(
             Bytes::from_static(b"not-a-valid-part-blob"),
             Arc::new(OpenBlobBudget::unlimited()),
+            Arc::new(LegacyNames::none()),
         )
         .await
         .expect_err("garbage bytes must fail to decode");

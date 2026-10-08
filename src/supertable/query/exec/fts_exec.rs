@@ -1182,7 +1182,7 @@ mod tests {
         use crate::supertable::query::exec::common::test_support::{call_tvf, scoped_inner};
         let st = demo_corpus();
         let reader = Arc::new(st.reader().expect("reader"));
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let func = Bm25SearchFunc::new(reader, scalar_schema);
         let table = call_tvf(&func, &[lit("title"), lit("rust"), lit(10_i64)]).expect("bm25 table");
 

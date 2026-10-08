@@ -344,3 +344,17 @@ pub fn default_supertable_options() -> SupertableOptions {
         .expect("SupertableOptions::new with default test fixture args")
         .with_writer_pool(pool)
 }
+
+/// A stable field id for a test column name. Real tables mint ids by
+/// position; tests that build manifest entries by hand only need a key that
+/// is the same wherever the same name is used, which a hash of the name
+/// gives without a schema. Never the reserved ids (`0`, `u32::MAX`).
+pub fn fid(name: &str) -> crate::supertable::schema::FieldId {
+    let mut h: u32 = 2_166_136_261;
+    for b in name.bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(16_777_619);
+    }
+    let h = h % (u32::MAX - 2) + 1;
+    crate::supertable::schema::FieldId(h)
+}

@@ -12,7 +12,7 @@ use std::{cmp::Ordering, collections::BinaryHeap, slice::from_mut};
 
 use super::{
     core::*,
-    cursor::TermCursor,
+    cursor::{CursorUse, TermCursor},
     filter::ExcludeFilter,
     metadata::{NormTable, unscored_norm_table},
     sink::{
@@ -2612,7 +2612,7 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let cursors = self
-            .build_term_cursors(column_id, terms, None, false, None, None)
+            .build_term_cursors(column_id, terms, None, CursorUse::Score, None, None)
             .await?;
         if cursors.is_empty() {
             return Ok(Vec::new());
@@ -2775,7 +2775,7 @@ mod tests {
         let r = FtsReader::open(blob, json).expect("open");
 
         let mut cursors = r
-            .build_term_cursors(0, &["common"], None, false, None, None)
+            .build_term_cursors(0, &["common"], None, CursorUse::Score, None, None)
             .await
             .expect("build common cursor");
         let cursor = &mut cursors[0];
@@ -3067,14 +3067,14 @@ mod tests {
         for (pos, neg) in cases {
             for k in [1usize, 5, 50] {
                 let mut wf = ExcludeFilter::new(
-                    r.build_term_cursors(col, neg, None, false, None, None)
+                    r.build_term_cursors(col, neg, None, CursorUse::Score, None, None)
                         .await
                         .expect("neg cursors"),
                 );
                 let wms = r
                     .run_windowed_maxscore(
                         col,
-                        r.build_term_cursors(col, pos, None, false, None, None)
+                        r.build_term_cursors(col, pos, None, CursorUse::Score, None, None)
                             .await
                             .expect("pos cursors"),
                         k,
@@ -3085,14 +3085,14 @@ mod tests {
                     )
                     .expect("windowed-maxscore");
                 let mut bf = ExcludeFilter::new(
-                    r.build_term_cursors(col, neg, None, false, None, None)
+                    r.build_term_cursors(col, neg, None, CursorUse::Score, None, None)
                         .await
                         .expect("neg cursors"),
                 );
                 let bmm = r
                     .run_max_score_bmm(
                         col,
-                        r.build_term_cursors(col, pos, None, false, None, None)
+                        r.build_term_cursors(col, pos, None, CursorUse::Score, None, None)
                             .await
                             .expect("pos cursors"),
                         k,
@@ -3574,7 +3574,7 @@ mod tests {
         let norms = &r.columns[col as usize].dl_norm_k1();
         let terms = ["book", "the", "of"];
         let build = async || {
-            r.build_term_cursors(col, &terms, None, false, None, None)
+            r.build_term_cursors(col, &terms, None, CursorUse::Score, None, None)
                 .await
                 .expect("cursors")
         };
@@ -3651,7 +3651,7 @@ mod tests {
                 let wms = r
                     .run_windowed_maxscore(
                         col,
-                        r.build_term_cursors(col, terms, None, false, None, None)
+                        r.build_term_cursors(col, terms, None, CursorUse::Score, None, None)
                             .await
                             .expect("cursors"),
                         k,
@@ -3664,7 +3664,7 @@ mod tests {
                 let bmm = r
                     .run_max_score_bmm_range(
                         col,
-                        r.build_term_cursors(col, terms, None, false, None, None)
+                        r.build_term_cursors(col, terms, None, CursorUse::Score, None, None)
                             .await
                             .expect("cursors"),
                         k,
@@ -3752,11 +3752,11 @@ mod tests {
         for terms in [&["the", "rare"], &["rare", "the"]] {
             for k in [1usize, 5, 10, 50, 128, 400] {
                 let cw = r
-                    .build_term_cursors(col, terms, None, false, None, None)
+                    .build_term_cursors(col, terms, None, CursorUse::Score, None, None)
                     .await
                     .expect("cursors");
                 let cb = r
-                    .build_term_cursors(col, terms, None, false, None, None)
+                    .build_term_cursors(col, terms, None, CursorUse::Score, None, None)
                     .await
                     .expect("cursors");
                 let wand = r.run_wand_bmw(col, cw, k).expect("wand");
@@ -3797,7 +3797,7 @@ mod tests {
         let dl_norm_k1 = &r.columns[col as usize].dl_norm_k1();
         for k in [1usize, 5, 20] {
             let mut cursors = r
-                .build_term_cursors(col, &["the", "rare"], None, false, None, None)
+                .build_term_cursors(col, &["the", "rare"], None, CursorUse::Score, None, None)
                 .await
                 .expect("cursors");
             let (a, bb) = cursors.split_at_mut(1);
@@ -3808,7 +3808,7 @@ mod tests {
             wand_two_term_tail(weak, strong, k, &mut heap, &mut threshold, dl_norm_k1);
             let tail = drain_top_k_desc(heap);
             let cb = r
-                .build_term_cursors(col, &["the", "rare"], None, false, None, None)
+                .build_term_cursors(col, &["the", "rare"], None, CursorUse::Score, None, None)
                 .await
                 .expect("cursors");
             let bmm = r
@@ -3852,11 +3852,11 @@ mod tests {
         for terms in shapes {
             for k in [1usize, 5, 50, 128] {
                 let cw = r
-                    .build_term_cursors(col, terms, None, false, None, None)
+                    .build_term_cursors(col, terms, None, CursorUse::Score, None, None)
                     .await
                     .expect("cursors");
                 let cb = r
-                    .build_term_cursors(col, terms, None, false, None, None)
+                    .build_term_cursors(col, terms, None, CursorUse::Score, None, None)
                     .await
                     .expect("cursors");
                 let wand = r.run_wand_bmw(col, cw, k).expect("wand");
@@ -3900,7 +3900,7 @@ mod tests {
 
         // common (df≈N) + rare (df≈N/200): ratio 200 ≥ 16 → anchor.
         let anchored = r
-            .build_term_cursors(col, &["common", "rare"], None, false, None, None)
+            .build_term_cursors(col, &["common", "rare"], None, CursorUse::Score, None, None)
             .await
             .expect("cursors");
         assert!(
@@ -3909,7 +3909,14 @@ mod tests {
         );
         // common (df≈N) + frequent (df≈N/2): ratio 2 < 16 → no anchor.
         let uniform = r
-            .build_term_cursors(col, &["common", "frequent"], None, false, None, None)
+            .build_term_cursors(
+                col,
+                &["common", "frequent"],
+                None,
+                CursorUse::Score,
+                None,
+                None,
+            )
             .await
             .expect("cursors");
         assert!(
@@ -3959,14 +3966,14 @@ mod tests {
         for (pos, neg) in cases {
             for k in [1usize, 5, 50] {
                 let mut wf = ExcludeFilter::new(
-                    r.build_term_cursors(col, neg, None, false, None, None)
+                    r.build_term_cursors(col, neg, None, CursorUse::Score, None, None)
                         .await
                         .expect("neg cursors"),
                 );
                 let win = r
                     .run_windowed_union(
                         col,
-                        r.build_term_cursors(col, pos, None, false, None, None)
+                        r.build_term_cursors(col, pos, None, CursorUse::Score, None, None)
                             .await
                             .expect("pos cursors"),
                         k,
@@ -3977,14 +3984,14 @@ mod tests {
                     )
                     .expect("windowed");
                 let mut bf = ExcludeFilter::new(
-                    r.build_term_cursors(col, neg, None, false, None, None)
+                    r.build_term_cursors(col, neg, None, CursorUse::Score, None, None)
                         .await
                         .expect("neg cursors"),
                 );
                 let bmm = r
                     .run_max_score_bmm(
                         col,
-                        r.build_term_cursors(col, pos, None, false, None, None)
+                        r.build_term_cursors(col, pos, None, CursorUse::Score, None, None)
                             .await
                             .expect("pos cursors"),
                         k,
@@ -4014,7 +4021,7 @@ mod tests {
         let unfiltered = r
             .run_windowed_union(
                 col,
-                r.build_term_cursors(col, pos, None, false, None, None)
+                r.build_term_cursors(col, pos, None, CursorUse::Score, None, None)
                     .await
                     .expect("pos"),
                 N_DOCS as usize,
@@ -4025,14 +4032,14 @@ mod tests {
             )
             .expect("unfiltered");
         let mut f = ExcludeFilter::new(
-            r.build_term_cursors(col, neg, None, false, None, None)
+            r.build_term_cursors(col, neg, None, CursorUse::Score, None, None)
                 .await
                 .expect("neg"),
         );
         let filtered = r
             .run_windowed_union(
                 col,
-                r.build_term_cursors(col, pos, None, false, None, None)
+                r.build_term_cursors(col, pos, None, CursorUse::Score, None, None)
                     .await
                     .expect("pos"),
                 N_DOCS as usize,
@@ -4164,7 +4171,7 @@ mod tests {
                     .build()
                     .expect("runtime");
                 let mut cursors = rt
-                    .block_on(r.build_term_cursors(col, &["lead", "other"], None, false, None, None))
+                    .block_on(r.build_term_cursors(col, &["lead", "other"], None, CursorUse::Score, None, None))
                     .expect("cursors");
                 prop_assume!(cursors.len() == 2);
                 let (lead_slice, others) = cursors.split_at_mut(1);
@@ -4227,7 +4234,7 @@ mod tests {
                         col,
                         &["lead", "other"],
                         None,
-                        false,
+                        CursorUse::Score,
                         None,
                         None,
                     ))

@@ -357,6 +357,31 @@ impl StorageProvider for AzureStorageProvider {
         out
     }
 
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        let path = self.path(uri)?;
+        let n = bytes.len() as u64;
+        // Overwrite is idempotent, so a transient failure re-issues like the
+        // create-only path; there is no precondition to lose.
+        let out = retry::with_reissue(|| {
+            let bytes = bytes.clone();
+            async {
+                let opts = PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                };
+                self.store
+                    .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| translate(uri, e))
+            }
+        })
+        .await;
+        if out.is_ok() {
+            self.meter.record_put(n);
+        }
+        out
+    }
     async fn put_if_match(
         &self,
         uri: &str,

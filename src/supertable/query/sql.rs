@@ -75,7 +75,7 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        options::SupertableOptions,
+        manifest::ManifestSnapshot,
         query::{
             covered_agg::CoveredAggregateRewrite,
             exec::{
@@ -116,16 +116,13 @@ impl SqlSchemas {
 /// Build the [`SqlSchemas`] for `options`. Called once per table; the result is
 /// cached on the handle. This is the one place that walks the full column set,
 /// so a wide (thousands of columns) table pays it once, not per query.
-pub(crate) fn build_sql_schemas(options: &SupertableOptions) -> SqlSchemas {
+pub(crate) fn build_sql_schemas(manifest: &ManifestSnapshot) -> SqlSchemas {
     // Stored shape: index-only FTS columns are absent from Parquet, so
     // SQL never sees them — selecting or filtering one fails at plan
     // time like any unknown column.
-    let scalar = options.stored_schema();
-    let fts: HashSet<&str> = options
-        .fts_columns
-        .iter()
-        .map(|c| c.column.as_str())
-        .collect();
+    let scalar = manifest.stored_schema();
+    let fts_configs = manifest.fts_configs();
+    let fts: HashSet<&str> = fts_configs.iter().map(|c| c.column.as_str()).collect();
     let scan = view_string_schema(&scalar, &fts);
     SqlSchemas { scalar, scan }
 }
@@ -415,9 +412,13 @@ impl SupertableReader {
             .create_physical_plan()
             .await
             .map_err(QueryError::DataFusion)?;
-        collect_plan_metered(&plan, task_ctx, op_stats)
+        let batches = collect_plan_metered(&plan, task_ctx, op_stats)
             .await
-            .map_err(QueryError::DataFusion)
+            .map_err(QueryError::DataFusion)?;
+        Ok(batches
+            .into_iter()
+            .map(crate::supertable::schema::strip_field_ids)
+            .collect())
     }
 
     /// Resolve a predicate to the matching `_id` values. Used by
@@ -573,6 +574,7 @@ mod tests {
         },
         supertable::{
             Supertable, SupertableOptions,
+            manifest::ManifestSnapshot,
             query::{candidate::LIKE_MAX_TERMS, sql::build_sql_schemas},
         },
     };
@@ -1379,7 +1381,7 @@ mod tests {
     /// per table.
     #[test]
     fn build_sql_schemas_views_scan_and_keeps_scalar() {
-        let s = build_sql_schemas(&options_id_cat_title());
+        let s = build_sql_schemas(&ManifestSnapshot::empty(Arc::new(options_id_cat_title())));
         // scan: `category` (non-FTS string) viewed; `title` (FTS) kept.
         assert_eq!(
             s.scan()

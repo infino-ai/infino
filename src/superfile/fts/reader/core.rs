@@ -26,7 +26,7 @@ use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 
 use super::{
-    cursor::{TermCursor, TermMeta},
+    cursor::{CursorUse, TermCursor, TermMeta},
     filter::ExcludeFilter,
     metadata::{ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions},
     phrase::{AnyCursor, PhraseCursor},
@@ -55,6 +55,7 @@ use crate::{
         id_space::{DocMap, FtsDocId, RowId},
         lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
     },
+    supertable::schema::FieldId,
     utils::terms::{DictEntry, TermBlocks, make_key},
 };
 
@@ -859,6 +860,7 @@ impl FtsReader {
             // then runs when the array is first read.
             let column = ColumnMeta {
                 name: col_cfg.name.clone(),
+                field_id: col_cfg.field_id.map(FieldId),
                 doc_lengths_range: doc_lengths_offset..array_end,
                 params,
                 positions: col_cfg.positions,
@@ -1191,11 +1193,14 @@ impl FtsReader {
         phrases: &[Phrase<String>],
         global_idf: Option<&GlobalTermIdf>,
         prefetched: Option<&FetchedTermMemo>,
+        purpose: CursorUse,
     ) -> Result<(Vec<Option<AnyCursor>>, u64), FtsError> {
         let col_meta = &self.columns[column_id as usize];
-        // Atom walks score, so the norms are needed before any cursor is
-        // built.
-        self.ensure_norms(column_id).await?;
+        // A scored walk needs the norms before any cursor is built; an
+        // unranked match does not, and must not read the length array.
+        if purpose.scores() {
+            self.ensure_norms(column_id).await?;
+        }
         if !phrases.is_empty() && !col_meta.positions {
             return Err(FtsError::PositionsUnavailable {
                 column: col_meta.name.clone(),
@@ -1210,7 +1215,9 @@ impl FtsReader {
         // dictionary range for the whole batch.
         if !terms.is_empty() {
             let term_cursors = self
-                .build_term_cursors_opt(column_id, terms, global_idf, false, None, prefetched, None)
+                .build_term_cursors_opt(
+                    column_id, terms, global_idf, purpose, None, prefetched, None,
+                )
                 .await?;
             dict_ranges += 1;
             for cursor in term_cursors {
@@ -1224,7 +1231,14 @@ impl FtsReader {
             // per-member rescale ratio cancels out of the phrase's tf/length
             // bound. Build members with the same `global_idf` as bare terms.
             let cursors = self
-                .build_term_cursors(column_id, &member_refs, global_idf, false, None, prefetched)
+                .build_term_cursors(
+                    column_id,
+                    &member_refs,
+                    global_idf,
+                    purpose,
+                    None,
+                    prefetched,
+                )
                 .await?;
             dict_ranges += 1;
             if cursors.len() != member_refs.len() {
@@ -1509,7 +1523,8 @@ impl FtsReader {
                     // This walk carries postings across into a merge; it
                     // reads doc ids, tfs and positions and never consults
                     // a score bound.
-                    let mut cursor = TermCursor::new(term_bytes, col_meta, None, 1, false)?;
+                    let mut cursor =
+                        TermCursor::new(term_bytes, col_meta, None, 1, CursorUse::Match)?;
                     // Each block's runs are one group, decoded whole at the
                     // block's start and sliced per pair.
                     let mut group = GroupIndex::default();
@@ -1612,10 +1627,11 @@ impl FtsReader {
                             }
                             Ok(())
                         }
-                        // A count-only cursor decodes a block's doc ids and
+                        // A `Count` cursor decodes a block's doc ids and
                         // skips its tfs.
                         false => {
-                            let mut cursor = TermCursor::new(term_bytes, col_meta, None, 1, true)?;
+                            let mut cursor =
+                                TermCursor::new(term_bytes, col_meta, None, 1, CursorUse::Count)?;
                             while !cursor.is_exhausted() {
                                 for &doc in &cursor.block_doc_ids[cursor.pos..cursor.block_n] {
                                     on_doc(&carry, doc);
@@ -4094,6 +4110,72 @@ mod tests {
         assert!(
             source.armed.load(Ordering::SeqCst),
             "an unranked match must not read the length array"
+        );
+        assert!(!reader.columns[0].norms_loaded());
+    }
+
+    /// An unranked phrase or boolean match (the rows, or their count with a
+    /// negation) never scores, so it must not read the length array: on a
+    /// cold reader that read is a GET for nothing, and a failure there would
+    /// fail a match that needs no norms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unranked_phrase_or_boolean_match_never_reads_the_length_array() {
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), true).expect("register");
+        for doc in 0..64u32 {
+            let text = match doc % 4 {
+                0 => "the quick brown fox jumps",
+                1 => "a quick red fox",
+                2 => "brown dogs and a quick fox",
+                _ => "slow brown turtle",
+            };
+            b.add_doc(0, doc, text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","positions":true,"k1":1.2,"b":0.75}]"#;
+        let eager = FtsReader::open(blob.clone(), json).expect("eager open");
+        let source = Arc::new(FailingOnceSource {
+            inner: BytesLazyByteSource::new(blob),
+            region: eager.columns[0].doc_lengths_range.clone(),
+            armed: AtomicBool::new(false),
+        });
+        let src: Arc<dyn LazyByteSource> = source.clone();
+        let reader = FtsReader::open_lazy(src, json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        source.armed.store(true, Ordering::SeqCst);
+
+        let quick_fox = vec![Phrase::adjacent(vec![
+            "quick".to_string(),
+            "fox".to_string(),
+        ])];
+        let slow_brown = vec![Phrase::adjacent(vec![
+            "slow".to_string(),
+            "brown".to_string(),
+        ])];
+        for mode in [BoolMode::Or, BoolMode::And] {
+            let (want, _) = eager
+                .atoms_match_ids("body", &["brown"], &quick_fox, mode)
+                .await
+                .expect("eager ids");
+            let (got, _) = reader
+                .atoms_match_ids("body", &["brown"], &quick_fox, mode)
+                .await
+                .expect("ids");
+            assert_eq!(got, want, "{mode:?} rows");
+            let (want, _) = eager
+                .atoms_match_count("body", &["brown"], &quick_fox, mode, &["dogs"], &slow_brown)
+                .await
+                .expect("eager count");
+            let (got, _) = reader
+                .atoms_match_count("body", &["brown"], &quick_fox, mode, &["dogs"], &slow_brown)
+                .await
+                .expect("count");
+            assert_eq!(got, want, "{mode:?} count");
+        }
+        assert!(
+            source.armed.load(Ordering::SeqCst),
+            "an unranked phrase or boolean match must not read the length array"
         );
         assert!(!reader.columns[0].norms_loaded());
     }

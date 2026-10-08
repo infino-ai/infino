@@ -45,9 +45,16 @@ use tracing::Instrument;
 use tracing::{Span, field::Value};
 
 use crate::runtime_metrics::{
+    cpu::{thread_cpu_delta_ns, thread_cpu_ns},
     io::{UsageMeter, UsageSnapshot},
     op_stats::OpStatsCollector,
+    rss::{available_memory_bytes, status_anon_rss_bytes},
 };
+
+/// Bytes in a MiB, for the memory fields [`RegionUsage`] records.
+const BYTES_PER_MIB: u64 = 1 << 20;
+/// Nanoseconds in a millisecond, for [`RegionUsage`]'s `cpu_ms`.
+const NS_PER_MS: u64 = 1_000_000;
 
 /// What kind of operation a span's work is being done for.
 ///
@@ -162,7 +169,22 @@ pub(crate) fn detached(span: Span) -> Span {
 /// `%x`) and dotted field names are not expressible here: for the
 /// sigils use `tracing::field::debug(&x)` / `display(&x)`, and for a
 /// dotted name reach for `info_span!` under a `cfg_attr`.
+///
+/// `parent: span` sets the parent explicitly, for work a rayon pool fans out:
+/// a `par_iter` task does not run inside the span that started it, so a span
+/// made there would otherwise start a trace of its own.
 macro_rules! detail_span {
+    ($name:literal, parent: $parent:expr $(, $field:ident = $value:expr)* $(,)?) => {{
+        #[cfg(feature = "detailed-tracing")]
+        {
+            ::tracing::info_span!(parent: $parent, $name $(, $field = $value)*)
+        }
+        #[cfg(not(feature = "detailed-tracing"))]
+        {
+            let _ = &$parent;
+            ::tracing::Span::none()
+        }
+    }};
     ($name:literal $(, $field:ident = $value:expr)* $(,)?) => {{
         #[cfg(feature = "detailed-tracing")]
         {
@@ -352,6 +374,59 @@ impl CloseOut {
     /// [`Self::finish`] with `rows_out` counted from the read's batches.
     pub(crate) fn finish_batches(self, batches: &[RecordBatch]) {
         self.finish(batches.iter().map(|b| b.num_rows() as u64).sum());
+    }
+}
+
+/// What a long, single-threaded region records on its span: memory when it
+/// starts and ends, and the CPU time its thread spent in it.
+///
+/// Read next to the span's wall time, `cpu_ms` says whether the region was
+/// computing or stalled (page faults, swap, a full disk). The memory pair says
+/// how much the region held and how close the host was to running out. Only
+/// the current thread's CPU is counted, so a region that fans out to a pool
+/// under-reports.
+///
+/// The span declares `cpu_ms`, `rss_anon_mb_before`, `rss_anon_mb_after`,
+/// `mem_available_mb_before` and `mem_available_mb_after` as
+/// `tracing::field::Empty`, and both calls run inside it. Without
+/// `detailed-tracing` nothing is read.
+pub(crate) struct RegionUsage {
+    cpu_start: Option<u128>,
+}
+
+impl RegionUsage {
+    /// Record the starting memory and take the CPU reading to subtract from.
+    pub(crate) fn begin() -> Self {
+        if !cfg!(feature = "detailed-tracing") {
+            return Self { cpu_start: None };
+        }
+        record_memory("rss_anon_mb_before", "mem_available_mb_before");
+        Self {
+            cpu_start: thread_cpu_ns(),
+        }
+    }
+
+    /// Record the CPU time since [`Self::begin`] and the ending memory. Must run
+    /// on the thread that called `begin`.
+    pub(crate) fn finish(self) {
+        if !cfg!(feature = "detailed-tracing") {
+            return;
+        }
+        // No CPU clock on this platform: leave `cpu_ms` empty rather than 0.
+        if self.cpu_start.is_some() {
+            record("cpu_ms", thread_cpu_delta_ns(self.cpu_start) / NS_PER_MS);
+        }
+        record_memory("rss_anon_mb_after", "mem_available_mb_after");
+    }
+}
+
+/// Record this process's anonymous RSS and the memory still available, in MiB.
+fn record_memory(rss_field: &'static str, available_field: &'static str) {
+    if let Some(rss) = status_anon_rss_bytes() {
+        record(rss_field, rss / BYTES_PER_MIB);
+    }
+    if let Some(available) = available_memory_bytes() {
+        record(available_field, available / BYTES_PER_MIB);
     }
 }
 

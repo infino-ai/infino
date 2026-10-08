@@ -112,10 +112,9 @@ use crate::{
         },
     },
     supertable::{
-        SuperfileEntry, SupertableOptions,
+        SuperfileEntry,
         error::QueryError,
         manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
-        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
             candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
             df_object_store::SuperfileObjectStore,
@@ -125,10 +124,12 @@ use crate::{
             },
             fts::{memos_from_plan_locations, plan_locations_for},
             prune::{PruneLeaf, select_superfiles},
-            skip::{ScalarOp, ScalarPredicate},
+            schema_adapter::TableExprAdapterFactory,
+            skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
             superfile_reader::{OpenTierCounts, superfile_reader_tiered},
         },
         reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
+        schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
         tombstones::SidecarCache,
     },
     utils::trace::{self, detail_span, tiered_span},
@@ -394,8 +395,9 @@ impl SupertableProvider {
             .complete_flat_superfiles()
             .and_then(|entries| {
                 let mut merged: Option<ScalarValueCounts> = None;
+                let id = self.manifest.field_id(column)?;
                 for entry in entries {
-                    let counts = entry.scalar_stats.get(column)?.value_counts.as_ref()?;
+                    let counts = entry.scalar_stats.get(&id)?.value_counts.as_ref()?;
                     merged = Some(match merged {
                         None => counts.clone(),
                         Some(current) => current.merged_with(counts)?,
@@ -415,7 +417,7 @@ impl SupertableProvider {
     // Pure manifest work: reads stats only, opens no superfile. Returns the
     // survivor entries; `scan` is what opens and reads them.
     async fn select_survivors(&self, filters: &[Expr]) -> DfResult<Vec<Arc<SuperfileEntry>>> {
-        let leaves = prune_leaves_for_filters(&self.manifest.options, &self.schema, filters);
+        let leaves = prune_leaves_for_filters(&self.manifest, &self.schema, filters);
         let mut survivors = select_superfiles(self.manifest.as_ref(), &leaves).await?;
 
         // Covered/residual residual scans read only their boundary
@@ -448,8 +450,8 @@ impl SupertableProvider {
     /// exactly. It reads only the expression and the table options, so a
     /// cached plan stays valid.
     fn exact_filter(&self, filter: &Expr, fts_cols: &HashSet<&str>) -> Option<ExactFilter> {
-        let opts = &self.manifest.options;
-        exact_filter(filter, fts_cols, &|col| opts.try_fts_tokenizer_for(col))
+        let manifest = &self.manifest;
+        exact_filter(filter, fts_cols, &|col| manifest.try_fts_tokenizer_for(col))
     }
 
     /// Whether this provider answers any of `filters` exactly
@@ -716,25 +718,42 @@ impl SupertableProvider {
                     return stats;
                 }
                 let mut stats = ColumnStatistics::new_unknown();
+                let Some(column) = self.manifest.field_id(name) else {
+                    return stats;
+                };
+                // Every statistic below is value-derived, so each is only
+                // true while it describes the type the table reads the
+                // column as today. After a retype the recorded bounds are
+                // the old type's and do not survive the cast — a string
+                // column holding "7" and "10" records min "10", max "7" —
+                // and a sum or null count is no better. Report nothing
+                // rather than something false; the scan derives the answer
+                // from the data, and compaction re-derives the statistics
+                // in the new type when it rewrites the file.
+                let guard = ColumnTypeGuard::new(&self.manifest, column);
+                if guard.aggregates_mix_types() || entries.iter().any(|e| guard.stats_are_stale(e))
+                {
+                    return stats;
+                }
                 // A range covering the column type's whole domain is
                 // withheld rather than reported — see `spans_full_domain`.
-                if let Some((min, max)) = scalar_min_max(entries, name)
+                if let Some((min, max)) = scalar_min_max(entries, column)
                     && !spans_full_domain(&min, &max)
                 {
                     stats.min_value = wrap(min);
                     stats.max_value = wrap(max);
                 }
-                if let Some(nulls) = scalar_null_count(entries, name) {
+                if let Some(nulls) = scalar_null_count(entries, column) {
                     stats.null_count = if clean {
                         Precision::Exact(nulls as usize)
                     } else {
                         Precision::Inexact(nulls as usize)
                     };
                 }
-                if let Some(sum) = scalar_sum(entries, name) {
+                if let Some(sum) = scalar_sum(entries, column) {
                     stats.sum_value = wrap(sum);
                 }
-                if let Some(distinct) = scalar_distinct(entries, name) {
+                if let Some(distinct) = scalar_distinct(entries, column) {
                     // A sketch estimate — never exact.
                     stats.distinct_count = Precision::Inexact(distinct);
                 }
@@ -764,18 +783,18 @@ fn id_min_max(entries: &[Arc<SuperfileEntry>]) -> Option<(ScalarValue, ScalarVal
 /// Total null count of column `name` across `entries`; `None` unless
 /// every entry carries the stat (a missing side makes the total
 /// unknowable).
-fn scalar_null_count(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<u64> {
+fn scalar_null_count(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<u64> {
     entries.iter().try_fold(0u64, |acc, entry| {
-        acc.checked_add(entry.scalar_stats.get(name)?.null_count?)
+        acc.checked_add(entry.scalar_stats.get(&column)?.null_count?)
     })
 }
 
 /// Exact sum of column `name` across `entries`; `None` unless every
 /// entry carries it and the fold doesn't overflow.
-fn scalar_sum(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<ScalarValue> {
+fn scalar_sum(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<ScalarValue> {
     let mut acc: Option<ArrayRef> = None;
     for entry in entries {
-        let part = entry.scalar_stats.get(name)?.sum.as_ref()?;
+        let part = entry.scalar_stats.get(&column)?.sum.as_ref()?;
         acc = Some(match acc {
             None => Arc::clone(part),
             Some(total) => add_sum_arrays(&total, part)?,
@@ -787,10 +806,10 @@ fn scalar_sum(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<ScalarValue
 /// HLL distinct-count estimate for column `name` across `entries`;
 /// `None` unless every entry carries a sketch. Sketch unions are
 /// exact, so the merged estimate has single-sketch accuracy.
-fn scalar_distinct(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<usize> {
+fn scalar_distinct(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<usize> {
     let mut merged: Option<HllSketch> = None;
     for entry in entries {
-        let sketch = HllSketch::from_bytes(entry.scalar_stats.get(name)?.hll.as_ref()?)?;
+        let sketch = HllSketch::from_bytes(entry.scalar_stats.get(&column)?.hll.as_ref()?)?;
         merged = Some(match merged {
             None => sketch,
             Some(mut acc) => {
@@ -804,11 +823,11 @@ fn scalar_distinct(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<usize>
 
 fn scalar_min_max(
     entries: &[Arc<SuperfileEntry>],
-    name: &str,
+    column: FieldId,
 ) -> Option<(ScalarValue, ScalarValue)> {
     let mut acc: Option<(ScalarValue, ScalarValue)> = None;
     for entry in entries {
-        let agg = entry.scalar_stats.get(name)?;
+        let agg = entry.scalar_stats.get(&column)?;
         let min = ScalarValue::try_from_array(&agg.min, 0).ok()?;
         let max = ScalarValue::try_from_array(&agg.max, 0).ok()?;
         if min.is_null() || max.is_null() {
@@ -1123,9 +1142,9 @@ impl TableProvider for SupertableProvider {
         // boolean tree over `token_match`; evaluated per superfile below
         // it yields a candidate row-id superset (or `Unbounded` = scan
         // the superfile). See `crate::supertable::query::candidate`.
-        let opts = &self.manifest.options;
+        let manifest = &self.manifest;
         let candidate_plan = CandidatePlan::from_filters(&bounded_filters, &fts_cols, &|col| {
-            opts.try_fts_tokenizer_for(col)
+            manifest.try_fts_tokenizer_for(col)
         });
         // A `LIKE` leaf is bound to each superfile's dictionary once, up
         // front, so the estimate and the evaluation below share one walk.
@@ -1223,9 +1242,10 @@ impl TableProvider for SupertableProvider {
                                 .get(&prepared.path)
                                 .map(|m| Arc::clone(m.value()));
                             let full_walk_pays = |column: &str| {
-                                let terms = entry
-                                    .fts_summary
-                                    .get(column)
+                                let terms = self
+                                    .manifest
+                                    .field_id(column)
+                                    .and_then(|id| entry.fts_summary.get(&id))
                                     .map_or(0, |summary| summary.n_terms_distinct);
                                 let bytes = meta
                                     .as_ref()
@@ -1433,7 +1453,8 @@ impl TableProvider for SupertableProvider {
         state
             .runtime_env()
             .register_object_store(url.as_ref(), store);
-        let mut builder = FileScanConfigBuilder::new(url, Arc::new(source));
+        let mut builder = FileScanConfigBuilder::new(url, Arc::new(source))
+            .with_expr_adapter(Some(Arc::new(TableExprAdapterFactory::new(&self.manifest))));
         for file in files {
             builder = builder.with_file(file);
         }
@@ -1748,18 +1769,21 @@ fn selection_access_plan_from_counts(
 /// of them possibly-present (`BoolMode::And`) never drops a match —
 /// bloom false positives can only keep a superfile, never drop one.
 fn scalar_predicates_to_prune_leaves(
-    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
     predicates: Vec<ScalarPredicate>,
 ) -> Vec<PruneLeaf> {
     let mut leaves = Vec::with_capacity(predicates.len());
     for pred in predicates {
         if pred.op == ScalarOp::Eq
-            && options.fts_columns.iter().any(|c| c.column == pred.column)
+            && manifest
+                .fts_configs()
+                .iter()
+                .any(|c| c.column == pred.column)
             && let Some(literal) = scalar_as_str(&pred.value)
         {
             // Per-column analyzer: prune with the tokenizer this column
             // was indexed with, not a single table-wide default.
-            let Some(tok) = options.try_fts_tokenizer_for(&pred.column) else {
+            let Some(tok) = manifest.try_fts_tokenizer_for(&pred.column) else {
                 leaves.push(PruneLeaf::Scalar(pred));
                 continue;
             };
@@ -1789,18 +1813,15 @@ fn scalar_predicates_to_prune_leaves(
 /// plain scan or over `bm25_search` / `hybrid_search`. Pure manifest
 /// work: reads statistics only, opens no superfile.
 pub(crate) fn prune_leaves_for_filters(
-    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
     schema: &SchemaRef,
     filters: &[Expr],
 ) -> Vec<PruneLeaf> {
-    let fts_cols: HashSet<&str> = options
-        .fts_columns
-        .iter()
-        .map(|c| c.column.as_str())
-        .collect();
-    let resolve = |col: &str| options.try_fts_tokenizer_for(col);
+    let fts_configs = manifest.fts_configs();
+    let fts_cols: HashSet<&str> = fts_configs.iter().map(|c| c.column.as_str()).collect();
+    let resolve = |col: &str| manifest.try_fts_tokenizer_for(col);
     let mut leaves =
-        scalar_predicates_to_prune_leaves(options, exprs_to_scalar_predicates(filters, schema));
+        scalar_predicates_to_prune_leaves(manifest, exprs_to_scalar_predicates(filters, schema));
     leaves.extend(exprs_to_value_set_leaves(
         filters, schema, &fts_cols, &resolve,
     ));
@@ -2116,7 +2137,7 @@ mod tests {
             Supertable, SupertableOptions,
             manifest::{ScalarStatsAgg, SuperfileUri},
         },
-        test_helpers::default_tokenizer,
+        test_helpers::{default_tokenizer, fid},
     };
 
     /// Per-column tokenizer resolver for the pruning-walker tests: every
@@ -2759,7 +2780,7 @@ mod tests {
 
         let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
-            st.options().scalar_schema(),
+            reader.manifest().scalar_schema(),
             reader.manifest().clone(),
             st.options().store.clone(),
             st.options().disk_cache.clone(),
@@ -2864,7 +2885,7 @@ mod tests {
 
         let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
-            st.options().scalar_schema(),
+            reader.manifest().scalar_schema(),
             reader.manifest().clone(),
             st.options().store.clone(),
             st.options().disk_cache.clone(),
@@ -3041,7 +3062,7 @@ mod tests {
 
         let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
-            st.options().scalar_schema(),
+            reader.manifest().scalar_schema(),
             reader.manifest().clone(),
             st.options().store.clone(),
             st.options().disk_cache.clone(),
@@ -3120,8 +3141,9 @@ mod tests {
         let mn: ArrayRef = Arc::new(LargeStringArray::from(vec![min]));
         let mx: ArrayRef = Arc::new(LargeStringArray::from(vec![max]));
         let mut scalar_stats = HashMap::new();
-        scalar_stats.insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
+        scalar_stats.insert(fid(col), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
@@ -3147,21 +3169,24 @@ mod tests {
     fn scalar_statistics_helpers_return_none_when_stat_absent() {
         let entries = vec![entry_minmax_only("s", "alpha", "omega")];
         // Column present, but the additive stats are absent → None.
-        assert!(scalar_sum(&entries, "s").is_none(), "no sum stat → None");
         assert!(
-            scalar_distinct(&entries, "s").is_none(),
+            scalar_sum(&entries, fid("s")).is_none(),
+            "no sum stat → None"
+        );
+        assert!(
+            scalar_distinct(&entries, fid("s")).is_none(),
             "no hll stat → None"
         );
         assert!(
-            scalar_null_count(&entries, "s").is_none(),
+            scalar_null_count(&entries, fid("s")).is_none(),
             "no null_count stat → None"
         );
         // min/max IS present for the column.
-        assert!(scalar_min_max(&entries, "s").is_some());
+        assert!(scalar_min_max(&entries, fid("s")).is_some());
         // A column absent from every entry yields None for all helpers.
-        assert!(scalar_sum(&entries, "missing").is_none());
-        assert!(scalar_min_max(&entries, "missing").is_none());
-        assert!(scalar_null_count(&entries, "missing").is_none());
+        assert!(scalar_sum(&entries, fid("missing")).is_none());
+        assert!(scalar_min_max(&entries, fid("missing")).is_none());
+        assert!(scalar_null_count(&entries, fid("missing")).is_none());
     }
 
     /// `CachedMetadataReaderFactory`'s `Debug` reports the superfile

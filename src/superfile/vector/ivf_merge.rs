@@ -3,39 +3,46 @@
 
 //! Byte-splice merge of Sq8+ε IVF subsections for compaction.
 //!
-//! Concatenates per-cluster blocks across inputs, remapping local doc ids,
-//! and Sq8-transcodes rerank rows only when a source cluster's quantizer
-//! differs from the destination — no fp32 corpus buffer and no re-kmeans.
+//! Concatenates per-cluster blocks across inputs, dropping tombstoned rows
+//! and remapping local doc ids, and Sq8-transcodes rerank rows only when a
+//! source cluster's quantizer differs from the destination — no fp32 corpus
+//! buffer and no re-kmeans.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use bytemuck::cast_slice;
 use rayon::prelude::*;
+use roaring::RoaringBitmap;
 
-use crate::superfile::{
-    BuildError,
-    format::{
-        CRC_BYTES,
-        checksum::crc32c,
-        vec::{
-            CLUSTER_IDX_ENTRY_BYTES, DOC_ID_BYTES, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES,
-            U64_BYTES, sub_hdr,
+use crate::{
+    superfile::{
+        BuildError,
+        builder::survivor_rows,
+        format::{
+            CRC_BYTES,
+            checksum::crc32c,
+            vec::{
+                CLUSTER_IDX_ENTRY_BYTES, DOC_ID_BYTES, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES,
+                U64_BYTES, sub_hdr,
+            },
+        },
+        id_space::RowId,
+        vector::{
+            builder::{
+                IvfSubsectionLayout, alloc_ivf_subsection_with_header, centroid_storage_order,
+                effective_cell_n_cent, fixed_sq8_quantizer, write_ivf_cluster_blocks,
+            },
+            cell_posting::{EncodedCellRow, sq8_quant_params_equal},
+            distance::{
+                Metric, add_weighted_f32_to_f64_acc, decode_f32_le_into, decode_f32_le_vec,
+                f64_acc_mean_into_f32, mean_f32_cluster_major,
+            },
+            quant::BitQuantizer,
+            reader::{VectorReader, read_cluster_entry},
+            rerank_codec::RerankCodec,
         },
     },
-    vector::{
-        builder::{
-            IvfSubsectionLayout, alloc_ivf_subsection_with_header, centroid_storage_order,
-            effective_cell_n_cent, fixed_sq8_quantizer, write_ivf_cluster_blocks,
-        },
-        cell_posting::{EncodedCellRow, sq8_quant_params_equal},
-        distance::{
-            Metric, add_weighted_f32_to_f64_acc, decode_f32_le_into, decode_f32_le_vec,
-            f64_acc_mean_into_f32, mean_f32_cluster_major,
-        },
-        quant::BitQuantizer,
-        reader::{VectorReader, read_cluster_entry},
-        rerank_codec::RerankCodec,
-    },
+    utils::trace::{detail_span, record},
 };
 
 /// Read a fragment's stable id at `src_local` (a doc id decoded from stored
@@ -113,6 +120,10 @@ pub(crate) struct Sq8IvfMergeInput {
     /// `None` for region-less sources (streaming/incoming). The merge produces a
     /// merged region only when every input has one.
     pub stable_ids: Option<Vec<i128>>,
+    /// New local doc id of each source row, `None` for a tombstoned row. It
+    /// numbers the survivors densely, as the caller numbers its Parquet rows.
+    /// `None` keeps every row under its own id.
+    pub survivors: Option<Vec<Option<RowId>>>,
 }
 
 /// Output of a byte-splice merge, ready for [`super::builder::VectorBuilder::set_prebuilt_subsection`].
@@ -135,20 +146,89 @@ fn cluster_entry(sub: &[u8], cluster_idx_off: usize, c: usize) -> (usize, usize)
     (doc_off as usize, count as usize)
 }
 
-/// Merge Sq8+ε IVF subsections by splicing per-cluster blocks.
+/// Source local doc id of row `i` in a cluster block whose doc ids start at
+/// `doc_ids_at`.
+fn block_doc_id(sub: &[u8], doc_ids_at: usize, i: usize) -> u32 {
+    let p = doc_ids_at + i * DOC_ID_BYTES;
+    u32::from_le_bytes([sub[p], sub[p + 1], sub[p + 2], sub[p + 3]])
+}
+
+/// New local doc id (before `doc_id_offset`) of source row `src_local`, or
+/// `None` when the row is tombstoned.
+fn survivor_id(inp: &Sq8IvfMergeInput, src_local: u32) -> Result<Option<u32>, BuildError> {
+    let Some(survivors) = &inp.survivors else {
+        return Ok(Some(src_local));
+    };
+    let row = survivors.get(src_local as usize).ok_or_else(|| {
+        BuildError::VectorSchemaMismatch("IVF merge doc id out of range for its input".into())
+    })?;
+    Ok(row.map(RowId::get))
+}
+
+/// Rows per cluster that survive the input's tombstones.
+fn live_cluster_counts(inp: &Sq8IvfMergeInput) -> Result<Vec<usize>, BuildError> {
+    (0..inp.n_cent)
+        .map(|c| {
+            let (doc_off, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
+            if inp.survivors.is_none() {
+                return Ok(count);
+            }
+            let doc_ids_at =
+                inp.per_cluster_blocks_off + doc_off * inp.stride + count * inp.code_bytes;
+            let mut live = 0;
+            for i in 0..count {
+                if survivor_id(inp, block_doc_id(&inp.sub, doc_ids_at, i))?.is_some() {
+                    live += 1;
+                }
+            }
+            Ok(live)
+        })
+        .collect()
+}
+
+/// Merge Sq8+ε IVF subsections by splicing per-cluster blocks. Each input
+/// carries its column, doc-id offset and tombstones.
 pub(crate) fn merge_sq8_ivf_subsections(
-    inputs: &[(&VectorReader, &str, u32)],
+    inputs: &[(&VectorReader, &str, u32, Option<Arc<RoaringBitmap>>)],
 ) -> Result<MergedIvfSubsection, BuildError> {
     if inputs.is_empty() {
         return Err(BuildError::VectorSchemaMismatch(
             "merge requires at least one IVF input".into(),
         ));
     }
+    // Each input's subsection is copied out of its reader here, so this
+    // phase's time and `copied_bytes` show what the copy costs.
+    let parse_span = detail_span!(
+        "ivf_merge.copy_inputs",
+        inputs = inputs.len(),
+        copied_bytes = tracing::field::Empty,
+    )
+    .entered();
     let parsed: Vec<Sq8IvfMergeInput> = inputs
         .iter()
-        .map(|(r, col, off)| r.sq8_ivf_merge_input(col, *off))
-        .collect::<Result<_, _>>()?;
-    merge_sq8_ivf_subsections_from_parsed(&parsed)
+        .map(|(r, col, off, deleted)| {
+            let mut inp = r.sq8_ivf_merge_input(col, *off)?;
+            inp.survivors = deleted
+                .as_deref()
+                .map(|d| survivor_rows(inp.n_docs, Some(d), 0).0);
+            Ok(inp)
+        })
+        .collect::<Result<_, BuildError>>()?;
+    record(
+        "copied_bytes",
+        parsed.iter().map(|p| p.sub.len() as u64).sum::<u64>(),
+    );
+    drop(parse_span);
+
+    let _splice_span = detail_span!(
+        "ivf_merge.splice",
+        n_cent = parsed[0].n_cent,
+        out_bytes = tracing::field::Empty,
+    )
+    .entered();
+    let merged = merge_sq8_ivf_subsections_from_parsed(&parsed)?;
+    record("out_bytes", merged.bytes.len() as u64);
+    Ok(merged)
 }
 
 /// Same as [`merge_sq8_ivf_subsections`], but takes already-parsed cell IVFs
@@ -178,7 +258,12 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
         }
     }
 
-    let n_docs: u32 = parsed.iter().map(|p| p.n_docs).sum();
+    // `live[k][c]`: rows of input k in cluster c that survive its tombstones.
+    let live: Vec<Vec<usize>> = parsed
+        .iter()
+        .map(live_cluster_counts)
+        .collect::<Result<_, _>>()?;
+    let n_docs: u32 = live.iter().flatten().sum::<usize>() as u32;
     debug_assert!(codec.is_ivf_mergeable());
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
@@ -190,8 +275,8 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
     for c in 0..n_cent {
         let mut acc = vec![0.0f64; dim];
         let mut total = 0u64;
-        for inp in parsed {
-            let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
+        for (inp, live) in parsed.iter().zip(&live) {
+            let count = live[c];
             if count == 0 {
                 continue;
             }
@@ -255,9 +340,8 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
             for c in 0..n_cent {
                 let base = c * dim;
                 let mut any = false;
-                for inp in parsed {
-                    let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
-                    if count == 0 {
+                for (inp, live) in parsed.iter().zip(&live) {
+                    if live[c] == 0 {
                         continue;
                     }
                     let s = &inp.scale[base..base + dim];
@@ -303,9 +387,8 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
             // ruler is already exact — no union needed. The per-row transcode
             // below finds source == destination and copies bytes verbatim.
             for c in 0..n_cent {
-                for inp in parsed {
-                    let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
-                    if count == 0 {
+                for (inp, live) in parsed.iter().zip(&live) {
+                    if live[c] == 0 {
                         continue;
                     }
                     let off = c * dim;
@@ -367,15 +450,10 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
     }
 
     let cluster_order = centroid_storage_order(&out_centroids, n_cent, dim);
-    // Merged per-cluster row counts (sum across inputs), so the shared
+    // Merged per-cluster live row counts (sum across inputs), so the shared
     // cluster-block writer owns the index + cursor + offset math.
     let merged_counts: Vec<u32> = (0..n_cent)
-        .map(|c| {
-            parsed
-                .iter()
-                .map(|inp| cluster_entry(&inp.sub, inp.cluster_idx_off, c).1 as u32)
-                .sum()
-        })
+        .map(|c| live.iter().map(|l| l[c] as u32).sum())
         .collect();
     let id_bytes = DOC_ID_BYTES;
     let mut row_buf = vec![0u8; dim * 2];
@@ -406,20 +484,20 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                 let full_at = block + count * (inp.code_bytes + id_bytes);
 
                 for i in 0..count {
+                    let src_local = block_doc_id(&inp.sub, doc_ids_at, i);
+                    // A deleted row is skipped; a live one takes its
+                    // survivor id, as its Parquet row does.
+                    let Some(survivor) = survivor_id(inp, src_local)? else {
+                        continue;
+                    };
+                    let local_id = survivor + inp.doc_id_offset;
+
                     bytes[blk.codes_base + out_i * code_bytes
                         ..blk.codes_base + (out_i + 1) * code_bytes]
                         .copy_from_slice(
                             &inp.sub[block + i * inp.code_bytes..block + (i + 1) * inp.code_bytes],
                         );
 
-                    let idb = doc_ids_at + i * id_bytes;
-                    let src_local = u32::from_le_bytes([
-                        inp.sub[idb],
-                        inp.sub[idb + 1],
-                        inp.sub[idb + 2],
-                        inp.sub[idb + 3],
-                    ]);
-                    let local_id = src_local + inp.doc_id_offset;
                     let id_off = blk.ids_base + out_i * id_bytes;
                     bytes[id_off..id_off + id_bytes].copy_from_slice(&local_id.to_le_bytes());
 
@@ -477,8 +555,8 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                             let encoded = EncodedCellRow {
                                 stable_id: 0,
                                 rerank_codec: inp.rerank_codec,
-                                scale: std::sync::Arc::from(src_scale),
-                                offset: std::sync::Arc::from(src_offset),
+                                scale: Arc::from(src_scale),
+                                offset: Arc::from(src_offset),
                                 codes,
                                 residuals,
                                 norm_sq: None,
@@ -527,7 +605,9 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
 }
 
 /// Stable `_id`s in merged local-doc-id order for inputs that all carry an
-/// inline stable-id region (hidden / materialized cells).
+/// inline stable-id region (hidden / materialized cells). Tombstoned rows are
+/// dropped and survivors take their survivor ids, as in
+/// [`merge_sq8_ivf_subsections_from_parsed`].
 pub(crate) fn stable_ids_in_merged_local_order(
     parsed: &[Sq8IvfMergeInput],
 ) -> Result<Vec<i128>, BuildError> {
@@ -539,13 +619,20 @@ pub(crate) fn stable_ids_in_merged_local_order(
             "multi-cell merge requires inline stable_ids on every cell IVF".into(),
         ));
     }
-    let n_docs: usize = parsed.iter().map(|p| p.n_docs as usize).sum();
+    let n_docs: usize = parsed
+        .iter()
+        .map(|p| match &p.survivors {
+            Some(survivors) => survivors.iter().flatten().count(),
+            None => p.n_docs as usize,
+        })
+        .sum();
     let mut ids = vec![0i128; n_docs];
     for inp in parsed {
         let src = inp.stable_ids.as_ref().expect("checked above");
-        let base = inp.doc_id_offset as usize;
         for (i, &sid) in src.iter().enumerate() {
-            ids[base + i] = sid;
+            if let Some(survivor) = survivor_id(inp, i as u32)? {
+                ids[(survivor + inp.doc_id_offset) as usize] = sid;
+            }
         }
     }
     Ok(ids)
@@ -688,13 +775,7 @@ pub(crate) fn splice_fragments_into_cell(
                 let id_off = blk.ids_base + i * id_bytes;
                 bytes[id_off..id_off + id_bytes].copy_from_slice(&(out_row as u32).to_le_bytes());
 
-                let idb = doc_ids_at + i * id_bytes;
-                let src_local = u32::from_le_bytes([
-                    inp.sub[idb],
-                    inp.sub[idb + 1],
-                    inp.sub[idb + 2],
-                    inp.sub[idb + 3],
-                ]);
+                let src_local = block_doc_id(&inp.sub, doc_ids_at, i);
                 let sid = stable_id_at(sids, src_local)?;
                 out_stable_ids[out_row] = sid;
                 if let Some(region_off) = stable_ids_region_off {
@@ -940,6 +1021,7 @@ pub(crate) fn sq8_ivf_merge_input_from_subsection(
         scale,
         offset,
         stable_ids,
+        survivors: None,
     })
 }
 
@@ -1131,6 +1213,45 @@ mod tests {
             provided_centroids: Some(Arc::from(centroids)),
         };
         build_merged_subsection_from_fp32(cfg, N_CENT, Arc::new(vectors), &ids).expect("cell build")
+    }
+
+    /// Stable `_id`s follow the same survivor numbering as the splice: a
+    /// tombstoned row's `_id` is dropped and later rows move down, so the list
+    /// matches the merged cell's doc count and its region.
+    #[test]
+    fn stable_ids_in_merged_local_order_drops_tombstoned_rows() {
+        const DELETED: [u32; 2] = [1, 4];
+        let parse = |sub: &MergedIvfSubsection, id_base: i128| {
+            let ids: Vec<i128> = (0..ROWS as i128).map(|i| id_base + i).collect();
+            sq8_ivf_merge_input_from_subsection(
+                &sub.bytes,
+                DIM,
+                sub.n_cent,
+                sub.n_docs,
+                Metric::Cosine,
+                sub.rerank_codec,
+                Some(ids),
+            )
+            .expect("parse cell")
+        };
+        let mut left = parse(&fixed_subsection_with_empty_clusters(1_000), 1_000);
+        let mut right = parse(&fixed_subsection_with_empty_clusters(2_000), 2_000);
+        let deleted: RoaringBitmap = DELETED.into_iter().collect();
+        let (survivors, kept) = survivor_rows(ROWS as u32, Some(&deleted), 0);
+        left.survivors = Some(survivors);
+        right.doc_id_offset = kept;
+        let inputs = [left, right];
+
+        let ids = stable_ids_in_merged_local_order(&inputs).expect("stable ids");
+        let mut want: Vec<i128> = (0..ROWS as i128)
+            .filter(|i| !DELETED.contains(&(*i as u32)))
+            .map(|i| 1_000 + i)
+            .collect();
+        want.extend((0..ROWS as i128).map(|i| 2_000 + i));
+        assert_eq!(ids, want);
+
+        let merged = merge_sq8_ivf_subsections_from_parsed(&inputs).expect("splice");
+        assert_eq!(merged.n_docs as usize, ids.len(), "one id per merged doc");
     }
 
     /// `merge_fragment_subsections` concatenates two fragment cells verbatim:

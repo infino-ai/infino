@@ -129,11 +129,11 @@ impl TableResolver {
         // is invisible; hand it the collector captured at registration.
         reader.op_stats = self.op_stats.clone();
         let resolved = ResolvedTable {
-            reader: Arc::new(reader),
             // Stored shape: search TVF output columns resolve against
             // what Parquet actually holds (index-only FTS columns are
             // not projectable).
-            scalar_schema: table.options().stored_schema(),
+            scalar_schema: reader.manifest().stored_schema(),
+            reader: Arc::new(reader),
         };
         self.cache
             .lock()

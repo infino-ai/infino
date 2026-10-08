@@ -29,7 +29,6 @@ use roaring::RoaringBitmap;
 use serde::Deserialize;
 use tokio::sync::oneshot;
 
-pub(crate) use crate::superfile::lazy_source::Source;
 use crate::{
     memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::{run_on_pool, spawn_on},
@@ -49,7 +48,9 @@ use crate::{
             },
             {self},
         },
-        lazy_source::{LazyByteSource, LazyByteSourceError, PrefetchedSource, RangeCoalescePlan},
+        lazy_source::{
+            LazyByteSource, LazyByteSourceError, PrefetchedSource, RangeCoalescePlan, Source,
+        },
         vector::{
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
             distance::{
@@ -65,6 +66,7 @@ use crate::{
             rotation::RandomRotation,
         },
     },
+    supertable::schema::FieldId,
 };
 
 /// Bytes per fp32 lane in the on-disk centroid region.
@@ -80,6 +82,9 @@ const SUB_HEADER_SIZE: usize = format::vec::SUB_HEADER_SIZE;
 #[derive(Debug, Clone, Deserialize)]
 pub struct VectorColumnConfig {
     pub column: String,
+    /// The column's stable id, when the writer stamped one.
+    #[serde(default)]
+    pub field_id: Option<u32>,
     pub dim: usize,
     pub rot_seed: u64,
     /// `"l2sq"`, `"cosine"`, or `"negdot"`.
@@ -115,6 +120,8 @@ pub struct ColumnReader {
     /// borrow). See [`TransposedCodeCache`].
     transposed_codes: Arc<TransposedCodeCache>,
     pub name: String,
+    /// The column's stable id, when the writer stamped one.
+    pub field_id: Option<FieldId>,
     pub dim: usize,
     pub n_cent: u32,
     pub n_docs: u32,
@@ -1221,13 +1228,7 @@ impl VectorReader {
             }
 
             // Soft cross-check: cfg.metric matches blob's metric.
-            let cfg_metric = match cfg.metric.as_str() {
-                "l2sq" => Some(Metric::L2Sq),
-                "cosine" => Some(Metric::Cosine),
-                "negdot" => Some(Metric::NegDot),
-                _ => None,
-            };
-            if let Some(m) = cfg_metric
+            if let Some(m) = Metric::from_name(&cfg.metric)
                 && m != metric
             {
                 return Err(VectorError::Read(ReadError::Malformed(format!(
@@ -1239,6 +1240,7 @@ impl VectorReader {
             columns.push(ColumnReader {
                 transposed_codes: Arc::new(TransposedCodeCache::default()),
                 name: cfg.column.clone(),
+                field_id: cfg.field_id.map(FieldId),
                 dim,
                 n_cent,
                 n_docs: col_n_docs,
@@ -1316,16 +1318,12 @@ impl VectorReader {
             ))));
         }
         let cfg = &cols_json[0];
-        let metric = match cfg.metric.as_str() {
-            "l2sq" => Metric::L2Sq,
-            "cosine" => Metric::Cosine,
-            "negdot" => Metric::NegDot,
-            other => {
-                return Err(VectorError::Read(ReadError::Malformed(format!(
-                    "unknown metric {other}"
-                ))));
-            }
-        };
+        let metric = Metric::from_name(&cfg.metric).ok_or_else(|| {
+            VectorError::Read(ReadError::Malformed(format!(
+                "unknown metric {}",
+                cfg.metric
+            )))
+        })?;
         let mut columns = Vec::with_capacity(n_cells);
         let mut cell_ids = Vec::with_capacity(n_cells);
         let mut flat_cluster_base = Vec::with_capacity(n_cells + 1);
@@ -1830,6 +1828,7 @@ impl VectorReader {
         Ok(ColumnReader {
             transposed_codes: Arc::new(TransposedCodeCache::default()),
             name: cfg.column.clone(),
+            field_id: cfg.field_id.map(FieldId),
             dim,
             n_cent: n_cent_u32,
             n_docs: col_n_docs,
@@ -1908,6 +1907,7 @@ impl VectorReader {
     pub(crate) fn global_fine_cluster_vectors(
         &self,
         column: &str,
+        column_id: FieldId,
         section: &crate::supertable::slow_vector_state::CentroidSection,
         superfile_id: uuid::Uuid,
     ) -> Result<Vec<(u32, Vec<f32>)>, VectorError> {
@@ -1922,7 +1922,7 @@ impl VectorReader {
             let cell_id = self.cell_ids.get(ci).copied();
             // A read of the local spill file, not of the superfile's source.
             let Some(bytes) = section
-                .read_cell_bytes(superfile_id, column, cell_id)
+                .read_cell_bytes(superfile_id, column_id, cell_id)
                 .map_err(ReadError::Io)?
             else {
                 continue;
@@ -2642,6 +2642,7 @@ impl VectorReader {
             scale,
             offset,
             stable_ids,
+            survivors: None,
         })
     }
 

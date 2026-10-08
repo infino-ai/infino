@@ -17,8 +17,11 @@
 //! `ManifestSnapshot::update_inner`).
 //!
 //! Layout: a fixed header (magic, version, covered-superfile ids) then a
-//! standard FST map — the same `column <KEY_SEPARATOR> term → u64`
-//! shape as a superfile dictionary, values holding summed gross df.
+//! standard FST map keyed `field_id <KEY_SEPARATOR> term → u64`
+//! ([`FieldId::term_key`]) — a superfile dictionary's shape with the
+//! column named by its id, so a rename leaves the artifact valid — values
+//! holding summed gross df. The build translates each superfile's
+//! name-keyed dictionary through that file's column ids as it sums.
 //! Gross means tombstoned docs still count until compaction rewrites the
 //! underlying dictionaries — exactly the semantics of the query-time
 //! gather this sidecar replaces (consumers clamp df to `n_docs_total`).
@@ -38,8 +41,9 @@ use crate::{
     supertable::{
         error::QueryError,
         manifest::{RoutingRef, SuperfileEntry, part::ContentHash},
+        schema::{FieldId, LegacyNames},
     },
-    utils::terms::{DictBuilder, make_key},
+    utils::terms::DictBuilder,
 };
 
 /// Object-store directory prefix for term-stats artifacts, sibling to
@@ -49,7 +53,9 @@ pub(crate) const STORAGE_PREFIX: &str = "term-stats/";
 /// Artifact magic: identifies the file and its major layout family.
 const MAGIC: &[u8; 8] = b"INFTSTA1";
 /// Layout version within the magic family; bump on any layout change.
-const FORMAT_VERSION: u32 = 1;
+/// `2` keys terms by the column's field id instead of its name. An
+/// artifact at an older version does not decode: maintenance rebuilds it.
+const FORMAT_VERSION: u32 = 2;
 /// Header size before the covered-id array: magic + version + count.
 const HEADER_FIXED_LEN: usize = 8 + 4 + 4;
 /// Terms per `term_dfs` batch while building — bounds the coalesced
@@ -108,8 +114,8 @@ impl TermStatsSidecar {
 
     /// Summed gross df for `term` in `column` across the covered set
     /// (0 when the term appears in none of them).
-    pub(crate) fn df(&self, column: &str, term: &str) -> u64 {
-        self.map.get(make_key(column, term)).unwrap_or(0)
+    pub(crate) fn df(&self, column: FieldId, term: &str) -> u64 {
+        self.map.get(column.term_key(term)).unwrap_or(0)
     }
 
     /// Decode an artifact, verifying layout only (the content hash is
@@ -163,7 +169,9 @@ fn encode(covered: &[Uuid], entries: &BTreeMap<Vec<u8>, u64>) -> Vec<u8> {
 }
 
 /// Build the artifact bytes over `readers`: for every FTS column of
-/// every superfile, walk its dictionary terms and sum gross df. The df
+/// every superfile, walk its dictionary terms and sum gross df under the
+/// column's id (`legacy` names the id of a column written before ids
+/// existed; a column the table does not have contributes nothing). The df
 /// reads are the batched header probes `FtsReader::term_dfs_with`
 /// performs (coalesced header fetches per batch) — no posting bodies are
 /// read, which is what makes this a *light* stats-only pass rather than a
@@ -176,6 +184,7 @@ fn encode(covered: &[Uuid], entries: &BTreeMap<Vec<u8>, u64>) -> Vec<u8> {
 /// 30,000-superfile table it reached roughly 100 GB and could not run at all.
 pub(crate) async fn build<F, Fut>(
     entries: &[Arc<SuperfileEntry>],
+    legacy: &LegacyNames,
     mut open: F,
 ) -> Result<Vec<u8>, TermStatsError>
 where
@@ -188,7 +197,10 @@ where
         covered.push(entry.superfile_id);
         let reader = open(entry).await?;
         let Some(fts) = reader.fts() else { continue };
-        let columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
+        let columns: Vec<(String, FieldId)> = fts
+            .fts_columns_config()
+            .filter_map(|c| Some((c.name.clone(), legacy.resolve_stored(c.field_id, &c.name)?)))
+            .collect();
         if columns.is_empty() {
             continue;
         }
@@ -200,7 +212,7 @@ where
                 what: "dict fetch",
                 source,
             })?;
-        for column in &columns {
+        for (column, column_id) in &columns {
             let term_bytes = fts
                 .iter_column_terms_with(&dict_bytes, column)
                 .map_err(|source| TermStatsError::Read {
@@ -220,7 +232,7 @@ where
                         source,
                     })?;
                 for (term, df) in chunk.iter().zip(dfs) {
-                    *merged.entry(make_key(column, term)).or_insert(0) += df;
+                    *merged.entry(column_id.term_key(term)).or_insert(0) += df;
                 }
             }
         }
@@ -274,12 +286,30 @@ mod tests {
         supertable::{
             manifest::{SuperfileUri, VectorLayout},
             reader_cache::disk::test_support::tiny_superfile_bytes,
+            schema::TableSchema,
         },
-        test_helpers::{decimal128_id_field, decimal128_ids},
+        test_helpers::{decimal128_id_field, decimal128_ids, fid, old_format_fts_fixture},
     };
+
+    /// The table schema the indexed fixture is written under: one text
+    /// column, `title`.
+    fn title_table() -> TableSchema {
+        TableSchema::from_user_schema(&Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]))
+    }
+
+    fn title_id() -> FieldId {
+        title_table()
+            .id_of("title")
+            .expect("title is a table column")
+    }
 
     fn entry() -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: TestUuid::new_v4(),
@@ -310,7 +340,7 @@ mod tests {
         let mut previous: Option<Weak<SuperfileReader>> = None;
         let mut opened = 0usize;
 
-        let bytes = build(&entries, |_entry| {
+        let bytes = build(&entries, &LegacyNames::none(), |_entry| {
             if let Some(prior) = previous.as_ref() {
                 assert!(
                     prior.upgrade().is_none(),
@@ -338,11 +368,16 @@ mod tests {
 
     /// Build a superfile carrying an FTS index, so the df walk actually runs.
     /// `tiny_superfile_bytes` has no FTS blob and is skipped by the build.
+    /// The schema is stamped with the table's ids, as the supertable writer
+    /// stamps it, so the footer names `title` by its id.
     fn indexed_superfile_bytes() -> Bytes {
-        let schema = Arc::new(Schema::new(vec![
-            decimal128_id_field("doc_id"),
-            Field::new("title", DataType::LargeUtf8, false),
-        ]));
+        let schema = title_table().stamp_field_ids(
+            &Schema::new(vec![
+                decimal128_id_field("doc_id"),
+                Field::new("title", DataType::LargeUtf8, false),
+            ]),
+            "doc_id",
+        );
         let opts = BuilderOptions::new(
             Arc::clone(&schema),
             "doc_id",
@@ -370,12 +405,14 @@ mod tests {
                 .map_err(|e| TermStatsError::Open(QueryError::from(e)))
         };
 
+        // A stamped column needs no name map: the footer's id keys it.
+        let legacy = LegacyNames::none();
         let one = vec![entry()];
         let side_one = TermStatsSidecar::decode(Bytes::from(
-            build(&one, open_indexed).await.expect("build one"),
+            build(&one, &legacy, open_indexed).await.expect("build one"),
         ))
         .expect("decode one");
-        let df_one = side_one.df("title", "rust");
+        let df_one = side_one.df(title_id(), "rust");
         assert!(
             df_one > 0,
             "the fixture must contribute a df for the walked term"
@@ -384,12 +421,14 @@ mod tests {
         let n = 4;
         let many: Vec<Arc<SuperfileEntry>> = (0..n).map(|_| entry()).collect();
         let side_many = TermStatsSidecar::decode(Bytes::from(
-            build(&many, open_indexed).await.expect("build many"),
+            build(&many, &legacy, open_indexed)
+                .await
+                .expect("build many"),
         ))
         .expect("decode many");
 
         assert_eq!(
-            side_many.df("title", "rust"),
+            side_many.df(title_id(), "rust"),
             df_one * n as u64,
             "df must be the sum over superfiles, so every reader's contribution counts"
         );
@@ -398,7 +437,7 @@ mod tests {
             n,
             "every superfile must be recorded as covered"
         );
-        assert_eq!(side_many.df("title", "absent"), 0);
+        assert_eq!(side_many.df(title_id(), "absent"), 0);
     }
 
     /// An opener failure must surface rather than yield a sidecar that
@@ -406,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn build_propagates_an_open_failure() {
         let entries = vec![entry()];
-        let result = build(&entries, |_entry| async {
+        let result = build(&entries, &LegacyNames::none(), |_entry| async {
             Err(TermStatsError::Open(QueryError::PermissionDenied(
                 "open refused".into(),
             )))
@@ -425,17 +464,64 @@ mod tests {
     fn round_trips_covered_ids_and_dfs() {
         let ids = vec![Uuid::from_u128(7), Uuid::from_u128(3)];
         let mut entries = BTreeMap::new();
-        entries.insert(make_key("title", "alpha"), 41);
-        entries.insert(make_key("title", "beta"), 1);
-        entries.insert(make_key("body", "alpha"), 9);
+        entries.insert(fid("title").term_key("alpha"), 41);
+        entries.insert(fid("title").term_key("beta"), 1);
+        entries.insert(fid("body").term_key("alpha"), 9);
         let bytes = encode(&ids, &entries);
         let side = TermStatsSidecar::decode(Bytes::from(bytes)).expect("decode");
         assert_eq!(side.covered(), ids.as_slice());
-        assert_eq!(side.df("title", "alpha"), 41);
-        assert_eq!(side.df("title", "beta"), 1);
-        assert_eq!(side.df("body", "alpha"), 9);
-        assert_eq!(side.df("title", "missing"), 0);
-        assert_eq!(side.df("other", "alpha"), 0);
+        assert_eq!(side.df(fid("title"), "alpha"), 41);
+        assert_eq!(side.df(fid("title"), "beta"), 1);
+        assert_eq!(side.df(fid("body"), "alpha"), 9);
+        assert_eq!(side.df(fid("title"), "missing"), 0);
+        assert_eq!(side.df(fid("other"), "alpha"), 0);
+    }
+
+    /// A superfile written before field ids names `title` only by name;
+    /// the build files its terms under the id the table's schema gives
+    /// that name, which is what the query side asks for.
+    #[tokio::test]
+    async fn build_keys_an_unstamped_superfile_by_its_resolved_id() {
+        let path = old_format_fts_fixture()
+            .join("data/seg-faba22e9-d559-4536-8360-61a2bd90c074.sf.parquet");
+        let bytes = Bytes::from(std::fs::read(path).expect("fixture superfile"));
+        let n_docs = SuperfileReader::open(bytes.clone()).expect("open").n_docs();
+        let legacy = LegacyNames::new(Arc::new(title_table()), "_id");
+        let built = build(&[entry()], &legacy, |_entry| {
+            let bytes = bytes.clone();
+            async move {
+                SuperfileReader::open(bytes)
+                    .map(Arc::new)
+                    .map_err(|e| TermStatsError::Open(QueryError::Store(e.to_string())))
+            }
+        })
+        .await
+        .expect("build");
+        let side = TermStatsSidecar::decode(Bytes::from(built)).expect("decode");
+        assert_eq!(
+            side.df(title_id(), "shared"),
+            n_docs,
+            "every fixture row holds `shared`, filed under `title`'s id"
+        );
+    }
+
+    /// The fixture's own sidecar predates id keys. It is refused on its
+    /// version, so a query reads df from the dictionaries until maintenance
+    /// republishes it, rather than looking ids up among names.
+    #[test]
+    fn a_name_keyed_sidecar_is_refused_on_its_version() {
+        let dir = old_format_fts_fixture().join("term-stats");
+        let artifact = std::fs::read_dir(dir)
+            .expect("fixture sidecar dir")
+            .next()
+            .expect("one artifact")
+            .expect("entry")
+            .path();
+        let bytes = Bytes::from(std::fs::read(artifact).expect("fixture sidecar"));
+        assert!(matches!(
+            TermStatsSidecar::decode(bytes),
+            Err(TermStatsError::Malformed(m)) if m.contains("unsupported version 1")
+        ));
     }
 
     #[test]

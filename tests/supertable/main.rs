@@ -54,6 +54,7 @@ mod reindex;
 mod reindex_crash;
 mod reindex_fixture;
 mod reindex_invariance;
+mod schema;
 mod storage;
 mod unreadable_index;
 mod update_crash_property;

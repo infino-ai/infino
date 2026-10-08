@@ -12,6 +12,7 @@ use std::str::from_utf8;
 use super::cursor::{TermCursor, TermMeta};
 use super::{
     core::*,
+    cursor::CursorUse,
     filter::AtomExcludeFilter,
     options::BoolMode,
     phrase::AnyCursor,
@@ -160,9 +161,10 @@ impl FtsReader {
         mode: BoolMode,
     ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        // Unranked: idf is irrelevant to the match set, so build local.
+        // Unranked: built to match, so no global idf and no norms; the
+        // column's length array is never read.
         let (built, dict_ranges) = self
-            .build_atom_cursors(column_id, terms, phrases, None, None)
+            .build_atom_cursors(column_id, terms, phrases, None, None, CursorUse::Match)
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
         let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
@@ -194,9 +196,10 @@ impl FtsReader {
         neg_phrases: &[Phrase<String>],
     ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        // Unranked: idf is irrelevant to the match set, so build local.
+        // Unranked: built to match, so no global idf and no norms; the
+        // column's length array is never read.
         let (built, dict_ranges) = self
-            .build_atom_cursors(column_id, terms, phrases, None, None)
+            .build_atom_cursors(column_id, terms, phrases, None, None, CursorUse::Match)
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
         let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
@@ -213,7 +216,14 @@ impl FtsReader {
         let mut filter = None;
         if !neg_terms.is_empty() || !neg_phrases.is_empty() {
             let (neg_built, neg_dict_ranges) = self
-                .build_atom_cursors(column_id, neg_terms, neg_phrases, None, None)
+                .build_atom_cursors(
+                    column_id,
+                    neg_terms,
+                    neg_phrases,
+                    None,
+                    None,
+                    CursorUse::Match,
+                )
                 .await?;
             let neg_atoms: Vec<AnyCursor> = neg_built.into_iter().flatten().collect();
             // Count the negated clause's posting work the same way the
@@ -286,7 +296,7 @@ impl FtsReader {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true, None, prefetched)
+            .build_term_cursors(column_id, tokens, None, CursorUse::Count, None, prefetched)
             .await?;
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
@@ -342,7 +352,7 @@ impl FtsReader {
             return Ok((0, MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true, None, prefetched)
+            .build_term_cursors(column_id, tokens, None, CursorUse::Count, None, prefetched)
             .await?;
         let mut work = MatchWork::for_cursors(&cursors);
         work.planned_ranges += dictionary_fetches(tokens, prefetched);
@@ -406,7 +416,15 @@ impl FtsReader {
             .map(|token| dict.lookup(&make_key(&col_meta.name, token)))
             .collect();
         let cursors = self
-            .build_term_cursors_opt(column_id, tokens, None, false, None, None, Some(dict_bytes))
+            .build_term_cursors_opt(
+                column_id,
+                tokens,
+                None,
+                CursorUse::Score,
+                None,
+                None,
+                Some(dict_bytes),
+            )
             .await?;
         Ok(entries
             .into_iter()
@@ -681,7 +699,7 @@ impl FtsReader {
             }));
         }
         let meta = TermMeta::parse(bytes.as_ref(), 0, col_meta.positions)?;
-        let cursor = TermCursor::new(bytes, col_meta, None, 1, true)?;
+        let cursor = TermCursor::new(bytes, col_meta, None, 1, CursorUse::Count)?;
         let mut layout = TermLayout {
             df: meta.df,
             num_blocks: meta.num_blocks,
@@ -993,7 +1011,7 @@ mod tests {
         // Prove `mix` really has both encodings — else the test silently checks
         // nothing about the transition.
         let cursors = r
-            .build_term_cursors(0, &["mix"], None, true, None, None)
+            .build_term_cursors(0, &["mix"], None, CursorUse::Count, None, None)
             .await
             .expect("build cursors");
         let mix = &cursors[0];

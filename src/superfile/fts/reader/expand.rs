@@ -13,7 +13,12 @@ use std::{borrow::Cow, mem::size_of, str, sync::Arc};
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 
-use super::{core::*, cursor::TermCursor, metadata::ColumnMeta, work::MatchWork};
+use super::{
+    core::*,
+    cursor::{CursorUse, TermCursor},
+    metadata::ColumnMeta,
+    work::MatchWork,
+};
 use crate::{
     memory::{ConnectionMemoryBudget, OverBudget, Reservation},
     runtime_bridge::run_on_pool,
@@ -675,8 +680,14 @@ impl FtsReader {
                 timed_section(|| {
                     let mut scratch = [0u32; BLOCK_LEN];
                     for (bytes, short) in fetched.into_iter().zip(forms) {
-                        let cursor =
-                            TermCursor::for_body(bytes, short, &col, None, UNWEIGHTED, true)?;
+                        let cursor = TermCursor::for_body(
+                            bytes,
+                            short,
+                            &col,
+                            None,
+                            UNWEIGHTED,
+                            CursorUse::Count,
+                        )?;
                         // The bitset spans this blob's documents; a list
                         // reaching past them is a damaged blob, refused
                         // before it can index out of the bitset.

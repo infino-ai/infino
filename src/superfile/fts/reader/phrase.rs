@@ -198,7 +198,12 @@ impl PhraseCursor {
             .zip(positions)
             .zip(positional)
             .map(|((cursor, positions), (term_meta, inline_position))| {
-                min_scaled_bound = min_scaled_bound.min(cursor.term_max_bm25 / cursor.idf_weight);
+                // An unscored member (built to match, not rank) has no idf
+                // and no bound to scale.
+                if cursor.idf_weight > 0.0 {
+                    min_scaled_bound =
+                        min_scaled_bound.min(cursor.term_max_bm25 / cursor.idf_weight);
+                }
                 idf_sum += cursor.idf_weight;
                 PhraseMember {
                     probe: cursor.clone(),
@@ -218,7 +223,11 @@ impl PhraseCursor {
         align_order.sort_by_key(|&i| members[i].cursor.block_count());
         let mut cursor = Self {
             idf_weight: idf_sum,
-            term_max_bm25: idf_sum * min_scaled_bound,
+            // An unscored phrase has no idf, so no bound either.
+            term_max_bm25: match idf_sum > 0.0 {
+                true => idf_sum * min_scaled_bound,
+                false => 0.0,
+            },
             members,
             position_offsets: offsets,
             align_order,
@@ -516,6 +525,12 @@ impl PhraseCursor {
     /// Phrase-scaled block-level upper bound over `[range_start,
     /// range_end]` — the block analog of `term_max_bm25`.
     pub(super) fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
+        // Each member's bound is divided by its idf, which an unscored
+        // phrase does not have; only ranked walks ask for this bound.
+        debug_assert!(
+            self.idf_weight > 0.0,
+            "an unscored phrase has no block bound"
+        );
         let mut min_scaled = f32::INFINITY;
         for m in self.members.iter_mut() {
             let b = m.cursor.block_max_in_range(range_start, range_end);
@@ -657,7 +672,7 @@ mod tests {
     use crate::superfile::{
         fts::{
             builder::FtsBuilder,
-            reader::{FtsReader, core::ClauseLists},
+            reader::{FtsReader, core::ClauseLists, cursor::CursorUse},
             tokenize::Phrase,
         },
         id_space::FtsDocId,
@@ -889,7 +904,7 @@ mod tests {
         let phrases = phrase(&["the", "mid", "rare"]);
         let build = || async {
             let (mut atoms, _) = r
-                .build_atom_cursors(0, &[], &phrases, None, None)
+                .build_atom_cursors(0, &[], &phrases, None, None, CursorUse::Score)
                 .await
                 .expect("atoms");
             match atoms.remove(0).expect("phrase present") {
@@ -1207,10 +1222,11 @@ mod tests {
     const RARE_MATCH_FIRST: u32 = 700;
     const RARE_MATCH_SECOND: u32 = 1400;
 
-    /// The one phrase cursor `terms` builds on `r`'s first column.
-    async fn phrase_cursor(r: &FtsReader, terms: &[&str]) -> PhraseCursor {
+    /// The one phrase cursor `terms` builds on `r`'s first column, for
+    /// `purpose`.
+    async fn phrase_cursor(r: &FtsReader, terms: &[&str], purpose: CursorUse) -> PhraseCursor {
         let (atoms, _) = r
-            .build_atom_cursors(0, &[], &phrase(terms), None, None)
+            .build_atom_cursors(0, &[], &phrase(terms), None, None, purpose)
             .await
             .expect("build atoms");
         match atoms.into_iter().next().flatten() {
@@ -1230,6 +1246,16 @@ mod tests {
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 
+    /// A phrase built to match, not rank, carries no idf and a 0 bound:
+    /// dividing its members' bounds by their 0 idf would make the bound NaN.
+    #[tokio::test]
+    async fn an_unscored_phrase_has_no_idf_and_a_zero_bound() {
+        let r = open_positional(["x y", "y x", "x y z"].into_iter().map(String::from));
+        let pc = phrase_cursor(&r, &["x", "y"], CursorUse::Match).await;
+        assert_eq!(pc.idf_weight, 0.0);
+        assert_eq!(pc.term_max_bm25, 0.0);
+    }
+
     /// A phrase whose rare member drives the alignment and whose common
     /// member must be seeked several blocks forward per candidate: the
     /// cursor lands on each verified match and skips the reversed
@@ -1244,7 +1270,7 @@ mod tests {
             _ => "x".to_string(),
         }));
         let norms = r.columns[0].dl_norm_k1();
-        let mut pc = phrase_cursor(&r, &["x", "y"]).await;
+        let mut pc = phrase_cursor(&r, &["x", "y"], CursorUse::Score).await;
         assert!(
             pc.members[0].cursor.block_count() > 8,
             "premise: the common member spans many blocks"
@@ -1276,7 +1302,7 @@ mod tests {
                 .map(str::to_string),
         );
         let norms = r.columns[0].dl_norm_k1();
-        let mut pc = phrase_cursor(&r, &["a", "a"]).await;
+        let mut pc = phrase_cursor(&r, &["a", "a"], CursorUse::Score).await;
         let mut seen: Vec<(u32, u32)> = Vec::new();
         while !pc.is_exhausted() {
             seen.push((pc.current_doc_id(), pc.current_tf));
@@ -1298,7 +1324,7 @@ mod tests {
                 .map(str::to_string),
         );
         let norms = r.columns[0].dl_norm_k1();
-        let mut pc = phrase_cursor(&r, &["p", "q", "r"]).await;
+        let mut pc = phrase_cursor(&r, &["p", "q", "r"], CursorUse::Score).await;
         let mut seen: Vec<(u32, u32)> = Vec::new();
         while !pc.is_exhausted() {
             seen.push((pc.current_doc_id(), pc.current_tf));

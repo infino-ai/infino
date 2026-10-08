@@ -58,6 +58,46 @@ export type SchemaDescriptor = Record<string, string | { vector: number }>;
 /** Accepted shapes for `Table.append`. */
 export type AppendData = RowRecord[] | arrow.Table | arrow.RecordBatch | Buffer | Uint8Array;
 
+/** A column's index in the schema document: full-text or vector. */
+export type ColumnIndex =
+  | { kind: "fts"; stopwords?: string; stemmer?: string; positions: boolean; stored: boolean; k1: number; b: number }
+  | { kind: "vector"; metric: Metric; rot_seed: string; rerank_codec: string };
+/** One field of the schema document. `type` is the document's type vocabulary (`"i64"`, `"large_utf8"`, …); a vector column carries `dim`. */
+export interface SchemaField {
+  id: number;
+  name: string;
+  type: string;
+  dim?: number;
+  nullable: boolean;
+  index?: ColumnIndex;
+  converting_from?: { type: string; dim?: number };
+}
+/** The schema document `Connection.schema` returns. */
+export interface TableSchema {
+  schema_id: number;
+  last_field_id: number;
+  max_fields: number;
+  max_depth: number;
+  fields: SchemaField[];
+  tombstoned: number[];
+}
+/** One field of a schema patch: a new column (`type` required), or a change to a live one addressed by `id` or `name`. */
+export interface SchemaFieldPatch {
+  id?: number;
+  name: string;
+  type?: string;
+  dim?: number;
+  nullable?: boolean;
+  index?: ColumnIndex;
+  dropped?: boolean;
+}
+/** What `Connection.schema(name, patch)` accepts: the document's own shape, every key optional. */
+export interface SchemaPatch {
+  fields?: SchemaFieldPatch[];
+  max_fields?: number;
+  max_depth?: number;
+}
+
 /**
  * Storage and cache config the `connect` URI can't carry. All optional.
  *
@@ -356,32 +396,74 @@ function buildColumn(field: arrow.Field, rows: RowRecord[]): arrow.Vector {
   return arrow.vectorFromArray(values, field.type);
 }
 
-// Normalize append input -> IPC bytes. An array of objects, or an
-// apache-arrow Table / RecordBatch (normalized to rows via its own
-// `toArray()`/`toJSON()`); either way the columns are rebuilt in our arrow
-// instance from the declared schema. (We can't feed the consumer's Table
-// straight into our `tableToIPC` — a different module instance isn't
-// recognized.)
-function dataToIpc(data: AppendData, getSchema: () => arrow.Schema): Buffer {
-  if (Buffer.isBuffer(data)) return data;
-  if (data instanceof Uint8Array) return Buffer.from(data);
+// Append / update input, sorted by how it reaches the engine: Arrow-typed
+// data (an apache-arrow Table / RecordBatch, or IPC bytes) as a batch, and
+// records as JSON text, which the engine maps to columns itself (nested
+// objects flatten to dot paths, arrays become list columns, a new key adds
+// a column typed from its values). `JSON.stringify` is what keeps a JS `5`
+// an integer literal and a `5.5` a float literal on the way in.
+//
+// A consumer's Table may come from another apache-arrow module instance,
+// which our `tableToIPC` does not recognize, so it is rebuilt here under
+// its own schema (types translated into our instance) from its rows.
+type WriteInput = { ipc: Buffer } | { rows: string };
 
-  let rows: RowRecord[];
-  const d = data as any;
-  if (Array.isArray(data)) {
-    rows = data as RowRecord[];
-  } else if (d && (Array.isArray(d.batches) || (d.schema && typeof d.numRows === "number"))) {
-    rows = Array.from(d).map((r: any) => r.toJSON() as RowRecord);
-  } else {
-    throw new TypeError(
-      "append: expected an array of objects, an apache-arrow Table / RecordBatch, or an Arrow IPC Buffer",
-    );
+// A `bigint` has no JSON form, so it travels as a one-key object the
+// replacer alone can produce and is then spliced back to the integer
+// literal it is — exact, and an integer rather than a float or a string.
+// A string in the data cannot be mistaken for one: `JSON.stringify`
+// escapes the quotes of a user's string, and the pattern below matches
+// only unescaped ones.
+const BIGINT_KEY = "$infino$bigint";
+function rowsToJson(rows: RowRecord[]): string {
+  const text = JSON.stringify(rows, (_key, value) =>
+    typeof value === "bigint" ? { [BIGINT_KEY]: value.toString() } : value,
+  );
+  return text.replace(/\{"\$infino\$bigint":"(-?\d+)"\}/g, "$1");
+}
+
+// Values JSON has no faithful spelling for. A `Buffer` stringifies to
+// `{"type":"Buffer","data":[...]}` and a `Date` to a string, so neither
+// throws on the document path and neither arrives as what it was. Rows
+// carrying them are refused with the route that does carry them, rather
+// than written as the object or the string JSON turned them into.
+function unspellableValue(rows: RowRecord[]): string | undefined {
+  for (const row of rows) {
+    for (const value of Object.values(row as Record<string, unknown>)) {
+      if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) return "a Buffer";
+      if (value instanceof Uint8Array) return "a Uint8Array";
+      if (value instanceof Date) return "a Date";
+    }
   }
+  return undefined;
+}
 
-  const schema = getSchema();
-  const cols: Record<string, arrow.Vector> = {};
-  for (const field of schema.fields) cols[field.name] = buildColumn(field, rows);
-  return Buffer.from(arrow.tableToIPC(new arrow.Table(cols), STREAM));
+function writeInput(data: AppendData): WriteInput {
+  if (Buffer.isBuffer(data)) return { ipc: data };
+  if (data instanceof Uint8Array) return { ipc: Buffer.from(data) };
+  if (Array.isArray(data)) {
+    const unspellable = unspellableValue(data);
+    if (unspellable) {
+      throw new TypeError(
+        `append: ${unspellable} has no document form and would be written as what JSON ` +
+          "turned it into; pass an apache-arrow Table or RecordBatch to keep its type",
+      );
+    }
+    return { rows: rowsToJson(data) };
+  }
+  const d = data as any;
+  if (d && (Array.isArray(d.batches) || (d.schema && typeof d.numRows === "number"))) {
+    const rows = Array.from(d).map((r: any) => r.toJSON() as RowRecord);
+    const fields: arrow.Field[] = d.schema.fields.map(
+      (f: any) => new arrow.Field(f.name, nativeTypeFromForeign(f.type), f.nullable),
+    );
+    const cols: Record<string, arrow.Vector> = {};
+    for (const field of fields) cols[field.name] = buildColumn(field, rows);
+    return { ipc: Buffer.from(arrow.tableToIPC(new arrow.Table(cols), STREAM)) };
+  }
+  throw new TypeError(
+    "append: expected an array of objects, an apache-arrow Table / RecordBatch, or an Arrow IPC Buffer",
+  );
 }
 
 // A Decimal128 value renders as a 4×u32 little-endian array in records.
@@ -470,8 +552,8 @@ export class Table {
    * append == one commit.
    */
   append(data: AppendData): void {
-    const ipc = dataToIpc(data, () => this.schema());
-    guard(this.remote, () => this.inner.append(ipc));
+    const input = writeInput(data);
+    guard(this.remote, () => ("rows" in input ? this.inner.appendRows(input.rows) : this.inner.append(input.ipc)));
   }
 
   /**
@@ -483,8 +565,10 @@ export class Table {
    * a hosted table.
    */
   appendNamed(data: AppendData, sourceName: string): void {
-    const ipc = dataToIpc(data, () => this.schema());
-    guard(this.remote, () => this.inner.appendNamed(ipc, sourceName));
+    const input = writeInput(data);
+    guard(this.remote, () =>
+      "rows" in input ? this.inner.appendRowsNamed(input.rows, sourceName) : this.inner.appendNamed(input.ipc, sourceName),
+    );
   }
 
   /** Ranked BM25 search; rows as records (or an Arrow `Table`). `score` is a
@@ -548,8 +632,10 @@ export class Table {
    * `data` (same shapes as `append`), 1:1 — the matched count must equal the
    * replacement-row count. Requires durable storage (not `memory://`). */
   update(predicate: string, data: AppendData): MutationStats {
-    const ipc = dataToIpc(data, () => this.schema());
-    return guard(this.remote, () => this.inner.update(predicate, ipc));
+    const input = writeInput(data);
+    return guard(this.remote, () =>
+      "rows" in input ? this.inner.updateRows(predicate, input.rows) : this.inner.update(predicate, input.ipc),
+    );
   }
 
   /** Delete rows matching a SQL predicate (e.g. `"status = 'spam'"`).
@@ -639,6 +725,23 @@ export class Connection {
 
   openTable(name: string): Table {
     return new Table(guard(this.remote, () => this.inner.openTable(name)), this.remote);
+  }
+
+  /**
+   * The schema document of `name`: its fields with ids, types, nullability
+   * and indexes, the field cap and the `schema_id`. With `patch` (the same
+   * shape), merge it into the schema — or create the table from it when
+   * there is none — and return the document afterwards. A field is matched
+   * by `id` when it carries one and by `name` otherwise; an unmatched field
+   * is added, a different type changes the column, `dropped: true` retires
+   * it, and a field not mentioned is untouched. `expectedSchemaId` is a
+   * compare-and-set against the current `schema_id`.
+   */
+  schema(name: string, patch?: SchemaPatch, expectedSchemaId?: number): TableSchema {
+    const text = guard(this.remote, () =>
+      this.inner.schema(name, patch === undefined ? undefined : JSON.stringify(patch), expectedSchemaId),
+    );
+    return JSON.parse(text) as TableSchema;
   }
 
   /** Drop a table. `purge` defaults to `true`, which also deletes the table's storage; pass `false` to only unregister it and keep the bytes. */

@@ -125,7 +125,8 @@ live on the [`Connection`] and [`Supertable`] pages:
     [`count`](Supertable::count). Each search returns Arrow rows as
     `Vec<RecordBatch>`.
   - **Write** — [`append`](Supertable::append),
-    [`update`](Supertable::update), [`delete`](Supertable::delete).
+    [`update`](Supertable::update), [`delete`](Supertable::delete), and the
+    experimental SQL-only bulk load [`hydrate`](Supertable::hydrate).
   - **Maintain** — [`optimize`](Supertable::optimize),
     [`gc`](Supertable::gc), and [`schema`](Supertable::schema).
   - **Repair** — [`reindex`](Supertable::reindex) brings stale superfiles'

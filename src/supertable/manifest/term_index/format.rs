@@ -66,8 +66,10 @@ use crate::{
 pub(crate) const ROOT_MAGIC: &[u8; 8] = b"INFTIDX1";
 /// Identifies a slice file and its major layout family.
 pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
-/// Layout version of the root. `2` added each superfile's smallest doc id.
-pub(crate) const ROOT_FORMAT_VERSION: u32 = 2;
+/// Layout version of the root. `2` added each superfile's smallest doc id;
+/// `3` keys terms by the column's field id instead of its name. A root at
+/// an older version does not decode: the index is rebuilt, not translated.
+pub(crate) const ROOT_FORMAT_VERSION: u32 = 3;
 /// Layout version of a slice.
 pub(crate) const SLICE_FORMAT_VERSION: u32 = 1;
 
@@ -705,6 +707,13 @@ mod tests {
         previous[MAGIC_LEN..MAGIC_LEN + U32_LEN].copy_from_slice(&1u32.to_le_bytes());
         assert!(
             matches!(Root::decode(&previous), Err(TermIndexError::Malformed(m)) if m.contains("unsupported version 1"))
+        );
+        // The layout before this one keyed terms by column name; a root
+        // written by it is refused the same way and the index rebuilt.
+        let mut named = bytes.clone();
+        named[MAGIC_LEN..MAGIC_LEN + U32_LEN].copy_from_slice(&2u32.to_le_bytes());
+        assert!(
+            matches!(Root::decode(&named), Err(TermIndexError::Malformed(m)) if m.contains("unsupported version 2"))
         );
         let mut trailing = bytes.clone();
         trailing.push(0);

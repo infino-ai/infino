@@ -1334,7 +1334,7 @@ mod tests {
         let dim = 16;
         let st = supertable_one_superfile(dim, 8);
         let reader = Arc::new(st.reader().expect("reader"));
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         use crate::supertable::query::exec::common::test_support::{call_tvf, scoped_inner};
         let func = VectorSearchFunc::new(reader, scalar_schema);
         let table = call_tvf(&func, &[lit("emb"), lit(csv_one_hot(dim, 0)), lit(5_i64)])

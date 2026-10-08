@@ -193,7 +193,10 @@ mod tests {
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
-        builder::FtsBuilder, posting::BLOCK_LEN, reader::FtsReader, tokenize::Phrase,
+        builder::FtsBuilder,
+        posting::BLOCK_LEN,
+        reader::{FtsReader, cursor::CursorUse},
+        tokenize::Phrase,
     };
 
     // ── ExcludeFilter (negation gate) ─────────────────────────────────
@@ -203,7 +206,7 @@ mod tests {
     async fn exclude_filter_for(reader: &FtsReader, terms: &[&str]) -> ExcludeFilter {
         let column_id = reader.resolve_column_id("body").expect("column exists");
         let cursors = reader
-            .build_term_cursors(column_id, terms, None, false, None, None)
+            .build_term_cursors(column_id, terms, None, CursorUse::Count, None, None)
             .await
             .expect("build cursors");
         ExcludeFilter::new(cursors)
@@ -243,7 +246,7 @@ mod tests {
         let column_id = r.resolve_column_id("body").expect("column exists");
         // Negate "rust" (docs 0 and 1); allow docs 1 and 2 only.
         let cursors = r
-            .build_term_cursors(column_id, &["rust"], None, false, None, None)
+            .build_term_cursors(column_id, &["rust"], None, CursorUse::Score, None, None)
             .await
             .expect("build cursors");
         let allow: RoaringBitmap = [1u32, 2].into_iter().collect();
@@ -274,7 +277,7 @@ mod tests {
         let r = edge_reader();
         let column_id = r.resolve_column_id("body").expect("column exists");
         let (atoms, _) = r
-            .build_atom_cursors(column_id, &["neg"], &[], None, None)
+            .build_atom_cursors(column_id, &["neg"], &[], None, None, CursorUse::Match)
             .await
             .expect("build atoms");
         // `neg` is in every even row; allow rows 0..4 only.
@@ -369,7 +372,7 @@ mod tests {
         let r = edge_reader();
         let column_id = r.resolve_column_id("body").expect("column exists");
         let cursors = r
-            .build_term_cursors(column_id, &["neg"], None, false, None, None)
+            .build_term_cursors(column_id, &["neg"], None, CursorUse::Score, None, None)
             .await
             .expect("build cursors");
         let edges: Vec<u32> = cursors[0].blocks.iter().map(|b| b.last_doc_id).collect();
@@ -416,7 +419,7 @@ mod tests {
         let column_id = r.resolve_column_id("body").expect("column exists");
         let phrases = vec![Phrase::adjacent(vec!["a".to_string(), "b".to_string()])];
         let (atoms, _) = r
-            .build_atom_cursors(column_id, &[], &phrases, None, None)
+            .build_atom_cursors(column_id, &[], &phrases, None, None, CursorUse::Match)
             .await
             .expect("build atoms");
         let atoms: Vec<AnyCursor> = atoms.into_iter().flatten().collect();
@@ -440,7 +443,7 @@ mod tests {
         let r = edge_reader();
         let column_id = r.resolve_column_id("body").expect("column exists");
         let (atoms, _) = r
-            .build_atom_cursors(column_id, &["neg"], &[], None, None)
+            .build_atom_cursors(column_id, &["neg"], &[], None, None, CursorUse::Match)
             .await
             .expect("build atoms");
         let mut f = AtomExcludeFilter::new(atoms.into_iter().flatten().collect());

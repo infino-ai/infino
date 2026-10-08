@@ -260,11 +260,17 @@ python-examples-test:
 	# package ships a compatible release, so it is gated on a compat probe and
 	# skipped (with a note) rather than hard-failing when it isn't ready yet.
 	# Direct-infino examples always run; LLM notebooks degrade to a note w/o a key.
+	# Kernels talk over Unix sockets in a per-notebook temp dir, not TCP: over
+	# TCP, jupyter_client picks a free port and releases it before the kernel
+	# binds it, so concurrent kernels can grab the same port and one fails with
+	# "Address already in use".
 	@PYTHONPATH=infino-python/examples infino-python/.venv/bin/python \
 		infino-python/examples/_shared/select_example_notebooks.py | \
 	PY=infino-python/.venv/bin/python xargs -P $(CONCURRENT_EXAMPLE_TESTS) -I {} \
-		sh -c 'echo "executing {}"; "$$PY" -m nbconvert --to notebook --execute \
-			--stdout --ExecutePreprocessor.timeout=900 "{}" >/dev/null'; \
+		sh -c 'echo "executing {}"; d=$$(mktemp -d); "$$PY" -m nbconvert --to notebook --execute \
+			--stdout --ExecutePreprocessor.timeout=900 \
+			--KernelManager.transport=ipc --KernelManager.ip="$$d/kernel" "{}" >/dev/null; \
+			rc=$$?; rm -rf "$$d"; exit $$rc'; \
 	status=$$?; \
 	rm -rf infino-python/examples/*/*_data infino-python/examples/_shared/__pycache__; \
 	exit $$status

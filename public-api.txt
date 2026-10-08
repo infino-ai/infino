@@ -1,6 +1,7 @@
 pub mod infino
 pub use infino::arrow_array
 pub use infino::arrow_schema
+pub use infino::serde_json
 pub enum infino::BoolMode
 pub infino::BoolMode::And
 pub infino::BoolMode::Or
@@ -46,6 +47,31 @@ impl core::marker::Unpin for infino::ColdFetchMode
 impl core::marker::UnsafeUnpin for infino::ColdFetchMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
+#[non_exhaustive] pub enum infino::ColumnIndex
+pub infino::ColumnIndex::Fts
+pub infino::ColumnIndex::Fts::bm25: infino::Bm25Params
+pub infino::ColumnIndex::Fts::positions: bool
+pub infino::ColumnIndex::Fts::stemmer: infino::Stemmer
+pub infino::ColumnIndex::Fts::stopwords: infino::Stopwords
+pub infino::ColumnIndex::Fts::stored: bool
+pub infino::ColumnIndex::Vector
+pub infino::ColumnIndex::Vector::metric: infino::Metric
+pub infino::ColumnIndex::Vector::rerank_codec: infino::RerankCodec
+pub infino::ColumnIndex::Vector::rot_seed: u64
+impl core::clone::Clone for infino::ColumnIndex
+pub fn infino::ColumnIndex::clone(&self) -> Self
+impl core::cmp::PartialEq for infino::ColumnIndex
+pub fn infino::ColumnIndex::eq(&self, &Self) -> bool
+impl core::fmt::Debug for infino::ColumnIndex
+pub fn infino::ColumnIndex::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::ColumnIndex
+impl core::marker::Freeze for infino::ColumnIndex
+impl core::marker::Send for infino::ColumnIndex
+impl core::marker::Sync for infino::ColumnIndex
+impl core::marker::Unpin for infino::ColumnIndex
+impl core::marker::UnsafeUnpin for infino::ColumnIndex
+impl core::panic::unwind_safe::RefUnwindSafe for infino::ColumnIndex
+impl core::panic::unwind_safe::UnwindSafe for infino::ColumnIndex
 pub enum infino::Consistency
 pub infino::Consistency::BoundedStaleness(core::time::Duration)
 pub infino::Consistency::Snapshot
@@ -97,7 +123,7 @@ pub infino::InfinoError::NotFound(alloc::string::String)
 pub infino::InfinoError::OverBudget(alloc::string::String)
 pub infino::InfinoError::PermissionDenied(alloc::string::String)
 pub infino::InfinoError::Query(alloc::string::String)
-pub infino::InfinoError::Schema(alloc::string::String)
+pub infino::InfinoError::Schema(infino::SchemaError)
 pub infino::InfinoError::Unsupported(alloc::string::String)
 impl core::error::Error for infino::InfinoError
 impl core::fmt::Debug for infino::InfinoError
@@ -115,6 +141,9 @@ pub enum infino::Metric
 pub infino::Metric::Cosine
 pub infino::Metric::L2Sq
 pub infino::Metric::NegDot
+impl infino::Metric
+pub fn infino::Metric::from_name(&str) -> core::option::Option<Self>
+pub fn infino::Metric::name(self) -> &'static str
 impl core::clone::Clone for infino::Metric
 pub fn infino::Metric::clone(&self) -> Self
 impl core::cmp::Eq for infino::Metric
@@ -249,6 +278,130 @@ impl core::marker::Unpin for infino::ReindexTarget
 impl core::marker::UnsafeUnpin for infino::ReindexTarget
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ReindexTarget
 impl core::panic::unwind_safe::UnwindSafe for infino::ReindexTarget
+#[non_exhaustive] pub enum infino::RerankCodec
+pub infino::RerankCodec::Fp32
+pub infino::RerankCodec::RabitqOnly
+pub infino::RerankCodec::Sq16
+pub infino::RerankCodec::Sq16Adaptive
+pub infino::RerankCodec::Sq8FixedResidual
+pub infino::RerankCodec::Sq8Residual
+impl infino::RerankCodec
+pub const fn infino::RerankCodec::name(self) -> &'static str
+pub const fn infino::RerankCodec::supports_metric(self, infino::Metric) -> bool
+impl core::clone::Clone for infino::RerankCodec
+pub fn infino::RerankCodec::clone(&self) -> Self
+impl core::cmp::Eq for infino::RerankCodec
+impl core::cmp::PartialEq for infino::RerankCodec
+pub fn infino::RerankCodec::eq(&self, &Self) -> bool
+impl core::default::Default for infino::RerankCodec
+pub fn infino::RerankCodec::default() -> Self
+impl core::fmt::Debug for infino::RerankCodec
+pub fn infino::RerankCodec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for infino::RerankCodec
+pub fn infino::RerankCodec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for infino::RerankCodec
+pub fn infino::RerankCodec::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for infino::RerankCodec
+impl core::marker::StructuralPartialEq for infino::RerankCodec
+impl serde_core::ser::Serialize for infino::RerankCodec
+pub fn infino::RerankCodec::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for infino::RerankCodec
+pub fn infino::RerankCodec::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for infino::RerankCodec
+impl core::marker::Send for infino::RerankCodec
+impl core::marker::Sync for infino::RerankCodec
+impl core::marker::Unpin for infino::RerankCodec
+impl core::marker::UnsafeUnpin for infino::RerankCodec
+impl core::panic::unwind_safe::RefUnwindSafe for infino::RerankCodec
+impl core::panic::unwind_safe::UnwindSafe for infino::RerankCodec
+#[non_exhaustive] pub enum infino::SchemaError
+pub infino::SchemaError::BacksGlobalVectorIndex
+pub infino::SchemaError::BacksGlobalVectorIndex::column: alloc::string::String
+pub infino::SchemaError::CapExceeded
+pub infino::SchemaError::CapExceeded::cap: u32
+pub infino::SchemaError::CapExceeded::setting: alloc::string::String
+pub infino::SchemaError::CapExceeded::value: u32
+pub infino::SchemaError::ConversionInProgress
+pub infino::SchemaError::ConversionInProgress::column: alloc::string::String
+pub infino::SchemaError::DepthExceeded
+pub infino::SchemaError::DepthExceeded::cap: u32
+pub infino::SchemaError::DepthExceeded::path: alloc::string::String
+pub infino::SchemaError::DuplicateColumn
+pub infino::SchemaError::DuplicateColumn::name: alloc::string::String
+pub infino::SchemaError::FieldCapExceeded
+pub infino::SchemaError::FieldCapExceeded::cap: u32
+pub infino::SchemaError::FieldCapExceeded::current: u32
+pub infino::SchemaError::FieldCapExceeded::fields: alloc::vec::Vec<alloc::string::String>
+pub infino::SchemaError::IdentityChange
+pub infino::SchemaError::IdentityChange::attribute: alloc::string::String
+pub infino::SchemaError::IntegerNotExactInFloat
+pub infino::SchemaError::IntegerNotExactInFloat::column: alloc::string::String
+pub infino::SchemaError::IntegerNotExactInFloat::stored: f64
+pub infino::SchemaError::IntegerNotExactInFloat::value: i128
+pub infino::SchemaError::Invalid
+pub infino::SchemaError::Invalid::reason: alloc::string::String
+pub infino::SchemaError::InvalidIndex
+pub infino::SchemaError::InvalidIndex::column: alloc::string::String
+pub infino::SchemaError::InvalidIndex::reason: alloc::string::String
+pub infino::SchemaError::InvalidRow
+pub infino::SchemaError::InvalidRow::reason: alloc::string::String
+pub infino::SchemaError::InvalidRow::row: usize
+pub infino::SchemaError::InvalidType
+pub infino::SchemaError::InvalidType::column: alloc::string::String
+pub infino::SchemaError::InvalidType::reason: alloc::string::String
+pub infino::SchemaError::MissingColumn
+pub infino::SchemaError::MissingColumn::column: alloc::string::String
+pub infino::SchemaError::MixedArray
+pub infino::SchemaError::MixedArray::column: alloc::string::String
+pub infino::SchemaError::MixedArray::types: alloc::vec::Vec<alloc::string::String>
+pub infino::SchemaError::NameTaken
+pub infino::SchemaError::NameTaken::name: alloc::string::String
+pub infino::SchemaError::NestedArray
+pub infino::SchemaError::NestedArray::path: alloc::string::String
+pub infino::SchemaError::NotEmpty
+pub infino::SchemaError::NotEmpty::column: alloc::string::String
+pub infino::SchemaError::NullInNonNullable
+pub infino::SchemaError::NullInNonNullable::column: alloc::string::String
+pub infino::SchemaError::PathShadowsColumn
+pub infino::SchemaError::PathShadowsColumn::column: alloc::string::String
+pub infino::SchemaError::PathShadowsColumn::path: alloc::string::String
+pub infino::SchemaError::SchemaConflict
+pub infino::SchemaError::SchemaConflict::current: u32
+pub infino::SchemaError::SchemaConflict::expected: u32
+pub infino::SchemaError::TableExists
+pub infino::SchemaError::TableExists::name: alloc::string::String
+pub infino::SchemaError::TypeMismatch
+pub infino::SchemaError::TypeMismatch::column: alloc::string::String
+pub infino::SchemaError::TypeMismatch::frozen: arrow_schema::datatype::DataType
+pub infino::SchemaError::TypeMismatch::offered: arrow_schema::datatype::DataType
+pub infino::SchemaError::TypeRequired
+pub infino::SchemaError::TypeRequired::column: alloc::string::String
+pub infino::SchemaError::UnknownFieldId
+pub infino::SchemaError::UnknownFieldId::id: infino::FieldId
+pub infino::SchemaError::UnknownStructField
+pub infino::SchemaError::UnknownStructField::column: alloc::string::String
+pub infino::SchemaError::UnknownStructField::field: alloc::string::String
+pub infino::SchemaError::ValueOutOfRange
+pub infino::SchemaError::ValueOutOfRange::column: alloc::string::String
+pub infino::SchemaError::ValueOutOfRange::data_type: alloc::string::String
+pub infino::SchemaError::ValueOutOfRange::value: alloc::string::String
+impl core::clone::Clone for infino::SchemaError
+pub fn infino::SchemaError::clone(&self) -> Self
+impl core::cmp::PartialEq for infino::SchemaError
+pub fn infino::SchemaError::eq(&self, &Self) -> bool
+impl core::error::Error for infino::SchemaError
+impl core::fmt::Debug for infino::SchemaError
+pub fn infino::SchemaError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for infino::SchemaError
+pub fn infino::SchemaError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::SchemaError
+impl core::marker::Freeze for infino::SchemaError
+impl core::marker::Send for infino::SchemaError
+impl core::marker::Sync for infino::SchemaError
+impl core::marker::Unpin for infino::SchemaError
+impl core::marker::UnsafeUnpin for infino::SchemaError
+impl core::panic::unwind_safe::RefUnwindSafe for infino::SchemaError
+impl core::panic::unwind_safe::UnwindSafe for infino::SchemaError
 #[non_exhaustive] pub enum infino::Stemmer
 pub infino::Stemmer::English
 pub infino::Stemmer::None
@@ -416,12 +569,14 @@ impl core::panic::unwind_safe::RefUnwindSafe for infino::ConnectOptions
 impl core::panic::unwind_safe::UnwindSafe for infino::ConnectOptions
 pub struct infino::Connection
 impl infino::Connection
+pub fn infino::Connection::apply_schema(&self, &str, &infino::SchemaPatch, core::option::Option<u32>) -> core::result::Result<infino::TableSchema, infino::InfinoError>
 pub fn infino::Connection::create_database(&self) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Connection::create_table(&self, &str, arrow_schema::schema::SchemaRef, infino::IndexSpec) -> core::result::Result<infino::Supertable, infino::InfinoError>
 pub fn infino::Connection::drop_table(&self, &str, bool) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Connection::list_tables(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
 pub fn infino::Connection::open_table(&self, &str) -> core::result::Result<infino::Supertable, infino::InfinoError>
 pub fn infino::Connection::query_sql(&self, &str) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Connection::schema(&self, &str) -> core::result::Result<infino::TableSchema, infino::InfinoError>
 pub fn infino::Connection::update_storage_credentials(&self, &[(alloc::string::String, alloc::string::String)]) -> bool
 impl core::clone::Clone for infino::Connection
 pub fn infino::Connection::clone(&self) -> Self
@@ -432,6 +587,86 @@ impl core::marker::Unpin for infino::Connection
 impl core::marker::UnsafeUnpin for infino::Connection
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::Connection
 impl !core::panic::unwind_safe::UnwindSafe for infino::Connection
+#[non_exhaustive] pub struct infino::FieldDef
+pub infino::FieldDef::converting_from: core::option::Option<arrow_schema::datatype::DataType>
+pub infino::FieldDef::data_type: arrow_schema::datatype::DataType
+pub infino::FieldDef::id: infino::FieldId
+pub infino::FieldDef::index: core::option::Option<infino::ColumnIndex>
+pub infino::FieldDef::metadata: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub infino::FieldDef::name: alloc::string::String
+pub infino::FieldDef::nullable: bool
+impl core::clone::Clone for infino::FieldDef
+pub fn infino::FieldDef::clone(&self) -> Self
+impl core::cmp::PartialEq for infino::FieldDef
+pub fn infino::FieldDef::eq(&self, &Self) -> bool
+impl core::fmt::Debug for infino::FieldDef
+pub fn infino::FieldDef::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::FieldDef
+impl core::marker::Freeze for infino::FieldDef
+impl core::marker::Send for infino::FieldDef
+impl core::marker::Sync for infino::FieldDef
+impl core::marker::Unpin for infino::FieldDef
+impl core::marker::UnsafeUnpin for infino::FieldDef
+impl core::panic::unwind_safe::RefUnwindSafe for infino::FieldDef
+impl core::panic::unwind_safe::UnwindSafe for infino::FieldDef
+pub struct infino::FieldId(pub u32)
+impl infino::FieldId
+pub const infino::FieldId::BIRTH_VERSION: infino::FieldId
+pub const infino::FieldId::ID_COLUMN: infino::FieldId
+impl core::clone::Clone for infino::FieldId
+pub fn infino::FieldId::clone(&self) -> Self
+impl core::cmp::Eq for infino::FieldId
+impl core::cmp::Ord for infino::FieldId
+pub fn infino::FieldId::cmp(&self, &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for infino::FieldId
+pub fn infino::FieldId::eq(&self, &Self) -> bool
+impl core::cmp::PartialOrd for infino::FieldId
+pub fn infino::FieldId::partial_cmp(&self, &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for infino::FieldId
+pub fn infino::FieldId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for infino::FieldId
+pub fn infino::FieldId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for infino::FieldId
+pub fn infino::FieldId::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for infino::FieldId
+impl core::marker::StructuralPartialEq for infino::FieldId
+impl core::marker::Freeze for infino::FieldId
+impl core::marker::Send for infino::FieldId
+impl core::marker::Sync for infino::FieldId
+impl core::marker::Unpin for infino::FieldId
+impl core::marker::UnsafeUnpin for infino::FieldId
+impl core::panic::unwind_safe::RefUnwindSafe for infino::FieldId
+impl core::panic::unwind_safe::UnwindSafe for infino::FieldId
+#[non_exhaustive] pub struct infino::FieldPatch
+pub infino::FieldPatch::data_type: core::option::Option<arrow_schema::datatype::DataType>
+pub infino::FieldPatch::dropped: bool
+pub infino::FieldPatch::id: core::option::Option<infino::FieldId>
+pub infino::FieldPatch::index: core::option::Option<infino::ColumnIndex>
+pub infino::FieldPatch::name: alloc::string::String
+pub infino::FieldPatch::nullable: core::option::Option<bool>
+impl infino::FieldPatch
+pub fn infino::FieldPatch::dropped(self) -> Self
+pub fn infino::FieldPatch::named(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn infino::FieldPatch::with_id(self, infino::FieldId) -> Self
+pub fn infino::FieldPatch::with_index(self, infino::ColumnIndex) -> Self
+pub fn infino::FieldPatch::with_nullable(self, bool) -> Self
+pub fn infino::FieldPatch::with_type(self, arrow_schema::datatype::DataType) -> Self
+impl core::clone::Clone for infino::FieldPatch
+pub fn infino::FieldPatch::clone(&self) -> Self
+impl core::cmp::PartialEq for infino::FieldPatch
+pub fn infino::FieldPatch::eq(&self, &Self) -> bool
+impl core::default::Default for infino::FieldPatch
+pub fn infino::FieldPatch::default() -> Self
+impl core::fmt::Debug for infino::FieldPatch
+pub fn infino::FieldPatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::FieldPatch
+impl core::marker::Freeze for infino::FieldPatch
+impl core::marker::Send for infino::FieldPatch
+impl core::marker::Sync for infino::FieldPatch
+impl core::marker::Unpin for infino::FieldPatch
+impl core::marker::UnsafeUnpin for infino::FieldPatch
+impl core::panic::unwind_safe::RefUnwindSafe for infino::FieldPatch
+impl core::panic::unwind_safe::UnwindSafe for infino::FieldPatch
 pub struct infino::FtsField
 impl infino::FtsField
 pub fn infino::FtsField::bm25(self, f32, f32) -> Self
@@ -624,6 +859,35 @@ impl core::marker::Unpin for infino::ReindexReport
 impl core::marker::UnsafeUnpin for infino::ReindexReport
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ReindexReport
 impl core::panic::unwind_safe::UnwindSafe for infino::ReindexReport
+#[non_exhaustive] pub struct infino::SchemaPatch
+pub infino::SchemaPatch::fields: alloc::vec::Vec<infino::FieldPatch>
+pub infino::SchemaPatch::max_depth: core::option::Option<u32>
+pub infino::SchemaPatch::max_fields: core::option::Option<u32>
+impl infino::SchemaPatch
+pub fn infino::SchemaPatch::from_json(&serde_json::value::Value) -> core::result::Result<Self, alloc::string::String>
+pub fn infino::SchemaPatch::to_json(&self) -> serde_json::value::Value
+impl infino::SchemaPatch
+pub fn infino::SchemaPatch::new(alloc::vec::Vec<infino::FieldPatch>) -> Self
+pub fn infino::SchemaPatch::with_max_depth(self, u32) -> Self
+pub fn infino::SchemaPatch::with_max_fields(self, u32) -> Self
+impl core::clone::Clone for infino::SchemaPatch
+pub fn infino::SchemaPatch::clone(&self) -> Self
+impl core::cmp::PartialEq for infino::SchemaPatch
+pub fn infino::SchemaPatch::eq(&self, &Self) -> bool
+impl core::convert::From<&infino::TableSchema> for infino::SchemaPatch
+pub fn infino::SchemaPatch::from(&infino::TableSchema) -> Self
+impl core::default::Default for infino::SchemaPatch
+pub fn infino::SchemaPatch::default() -> Self
+impl core::fmt::Debug for infino::SchemaPatch
+pub fn infino::SchemaPatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::SchemaPatch
+impl core::marker::Freeze for infino::SchemaPatch
+impl core::marker::Send for infino::SchemaPatch
+impl core::marker::Sync for infino::SchemaPatch
+impl core::marker::Unpin for infino::SchemaPatch
+impl core::marker::UnsafeUnpin for infino::SchemaPatch
+impl core::panic::unwind_safe::RefUnwindSafe for infino::SchemaPatch
+impl core::panic::unwind_safe::UnwindSafe for infino::SchemaPatch
 #[non_exhaustive] pub struct infino::StalenessReport
 pub infino::StalenessReport::awaiting_reanalysis: usize
 pub infino::StalenessReport::bytes_to_rewrite: u64
@@ -654,12 +918,15 @@ pub struct infino::Supertable
 impl infino::Supertable
 pub fn infino::Supertable::append(&self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::append_named(&self, &arrow_array::record_batch::RecordBatch, &str) -> core::result::Result<(), infino::InfinoError>
+pub fn infino::Supertable::append_rows(&self, &[serde_json::value::Value]) -> core::result::Result<(), infino::InfinoError>
+pub fn infino::Supertable::append_rows_named(&self, &[serde_json::value::Value], &str) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::Bm25SearchOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::count(&self, &str, &str, infino::BoolMode) -> core::result::Result<u64, infino::InfinoError>
 pub fn infino::Supertable::delete(&self, datafusion_expr::expr::Expr) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Result<infino::GcReport, infino::GcError>
 pub fn infino::Supertable::hybrid_search(&self, &str, &str, infino::BoolMode, &str, &[f32], usize, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::hydrate(&self, impl arrow_array::record_batch::RecordBatchReader, usize) -> core::result::Result<usize, infino::InfinoError>
 pub fn infino::Supertable::index_staleness(&self, &infino::ReindexOptions) -> core::result::Result<infino::StalenessReport, infino::ReindexError>
 pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
 pub fn infino::Supertable::reindex(&self, &infino::ReindexOptions) -> core::result::Result<infino::ReindexReport, infino::ReindexError>
@@ -668,6 +935,7 @@ pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
 pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::tokenize(&self, &str, &str) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
 pub fn infino::Supertable::update(&self, datafusion_expr::expr::Expr, &arrow_array::record_batch::RecordBatch) -> core::result::Result<infino::MutationStats, infino::InfinoError>
+pub fn infino::Supertable::update_rows(&self, datafusion_expr::expr::Expr, &[serde_json::value::Value]) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, core::option::Option<infino::VectorFilter<'_>>, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl core::clone::Clone for infino::Supertable
 pub fn infino::Supertable::clone(&self) -> Self
@@ -680,6 +948,33 @@ impl core::marker::Unpin for infino::Supertable
 impl core::marker::UnsafeUnpin for infino::Supertable
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::Supertable
 impl !core::panic::unwind_safe::UnwindSafe for infino::Supertable
+pub struct infino::TableSchema
+impl infino::TableSchema
+pub fn infino::TableSchema::fields(&self) -> &[infino::FieldDef]
+pub fn infino::TableSchema::from_json(&serde_json::value::Value) -> core::result::Result<Self, alloc::string::String>
+pub fn infino::TableSchema::id_of(&self, &str) -> core::option::Option<infino::FieldId>
+pub fn infino::TableSchema::max_depth(&self) -> u32
+pub fn infino::TableSchema::max_fields(&self) -> u32
+pub fn infino::TableSchema::name_of(&self, infino::FieldId) -> core::option::Option<&str>
+pub fn infino::TableSchema::schema_id(&self) -> u32
+pub fn infino::TableSchema::to_json(&self) -> serde_json::value::Value
+pub fn infino::TableSchema::tombstoned(&self) -> &[infino::FieldId]
+impl core::clone::Clone for infino::TableSchema
+pub fn infino::TableSchema::clone(&self) -> Self
+impl core::cmp::PartialEq for infino::TableSchema
+pub fn infino::TableSchema::eq(&self, &Self) -> bool
+impl core::convert::From<&infino::TableSchema> for infino::SchemaPatch
+pub fn infino::SchemaPatch::from(&infino::TableSchema) -> Self
+impl core::fmt::Debug for infino::TableSchema
+pub fn infino::TableSchema::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::TableSchema
+impl core::marker::Freeze for infino::TableSchema
+impl core::marker::Send for infino::TableSchema
+impl core::marker::Sync for infino::TableSchema
+impl core::marker::Unpin for infino::TableSchema
+impl core::marker::UnsafeUnpin for infino::TableSchema
+impl core::panic::unwind_safe::RefUnwindSafe for infino::TableSchema
+impl core::panic::unwind_safe::UnwindSafe for infino::TableSchema
 pub struct infino::VectorFilter<'a>
 pub infino::VectorFilter::column: &'a str
 pub infino::VectorFilter::mode: infino::BoolMode
@@ -694,3 +989,4 @@ impl<'a> core::panic::unwind_safe::UnwindSafe for infino::VectorFilter<'a>
 pub const infino::BUILDER_ID: &str
 pub fn infino::connect(impl core::convert::AsRef<str>) -> core::result::Result<infino::Connection, infino::InfinoError>
 pub fn infino::connect_with(impl core::convert::AsRef<str>, infino::ConnectOptions) -> core::result::Result<infino::Connection, infino::InfinoError>
+pub fn infino::rows_to_batch(&[serde_json::value::Value], &infino::TableSchema) -> core::result::Result<arrow_array::record_batch::RecordBatch, infino::SchemaError>
