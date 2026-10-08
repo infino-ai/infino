@@ -52,10 +52,7 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
 }
 
 /// The hash a list written before it carried the schema bears.
-fn creation_record_hash(
-    opts: &SupertableOptions,
-    strategy: &PartitionStrategy,
-) -> ContentHash {
+fn creation_record_hash(opts: &SupertableOptions, strategy: &PartitionStrategy) -> ContentHash {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
     push_tag(&mut buf, b"schema");
@@ -445,7 +442,6 @@ mod tests {
         let h_ft = record(&opts(false, true), &time_range());
         assert_ne!(h_ff.0, h_tf.0, "positional column must change the hash");
         assert_ne!(h_tf.0, h_ft.0, "which column is positional must matter");
-
     }
 
     /// The stored flag follows the same only-when-non-default rule as
@@ -473,7 +469,6 @@ mod tests {
         let h_tf = record(&opts(true, false), &time_range());
         assert_ne!(h_tt.0, h_ft.0, "index-only column must change the hash");
         assert_ne!(h_ft.0, h_tf.0, "which column is index-only must matter");
-
     }
 
     #[test]

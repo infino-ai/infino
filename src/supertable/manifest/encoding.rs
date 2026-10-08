@@ -1047,7 +1047,8 @@ mod decode_error_tests {
         bytes.extend_from_slice(key);
         bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&value);
-        let err = decode_fts_summary_map(&bytes, None).expect_err("an old summary map must not decode");
+        let err =
+            decode_fts_summary_map(&bytes, None).expect_err("an old summary map must not decode");
         assert!(matches!(err, DecodeError::FtsSummaryTooOld), "{err:?}");
     }
 
