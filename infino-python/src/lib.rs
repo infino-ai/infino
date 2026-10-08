@@ -28,6 +28,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::create_exception;
+use pyo3::sync::PyOnceLock;
 use pyo3::exceptions::{
     PyException, PyKeyError, PyNotImplementedError, PyRuntimeError, PyValueError,
 };
@@ -1584,62 +1585,66 @@ fn append_input(
     // would reject with a message about the text rather than the value. A
     // raise is also how a value JSON cannot spell at all reaches the typed
     // path, so the two cases share one route out.
-    let dumps = PyDict::new(py);
-    dumps.set_item("allow_nan", false)?;
-    match py
-        .import("json")?
-        .call_method("dumps", (&records,), Some(&dumps))
-    {
-        Ok(text) => {
-            let text: String = text.extract()?;
-            let rows: Vec<serde_json::Value> = serde_json::from_str(&text)
-                .map_err(|e| PyValueError::new_err(format!("rows: {e}")))?;
-            Ok(if rows.is_empty() {
-                AppendInput::Empty
-            } else {
-                AppendInput::Rows(rows)
-            })
-        }
+    let strict = PyDict::new(py);
+    strict.set_item("allow_nan", false)?;
+    // `allow_nan=False` so a non-finite float raises here rather than being
+    // written as a bare `NaN`, which is not JSON and which the parser below
+    // would reject with a message about the text rather than the value. A
+    // raise is also how a value JSON cannot spell at all reaches the typed
+    // path, so the two cases share one route out.
+    let json = py.import("json")?;
+    match json.call_method("dumps", (&records,), Some(&strict)) {
+        Ok(text) => rows_from_json(&text.extract::<String>()?),
         Err(_) => {
             // A missing value in a pandas frame is a non-finite float, and
-            // it means the row carries nothing there — the same as a key a
+            // it means the row carries nothing there - the same as a key a
             // dict leaves out. Writing it as null keeps that meaning, keeps
             // the document path (which grows the schema, where the typed
             // path only fills columns the table already declares), and
             // agrees with Node, whose `JSON.stringify` nulls a NaN before
             // the binding ever sees it.
-            match nulled_non_finite(py, &records) {
-                Ok(cleaned) => {
-                    let text: String = py
-                        .import("json")?
-                        .call_method("dumps", (cleaned,), Some(&dumps))?
-                        .extract()?;
-                    let rows: Vec<serde_json::Value> = serde_json::from_str(&text)
-                        .map_err(|e| PyValueError::new_err(format!("rows: {e}")))?;
-                    Ok(if rows.is_empty() {
-                        AppendInput::Empty
-                    } else {
-                        AppendInput::Rows(rows)
-                    })
-                }
+            match nulled_non_finite(py, &json, &strict, &records) {
+                Ok(text) => rows_from_json(&text),
                 // Not a non-finite float, then: a value JSON has no spelling
-                // for at all (bytes, Decimal, datetime, a numpy scalar), which
-                // only the typed path carries.
+                // for at all (bytes, Decimal, datetime, a numpy scalar),
+                // which only the typed path carries.
                 Err(_) => typed_batch_input(py, data, schema, is_frame, &table_cls),
             }
         }
     }
 }
 
-/// `records` with every non-finite float replaced by `None`, leaving
-/// everything else as it is.
+/// The rows of a serialized `data` list, or [`AppendInput::Empty`] when it
+/// carries none.
+fn rows_from_json(text: &str) -> PyResult<AppendInput> {
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(text).map_err(|e| PyValueError::new_err(format!("rows: {e}")))?;
+    Ok(if rows.is_empty() {
+        AppendInput::Empty
+    } else {
+        AppendInput::Rows(rows)
+    })
+}
+
+/// The Python function that replaces every non-finite float with `None`.
 ///
-/// Returns an error when the result still cannot be serialized, which is the
-/// signal that the obstacle was never `NaN`.
-fn nulled_non_finite<'py>(
-    py: Python<'py>,
-    records: &Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
+/// Compiled once for the process rather than per call: the source is
+/// constant, and an append carrying a `NaN` would otherwise pay a module
+/// compile on top of the walk.
+static NULLED: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+/// `records` serialized with every non-finite float written as `null`.
+///
+/// Returns the text rather than the cleaned object: proving the result
+/// serializes and producing the bytes to parse are the same `dumps`, and a
+/// frame of any size pays for each one. An error means the obstacle was
+/// never a `NaN`, which is the caller's signal to take the typed path.
+fn nulled_non_finite(
+    py: Python<'_>,
+    json: &Bound<'_, PyAny>,
+    strict: &Bound<'_, PyDict>,
+    records: &Bound<'_, PyAny>,
+) -> PyResult<String> {
     const SANITIZE: &str = r#"
 import math
 
@@ -1652,20 +1657,18 @@ def nulled(value):
         return [nulled(v) for v in value]
     return value
 "#;
-    let module = PyModule::from_code(
-        py,
-        &CString::new(SANITIZE)?,
-        &CString::new("infino_nan.py")?,
-        &CString::new("infino_nan")?,
-    )?;
-    let cleaned = module.getattr("nulled")?.call1((records,))?;
-    // Prove it serializes now; otherwise the caller falls through to the
-    // typed path rather than failing on a value this never addressed.
-    let strict = PyDict::new(py);
-    strict.set_item("allow_nan", false)?;
-    py.import("json")?
-        .call_method("dumps", (&cleaned,), Some(&strict))?;
-    Ok(cleaned)
+    let nulled = NULLED.get_or_try_init::<_, PyErr>(py, || {
+        Ok(PyModule::from_code(
+            py,
+            &CString::new(SANITIZE)?,
+            &CString::new("infino_nan.py")?,
+            &CString::new("infino_nan")?,
+        )?
+        .getattr("nulled")?
+        .unbind())
+    })?;
+    let cleaned = nulled.bind(py).call1((records,))?;
+    json.call_method("dumps", (cleaned,), Some(strict))?.extract()
 }
 
 /// Rows carrying values JSON cannot spell, as one batch typed by the table's

@@ -170,3 +170,58 @@ def test_a_missing_value_in_a_frame_is_stored_as_null():
     rows = db.query_sql("SELECT title, score FROM docs ORDER BY _id").to_pylist()
     assert rows[2]["score"] is None
     assert rows[3]["score"] is None
+
+
+def test_a_frame_with_a_nan_is_serialized_twice_not_three_times():
+    """The strict dump that detects the NaN is unavoidable, and the sanitized
+    one that follows is the bytes we parse. A third, thrown away only to
+    prove the result serializes, is a full pass over the frame for nothing —
+    and a million-row frame pays for each one."""
+    import json as json_module
+
+    calls = []
+    original = json_module.dumps
+
+    def counting(*args, **kwargs):
+        calls.append(kwargs.get("allow_nan"))
+        return original(*args, **kwargs)
+
+    db = infino.connect("memory://")
+    docs = db.create_table("docs", _title_schema(), infino.IndexSpec())
+    json_module.dumps = counting
+    try:
+        # One row carries a real value, so the column exists to read back:
+        # a column whose every value is null is never created.
+        docs.append([
+            {"title": "a", "score": 1.5},
+            {"title": "b", "score": float("nan")},
+        ])
+    finally:
+        json_module.dumps = original
+
+    assert len(calls) == 2, f"one to detect, one to serialize; got {len(calls)}"
+    rows = db.query_sql("SELECT score FROM docs ORDER BY _id").to_pylist()
+    assert [r["score"] for r in rows] == [1.5, None]
+
+
+def test_a_frame_without_a_nan_is_serialized_once():
+    """The common path pays nothing for the NaN handling: no sanitizing walk,
+    and no second dump."""
+    import json as json_module
+
+    calls = []
+    original = json_module.dumps
+
+    def counting(*args, **kwargs):
+        calls.append(kwargs.get("allow_nan"))
+        return original(*args, **kwargs)
+
+    db = infino.connect("memory://")
+    docs = db.create_table("docs", _title_schema(), infino.IndexSpec())
+    json_module.dumps = counting
+    try:
+        docs.append([{"title": "a", "score": 1.5}])
+    finally:
+        json_module.dumps = original
+
+    assert len(calls) == 1, f"nothing but the one dump; got {len(calls)}"
