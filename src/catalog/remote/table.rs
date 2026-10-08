@@ -57,10 +57,6 @@ fn mode_str(mode: BoolMode) -> &'static str {
     }
 }
 
-/// BM25 statistics scope sent with every search. The hosted endpoint scores
-/// an omitted `stats` per superfile, so requests name table-wide statistics.
-const GLOBAL_STATS: &str = "global";
-
 /// Render a mutation predicate to SQL for the wire. The public API takes a
 /// DataFusion `Expr`, but the endpoint takes a SQL string (the server parses it
 /// back against the table's schema), so unparse it here.
@@ -191,7 +187,6 @@ impl Table for RemoteTable {
             "query": query,
             "k": k,
             "mode": mode_str(opts.mode),
-            "stats": GLOBAL_STATS,
             "projection": projection,
         });
         let response = self.catalog.post_json("bm25_search", body)?;

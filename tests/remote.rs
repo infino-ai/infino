@@ -176,9 +176,6 @@ async fn bm25_search_sends_json_and_decodes_arrow() {
             "query": "hello",
             "k": 10,
             "mode": "or",
-            // Every request names table-wide statistics: the server scores
-            // an omitted `stats` per superfile.
-            "stats": "global",
         })))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(ipc_bytes(&id_batch(vec![1, 2, 3])), ARROW_CT),
@@ -196,6 +193,14 @@ async fn bm25_search_sends_json_and_decodes_arrow() {
     .await;
     let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total, 3, "decoded the canned Arrow response into 3 rows");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("json request body");
+    assert!(body.get("stats").is_none(), "no stats field: {body}");
 }
 
 #[tokio::test]
