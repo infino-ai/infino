@@ -33,6 +33,7 @@ pub mod skip;
 pub(crate) mod sorted_root;
 pub mod sql;
 pub mod superfile_reader;
+pub(crate) mod values_subquery;
 pub mod vector;
 
 pub use vector::VectorSearchOptions;
