@@ -171,7 +171,7 @@ pub(crate) fn bisect_order(fwd: &ForwardIndex, params: BisectParams) -> Vec<u32>
         n_terms: fwd.n_terms,
         free: Mutex::new(Vec::new()),
     };
-    split_parallel(fwd, &mut order, 0, &pool, params, true);
+    split_parallel(fwd, &mut order, 0, &pool, params);
     order
 }
 
@@ -183,32 +183,31 @@ fn split_parallel(
     depth: u32,
     pool: &StatePool,
     params: BisectParams,
-    may_localize: bool,
 ) {
     if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
         return;
     }
-    if may_localize && localizing_pays(fwd, order) {
+    if localizing_pays(fwd, order) {
         let local = pool.with_state(|state| state.localize(fwd, order));
         let mut inner: Vec<u32> = (0..order.len() as u32).collect();
         let inner_pool = StatePool {
             n_terms: local.n_terms,
             free: Mutex::new(Vec::new()),
         };
-        split_parallel(&local, &mut inner, depth, &inner_pool, params, false);
+        split_parallel(&local, &mut inner, depth, &inner_pool, params);
         apply_inner_order(order, &inner);
         return;
     }
     if order.len() < PARALLEL_MIN_PARTITION {
-        pool.with_state(|state| state.split(fwd, order, depth, params, may_localize));
+        pool.with_state(|state| state.split(fwd, order, depth, params));
         return;
     }
     let mid = order.len() / 2;
     pool.with_state(|state| state.refine(fwd, order, mid, true, params));
     let (left, right) = order.split_at_mut(mid);
     join(
-        || split_parallel(fwd, left, depth + 1, pool, params, may_localize),
-        || split_parallel(fwd, right, depth + 1, pool, params, may_localize),
+        || split_parallel(fwd, left, depth + 1, pool, params),
+        || split_parallel(fwd, right, depth + 1, pool, params),
     );
 }
 
@@ -223,12 +222,8 @@ fn split_parallel(
 /// Expressing the trigger as "the vocabulary has shrunk by half" rather than
 /// as a document count is what makes it travel between corpora: it fires on
 /// the relationship between a partition and its vocabulary, which is the thing
-/// that actually decides whether the tables are oversized.
-///
-/// A subtree renumbers at most once. Renumbering again further down shrinks
-/// the tables again, but each one allocates its subtree a fresh scratch state
-/// sized to the new vocabulary, and measured against a single renumbering per
-/// path that zeroing cost more than the extra cache locality returned.
+/// that actually decides whether the tables are oversized. Halving at minimum
+/// also bounds how often it can fire on any root-to-leaf path.
 fn localizing_pays(fwd: &ForwardIndex, order: &[u32]) -> bool {
     // An empty table cannot shrink, and without this a partition carrying no
     // terms at all satisfies the test against its own renumbering forever.
@@ -361,29 +356,22 @@ impl BisectState {
         }
     }
 
-    fn split(
-        &mut self,
-        fwd: &ForwardIndex,
-        order: &mut [u32],
-        depth: u32,
-        params: BisectParams,
-        may_localize: bool,
-    ) {
+    fn split(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, params: BisectParams) {
         if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
             return;
         }
-        if may_localize && localizing_pays(fwd, order) {
+        if localizing_pays(fwd, order) {
             let local = self.localize(fwd, order);
             let mut inner: Vec<u32> = (0..order.len() as u32).collect();
-            BisectState::new(local.n_terms).split(&local, &mut inner, depth, params, false);
+            BisectState::new(local.n_terms).split(&local, &mut inner, depth, params);
             apply_inner_order(order, &inner);
             return;
         }
         let mid = order.len() / 2;
         self.refine(fwd, order, mid, false, params);
         let (left, right) = order.split_at_mut(mid);
-        self.split(fwd, left, depth + 1, params, may_localize);
-        self.split(fwd, right, depth + 1, params, may_localize);
+        self.split(fwd, left, depth + 1, params);
+        self.split(fwd, right, depth + 1, params);
     }
 
     /// Move documents across the split while it lowers the cost, then
@@ -1013,7 +1001,7 @@ mod tests {
     fn the_parallel_order_matches_the_serial_one() {
         let (fwd, _) = clustered(3 * PARALLEL_MIN_PARTITION, 20, 13);
         let mut serial: Vec<u32> = (0..fwd.len() as u32).collect();
-        BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0, exhaustive(), true);
+        BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0, exhaustive());
         assert_eq!(bisect_order(&fwd, exhaustive()), serial);
     }
 }
