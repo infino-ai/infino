@@ -36,7 +36,7 @@ use super::{
 use crate::{
     supertable::manifest::part::ContentHash,
     utils::{
-        terms::{DictLayout, FstValue, TermDictBuilder},
+        terms::{FstValue, TermBlockWriter},
         varint::{CONTINUATION_BIT, push_varint, read_u64_varint, read_varint},
     },
 };
@@ -46,12 +46,6 @@ use crate::{
 /// measurement** — the plan's first milestone replaces this with a
 /// measured value.
 pub(crate) const SLICE_TARGET_BYTES: usize = 8 * 1024 * 1024;
-
-/// Bytes a front-coded dictionary entry costs beyond the key's unshared
-/// tail, used only to decide when a slice is full. Rough on purpose.
-const DICT_ENTRY_OVERHEAD_ESTIMATE: usize = 4;
-/// Share of a key the front-coded dictionary is assumed to keep.
-const DICT_KEY_SHARE_ESTIMATE_DIVISOR: usize = 3;
 
 /// Knobs the build takes from its caller.
 #[derive(Debug, Clone, Copy)]
@@ -303,53 +297,58 @@ impl Ord for Head {
 
 /// The slice under construction.
 struct SliceBuilder {
-    dict: TermDictBuilder,
+    /// Keys arrive in order from the merge, so the dictionary streams into
+    /// its final bytes and its size is known exactly as it grows.
+    dict: TermBlockWriter<Vec<u8>>,
     postings: Vec<u8>,
     first_key: Option<Vec<u8>>,
     last_key: Vec<u8>,
-    dict_estimate: usize,
     n_terms: usize,
 }
 
 impl SliceBuilder {
     fn new() -> Self {
         Self {
-            dict: TermDictBuilder::new(DictLayout::Blocks),
+            dict: TermBlockWriter::new(Vec::new()),
             postings: Vec::new(),
             first_key: None,
             last_key: Vec::new(),
-            dict_estimate: 0,
             n_terms: 0,
         }
     }
 
     fn add(&mut self, key: &[u8], run: &[u8]) {
-        self.dict.insert(
-            key,
-            FstValue::Pfor {
-                metadata_offset: self.postings.len() as u64,
-                postings_length_hint: Some(run.len() as u32),
-                short: false,
-            },
-        );
+        self.dict
+            .insert_sorted(
+                key,
+                FstValue::Pfor {
+                    metadata_offset: self.postings.len() as u64,
+                    postings_length_hint: Some(run.len() as u32),
+                    short: false,
+                },
+            )
+            .expect("Vec sink cannot fail");
         self.postings.extend_from_slice(run);
         if self.first_key.is_none() {
             self.first_key = Some(key.to_vec());
         }
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
-        self.dict_estimate +=
-            key.len() / DICT_KEY_SHARE_ESTIMATE_DIVISOR + DICT_ENTRY_OVERHEAD_ESTIMATE;
         self.n_terms += 1;
     }
 
-    fn estimated_bytes(&self) -> usize {
-        self.postings.len() + self.dict_estimate
+    /// The slice's size so far, its fixed-size header aside. Measured, not
+    /// estimated: how much of a key front-coding keeps depends on the
+    /// column, and a column of random keys shares almost no prefix, so a
+    /// fixed guess undercounted those slices to about twice the target.
+    fn encoded_bytes(&self) -> usize {
+        self.postings.len() + self.dict.encoded_len()
     }
 
     fn finish(self) -> Option<(SliceRef, Vec<u8>)> {
         let first_key = self.first_key?;
-        let bytes = encode_slice(&self.dict.finish(), &self.postings);
+        let dict = self.dict.finish().expect("Vec sink cannot fail");
+        let bytes = encode_slice(&dict, &self.postings);
         let content_hash = ContentHash::of(&bytes);
         Some((
             SliceRef {
@@ -385,6 +384,15 @@ pub(crate) struct BuiltSegment {
 }
 
 /// Merge contributions into a base root: one segment, ordinals from zero.
+///
+/// Optimize skips the rebuild when the current index already has this
+/// shape, so a change to what this writes reaches existing tables only if
+/// it also bumps `ROOT_FORMAT_VERSION`: an old root then fails to load and
+/// is rebuilt.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(skip_all, fields(inputs = contributions.len()))
+)]
 pub(crate) fn build(
     contributions: &[Contribution],
     policy: &BuildPolicy,
@@ -483,7 +491,7 @@ pub(crate) fn build_segment(
         // was once dropped.
         let encoded = encode_run(&run);
         if current.n_terms > 0
-            && current.estimated_bytes() + encoded.len() > policy.slice_target_bytes
+            && current.encoded_bytes() + encoded.len() > policy.slice_target_bytes
         {
             let (reference, bytes) = std::mem::replace(&mut current, SliceBuilder::new())
                 .finish()

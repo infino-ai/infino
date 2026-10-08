@@ -1,7 +1,10 @@
 name: PR Review
 
+# `pull_request_target` gives fork PRs the model secrets. Safe only because no
+# step checks out PR code, the image is pinned by digest, and only trusted
+# authors trigger a run (outside contributors: a maintainer comments `/review`).
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, ready_for_review, synchronize]
   issue_comment:
     types: [created]
@@ -13,17 +16,32 @@ permissions:
   pull-requests: write
   issues: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
 jobs:
   review:
-    if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}
+    # Comments run only for agent commands; fork review comments get no secrets.
+    if: >-
+      (github.event_name == 'pull_request_target' &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)) ||
+      (github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        startsWith(github.event.comment.body, '/') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      # Foundry exposes an OpenAI-compatible endpoint, so this runs through
-      # LiteLLM's openai provider, not its azure provider.
-      - uses: The-PR-Agent/pr-agent@main
+      # pragent/pr-agent:0.47.0-github_action; Foundry is OpenAI-compatible.
+      - uses: docker://pragent/pr-agent@sha256:31b9aac6ab067bada9a0c1b001d30ebc500ea4487e00a93c18c59b9ef5fa66db
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENAI_KEY: ${{ secrets.AZURE_AI_API_KEY }} # flat var; runner ignores OPENAI__KEY
+          OPENAI_KEY: ${{ secrets.AZURE_AI_API_KEY }} # runner ignores OPENAI__KEY
           OPENAI__API_BASE: ${{ secrets.AZURE_AI_ENDPOINT }}
           CONFIG__MODEL: "openai/gpt-5.4"
           CONFIG__FALLBACK_MODELS: "[]"
@@ -31,6 +49,4 @@ jobs:
           GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
           GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "false"
           GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "true"
-          # synchronize isn't in the runner's default action set, so re-review
-          # on each push must be opted into explicitly.
           GITHUB_ACTION_CONFIG__PR_ACTIONS: '["opened", "reopened", "ready_for_review", "synchronize"]'

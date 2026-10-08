@@ -30,7 +30,9 @@
 //! specifically, re-reads the pointer to capture the winner's
 //! state, and retries the commit on top of it.
 
-use std::{fmt, ops::Range, path::PathBuf, sync::Arc, time::SystemTime};
+use std::{
+    error::Error as StdError, fmt, io, iter, ops::Range, path::PathBuf, sync::Arc, time::SystemTime,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -157,10 +159,27 @@ impl StorageError {
 /// *before* it is flattened, so the classification stays typed rather than
 /// matching on message text. Every link in the chain must declare its
 /// `#[source]` / `#[from]` for the walk to reach the bottom.
-pub(crate) fn permission_denied_in_chain(e: &(dyn std::error::Error + 'static)) -> bool {
-    std::iter::successors(Some(e), |e| e.source()).any(|link| {
+pub(crate) fn permission_denied_in_chain(e: &(dyn StdError + 'static)) -> bool {
+    error_chain(e).any(|link| {
         link.downcast_ref::<StorageError>()
             .is_some_and(StorageError::is_permission_denied)
+    })
+}
+
+/// `e` and every error under it, outermost first, for classifying an error by
+/// what caused it.
+///
+/// Steps into an [`io::Error`] by hand: its `source()` returns the source of
+/// the error it wraps, not that error itself, so a storage error carried in an
+/// `io::Error` (as a superfile read carries one) would otherwise be skipped.
+pub(crate) fn error_chain<'a>(
+    e: &'a (dyn StdError + 'static),
+) -> impl Iterator<Item = &'a (dyn StdError + 'static)> {
+    iter::successors(Some(e), |&link| match link.downcast_ref::<io::Error>() {
+        Some(wrapper) => wrapper
+            .get_ref()
+            .map(|inner| inner as &(dyn StdError + 'static)),
+        None => link.source(),
     })
 }
 
@@ -478,6 +497,15 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     /// absent" on the subsequent [`put_if_match`].
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError>;
 
+    /// Unconditional write — replaces the object if it is already there.
+    ///
+    /// For bytes whose key is derived rather than freshly minted, so a
+    /// retry can legitimately arrive with different content at the same
+    /// key. [`put_atomic`](Self::put_atomic) is the default; reach for this
+    /// only where an existing object is known to be a superseded attempt
+    /// that nothing references.
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError>;
+
     /// Conditional write — succeeds only if the target's
     /// current ETag matches `expected_etag`.
     ///
@@ -671,6 +699,10 @@ impl StorageProvider for PrefixedStorageProvider {
         bytes: bytes::Bytes,
     ) -> Result<Option<String>, StorageError> {
         self.inner.put_atomic(&self.prefixed(uri), bytes).await
+    }
+
+    async fn put_overwrite(&self, uri: &str, bytes: bytes::Bytes) -> Result<(), StorageError> {
+        self.inner.put_overwrite(&self.prefixed(uri), bytes).await
     }
 
     async fn put_if_match(
@@ -885,6 +917,11 @@ mod tests {
                 Some(b) => Ok(b.slice(range.start as usize..range.end as usize)),
                 None => Err(not_found(uri)),
             }
+        }
+
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.objects.lock().expect("lock").insert(uri.into(), bytes);
+            Ok(())
         }
 
         async fn put_atomic(

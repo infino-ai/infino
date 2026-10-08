@@ -35,6 +35,7 @@
 //! object-store retries fire correctly.
 
 use std::{
+    error::Error,
     io,
     sync::{
         Arc,
@@ -137,9 +138,7 @@ pub async fn superfile_reader_tiered(
                 .get(storage_key)
                 .await
                 .map_err(|e| ReaderCacheError::OpenFailed {
-                    source: ReadError::Io(io::Error::other(format!(
-                        "storage fetch {storage_key}: {e}"
-                    ))),
+                    source: fetch_failed(format!("storage fetch {storage_key}"), e),
                 })?;
         let reader = SuperfileReader::open(bytes)
             .map_err(|source| ReaderCacheError::OpenFailed { source })?;
@@ -229,8 +228,25 @@ impl OpenTierCounts {
 
 fn cache_open_failed(e: DiskCacheError) -> ReaderCacheError {
     ReaderCacheError::OpenFailed {
-        source: ReadError::Io(io::Error::other(format!("disk cache fetch: {e}"))),
+        source: fetch_failed("disk cache fetch".to_string(), e),
     }
+}
+
+/// A fetch of a superfile's bytes that failed, read as `{label}: {source}`.
+/// The store's error stays typed underneath, so a refused credential is still
+/// found under the read error rather than lost in its text.
+#[derive(Debug, thiserror::Error)]
+#[error("{label}: {source}")]
+struct FetchFailed {
+    label: String,
+    source: Box<dyn Error + Send + Sync>,
+}
+
+fn fetch_failed(label: String, source: impl Error + Send + Sync + 'static) -> ReadError {
+    ReadError::Io(io::Error::other(FetchFailed {
+        label,
+        source: Box::new(source),
+    }))
 }
 
 #[cfg(test)]
@@ -242,12 +258,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        storage::LocalFsStorageProvider,
+        storage::{LocalFsStorageProvider, StorageError},
         superfile::{
             ReadError,
             builder::{BuilderOptions, SuperfileBuilder},
         },
-        supertable::reader_cache::{InMemoryReaderCache, config::DiskCacheConfig},
+        supertable::{
+            QueryError,
+            reader_cache::{InMemoryReaderCache, config::DiskCacheConfig},
+        },
         test_helpers::{decimal128_id_field, decimal128_ids},
     };
 
@@ -588,5 +607,23 @@ mod tests {
             }
             other => panic!("expected OpenFailed, got {other:?}"),
         }
+    }
+
+    /// A cold fetch the disk cache could not make keeps the store's error
+    /// typed under the read error, so a refused credential is still one; the
+    /// message reads as it always has.
+    #[test]
+    fn a_failed_cold_fetch_keeps_the_stores_error_under_its_label() {
+        let refused = cache_open_failed(DiskCacheError::Storage(StorageError::PermissionDenied {
+            uri: "u".into(),
+        }));
+        assert_eq!(
+            refused.to_string(),
+            "failed to open superfile bytes: io error during read: disk cache fetch: storage error during cold fetch"
+        );
+        assert!(matches!(
+            QueryError::store(refused),
+            QueryError::PermissionDenied(_)
+        ));
     }
 }

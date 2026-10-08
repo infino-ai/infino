@@ -64,8 +64,8 @@ use crate::{
         fts::{
             bm25::Bm25Params,
             reader::{
-                self as fts_reader, BoolMode, ClauseLists, FetchedTermMemo, FtsReader, MatchWork,
-                OrCursorSet, PreparedClauses, TermPattern,
+                self as fts_reader, BoolMode, ClauseLists, ContainsRows, FetchedTermMemo,
+                FtsReader, MatchWork, OrCursorSet, PreparedClauses, TermPattern,
             },
             tokenize::{Phrase, Tokenizer},
         },
@@ -76,7 +76,7 @@ use crate::{
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
         },
     },
-    supertable::query::provider::tombstone_access_plan,
+    supertable::{query::provider::tombstone_access_plan, schema::FieldId},
     utils::terms::FstValue,
 };
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
@@ -233,7 +233,7 @@ impl MetadataFetch for &mut LazyMetadataFetch {
             source
                 .range(range.start, len)
                 .await
-                .map_err(|error| ParquetError::General(error.to_string()))
+                .map_err(|error| ParquetError::External(Box::new(error)))
         }
         .boxed()
     }
@@ -270,9 +270,11 @@ impl SuperfileReader {
     /// 2. **3-4 GETs** for the embedded vector subsection, via
     ///    `VectorReader::open_lazy` (outer header, directory + CRC,
     ///    subsection headers, and Sq8 codec_meta when present).
-    /// 3. **3 GETs** for the embedded FTS subsection, via
-    ///    `FtsReader::open_lazy` (header, FST dictionary, doc-length
-    ///    tail; postings stay lazy until search).
+    /// 3. **2-3 GETs** for the embedded FTS subsection, via
+    ///    `FtsReader::open_lazy` (header, doc-lengths directory, and the
+    ///    doc-id map when the file has one; the dictionary, each column's
+    ///    length array and the postings stay lazy until a query needs
+    ///    them).
     ///
     /// Total open budget is small exact metadata ranges rather than
     /// whole-subsection/speculative slabs. Subsequent vector queries
@@ -328,8 +330,9 @@ impl SuperfileReader {
             )));
         }
         let version_str = kv_map.get(kv::FORMAT_VERSION).expect("checked above");
-        let version = format::Version::parse(version_str)
-            .ok_or_else(|| ReadError::MalformedVersion(version_str.clone()))?;
+        let version = format::Version::parse(version_str).ok_or_else(|| {
+            ReadError::Malformed(format!("format-version {version_str:?} does not parse"))
+        })?;
         if !version.is_compatible_with_current() {
             return Err(ReadError::UnsupportedVersion(version_str.clone()));
         }
@@ -463,8 +466,9 @@ impl SuperfileReader {
             )));
         }
         let version_str = kv_map.get(kv::FORMAT_VERSION).expect("checked above");
-        let version = format::Version::parse(version_str)
-            .ok_or_else(|| ReadError::MalformedVersion(version_str.clone()))?;
+        let version = format::Version::parse(version_str).ok_or_else(|| {
+            ReadError::Malformed(format!("format-version {version_str:?} does not parse"))
+        })?;
         if !version.is_compatible_with_current() {
             return Err(ReadError::UnsupportedVersion(version_str.clone()));
         }
@@ -685,6 +689,32 @@ impl SuperfileReader {
     }
 
     /// FTS column names in declaration order, or empty.
+    /// The name this file knows the column `id` by, for a caller holding
+    /// the table's current name for it. A file written before a rename
+    /// carries the old label in its FTS and vector blobs, which key their
+    /// columns by name; the id is what identifies the column across both.
+    /// Falls back to `name` for a file written before ids, whose labels
+    /// were the table's at the time.
+    pub(crate) fn column_alias<'a>(&'a self, id: Option<FieldId>, name: &'a str) -> &'a str {
+        let Some(id) = id else {
+            return name;
+        };
+        let fts = self
+            .fts()
+            .into_iter()
+            .flat_map(|fts| fts.fts_columns_config())
+            .find(|c| c.field_id == Some(id))
+            .map(|c| c.name.as_str());
+        fts.or_else(|| {
+            self.vec()
+                .into_iter()
+                .flat_map(|vec| vec.vector_columns_config())
+                .find(|c| c.field_id == Some(id))
+                .map(|c| c.name.as_str())
+        })
+        .unwrap_or(name)
+    }
+
     pub fn fts_columns(&self) -> Vec<&str> {
         match &self.fts {
             Some(r) => r.fts_columns().collect(),
@@ -1436,6 +1466,24 @@ impl SuperfileReader {
         Ok(fts
             .expand_terms(column, patterns, fold, max_terms, allow_full_walk, pool)
             .await?)
+    }
+
+    /// For each of `needles`, the rows of `column` an `ILIKE '%needle%'`
+    /// matches, decided from the dictionary and postings in one walk but
+    /// for the rows it marks doubtful; every needle meets the exact rule.
+    /// What it holds meanwhile is charged to `budget`. Delegates to
+    /// [`FtsReader::contains_rows`].
+    pub(crate) async fn contains_rows(
+        &self,
+        column: &str,
+        needles: &[&str],
+        pool: Option<&ThreadPool>,
+        budget: Option<&Arc<ConnectionMemoryBudget>>,
+    ) -> Result<(Vec<ContainsRows>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.contains_rows(column, needles, pool, budget).await?)
     }
 
     /// Unranked token-match **count**: the number of `local_doc_id`s
@@ -2388,11 +2436,11 @@ impl fmt::Display for SuperfileSizeBreakdown {
 }
 
 /// An FTS read error surfaced by the size report is a read error of the
-/// file it was read from.
+/// file it was read from; any other FTS error stays typed under it.
 fn fts_reader_error_to_read(e: FtsError) -> ReadError {
     match e {
         FtsError::Read(r) => r,
-        other => ReadError::MalformedVersion(other.to_string()),
+        other => ReadError::Fts(Box::new(other)),
     }
 }
 
@@ -2407,6 +2455,7 @@ mod tests {
     use crate::{
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+            format::footer::with_forged_footer_kv,
             vector::distance::normalize,
         },
         test_helpers::{decimal128_ids, default_vector_config},
@@ -3485,8 +3534,18 @@ mod tests {
             .expect("build RecordBatch");
         let body = encode_parquet_body(&schema, &[batch], Compression::SNAPPY, ROW_GROUP_SIZE, &[])
             .expect("encode parquet body");
-        let parts = splice_index_blobs(body, &[], &[], &[], extra_kv).expect("splice index blobs");
-        Bytes::from(parts.bytes)
+        // The splice writes region keys itself and drops a caller's, so the
+        // malformed ones these tests need are forged onto the footer after.
+        let (region, rest): (Vec<_>, Vec<_>) = extra_kv
+            .iter()
+            .cloned()
+            .partition(|(k, _)| kv::REGION_KEYS.contains(&k.as_str()));
+        let parts = splice_index_blobs(body, &[], &[], &[], &rest).expect("splice index blobs");
+        let region: Vec<(&str, &str)> = region
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        with_forged_footer_kv(&parts.bytes, &region)
     }
 
     /// The five always-required KV entries, with a correct format value
@@ -3521,6 +3580,19 @@ mod tests {
         let bytes = superfile_with_kv(&kvs);
         let err = SuperfileReader::open(bytes).expect_err("expected error");
         assert!(matches!(err, ReadError::UnsupportedVersion(_)));
+    }
+
+    #[test]
+    fn open_with_rejects_a_format_version_that_does_not_parse() {
+        // Not a version at all: a malformed file, not one from another version.
+        let mut kvs = required_kv();
+        kvs[1] = (kv::FORMAT_VERSION.into(), "not-a-version".into());
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(
+            matches!(&err, ReadError::Malformed(m) if m.contains("not-a-version")),
+            "got {err:?}"
+        );
     }
 
     #[test]

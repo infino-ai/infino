@@ -1,6 +1,6 @@
 [package]
 name = "infino"
-version = "0.8.10"
+version = "0.10.0"
 edition = "2024"
 # Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
 # uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
@@ -117,7 +117,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
 [dependencies]
 # Format / parquet
 arrow = "58"
-arrow-array = "58"
+# `chrono-tz` resolves a named time zone (`America/New_York`) to its
+# offsets. The JSON row mapper needs it to read a naive timestamp string
+# as the wall clock of its column's zone; without it such a string would
+# silently land hours away. Already in the graph through datafusion, named
+# here so a change there cannot take it away.
+arrow-array = { version = "58", features = ["chrono-tz"] }
 arrow-schema = "58"
 parquet = { version = "58", features = ["async", "object_store"] }
 
@@ -342,6 +347,11 @@ hashbrown = "0.17.1"
 # depends on `infino` WITHOUT `test-helpers`) when the catalog API
 # lands; the public surface itself is guarded by `cargo-public-api`.
 infino-bench-utils = { path = "benches/utils" }
+
+# tests/hydrate.rs reads a Parquet fixture to Arrow batches. `parquet` is already
+# a direct dependency; this only adds the `arrow` feature, dev-only (the engine
+# doesn't need it). Keep the version in sync with the [dependencies] entry.
+parquet = { version = "58", features = ["arrow"] }
 
 # `test-util` adds tokio's paused-clock test surface
 # (`start_paused`), which lets concurrency regression tests drive

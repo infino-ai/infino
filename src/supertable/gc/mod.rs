@@ -285,14 +285,19 @@ async fn live_set(
         // on that URI (missing, corrupt, or hash-mismatched bytes) — surface
         // it through the existing `Storage` variant rather than a dedicated
         // public error variant.
-        let state = slow_vector_state::load_full_state(storage.as_ref(), uri, &hash)
-            .await
-            .map_err(|error| {
-                GcError::Storage(StorageError::Permanent {
-                    uri: uri.to_string(),
-                    source: Box::new(error),
-                })
-            })?;
+        let state = slow_vector_state::load_full_state(
+            storage.as_ref(),
+            uri,
+            &hash,
+            &manifest.options.legacy_names(),
+        )
+        .await
+        .map_err(|error| {
+            GcError::Storage(StorageError::Permanent {
+                uri: uri.to_string(),
+                source: Box::new(error),
+            })
+        })?;
         if let Some(pending) = state.pending_drain {
             uris.extend(pending.entries.iter().map(|entry| entry.storage_path()));
         }
@@ -675,6 +680,7 @@ mod tests {
 
     fn sf_entry(uri: SuperfileUri) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
@@ -756,10 +762,9 @@ mod tests {
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
-                schema: Vec::new(),
+                schema: None,
                 id_column: "_id".into(),
-                fts_columns: Vec::new(),
-                vector_columns: Vec::new(),
+                commit_token: Uuid::nil(),
                 partition_strategy: PartitionStrategy::Hash {
                     column: "_id".into(),
                     n_buckets: TEST_HASH_BUCKETS,
@@ -832,10 +837,9 @@ mod tests {
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
-                schema: Vec::new(),
+                schema: None,
                 id_column: "_id".into(),
-                fts_columns: Vec::new(),
-                vector_columns: Vec::new(),
+                commit_token: Uuid::nil(),
                 partition_strategy: PartitionStrategy::Hash {
                     column: "_id".into(),
                     n_buckets: TEST_HASH_BUCKETS,
@@ -903,10 +907,9 @@ mod tests {
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
-                schema: Vec::new(),
+                schema: None,
                 id_column: "_id".into(),
-                fts_columns: Vec::new(),
-                vector_columns: Vec::new(),
+                commit_token: Uuid::nil(),
                 partition_strategy: PartitionStrategy::Hash {
                     column: "_id".into(),
                     n_buckets: TEST_HASH_BUCKETS,
@@ -1041,6 +1044,10 @@ mod tests {
             range: std::ops::Range<u64>,
         ) -> Result<bytes::Bytes, StorageError> {
             self.inner.get_range(uri, range).await
+        }
+
+        async fn put_overwrite(&self, uri: &str, bytes: bytes::Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
         }
 
         async fn put_atomic(

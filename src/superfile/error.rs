@@ -9,6 +9,8 @@
 
 use thiserror::Error;
 
+use crate::superfile::LazyByteSourceError;
+
 /// Errors that can occur while building a superfile.
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -132,8 +134,17 @@ pub enum ReadError {
         column: String, // empty if not column-scoped
     },
 
-    #[error("malformed format-version string {0:?}")]
-    MalformedVersion(String),
+    /// The superfile's bytes do not match its format: an offset or length out
+    /// of range, a region shorter than declared, a codec id it never defined,
+    /// or JSON or a format version that does not parse. Required KV keys that
+    /// are missing or mistyped are [`Self::MalformedKv`].
+    #[error("malformed superfile: {0}")]
+    Malformed(String),
+
+    /// A read that does not support the column's rerank codec was called on
+    /// it: a caller bug, not a problem with the file.
+    #[error("this read does not support the column's codec: {0}")]
+    WrongCodecPath(String),
 
     #[error("io error during read: {0}")]
     Io(#[from] std::io::Error),
@@ -147,11 +158,13 @@ pub enum ReadError {
     #[error("schema unavailable in Parquet metadata")]
     MissingSchema,
 
+    // Each carries its error as the source, so a storage error under it
+    // (refused credentials) stays reachable from the read error.
     #[error("FTS error: {0}")]
-    Fts(Box<FtsError>),
+    Fts(#[source] Box<FtsError>),
 
     #[error("vector error: {0}")]
-    Vector(Box<VectorError>),
+    Vector(#[source] Box<VectorError>),
 
     #[error("column {0:?} not found in superfile schema")]
     UnknownColumn(String),
@@ -167,13 +180,26 @@ pub enum ReadError {
 }
 
 impl ReadError {
-    /// The over-budget message if this, or the vector error it wraps, is a
-    /// budget refusal, else `None`. Lets a `From` impl route to
+    /// The over-budget message if this, or the vector or FTS error it
+    /// wraps, is a budget refusal, else `None`. Lets a `From` impl route to
     /// `InfinoError::OverBudget` without matching the nested shape.
     pub(crate) fn over_budget(&self) -> Option<&str> {
         match self {
             ReadError::Vector(v) => v.over_budget(),
+            ReadError::Fts(f) => f.over_budget(),
             _ => None,
+        }
+    }
+
+    /// Whether this, or the read error a vector or FTS error wraps, is the
+    /// engine breaking its own invariant: a doc id past the superfile's end,
+    /// or a read called on a codec it does not support. Retrying cannot help.
+    pub(crate) fn is_internal(&self) -> bool {
+        match self {
+            ReadError::DocIdOutOfRange { .. } | ReadError::WrongCodecPath(_) => true,
+            ReadError::Vector(v) => matches!(v.as_ref(), VectorError::Read(r) if r.is_internal()),
+            ReadError::Fts(f) => matches!(f.as_ref(), FtsError::Read(r) if r.is_internal()),
+            _ => false,
         }
     }
 }
@@ -193,6 +219,16 @@ impl From<VectorError> for ReadError {
 /// Errors specific to FTS query execution.
 #[derive(Debug, Error)]
 pub enum FtsError {
+    /// A range fetch from the column's byte source failed (a storage error,
+    /// a range past the end, a short read). `what` names the part of the
+    /// column being read, so the message says which fetch failed; the source
+    /// error stays typed, so a refused credential under it still reads as one.
+    #[error("{what} range fetch failed: {source}")]
+    RangeFetch {
+        what: &'static str,
+        source: LazyByteSourceError,
+    },
+
     #[error("unknown FTS column {0:?}")]
     UnknownColumn(String),
 
@@ -205,9 +241,22 @@ pub enum FtsError {
     /// without them (`FtsConfig::positions` was false). A typed error
     /// — never a silent bag-of-words fallback, which would return
     /// wrong matches.
+    ///
+    /// The message names the way to the phrase that needs no positions
+    /// before the rebuild, because a caller reading it is usually a model
+    /// mid-question: told only to rebuild, it gave up on the phrase, and the
+    /// words' rows narrowed by a substring filter find it on the table as
+    /// built. The filter is `ILIKE`, not `LIKE`: the tokenizers lowercase
+    /// the text, so a phrase matches regardless of case and a case-sensitive
+    /// filter would drop its capitalised rows (a heading, a sentence start).
+    /// It still only approximates the phrase, which also matches across
+    /// punctuation (`national-defense`), and the message says so.
     #[error(
         "phrase query on column {column:?}, which was indexed without token \
-         positions; rebuild with positions enabled to use phrase queries"
+         positions: to find the phrase, token_match its words and keep the rows \
+         whose {column} contains it (ILIKE '%<phrase>%', which approximates the \
+         phrase: it misses the words joined by punctuation); a rebuild with \
+         positions enabled lets a search quote it"
     )]
     PositionsUnavailable { column: String },
 
@@ -220,8 +269,39 @@ pub enum FtsError {
     #[error("dictionary walk dropped its result during {0}")]
     TaskDropped(&'static str),
 
+    /// An exact substring answer was asked of a column this superfile
+    /// indexed with an analyzer other than `standard`. The answer rests on
+    /// the standard analyzer's token rules, and the plan that asked for it
+    /// promised an exact answer, so the query fails rather than answer
+    /// from terms that could miss a row.
+    #[error(
+        "column {column:?} is indexed with the {analyzer:?} analyzer in this superfile; \
+         an exact substring answer needs the standard analyzer"
+    )]
+    ExactNeedsStandard { column: String, analyzer: String },
+
+    /// An exact substring answer's term values, postings or row bitsets
+    /// would cross the connection memory budget; the query is refused
+    /// before they are fetched or allocated. The string is already labelled
+    /// with the operation ("exact ILIKE, ..."); it routes to
+    /// `InfinoError::OverBudget` via [`FtsError::over_budget`].
+    #[error("{0}")]
+    OverBudget(String),
+
     #[error("read error: {0}")]
     Read(#[from] ReadError),
+}
+
+impl FtsError {
+    /// The over-budget message if this, or the read error it wraps, is a
+    /// budget refusal, else `None`.
+    pub(crate) fn over_budget(&self) -> Option<&str> {
+        match self {
+            FtsError::OverBudget(m) => Some(m),
+            FtsError::Read(r) => r.over_budget(),
+            _ => None,
+        }
+    }
 }
 
 /// Errors specific to vector query execution.
@@ -236,13 +316,20 @@ pub enum VectorError {
     #[error("read error: {0}")]
     Read(#[from] ReadError),
 
-    /// The underlying [`crate::superfile::LazyByteSource`]
-    /// surfaced a typed error during a range fetch (storage failure,
-    /// out-of-bounds range, …). Stringified for crate-boundary
-    /// stability; callers that need the typed
-    /// `LazyByteSourceError` should match on the source directly.
-    #[error("lazy source error during vector search: {0}")]
-    LazySource(String),
+    /// A range fetch from the column's byte source failed once the column is
+    /// open (a storage error, a range past the end, a short read). Kept typed,
+    /// so a refused credential under it still reads as one.
+    #[error("lazy source error during vector read: {0}")]
+    LazySource(#[from] LazyByteSourceError),
+
+    /// The same failure while opening the column, where the reader knows which
+    /// part it was fetching: `what` names it (`lazy open: directory fetch`,
+    /// a subsection's header), so the message says where the open stopped.
+    #[error("{what}: {source}")]
+    RangeFetch {
+        what: String,
+        source: LazyByteSourceError,
+    },
 
     /// A cold cluster-block fetch would cross the connection memory budget; the
     /// search is refused before the fetch. The string is already labelled with

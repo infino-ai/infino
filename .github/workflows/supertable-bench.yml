@@ -1,10 +1,11 @@
-name: Benchmark (Azure)
+name: Benchmark (VM)
 
-# Runs a selected benchmark (`bench` input) on a per-run ephemeral Azure
-# VM in the storage account's region (transfers ride the Azure backbone,
-# not the public internet). The VM builds with an sccache compile cache
-# in Azure Blob — shared across branches — runs the bench, and is torn
-# down.
+# Runs a selected benchmark (`bench` input) on a per-run ephemeral GCE VM
+# in the bench bucket's region (transfers stay on Google's network, not
+# the public internet). The VM builds with an sccache compile cache in
+# GCS — shared across branches — runs the bench, and is torn down. The VM
+# authenticates to GCS as its attached service account, so no storage
+# credential is passed to it.
 #
 # Benchmarks are A/B: the PR ref and base `main` are built and run on the
 # *same* VM and compared against each other, so the deltas reflect the code
@@ -19,21 +20,31 @@ on:
         required: false
         default: supertable_all
         type: choice
-        options: [superfile, supertable, supertable_all, supertable_fts, supertable_vector, supertable_sql, all]
+        options: [superfile, supertable, supertable_all, supertable_fts, supertable_fts_warm, supertable_fts_cold, supertable_vector, supertable_sql, all]
+      corpus:
+        description: "Corpus spec (empty = synthetic; `realistic` = generated text the FTS legs use)."
+        required: false
+        default: ""
+        type: string
+      metric:
+        description: "Vector metric (empty/cosine, l2sq, negdot)."
+        required: false
+        default: ""
+        type: string
       docs:
         description: "Doc count (plain integer, NOT 1M/100K — those do not parse)"
         required: false
         default: "1000000"
         type: string
-      vm_size:
-        description: "Azure VM size."
+      machine_type:
+        description: "GCE machine type."
         required: false
-        default: "Standard_D8s_v7"
+        default: "c4-standard-8"
         type: string
-      location:
-        description: "VM region."
+      zone:
+        description: "GCE zone; its region must hold the bench subnet and bucket."
         required: false
-        default: "eastus"
+        default: "us-east4-a"
         type: string
       ref:
         description: "Git ref / SHA to benchmark (the PR arm)."
@@ -51,7 +62,7 @@ on:
         default: false
         type: boolean
       keep_table:
-        description: "Keep the bench blob prefix after the run (debug)."
+        description: "Keep the bench object prefix after the run (debug)."
         required: false
         default: false
         type: boolean
@@ -111,8 +122,8 @@ on:
       # unbounded metrics whose default codec is Sq16Adaptive. Passed to the
       # bench as INFINO_BENCH_METRIC. (Empty on legs that don't set it → cosine.)
       metric:          { type: string, required: false, default: "" }
-      vm_size:         { type: string, required: false, default: "Standard_D8s_v7" }
-      location:        { type: string, required: false, default: eastus }
+      machine_type:    { type: string, required: false, default: "c4-standard-8" }
+      zone:            { type: string, required: false, default: us-east4-a }
       ref:             { type: string, required: false, default: main }
       base_ref:        { type: string, required: false, default: main }
       keep_table:      { type: boolean, required: false, default: false }
@@ -137,7 +148,7 @@ on:
       is_fork_pr:      { type: boolean, required: false, default: false }
 
 permissions:
-  id-token: write       # Azure OIDC federated login
+  id-token: write       # GCP workload identity federation
   contents: read        # clone the repo on the VM via the job token
   pull-requests: write  # post the sticky bench-results comment on a PR
 
@@ -145,14 +156,17 @@ permissions:
 # dispatch needs none — runs are isolated by run_id and self-clean.
 
 env:
-  # Pre-existing RG the bench service principal is scoped to (Contributor
-  # on this RG only). The workflow creates per-run resources inside it,
-  # never the RG itself.
-  RG: rg-infino-bench
+  # Project, identities and bucket are repository variables: nothing in them
+  # is secret, and an infra move needs no workflow edit.
+  GCP_PROJECT: ${{ vars.GCP_BENCH_PROJECT }}
+  GCS_BUCKET: ${{ vars.GCP_BENCH_BUCKET }}
+  # Pre-existing VPC with no standing allow rules; each run adds only its own
+  # runner-IP SSH rule. Subnets are named `bench-<region>`.
+  NETWORK: bench-vpc
   # Unique per run; `name_suffix` keeps parallel callers that share a
   # run_id (matrix legs) from colliding on the same VM.
   VM: bench-vm-${{ github.run_id }}${{ inputs.name_suffix }}
-  ADMIN: azureuser
+  ADMIN: bench
   SCCACHE_VERSION: v0.8.2
   # Keepalive so a dead-but-unclosed SSH session fails in ~60s instead of
   # hanging until the job timeout (ServerAliveInterval × CountMax).
@@ -164,9 +178,9 @@ jobs:
   benchmark:
     runs-on: ubuntu-latest
     # `ci`: same-repo, no gate. `bench`: required reviewers, so a maintainer
-    # approves before secrets reach fork code. The env name is the OIDC
-    # subject (repo:…:environment:<name>) — each needs its own Azure
-    # federated credential.
+    # approves before cloud credentials reach fork code. The env name is in
+    # the OIDC token, and the GCP workload identity provider admits only
+    # these two.
     environment: ${{ inputs.is_fork_pr && 'bench' || 'ci' }}
     # Auto-stop ceiling on VM billing; teardown runs on timeout.
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
@@ -247,56 +261,65 @@ jobs:
               ;;
           esac
 
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
+      - name: GCP login (workload identity federation)
+        uses: google-github-actions/auth@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          workload_identity_provider: ${{ vars.GCP_BENCH_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_BENCH_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Provision ephemeral VM
         id: provision
         run: |
           set -euo pipefail
-          LOC="${{ inputs.location }}"
-          SIZE="${{ inputs.vm_size }}"
+          ZONE="${{ inputs.zone }}"
+          REGION="${ZONE%-*}"
+          MACHINE="${{ inputs.machine_type }}"
 
-          # Tags attribute spend by purpose / run; delete-after lets the
-          # bench janitor reclaim this if teardown is skipped (cancel / lost runner).
-          DELETE_AFTER="$(date -u -d '+3 hours' +%Y-%m-%dT%H:%M:%SZ)"
-          TAGS=(purpose=supertable-bench "run-id=${{ github.run_id }}" "ref=${{ inputs.ref }}" auto-delete=true "delete-after=${DELETE_AFTER}")
+          # Per-run key; the VM trusts only it, via instance metadata.
+          mkdir -p "$HOME/.ssh"
+          [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -t ed25519 -N '' -q -f "$HOME/.ssh/id_ed25519"
 
-          # Every resource is named with the unique per-run VM name so
-          # teardown can delete this run's resources by exact name (never
-          # a prefix that could match another run). No default inbound
-          # rule; the only SSH allow is the runner-IP /32 added below.
-          az vm create \
-            -g "$RG" -n "$VM" \
-            --image Ubuntu2204 \
-            --size "$SIZE" \
-            --admin-username "$ADMIN" \
-            --generate-ssh-keys \
-            --public-ip-sku Standard \
-            --os-disk-size-gb 128 \
-            --nsg-rule NONE \
-            --nsg "${VM}-nsg" \
-            --public-ip-address "${VM}-pip" \
-            --vnet-name "${VM}-vnet" \
-            --subnet "${VM}-subnet" \
-            --os-disk-name "${VM}-osdisk" \
-            --tags "${TAGS[@]}" \
-            -o none
+          # Labels attribute spend by purpose / run; delete-after (epoch
+          # seconds — label values allow no ':') lets the bench janitor
+          # reclaim this if teardown is skipped (cancel / lost runner).
+          DELETE_AFTER="$(date -u -d '+3 hours' +%s)"
+          LABELS="purpose=supertable-bench,run-id=${{ github.run_id }},auto-delete=true,delete-after=${DELETE_AFTER}"
+
+          # All-core turbo pins the clock both A/B arms run at; only the
+          # C-series accepts it.
+          TURBO=()
+          case "$MACHINE" in c3-*|c4-*|c4d-*) TURBO=(--turbo-mode=ALL_CORE_MAX) ;; esac
+
+          # The VM reaches GCS as the bench VM service account, which holds
+          # object access on the bench bucket and nothing else. The network
+          # tag is the VM name, so the SSH rule below matches this VM only.
+          gcloud compute instances create "$VM" \
+            --project "$GCP_PROJECT" --zone "$ZONE" \
+            --machine-type "$MACHINE" "${TURBO[@]}" \
+            --image-family ubuntu-2204-lts --image-project ubuntu-os-cloud \
+            --boot-disk-size 128GB --boot-disk-type hyperdisk-balanced \
+            --subnet "bench-${REGION}" \
+            --service-account "${{ vars.GCP_BENCH_VM_SA }}" --scopes storage-rw \
+            --tags "$VM" \
+            --labels "$LABELS" \
+            --description "supertable bench; ref=${{ inputs.ref }}" \
+            --metadata "enable-oslogin=FALSE,ssh-keys=${ADMIN}:$(cat "$HOME/.ssh/id_ed25519.pub")" \
+            --quiet
 
           RUNNER_IP="$(curl -s https://api.ipify.org)"
-          az network nsg rule create \
-            -g "$RG" --nsg-name "${VM}-nsg" -n allow-ssh-runner --priority 300 \
-            --access Allow --protocol Tcp --direction Inbound \
-            --destination-port-ranges 22 \
-            --source-address-prefixes "${RUNNER_IP}/32" -o none
+          gcloud compute firewall-rules create "${VM}-ssh" \
+            --project "$GCP_PROJECT" --network "$NETWORK" \
+            --direction INGRESS --allow tcp:22 \
+            --source-ranges "${RUNNER_IP}/32" --target-tags "$VM" --quiet
 
-          VM_IP="$(az vm show -d -g "$RG" -n "$VM" --query publicIps -o tsv)"
+          VM_IP="$(gcloud compute instances describe "$VM" \
+            --project "$GCP_PROJECT" --zone "$ZONE" \
+            --format 'get(networkInterfaces[0].accessConfigs[0].natIP)')"
           echo "vm_ip=$VM_IP" >> "$GITHUB_OUTPUT"
-          echo "Provisioned $VM ($SIZE) at $VM_IP in $LOC"
+          echo "Provisioned $VM ($MACHINE) at $VM_IP in $ZONE"
 
       - name: Wait for SSH
         run: |
@@ -333,14 +356,6 @@ jobs:
               | sh -s -- -y --default-toolchain stable --profile minimal
           fi
 
-          # The Azure-hosted Ubuntu mirror can serve at ~60 KB/s for hours. apt only
-          # gives up on a stalled connection, not a slow one, so the install runs past
-          # this step's timeout. Install from Canonical's archive instead.
-          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
-            if [ -f "$f" ]; then
-              sudo sed -i 's#azure\.archive\.ubuntu\.com#archive.ubuntu.com#g' "$f"
-            fi
-          done
           sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential pkg-config cmake clang protobuf-compiler git
@@ -357,6 +372,10 @@ jobs:
           echo "cpu governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)"
           echo "intel turbo: $(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo n/a)"
           echo "cpufreq boost: $(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || echo n/a)"
+          # CPU model and ISA flags decide which SIMD kernels run; log them so
+          # a host change is visible next to the numbers.
+          lscpu | grep -E '^(Model name|CPU\(s\)|Thread)' || true
+          echo "avx512: $(grep -o 'avx512[a-z0-9_]*' /proc/cpuinfo | sort -u | tr '\n' ' ')"
 
           # Prebuilt sccache (static musl, glibc-agnostic).
           if ! command -v sccache >/dev/null 2>&1; then
@@ -396,9 +415,7 @@ jobs:
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
-            "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
-             AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
-             INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
+            "GCS_BUCKET='${{ env.GCS_BUCKET }}' \
              REF='${{ inputs.ref }}' \
              BASE_REF='${{ inputs.base_ref }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/build.log
@@ -406,15 +423,15 @@ jobs:
           source "$HOME/.cargo/env"
           cd "$HOME/infino-src"
 
-          # Content-addressed compile cache in Azure Blob, shared across
-          # branches. CARGO_INCREMENTAL=0 is required (it conflicts with
-          # sccache). Reuses the bench container under a key prefix;
-          # connection string from the same account.
+          # Content-addressed compile cache in GCS, shared across branches.
+          # CARGO_INCREMENTAL=0 is required (it conflicts with sccache).
+          # Reuses the bench bucket under a key prefix; sccache authenticates
+          # through the VM's metadata server.
           export RUSTC_WRAPPER=sccache
           export CARGO_INCREMENTAL=0
-          export SCCACHE_AZURE_BLOB_CONTAINER="$INFINO_REAL_AZURE_CONTAINER"
-          export SCCACHE_AZURE_KEY_PREFIX=sccache
-          export SCCACHE_AZURE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=${AZURE_STORAGE_ACCOUNT_NAME};AccountKey=${AZURE_STORAGE_ACCOUNT_KEY};EndpointSuffix=core.windows.net"
+          export SCCACHE_GCS_BUCKET="$GCS_BUCKET"
+          export SCCACHE_GCS_KEY_PREFIX=sccache
+          export SCCACHE_GCS_RW_MODE=READ_WRITE
           sccache --start-server || true
 
           # Build the unified bench target at one ref and save its binary so
@@ -462,9 +479,7 @@ jobs:
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           baseline_status=0
           ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
-            "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
-             AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
-             INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
+            "INFINO_REAL_GCS_BUCKET='${{ env.GCS_BUCKET }}' \
              INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
              INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
              INFINO_BENCH_METRIC='${{ inputs.metric }}' \
@@ -474,7 +489,7 @@ jobs:
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/build-main.log || baseline_status=$?
           set -euo pipefail
           cd "$HOME/infino-src"
-          export INFINO_BENCH_STORE=azure
+          export INFINO_BENCH_STORE=gcs
           [ "$SKIP_CALIBRATION" = "true" ] && export INFINO_BENCH_SKIP_CALIBRATION=1
           ulimit -n "$(ulimit -Hn)"
           if ! CPUSET="$(bash "$HOME/infino-src/.github/scripts/resolve_cpuset.sh" "$CPUSET")"; then
@@ -506,9 +521,7 @@ jobs:
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
-            "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
-             AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
-             INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
+            "INFINO_REAL_GCS_BUCKET='${{ env.GCS_BUCKET }}' \
              INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
              INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
              INFINO_BENCH_METRIC='${{ inputs.metric }}' \
@@ -519,7 +532,7 @@ jobs:
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/bench.log
           set -euo pipefail
           cd "$HOME/infino-src"
-          export INFINO_BENCH_STORE=azure
+          export INFINO_BENCH_STORE=gcs
           [ "$KEEP" = "true" ] && export INFINO_BENCH_KEEP_TABLE=1
           [ "$SKIP_CALIBRATION" = "true" ] && export INFINO_BENCH_SKIP_CALIBRATION=1
           # The multi-commit build holds many superfile files + object-store
@@ -557,9 +570,9 @@ jobs:
           trap 'cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"' EXIT
           LOG=/tmp/bench.clean
           {
-            echo "## Benchmark \`${{ inputs.bench }}\` — Azure (${{ inputs.location }})"
+            echo "## Benchmark \`${{ inputs.bench }}\` — GCP (${{ inputs.zone }})"
             echo ""
-            echo "- docs: \`${{ inputs.docs }}\` · vm: \`${{ inputs.vm_size }}\` · ref: \`${{ inputs.ref }}\`"
+            echo "- docs: \`${{ inputs.docs }}\` · vm: \`${{ inputs.machine_type }}\` · ref: \`${{ inputs.ref }}\`"
             echo ""
           } >> "$SUMMARY"
 
@@ -658,8 +671,8 @@ jobs:
           CURRENT_DIR: current
           OUT_FILE: /tmp/ai-summary.md
           BENCH_LABEL: ${{ inputs.bench }}
-          BENCH_VM_SIZE: ${{ inputs.vm_size }}
-          BENCH_LOCATION: ${{ inputs.location }}
+          BENCH_VM_SIZE: ${{ inputs.machine_type }}
+          BENCH_LOCATION: ${{ inputs.zone }}
           BENCH_CPUSET: ${{ inputs.bench_cpuset }}
           BENCH_GATE_METRIC: ${{ inputs.bench_gate_metric }}
           BASE_REF_LABEL: ${{ inputs.base_ref }}
@@ -773,19 +786,12 @@ jobs:
 
       - name: Teardown (always)
         if: always()
-        env:
-          # The auto-created NIC is the only resource az names for us:
-          # "<vm>VMNic".
-          NIC: ${{ env.VM }}VMNic
         run: |
           # Delete exactly this run's resources by name (VM is unique per
-          # run, so no name can collide with another run), keeping the
-          # shared RG. Ordered so dependencies release: VM frees the NIC
-          # and disk; the NIC frees the IP/NSG/subnet. Each is best-effort
-          # so a missing resource doesn't fail teardown.
-          az vm delete            -g "$RG" -n "$VM"          --yes        || true
-          az network nic delete   -g "$RG" -n "$NIC"                      || true
-          az disk delete          -g "$RG" -n "${VM}-osdisk" --yes        || true
-          az network public-ip delete -g "$RG" -n "${VM}-pip"             || true
-          az network nsg delete   -g "$RG" -n "${VM}-nsg"                 || true
-          az network vnet delete  -g "$RG" -n "${VM}-vnet"                || true
+          # run, so no name can collide with another run). The boot disk and
+          # ephemeral IP go with the instance. Best-effort so a missing
+          # resource doesn't fail teardown.
+          gcloud compute instances delete "$VM" \
+            --project "$GCP_PROJECT" --zone "${{ inputs.zone }}" --quiet || true
+          gcloud compute firewall-rules delete "${VM}-ssh" \
+            --project "$GCP_PROJECT" --quiet || true

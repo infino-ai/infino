@@ -111,7 +111,7 @@ async fn open_reader_tiered(
         intent,
     )
     .await
-    .map_err(|e| QueryError::build(e.to_string(), &e))
+    .map_err(QueryError::store)
 }
 
 /// Verify that each configured vector column is present in this superfile and
@@ -132,24 +132,22 @@ pub(crate) fn verify_superfile_vector_codecs(
     reader: &SuperfileReader,
     expected: &[VectorConfig],
 ) -> Result<(), QueryError> {
-    if expected.is_empty() {
+    // A file written before a vector column existed holds no index for it
+    // and contributes nothing to a search on it; only the columns a file
+    // does hold are checked.
+    let Some(vector) = reader.vec() else {
         return Ok(());
-    }
-    let vector = reader.vec().ok_or_else(|| {
-        QueryError::Execute("superfile is missing configured vector index".into())
-    })?;
+    };
     for config in expected {
-        let mut matched = false;
         for column in vector
             .vector_columns_config()
             .filter(|column| column.name == config.column)
         {
-            matched = true;
             let stored = column.rerank_codec;
             let usable = stored.supports_metric(config.metric)
                 && (!vector.is_multi_cell() || stored.is_ivf_mergeable());
             if !usable {
-                return Err(QueryError::Execute(format!(
+                return Err(QueryError::Internal(format!(
                     "vector codec {} stored for {:?} cannot serve this table (metric {:?}{})",
                     stored.name(),
                     config.column,
@@ -161,12 +159,6 @@ pub(crate) fn verify_superfile_vector_codecs(
                     },
                 )));
             }
-        }
-        if !matched {
-            return Err(QueryError::Execute(format!(
-                "superfile is missing configured vector column {:?}",
-                config.column
-            )));
         }
     }
     Ok(())
@@ -203,7 +195,7 @@ pub(crate) async fn open_compaction_input(
                     Arc::clone(storage),
                 )
                 .await
-                .map_err(|e| QueryError::build(e.to_string(), &e));
+                .map_err(QueryError::store);
             // Fully-resident only: a promoted hybrid reader exposes parquet
             // bytes but leaves the vector blob sparse, and the Sq8 merge
             // below reads real vector bytes synchronously.
@@ -216,12 +208,8 @@ pub(crate) async fn open_compaction_input(
         // Compaction needs synchronous Parquet/id-column access; if the hidden
         // table was opened without a disk cache, force an eager open here.
         let path = entry.storage_path();
-        let (bytes, _) = storage
-            .get(&path)
-            .await
-            .map_err(|e| QueryError::build(e.to_string(), &e))?;
-        let reader =
-            SuperfileReader::open(bytes).map_err(|e| QueryError::build(e.to_string(), &e))?;
+        let (bytes, _) = storage.get(&path).await.map_err(QueryError::store)?;
+        let reader = SuperfileReader::open(bytes)?;
         return Ok(Arc::new(reader));
     }
     // Compaction is not a query modality; allow fill so inputs can promote.
@@ -260,7 +248,7 @@ pub(crate) fn tombstone_deny_set(
 ) -> Result<Option<Arc<RoaringBitmap>>, QueryError> {
     let bitmap = cache
         .bitmap_for(superfile_id, now)
-        .map_err(|e| QueryError::build(format!("tombstone cache: {e}"), &e))?;
+        .map_err(QueryError::tombstone_cache)?;
     Ok((!bitmap.is_empty()).then_some(bitmap))
 }
 
@@ -333,7 +321,7 @@ pub(crate) async fn attach_stable_ids(
         let (batch, decode_ns) = op_stats::timed_section(|| {
             reader
                 .take_by_local_doc_ids(&locals, &[id_column])
-                .map_err(|error| QueryError::Execute(error.to_string()))
+                .map_err(|error| QueryError::Internal(error.to_string()))
         });
         if let Some(stats) = op_stats {
             stats.add_kernel_cpu_ns(decode_ns);
@@ -342,13 +330,13 @@ pub(crate) async fn attach_stable_ids(
     } else {
         take_rows_byte_source(reader, &locals, &[id_column])
             .await
-            .map_err(|error| QueryError::Execute(error.to_string()))?
+            .map_err(|error| QueryError::Internal(error.to_string()))?
     };
     let ids = batch
         .column(0)
         .as_any()
         .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
+        .ok_or_else(|| QueryError::Internal("_id column missing".into()))?;
     for (hit, id) in hits.iter_mut().zip(ids.values()) {
         hit.stable_id = Some(*id);
     }
@@ -375,9 +363,9 @@ pub(crate) async fn attach_stable_ids_to_hits(
     // dominated large-k scored latency on real corpora.
     stamp_stable_ids(table_reader, hits)
         .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        .map_err(QueryError::DataFusion)?;
     if let Some(missing) = hits.iter().find(|h| h.stable_id.is_none()) {
-        return Err(QueryError::Execute(format!(
+        return Err(QueryError::Internal(format!(
             "hit {:?}/{} missing stable _id after search-wave stamping",
             missing.superfile, missing.local_doc_id
         )));
@@ -406,7 +394,7 @@ pub(crate) async fn apply_resolved_tombstone_filter(
     };
     let bitmap = cache
         .bitmap_for(entry.superfile_id, now)
-        .map_err(|e| QueryError::build(format!("tombstone cache: {e}"), &e))?;
+        .map_err(QueryError::tombstone_cache)?;
     if bitmap.is_empty() {
         return Ok(());
     }
@@ -416,7 +404,7 @@ pub(crate) async fn apply_resolved_tombstone_filter(
         let (batch, decode_ns) = op_stats::timed_section(|| {
             reader
                 .take_by_local_doc_ids(&locals, &[id_column])
-                .map_err(|e| QueryError::Execute(e.to_string()))
+                .map_err(QueryError::from)
         });
         if let Some(stats) = op_stats {
             stats.add_kernel_cpu_ns(decode_ns);
@@ -424,13 +412,13 @@ pub(crate) async fn apply_resolved_tombstone_filter(
         batch?
     } else {
         let storage = storage.ok_or_else(|| {
-            QueryError::Execute(
+            QueryError::Internal(
                 "MultiCell tombstone resolve needs resident bytes or storage".into(),
             )
         })?;
         let (object_store, path) = storage
             .object_store_handle(&entry.storage_path())
-            .ok_or_else(|| QueryError::Execute("no object_store handle for superfile".into()))?;
+            .ok_or_else(|| QueryError::Internal("no object_store handle for superfile".into()))?;
         let file_size = entry
             .subsection_offsets
             .as_ref()
@@ -445,13 +433,13 @@ pub(crate) async fn apply_resolved_tombstone_filter(
             &[id_column],
         )
         .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?
+        .map_err(QueryError::DataFusion)?
     };
     let ids = batch
         .column(0)
         .as_any()
         .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
+        .ok_or_else(|| QueryError::Internal("_id column missing".into()))?;
     let deleted: HashSet<i128> = ids.values().iter().copied().collect();
     hits.retain(|hit| hit.stable_id.is_none_or(|id| !deleted.contains(&id)));
     Ok(())
@@ -478,7 +466,7 @@ async fn stable_ids_for_tagged_hits(
         && let Some(ids) = v
             .inline_stable_ids_for_locals_async(locals)
             .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+            .map_err(QueryError::from)?
     {
         return Ok(Some(ids));
     }
@@ -494,12 +482,12 @@ async fn stable_ids_for_tagged_hits(
     let id_column = reader.id_column();
     let batch = reader
         .take_by_local_doc_ids(locals, &[id_column])
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        .map_err(QueryError::from)?;
     let array = batch
         .column(0)
         .as_any()
         .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
+        .ok_or_else(|| QueryError::Internal("_id column missing".into()))?;
     Ok(Some(array.values().to_vec()))
 }
 
@@ -557,7 +545,7 @@ impl FanoutContext {
             store: Arc::clone(&manifest.options.store),
             disk_cache: manifest.options.disk_cache.as_ref().map(Arc::clone),
             storage: manifest.options.storage.as_ref().map(Arc::clone),
-            vector_columns: Arc::new(manifest.options.vector_columns.clone()),
+            vector_columns: Arc::new(manifest.vector_configs()),
             tombstone_cache,
             op_stats: reader.op_stats.clone(),
             now,

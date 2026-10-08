@@ -258,14 +258,14 @@ impl FtsReader {
                         let tb = bytes.as_ref();
                         if short {
                             let df = u64::from(short_df(tb).ok_or_else(|| {
-                                FtsError::Read(ReadError::MalformedVersion(
-                                    "malformed short-form term body".into(),
+                                FtsError::Read(ReadError::Malformed(
+                                    "short-form term body does not decode".into(),
                                 ))
                             })?);
                             let decoded =
                                 decode_short(tb, positional, &mut d, &mut t).ok_or_else(|| {
-                                    FtsError::Read(ReadError::MalformedVersion(
-                                        "malformed short-form term body".into(),
+                                    FtsError::Read(ReadError::Malformed(
+                                        "short-form term body does not decode".into(),
                                     ))
                                 })?;
                             let b = &mut buckets[band_of(df)];

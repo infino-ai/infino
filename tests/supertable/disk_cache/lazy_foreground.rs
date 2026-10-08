@@ -41,16 +41,19 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use infino::{
+    OptimizeOptions,
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         fts::reader::BoolMode,
     },
     supertable::{
-        SuperfileUri,
+        SuperfileUri, Supertable,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
     },
-    test_helpers::decimal128_ids,
+    test_helpers::{
+        build_title_batch, decimal128_ids, default_supertable_options, lazy_foreground_disk_cache,
+    },
 };
 use tempfile::TempDir;
 
@@ -104,6 +107,10 @@ impl StorageProvider for CountingProxy {
     }
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         self.inner.put_atomic(uri, bytes).await
+    }
+
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        self.inner.put_overwrite(uri, bytes).await
     }
     async fn put_if_match(
         &self,
@@ -428,5 +435,82 @@ async fn lazy_foreground_total_bandwidth_includes_background_fill() {
          counting proxy observed {} bytes total",
         superfile_size,
         total_bytes,
+    );
+}
+
+// ============================================================
+// Optimize's term-index pass on a lazy cache.
+//
+// The pass reads most of each superfile's FTS section, and FTS reads skip
+// the block cache, so each would be its own GET. The pass prefetches the
+// section in bulk first. This pins the GET count to a small number however
+// many terms a superfile has, so a change that brings back per-read GETs
+// fails here.
+// ============================================================
+
+/// Distinct terms in the superfile: about 49 of the pass's 4,096-term batches.
+const TERM_PASS_TERM_COUNT: usize = 200_000;
+/// Documents in the superfile.
+const TERM_PASS_DOC_COUNT: usize = 20_000;
+/// Terms per document. With the counts above every term is in two documents,
+/// so each has postings to read rather than an inline entry.
+const TERM_PASS_TERMS_PER_DOC: usize = 20;
+/// GETs the whole `optimize` may make on the cold table. It makes 3 with the
+/// prefetch and about 50 without, one per batch.
+const TERM_PASS_MAX_OPTIMIZE_GETS: usize = 15;
+
+fn term_pass_titles() -> Vec<String> {
+    (0..TERM_PASS_DOC_COUNT)
+        .map(|d| {
+            (0..TERM_PASS_TERMS_PER_DOC)
+                .map(|k| {
+                    format!(
+                        "t{:06}",
+                        (d * TERM_PASS_TERMS_PER_DOC / 2 + k) % TERM_PASS_TERM_COUNT
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+#[test]
+fn term_pass_on_a_lazy_cache_makes_few_gets() {
+    let storage_dir = TempDir::new().expect("storage tempdir");
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+
+    // One superfile, written without a cache.
+    {
+        let producer =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&local)))
+                .expect("create");
+        let titles = term_pass_titles();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let mut w = producer.writer().expect("writer");
+        w.append(&build_title_batch(&refs)).expect("append");
+        w.commit().expect("commit");
+    }
+
+    // Reopen cold through a lazy cache, the optimizer's setup.
+    let counting = CountingProxy::new(Arc::clone(&local));
+    let storage: Arc<dyn StorageProvider> = Arc::<CountingProxy>::clone(&counting);
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let st = Supertable::open(
+        default_supertable_options()
+            .with_storage(storage)
+            .with_disk_cache(cache),
+    )
+    .expect("open");
+
+    let before = counting.calls();
+    st.optimize(&OptimizeOptions::default()).expect("optimize");
+    let gets = counting.calls() - before;
+    assert!(
+        gets <= TERM_PASS_MAX_OPTIMIZE_GETS,
+        "optimize made {gets} range GETs on a cold lazy cache; at most \
+         {TERM_PASS_MAX_OPTIMIZE_GETS} expected with the FTS section prefetched"
     );
 }

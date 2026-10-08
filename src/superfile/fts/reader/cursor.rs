@@ -149,7 +149,7 @@ impl TermMeta {
             false => TERM_META_SIZE,
         };
         if metadata_offset + term_meta_size > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "term metadata offset out of postings region".into(),
             )));
         }
@@ -184,14 +184,14 @@ impl TermMeta {
         // The last block's end offset comes straight from
         // `postings_length`; bound it now instead of slicing OOB later.
         if metadata_offset + postings_length > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "term postings length exceeds the fetched term range".into(),
             )));
         }
         let skip_start = metadata_offset + term_meta_size;
         let skip_end = skip_start + num_blocks * skip_entry_bytes;
         if skip_end > postings.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "skip table runs past postings region".into(),
             )));
         }
@@ -204,7 +204,7 @@ impl TermMeta {
                 let subindex_end = skip_end
                     + num_blocks * POSITION_SUBINDEX_ENTRIES_PER_BLOCK * subindex.entry_bytes();
                 if subindex_end > postings.len() {
-                    return Err(FtsError::Read(ReadError::MalformedVersion(
+                    return Err(FtsError::Read(ReadError::Malformed(
                         "position sub-index runs past postings region".into(),
                     )));
                 }
@@ -225,12 +225,12 @@ impl TermMeta {
         // The length layout reaches a block through its span's start
         // offset, so it exists only alongside the coarse table.
         if skip == SkipLayout::Length && !has_coarse {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "length-coded skip table without a coarse table".into(),
             )));
         }
         if coarse_size > postings_length {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "coarse block-max table larger than the term region".into(),
             )));
         }
@@ -450,6 +450,32 @@ pub(super) struct BlockMeta {
     pub(super) block_max_bm25: f32,
 }
 
+/// What a cursor is built for, which decides what its build reads and what
+/// its blocks decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CursorUse {
+    /// Ranked: idf and bounds from the column's norms, and every block's tfs.
+    Score,
+    /// Matched but never ranked: every block's tfs (a phrase walks its
+    /// positions with them), and no idf, bounds or norms.
+    Match,
+    /// Counted: doc ids only; no tfs, idf, bounds or norms.
+    Count,
+}
+
+impl CursorUse {
+    /// Whether the cursor scores, so its build needs the column's norms.
+    pub(super) fn scores(self) -> bool {
+        self == CursorUse::Score
+    }
+
+    /// Whether the cursor's blocks decode their tfs; a `Count` cursor reads
+    /// doc ids alone.
+    pub(super) fn decodes_tfs(self) -> bool {
+        self != CursorUse::Count
+    }
+}
+
 /// Per-query-term cursor used by [`FtsReader::run_max_score_bmm`]
 /// (and by [`FtsReader::run_wand_bmw`] in the bench-only path).
 ///
@@ -526,12 +552,11 @@ pub(crate) struct TermCursor {
     /// so the build probed the 20-byte header before fetching the body
     /// — two planned byte-source ranges instead of one.
     pub(super) header_probed: bool,
-    /// Count-only cursor: `decode_current_block` skips the tf half of each
-    /// block (see [`decode_block_doc_ids`]). Set by the unranked count
-    /// kernels (union / intersection), which never read `block_tfs`;
-    /// leaves `block_tfs` stale, so a `count_only` cursor must not be used
-    /// for scoring.
-    pub(super) count_only: bool,
+    /// What the cursor was built for. A `Count` cursor's
+    /// `decode_current_block` skips the tf half of each block (see
+    /// [`decode_block_doc_ids`]) and leaves `block_tfs` stale, so it must
+    /// not be used where tfs are read.
+    pub(super) purpose: CursorUse,
     /// Which block index is currently decoded into `block_doc_ids`
     /// (`usize::MAX` = none). Lets [`Self::contains`] skip re-decoding a
     /// PACKED block it already holds while probing membership across a
@@ -592,7 +617,7 @@ impl TermCursor {
         global_idf: Option<f32>,
         weight: u32,
         header_probed: bool,
-        count_only: bool,
+        purpose: CursorUse,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
@@ -609,18 +634,20 @@ impl TermCursor {
             stored,
             false,
         )?;
-        // A match-only cursor never scores, so it neither needs the idf nor
-        // the norms it would read the length array for.
-        let local_idf = match count_only {
-            true => 0.0,
-            false => bm25::idf(col.scored_doc_count(), term_meta.df),
-        };
-        // Effective idf folds in the query-term-frequency `weight` (> 1
-        // only for a deduplicated repeated term) on top of any global-idf
-        // override. Every stored bound is decoded at this idf too, so the
+        // An unscored cursor (`Match` or `Count`) needs neither the idf nor
+        // the bounds, both of which read the norms the length array holds.
+        // Otherwise the effective idf folds in the query-term-frequency
+        // `weight` (> 1 only for a deduplicated repeated term) on top of any
+        // global-idf override, and every stored bound is decoded at it, so the
         // bounds stay consistent with the scores computed from it.
-        let idf = global_idf.unwrap_or(local_idf) * weight as f32;
-        let bounds = BoundDecoder::new(stored, col, idf, local_idf);
+        let (idf, bounds) = match purpose.scores() {
+            false => (0.0, BoundDecoder::unscored(stored)),
+            true => {
+                let local_idf = bm25::idf(col.scored_doc_count(), term_meta.df);
+                let idf = global_idf.unwrap_or(local_idf) * weight as f32;
+                (idf, BoundDecoder::new(stored, col, idf, local_idf))
+            }
+        };
 
         // Collect straight into the `Arc` allocation: `0..num_blocks` is
         // an exact-size iterator, so this writes each entry in place —
@@ -660,7 +687,7 @@ impl TermCursor {
             inspect_block: 0,
             bytes: term_bytes,
             header_probed,
-            count_only,
+            purpose,
             decoded_block: usize::MAX,
             tf_decoded_block: usize::MAX,
             predecoded: false,
@@ -677,6 +704,34 @@ impl TermCursor {
         Ok(cursor)
     }
 
+    /// A cursor over one term's fetched body in whichever form its
+    /// dictionary value names: the short form ([`Self::new_short`]) or the
+    /// long one ([`Self::new`]). The one place a `Pfor` value's bytes become
+    /// a cursor, so every build reads the two forms alike.
+    pub(super) fn for_body(
+        bytes: Bytes,
+        short: bool,
+        col: &ColumnMeta,
+        stored: StoredBound,
+        global_idf: Option<f32>,
+        weight: u32,
+        header_probed: bool,
+        purpose: CursorUse,
+    ) -> Result<Self, FtsError> {
+        match short {
+            true => Self::new_short(bytes, col, global_idf, weight, header_probed, purpose),
+            false => Self::new(
+                bytes,
+                col,
+                stored,
+                global_idf,
+                weight,
+                header_probed,
+                purpose,
+            ),
+        }
+    }
+
     /// Build a cursor from a short-form body (`fts::short`): decode the
     /// whole list — at most one block — into the cursor's buffers and
     /// synthesize its single block's metadata. The block's upper bound
@@ -690,7 +745,7 @@ impl TermCursor {
         global_idf: Option<f32>,
         weight: u32,
         header_probed: bool,
-        count_only: bool,
+        purpose: CursorUse,
     ) -> Result<Self, FtsError> {
         let mut block_doc_ids = vec![0u32; BLOCK_LEN];
         let mut block_tfs = vec![0u32; BLOCK_LEN];
@@ -701,16 +756,16 @@ impl TermCursor {
             &mut block_tfs,
         )
         .ok_or_else(|| {
-            FtsError::Read(ReadError::MalformedVersion(
-                "malformed short-form term body".into(),
+            FtsError::Read(ReadError::Malformed(
+                "short-form term body does not decode".into(),
             ))
         })?;
         let n = decoded.n;
-        // A match-only cursor never scores: no idf, no block maximum, and
-        // no read of the length array to compute either.
-        let (idf_weight, block_max_bm25) = match count_only {
-            true => (0.0, 0.0),
-            false => {
+        // An unscored cursor (`Match` or `Count`): no idf, no block maximum,
+        // and no read of the length array to compute either.
+        let (idf_weight, block_max_bm25) = match purpose.scores() {
+            false => (0.0, 0.0),
+            true => {
                 let local_idf = bm25::idf(col.scored_doc_count(), n as u64);
                 let idf_weight = global_idf.unwrap_or(local_idf) * weight as f32;
                 let block_max_bm25 = block_doc_ids[..n]
@@ -742,7 +797,7 @@ impl TermCursor {
             inspect_block: 0,
             bytes: body,
             header_probed,
-            count_only: false,
+            purpose,
             decoded_block: 0,
             tf_decoded_block: 0,
             predecoded: true,
@@ -765,15 +820,27 @@ impl TermCursor {
     pub(super) fn new_inline(
         doc_id: u32,
         tf: u32,
-        n_scored_docs: u64,
-        dl_norm_k1: f32,
+        col: &ColumnMeta,
         global_idf: Option<f32>,
         weight: u32,
+        purpose: CursorUse,
     ) -> Self {
-        // Fold the qtf `weight` into the effective idf so the single-doc block-max
-        // (computed below from `idf_weight`) scales together with the score.
-        let idf_weight = global_idf.unwrap_or_else(|| bm25::idf(n_scored_docs, 1)) * weight as f32;
-        let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1);
+        // An unscored cursor (`Match` or `Count`): no idf, no block maximum,
+        // and no read of the length array to compute either. Otherwise the
+        // qtf `weight` folds into the effective idf, so the single-doc
+        // block maximum scales together with the score.
+        let (idf_weight, block_max_bm25) = match purpose.scores() {
+            false => (0.0, 0.0),
+            true => {
+                let local_idf = bm25::idf(col.scored_doc_count(), 1);
+                let idf_weight = global_idf.unwrap_or(local_idf) * weight as f32;
+                let dl_norm_k1 = col.dl_norm_k1().get(doc_id);
+                (
+                    idf_weight,
+                    bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1),
+                )
+            }
+        };
 
         let blocks: Arc<[BlockMeta]> = Arc::from([BlockMeta {
             last_doc_id: doc_id,
@@ -804,8 +871,9 @@ impl TermCursor {
             bytes: Bytes::new(),
             header_probed: false,
             // Inline cursors carry their single posting pre-decoded and
-            // never call `decode_current_block`, so the flag is inert.
-            count_only: false,
+            // never call `decode_current_block`, so no block decode reads
+            // `purpose` here.
+            purpose,
             decoded_block: 0,
             tf_decoded_block: 0,
             predecoded: true,
@@ -868,17 +936,17 @@ impl TermCursor {
         // `&mut self.block_*` decode targets, which are separate fields).
         let hdr = self.current_header();
         let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        // Count-only cursors skip the tf half of the block; the count
+        // A `Count` cursor skips the tf half of the block; the count
         // kernels never read `block_tfs`, so it is left stale.
-        self.block_n = match self.count_only {
-            true => decode_block_doc_ids(bytes, &hdr, &mut self.block_doc_ids),
-            false => decode_block(bytes, &hdr, &mut self.block_doc_ids, &mut self.block_tfs),
+        self.block_n = match self.purpose.decodes_tfs() {
+            false => decode_block_doc_ids(bytes, &hdr, &mut self.block_doc_ids),
+            true => decode_block(bytes, &hdr, &mut self.block_doc_ids, &mut self.block_tfs),
         };
         self.pos = 0;
         self.decoded_block = self.current_block;
         // A non-count decode also fills `block_tfs` for this block, so the
         // tf-only probe can reuse it without re-decoding.
-        if !self.count_only {
+        if self.purpose.decodes_tfs() {
             self.tf_decoded_block = self.current_block;
         }
     }
@@ -1431,14 +1499,14 @@ impl TermCursor {
     }
 
     /// Publish one doc of the current bitset block as the whole decoded
-    /// block. The tf is one lane read (skipped for a count-only cursor);
+    /// block. The tf is one lane read (skipped for a `Count` cursor);
     /// the arrays are marked undecoded so `materialize_at`, positions and
     /// the tf probes expand the block if they need it.
     fn publish_lazy(&mut self, doc: u32, rank: usize) {
         let (hdr, range) = self.current_block_bytes();
         let raw = &self.bytes[range];
         self.block_doc_ids[0] = doc;
-        if !self.count_only {
+        if self.purpose.decodes_tfs() {
             self.block_tfs[0] = bitset_tf_at(raw, &hdr, rank);
         }
         self.block_n = 1;
@@ -1752,7 +1820,7 @@ mod tests {
         let json = r#"[{"name":"flat","tokenizer":"ascii_lower"}]"#;
         let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let cursors = view
-            .build_term_cursors(0, &["common"], None, false, None, None)
+            .build_term_cursors(0, &["common"], None, CursorUse::Score, None, None)
             .await
             .expect("cursors");
         let tf_of = |doc: u32| 1 + doc % 5;
@@ -1806,7 +1874,7 @@ mod tests {
         let json = r#"[{"name":"flat","tokenizer":"ascii_lower"}]"#;
         let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let cursors = view
-            .build_term_cursors(0, &["sparse"], None, false, None, None)
+            .build_term_cursors(0, &["sparse"], None, CursorUse::Score, None, None)
             .await
             .expect("cursors");
         let mut c = cursors[0].clone();
@@ -1836,7 +1904,7 @@ mod tests {
     async fn lazy_block_expands_for_materialize_contains_and_walk() {
         let view = two_column_reader();
         let cursors = view
-            .build_term_cursors(1, &["common"], None, false, None, None)
+            .build_term_cursors(1, &["common"], None, CursorUse::Score, None, None)
             .await
             .expect("cursors");
         let mut reference = cursors[0].clone();
@@ -1880,9 +1948,9 @@ mod tests {
     #[tokio::test]
     async fn dense_and_sparse_skip_patterns_match_the_decoded_walk() {
         let view = two_column_reader();
-        for count_only in [false, true] {
+        for purpose in [CursorUse::Score, CursorUse::Count] {
             let cursors = view
-                .build_term_cursors(1, &["common"], None, false, None, None)
+                .build_term_cursors(1, &["common"], None, CursorUse::Score, None, None)
                 .await
                 .expect("cursors");
             let mut reference = cursors[0].clone();
@@ -1893,7 +1961,7 @@ mod tests {
             }
             let expect_at = |target: u32| walked.iter().find(|(d, _)| *d >= target).copied();
             let mut c = cursors[0].clone();
-            c.count_only = count_only;
+            c.purpose = purpose;
             let mut target = 0u32;
             let mut strides: Vec<u32> = Vec::new();
             strides.extend(std::iter::repeat_n(1, 300)); // dense: every doc, several per block
@@ -1907,7 +1975,7 @@ mod tests {
                     None => assert!(c.is_exhausted(), "step {k} target {target}"),
                     Some((d, tf)) => {
                         assert_eq!(c.current_doc_id(), d, "step {k} target {target}");
-                        if !count_only {
+                        if purpose.decodes_tfs() {
                             assert_eq!(c.current_tf(), tf, "step {k} target {target}");
                         }
                     }
@@ -1924,9 +1992,9 @@ mod tests {
     #[tokio::test]
     async fn lazy_bitset_skips_match_the_decoded_walk() {
         let view = two_column_reader();
-        for count_only in [false, true] {
+        for purpose in [CursorUse::Score, CursorUse::Count] {
             let cursors = view
-                .build_term_cursors(1, &["common"], None, false, None, None)
+                .build_term_cursors(1, &["common"], None, CursorUse::Score, None, None)
                 .await
                 .expect("cursors");
             let mut reference = cursors[0].clone();
@@ -1939,7 +2007,7 @@ mod tests {
             let expect_at = |target: u32| walked.iter().find(|(d, _)| *d >= target).copied();
 
             let mut c = cursors[0].clone();
-            c.count_only = count_only;
+            c.purpose = purpose;
             // Probe pattern: strides that land in a new block each time,
             // then inside the same block, then a long jump.
             let mut target = 0u32;
@@ -1950,7 +2018,7 @@ mod tests {
                     None => assert!(c.is_exhausted(), "target {target}"),
                     Some((d, tf)) => {
                         assert_eq!(c.current_doc_id(), d, "target {target}");
-                        if !count_only {
+                        if purpose.decodes_tfs() {
                             assert_eq!(c.current_tf(), tf, "target {target}");
                         }
                     }
@@ -1959,7 +2027,7 @@ mod tests {
             // Walk pattern after a skip: the steps expand the lazy block
             // and continue from the right position, then cross blocks.
             let mut c = cursors[0].clone();
-            c.count_only = count_only;
+            c.purpose = purpose;
             c.skip_to(2_600);
             let start = walked
                 .iter()
@@ -1967,7 +2035,7 @@ mod tests {
                 .expect("in range");
             for (k, &(d, tf)) in walked[start..start + 300].iter().enumerate() {
                 assert_eq!(c.current_doc_id(), d, "step {k}");
-                if !count_only {
+                if purpose.decodes_tfs() {
                     assert_eq!(c.current_tf(), tf, "step {k}");
                 }
                 c.next();
@@ -1977,7 +2045,7 @@ mod tests {
             c.skip_to(target);
             let (d, tf) = expect_at(target).expect("in range");
             assert_eq!(c.current_doc_id(), d);
-            if !count_only {
+            if purpose.decodes_tfs() {
                 assert_eq!(c.current_tf(), tf);
             }
         }
@@ -1989,7 +2057,7 @@ mod tests {
         assert_eq!(view.bounds.skip_layout(), SkipLayout::Length);
         for (col, positional) in [(0u32, true), (1u32, false)] {
             let cursors = view
-                .build_term_cursors(col, &["common"], None, false, None, None)
+                .build_term_cursors(col, &["common"], None, CursorUse::Score, None, None)
                 .await
                 .expect("cursors");
             let cursor = &cursors[0];
@@ -2068,7 +2136,7 @@ mod tests {
     async fn block_bounds_and_maxima(view: &FtsReader) -> Vec<(f32, f32)> {
         let col = &view.columns[0];
         let mut cursors = view
-            .build_term_cursors(0, &["common"], None, false, None, None)
+            .build_term_cursors(0, &["common"], None, CursorUse::Score, None, None)
             .await
             .expect("cursors");
         let cursor = cursors.first_mut().expect("term present");
@@ -2207,7 +2275,7 @@ mod tests {
         let reader = FtsReader::open(bytes, json).expect("open FtsReader");
 
         let mut cursors = reader
-            .build_term_cursors(0, &["common"], None, false, None, None)
+            .build_term_cursors(0, &["common"], None, CursorUse::Score, None, None)
             .await
             .expect("build term cursors");
         let cursor = cursors.first_mut().expect("`common` present in dictionary");
@@ -2426,7 +2494,7 @@ mod tests {
         let n_docs = d + 1;
         let view = planted_reader(&[list.clone()], n_docs);
         let cursors = view
-            .build_term_cursors(0, &SEEK_TERMS[..1], None, false, None, None)
+            .build_term_cursors(0, &SEEK_TERMS[..1], None, CursorUse::Score, None, None)
             .await
             .expect("cursors");
         let c = &cursors[0];
@@ -2558,7 +2626,7 @@ mod tests {
                                 0,
                                 &SEEK_TERMS[t..=t],
                                 None,
-                                false,
+                                CursorUse::Score,
                                 None,
                                 None,
                             ))
@@ -2592,7 +2660,7 @@ mod tests {
     async fn eager_mode_retries_a_lazy_probe_every_few_blocks() {
         let view = two_column_reader();
         let cursors = view
-            .build_term_cursors(1, &["common"], None, false, None, None)
+            .build_term_cursors(1, &["common"], None, CursorUse::Score, None, None)
             .await
             .expect("cursors");
         let walked = walk_all(&cursors[0]);

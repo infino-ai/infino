@@ -256,6 +256,9 @@ pub(crate) struct TermBlockWriter<W: Write> {
     in_block: usize,
     /// `(first key, byte offset)` of every finished block.
     index: Vec<(Vec<u8>, u64)>,
+    /// Total length of the keys in `index`, kept so [`Self::encoded_len`]
+    /// is constant-time.
+    index_key_bytes: usize,
     n_terms: u64,
 }
 
@@ -270,8 +273,24 @@ impl<W: Write> TermBlockWriter<W> {
             prev_offset: 0,
             in_block: 0,
             index: Vec::new(),
+            index_key_bytes: 0,
             n_terms: 0,
         }
+    }
+
+    /// Bytes [`Self::finish`] would write if called now: the blocks so far,
+    /// the open one, and the index and footer covering them.
+    pub(crate) fn encoded_len(&self) -> usize {
+        let (open_blocks, open_key) = match self.in_block {
+            0 => (0, 0),
+            _ => (1, self.block_first_key.len()),
+        };
+        self.written as usize
+            + self.block.len()
+            + self.index_key_bytes
+            + open_key
+            + (self.index.len() + open_blocks) * INDEX_ENTRY_BYTES
+            + TERM_BLOCKS_FOOTER_BYTES
     }
 
     /// Append one term. Keys must arrive strictly ascending.
@@ -334,6 +353,7 @@ impl<W: Write> TermBlockWriter<W> {
         if self.in_block == 0 {
             return Ok(());
         }
+        self.index_key_bytes += self.block_first_key.len();
         self.index
             .push((take(&mut self.block_first_key), self.written));
         self.out.write_all(&self.block)?;
@@ -803,6 +823,32 @@ mod tests {
                     .iter_prefix(&make_key("body", "zzz"))
                     .is_empty()
             );
+        }
+    }
+
+    #[test]
+    fn encoded_len_matches_the_finished_bytes() {
+        // Empty, one term, mid-block, one short of a block, exactly on a
+        // block boundary, one past it, and several blocks in. Guards the
+        // estimate against drifting from the layout `finish` writes.
+        for n in [
+            0usize,
+            1,
+            TERM_BLOCK_SIZE / 2,
+            TERM_BLOCK_SIZE - 1,
+            TERM_BLOCK_SIZE,
+            TERM_BLOCK_SIZE + 1,
+            2 * TERM_BLOCK_SIZE,
+            5 * TERM_BLOCK_SIZE + 7,
+        ] {
+            let items = entries(n as u32);
+            let mut w = TermBlockWriter::new(Vec::new());
+            for (k, v) in &items {
+                w.insert_sorted(k, *v).expect("vec sink");
+            }
+            let estimate = w.encoded_len();
+            let bytes = w.finish().expect("vec sink");
+            assert_eq!(estimate, bytes.len(), "n={n}");
         }
     }
 

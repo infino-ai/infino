@@ -766,6 +766,10 @@ pub(crate) mod test_support {
         ) -> Result<Option<String>, StorageError> {
             self.inner.put_atomic(uri, bytes).await
         }
+
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
         async fn put_if_match(
             &self,
             uri: &str,
@@ -885,6 +889,45 @@ pub(crate) mod test_support {
         let titles = LargeStringArray::from(vec!["alpha"]);
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(b.finish().expect("finish"))
+    }
+
+    /// Rows in [`multi_block_superfile_bytes`]: enough that the file spans several cache blocks.
+    const MULTI_BLOCK_ROWS: u64 = 40_000;
+    /// Characters per title in [`multi_block_superfile_bytes`].
+    const MULTI_BLOCK_TITLE_CHARS: usize = 64;
+
+    /// A scalar superfile several cache blocks long, with titles that barely compress, so a test
+    /// can read a block no open or query has touched.
+    pub(crate) fn multi_block_superfile_bytes() -> Bytes {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let schema = Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let titles: Vec<String> = (0..MULTI_BLOCK_ROWS)
+            .map(|_| {
+                (0..MULTI_BLOCK_TITLE_CHARS)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        ALPHABET[(state % 64) as usize] as char
+                    })
+                    .collect()
+            })
+            .collect();
+        let ids = decimal128_ids((1..=MULTI_BLOCK_ROWS).collect::<Vec<u64>>());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ids), Arc::new(LargeStringArray::from(titles))],
+        )
+        .expect("batch");
         b.add_batch(&batch, &[]).expect("add_batch");
         Bytes::from(b.finish().expect("finish"))
     }

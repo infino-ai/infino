@@ -21,9 +21,14 @@
 //! via [`InfinoError::with_context`]. Structured payload / `source()`
 //! chaining can follow in later PRs.
 
+use std::{error::Error, io};
+
+use datafusion::error::DataFusionError;
+use object_store::Error as ObjectStoreError;
+
 use crate::{
-    storage::StorageError,
-    superfile::{BuildError as SuperfileBuildError, ReadError as SuperfileReadError},
+    storage::{StorageError, error_chain, permission_denied_in_chain},
+    superfile::BuildError as SuperfileBuildError,
     supertable::{
         error::{
             BuildError as SupertableBuildError, CommitError as SupertableCommitError, OpenError,
@@ -31,6 +36,7 @@ use crate::{
         },
         manifest::ManifestLoadError,
         mutations::{CommitError as MutationCommitError, MutationError},
+        schema::error::SchemaError,
     },
 };
 
@@ -50,9 +56,15 @@ pub enum InfinoError {
     #[error("already exists: {0}")]
     AlreadyExists(String),
 
-    /// Schema or column validation failed.
+    /// Schema or column validation failed: a row that does not fit the
+    /// table's schema, or a schema write the table refused.
+    ///
+    /// The cause is carried typed, so a caller can tell a field-cap breach
+    /// from a compare-and-set conflict from a type mismatch and answer each
+    /// differently, instead of matching on the message text. Causes the
+    /// engine does not classify further arrive as [`SchemaError::Invalid`].
     #[error("schema: {0}")]
-    Schema(String),
+    Schema(SchemaError),
 
     /// A predicate matched a different row count than required, or
     /// exceeded the mutation cap.
@@ -67,7 +79,10 @@ pub enum InfinoError {
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
-    /// SQL planning or execution failure.
+    /// The query or search is wrong: it does not parse or plan, names a
+    /// column or function that does not exist, or fails on the caller's own
+    /// data (a bad cast). A failure inside the engine is `Io` or `Backend`;
+    /// valid SQL the engine does not implement is `Unsupported`.
     #[error("query: {0}")]
     Query(String),
 
@@ -84,7 +99,8 @@ pub enum InfinoError {
 
     /// A concurrent writer won the race: an optimistic-concurrency
     /// (compare-and-set) precondition failed and the operation's own retry
-    /// budget was exhausted.
+    /// budget was exhausted, or another writer in this process holds the
+    /// table's single writer slot.
     ///
     /// **Retryable.** Nothing partial is left visible — the losing writer's
     /// manifest swap never published, and a mutation whose WAL did become
@@ -103,6 +119,11 @@ pub enum InfinoError {
     /// An invalid or conflicting configuration was supplied.
     #[error("config: {0}")]
     Config(String),
+
+    /// The query is valid but uses something the engine does not support
+    /// yet, such as a SQL feature DataFusion does not implement.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 impl InfinoError {
@@ -122,7 +143,11 @@ impl InfinoError {
         match self {
             Self::NotFound(m) => Self::NotFound(format!("{prefix}: {m}")),
             Self::AlreadyExists(m) => Self::AlreadyExists(format!("{prefix}: {m}")),
-            Self::Schema(m) => Self::Schema(format!("{prefix}: {m}")),
+            // The only variant carrying a typed cause rather than a message.
+            // Prefixing would mean flattening it back to text, which is the
+            // thing this variant exists to avoid, so it passes through: the
+            // schema error names its own column or cap already.
+            Self::Schema(e) => Self::Schema(e),
             Self::Cardinality(m) => Self::Cardinality(format!("{prefix}: {m}")),
             Self::Io(m) => Self::Io(format!("{prefix}: {m}")),
             Self::PermissionDenied(m) => Self::PermissionDenied(format!("{prefix}: {m}")),
@@ -131,7 +156,24 @@ impl InfinoError {
             Self::Conflict(m) => Self::Conflict(format!("{prefix}: {m}")),
             Self::Backend(m) => Self::Backend(format!("{prefix}: {m}")),
             Self::Config(m) => Self::Config(format!("{prefix}: {m}")),
+            Self::Unsupported(m) => Self::Unsupported(format!("{prefix}: {m}")),
         }
+    }
+
+    /// [`From<QueryError>`] for a query error held by reference, as one found
+    /// inside a DataFusion error is. The match names every variant, so a new
+    /// one has to choose its public variant rather than fall into `Query`.
+    fn from_query_ref(e: &QueryError) -> Self {
+        let variant = match e {
+            QueryError::DataFusion(df) => return datafusion_error(df),
+            QueryError::InvalidQuery(_) => InfinoError::Query,
+            QueryError::Store(_) | QueryError::Parquet(_) => InfinoError::Io,
+            QueryError::ManifestLoad(load) => manifest_load_variant(load),
+            QueryError::Internal(_) => InfinoError::Backend,
+            QueryError::OverBudget(_) => InfinoError::OverBudget,
+            QueryError::PermissionDenied(_) => InfinoError::PermissionDenied,
+        };
+        variant(e.to_string())
     }
 }
 
@@ -149,51 +191,184 @@ impl From<StorageError> for InfinoError {
     }
 }
 
+/// `Query` is only for the caller's own mistakes: a query that does not parse
+/// or plan, a search over a column the table does not index. Everything the
+/// engine failed at on its own, mid-query, is something else, so a caller can
+/// tell "fix the query" from "the engine failed":
+///
+/// | `QueryError` | public | why |
+/// |---|---|---|
+/// | `InvalidQuery` | `Query` | the request itself is wrong |
+/// | `DataFusion` | by its cause | see [`datafusion_error`] |
+/// | `Store`, `Parquet` | `Io` | a read failed; retrying can succeed |
+/// | `ManifestLoad` | as a [`ManifestLoadError`] would | same failure, same answer |
+/// | `Internal` | `Backend` | the engine broke its own invariant: a bug |
+/// | `OverBudget`, `PermissionDenied` | the same names | |
 impl From<QueryError> for InfinoError {
     fn from(e: QueryError) -> Self {
-        if let Some(msg) = e.over_budget() {
-            return InfinoError::OverBudget(msg.to_string());
-        }
-        if e.is_permission_denied() {
-            return InfinoError::PermissionDenied(e.to_string());
-        }
-        InfinoError::Query(e.to_string())
+        InfinoError::from_query_ref(&e)
     }
+}
+
+/// Map a failure DataFusion returned from planning or running a query to the
+/// public error. Our own errors cross a plan typed (see `From<QueryError> for
+/// DataFusionError`), so the cause decides:
+///
+/// Checked in this order, the first match deciding:
+///
+/// | found | public |
+/// |---|---|
+/// | our [`QueryError`] anywhere in the chain | its own mapping and message |
+/// | `ResourcesExhausted` at the root, however wrapped | `OverBudget`, the pool's message |
+/// | refused credentials | `PermissionDenied` |
+/// | a read that failed: storage, object store or io, in the chain | `Io` |
+/// | `NotImplemented` | `Unsupported` |
+/// | `SQL`, `Plan`, `SchemaError`, `Configuration`, `ArrowError` | `Query`: the query or its data |
+/// | `External` holding someone else's error (a regex that does not parse) | `Query` |
+/// | a pushed-down predicate that failed on the data | `Query` |
+/// | `Execution` while turning SQL into a logical plan (see [`datafusion_planning_error`]) | `Query` |
+/// | anything else: `Execution`, `Internal`, a failed task | `Backend` |
+///
+/// An `External` error at the root that is neither ours nor storage's comes
+/// from a DataFusion function rejecting its arguments, which only the caller
+/// wrote. DataFusion's own `Execution` errors while a query runs are mixed (a
+/// value the caller's function cannot take next to a missing partition), so
+/// they count as ours until shown otherwise: a false `Backend` reads as an
+/// engine fault the caller can report, a false `Query` blames the caller and
+/// hides the bug.
+pub(crate) fn datafusion_error(e: &DataFusionError) -> InfinoError {
+    classify_datafusion_error(e, false)
+}
+
+/// [`datafusion_error`] for a failure turning SQL into a logical plan. No
+/// optimizer has run and no data has been scanned yet, so DataFusion's own
+/// `Execution` there is almost always a function rejecting the caller's
+/// arguments (`arrow_cast(x, 'NotAType')`), and is the caller's. Anything we
+/// read while planning (a search table function opening its table) fails with
+/// our own error, typed, and keeps its own answer. The cost: the few planner
+/// checks DataFusion raises as `Execution` for its own impossible states would
+/// read as `Query` here.
+pub(crate) fn datafusion_planning_error(e: &DataFusionError) -> InfinoError {
+    classify_datafusion_error(e, true)
+}
+
+fn classify_datafusion_error(e: &DataFusionError, planning: bool) -> InfinoError {
+    if let Some(cause) = error_chain(e).find_map(|link| link.downcast_ref::<QueryError>()) {
+        return InfinoError::from_query_ref(cause);
+    }
+    // A budget refusal keeps the pool's own message, however an operator
+    // wrapped it (an external sort adds "Not enough memory to continue").
+    if let DataFusionError::ResourcesExhausted(msg) = e.find_root() {
+        return InfinoError::OverBudget(msg.clone());
+    }
+    let variant = if permission_denied_in_chain(e) {
+        InfinoError::PermissionDenied
+    } else if error_chain(e).any(is_failed_read) {
+        InfinoError::Io
+    } else {
+        // Nothing of ours or the store's under it: DataFusion's own variant.
+        match e.find_root() {
+            DataFusionError::NotImplemented(_) => InfinoError::Unsupported,
+            DataFusionError::SQL(..)
+            | DataFusionError::Plan(_)
+            | DataFusionError::SchemaError(..)
+            | DataFusionError::Configuration(_)
+            | DataFusionError::ArrowError(..)
+            | DataFusionError::External(_) => InfinoError::Query,
+            DataFusionError::Execution(_) if planning => InfinoError::Query,
+            _ => InfinoError::Backend,
+        }
+    };
+    variant(e.to_string())
+}
+
+/// Whether `link` is a read that failed: a storage, object store or io error.
+/// A store saying it cannot do an operation at all (not implemented, not
+/// supported) is not one: no retry changes that answer, and a scan only asks
+/// a store for what it serves, so reaching one is our bug.
+fn is_failed_read(link: &(dyn Error + 'static)) -> bool {
+    if let Some(store) = link.downcast_ref::<ObjectStoreError>() {
+        return !matches!(
+            store,
+            ObjectStoreError::NotImplemented { .. } | ObjectStoreError::NotSupported { .. }
+        );
+    }
+    link.is::<StorageError>() || link.is::<io::Error>()
 }
 
 impl From<ManifestLoadError> for InfinoError {
     fn from(e: ManifestLoadError) -> Self {
-        let msg = e.to_string();
-        if e.is_permission_denied() {
-            return InfinoError::PermissionDenied(msg);
-        }
-        match e {
-            // The table this handle was reading has been dropped and purged, so
-            // the name it was opened under no longer resolves to anything —
-            // `NotFound`, not a backend fault, is what a caller must react to.
-            ManifestLoadError::PointerVanished => InfinoError::NotFound(msg),
-            // A storage fault reading the manifest — the pointer probe or a
-            // part load — is a transient I/O hiccup, not a permanent failure.
-            // Surface it as `Io` so a caller can retry (e.g. against another
-            // copy of the data) rather than treat it as a hard backend fault.
-            ManifestLoadError::Storage(_) => InfinoError::Io(msg),
-            _ => InfinoError::Backend(msg),
-        }
+        manifest_load_variant(&e)(e.to_string())
     }
 }
 
-impl From<SuperfileReadError> for InfinoError {
-    fn from(e: SuperfileReadError) -> Self {
-        if let Some(msg) = e.over_budget() {
-            return InfinoError::OverBudget(msg.to_string());
-        }
-        InfinoError::Query(e.to_string())
+/// The public variant a manifest load failure maps to, wherever it is met:
+/// opening a table, or in the middle of a query. Returned as the variant's
+/// constructor, so each caller wraps its own message (a mid-query failure
+/// keeps its `manifest load error:` label).
+fn manifest_load_variant(e: &ManifestLoadError) -> fn(String) -> InfinoError {
+    if e.is_permission_denied() {
+        return InfinoError::PermissionDenied;
+    }
+    match e {
+        // The table this handle was reading has been dropped and purged, so
+        // the name it was opened under no longer resolves to anything:
+        // `NotFound`, not a backend fault, is what a caller must react to.
+        ManifestLoadError::PointerVanished => InfinoError::NotFound,
+        // A storage fault reading the manifest (the pointer probe or a part
+        // load) is a transient I/O hiccup, not a permanent failure.
+        // Surface it as `Io` so a caller can retry (e.g. against another
+        // copy of the data) rather than treat it as a hard backend fault.
+        ManifestLoadError::Storage(_) => InfinoError::Io,
+        _ => InfinoError::Backend,
     }
 }
 
+/// A superfile build failure, by whose it is: the caller's schema or data
+/// (`Schema`), a valid choice we do not run yet (`Unsupported`), or ours
+/// (`Backend`: an I/O or encoding failure while writing). A refused
+/// credential under any of them keeps its own class. Exhaustive on purpose,
+/// so a new variant has to be classified rather than read as the caller's.
 impl From<SuperfileBuildError> for InfinoError {
     fn from(e: SuperfileBuildError) -> Self {
-        InfinoError::Schema(e.to_string())
+        if permission_denied_in_chain(&e) {
+            return InfinoError::PermissionDenied(e.to_string());
+        }
+        match &e {
+            SuperfileBuildError::MissingIdColumn(_)
+            | SuperfileBuildError::IdColumnWrongType(..)
+            | SuperfileBuildError::IdColumnMismatch(..)
+            | SuperfileBuildError::FtsColumnMustBeLargeUtf8 { .. }
+            | SuperfileBuildError::FtsColumnTypeInvalid { .. }
+            | SuperfileBuildError::FTSSchemaMismatch(_)
+            | SuperfileBuildError::DuplicateColumnName(_)
+            | SuperfileBuildError::DuplicateLogicalName(_)
+            | SuperfileBuildError::ReservedSeparatorInColumnName(_)
+            | SuperfileBuildError::PositionOverflow { .. }
+            | SuperfileBuildError::SchemaMismatch { .. }
+            | SuperfileBuildError::ReservedPrefixInColumnName(_)
+            | SuperfileBuildError::VectorDimOutOfRange { .. }
+            | SuperfileBuildError::VectorDimMismatch { .. }
+            | SuperfileBuildError::VectorSchemaMismatch(_)
+            | SuperfileBuildError::VectorCountMismatch { .. }
+            | SuperfileBuildError::WrongRowShape { .. }
+            | SuperfileBuildError::BatchSchemaMismatch { .. }
+            | SuperfileBuildError::FtsColumnMissing(_) => {
+                InfinoError::Schema(SchemaError::Invalid {
+                    reason: e.to_string(),
+                })
+            }
+            SuperfileBuildError::UnknownAnalyzer { .. } => InfinoError::Config(e.to_string()),
+            SuperfileBuildError::VectorRerankCodecUnimplemented { .. } => {
+                InfinoError::Unsupported(e.to_string())
+            }
+            // Decoding a superfile we wrote, a missing internal builder or an
+            // empty merge input: never the caller's batch.
+            SuperfileBuildError::VectorReadError
+            | SuperfileBuildError::BatchReadError
+            | SuperfileBuildError::Io(_)
+            | SuperfileBuildError::Footer(_) => InfinoError::Backend(e.to_string()),
+        }
     }
 }
 
@@ -208,19 +383,67 @@ impl From<SupertableBuildError> for InfinoError {
         if e.is_conflict() {
             return InfinoError::Conflict(e.to_string());
         }
-        // A commit that found its table dropped and purged is not a schema
-        // problem; it is the name no longer resolving. Same answer the read
-        // path gives, so a caller can match one condition, not three.
-        if matches!(e, SupertableBuildError::TableGone) {
-            return InfinoError::NotFound(e.to_string());
+        // Exhaustive on purpose, so a new variant has to be classified rather
+        // than read as the caller's.
+        let message = e.to_string();
+        match e {
+            // The superfile layer classifies its own failures.
+            SupertableBuildError::Superfile(inner) => InfinoError::from(inner),
+            // A table that already exists is the one schema cause with an
+            // answer of its own.
+            SupertableBuildError::Schema(SchemaError::TableExists { .. }) => {
+                InfinoError::AlreadyExists(message)
+            }
+            // The cause is already classified; hand it to the caller whole
+            // rather than flattening it into its own message.
+            SupertableBuildError::Schema(schema) => InfinoError::Schema(schema),
+            // The caller's table shape, batch or parameters.
+            SupertableBuildError::NoDocsToBuild
+            | SupertableBuildError::MissingIdColumn(_)
+            | SupertableBuildError::IdColumnWrongType(..)
+            | SupertableBuildError::IdColumnReserved(_)
+            | SupertableBuildError::FtsColumnMissing { .. }
+            | SupertableBuildError::FtsColumnMustBeLargeUtf8 { .. }
+            | SupertableBuildError::FtsBm25ParamsOutOfRange { .. }
+            | SupertableBuildError::VectorColumnMissing { .. }
+            | SupertableBuildError::VectorColumnNotFixedSizeList { .. }
+            | SupertableBuildError::VectorColumnDimMismatch { .. }
+            | SupertableBuildError::VectorColumnHasNulls { .. }
+            | SupertableBuildError::VectorDimOutOfRange { .. }
+            | SupertableBuildError::DuplicateLogicalName(_)
+            | SupertableBuildError::ReservedSeparatorInColumnName(_)
+            | SupertableBuildError::ReservedPrefixInColumnName(_)
+            | SupertableBuildError::PartitionColumnMissing(_)
+            | SupertableBuildError::HydrateRequiresNoIndex { .. }
+            | SupertableBuildError::HydrateChunkTooLarge { .. } => {
+                InfinoError::Schema(SchemaError::Invalid { reason: message })
+            }
+            // A bad setting: an unknown analyzer name (the same class a bad
+            // connect option gets), or a zero hydrate `target_rows`.
+            SupertableBuildError::UnknownAnalyzer { .. }
+            | SupertableBuildError::HydrateZeroTargetRows => InfinoError::Config(message),
+            // The caller's input reader failing during hydrate: I/O on their side.
+            SupertableBuildError::HydrateInputRead(_) => InfinoError::Io(message),
+            // A commit that found its table dropped and purged: the name no
+            // longer resolves, the same answer the read path gives.
+            SupertableBuildError::TableGone => InfinoError::NotFound(message),
+            // Decided by the checks above, named here for completeness.
+            SupertableBuildError::OverBudget(_) => InfinoError::OverBudget(message),
+            SupertableBuildError::PermissionDenied(_) => InfinoError::PermissionDenied(message),
+            // A commit that lost the schema compare-and-set is a lost race like
+            // the other two: the writer retries it, and a caller that sees it
+            // has had the retries spent on its behalf.
+            SupertableBuildError::SupertableInUse
+            | SupertableBuildError::WriteContention
+            | SupertableBuildError::SchemaMoved { .. } => InfinoError::Conflict(message),
+            // Ours: a store, scratch file, thread pool or cache directory
+            // failing while the write ran, none of it the caller's to fix.
+            SupertableBuildError::Store(_)
+            | SupertableBuildError::ThreadPoolCreation(_)
+            | SupertableBuildError::ReadAfterCommit(_)
+            | SupertableBuildError::StorageConstruction(_)
+            | SupertableBuildError::DiskCacheRootUnwritable(_) => InfinoError::Backend(message),
         }
-        // A bad analyzer name is a configuration mistake, not a schema
-        // shape problem — surface it as the same class a bad connect
-        // option gets.
-        if matches!(e, SupertableBuildError::UnknownAnalyzer { .. }) {
-            return InfinoError::Config(e.to_string());
-        }
-        InfinoError::Schema(e.to_string())
     }
 }
 
@@ -269,7 +492,6 @@ impl From<MutationError> for InfinoError {
             MutationError::Storage(s) => InfinoError::from(s),
             MutationError::CardinalityMismatch { .. }
             | MutationError::MatchCountExceedsCap { .. } => InfinoError::Cardinality(msg),
-            MutationError::SchemaMismatch(_) => InfinoError::Schema(msg),
             // Classifies exactly as the same rows would through `append`.
             MutationError::InvalidNewRows(b) => InfinoError::from(b),
             // Matches the read path: a purged table's name resolves to nothing.
@@ -299,17 +521,26 @@ impl From<MutationCommitError> for InfinoError {
         ) {
             return InfinoError::NotFound(e.to_string());
         }
+        // A buffer the table's schema refuses at commit (a peer froze a
+        // column in another type first) classifies as the same batch would
+        // through a synchronous append.
+        if let MutationCommitError::AppendFlush(SupertableBuildError::Schema(schema)) = &e {
+            return InfinoError::from(SupertableBuildError::Schema(schema.clone()));
+        }
         InfinoError::Backend(e.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use arrow_schema::ArrowError;
+    use parquet::errors::ParquetError;
     use uuid::Uuid;
 
     use super::*;
     use crate::{
         storage::StorageError,
+        superfile::LazyByteSourceError,
         supertable::wal::{
             WalStoreError,
             pipeline::{AppendPhaseError, TombstonePhaseError},
@@ -326,7 +557,10 @@ mod tests {
             InfinoError::AlreadyExists("t".into()).to_string(),
             "already exists: t"
         );
-        assert_eq!(InfinoError::Schema("t".into()).to_string(), "schema: t");
+        assert_eq!(
+            InfinoError::Schema(SchemaError::Invalid { reason: "t".into() }).to_string(),
+            "schema: t"
+        );
         assert_eq!(
             InfinoError::Cardinality("t".into()).to_string(),
             "cardinality: t"
@@ -377,19 +611,15 @@ mod tests {
     }
 
     #[test]
-    fn from_query_read_and_build_errors() {
+    fn from_query_and_build_errors() {
         assert!(matches!(
-            InfinoError::from(QueryError::Plan("p".into())),
+            InfinoError::from(QueryError::InvalidQuery("p".into())),
             InfinoError::Query(_)
         ));
         // A budget refusal keeps its own variant rather than collapsing to Query.
         assert!(matches!(
             InfinoError::from(QueryError::OverBudget("b".into())),
             InfinoError::OverBudget(_)
-        ));
-        assert!(matches!(
-            InfinoError::from(SuperfileReadError::MissingKv("k")),
-            InfinoError::Query(_)
         ));
         assert!(matches!(
             InfinoError::from(SuperfileBuildError::MissingIdColumn("c".into())),
@@ -399,6 +629,65 @@ mod tests {
             InfinoError::from(SupertableBuildError::NoDocsToBuild),
             InfinoError::Schema(_)
         ));
+    }
+
+    /// A build failure on our side (a store, scratch file or encoding step
+    /// failing while the write ran) is `Backend`, never the `Schema` a
+    /// caller's own table shape gets; a valid choice we do not run yet is
+    /// `Unsupported`, and the superfile layer's failures keep their class
+    /// through the supertable's wrapper.
+    #[test]
+    fn a_build_failure_is_classified_by_whose_it_is() {
+        let io = || SuperfileBuildError::Io(io::Error::other("disk full"));
+        let codec = || SuperfileBuildError::VectorRerankCodecUnimplemented {
+            column: "emb".into(),
+            codec: "pq",
+        };
+        let cases: [(InfinoError, fn(&InfinoError) -> bool); 9] = [
+            (
+                InfinoError::from(SuperfileBuildError::BatchReadError),
+                |e| matches!(e, InfinoError::Backend(_)),
+            ),
+            (
+                InfinoError::from(SupertableBuildError::Store(
+                    "term-stats write timed out".into(),
+                )),
+                |e| matches!(e, InfinoError::Backend(_)),
+            ),
+            (
+                InfinoError::from(SupertableBuildError::ThreadPoolCreation(
+                    "no threads".into(),
+                )),
+                |e| matches!(e, InfinoError::Backend(_)),
+            ),
+            (InfinoError::from(io()), |e| {
+                matches!(e, InfinoError::Backend(_))
+            }),
+            (
+                InfinoError::from(SupertableBuildError::Superfile(io())),
+                |e| matches!(e, InfinoError::Backend(_)),
+            ),
+            (InfinoError::from(codec()), |e| {
+                matches!(e, InfinoError::Unsupported(_))
+            }),
+            (
+                InfinoError::from(SupertableBuildError::Superfile(codec())),
+                |e| matches!(e, InfinoError::Unsupported(_)),
+            ),
+            (
+                InfinoError::from(SupertableBuildError::Superfile(
+                    SuperfileBuildError::MissingIdColumn("c".into()),
+                )),
+                |e| matches!(e, InfinoError::Schema(_)),
+            ),
+            (
+                InfinoError::from(SupertableBuildError::MissingIdColumn("c".into())),
+                |e| matches!(e, InfinoError::Schema(_)),
+            ),
+        ];
+        for (got, expected) in cases {
+            assert!(expected(&got), "got {got:?}");
+        }
     }
 
     #[test]
@@ -465,6 +754,262 @@ mod tests {
                 source: "bad region".into(),
             }),
             InfinoError::Io(_)
+        ));
+    }
+
+    /// `Query` is the caller's mistake alone. What the engine fails at in the
+    /// middle of a query maps elsewhere, so a caller can tell "fix the query"
+    /// from "the engine failed" without reading the message.
+    #[test]
+    fn a_query_error_is_the_callers_only_when_the_request_is_wrong() {
+        let ordinary_storage_fault = || StorageError::Permanent {
+            uri: "u".into(),
+            source: "bad region".into(),
+        };
+        // The request itself is wrong.
+        assert!(matches!(
+            InfinoError::from(QueryError::InvalidQuery("unknown vector column".into())),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(QueryError::InvalidQuery("p".into())),
+            InfinoError::Query(_)
+        ));
+        // A read failed: retrying can succeed.
+        assert!(matches!(
+            InfinoError::from(QueryError::Store("s".into())),
+            InfinoError::Io(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(QueryError::Parquet("p".into())),
+            InfinoError::Io(_)
+        ));
+        // A manifest load answers the same mid-query as it does on open.
+        assert!(matches!(
+            InfinoError::from(QueryError::ManifestLoad(ManifestLoadError::Storage(
+                ordinary_storage_fault()
+            ))),
+            InfinoError::Io(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(QueryError::ManifestLoad(ManifestLoadError::PointerVanished)),
+            InfinoError::NotFound(_)
+        ));
+        // The engine's own invariants.
+        assert!(matches!(
+            InfinoError::from(QueryError::Internal("_id column missing".into())),
+            InfinoError::Backend(_)
+        ));
+        // The budget refusal keeps its own, already labelled message.
+        assert_eq!(
+            InfinoError::from(QueryError::OverBudget("during scan, over".into())).to_string(),
+            "over budget: during scan, over"
+        );
+        // The message is the internal error's, unchanged.
+        assert_eq!(
+            InfinoError::from(QueryError::Store("s".into())).to_string(),
+            "io: superfile store error during query: s"
+        );
+    }
+
+    /// DataFusion's own `Execution` is the caller's only while planning; a
+    /// broken invariant and our own errors keep their answer either way.
+    #[test]
+    fn an_execution_error_is_the_callers_only_while_planning() {
+        let execution = DataFusionError::Execution("bad argument".into());
+        assert!(matches!(
+            datafusion_planning_error(&execution),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&execution),
+            InfinoError::Backend(_)
+        ));
+        let invariant = DataFusionError::Internal("bug".into());
+        assert!(matches!(
+            datafusion_planning_error(&invariant),
+            InfinoError::Backend(_)
+        ));
+        let ours = DataFusionError::from(QueryError::Internal("bug".into()));
+        assert!(matches!(
+            datafusion_planning_error(&ours),
+            InfinoError::Backend(_)
+        ));
+    }
+
+    /// A DataFusion failure maps by what caused it, not by DataFusion's own
+    /// variant alone: our errors cross a plan typed and keep their answer.
+    #[test]
+    fn a_datafusion_failure_maps_by_its_cause() {
+        let ours = |e: QueryError| DataFusionError::from(e);
+        // Our own error inside the plan decides, with its own message.
+        let err = datafusion_error(&ours(QueryError::Store("bucket timed out".into())));
+        assert!(
+            matches!(&err, InfinoError::Io(m) if m == "superfile store error during query: bucket timed out"),
+            "{err:?}"
+        );
+        assert!(matches!(
+            datafusion_error(&ours(QueryError::InvalidQuery("no full-text index".into()))),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&ours(QueryError::Internal("_id column missing".into()))),
+            InfinoError::Backend(_)
+        ));
+        // Wrapped by DataFusion on the way out, it still decides.
+        assert!(matches!(
+            datafusion_error(&ours(QueryError::Store("s".into())).context("scan")),
+            InfinoError::Io(_)
+        ));
+        // Storage under DataFusion's own variants is a failed read.
+        assert!(matches!(
+            datafusion_error(&DataFusionError::IoError(io::Error::other("reset"))),
+            InfinoError::Io(_)
+        ));
+        // DataFusion's own classes.
+        let plan = |m: &str| DataFusionError::Plan(m.into());
+        assert!(matches!(
+            datafusion_error(&plan("No field named ghost")),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ArrowError(
+                Box::new(ArrowError::DivideByZero),
+                None
+            )),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ResourcesExhausted("spill".into())),
+            InfinoError::OverBudget(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&DataFusionError::NotImplemented("LATERAL".into())),
+            InfinoError::Unsupported(_)
+        ));
+        // Mixed or ours: counted as ours, so it is logged and looked at.
+        for e in [
+            DataFusionError::Execution("Partition 3 not found".into()),
+            DataFusionError::Internal("bug".into()),
+        ] {
+            assert!(
+                matches!(datafusion_error(&e), InfinoError::Backend(_)),
+                "{e:?}"
+            );
+        }
+    }
+
+    /// A SQL scan reads a superfile through an object store, so a range fetch
+    /// reaches the plan under the store's error, typed: refused credentials
+    /// are found under it, and any other range-fetch failure is a read that
+    /// failed.
+    #[test]
+    fn a_range_fetch_inside_a_scan_is_classified_by_its_kind() {
+        let in_scan = |fetch: LazyByteSourceError| {
+            datafusion_error(&DataFusionError::ParquetError(Box::new(
+                ParquetError::External(Box::new(ObjectStoreError::Generic {
+                    store: "SuperfileObjectStore",
+                    source: Box::new(fetch),
+                })),
+            )))
+        };
+        assert!(matches!(
+            in_scan(LazyByteSourceError::Storage(
+                StorageError::PermissionDenied { uri: "u".into() }
+            )),
+            InfinoError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            in_scan(LazyByteSourceError::ShortRead {
+                start: 0,
+                requested: 8,
+                got: 4
+            }),
+            InfinoError::Io(_)
+        ));
+        assert!(matches!(
+            in_scan(LazyByteSourceError::OutOfBounds {
+                start: 9,
+                len: 1,
+                size: 4
+            }),
+            InfinoError::Io(_)
+        ));
+    }
+
+    /// The chain branches: refused credentials, a failed read, a store that
+    /// cannot do an operation at all, our error under arrow and parquet
+    /// wrappers, and another crate's error a DataFusion function returned.
+    #[test]
+    fn a_datafusion_failure_is_classified_through_its_whole_chain() {
+        let external = |e: Box<dyn Error + Send + Sync>| DataFusionError::External(e);
+        assert!(matches!(
+            datafusion_error(&external(Box::new(StorageError::PermissionDenied {
+                uri: "u".into()
+            }))),
+            InfinoError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ObjectStore(Box::new(
+                ObjectStoreError::Generic {
+                    store: "s3",
+                    source: "connection reset".into(),
+                }
+            ))),
+            InfinoError::Io(_)
+        ));
+        // A store refusing an operation outright is not a read that failed.
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ObjectStore(Box::new(
+                ObjectStoreError::NotImplemented {
+                    operation: "put".into(),
+                    implementer: "store".into(),
+                }
+            ))),
+            InfinoError::Backend(_)
+        ));
+        // Our error still decides under arrow's and parquet's own wrappers.
+        let ours = || Box::new(QueryError::Store("s".into()));
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ArrowError(
+                Box::new(ArrowError::ExternalError(ours())),
+                None
+            )),
+            InfinoError::Io(_)
+        ));
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ParquetError(Box::new(
+                ParquetError::External(ours())
+            ))),
+            InfinoError::Io(_)
+        ));
+        // Another crate's error, returned by a DataFusion function rejecting
+        // the caller's argument (an invalid regex), is the caller's.
+        assert!(matches!(
+            datafusion_error(&external("regex parse error".into())),
+            InfinoError::Query(_)
+        ));
+    }
+
+    /// A parquet failure is a corrupt or unread file: the engine's, not the
+    /// caller's. Predicates never run inside the scan, so none can fail there.
+    #[test]
+    fn a_parquet_failure_is_the_engines() {
+        assert!(matches!(
+            datafusion_error(&DataFusionError::ParquetError(Box::new(
+                ParquetError::General("bad footer".into())
+            ))),
+            InfinoError::Backend(_)
+        ));
+    }
+
+    /// Another writer holding the table's writer slot is the same retryable
+    /// condition as a lost commit race, not a schema problem.
+    #[test]
+    fn a_taken_writer_slot_is_a_conflict() {
+        assert!(matches!(
+            InfinoError::from(SupertableBuildError::SupertableInUse),
+            InfinoError::Conflict(_)
         ));
     }
 
@@ -631,7 +1176,9 @@ mod tests {
     #[test]
     fn from_mutation_error_maps_each_arm() {
         assert!(matches!(
-            InfinoError::from(MutationError::PredicateEval(QueryError::Plan("p".into()))),
+            InfinoError::from(MutationError::PredicateEval(QueryError::InvalidQuery(
+                "p".into()
+            ))),
             InfinoError::Query(_)
         ));
         assert!(matches!(
@@ -650,10 +1197,6 @@ mod tests {
         assert!(matches!(
             InfinoError::from(MutationError::MatchCountExceedsCap { matched: 9, cap: 5 }),
             InfinoError::Cardinality(_)
-        ));
-        assert!(matches!(
-            InfinoError::from(MutationError::SchemaMismatch("s".into())),
-            InfinoError::Schema(_)
         ));
         assert!(matches!(
             InfinoError::from(MutationError::NoStorageAttached),

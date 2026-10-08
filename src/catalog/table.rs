@@ -14,9 +14,10 @@
 use std::any::Any;
 use std::{fmt, sync::Arc, time::Duration};
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
 use datafusion::prelude::Expr;
+use serde_json::Value;
 
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
@@ -25,6 +26,7 @@ use crate::{
     superfile::VectorSearchOptions,
     supertable::{
         Supertable as SupertableHandle,
+        hydrate::hydrate_from_reader,
         reindex::{PlannedRepair, ReindexReport, StalenessReport},
     },
 };
@@ -37,7 +39,10 @@ pub(crate) trait Table: Send + Sync {
     fn schema(&self) -> SchemaRef;
     fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError>;
     fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError>;
+    fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError>;
+    fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError>;
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError>;
+    fn update_rows(&self, predicate: Expr, rows: &[Value]) -> Result<MutationStats, InfinoError>;
     fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError>;
     fn bm25_search(
         &self,
@@ -84,6 +89,11 @@ pub(crate) trait Table: Send + Sync {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError>;
+    fn hydrate(
+        &self,
+        batches: &mut dyn RecordBatchReader,
+        target_rows: usize,
+    ) -> Result<usize, InfinoError>;
     fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError>;
     fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError>;
     fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError>;
@@ -110,8 +120,17 @@ impl Table for SupertableHandle {
     fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
         SupertableHandle::append_named(self, batch, source_name)
     }
+    fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
+        SupertableHandle::append_rows(self, rows)
+    }
+    fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
+        SupertableHandle::append_rows_named(self, rows, source_name)
+    }
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError> {
         SupertableHandle::update(self, predicate, batch)
+    }
+    fn update_rows(&self, predicate: Expr, rows: &[Value]) -> Result<MutationStats, InfinoError> {
+        SupertableHandle::update_rows(self, predicate, rows)
     }
     fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
         SupertableHandle::delete(self, predicate)
@@ -185,6 +204,13 @@ impl Table for SupertableHandle {
     }
     fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
         SupertableHandle::optimize(self, opts)
+    }
+    fn hydrate(
+        &self,
+        batches: &mut dyn RecordBatchReader,
+        target_rows: usize,
+    ) -> Result<usize, InfinoError> {
+        Ok(hydrate_from_reader(self, batches, target_rows)?)
     }
     fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
         SupertableHandle::reindex(self, opts)
@@ -263,6 +289,23 @@ impl Supertable {
         self.inner.append_named(batch, source_name)
     }
 
+    /// Append rows given as JSON documents. Each document is flattened to
+    /// dot paths and typed from its values: a path the table does not have
+    /// joins the schema, a nullable column a document omits is null, and a
+    /// value whose type disagrees with the column's is refused with the
+    /// same error an Arrow batch would get. Numbers are never parsed from
+    /// strings or truncated: an integral literal fits an integer or a
+    /// `Float64` column, a literal with a fraction fits only a float column.
+    pub fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
+        self.inner.append_rows(rows)
+    }
+
+    /// [`Self::append_rows`], naming the source the rows came from as
+    /// [`Self::append_named`] does.
+    pub fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
+        self.inner.append_rows_named(rows, source_name)
+    }
+
     /// Update rows matching `predicate` with values from `batch`.
     pub fn update(
         &self,
@@ -271,6 +314,17 @@ impl Supertable {
     ) -> Result<MutationStats, InfinoError> {
         ensure_expr_within_connective_cap(&predicate)?;
         self.inner.update(predicate, batch)
+    }
+
+    /// [`Self::update`] with the replacement rows given as JSON documents,
+    /// mapped as [`Self::append_rows`] maps them.
+    pub fn update_rows(
+        &self,
+        predicate: Expr,
+        rows: &[Value],
+    ) -> Result<MutationStats, InfinoError> {
+        ensure_expr_within_connective_cap(&predicate)?;
+        self.inner.update_rows(predicate, rows)
     }
 
     /// Delete rows matching `predicate`.
@@ -469,6 +523,37 @@ impl Supertable {
     /// Optimize (compact) the table.
     pub fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
         self.inner.optimize(opts)
+    }
+
+    /// Bulk-load `batches` into this table as a few big superfiles, for data
+    /// already in columnar form that is queried with SQL only. Returns the rows
+    /// committed. **Experimental:** the signature may change.
+    ///
+    /// Batches are packed into superfiles of about `target_rows` rows each (at
+    /// least 1), with no per-append superfiles and no `optimize` pass. A Parquet
+    /// reader can be passed straight in: batches are read as needed, and a read
+    /// error comes back as [`InfinoError::Io`].
+    ///
+    /// - SQL-only: the table must have no full-text or vector index, else
+    ///   [`InfinoError::Schema`]. Hydrated rows are never found by BM25 or
+    ///   vector search.
+    /// - Columns are matched by name, like `append`. Unlike `append`, a column the
+    ///   table doesn't have is refused: hydrate doesn't grow the schema.
+    /// - Takes the table's writer slot for the whole load; a concurrent writer
+    ///   gets [`InfinoError::Conflict`].
+    /// - Not atomic: superfiles commit in waves to bound memory, so an error part
+    ///   way leaves the waves already committed. Don't retry on the same table
+    ///   (that adds those rows again); drop it and hydrate again.
+    /// - Memory is bounded by the connection memory budget and the memory free to
+    ///   the process. A table with no storage backend keeps all its data in
+    ///   memory anyway.
+    /// - Hosted (remote) tables return [`InfinoError::Unsupported`].
+    pub fn hydrate(
+        &self,
+        mut batches: impl RecordBatchReader,
+        target_rows: usize,
+    ) -> Result<usize, InfinoError> {
+        self.inner.hydrate(&mut batches, target_rows)
     }
 
     /// Rewrite every superfile whose full-text index is behind the format

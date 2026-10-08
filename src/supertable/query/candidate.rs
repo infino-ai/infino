@@ -53,6 +53,41 @@
 //! compares dictionary terms with those folded back (`fold_term`). Tokens
 //! with non-ASCII characters are not bounded under `ILIKE`. `NOT LIKE`
 //! stays `Unbounded`.
+//!
+//! ## The exact shape
+//!
+//! One `LIKE` shape skips pass 2 entirely: `col ILIKE '%word%'` on a
+//! `standard` column, where `word` is one whole ASCII token, and any `AND`
+//! / `OR` of such filters. The dictionary decides their rows (see
+//! [`exact_contains`] and [`ExactFilter`]), the provider reports them
+//! `Exact`, and the scan selects exactly those rows — every other shape
+//! above stays a verified superset.
+//!
+//! Why one leaf is exact. Arrow matches `%f%` case-insensitively under
+//! simple case folding. The one-token condition means every character of
+//! `f` is a word character or a joiner the word rules keep inside a word
+//! (`.` between letters, `'`, `_`, …), so an occurrence of `f` in any text
+//! lies inside one word, and that word, lowercased, contains `f`
+//! lowercased; conversely a word containing the lowercased `f` spells it
+//! out in its row. Case folding and lowercasing agree on ASCII but for the
+//! characters the dictionary walk folds back (`ſ`, the Kelvin sign) and the
+//! dotted capital I, which the walk marks doubtful. A word longer than the
+//! tokenizer's cut is indexed in pieces, and a match across a cut is marked
+//! doubtful too. Doubtful rows are checked against their text; every other
+//! row is decided by the dictionary. What the rule leaves out needs the
+//! text: an anchored `f%` or `%f` (the dictionary does not know which word
+//! starts or ends a value, nor the punctuation beside it), case-sensitive
+//! `LIKE` (terms are lowercased), `_` and several literals (order and
+//! gaps), a literal with a separator in it (a phrase), a non-ASCII literal,
+//! and other analyzers.
+//!
+//! Why a tree of exact leaves is exact. Each leaf splits a superfile's rows
+//! into proven, doubtful and false; `AND` and `OR` combine those splits row
+//! by row, and a row the combination leaves doubtful is checked against the
+//! whole conjunct's text. With only `AND` and `OR` above the leaves, an
+//! unknown (NULL) leaf makes the conjunct true exactly when a false one
+//! would, and `WHERE` keeps only the true rows; `NOT` breaks that (`NOT
+//! NULL` is unknown, `NOT false` is true).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -76,9 +111,10 @@ use crate::{
         ReadError, SuperfileReader,
         fts::{
             reader::{
-                BoolMode, FetchedTermMemo, LONG_S_ASCII, MatchWork, TermPattern, has_fold_partner,
+                BoolMode, ContainsRows, FetchedTermMemo, LONG_S_ASCII, MatchWork, TermPattern,
+                has_fold_partner,
             },
-            tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER, Tokenizer},
+            tokenize::{ASCII_LOWER_TOKENIZER, MAX_TOKEN_CHARS, STANDARD_TOKENIZER, Tokenizer},
         },
         id_space::RowId,
     },
@@ -165,7 +201,8 @@ impl CandidateScope {
 /// posting walk, and a token this broad matches enough rows that the
 /// scan wins anyway — the provider's selectivity gate would send it there
 /// after paying for the probes. Sibling of the provider's `PUSHDOWN_*`
-/// gates.
+/// gates. Bounds the verified path only: the exact shape
+/// ([`exact_contains`]) has no scan to fall back to and takes every term.
 pub(crate) const LIKE_MAX_TERMS: usize = 1024;
 
 /// `LIKE` wildcard matching any run of characters, including none.
@@ -817,38 +854,18 @@ fn like_leaf(
     fts_cols: &HashSet<&str>,
     resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
-    // `NOT LIKE` excludes rows — no term set bounds an exclusion.
-    if like.negated {
-        return CandidatePlan::Unbounded;
-    }
-    // `ILIKE`: Arrow compares under Unicode simple case folding (ASCII
-    // fast paths aside), so the analyzers' lowercasing does not reproduce
-    // every match — `fold` carries that to the token rules and the
-    // expansion.
-    let fold = like.case_insensitive;
-    // Arrow's kernel reads `\` as the escape; the executor rejects others.
-    if like.escape_char.is_some_and(|c| c != LIKE_ESCAPE) {
-        return CandidatePlan::Unbounded;
-    }
-    let (Expr::Column(c), Expr::Literal(v, _)) = (like.expr.as_ref(), like.pattern.as_ref()) else {
+    let Some(parts) = like_parts(like, fts_cols, resolve) else {
         return CandidatePlan::Unbounded;
     };
-    if !fts_cols.contains(c.name.as_str()) {
-        return CandidatePlan::Unbounded;
-    }
-    let Some(pattern) = scalar_str(v) else {
-        return CandidatePlan::Unbounded;
-    };
-    let Some(tok) = resolve(&c.name) else {
-        return CandidatePlan::Unbounded;
-    };
-    let Some(analyzer) = Analyzer::of(tok.as_ref()) else {
-        return CandidatePlan::Unbounded;
-    };
-    let Some(fragments) = like_fragments(pattern) else {
-        return CandidatePlan::Unbounded;
-    };
-    let tokens: Vec<LikeToken> = fragments
+    let LikeParts {
+        column,
+        tok,
+        analyzer,
+        pattern,
+        fold,
+    } = parts;
+    let tokens: Vec<LikeToken> = pattern
+        .fragments
         .iter()
         .flat_map(|fragment| fragment.tokens(tok.as_ref(), analyzer, fold))
         .collect();
@@ -861,14 +878,217 @@ fn like_leaf(
         && !(fold && tokens.iter().any(|t| t.text.contains(LONG_S_ASCII)));
     if exact_terms {
         return CandidatePlan::TermsAll {
-            column: c.name.clone(),
+            column: column.to_owned(),
             tokens: tokens.into_iter().map(|t| t.text).collect(),
         };
     }
     CandidatePlan::TermsLike {
-        column: c.name.clone(),
+        column: column.to_owned(),
         tokens,
         fold,
+    }
+}
+
+/// A `LIKE` / `ILIKE` leaf the index can reason about, parsed once for
+/// both lowerings: the bounding one ([`like_leaf`]) and the exact one
+/// ([`exact_contains`]).
+struct LikeParts<'a> {
+    /// The FTS column the pattern is matched against.
+    column: &'a str,
+    /// The analyzer the table indexes that column with.
+    tok: Arc<dyn Tokenizer>,
+    analyzer: Analyzer,
+    pattern: LikePattern,
+    /// `ILIKE`: Arrow compares under Unicode simple case folding (ASCII
+    /// fast paths aside), so the analyzers' lowercasing does not reproduce
+    /// every match — this carries that to the token rules and the
+    /// expansion.
+    fold: bool,
+}
+
+/// Parse `like` for the index, or `None` for a leaf it cannot bound:
+/// `NOT LIKE` (no term set bounds an exclusion), a non-column or
+/// non-literal operand, a non-FTS column, an escape other than `\`, an
+/// analyzer the lowering does not know, or a pattern the executor rejects.
+fn like_parts<'a>(
+    like: &'a Like,
+    fts_cols: &HashSet<&str>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
+) -> Option<LikeParts<'a>> {
+    // Arrow's kernel reads `\` as the escape; the executor rejects others.
+    if like.negated || like.escape_char.is_some_and(|c| c != LIKE_ESCAPE) {
+        return None;
+    }
+    let (Expr::Column(c), Expr::Literal(v, _)) = (like.expr.as_ref(), like.pattern.as_ref()) else {
+        return None;
+    };
+    if !fts_cols.contains(c.name.as_str()) {
+        return None;
+    }
+    let pattern = like_fragments(scalar_str(v)?)?;
+    let tok = resolve(&c.name)?;
+    let analyzer = Analyzer::of(tok.as_ref())?;
+    Some(LikeParts {
+        column: &c.name,
+        tok,
+        analyzer,
+        pattern,
+        fold: like.case_insensitive,
+    })
+}
+
+/// A `WHERE` conjunct the term dictionary answers exactly: `column ILIKE
+/// '%needle%'`, with the rows it matches read from the postings rather
+/// than the text (see [`exact_contains`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactContains {
+    /// The FTS column.
+    pub(crate) column: String,
+    /// The pattern's literal, lowercased: one whole `standard` token.
+    pub(crate) needle: String,
+}
+
+/// `filter` as an [`ExactContains`], or `None` when it stays a bounded,
+/// verified filter.
+///
+/// Exact only when all of these hold:
+///  - `ILIKE`, not `NOT ILIKE` or case-sensitive `LIKE`;
+///  - a bare FTS column indexed by `standard`;
+///  - the pattern is `%f%` with one literal `f` and no `_`;
+///  - `f` is ASCII and tokenizes to exactly one token, `f` lowercased.
+///
+/// Rows the dictionary can't decide (a dotted capital I, a match across a
+/// 255-char cut) come back doubtful and are checked against their text.
+/// Why the rule is exact is in the module's "The exact shape" section.
+pub(crate) fn exact_contains(
+    filter: &Expr,
+    fts_cols: &HashSet<&str>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
+) -> Option<ExactContains> {
+    let Expr::Like(like) = filter else {
+        return None;
+    };
+    let parts = like_parts(like, fts_cols, resolve)?;
+    if !parts.fold || parts.analyzer != Analyzer::Standard || parts.pattern.any_one {
+        return None;
+    }
+    let [fragment] = parts.pattern.fragments.as_slice() else {
+        return None;
+    };
+    if fragment.at_start || fragment.at_end || !fragment.text.is_ascii() {
+        return None;
+    }
+    let needle = fragment.text.to_ascii_lowercase();
+    let mut tokens = parts.tok.tokenize(&fragment.text);
+    let one_token = tokens.next().is_some_and(|token| token == needle) && tokens.next().is_none();
+    one_token.then(|| ExactContains {
+        column: parts.column.to_owned(),
+        needle,
+    })
+}
+
+/// An `AND` / `OR` tree of [`ExactContains`] leaves, e.g. `title ILIKE
+/// '%japan%' OR title ILIKE '%japanese%'`.
+///
+/// Leaves combine row by row ([`Self::rows`]). A NULL holds no term, so
+/// every leaf reads it as false, which matches SQL only while there is no
+/// `NOT` above it, so `NOT` is never exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExactFilter {
+    Contains(ExactContains),
+    And(Vec<ExactFilter>),
+    Or(Vec<ExactFilter>),
+}
+
+impl ExactFilter {
+    /// Every leaf of the tree, in order, repeats included.
+    pub(crate) fn leaves(&self) -> Vec<&ExactContains> {
+        fn walk<'a>(filter: &'a ExactFilter, out: &mut Vec<&'a ExactContains>) {
+            match filter {
+                ExactFilter::Contains(leaf) => out.push(leaf),
+                ExactFilter::And(children) | ExactFilter::Or(children) => {
+                    for child in children {
+                        walk(child, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &mut out);
+        out
+    }
+
+    /// The tree's rows in one superfile, from each leaf's
+    /// (`leaf_rows`). A row is proven when the tree holds with every
+    /// doubtful leaf read as false, and admitted when it holds with every
+    /// doubtful leaf read as true; the admitted rows that are not proven
+    /// are the doubtful ones. Under `AND` that is the intersection of the
+    /// children's proven rows, and of their admitted rows; under `OR` the
+    /// union of each.
+    pub(crate) fn rows(&self, leaf_rows: &dyn Fn(&ExactContains) -> ContainsRows) -> ContainsRows {
+        match self {
+            ExactFilter::Contains(leaf) => leaf_rows(leaf),
+            ExactFilter::And(children) => combine_rows(children, leaf_rows, true),
+            ExactFilter::Or(children) => combine_rows(children, leaf_rows, false),
+        }
+    }
+}
+
+/// [`ExactFilter::rows`] of an `AND` (`and`) or an `OR` of `children`.
+fn combine_rows(
+    children: &[ExactFilter],
+    leaf_rows: &dyn Fn(&ExactContains) -> ContainsRows,
+    and: bool,
+) -> ContainsRows {
+    let mut proven: Option<RoaringBitmap> = None;
+    let mut admitted: Option<RoaringBitmap> = None;
+    for child in children {
+        let rows = child.rows(leaf_rows);
+        let child_admitted = &rows.proven | &rows.doubtful;
+        let merge = |acc: Option<RoaringBitmap>, next: RoaringBitmap| match acc {
+            Some(acc) if and => acc & next,
+            Some(acc) => acc | next,
+            None => next,
+        };
+        proven = Some(merge(proven, rows.proven));
+        admitted = Some(merge(admitted, child_admitted));
+    }
+    let proven = proven.unwrap_or_default();
+    let mut doubtful = admitted.unwrap_or_default();
+    doubtful -= &proven;
+    ContainsRows { proven, doubtful }
+}
+
+/// `filter` as an [`ExactFilter`], or `None` when some part of it is not
+/// exact — then the whole conjunct stays a bounded, verified filter.
+pub(crate) fn exact_filter(
+    filter: &Expr,
+    fts_cols: &HashSet<&str>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
+) -> Option<ExactFilter> {
+    match filter {
+        Expr::BinaryExpr(be) if matches!(be.op, Operator::And | Operator::Or) => {
+            let children = [&be.left, &be.right]
+                .into_iter()
+                .map(|side| exact_filter(side, fts_cols, resolve))
+                .collect::<Option<Vec<ExactFilter>>>()?;
+            // Flatten a chain of the same operator into one node, as the
+            // SQL planner nests `a OR b OR c` two at a time.
+            let and = be.op == Operator::And;
+            let mut flat = Vec::with_capacity(children.len());
+            for child in children {
+                match child {
+                    ExactFilter::And(inner) if and => flat.extend(inner),
+                    ExactFilter::Or(inner) if !and => flat.extend(inner),
+                    other => flat.push(other),
+                }
+            }
+            Some(match and {
+                true => ExactFilter::And(flat),
+                false => ExactFilter::Or(flat),
+            })
+        }
+        _ => exact_contains(filter, fts_cols, resolve).map(ExactFilter::Contains),
     }
 }
 
@@ -892,9 +1112,22 @@ impl Fragment {
     /// wildcard stands for. Tokens the analyzer cannot bound soundly are
     /// dropped — a dropped constraint keeps a superset. `fold` is the
     /// `ILIKE` flag.
+    ///
+    /// A fragment word longer than [`MAX_TOKEN_CHARS`] comes back cut into
+    /// pieces, and the edges between two pieces are not word boundaries: a
+    /// matching row's copy of the word may start anywhere relative to the
+    /// fragment, so its own cuts fall elsewhere. A token of exactly the cut
+    /// length, and the token after it, are therefore dropped (a genuine
+    /// word of that length goes too, which only loosens the bound).
     fn tokens(&self, tok: &dyn Tokenizer, analyzer: Analyzer, fold: bool) -> Vec<LikeToken> {
         let texts: Vec<String> = tok.tokenize(&self.text).collect();
         let n = texts.len();
+        let cut_piece: Vec<bool> = texts
+            .iter()
+            .map(|t| t.chars().count() == MAX_TOKEN_CHARS)
+            .collect();
+        // A cut piece, or the piece its cut edge runs into.
+        let beside_cut = |i: usize| cut_piece[i] || (i > 0 && cut_piece[i - 1]);
         let left_closed = self.at_start
             || self
                 .text
@@ -910,6 +1143,7 @@ impl Fragment {
         texts
             .into_iter()
             .enumerate()
+            .filter(|&(i, _)| !beside_cut(i))
             .filter_map(|(i, text)| {
                 analyzer.admits(
                     LikeToken {
@@ -924,12 +1158,24 @@ impl Fragment {
     }
 }
 
+/// A `LIKE` pattern split at its wildcards.
+#[derive(Debug, PartialEq, Eq)]
+struct LikePattern {
+    /// The literal runs between the wildcards, in order.
+    fragments: Vec<Fragment>,
+    /// The pattern holds an unescaped `_`: a gap of exactly one character
+    /// somewhere, which a fragment list alone does not show.
+    any_one: bool,
+}
+
 /// Split a `LIKE` pattern at its wildcards into literal fragments,
-/// unescaping `\x` to a literal `x`. `None` for a trailing `\`, which the
-/// executor rejects — nothing to plan.
-fn like_fragments(pattern: &str) -> Option<Vec<Fragment>> {
+/// unescaping `\x` to a literal `x` for any `x`, as Arrow's kernel reads
+/// it. `None` for a trailing `\`, which the executor rejects — nothing to
+/// plan.
+fn like_fragments(pattern: &str) -> Option<LikePattern> {
     let mut fragments = Vec::new();
     let mut text = String::new();
+    let mut any_one = false;
     // No wildcard seen yet: the next fragment starts where the pattern does.
     let mut at_start = true;
     let mut chars = pattern.chars();
@@ -937,6 +1183,7 @@ fn like_fragments(pattern: &str) -> Option<Vec<Fragment>> {
         match c {
             LIKE_ESCAPE => text.push(chars.next()?),
             LIKE_ANY | LIKE_ONE => {
+                any_one |= c == LIKE_ONE;
                 if !text.is_empty() {
                     fragments.push(Fragment {
                         text: mem::take(&mut text),
@@ -956,7 +1203,7 @@ fn like_fragments(pattern: &str) -> Option<Vec<Fragment>> {
             at_end: true,
         });
     }
-    Some(fragments)
+    Some(LikePattern { fragments, any_one })
 }
 
 /// Which shipped analyzer indexed a column. It decides which fragment
@@ -1156,9 +1403,10 @@ fn collect_like_leaves(
 
 #[cfg(test)]
 mod tests {
+    use arrow_schema::DataType;
     use datafusion::{
         logical_expr::expr::InList,
-        prelude::{col, lit},
+        prelude::{cast, col, lit},
     };
     use uuid::Uuid;
 
@@ -1181,6 +1429,7 @@ mod tests {
     /// scope reads only `uri` and `n_docs` of it.
     fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             superfile_id: Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             stem: None,
@@ -1664,6 +1913,39 @@ mod tests {
         );
     }
 
+    /// A fragment word past the tokenizer's cut, so the query side cuts
+    /// it into a piece of the cut length and a remainder.
+    const LONG_FRAGMENT_WORD: usize = MAX_TOKEN_CHARS + 45;
+
+    #[test]
+    fn like_drops_the_pieces_a_long_fragment_word_is_cut_into() {
+        // The pieces' shared edge is no word boundary: a matching row's
+        // copy of the word starts wherever it starts, so its own cuts fall
+        // elsewhere. `%a…a%` (300 a's) against `y` + 300 a's, indexed as
+        // `ya…a` (the cut length) and 46 a's, must not require a term
+        // ending in 255 a's.
+        let word = "a".repeat(LONG_FRAGMENT_WORD);
+        assert_eq!(
+            standard_plan(col("title").like(lit(format!("%{word}%")))),
+            CandidatePlan::Unbounded
+        );
+        assert_eq!(
+            standard_plan(col("title").ilike(lit(format!("%{word}")))),
+            CandidatePlan::Unbounded
+        );
+        // A separate word beside the long one keeps its own bound.
+        assert_eq!(
+            standard_plan(col("title").like(lit(format!("%{word} fox%")))),
+            terms_like(vec![like_token("fox", false, true)])
+        );
+        // A word of exactly the cut length cannot be told from a piece.
+        let exact_cut = "a".repeat(MAX_TOKEN_CHARS);
+        assert_eq!(
+            standard_plan(col("title").like(lit(format!("% {exact_cut} fox %")))),
+            CandidatePlan::Unbounded
+        );
+    }
+
     #[test]
     fn like_under_ascii_lower_keeps_only_complete_tokens() {
         // The default analyzer drops any run holding a non-ASCII byte, so
@@ -1980,5 +2262,171 @@ mod tests {
             &ascii_resolver,
         );
         assert_eq!(unbounded, CandidatePlan::Unbounded);
+    }
+
+    /// `exact_contains` of `expr` over `title` under the standard analyzer.
+    fn exact(expr: Expr) -> Option<ExactContains> {
+        exact_contains(&expr, &fts_cols(), &standard_resolver)
+    }
+
+    fn needle(text: &str) -> Option<ExactContains> {
+        Some(ExactContains {
+            column: "title".into(),
+            needle: text.into(),
+        })
+    }
+
+    #[test]
+    fn exact_contains_accepts_one_whole_standard_token_between_wildcards() {
+        let accepted = [
+            ("%bbc%", "bbc"),
+            ("%BBC%", "bbc"),
+            ("%%bbc%%", "bbc"),
+            // Escapes read as Arrow reads them: `\x` is `x` for any `x`.
+            (r"%b\_c%", "b_c"),
+            (r"%\b\b\c%", "bbc"),
+            // Joiners the word rules keep inside a word.
+            ("%don't%", "don't"),
+            ("%3.5%", "3.5"),
+            ("%u.s%", "u.s"),
+        ];
+        for (pattern, want) in accepted {
+            assert_eq!(
+                exact(col("title").ilike(lit(pattern))),
+                needle(want),
+                "{pattern}"
+            );
+        }
+        // The longest word the tokenizer keeps whole.
+        let longest = "a".repeat(MAX_TOKEN_CHARS);
+        assert_eq!(
+            exact(col("title").ilike(lit(format!("%{longest}%")))),
+            needle(&longest)
+        );
+        // A qualified column is the same column.
+        assert_eq!(exact(col("t.title").ilike(lit("%bbc%"))), needle("bbc"));
+    }
+
+    #[test]
+    fn exact_contains_leaves_everything_the_text_must_decide_to_the_verified_path() {
+        let too_long = "a".repeat(MAX_TOKEN_CHARS + 1);
+        let rejected = [
+            // Case-sensitive, negated.
+            col("title").like(lit("%bbc%")),
+            col("title").not_ilike(lit("%bbc%")),
+            // Anchored at either end, or both.
+            col("title").ilike(lit("bbc%")),
+            col("title").ilike(lit("%bbc")),
+            col("title").ilike(lit("bbc")),
+            // A one-character gap, and several literals.
+            col("title").ilike(lit("%_bbc%")),
+            col("title").ilike(lit("%b_c%")),
+            col("title").ilike(lit("%bbc%news%")),
+            // A literal that is not one whole token.
+            col("title").ilike(lit("%bbc.%")),
+            col("title").ilike(lit("%.net%")),
+            col("title").ilike(lit("%a.1%")),
+            col("title").ilike(lit("%bbc news%")),
+            col("title").ilike(lit(format!("%{too_long}%"))),
+            // Escaped wildcards and backslashes are literal text.
+            col("title").ilike(lit(r"%\\bbc%")),
+            col("title").ilike(lit(r"%bbc\%")),
+            col("title").ilike(lit(r"%\%bbc%")),
+            col("title").ilike(lit(r"%bbc\")),
+            // No literal at all.
+            col("title").ilike(lit("%%")),
+            // A non-ASCII literal.
+            col("title").ilike(lit("%riſe%")),
+            // Not a bare FTS column against a literal.
+            col("body").ilike(lit("%bbc%")),
+            cast(col("title"), DataType::Utf8).ilike(lit("%bbc%")),
+            col("title").ilike(col("title")),
+        ];
+        for expr in rejected {
+            assert_eq!(exact(expr.clone()), None, "{expr}");
+        }
+        // Other analyzers: the rule is the standard analyzer's.
+        let expr = col("title").ilike(lit("%bbc%"));
+        for resolve in [ascii_resolver, stemming_resolver, stopping_resolver] {
+            assert_eq!(exact_contains(&expr, &fts_cols(), &resolve), None);
+        }
+    }
+
+    /// `exact_filter` over `title` and `body`, both standard.
+    fn exact_tree(expr: Expr) -> Option<ExactFilter> {
+        let cols: HashSet<&str> = HashSet::from(["title", "body"]);
+        exact_filter(&expr, &cols, &standard_resolver)
+    }
+
+    fn leaf(column: &str, needle: &str) -> ExactFilter {
+        ExactFilter::Contains(ExactContains {
+            column: column.into(),
+            needle: needle.into(),
+        })
+    }
+
+    #[test]
+    fn exact_filter_takes_and_or_trees_of_exact_leaves_flattening_chains() {
+        let japan = || col("title").ilike(lit("%Japan%"));
+        let japanese = || col("title").ilike(lit("%Japanese%"));
+        let bbc = || col("body").ilike(lit("%bbc%"));
+        assert_eq!(exact_tree(japan()), Some(leaf("title", "japan")));
+        assert_eq!(
+            exact_tree(japan().or(japanese()).or(bbc())),
+            Some(ExactFilter::Or(vec![
+                leaf("title", "japan"),
+                leaf("title", "japanese"),
+                leaf("body", "bbc"),
+            ])),
+            "a chain of ORs is one node, across columns"
+        );
+        assert_eq!(
+            exact_tree(japan().and(bbc()).or(japanese())),
+            Some(ExactFilter::Or(vec![
+                ExactFilter::And(vec![leaf("title", "japan"), leaf("body", "bbc")]),
+                leaf("title", "japanese"),
+            ]))
+        );
+        // One part that is not exact leaves the whole tree verified.
+        for expr in [
+            japan().or(col("category").eq(lit("y"))),
+            japan().or(col("title").ilike(lit("japan%"))),
+            japan().or(col("title").like(lit("%japan%"))),
+            japan().and(japanese().or(col("title").ilike(lit("%_x%")))),
+            Expr::Not(Box::new(japan().or(japanese()))),
+            Expr::Not(Box::new(japan())),
+        ] {
+            assert_eq!(exact_tree(expr.clone()), None, "{expr}");
+        }
+    }
+
+    #[test]
+    fn exact_rows_combine_proven_and_doubtful_through_and_and_or() {
+        let rows = |proven: &[u32], doubtful: &[u32]| ContainsRows {
+            proven: proven.iter().copied().collect(),
+            doubtful: doubtful.iter().copied().collect(),
+        };
+        // a: proves 1 2, doubts 3; b: proves 2 4, doubts 1 5.
+        let leaf_rows = |leaf: &ExactContains| match leaf.needle.as_str() {
+            "a" => rows(&[1, 2], &[3]),
+            "b" => rows(&[2, 4], &[1, 5]),
+            other => panic!("no leaf {other}"),
+        };
+        let (a, b) = (leaf("title", "a"), leaf("title", "b"));
+        // AND: proven in both; admitted in both, less the proven.
+        assert_eq!(
+            ExactFilter::And(vec![a.clone(), b.clone()]).rows(&leaf_rows),
+            rows(&[2], &[1])
+        );
+        // OR: proven in either; admitted in either, less the proven.
+        assert_eq!(
+            ExactFilter::Or(vec![a.clone(), b.clone()]).rows(&leaf_rows),
+            rows(&[1, 2, 4], &[3, 5])
+        );
+        // Nested: (a AND b) OR a.
+        assert_eq!(
+            ExactFilter::Or(vec![ExactFilter::And(vec![a.clone(), b]), a]).rows(&leaf_rows),
+            rows(&[1, 2], &[3])
+        );
     }
 }

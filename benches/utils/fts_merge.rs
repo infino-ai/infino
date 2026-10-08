@@ -20,7 +20,6 @@
 //! ```
 
 use std::{
-    collections::HashMap,
     io::{self, Write},
     sync::{
         Arc,
@@ -36,7 +35,7 @@ use infino::{
     roaring::RoaringBitmap,
     superfile::{
         SuperfileReader,
-        builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder, same_shape_inputs},
     },
 };
 use rand::{SeedableRng, rngs::StdRng};
@@ -120,9 +119,12 @@ pub fn run() {
     for run in 0..runs {
         let mut sink = ByteCounter(0);
         let start = Instant::now();
-        // Empty corpus stats: a standalone merge averages lengths over its own docs.
+        // The inputs share one shape, and a standalone merge averages
+        // lengths over its own docs (no corpus stats on the base options).
+        let merge_inputs = same_shape_inputs(&inputs);
+        let base = BuilderOptions::new_from_reader(&merge_inputs[0].reader);
         let stats =
-            SuperfileBuilder::build_from_readers_fts_merge_to(&inputs, &HashMap::new(), &mut sink)
+            SuperfileBuilder::build_from_readers_fts_merge_to(&merge_inputs, base, &mut sink)
                 .expect("merge");
         let secs = start.elapsed().as_secs_f64();
         assert_eq!(stats.n_docs, expected_docs, "merged doc count");

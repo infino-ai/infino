@@ -44,16 +44,14 @@ use crate::{
     runtime_bridge::{bridge_on_runtime, run_on_pool},
     runtime_metrics::rss::memory_budget,
     superfile::{
-        builder::SuperfileBuilder,
-        fts::reader::ColumnLengthStats,
-        reader::SuperfileReader,
+        builder::{BuilderOptions, MergeInput, SuperfileBuilder},
         stats::SuperfileStats as BuiltSuperfileStats,
         vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
     },
     supertable::{
         BuildError, CommitError, ManifestSnapshot, SuperfileEntry, Supertable,
         error::CompactionError,
-        handle::hidden_vector_index_compaction_settings,
+        handle::{SupertableInner, hidden_vector_index_compaction_settings},
         manifest::{
             SuperfileUri, list::PartitionStrategy, listed_once,
             term_index::Contribution as TermContribution,
@@ -61,15 +59,16 @@ use crate::{
         opann::rerank_pool_hint,
         query::dispatch::open_compaction_input,
         reader_cache::disk::mmap_readonly_bytes,
+        schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            CommitFence, NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
-            finalize_compaction_commit, maint_pool, prepare_superfile_named,
-            recalibrate_probe_laws, refresh_slow_vector_state, split_overflow_cells,
-            try_commit_attempt, write_superfile_list,
+            CommitFence, CommitListMetadata, NewEntryBirthVersions, PreparedSuperfile, ShardOutput,
+            backoff_delay, finalize_compaction_commit, maint_pool, persist_list_metadata_async,
+            prepare_superfile_named, recalibrate_probe_laws, refresh_slow_vector_state,
+            split_overflow_cells, try_commit_attempt, write_superfile_list,
         },
     },
     utils::trace::{detail_span, record},
@@ -140,24 +139,29 @@ pub(crate) trait SuperfileMerge: Send + Sync {
 
 /// The opened inputs a [`SuperfileMerge`] builds from.
 pub(crate) struct MergeInputs<'a> {
-    /// Each input reader with the tombstones that apply to it.
-    pub(crate) readers: &'a [(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-    /// The manifest entries those readers were opened from, in the same
+    /// Each input file with the tombstones that apply to it and the map
+    /// from its columns to the table's.
+    pub(crate) inputs: &'a [MergeInput],
+    /// The manifest entries those inputs were opened from, in the same
     /// order. A build that carries rows unchanged takes its output stats
     /// from here rather than recomputing them from decoded rows.
     pub(crate) entries: &'a [Arc<SuperfileEntry>],
-    /// Per reader, the hidden-index cells its rows have been superseded in.
+    /// Per input, the hidden-index cells its rows have been superseded in.
     pub(crate) superseded: &'a [BTreeSet<u32>],
-    /// Table-wide document-length totals excluding the inputs, so the
-    /// output bakes the average an unfragmented table would have.
-    pub(crate) fts_corpus: &'a HashMap<String, ColumnLengthStats>,
+    /// The output's options: the table's schema and index config as the
+    /// snapshot derives them, carrying the table-wide document-length
+    /// totals excluding the inputs, so the output bakes the average an
+    /// unfragmented table would have.
+    pub(crate) builder_options: BuilderOptions,
 }
 
-/// What compaction does: splice or carry, never re-tokenize.
+/// What compaction does: splice or carry, and re-tokenize only when an
+/// input's index is not the output's.
 ///
-/// Each arm is chosen by what the inputs hold, and every one of them
-/// carries the inputs' posting lists across rather than rebuilding them —
-/// re-tokenizing a corpus to merge it costs far more and changes nothing.
+/// Each arm is chosen by what the inputs hold, and the carrying arms move
+/// the inputs' posting lists across rather than rebuilding them —
+/// re-tokenizing a corpus to merge it costs far more and changes nothing
+/// while the index config is the same.
 pub(crate) struct CompactionMerge;
 
 impl SuperfileMerge for CompactionMerge {
@@ -167,12 +171,12 @@ impl SuperfileMerge for CompactionMerge {
         output: &mut dyn Write,
     ) -> Result<BuiltSuperfileStats, BuildError> {
         let MergeInputs {
-            readers,
+            inputs,
             superseded,
-            fts_corpus,
+            builder_options,
             ..
         } = inputs;
-        let first_vec = readers.first().and_then(|(reader, _)| reader.vec());
+        let first_vec = inputs.first().and_then(|input| input.reader.vec());
         let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
         let sq8_merge = first_vec.and_then(|v| {
             v.vector_columns_config()
@@ -181,20 +185,29 @@ impl SuperfileMerge for CompactionMerge {
         });
         let stats = if multi_cell && sq8_merge == Some(true) {
             SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
-                readers, superseded, fts_corpus, output,
+                inputs,
+                superseded,
+                builder_options,
+                output,
             )?
         } else if sq8_merge == Some(true) {
-            SuperfileBuilder::build_from_sq8_ivf_readers_to(readers, fts_corpus, output)?
-        } else if first_vec.is_none() {
-            // FTS/scalar inputs (no vector index): carry each input's
-            // already-built posting lists across instead of re-tokenizing
-            // the whole corpus.
-            SuperfileBuilder::build_from_readers_fts_merge_to(readers, fts_corpus, output)?
+            SuperfileBuilder::build_from_sq8_ivf_readers_to(inputs, builder_options, output)?
+        } else if first_vec.is_none()
+            && inputs
+                .iter()
+                .all(|input| builder_options.fts_carry_compatible(&input.reader))
+        {
+            // FTS/scalar inputs (no vector index) whose indexes match the
+            // output's: carry each input's already-built posting lists
+            // across instead of re-tokenizing the whole corpus.
+            SuperfileBuilder::build_from_readers_fts_merge_to(inputs, builder_options, output)?
         } else {
             // A vector index is present but not IVF-mergeable (e.g. an fp32
-            // rerank codec); this path re-encodes both the FTS and the
-            // vectors from the decoded rows.
-            SuperfileBuilder::build_from_readers_to(readers, fts_corpus, output)?
+            // rerank codec), or an input's full-text index does not match
+            // the output's (the column's index was added, dropped or renamed
+            // since the file was written); this path re-encodes both the
+            // FTS and the vectors from the decoded rows.
+            SuperfileBuilder::build_from_readers_to(inputs, builder_options, output)?
         };
         Ok(stats)
     }
@@ -425,6 +438,7 @@ impl Supertable {
         let now = Utc::now();
         let stale_seal_timeout = Duration::from_millis(cfg.stale_seal_timeout_ms);
         let listed = manifest.get_all_superfiles();
+        let schema = manifest.table_schema();
         let stats: Vec<SuperfileStats> = listed_once(listed, |entry| entry.superfile_id)
             .map(|entry| {
                 let (bitmap, seal) = sidecar_map
@@ -447,6 +461,8 @@ impl Supertable {
                     tombstoned_docs,
                     sealed_by_other,
                     birth_version: entry.birth_version,
+                    stale_type: !unconverted_columns(entry, &schema, &manifest.options.id_column)
+                        .is_empty(),
                 }
             })
             .collect();
@@ -490,6 +506,7 @@ impl Supertable {
                 info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   merge");
             }
         }
+        clear_completed_conversions(inner).await?;
 
         // The pass reshaped the hidden index (split children and/or merge
         // outputs committed): the probe laws were measured against the old
@@ -652,7 +669,13 @@ impl Supertable {
         let carries_rows = merge.preserves_tombstones();
 
         let superseded_map = manifest.get_superseded_cells();
-        let mut readers_with_tombstones = Vec::with_capacity(readers.len());
+        // Every input reads through its own map to the table's columns: a
+        // file written before a column, in another type, or under another
+        // name is adapted as it is merged, so the output always has the
+        // table's current shape.
+        let table = manifest.table_schema();
+        let legacy = manifest.options.legacy_names();
+        let mut inputs = Vec::with_capacity(readers.len());
         let mut superseded_per_reader = Vec::with_capacity(readers.len());
         for (_idx, superfile_id, reader) in readers {
             let bitmap = match carries_rows {
@@ -666,7 +689,16 @@ impl Supertable {
                 .cloned()
                 .unwrap_or_default();
             superseded_per_reader.push(superseded);
-            readers_with_tombstones.push((reader.clone(), bitmap));
+            let adapter = FileSchemaMap::new(
+                &table,
+                &manifest.options.id_column,
+                &PhysicalSchema::of_reader(&reader, &legacy),
+            );
+            inputs.push(MergeInput {
+                reader,
+                deleted: bitmap,
+                adapter: Some(adapter),
+            });
         }
 
         // The merged file replaces its inputs, so it bakes the table-wide
@@ -674,7 +706,9 @@ impl Supertable {
         // its own documents — the same statistic a fresh append bakes, and
         // what lets a compacted table score like an unfragmented one.
         let replaced: HashSet<Uuid> = superfiles.iter().map(|e| e.superfile_id).collect();
-        let fts_corpus = manifest.fts_corpus_stats(&replaced);
+        let builder_options = manifest
+            .builder_options()
+            .with_fts_corpus_stats(manifest.fts_corpus_stats(&replaced));
         // The build is long, synchronous CPU work, so it runs on the
         // maintenance pool rather than the thread driving this future.
         // `run_on_pool` needs a `'static` closure, so everything it reads —
@@ -697,10 +731,10 @@ impl Supertable {
                     let mut writer = BufWriter::new(output.as_file_mut());
                     let stats = merge.build(
                         MergeInputs {
-                            readers: &readers_with_tombstones,
+                            inputs: &inputs,
                             entries: &entries,
                             superseded: &superseded_per_reader,
-                            fts_corpus: &fts_corpus,
+                            builder_options,
                         },
                         &mut writer,
                     )?;
@@ -735,7 +769,11 @@ impl Supertable {
             .filter(|stem| superfiles.iter().all(|e| e.stem.as_deref() == Some(*stem)));
         let prepared_superfile = {
             let _span = detail_span!("prepare_merged_superfile").entered();
-            prepare_superfile_named(self.inner().as_ref(), shard, stem)?
+            // The snapshot the merged bytes were built from, not a fresh
+            // load. A merge runs for minutes, so a schema change can land
+            // while it does; deriving the entry's summaries from a newer
+            // snapshot would key them to columns the output does not hold.
+            prepare_superfile_named(self.inner().as_ref(), &manifest, shard, stem)?
         };
 
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)
@@ -1965,12 +2003,70 @@ async fn seal_with_bounded_retry(
     Err(CompactionError::SealRetriesExhausted { superfile_id })
 }
 
+/// The columns a file holds in a type the table has since left: what
+/// makes it an input to a conversion rewrite, whatever its size.
+///
+/// A file that records no physical schema was written before field ids
+/// existed. It holds every column in the type the table had then, which
+/// for a column under conversion is the old type — so it is one of that
+/// conversion's inputs. Both the job selection and the clear below read
+/// the absent schema this one way: taking it as "nothing stale" would
+/// leave the file out of every rewrite while still counting against the
+/// clear, and the conversion would never end.
+fn unconverted_columns(
+    entry: &SuperfileEntry,
+    schema: &TableSchema,
+    id_column: &str,
+) -> Vec<FieldId> {
+    match entry.physical_schema.as_ref() {
+        Some(physical) => FileSchemaMap::new(schema, id_column, physical)
+            .stale_columns()
+            .collect(),
+        None => schema.converting().collect(),
+    }
+}
+
+/// Commit the end of every type conversion whose files are all rewritten:
+/// a column with `converting_from` set whose old type no live file holds
+/// any more is cleared, one list commit for all of them. A commit that
+/// loses to a concurrent schema change is left for the next run.
+async fn clear_completed_conversions(inner: &SupertableInner) -> Result<(), CompactionError> {
+    let manifest = inner.manifest.load_full();
+    let schema = manifest.table_schema();
+    let converting: Vec<FieldId> = schema.converting().collect();
+    if converting.is_empty() {
+        return Ok(());
+    }
+    let mut outstanding: HashSet<FieldId> = HashSet::new();
+    for entry in manifest.get_all_superfiles() {
+        outstanding.extend(unconverted_columns(
+            entry,
+            &schema,
+            &manifest.options.id_column,
+        ));
+    }
+    let completed: Vec<FieldId> = converting
+        .into_iter()
+        .filter(|id| !outstanding.contains(id))
+        .collect();
+    let Some(next) = schema.with_conversions_cleared(&completed) else {
+        return Ok(());
+    };
+    let metadata = CommitListMetadata::schema_change(Arc::new(next), schema.schema_id());
+    match persist_list_metadata_async(inner, metadata).await {
+        Ok(()) | Err(BuildError::SchemaMoved { .. }) => Ok(()),
+        Err(e) => Err(CompactionError::Build(e.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, env, mem, str, sync::Arc, time::Duration};
 
+    use arrow::util::pretty::pretty_format_batches;
     use arrow_array::{
-        ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+        ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
+        RecordBatch,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::{col, lit};
@@ -1988,7 +2084,7 @@ mod tests {
         memory::ConnectionMemoryBudget,
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::reader::Bm25SearchOptions,
+            fts::{reader::Bm25SearchOptions, tokenize::STANDARD_TOKENIZER},
             reader::SuperfileReader,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
@@ -1996,16 +2092,121 @@ mod tests {
             Supertable, SupertableOptions,
             error::CompactionError,
             manifest::commit::{POINTER_PATH, get_current_manifest_etag},
+            schema::change::{FieldPatch, SchemaPatch},
             storage::{LocalFsStorageProvider, StorageProvider},
+            writer::persist_commit_async,
         },
         test_helpers::{
             build_title_batch, default_supertable_options, default_vector_config,
             fault_storage::{FaultKind, FaultOp, FaultStorage},
+            schema_id_title,
         },
     };
 
     const DEFAULT_STALE_SEAL_TIMEOUT: Duration =
         Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
+
+    /// Titles that cast cleanly to the integers the column is flipped to,
+    /// so the rewritten file carries real values rather than nulls.
+    const NUMERIC_TITLES: [&str; 2] = ["11", "22"];
+
+    /// Flip the `title` column to integers: a lossy rewrite that sets
+    /// `converting_from` and leaves compaction to convert the files.
+    fn retype_title_to_int() -> SchemaPatch {
+        SchemaPatch {
+            fields: vec![FieldPatch {
+                id: None,
+                name: "title".into(),
+                data_type: Some(DataType::Int64),
+                nullable: None,
+                index: None,
+                dropped: false,
+            }],
+            max_fields: None,
+            max_depth: None,
+        }
+    }
+
+    /// A table whose files were written before field ids — no recorded
+    /// physical schema — still finishes a type conversion.
+    ///
+    /// Such a file holds every column in the type the table had when it
+    /// was written, which for a column under conversion is the old type.
+    /// It is therefore one of the conversion's inputs and must be
+    /// rewritten; reading it as "nothing to convert" instead leaves
+    /// `converting_from` set for good, and the column can never be
+    /// changed again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_conversion_completes_over_files_that_record_no_physical_schema() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_titles(&st, &NUMERIC_TITLES);
+
+        // Re-commit the one file as a file from before field ids: the same
+        // bytes under a fresh entry that records no physical schema.
+        let manifest = st.inner().manifest.load_full();
+        let live = manifest
+            .get_all_superfiles()
+            .first()
+            .expect("one superfile")
+            .clone();
+        let unrecorded = Arc::new(SuperfileEntry {
+            physical_schema: None,
+            superfile_id: Uuid::new_v4(),
+            partition_key: Vec::new(),
+            ..(*live).clone()
+        });
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let swapped = persist_commit_async(
+            st.inner(),
+            storage,
+            vec![unrecorded],
+            &[live],
+            Vec::new(),
+            Vec::new(),
+            CommitListMetadata::empty(),
+            Vec::new(),
+        )
+        .await
+        .expect("commit the file without its physical schema");
+        st.inner().manifest.store(swapped);
+
+        let flipped = st.apply_schema(&retype_title_to_int(), None).expect("flip");
+        assert_eq!(
+            flipped.fields()[0].converting_from,
+            Some(DataType::LargeUtf8),
+            "the flip is lossy, so the files owe a rewrite"
+        );
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact converts");
+
+        let after = st.inner().manifest.load_full().table_schema();
+        assert!(
+            after.fields()[0].converting_from.is_none(),
+            "every file holding the old type was rewritten, so the \
+             conversion is over"
+        );
+        let rows = st
+            .reader()
+            .expect("reader")
+            .query_sql("SELECT title FROM supertable ORDER BY _id")
+            .expect("sql");
+        let mut got: Vec<i64> = Vec::new();
+        for b in &rows {
+            let arr = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("title is Int64 after the flip");
+            got.extend((0..b.num_rows()).map(|i| arr.value(i)));
+        }
+        assert_eq!(got, vec![11, 22]);
+        st.apply_schema(&retype_title_to_int(), None)
+            .expect("a settled column can be changed again");
+    }
 
     /// A build that carries every row, so the runner must carry the
     /// input's tombstones onto its output.
@@ -2058,6 +2259,7 @@ mod tests {
             .expect("one superfile")
             .clone();
         let output = Arc::new(SuperfileEntry {
+            physical_schema: None,
             superfile_id: Uuid::from_u128(0xFEED),
             ..(*input).clone()
         });
@@ -2148,6 +2350,7 @@ mod tests {
             .expect("one superfile")
             .clone();
         let output = Arc::new(SuperfileEntry {
+            physical_schema: None,
             superfile_id: Uuid::from_u128(0xFEED),
             ..(*input).clone()
         });
@@ -2659,7 +2862,13 @@ mod tests {
         let title_stats = merged_superfile
             .entry
             .scalar_stats
-            .get("title")
+            .get(
+                &st.reader()
+                    .expect("reader")
+                    .manifest()
+                    .field_id("title")
+                    .expect("title id"),
+            )
             .expect("merged entry should have title column stats");
 
         // Extract min and max string values from the arrays
@@ -2883,7 +3092,7 @@ mod tests {
             .expect("open reader on merged superfile");
         let fts = merged_reader.fts().expect("fts index");
         assert_eq!(
-            fts.column_length_stats("title"),
+            fts.column_length_stats("title").expect("lengths readable"),
             Some(ColumnLengthStats {
                 total_tokens: 8,
                 n_scored_docs: 3,
@@ -3434,6 +3643,7 @@ mod tests {
         let first = Arc::clone(&current.get_all_superfiles()[0]);
         // `update` stamps the partition key, so the copy arrives unstamped.
         let again = Arc::new(SuperfileEntry {
+            physical_schema: None,
             partition_key: Vec::new(),
             ..(*first).clone()
         });
@@ -3865,7 +4075,7 @@ mod tests {
         // FTS bloom covers the unique first word from each of the 10 input batches
         let fts = sfs[0]
             .fts_summary
-            .get("title")
+            .get(&after.manifest().field_id("title").expect("title id"))
             .expect("fts summary present");
         for term in &[
             b"alpha" as &[u8],
@@ -4108,6 +4318,122 @@ mod tests {
         }
     }
 
+    /// An `ILIKE '%word%'` answered from the dictionary reads postings in
+    /// the blob's own document order, so on a compacted superfile that
+    /// reorders its documents every id has to become its Parquet row, and
+    /// a deleted row has to stay out, with nothing re-checking the text.
+    /// The deletes include one through the exact filter itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exact_ilike_on_a_reordered_compacted_table_names_the_right_rows() {
+        const BATCHES: usize = 60;
+        const PER_BATCH: usize = 80;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let opts = SupertableOptions::new(
+            schema_id_title(),
+            vec![FtsConfig::new("title").analyzer(STANDARD_TOKENIZER)],
+            vec![],
+        )
+        .expect("options")
+        .with_writer_pool(pool)
+        .with_storage(Arc::clone(&storage));
+        let st = Supertable::create(opts).expect("create");
+        let mut titles: Vec<String> = Vec::with_capacity(BATCHES * PER_BATCH);
+        for b in 0..BATCHES {
+            let batch: Vec<String> = (0..PER_BATCH)
+                .map(|i| {
+                    let n = b * PER_BATCH + i;
+                    format!("uq{n} Shared t{} t{}", n % 37, n % 53)
+                })
+                .collect();
+            titles.extend(batch.iter().cloned());
+            let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
+            commit_titles(&st, &refs);
+        }
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+        let mut reordered = false;
+        for entry in st.reader().expect("reader").manifest().get_all_superfiles() {
+            let (bytes, _) = storage.get(&entry.storage_path()).await.expect("get");
+            let reader = SuperfileReader::open(bytes).expect("open");
+            reordered |= reader.fts().expect("fts").has_doc_map();
+        }
+        assert!(
+            reordered,
+            "the compaction must reorder for this test to mean anything"
+        );
+
+        let deleted = [3usize, 1000, 2222, 4000];
+        for n in deleted {
+            st.delete(col("title").eq(lit(titles[n].clone())))
+                .expect("delete");
+        }
+        let through_ilike = BATCHES * PER_BATCH - 1;
+        let stats = st
+            .delete(col("title").ilike(lit(format!("%uq{through_ilike}%"))))
+            .expect("delete through the exact filter");
+        assert_eq!(stats.matched(), 1);
+
+        for needle in ["uq12", "UQ4", "t36", "shared", "uq479", "uq3"] {
+            let lower = needle.to_ascii_lowercase();
+            let mut want: Vec<String> = titles
+                .iter()
+                .enumerate()
+                .filter(|&(n, title)| {
+                    !deleted.contains(&n)
+                        && n != through_ilike
+                        && title.to_ascii_lowercase().contains(&lower)
+                })
+                .map(|(_, title)| title.clone())
+                .collect();
+            want.sort();
+            let sql = format!("SELECT title FROM supertable WHERE title ILIKE '%{needle}%'");
+            let reader = st.reader().expect("reader");
+            let plan = pretty_format_batches(
+                &reader
+                    .query_sql(&format!("EXPLAIN {sql}"))
+                    .expect("explain"),
+            )
+            .expect("render the plan")
+            .to_string();
+            // The logical scan lists the filter as one it answers in full;
+            // nothing in the physical plan evaluates it.
+            let (logical, physical) = plan.split_once("physical_plan").expect("a physical plan");
+            assert!(
+                logical.contains("full_filters") && !physical.contains("ILIKE"),
+                "{needle} must be answered exactly: {plan}"
+            );
+            let mut got = titles_of(&reader.query_sql(&sql).expect("sql"));
+            got.sort();
+            assert_eq!(got, want, "{needle}");
+            // A count over the same selection, which spans the merged
+            // file's row groups, agrees with it. It does not prove the
+            // covered-aggregate guard: the deletes leave tombstones, which
+            // refuse the statistics rewrite on their own; the counts over
+            // the clean tables in `query::sql` do.
+            let counted = reader
+                .query_sql(&format!(
+                    "SELECT COUNT(*) FROM supertable WHERE title ILIKE '%{needle}%'"
+                ))
+                .expect("count");
+            let n = counted[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count is Int64")
+                .value(0);
+            assert_eq!(n as usize, want.len(), "COUNT for {needle}");
+        }
+    }
+
     /// Compacting an already-reordered superfile again must keep every
     /// document with its own postings.
     ///
@@ -4269,7 +4595,7 @@ mod tests {
 
         let fts = sfs[0]
             .fts_summary
-            .get("title")
+            .get(&r.manifest().field_id("title").expect("title id"))
             .expect("fts summary present");
         for term in &[
             b"alpha" as &[u8],

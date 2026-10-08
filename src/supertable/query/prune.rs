@@ -43,9 +43,11 @@ use crate::{
             term_index::TermIndex,
         },
         query::skip::{
-            ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip, null_check_may_match,
-            null_check_skip, scalar_skip, scalar_value_may_match, scalar_value_set_skip,
+            ColumnTypeGuard, ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip,
+            null_check_may_match, null_check_skip, scalar_skip, scalar_value_may_match,
+            scalar_value_set_skip,
         },
+        schema::FieldId,
     },
 };
 
@@ -81,25 +83,70 @@ impl PruneLeaf {
     /// Identified Which manifest parts this leaf keeps, from the part-level
     /// aggregates (`ManifestPartEntry`). `None` = no part constraint →
     /// keep all parts. The per-superfile tier runs separately.
-    pub(crate) fn keep_parts(&self, list: &Manifest) -> Option<Vec<PartId>> {
+    /// The parts that may hold a match, by this leaf's aggregate. A column
+    /// the table does not have has no aggregate anywhere, which the
+    /// list-level pruner already treats as "keep every part".
+    pub(crate) fn keep_parts(
+        &self,
+        list: &Manifest,
+        manifest: &ManifestSnapshot,
+    ) -> Option<Vec<PartId>> {
+        let all = || {
+            list.parts
+                .iter()
+                .map(|entry| entry.part_id)
+                .collect::<Vec<_>>()
+        };
         match self {
             PruneLeaf::TermPresence {
                 column,
                 terms,
                 mode,
             } => {
+                let Some(id) = manifest.field_id(column) else {
+                    return Some(all());
+                };
                 let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
-                Some(prune_parts_for_fts_terms(list, column, &refs, *mode))
+                Some(prune_parts_for_fts_terms(list, id, &refs, *mode))
             }
             PruneLeaf::Prefix { column, prefix } => {
-                Some(prune_parts_for_fts_prefix(list, column, prefix))
+                let Some(id) = manifest.field_id(column) else {
+                    return Some(all());
+                };
+                Some(prune_parts_for_fts_prefix(list, id, prefix))
             }
-            PruneLeaf::Scalar(pred) => Some(scalar_keep_parts(list, pred)),
+            PruneLeaf::Scalar(pred) => {
+                let Some(id) = manifest.field_id(&pred.column) else {
+                    return Some(all());
+                };
+                Some(scalar_keep_parts(
+                    list,
+                    id,
+                    &ColumnTypeGuard::new(manifest, id),
+                    pred,
+                ))
+            }
             PruneLeaf::ScalarValueSet { column, values } => {
-                Some(scalar_value_set_keep_parts(list, column, values))
+                let Some(id) = manifest.field_id(column) else {
+                    return Some(all());
+                };
+                Some(scalar_value_set_keep_parts(
+                    list,
+                    id,
+                    &ColumnTypeGuard::new(manifest, id),
+                    values,
+                ))
             }
             PruneLeaf::NullCheck { column, want_null } => {
-                Some(null_check_keep_parts(list, column, *want_null))
+                let Some(id) = manifest.field_id(column) else {
+                    return Some(all());
+                };
+                Some(null_check_keep_parts(
+                    list,
+                    id,
+                    &ColumnTypeGuard::new(manifest, id),
+                    *want_null,
+                ))
             }
         }
     }
@@ -109,15 +156,23 @@ impl PruneLeaf {
 /// aggregate keeps the part (conservative — never a false prune). The
 /// stats are length-1 [`ArrayRef`]s decoded when the list loaded, so
 /// reading them here is free of per-query Arrow decode.
+///
+/// A part's aggregate folds one pair of bounds and one null count over
+/// every file it lists, each recorded in the type its file was written
+/// in. While `column` is converting those types differ across the part,
+/// so no aggregate over it describes what the rows read as and every part
+/// is kept; `guard` is what knows that.
 fn keep_parts_where_agg(
     list: &Manifest,
-    column: &str,
+    column: FieldId,
+    guard: &ColumnTypeGuard,
     keep: impl Fn(&ScalarStatsAgg) -> bool,
 ) -> Vec<PartId> {
     list.parts
         .iter()
         .filter_map(|entry| {
-            let k = entry.scalar_stats_agg.get(column).is_none_or(&keep);
+            let k = guard.aggregates_mix_types()
+                || entry.scalar_stats_agg.get(&column).is_none_or(&keep);
             k.then_some(entry.part_id)
         })
         .collect()
@@ -127,10 +182,11 @@ fn keep_parts_where_agg(
 // undecodable bounds keep the part.
 fn keep_parts_where(
     list: &Manifest,
-    column: &str,
+    column: FieldId,
+    guard: &ColumnTypeGuard,
     may_match: impl Fn(&ScalarValue, &ScalarValue) -> bool,
 ) -> Vec<PartId> {
-    keep_parts_where_agg(list, column, |agg| {
+    keep_parts_where_agg(list, column, guard, |agg| {
         agg_minmax(agg).is_none_or(|(min, max)| may_match(&min, &max))
     })
 }
@@ -147,13 +203,43 @@ fn agg_minmax(agg: &ScalarStatsAgg) -> Option<(ScalarValue, ScalarValue)> {
 }
 
 // Part-tier `IS [NOT] NULL` prune; the superfile-tier sibling lives in `skip`.
-fn null_check_keep_parts(list: &Manifest, column: &str, want_null: bool) -> Vec<PartId> {
-    keep_parts_where_agg(list, column, |agg| null_check_may_match(agg, want_null))
+//
+// `IS NULL` prunes here only for a column no file can predate. A part's
+// aggregate folds only the files that hold the column: one written before
+// the column was added contributes no entry at all, rather than
+// contributing its rows as nulls. So a part holding one old file beside one
+// new file with every value set aggregates to `null_count: Some(0)`, and
+// pruning on that drops the old file, whose rows read null and should have
+// come back. For a column declared at creation no file predates it, the
+// fold covers every file, and the prune is sound. Otherwise the part is
+// kept and the superfile tier decides file by file, which it can do because
+// it sees which files carry the column.
+//
+// `IS NOT NULL` is safe and still prunes: a file that does not hold the
+// column has no non-null value to contribute, so an aggregate over the files
+// that do hold it answers the question for the whole part.
+fn null_check_keep_parts(
+    list: &Manifest,
+    column: FieldId,
+    guard: &ColumnTypeGuard,
+    want_null: bool,
+) -> Vec<PartId> {
+    if want_null && !guard.in_every_file() {
+        return list.parts.iter().map(|entry| entry.part_id).collect();
+    }
+    keep_parts_where_agg(list, column, guard, |agg| {
+        null_check_may_match(agg, want_null)
+    })
 }
 
 // Part-tier scalar prune: keep parts whose min/max could satisfy `pred`.
-fn scalar_keep_parts(list: &Manifest, pred: &ScalarPredicate) -> Vec<PartId> {
-    keep_parts_where(list, &pred.column, |min, max| {
+fn scalar_keep_parts(
+    list: &Manifest,
+    column: FieldId,
+    guard: &ColumnTypeGuard,
+    pred: &ScalarPredicate,
+) -> Vec<PartId> {
+    keep_parts_where(list, column, guard, |min, max| {
         scalar_value_may_match(min, max, pred.op, &pred.value)
     })
 }
@@ -162,10 +248,11 @@ fn scalar_keep_parts(list: &Manifest, pred: &ScalarPredicate) -> Vec<PartId> {
 // value (an `IN` is a disjunction of equalities).
 fn scalar_value_set_keep_parts(
     list: &Manifest,
-    column: &str,
+    column: FieldId,
+    guard: &ColumnTypeGuard,
     values: &[ScalarValue],
 ) -> Vec<PartId> {
-    keep_parts_where(list, column, |min, max| {
+    keep_parts_where(list, column, guard, |min, max| {
         values
             .iter()
             .any(|v| scalar_value_may_match(min, max, ScalarOp::Eq, v))
@@ -180,12 +267,13 @@ async fn with_routing(
     superfiles: &[Arc<SuperfileEntry>],
     index: Option<&TermIndex>,
     leaf: &PruneLeaf,
+    manifest: &ManifestSnapshot,
     fallback: Vec<bool>,
 ) -> Vec<bool> {
     let Some(index) = index else {
         return fallback;
     };
-    let Some(routed) = index.route_leaf(leaf).await else {
+    let Some(routed) = index.route_leaf(leaf, manifest).await else {
         return fallback;
     };
     superfiles
@@ -227,15 +315,18 @@ pub(crate) async fn select_superfiles(
     // conjunction call) to match the pre-unification semantics.
     let mut mask = vec![true; superfiles.len()];
 
-    let scalar_preds: Vec<ScalarPredicate> = leaves
+    let scalar_preds: Vec<(Option<FieldId>, &ScalarPredicate)> = leaves
         .iter()
         .filter_map(|l| match l {
-            PruneLeaf::Scalar(p) => Some(p.clone()),
+            PruneLeaf::Scalar(p) => Some((manifest.field_id(&p.column), p)),
             _ => None,
         })
         .collect();
     if !scalar_preds.is_empty() {
-        and_into(&mut mask, &scalar_skip(&superfiles, &scalar_preds));
+        and_into(
+            &mut mask,
+            &scalar_skip(manifest, &superfiles, &scalar_preds),
+        );
     }
 
     // The table-level term index answers term and prefix leaves exactly
@@ -250,28 +341,57 @@ pub(crate) async fn select_superfiles(
                 terms,
                 mode,
             } => {
+                let Some(column_id) = manifest.field_id(column) else {
+                    continue;
+                };
                 let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
-                let summaries = fts_bloom_skip(&superfiles, column, &refs, *mode);
+                let summaries = fts_bloom_skip(&superfiles, column_id, &refs, *mode);
                 and_into(
                     &mut mask,
-                    &with_routing(&superfiles, term_index.as_deref(), leaf, summaries).await,
+                    &with_routing(
+                        &superfiles,
+                        term_index.as_deref(),
+                        leaf,
+                        manifest,
+                        summaries,
+                    )
+                    .await,
                 );
             }
             PruneLeaf::Prefix { column, prefix } => {
-                let summaries = fts_prefix_skip(&superfiles, column, prefix);
+                let Some(column_id) = manifest.field_id(column) else {
+                    continue;
+                };
+                let summaries = fts_prefix_skip(&superfiles, column_id, prefix);
                 and_into(
                     &mut mask,
-                    &with_routing(&superfiles, term_index.as_deref(), leaf, summaries).await,
+                    &with_routing(
+                        &superfiles,
+                        term_index.as_deref(),
+                        leaf,
+                        manifest,
+                        summaries,
+                    )
+                    .await,
                 );
             }
             PruneLeaf::ScalarValueSet { column, values } => {
+                let Some(column_id) = manifest.field_id(column) else {
+                    continue;
+                };
                 and_into(
                     &mut mask,
-                    &scalar_value_set_skip(&superfiles, column, values),
+                    &scalar_value_set_skip(manifest, &superfiles, column_id, values),
                 );
             }
             PruneLeaf::NullCheck { column, want_null } => {
-                and_into(&mut mask, &null_check_skip(&superfiles, column, *want_null));
+                let Some(column_id) = manifest.field_id(column) else {
+                    continue;
+                };
+                and_into(
+                    &mut mask,
+                    &null_check_skip(manifest, &superfiles, column_id, *want_null),
+                );
             }
             // Scalar leaves handled above as one conjunction.
             PruneLeaf::Scalar(_) => {}
@@ -306,6 +426,20 @@ fn and_into(dst: &mut [bool], src: &[bool]) {
 
 #[cfg(test)]
 mod tests {
+    use crate::supertable::schema::FieldId;
+    /// The id a test column resolves to through the table these tests
+    /// open; a name the table lacks gets a stable id no entry carries.
+    fn fid(name: &str) -> FieldId {
+        ManifestSnapshot::empty(opts_title_fts())
+            .field_id(name)
+            .unwrap_or_else(|| crate::test_helpers::fid(name))
+    }
+
+    /// The guard for `name` on a table with no column under conversion:
+    /// what every part-tier assertion below measures against.
+    fn current_types(name: &str) -> ColumnTypeGuard {
+        ColumnTypeGuard::new(&ManifestSnapshot::empty(opts_title_fts()), fid(name))
+    }
     use std::{
         collections::{HashMap, HashSet},
         slice::from_ref,
@@ -337,15 +471,16 @@ mod tests {
 
     fn seg_int(col: &str, min: i64, max: i64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
-        let mut cols: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        let mut cols: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
         cols.insert(
-            col.to_string(),
+            fid(col),
             ScalarStatsAgg::from_min_max(
                 Arc::new(Int64Array::from(vec![min])),
                 Arc::new(Int64Array::from(vec![max])),
             ),
         );
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -389,10 +524,9 @@ mod tests {
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
-            schema: Vec::new(),
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 64,
@@ -427,17 +561,32 @@ mod tests {
 
         // x = 5 → only p0's [0,10] aggregate can contain it.
         assert_eq!(
-            scalar_keep_parts(&list, &pred("x", ScalarOp::Eq, 5)),
+            scalar_keep_parts(
+                &list,
+                fid("x"),
+                &current_types("x"),
+                &pred("x", ScalarOp::Eq, 5)
+            ),
             vec![p0.part_id]
         );
         // x = 105 → only p1's [100,110].
         assert_eq!(
-            scalar_keep_parts(&list, &pred("x", ScalarOp::Eq, 105)),
+            scalar_keep_parts(
+                &list,
+                fid("x"),
+                &current_types("x"),
+                &pred("x", ScalarOp::Eq, 105)
+            ),
             vec![p1.part_id]
         );
         // x > 50 → p0.max=10 can't; p1 kept.
         assert_eq!(
-            scalar_keep_parts(&list, &pred("x", ScalarOp::Gt, 50)),
+            scalar_keep_parts(
+                &list,
+                fid("x"),
+                &current_types("x"),
+                &pred("x", ScalarOp::Gt, 50)
+            ),
             vec![p1.part_id]
         );
     }
@@ -452,14 +601,16 @@ mod tests {
 
         // IN (5, 205) → p0 ([0,10]) and p2 ([200,210]); not p1.
         assert_eq!(
-            scalar_value_set_keep_parts(&list, "x", &[i(5), i(205)]),
+            scalar_value_set_keep_parts(&list, fid("x"), &current_types("x"), &[i(5), i(205)]),
             vec![p0.part_id, p2.part_id]
         );
         // IN (50) → in no part's range.
-        assert!(scalar_value_set_keep_parts(&list, "x", &[i(50)]).is_empty());
+        assert!(
+            scalar_value_set_keep_parts(&list, fid("x"), &current_types("x"), &[i(50)]).is_empty()
+        );
         // Unknown column → conservative keep-all.
         assert_eq!(
-            scalar_value_set_keep_parts(&list, "missing", &[i(5)]),
+            scalar_value_set_keep_parts(&list, fid("missing"), &current_types("missing"), &[i(5)]),
             vec![p0.part_id, p1.part_id, p2.part_id]
         );
     }
@@ -484,7 +635,7 @@ mod tests {
         let p2 = part_from(&[seg_int("x", 200, 210)], 2);
         let list = list_with(vec![p0.clone(), p1, p2.clone()]);
         assert_eq!(
-            scalar_value_set_keep_parts(&list, column, &values),
+            scalar_value_set_keep_parts(&list, fid(column), &current_types(column), &values),
             vec![p0.part_id, p2.part_id],
             "part tier prunes 1 of 3"
         );
@@ -493,7 +644,12 @@ mod tests {
         // superfiles → 1; [50,60] holds neither value, dropped here.
         let segs = vec![seg_int("x", 0, 10), seg_int("x", 50, 60)];
         assert_eq!(
-            scalar_value_set_skip(&segs, column, &values),
+            scalar_value_set_skip(
+                &ManifestSnapshot::empty(opts_title_fts()),
+                &segs,
+                fid(column),
+                &values,
+            ),
             vec![true, false],
             "superfile tier prunes 1 of 2"
         );
@@ -505,7 +661,12 @@ mod tests {
         let p0 = part_from(&[seg_int("x", 0, 10)], 0);
         let list = list_with(vec![p0.clone()]);
         assert_eq!(
-            scalar_keep_parts(&list, &pred("other", ScalarOp::Eq, 5)),
+            scalar_keep_parts(
+                &list,
+                fid("other"),
+                &current_types("other"),
+                &pred("other", ScalarOp::Eq, 5),
+            ),
             vec![p0.part_id]
         );
     }
@@ -533,9 +694,9 @@ mod tests {
         sorted.sort();
         let (mn, mx) = (sorted[0], sorted[sorted.len() - 1]);
 
-        let mut cols: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        let mut cols: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
         cols.insert(
-            "title".to_string(),
+            fid("title"),
             ScalarStatsAgg::from_min_max(
                 Arc::new(LargeStringArray::from(vec![mn])),
                 Arc::new(LargeStringArray::from(vec![mx])),
@@ -548,7 +709,7 @@ mod tests {
         }
         let mut fts = HashMap::new();
         fts.insert(
-            "title".to_string(),
+            fid("title"),
             FtsSummaryAgg::new_with_params(
                 Some(bb.finish()),
                 titles.len() as u32,
@@ -559,6 +720,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -639,9 +801,9 @@ mod tests {
     /// for the `title` column. `bloom_tokens` are inserted as exact
     /// terms; the term range is their lex span.
     fn seg(scalar_min: &str, scalar_max: &str, bloom_tokens: &[&str]) -> Arc<SuperfileEntry> {
-        let mut cols: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        let mut cols: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
         cols.insert(
-            "title".to_string(),
+            fid("title"),
             ScalarStatsAgg::from_min_max(
                 Arc::new(LargeStringArray::from(vec![scalar_min])),
                 Arc::new(LargeStringArray::from(vec![scalar_max])),
@@ -663,7 +825,7 @@ mod tests {
         };
         let mut fts = HashMap::new();
         fts.insert(
-            "title".to_string(),
+            fid("title"),
             FtsSummaryAgg::new_with_params(
                 Some(bb.finish()),
                 bloom_tokens.len() as u32,
@@ -673,6 +835,7 @@ mod tests {
         );
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,

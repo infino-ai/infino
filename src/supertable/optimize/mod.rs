@@ -60,10 +60,14 @@ impl Supertable {
             );
             __t = Instant::now();
         }
-        // Centroids have settled at the final generation (drain + compaction);
-        // pre-build the centroid-router graph so the next centroid-graph query
-        // loads it instead of building on the hot path. Best-effort.
-        self.refresh_centroid_router_cache();
+
+        if !opts.skip_router_cache_warmup {
+            // Centroids have settled at the final generation (drain + compaction);
+            // pre-build the centroid-router graph so the next centroid-graph query
+            // loads it instead of building on the hot path. Best-effort.
+            self.refresh_centroid_router_cache();
+        }
+
         if phase_timers {
             tracing::info!(
                 secs = __t.elapsed().as_secs_f64(),

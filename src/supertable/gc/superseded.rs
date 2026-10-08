@@ -385,6 +385,10 @@ mod tests {
             self.inner.get_range(uri, range).await
         }
 
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+
         async fn put_atomic(
             &self,
             uri: &str,

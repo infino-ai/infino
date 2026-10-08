@@ -11,18 +11,15 @@
 //! survivors, and the job runner carries their tombstones onto the output.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     io::{Error, Write},
     sync::Arc,
 };
 
-use roaring::RoaringBitmap;
-
 use crate::{
     superfile::{
-        builder::{CarryScope, SuperfileBuilder, merge_builder_opts},
+        builder::{BuilderOptions, CarryScope, MergeInput, SuperfileBuilder, merge_builder_opts},
         error::BuildError as SuperfileBuildError,
-        fts::reader::ColumnLengthStats,
         reader::SuperfileReader,
         stats::SuperfileStats,
     },
@@ -31,6 +28,7 @@ use crate::{
         manifest::SuperfileEntry,
         optimize::compact::{CompactionMerge, MergeInputs, SuperfileMerge},
         reindex::Repair,
+        schema::map::FileSchemaMap,
     },
 };
 
@@ -49,12 +47,19 @@ use crate::{
 fn carry_body<'a>(
     inputs: &'a MergeInputs<'a>,
 ) -> Option<(&'a Arc<SuperfileReader>, &'a Arc<SuperfileEntry>)> {
-    let ([(reader, deleted)], [entry]) = (inputs.readers, inputs.entries) else {
+    let ([input], [entry]) = (inputs.inputs, inputs.entries) else {
         return None;
     };
-    let carries_every_row = deleted.as_ref().is_none_or(|b| b.is_empty())
+    let carries_every_row = input.deleted.as_ref().is_none_or(|b| b.is_empty())
         && inputs.superseded.iter().all(BTreeSet::is_empty);
-    (carries_every_row && reader.is_fully_resident()).then_some((reader, entry))
+    // The body is copied verbatim, so it must already have the table's
+    // shape; a file that needs adapting goes through the merge instead.
+    let same_shape = input
+        .adapter
+        .as_ref()
+        .is_none_or(FileSchemaMap::is_identity);
+    (carries_every_row && same_shape && input.reader.is_fully_resident())
+        .then_some((&input.reader, entry))
 }
 
 /// The row count a carried body will hold, checked against the manifest.
@@ -96,14 +101,18 @@ impl SuperfileMerge for RepairMerge {
         output: &mut dyn Write,
     ) -> Result<SuperfileStats, BuildError> {
         match carry_body(&inputs) {
-            Some((reader, entry)) => {
-                repair_carrying_body_to(self.0, reader, entry, inputs.fts_corpus, output)
-            }
+            Some((reader, entry)) => repair_carrying_body_to(
+                self.0,
+                reader,
+                entry,
+                inputs.builder_options.clone(),
+                output,
+            ),
             // Restating compaction's merge here would be a second copy that
             // could drift from the one the table is actually compacted with.
             None => match self.0 {
                 Repair::Layout => CompactionMerge.build(inputs, output),
-                Repair::Terms => reanalyze_to(inputs.readers, inputs.fts_corpus, output),
+                Repair::Terms => reanalyze_to(inputs.inputs, inputs.builder_options, output),
             },
         }
     }
@@ -127,11 +136,11 @@ fn repair_carrying_body_to(
     repair: Repair,
     source: &Arc<SuperfileReader>,
     entry: &Arc<SuperfileEntry>,
-    fts_corpus: &HashMap<String, ColumnLengthStats>,
+    base: BuilderOptions,
     output: &mut dyn Write,
 ) -> Result<SuperfileStats, BuildError> {
-    let readers = [(Arc::clone(source), None)];
-    let opts = merge_builder_opts(&readers, fts_corpus)?;
+    let inputs = [MergeInput::same_shape(Arc::clone(source), None)];
+    let opts = merge_builder_opts(&inputs, base)?;
     let mut builder = SuperfileBuilder::new(match repair {
         Repair::Layout => opts,
         Repair::Terms => opts.reanalyze_stored_columns(),
@@ -158,23 +167,38 @@ fn repair_carrying_body_to(
 /// A column whose text was never stored cannot be re-analyzed, so its
 /// postings are carried and it keeps the revision it was built at.
 ///
-/// Vectors are decoded and re-encoded rather than spliced, so the output
-/// holds whatever that round trip produces. Nothing gates which codec may
-/// take this path, so a codec that does not round-trip exactly would move
-/// its vectors here.
+/// Refuses a superfile with a vector index: this build would decode its
+/// vectors and re-encode them, and the default codecs do not round-trip
+/// exactly, so an FTS repair would quietly move the vectors. A user-table
+/// repair carries its body instead and never reaches here; a file that
+/// does needs a vector-preserving rebuild first.
 fn reanalyze_to<W: Write>(
-    readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-    fts_corpus: &HashMap<String, ColumnLengthStats>,
+    inputs: &[MergeInput],
+    base: BuilderOptions,
     output: W,
 ) -> Result<SuperfileStats, BuildError> {
-    let builder_opts = merge_builder_opts(readers, fts_corpus)?.reanalyze_stored_columns();
+    let builder_opts = merge_builder_opts(inputs, base)?.reanalyze_stored_columns();
+    if !builder_opts.vector_columns.is_empty() {
+        let columns: Vec<&str> = builder_opts
+            .vector_columns
+            .iter()
+            .map(|c| c.column.as_str())
+            .collect();
+        return Err(BuildError::Superfile(SuperfileBuildError::Io(
+            Error::other(format!(
+                "re-analysis cannot carry the vector index on {columns:?} across \
+                 untouched, and re-encoding it would move the vectors"
+            )),
+        )));
+    }
     let mut builder = SuperfileBuilder::new(builder_opts)?;
 
-    let mut stats = Vec::with_capacity(readers.len());
-    for (reader, deleted) in readers {
+    let mut stats = Vec::with_capacity(inputs.len());
+    for input in inputs {
         stats.push(builder.add_batch_from_reader_scoped(
-            reader,
-            deleted.clone(),
+            &input.reader,
+            input.deleted.clone(),
+            input.adapter.as_ref(),
             CarryScope::UnstoredOnly,
         )?);
     }
@@ -187,7 +211,8 @@ fn reanalyze_to<W: Write>(
 mod tests {
     use std::collections::HashMap;
 
-    use arrow_array::RecordBatch;
+    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
     use uuid::Uuid;
 
@@ -199,8 +224,15 @@ mod tests {
             vector::layout::VectorLayout,
         },
         supertable::manifest::SuperfileUri,
-        test_helpers::{decimal128_id_field, decimal128_ids},
+        test_helpers::{
+            decimal128_id_field, decimal128_ids, default_vector_config, distinct_unit_vectors,
+        },
     };
+
+    /// Rows in the vector-bearing fixture.
+    const VECTOR_ROWS: usize = 4;
+    /// Rotation seed for the fixture's vector column.
+    const VECTOR_ROT_SEED: u64 = 7;
 
     /// A carrying build reports the manifest's row count as its own, so
     /// the only number that can disagree is the file's. A manifest entry
@@ -209,9 +241,6 @@ mod tests {
     /// a different row count means they mark different rows.
     #[test]
     fn a_manifest_row_count_that_disagrees_with_the_file_refuses_the_carry() {
-        use arrow_array::LargeStringArray;
-        use arrow_schema::{DataType, Field, Schema};
-
         let schema = Arc::new(Schema::new(vec![
             decimal128_id_field("doc_id"),
             Field::new("title", DataType::LargeUtf8, false),
@@ -238,6 +267,7 @@ mod tests {
 
         let id = Uuid::from_u128(1);
         let honest = Arc::new(SuperfileEntry {
+            physical_schema: None,
             superfile_id: id,
             uri: SuperfileUri(id),
             stem: None,
@@ -259,6 +289,7 @@ mod tests {
         );
 
         let drifted = Arc::new(SuperfileEntry {
+            physical_schema: None,
             n_docs: source.n_docs() + 1,
             ..(*honest).clone()
         });
@@ -266,5 +297,47 @@ mod tests {
             carried_doc_count(&source, &drifted).is_err(),
             "an entry claiming a row the file does not hold must refuse"
         );
+    }
+
+    /// The rebuild fallback refuses a vector-bearing superfile rather than
+    /// re-encode its vectors, so the day an FTS repair reaches it the run
+    /// stops instead of moving them.
+    #[test]
+    fn a_rebuild_refuses_a_superfile_with_a_vector_index() {
+        let schema = Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let vector = default_vector_config("emb", VECTOR_ROT_SEED);
+        let flat = distinct_unit_vectors(VECTOR_ROWS, vector.dim, VECTOR_ROT_SEED);
+        let options = || {
+            BuilderOptions::new(
+                Arc::clone(&schema),
+                "doc_id",
+                vec![FtsConfig::new("title")],
+                vec![default_vector_config("emb", VECTOR_ROT_SEED)],
+            )
+        };
+        let mut b = SuperfileBuilder::new(options()).expect("new builder");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(decimal128_ids(0..VECTOR_ROWS as u64)),
+                Arc::new(LargeStringArray::from(vec!["hello"; VECTOR_ROWS])),
+            ],
+        )
+        .expect("batch matches schema");
+        b.add_batch(&batch, &[flat.as_slice()]).expect("add");
+        let source = Arc::new(
+            SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"),
+        );
+
+        let err = reanalyze_to(
+            &[MergeInput::same_shape(source, None)],
+            options(),
+            Vec::new(),
+        )
+        .expect_err("a vector-bearing rebuild must refuse");
+        assert!(err.to_string().contains("emb"), "{err}");
     }
 }

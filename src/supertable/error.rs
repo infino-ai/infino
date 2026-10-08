@@ -13,14 +13,20 @@
 //! as `FixedSizeList<Float32>` (vs superfile, where vectors are
 //! out-of-band entirely).
 
-use std::path::PathBuf;
+use std::{error::Error, fmt::Display, path::PathBuf};
 
+use arrow_schema::ArrowError;
+use datafusion::error::DataFusionError;
 use thiserror::Error;
 
 use crate::{
-    storage::{StorageError, permission_denied_in_chain},
-    superfile::error::BuildError as SuperfileBuildError,
-    supertable::{ManifestLoadError, manifest::part},
+    storage::{StorageError, error_chain, permission_denied_in_chain},
+    superfile::error::{BuildError as SuperfileBuildError, FtsError, ReadError, VectorError},
+    supertable::{
+        ManifestLoadError,
+        manifest::{part, term_stats::TermStatsError},
+        schema::error::SchemaError,
+    },
 };
 
 /// Errors raised when constructing or operating against a
@@ -29,6 +35,22 @@ use crate::{
 pub enum BuildError {
     #[error("no documents to build")]
     NoDocsToBuild,
+
+    #[error(
+        "hydrate requires a SQL-only table with no index; this table declares \
+         {fts} full-text and {vector} vector column(s). Use `append` for an \
+         indexed table."
+    )]
+    HydrateRequiresNoIndex { fts: usize, vector: usize },
+
+    #[error("hydrate target_rows must be at least 1")]
+    HydrateZeroTargetRows,
+
+    #[error("a hydrate chunk has {rows} rows; one superfile holds at most {max}")]
+    HydrateChunkTooLarge { rows: usize, max: u32 },
+
+    #[error("reading a hydrate input batch: {0}")]
+    HydrateInputRead(#[source] ArrowError),
 
     #[error("schema is missing the declared id_column {0:?}")]
     MissingIdColumn(String),
@@ -106,8 +128,14 @@ pub enum BuildError {
     )]
     UnknownAnalyzer { column: String, analyzer: String },
 
-    #[error("input RecordBatch schema does not match the supertable's declared schema")]
-    BatchSchemaMismatch,
+    #[error("{0}")]
+    Schema(#[from] SchemaError),
+
+    #[error(
+        "the table's schema moved from {expected} to {current} while this commit was built; \
+         it is rebuilt against the current schema"
+    )]
+    SchemaMoved { expected: u32, current: u32 },
 
     #[error("error from underlying superfile layer: {0}")]
     Superfile(#[from] SuperfileBuildError),
@@ -194,7 +222,13 @@ impl BuildError {
     /// compare-and-set race, so reissuing against fresh state can succeed.
     pub(crate) fn is_conflict(&self) -> bool {
         match self {
-            BuildError::WriteContention => true,
+            // Another writer holds this table's single writer slot: the same
+            // retry-after-the-other-writer answer as a lost commit race.
+            BuildError::WriteContention | BuildError::SupertableInUse => true,
+            // The schema moved under this build: rebuilding against the
+            // winner's schema and reissuing can succeed.
+            BuildError::SchemaMoved { .. } => true,
+            BuildError::Schema(SchemaError::SchemaConflict { .. }) => true,
             BuildError::StorageConstruction(e) => e.is_conflict(),
             _ => false,
         }
@@ -210,6 +244,18 @@ impl BuildError {
     }
 }
 
+impl From<TermStatsError> for BuildError {
+    /// The term-stats pass reaches the build path as `Store` carrying the
+    /// message, except a refused credential under it, which keeps its own
+    /// variant so the caller is told to fix the credentials, not to retry.
+    fn from(e: TermStatsError) -> Self {
+        if e.is_permission_denied() {
+            return BuildError::PermissionDenied(e.to_string());
+        }
+        BuildError::Store(e.to_string())
+    }
+}
+
 impl From<CommitError> for BuildError {
     /// Commit failures reach the build path as `Store` carrying the message —
     /// except a vanished pointer and a lost commit race, which keep their own
@@ -219,6 +265,9 @@ impl From<CommitError> for BuildError {
     fn from(e: CommitError) -> Self {
         match e {
             CommitError::PointerVanished => BuildError::TableGone,
+            CommitError::SchemaMoved { expected, current } => {
+                BuildError::SchemaMoved { expected, current }
+            }
             other if other.is_conflict() => BuildError::WriteContention,
             other if other.is_permission_denied() => {
                 BuildError::PermissionDenied(other.to_string())
@@ -279,6 +328,9 @@ pub enum CommitError {
     /// seal moved and committing the rest.
     #[error("input {superfile_id} changed under this commit's seal")]
     InputsChanged { superfile_id: uuid::Uuid },
+
+    #[error("the table's schema moved from {expected} to {current} under this commit")]
+    SchemaMoved { expected: u32, current: u32 },
 }
 
 impl CommitError {
@@ -290,8 +342,10 @@ impl CommitError {
     /// both shapes are classified together.
     pub(crate) fn is_conflict(&self) -> bool {
         match self {
-            // Both are a race lost to another writer with nothing published.
-            CommitError::WriteContentionExhausted | CommitError::InputsChanged { .. } => true,
+            // All three are a race lost to another writer with nothing published.
+            CommitError::WriteContentionExhausted
+            | CommitError::InputsChanged { .. }
+            | CommitError::SchemaMoved { .. } => true,
             CommitError::Storage(e) => e.is_conflict(),
             CommitError::Build(b) => b.is_conflict(),
             _ => false,
@@ -622,16 +676,13 @@ pub enum GcError {
     Storage(#[from] crate::storage::StorageError),
 }
 
-/// Errors raised by query-time methods on [`crate::supertable::Supertable`]
-/// (`query_sql`; future: `bm25_search`, `vector_search`).
+/// Errors raised by the query and search kernels.
 ///
-/// Each variant carries a stringified source — DataFusion's error
-/// types are not in the supertable's public dependency surface, so
-/// we don't propagate them as `#[from]`. Callers get the formatted
-/// message; structured introspection isn't a v1 concern. When the
-/// SQL surface gains a manifest-level skip planner, it'll get its
-/// own variant to distinguish "the query engine failed" from
-/// "store failed mid-scan".
+/// Each variant names a cause, which decides the public [`crate::InfinoError`]
+/// (see its `From<QueryError>`): the caller's mistake, a failed read, or the
+/// engine breaking its own invariant. Inside a DataFusion plan a `QueryError`
+/// travels as `DataFusionError::External` (see `From<QueryError> for
+/// DataFusionError`), so it comes out the other side with its cause intact.
 #[derive(Debug, Error)]
 pub enum QueryError {
     #[error("superfile store error during query: {0}")]
@@ -643,11 +694,20 @@ pub enum QueryError {
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
-    #[error("failed to plan the query: {0}")]
-    Plan(String),
-
+    /// The engine broke one of its own invariants: a superfile without the
+    /// `_id` column every superfile has, a hit the pipeline failed to stamp,
+    /// a build that left out what it must carry. Neither the caller nor a
+    /// retry can fix it; it is a bug, and maps to the public `Backend`. A
+    /// caller's mistake is [`Self::InvalidQuery`], a failed read
+    /// [`Self::Store`] or [`Self::Parquet`].
     #[error("failed to run the query: {0}")]
-    Execute(String),
+    Internal(String),
+
+    /// DataFusion failed to plan or run a query, typed as it returned it, so
+    /// the public mapping can tell a bad query from a failed read or an
+    /// engine fault (`crate::error::datafusion_error`).
+    #[error(transparent)]
+    DataFusion(DataFusionError),
 
     /// A query crossed the connection memory budget. The string is already
     /// labelled with the operation; routes to `InfinoError::OverBudget` via
@@ -658,18 +718,91 @@ pub enum QueryError {
     #[error("manifest load error: {0}")]
     ManifestLoad(ManifestLoadError),
 
-    /// The storage backend refused the credentials in use. Classified at the
-    /// boundary — like [`Self::OverBudget`] — because the variants above carry
-    /// stringified sources; routes to `InfinoError::PermissionDenied`.
+    /// The storage backend refused the credentials in use; routes to
+    /// `InfinoError::PermissionDenied`. Classified where a source is about to
+    /// be stringified into [`Self::Store`] or [`Self::Parquet`] (see
+    /// [`Self::build`]); a typed [`Self::DataFusion`] source is checked in
+    /// place, by walking its chain.
     #[error("permission denied during query: {0}")]
     PermissionDenied(String),
 }
 
+/// A `QueryError` raised inside a DataFusion plan (a table scan, a search
+/// table function) crosses back to the caller as `External`, not flattened to
+/// a string, so the error keeps the cause it was raised with.
+impl From<QueryError> for DataFusionError {
+    fn from(e: QueryError) -> Self {
+        DataFusionError::External(Box::new(e))
+    }
+}
+
+/// A superfile read that failed during a query, classified once for every
+/// caller (the scan, the search kernels, the id lookups):
+///
+/// | `ReadError` | `QueryError` |
+/// |---|---|
+/// | over the connection's memory budget | `OverBudget` |
+/// | an FTS query the column cannot answer: a phrase without positions, nothing positive to rank | `InvalidQuery`: the caller's |
+/// | the store refused our credentials | `PermissionDenied` |
+/// | a local doc id past the superfile's end, or a read called on a codec it does not support: our bug, retrying cannot help | `Internal` |
+/// | anything else | `Parquet`: a read failed |
+impl From<ReadError> for QueryError {
+    fn from(e: ReadError) -> Self {
+        if let Some(msg) = e.over_budget() {
+            return QueryError::OverBudget(msg.to_string());
+        }
+        if let ReadError::Fts(fts) = &e
+            && matches!(
+                fts.as_ref(),
+                FtsError::PositionsUnavailable { .. } | FtsError::NegationOnly
+            )
+        {
+            return QueryError::InvalidQuery(e.to_string());
+        }
+        if permission_denied_in_chain(&e) {
+            return QueryError::PermissionDenied(e.to_string());
+        }
+        if e.is_internal() {
+            return QueryError::Internal(e.to_string());
+        }
+        QueryError::Parquet(e.to_string())
+    }
+}
+
+/// The vector reader's own error, before it is wrapped in a [`ReadError`]:
+/// classified the same way.
+impl From<VectorError> for QueryError {
+    fn from(e: VectorError) -> Self {
+        QueryError::from(ReadError::Vector(Box::new(e)))
+    }
+}
+
 impl QueryError {
+    /// The engine broke its own invariant; `error` says how.
+    pub(crate) fn internal(error: impl Display) -> Self {
+        QueryError::Internal(error.to_string())
+    }
+
+    /// A storage or cache failure under a query: [`Self::Store`], or
+    /// [`Self::PermissionDenied`] when the store refused our credentials. A
+    /// superfile [`ReadError`] goes through `From<ReadError>` instead, which
+    /// also catches a budget refusal and the caller's own mistakes.
+    pub(crate) fn store(error: impl Error + 'static) -> Self {
+        QueryError::build(error.to_string(), &error)
+    }
+
     /// The over-budget message if this is a budget refusal, else `None`.
     pub(crate) fn over_budget(&self) -> Option<&str> {
         match self {
             QueryError::OverBudget(m) => Some(m),
+            // Ours, carried through the plan, or the plan's own memory pool.
+            QueryError::DataFusion(e) => error_chain(e)
+                .find_map(|link| link.downcast_ref::<QueryError>())
+                .and_then(QueryError::over_budget)
+                .or(match e.find_root() {
+                    DataFusionError::ResourcesExhausted(m) => Some(m.as_str()),
+                    _ => None,
+                }),
             _ => None,
         }
     }
@@ -679,15 +812,22 @@ impl QueryError {
         match self {
             QueryError::PermissionDenied(_) => true,
             QueryError::ManifestLoad(e) => e.is_permission_denied(),
+            QueryError::DataFusion(e) => permission_denied_in_chain(e),
             _ => false,
         }
+    }
+
+    /// The tombstone cache failed to load a superfile's deletes; classified
+    /// like any storage failure, labelled so the message says where.
+    pub(crate) fn tombstone_cache(error: impl Error + 'static) -> Self {
+        QueryError::build(format!("tombstone cache: {error}"), &error)
     }
 
     /// Classify a storage-backed query failure whose source is about to be
     /// stringified: refused credentials get their own variant, everything else
     /// stays a [`Self::Store`]. `message` is the text the caller would have
     /// used either way, so no message changes shape.
-    pub(crate) fn build(message: String, source: &(dyn std::error::Error + 'static)) -> Self {
+    pub(crate) fn build(message: String, source: &(dyn Error + 'static)) -> Self {
         if permission_denied_in_chain(source) {
             return QueryError::PermissionDenied(message);
         }
@@ -697,8 +837,137 @@ impl QueryError {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
-    use crate::supertable::reader_cache::disk::DiskCacheError;
+    use crate::{superfile::LazyByteSourceError, supertable::reader_cache::disk::DiskCacheError};
+
+    /// The term-stats pass runs during optimize: a refused credential under
+    /// any of its failures (a dictionary read, a reader open, the artifact
+    /// write) reaches the build path as `PermissionDenied`, so the caller
+    /// fixes the credentials instead of retrying; anything else stays `Store`.
+    #[test]
+    fn a_refused_credential_in_the_term_stats_pass_stays_permission_denied() {
+        let refused = || StorageError::PermissionDenied { uri: "u".into() };
+        let read = TermStatsError::Read {
+            what: "dict fetch",
+            source: FtsError::RangeFetch {
+                what: "fts/dict",
+                source: LazyByteSourceError::Storage(refused()),
+            },
+        };
+        let open = TermStatsError::Open(QueryError::PermissionDenied("refused".into()));
+        for failure in [read, open, TermStatsError::Storage(refused())] {
+            assert!(
+                matches!(BuildError::from(failure), BuildError::PermissionDenied(_)),
+                "a refused credential must stay one"
+            );
+        }
+        let timeout = TermStatsError::Storage(StorageError::TransientExhausted {
+            uri: "u".into(),
+            source: "boom".into(),
+        });
+        assert!(matches!(BuildError::from(timeout), BuildError::Store(_)));
+    }
+
+    /// A range fetch inside the FTS or vector reader keeps its kind through
+    /// the reader's error: refused credentials are found under it, and any
+    /// other range-fetch failure is a read that failed.
+    #[test]
+    fn a_range_fetch_inside_a_reader_is_classified_by_its_kind() {
+        let refused =
+            || LazyByteSourceError::Storage(StorageError::PermissionDenied { uri: "u".into() });
+        let fts = |source| {
+            QueryError::from(ReadError::Fts(Box::new(FtsError::RangeFetch {
+                what: "fts/dict",
+                source,
+            })))
+        };
+        assert!(matches!(fts(refused()), QueryError::PermissionDenied(_)));
+        assert!(matches!(
+            QueryError::from(VectorError::LazySource(refused())),
+            QueryError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            QueryError::from(VectorError::RangeFetch {
+                what: "lazy open: directory fetch".to_string(),
+                source: refused(),
+            }),
+            QueryError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            QueryError::from(VectorError::LazySource(LazyByteSourceError::ShortRead {
+                start: 0,
+                requested: 8,
+                got: 4,
+            })),
+            QueryError::Parquet(_)
+        ));
+        assert!(matches!(
+            fts(LazyByteSourceError::OutOfBounds {
+                start: 9,
+                len: 1,
+                size: 4,
+            }),
+            QueryError::Parquet(_)
+        ));
+    }
+
+    /// A superfile read carries its storage error inside an `io::Error`, whose
+    /// `source()` skips the error it wraps. Refused credentials must still be
+    /// found there, and a budget refusal and the caller's own FTS mistake kept
+    /// apart from a read that failed.
+    #[test]
+    fn a_read_error_is_classified_through_its_io_wrapper() {
+        let in_io = |storage| ReadError::Io(io::Error::other(storage));
+        assert!(matches!(
+            QueryError::from(in_io(StorageError::PermissionDenied { uri: "u".into() })),
+            QueryError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            QueryError::from(in_io(StorageError::TransientExhausted {
+                uri: "u".into(),
+                source: "boom".into(),
+            })),
+            QueryError::Parquet(_)
+        ));
+        assert!(matches!(
+            QueryError::from(VectorError::OverBudget("gate".into())),
+            QueryError::OverBudget(_)
+        ));
+        assert!(matches!(
+            QueryError::from(ReadError::Fts(Box::new(FtsError::NegationOnly))),
+            QueryError::InvalidQuery(_)
+        ));
+        // A local doc id past the end is our bug: retrying the read cannot help.
+        assert!(matches!(
+            QueryError::from(ReadError::DocIdOutOfRange {
+                doc_id: 9,
+                n_docs: 4
+            }),
+            QueryError::Internal(_)
+        ));
+        // So is asking a read path for a codec it does not support, which
+        // the vector reader raises wrapped in its own error.
+        assert!(matches!(
+            QueryError::from(VectorError::Read(ReadError::WrongCodecPath(
+                "fp32 only".into()
+            ))),
+            QueryError::Internal(_)
+        ));
+    }
+
+    /// A budget refusal that crossed DataFusion is still one.
+    #[test]
+    fn a_budget_refusal_inside_datafusion_is_still_over_budget() {
+        let refused = QueryError::DataFusion(DataFusionError::ResourcesExhausted("cap".into()));
+        assert_eq!(refused.over_budget(), Some("cap"));
+        let other = QueryError::DataFusion(DataFusionError::Execution("boom".into()));
+        assert_eq!(other.over_budget(), None);
+        let ours =
+            QueryError::DataFusion(DataFusionError::from(QueryError::OverBudget("ours".into())));
+        assert_eq!(ours.over_budget(), Some("ours"));
+    }
 
     #[test]
     fn a_refused_credential_is_classified_through_the_disk_cache_wrapper() {

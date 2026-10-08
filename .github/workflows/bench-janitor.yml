@@ -1,8 +1,9 @@
-name: Bench janitor (Azure)
+name: Bench janitor
 
 # Reclaims ephemeral bench VMs (and their networking/disks) that outlive
-# their TTL. The bench workflows tear down on exit, but that is skipped on
-# force-cancel or a lost runner; this sweep is the independent backstop.
+# their TTL, on Azure (dataset benches) and GCP (PR benches). The bench
+# workflows tear down on exit, but that is skipped on force-cancel or a lost
+# runner; this sweep is the independent backstop.
 
 on:
   schedule:
@@ -29,7 +30,7 @@ env:
   RG: rg-infino-bench
 
 jobs:
-  sweep:
+  sweep-azure:
     runs-on: ubuntu-latest
     # Never run in a fork: the schedule/dispatch would sweep the shared RG.
     if: github.repository == 'infino-ai/infino'
@@ -94,3 +95,66 @@ jobs:
           done
 
           echo "resources remaining in $RG: $(az resource list -g "$RG" --query 'length(@)' -o tsv)"
+
+  sweep-gcp:
+    runs-on: ubuntu-latest
+    # Never run in a fork: the schedule/dispatch would sweep the shared project.
+    if: github.repository == 'infino-ai/infino'
+    # The workload identity provider admits the `ci` environment.
+    environment: ci
+    env:
+      GCP_PROJECT: ${{ vars.GCP_BENCH_PROJECT }}
+    steps:
+      - name: GCP login (workload identity federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_BENCH_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_BENCH_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Sweep expired bench resources
+        env:
+          TTL_HOURS: ${{ inputs.ttl_hours || '3' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          cutoff=$(( now - TTL_HOURS * 3600 ))
+
+          del() {
+            if [ "$DRY_RUN" = "true" ]; then echo "DRY-RUN would delete: $*"; return; fi
+            echo "deleting: $*"; "$@" || true
+          }
+
+          # Expired = delete-after label (epoch seconds) in the past, or
+          # created before the TTL (backstops instances with no label). The
+          # boot disk and ephemeral IP go with the instance.
+          live_vms=()
+          while IFS=$'\t' read -r name zone created after; do
+            [ -z "$name" ] && continue
+            expired=false
+            [ -n "$after" ] && [ "$now" -gt "$after" ] && expired=true
+            [ "$(date -u -d "$created" +%s)" -lt "$cutoff" ] && expired=true
+            if [ "$expired" = true ]; then
+              del gcloud compute instances delete "$name" \
+                --project "$GCP_PROJECT" --zone "${zone##*/}" --quiet
+            else
+              live_vms+=("$name")
+            fi
+          done < <(gcloud compute instances list --project "$GCP_PROJECT" \
+            --filter 'labels.purpose=supertable-bench' \
+            --format 'value(name,zone,creationTimestamp,labels.delete-after)')
+
+          # Each run's SSH rule is "<vm>-ssh"; reclaim it once its VM is gone.
+          is_live() { local v; for v in "${live_vms[@]:-}"; do [ "$v" = "$1" ] && return 0; done; return 1; }
+          while IFS= read -r rule; do
+            [ -z "$rule" ] && continue
+            is_live "${rule%-ssh}" && continue
+            del gcloud compute firewall-rules delete "$rule" --project "$GCP_PROJECT" --quiet
+          done < <(gcloud compute firewall-rules list --project "$GCP_PROJECT" \
+            --filter 'name ~ ^bench-vm-.*-ssh$' --format 'value(name)')
+
+          echo "bench instances remaining: $(gcloud compute instances list --project "$GCP_PROJECT" \
+            --filter 'labels.purpose=supertable-bench' --format 'value(name)' | wc -l)"

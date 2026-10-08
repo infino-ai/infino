@@ -2117,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.8.10"
+version = "0.10.0"
 dependencies = [
  "apache-avro",
  "arc-swap",
@@ -2171,7 +2171,7 @@ dependencies = [
 
 [[package]]
 name = "infino-python"
-version = "0.8.10"
+version = "0.10.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2180,6 +2180,7 @@ dependencies = [
  "infino",
  "numpy",
  "pyo3",
+ "serde_json",
  "tracing-subscriber",
 ]
 

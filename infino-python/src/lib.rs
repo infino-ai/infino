@@ -14,7 +14,7 @@
 //! maturin — it consumes the core crate's curated public API only (no
 //! `test-helpers`), so it is also a public-surface consumer test.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,15 +27,17 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyKeyError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{
+    PyException, PyKeyError, PyNotImplementedError, PyRuntimeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
     GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
-    ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions, Stemmer, Stopwords,
-    VectorFilter,
+    ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions, SchemaPatch, Stemmer,
+    Stopwords, VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
 // the engine's public API and reachable only under `infino/test-helpers`.
@@ -90,16 +92,20 @@ fn py_err(e: CoreError) -> PyErr {
     match e {
         CoreError::NotFound(m) => PyKeyError::new_err(m),
         CoreError::AlreadyExists(m)
-        | CoreError::Schema(m)
         | CoreError::Cardinality(m)
         | CoreError::Config(m)
         | CoreError::Query(m) => PyValueError::new_err(m),
+        // The schema cause is typed on the Rust side; Python gets its
+        // message, which names the column, cap or version at fault.
+        CoreError::Schema(e) => PyValueError::new_err(e.to_string()),
         CoreError::Io(m) | CoreError::Backend(m) => PyRuntimeError::new_err(m),
         // A connection-memory-budget refusal: recoverable, so raise the typed
         // ConnectionMemoryBudgetError the caller can catch and back off on.
         CoreError::OverBudget(m) => ConnectionMemoryBudgetError::new_err(m),
         // A lost CAS race: retryable
         CoreError::Conflict(m) => ConflictError::new_err(m),
+        // A valid query using something the engine does not support yet.
+        CoreError::Unsupported(m) => PyNotImplementedError::new_err(m),
         // The core error is `#[non_exhaustive]`: future variants fall back
         // to a generic runtime error carrying the message.
         other => PyRuntimeError::new_err(other.to_string()),
@@ -504,6 +510,39 @@ impl Connection {
         Ok(Table { inner })
     }
 
+    /// The table's schema document as a `dict`: its fields with ids, types,
+    /// nullability and indexes, the field cap, and the `schema_id`. With
+    /// `patch` (a `dict` in the same shape), merge it into the schema — or
+    /// create the table from it when there is none — and return the document
+    /// afterwards. A field is matched by `id` when it carries one and by
+    /// `name` otherwise; an unmatched field is added, a different type
+    /// changes the column, `dropped: True` retires it, and a field not
+    /// mentioned is untouched. `expected_schema_id` is a compare-and-set
+    /// against the current `schema_id`.
+    #[pyo3(signature = (name, patch=None, expected_schema_id=None))]
+    fn schema<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        patch: Option<&Bound<'py, PyAny>>,
+        expected_schema_id: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let json = py.import("json")?;
+        let doc = match patch {
+            None => py.detach(|| self.inner.schema(name)).map_err(py_err)?,
+            Some(patch) => {
+                let text: String = json.call_method1("dumps", (patch,))?.extract()?;
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| PyValueError::new_err(format!("schema patch: {e}")))?;
+                let patch = SchemaPatch::from_json(&value)
+                    .map_err(|e| PyValueError::new_err(format!("schema patch: {e}")))?;
+                py.detach(|| self.inner.apply_schema(name, &patch, expected_schema_id))
+                    .map_err(py_err)?
+            }
+        };
+        json.call_method1("loads", (doc.to_json().to_string(),))
+    }
+
     /// Drop a table. By default (`purge=True`) this also deletes the table's
     /// storage subtree after the catalog commit, reclaiming the bytes. Pass
     /// `purge=False` to only unregister the table from the catalog and leave
@@ -523,6 +562,7 @@ impl Connection {
     /// Run SQL across the catalog's tables; returns a pyarrow `Table`.
     /// Search is available in SQL via the TVFs, e.g.
     /// `SELECT _id, score FROM bm25_search('docs', 'body', 'q', 10)`.
+    /// Read-only, one statement per call: a write raises `ValueError`.
     fn query_sql<'py>(&self, py: Python<'py>, sql: &str) -> PyResult<Bound<'py, PyAny>> {
         let batches = py.detach(|| self.inner.query_sql(sql)).map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
@@ -700,6 +740,8 @@ struct ReindexReport {
     held_by_another_run: usize,
     #[pyo3(get)]
     unrepairable_columns: Vec<String>,
+    #[pyo3(get)]
+    inconsistent_footers: Vec<String>,
 }
 
 impl ReindexReport {
@@ -710,6 +752,7 @@ impl ReindexReport {
             awaiting_reanalysis: r.awaiting_reanalysis,
             held_by_another_run: r.held_by_another_run,
             unrepairable_columns: r.unrepairable_columns,
+            inconsistent_footers: ids_to_strings(&r.inconsistent_footers),
         }
     }
 }
@@ -719,12 +762,13 @@ impl ReindexReport {
     fn __repr__(&self) -> String {
         format!(
             "ReindexReport(rewritten={}, already_current={}, awaiting_reanalysis={}, \
-             held_by_another_run={}, unrepairable_columns={:?})",
+             held_by_another_run={}, unrepairable_columns={:?}, inconsistent_footers={:?})",
             self.rewritten,
             self.already_current,
             self.awaiting_reanalysis,
             self.held_by_another_run,
             self.unrepairable_columns,
+            self.inconsistent_footers,
         )
     }
 }
@@ -743,6 +787,8 @@ struct StalenessReport {
     #[pyo3(get)]
     unrepairable_columns: Vec<String>,
     #[pyo3(get)]
+    inconsistent_footers: Vec<String>,
+    #[pyo3(get)]
     is_current: bool,
 }
 
@@ -755,8 +801,14 @@ impl StalenessReport {
             awaiting_reanalysis: r.awaiting_reanalysis,
             bytes_to_rewrite: r.bytes_to_rewrite,
             unrepairable_columns: r.unrepairable_columns,
+            inconsistent_footers: ids_to_strings(&r.inconsistent_footers),
         }
     }
+}
+
+/// Superfile ids as the strings the binding exposes them as.
+fn ids_to_strings(ids: &[impl ToString]) -> Vec<String> {
+    ids.iter().map(ToString::to_string).collect()
 }
 
 #[pymethods]
@@ -764,12 +816,14 @@ impl StalenessReport {
     fn __repr__(&self) -> String {
         format!(
             "StalenessReport(superfiles={}, needing_rewrite={}, awaiting_reanalysis={}, \
-             bytes_to_rewrite={}, unrepairable_columns={:?}, is_current={})",
+             bytes_to_rewrite={}, unrepairable_columns={:?}, inconsistent_footers={:?}, \
+             is_current={})",
             self.superfiles,
             self.needing_rewrite,
             self.awaiting_reanalysis,
             self.bytes_to_rewrite,
             self.unrepairable_columns,
+            self.inconsistent_footers,
             if self.is_current { "True" } else { "False" },
         )
     }
@@ -815,20 +869,21 @@ struct Table {
 #[pymethods]
 impl Table {
     /// Append data. Accepts a pyarrow `RecordBatch` or `Table`, a pandas
-    /// `DataFrame`, or a `list[dict]` (coerced to Arrow with the table's
-    /// declared schema). Durable when this returns — one `append` == one
-    /// commit == one sealed superfile, so batch rows per call.
+    /// `DataFrame`, or a `list[dict]`. Rows and frames go to the engine as
+    /// JSON documents: nested dicts flatten to dot paths, lists become list
+    /// columns, a key the table has not seen adds a column typed from its
+    /// values, and a value whose type disagrees with the column's is
+    /// refused. Durable when this returns — one `append` == one commit ==
+    /// one sealed superfile, so batch rows per call.
     fn append(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let declared = self.inner.schema();
-        let py_schema = declared.as_ref().to_pyarrow(py)?;
-        match coerce_to_record_batch(py, data, &py_schema)? {
-            Some(batch) => {
-                let aligned = align_to_schema(declared, batch)?;
-                // Append commits a superfile to storage — release the GIL.
-                py.detach(|| self.inner.append(&aligned)).map_err(py_err)
-            }
+        match append_input(py, data, &self.schema(py)?)? {
+            // Append commits a superfile to storage — release the GIL. The
+            // engine brings the batch to the table's shape: a column it does
+            // not have joins the schema, an absent nullable one is null-filled.
+            AppendInput::Batch(batch) => py.detach(|| self.inner.append(&batch)).map_err(py_err),
+            AppendInput::Rows(rows) => py.detach(|| self.inner.append_rows(&rows)).map_err(py_err),
             // Empty input — nothing to append (no empty commit).
-            None => Ok(()),
+            AppendInput::Empty => Ok(()),
         }
     }
 
@@ -844,15 +899,14 @@ impl Table {
         data: &Bound<'_, PyAny>,
         source_name: &str,
     ) -> PyResult<()> {
-        let declared = self.inner.schema();
-        let py_schema = declared.as_ref().to_pyarrow(py)?;
-        match coerce_to_record_batch(py, data, &py_schema)? {
-            Some(batch) => {
-                let aligned = align_to_schema(declared, batch)?;
-                py.detach(|| self.inner.append_named(&aligned, source_name))
-                    .map_err(py_err)
-            }
-            None => Ok(()),
+        match append_input(py, data, &self.schema(py)?)? {
+            AppendInput::Batch(batch) => py
+                .detach(|| self.inner.append_named(&batch, source_name))
+                .map_err(py_err),
+            AppendInput::Rows(rows) => py
+                .detach(|| self.inner.append_rows_named(&rows, source_name))
+                .map_err(py_err),
+            AppendInput::Empty => Ok(()),
         }
     }
 
@@ -1215,18 +1269,18 @@ impl Table {
         predicate: &str,
         new_rows: &Bound<'_, PyAny>,
     ) -> PyResult<MutationStats> {
-        let declared = self.inner.schema();
-        let py_schema = declared.as_ref().to_pyarrow(py)?;
-        // Pass an empty batch through rather than short-circuiting like
+        // Empty input goes through rather than short-circuiting like
         // `append` does — we want the engine's cardinality check to run.
-        let aligned = match coerce_to_record_batch(py, new_rows, &py_schema)? {
-            Some(batch) => align_to_schema(declared, batch)?,
-            None => RecordBatch::new_empty(declared),
-        };
+        let input = append_input(py, new_rows, &self.schema(py)?)?;
         // Parse and mutate both off the GIL — neither touches Python.
         let stats = py.detach(|| {
             let expr = self.parse_predicate(predicate)?;
-            self.inner.update(expr, &aligned).map_err(py_err)
+            match input {
+                AppendInput::Batch(batch) => self.inner.update(expr, &batch),
+                AppendInput::Rows(rows) => self.inner.update_rows(expr, &rows),
+                AppendInput::Empty => self.inner.update_rows(expr, &[]),
+            }
+            .map_err(py_err)
         })?;
         Ok(MutationStats::from_core(&stats))
     }
@@ -1419,77 +1473,169 @@ fn parse_stats(stats: Option<&str>) -> PyResult<Bm25Stats> {
     }
 }
 
-/// Re-wrap a coerced batch under the table's declared schema. Python
-/// sources (pandas, list[dict]) are inherently nullable; this lets the
-/// exact-schema check accept them. A genuine type / null mismatch still errors.
-fn align_to_schema(declared: Arc<Schema>, batch: RecordBatch) -> PyResult<RecordBatch> {
-    RecordBatch::try_new(declared, batch.columns().to_vec())
-        .map_err(|e| PyValueError::new_err(e.to_string()))
+/// What an append or update was given.
+enum AppendInput {
+    /// Arrow-typed input: a pyarrow `RecordBatch` or `Table`, as one batch.
+    Batch(RecordBatch),
+    /// Row input: a `list[dict]` or a pandas `DataFrame`, as JSON documents.
+    Rows(Vec<serde_json::Value>),
+    /// Nothing to write.
+    Empty,
 }
 
-/// Coerce append input — a pyarrow `RecordBatch` / `Table`, a pandas
-/// `DataFrame`, or a `list[dict]` — into a single `RecordBatch`. `schema`
-/// is the table's declared pyarrow `Schema`, used to type the `list` /
-/// `DataFrame` conversions so column types match. Returns `None` for
-/// empty input (so an empty append is a no-op, not an empty commit).
-fn coerce_to_record_batch(
+/// Sort `data` into Arrow-typed or row input. Rows are serialised with
+/// Python's `json` module, so a Python `5` arrives as an integer literal
+/// and a `5.0` as a float literal, and the engine's number rule sees the
+/// literal the caller wrote.
+fn append_input(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
     schema: &Bound<'_, PyAny>,
-) -> PyResult<Option<RecordBatch>> {
+) -> PyResult<AppendInput> {
     let pa = py.import("pyarrow")?;
     let table_cls = pa.getattr("Table")?;
     let record_batch_cls = pa.getattr("RecordBatch")?;
 
-    // A single RecordBatch: convert directly.
     if data.is_instance(&record_batch_cls)? {
-        return Ok(Some(RecordBatch::from_pyarrow_bound(data)?));
+        let batch = RecordBatch::from_pyarrow_bound(data)?;
+        return Ok(if batch.num_rows() == 0 {
+            AppendInput::Empty
+        } else {
+            AppendInput::Batch(batch)
+        });
     }
-
-    // Normalize a Table / list[dict] / DataFrame to a pyarrow Table,
-    // typed by the table's own schema so column types line up.
-    let table = if data.is_instance(&table_cls)? {
-        data.clone()
-    } else if data.is_instance_of::<PyList>() {
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("schema", schema)?;
-        table_cls.call_method("from_pylist", (data,), Some(&kwargs))?
+    if data.is_instance(&table_cls)? {
+        // Collapse the Table's chunks into a single RecordBatch — one append
+        // == one commit; chunk boundaries are a pyarrow detail.
+        let batches = data
+            .call_method0("combine_chunks")?
+            .call_method0("to_batches")?;
+        let batches = batches.cast::<PyList>()?;
+        let mut rust_batches = Vec::with_capacity(batches.len());
+        for batch in batches.iter() {
+            rust_batches.push(RecordBatch::from_pyarrow_bound(&batch)?);
+        }
+        return Ok(match rust_batches.len() {
+            0 => AppendInput::Empty,
+            1 => AppendInput::Batch(rust_batches.remove(0)),
+            _ => {
+                let merged_schema = rust_batches[0].schema();
+                AppendInput::Batch(
+                    concat_batches(&merged_schema, &rust_batches)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?,
+                )
+            }
+        });
+    }
+    // A list of dicts, or a DataFrame. The document path is the contract and
+    // stays the default: nested dicts flatten to dot paths, a new key adds a
+    // column typed from its values, and a value disagreeing with a column's
+    // type is refused.
+    //
+    // It cannot carry what JSON has no spelling for. `json.dumps` raises on
+    // bytes, `Decimal`, `datetime` and numpy scalars, and the engine's mapper
+    // has no arm for binary or decimal, so a `Binary` or `Decimal128` column
+    // the caller declared was unwritable from a list of dicts. Those rows go
+    // through pyarrow instead, typed by inference and cast to the columns the
+    // table declares, which is the only route that carries them.
+    let is_frame = !data.is_instance_of::<PyList>();
+    let records = if is_frame {
+        data.call_method1("to_dict", ("records",))?
     } else {
-        // Assume a pandas DataFrame (or anything `from_pandas` accepts).
+        data.clone()
+    };
+    match py.import("json")?.call_method1("dumps", (&records,)) {
+        Ok(text) => {
+            let text: String = text.extract()?;
+            let rows: Vec<serde_json::Value> = serde_json::from_str(&text)
+                .map_err(|e| PyValueError::new_err(format!("rows: {e}")))?;
+            Ok(if rows.is_empty() {
+                AppendInput::Empty
+            } else {
+                AppendInput::Rows(rows)
+            })
+        }
+        Err(_) => typed_batch_input(py, data, schema, is_frame, &table_cls),
+    }
+}
+
+/// Rows carrying values JSON cannot spell, as one batch typed by the table's
+/// own columns.
+///
+/// Every column's type comes from the schema; the binding decides none of
+/// them. pyarrow's inference is a step on the way and never the answer: the
+/// batch is immediately cast to the declared types, so a `string` lands in a
+/// `LargeUtf8` column, and the cast is `safe`, so a value that would be
+/// truncated is refused rather than quietly changed.
+///
+/// A column the table does not declare is refused. Inventing a type for it
+/// here would mean the binding choosing by pyarrow's rules what the engine
+/// chooses by its own on the document path, so the same value could become
+/// different columns depending on which route it took. A new column has to
+/// arrive as something the document path can carry, or be declared first.
+fn typed_batch_input(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    schema: &Bound<'_, PyAny>,
+    is_frame: bool,
+    table_cls: &Bound<'_, PyAny>,
+) -> PyResult<AppendInput> {
+    let pa_table = if is_frame {
         let kwargs = PyDict::new(py);
-        kwargs.set_item("schema", schema)?;
         kwargs.set_item("preserve_index", false)?;
         table_cls.call_method("from_pandas", (data,), Some(&kwargs))?
+    } else {
+        table_cls.call_method1("from_pylist", (data,))?
     };
 
-    // Collapse the Table's chunks into a single RecordBatch — one append
-    // is one commit / one sealed superfile.
-    let batches = table
+    // Target types: the table's for a column it has, the inferred one
+    // otherwise, in the batch's own column order as `cast` requires.
+    let declared: HashSet<String> = schema
+        .getattr("names")?
+        .try_iter()?
+        .map(|n| n?.extract::<String>())
+        .collect::<PyResult<_>>()?;
+    let inferred = pa_table.getattr("schema")?;
+    let fields = PyList::empty(py);
+    for name in inferred.getattr("names")?.try_iter()? {
+        let name: String = name?.extract()?;
+        if !declared.contains(&name) {
+            return Err(PyValueError::new_err(format!(
+                "column `{name}` is new and the row carries a value no document can \
+                 spell; add the column with a schema write first, or send a value \
+                 the document path carries"
+            )));
+        }
+        fields.append(schema.call_method1("field", (&name,))?)?;
+    }
+    let target = py.import("pyarrow")?.call_method1("schema", (fields,))?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("safe", true)?;
+    let pa_table = pa_table
+        .call_method("cast", (target,), Some(&kwargs))
+        .map_err(|e| PyValueError::new_err(format!("rows: {e}")))?;
+
+    let batches = pa_table
         .call_method0("combine_chunks")?
         .call_method0("to_batches")?;
     let batches = batches.cast::<PyList>()?;
-    if batches.is_empty() {
-        return Ok(None);
-    }
     let mut rust_batches = Vec::with_capacity(batches.len());
     for batch in batches.iter() {
         rust_batches.push(RecordBatch::from_pyarrow_bound(&batch)?);
     }
-    if rust_batches.len() == 1 {
-        Ok(rust_batches.into_iter().next())
-    } else {
-        let merged_schema = rust_batches[0].schema();
-        concat_batches(&merged_schema, &rust_batches)
-            .map(Some)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    }
+    Ok(match rust_batches.len() {
+        0 => AppendInput::Empty,
+        1 => AppendInput::Batch(rust_batches.remove(0)),
+        _ => {
+            let merged_schema = rust_batches[0].schema();
+            AppendInput::Batch(
+                concat_batches(&merged_schema, &rust_batches)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            )
+        }
+    })
 }
 
-// The compiled extension is `infino._infino`: the `python/infino/`
-// package re-exports it and carries the typing artifacts (`py.typed`,
-// stubs, `__version__`). Naming the module item `infino_ext` keeps it
-// from shadowing the `infino` crate inside this file; the init symbol is
-// `PyInit__infino`.
 #[pymodule]
 #[pyo3(name = "_infino")]
 fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {

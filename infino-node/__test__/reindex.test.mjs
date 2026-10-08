@@ -74,6 +74,7 @@ test("a table this engine wrote is current", () => {
     awaitingReanalysis: 0,
     bytesToRewrite: 0,
     unrepairableColumns: [],
+    inconsistentFooters: [],
     isCurrent: true,
   });
   assert.deepEqual(table.reindexPlan(), []);
@@ -107,6 +108,7 @@ test("the plan names exactly what the run repairs", () => {
     awaitingReanalysis: 0,
     heldByAnotherRun: 0,
     unrepairableColumns: [],
+    inconsistentFooters: [],
   });
 
   // Repaired in place: nothing left to plan, and every row still answers.

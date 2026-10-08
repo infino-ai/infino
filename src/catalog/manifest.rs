@@ -464,6 +464,10 @@ mod tests {
             self.try_put(bytes)
         }
 
+        async fn put_overwrite(&self, _uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.try_put(bytes).map(|_| ())
+        }
+
         async fn put_if_match(
             &self,
             _uri: &str,

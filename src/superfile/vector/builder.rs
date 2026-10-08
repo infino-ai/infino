@@ -21,9 +21,10 @@ use std::{
 };
 
 use rayon::prelude::*;
-use tempfile::{tempdir, tempdir_in};
+use tempfile::{Builder, TempDir, tempdir_in};
 
 use crate::{
+    config::scratch_root,
     superfile::{
         BuildError,
         format::{
@@ -397,7 +398,7 @@ struct ColumnState {
 #[derive(Default)]
 struct ScratchDir {
     parent: Option<PathBuf>,
-    tempdir: Option<tempfile::TempDir>,
+    tempdir: Option<TempDir>,
 }
 
 impl ScratchDir {
@@ -418,9 +419,12 @@ impl ScratchDir {
     fn path(&mut self) -> Result<&Path, BuildError> {
         if self.tempdir.is_none() {
             let tmp = if let Some(parent) = &self.parent {
-                tempfile::TempDir::new_in(parent)?
+                TempDir::new_in(parent)?
             } else {
-                tempfile::tempdir()?
+                let scratch_root = scratch_root();
+                Builder::new()
+                    .prefix("infino-vector-")
+                    .tempdir_in(scratch_root)?
             };
             self.tempdir = Some(tmp);
         }
@@ -454,8 +458,8 @@ impl Default for VectorBuilder {
 }
 
 impl VectorBuilder {
-    /// Construct a builder with the default scratch directory
-    /// (under `$TMPDIR` via `tempfile::tempdir()`) and the
+    /// Construct a builder with the scratch directory at `storage.scratch_root`
+    /// (defaults to the system temp dir when unset) and the
     /// default 256 MiB spill threshold.
     ///
     /// The scratch tempdir is created lazily when the build first
@@ -2477,16 +2481,18 @@ fn build_cell_subsection_in_memory(
     requested_n_cent: usize,
     source: CellPackSource<'_>,
 ) -> Result<MergedIvfSubsection, BuildError> {
-    let scratch = tempdir()?;
-    let subsection_path = scratch.path().join("cell.ivf");
-    let stable_ids_path = scratch.path().join("cell.ids");
+    let scratch_dir = tempfile::Builder::new()
+        .prefix("cell-")
+        .tempdir_in(scratch_root())?;
+    let subsection_path = scratch_dir.path().join("cell.ivf");
+    let stable_ids_path = scratch_dir.path().join("cell.ids");
     let built = build_cell_subsection_from_source(
         cfg,
         requested_n_cent,
         source,
         &subsection_path,
         &stable_ids_path,
-        scratch.path(),
+        scratch_dir.path(),
     )?;
     let bytes = fs::read(&subsection_path)?;
     if bytes.len() as u64 != built.subsection_len {
@@ -3776,8 +3782,11 @@ mod tests {
         let reader_b = VectorReader::open(blob_b, &json).expect("open B");
 
         // Merge: B's local ids shift by `na` (its doc_id_offset).
-        let merged = merge_sq8_ivf_subsections(&[(&reader_a, "v", 0), (&reader_b, "v", na as u32)])
-            .expect("merge");
+        let merged = merge_sq8_ivf_subsections(&[
+            (&reader_a, "v", 0, None),
+            (&reader_b, "v", na as u32, None),
+        ])
+        .expect("merge");
         assert_eq!(merged.n_docs as usize, na + nb);
 
         let mut wb = VectorBuilder::new();

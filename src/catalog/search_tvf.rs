@@ -34,8 +34,10 @@ use datafusion::{
 
 use super::Connection;
 use crate::{
+    InfinoError,
     runtime_metrics::op_stats::{self, OpStatsCollector},
     supertable::{
+        error::QueryError,
         handle::SupertableReader,
         query::exec::{
             common::arg_to_string,
@@ -46,6 +48,24 @@ use crate::{
         },
     },
 };
+
+/// Why the table a search names could not be opened, as a DataFusion error that
+/// keeps its cause: a name that resolves to nothing is the caller's mistake (a
+/// plan error); a storage or credential failure while opening it is not, and
+/// crosses the plan typed.
+fn open_table_error(name: &str, e: InfinoError) -> DataFusionError {
+    let opening = |detail: &str| format!("opening table {name:?} for a search: {detail}");
+    match e {
+        InfinoError::NotFound(detail) => {
+            DataFusionError::Plan(format!("search over unknown table {name:?}: {detail}"))
+        }
+        InfinoError::Io(detail) => QueryError::Store(opening(&detail)).into(),
+        InfinoError::PermissionDenied(detail) => {
+            QueryError::PermissionDenied(opening(&detail)).into()
+        }
+        other => QueryError::Internal(opening(&other.to_string())).into(),
+    }
+}
 
 /// A resolved table's pinned snapshot: the reader the search kernels run
 /// against plus its scalar schema (the TVF's output columns).
@@ -93,24 +113,27 @@ impl TableResolver {
         {
             return Ok(t.clone());
         }
-        let table = self.conn.open_table_handle(name).map_err(|e| {
-            DataFusionError::Plan(format!("search over unknown table {name:?}: {e}"))
-        })?;
+        let table = self
+            .conn
+            .open_table_handle(name)
+            .map_err(|e| open_table_error(name, e))?;
         // `reader()` applies the read-consistency freshness check itself (and,
         // under Strong, fails rather than serving a stale snapshot), so there
-        // is no separate `ensure_fresh` call here.
-        let mut reader = table.reader().map_err(|e| {
-            DataFusionError::Plan(format!("search over unknown table {name:?}: {e}"))
-        })?;
+        // is no separate `ensure_fresh` call here. A failure is classified
+        // like the open's, so a table purged in between is an unknown table
+        // here too, not a separate `NotFound`.
+        let mut reader = table
+            .reader()
+            .map_err(|e| open_table_error(name, InfinoError::from(e)))?;
         // The mint ran on a runtime thread where the scope's thread-local
         // is invisible; hand it the collector captured at registration.
         reader.op_stats = self.op_stats.clone();
         let resolved = ResolvedTable {
-            reader: Arc::new(reader),
             // Stored shape: search TVF output columns resolve against
             // what Parquet actually holds (index-only FTS columns are
             // not projectable).
-            scalar_schema: table.options().stored_schema(),
+            scalar_schema: reader.manifest().stored_schema(),
+            reader: Arc::new(reader),
         };
         self.cache
             .lock()
@@ -255,5 +278,34 @@ impl TableFunctionImpl for ExactMatchCatalogFunc {
 
         ExactMatchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::datafusion_error;
+
+    /// Only a table name that resolves to nothing is the caller's mistake. A
+    /// table that exists but failed to open is ours, and keeps its cause.
+    #[test]
+    fn a_search_over_a_table_that_failed_to_open_keeps_its_cause() {
+        let public = |e| datafusion_error(&open_table_error("docs", e));
+        assert!(matches!(
+            public(InfinoError::NotFound("docs".into())),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            public(InfinoError::Io("bucket timed out".into())),
+            InfinoError::Io(_)
+        ));
+        assert!(matches!(
+            public(InfinoError::PermissionDenied("refused".into())),
+            InfinoError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            public(InfinoError::Backend("manifest list unreadable".into())),
+            InfinoError::Backend(_)
+        ));
     }
 }
