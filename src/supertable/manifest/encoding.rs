@@ -68,7 +68,7 @@ const CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY: u32 = 0x3052_4643;
 
 /// What to do about an FTS summary written before it carried length totals.
 const FTS_SUMMARY_TOO_OLD_MSG: &str = "manifest FTS summary has no length totals, so infino < 0.8.3 \
-     wrote it; reindex the table with infino 0.9.1 before upgrading";
+     wrote it; reindex the table with infino 0.10.0 before upgrading";
 
 /// Which form of each summary cell's cluster block goes on the wire.
 ///

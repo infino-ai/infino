@@ -118,7 +118,7 @@ pub mod fts {
 
     /// The infino release whose `reindex` rewrites an older blob to
     /// [`VERSION_MIN`] and reports a table under a removed analyzer.
-    pub const REPAIR_RELEASE: &str = "0.9.1";
+    pub const REPAIR_RELEASE: &str = "0.10.0";
 
     /// The blob version a file must carry to be current — what the
     /// staleness check compares against and what a migration plans from.
