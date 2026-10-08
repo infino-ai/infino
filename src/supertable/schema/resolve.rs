@@ -152,18 +152,6 @@ pub fn union_schema<'a>(
     batches: impl IntoIterator<Item = &'a RecordBatch>,
     id_column: &str,
 ) -> Result<Option<TableSchema>, SchemaError> {
-    // Indexed once, not scanned per field. Finding a column used to cost two
-    // linear passes — `id_of` for the id, then the fields again for the type
-    // — inside a loop over every field of every batch, so a commit was
-    // quadratic in the table's width: 1.7us at ten columns, 120us at a
-    // hundred, 7.3ms at a thousand, paid on every commit whether or not the
-    // schema moved. The frozen-schema case is the common one and now costs
-    // one pass to build this and one to check against it.
-    let live: HashMap<&str, &DataType> = current
-        .fields()
-        .iter()
-        .map(|f| (f.name.as_str(), &f.data_type))
-        .collect();
     let mut added: Vec<AddColumn> = Vec::new();
     let mut added_at: HashMap<String, usize> = HashMap::new();
     for batch in batches {
@@ -171,8 +159,11 @@ pub fn union_schema<'a>(
             if field.name() == id_column {
                 continue;
             }
-            let frozen = match live.get(field.name().as_str()) {
-                Some(data_type) => Some(*data_type),
+            // The table's own lookup by name, which is a hash; `added`
+            // carries the columns this commit is adding, which no schema
+            // knows about yet.
+            let frozen = match current.field_named(field.name()) {
+                Some(f) => Some(&f.data_type),
                 None => added_at
                     .get(field.name().as_str())
                     .map(|&i| &added[i].data_type),

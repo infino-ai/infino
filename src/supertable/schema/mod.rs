@@ -206,6 +206,17 @@ pub(crate) fn user_metadata(field: &Field) -> BTreeMap<String, String> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableSchema {
     fields: Vec<FieldDef>,
+    /// Where each live column's name sits in `fields`.
+    ///
+    /// Derived from `fields` and kept beside them so a lookup by name is one
+    /// hash rather than a scan. Every path that reads a document does that
+    /// lookup per key per row — the depth cap, the struct check, the target
+    /// type, the shadow check — so without it a wide table makes a write
+    /// quadratic in its own width.
+    ///
+    /// Rebuilt by [`TableSchema::reindex`] whenever `fields` moves, which is
+    /// only ever at the end of a construction or an `apply`.
+    by_name: HashMap<String, usize>,
     /// Ids retired by a drop. Never reused.
     tombstoned: Vec<FieldId>,
     /// The highest id ever minted, live or tombstoned.
@@ -219,6 +230,21 @@ pub struct TableSchema {
 }
 
 impl TableSchema {
+    /// Rebuild [`TableSchema::by_name`] from `fields`.
+    pub(crate) fn reindex(&mut self) {
+        self.by_name = self
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(at, f)| (f.name.clone(), at))
+            .collect();
+    }
+
+    /// The live column called `name`, in one lookup.
+    pub(crate) fn field_named(&self, name: &str) -> Option<&FieldDef> {
+        self.by_name.get(name).map(|&at| &self.fields[at])
+    }
+
     /// The schema of a table created from `user`: ids `1..=n` in declared
     /// order, `schema_id` 1, no indexes.
     pub(crate) fn from_user_schema(user: &Schema) -> Self {
@@ -245,14 +271,17 @@ impl TableSchema {
             })
             .collect();
         let last_field_id = fields.len() as u32;
-        Self {
+        let mut schema = Self {
             fields,
+            by_name: HashMap::new(),
             tombstoned: Vec::new(),
             last_field_id,
             schema_id: 1,
             max_fields: DEFAULT_MAX_FIELDS,
             max_depth: DEFAULT_MAX_DEPTH,
-        }
+        };
+        schema.reindex();
+        schema
     }
 
     /// The user schema: every live column in declared order, unstamped.
@@ -490,14 +519,17 @@ impl TableSchema {
             })
             .transpose()?
             .unwrap_or_default();
-        Ok(Self {
+        let mut schema = Self {
             fields,
+            by_name: HashMap::new(),
             tombstoned,
             last_field_id,
             schema_id,
             max_fields,
             max_depth,
-        })
+        };
+        schema.reindex();
+        Ok(schema)
     }
 
     /// Live columns in declared order.
@@ -523,7 +555,7 @@ impl TableSchema {
 
     /// The id of the live column named `name`.
     pub fn id_of(&self, name: &str) -> Option<FieldId> {
-        self.fields.iter().find(|f| f.name == name).map(|f| f.id)
+        self.field_named(name).map(|f| f.id)
     }
 
     /// The current name of the live column with id `id`.

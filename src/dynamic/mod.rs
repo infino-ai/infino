@@ -206,8 +206,7 @@ impl<'a> Column<'a> {
 /// what stops [`flatten`] descending into the object that fills it.
 fn is_struct_column(schema: &TableSchema, path: &str) -> bool {
     schema
-        .id_of(path)
-        .and_then(|id| schema.fields().iter().find(|f| f.id == id))
+        .field_named(path)
         .is_some_and(|f| matches!(f.data_type, DataType::Struct(_)))
 }
 
@@ -305,13 +304,9 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
         let metadata = HashMap::new();
         // A path the table already has is written in that column's type; a
         // path it does not is inferred from the values.
-        let target = schema.id_of(&column.path).and_then(|id| {
-            schema
-                .fields()
-                .iter()
-                .find(|f| f.id == id)
-                .map(|f| f.data_type.clone())
-        });
+        let target = schema
+            .field_named(&column.path)
+            .map(|f| f.data_type.clone());
         if column.kinds.is_empty() {
             // Only empty arrays. On a list column the table already has,
             // that is a row of empty lists and the column's own type says
