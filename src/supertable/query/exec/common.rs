@@ -1351,6 +1351,19 @@ where
         }
     }
 
+    // A projection resolves to no columns at all when every name it asks
+    // for belongs to a column this file predates. There is nothing to read,
+    // but the row count still has to be right: the caller null-fills to it,
+    // and a batch reporting no rows would drop the hits instead.
+    if names.is_empty() {
+        return RecordBatch::try_new_with_options(
+            out_schema,
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(local_doc_ids.len())),
+        )
+        .map_err(|e| QueryError::internal(e).into());
+    }
+
     // Distinct, sorted ids → monotonic skip/select runs (decode only the
     // rows the hits land on, not the whole column). Same selection
     // contract as `take_by_local_doc_ids` — shared helpers, different
