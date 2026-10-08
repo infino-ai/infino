@@ -47,7 +47,7 @@ impl Supertable {
         let phase_timers = crate::config::global().diagnostics.optimize_phase_timers;
         let mut __t = Instant::now();
         self.drain_hidden_vector_cells_sync()
-            .map_err(|e| OptimizeError::Build(e.to_string()))?;
+            .map_err(OptimizeError::from)?;
         if phase_timers {
             tracing::info!(secs = __t.elapsed().as_secs_f64(), "[optphase] drain");
             __t = Instant::now();
@@ -80,7 +80,7 @@ impl Supertable {
         // carry rule). Runs before gc so the sweep's live set names the
         // fresh artifacts.
         self.refresh_term_stats_sync()
-            .map_err(|e| OptimizeError::Build(e.to_string()))?;
+            .map_err(OptimizeError::from)?;
         match self.gc(opts.gc.safety_gap) {
             Ok(_) | Err(GcError::NoStorage) => {}
             Err(e) => return Err(OptimizeError::Gc(e)),

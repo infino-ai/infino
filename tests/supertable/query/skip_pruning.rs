@@ -315,17 +315,21 @@ fn bm25_and_mode_skip_requires_all_terms_present_in_superfile() {
     let manifest = r.manifest();
     let kept_uri = manifest.superfiles[0].uri;
 
-    let before = store.snapshot();
-    let _hits = r
-        .bm25_hits(
+    let and_query = || {
+        r.bm25_hits(
             "title",
             "alpha beta",
             BM25_TOP_K,
-            Bm25SearchOptions::new()
-                .with_mode(infino::supertable::query::fts::BoolMode::And)
-                .with_stats(infino::Bm25Stats::PerSuperfile),
+            Bm25SearchOptions::new().with_mode(infino::supertable::query::fts::BoolMode::And),
         )
-        .expect("AND query");
+        .expect("AND query")
+    };
+    // The first query also probes the pruned superfile for `alpha`'s
+    // document frequency; the idf-cache-served repeat opens only what it
+    // scores.
+    and_query();
+    let before = store.snapshot();
+    and_query();
 
     let delta = store.delta(&before);
     assert_eq!(

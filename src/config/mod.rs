@@ -1177,25 +1177,6 @@ pub struct ReindexOptions {
     /// tuned it for compaction meant it for this too. A value here
     /// overrides that for one run.
     pub stale_seal_timeout_ms: Option<u64>,
-    /// Credit a superfile that records no analysis revision with the one
-    /// the engine that wrote it emitted, instead of treating it as
-    /// unknown. Defaults to `false`.
-    ///
-    /// Revisions were not recorded before this field existed, so every
-    /// older superfile reads as stale and `Auto` re-analyzes it — correct,
-    /// but it re-tokenizes corpora whose terms are already current.
-    /// Setting this reads the writer's version out of `inf.builder` and
-    /// credits what that version's chains emitted, skipping those files.
-    ///
-    /// **Only sound when the table never held superfiles older than the
-    /// writer's version.** A merge carries postings rather than
-    /// re-analyzing them, and engines that did not record revisions did
-    /// not lower the output to its oldest input either — so a compaction
-    /// run by one of them could have folded much older terms into a file
-    /// stamped with its own version, and nothing in that file says so.
-    /// Crediting it leaves those terms in place and reports the table
-    /// migrated. Leave this off unless the table's whole history is known.
-    pub trust_writer_analysis: bool,
 }
 
 impl ReindexOptions {
@@ -1232,15 +1213,6 @@ impl ReindexOptions {
     /// Override the table's seal-takeover age for this run.
     pub fn with_stale_seal_timeout_ms(mut self, ms: u64) -> Self {
         self.stale_seal_timeout_ms = Some(ms);
-        self
-    }
-
-    /// Credit a superfile recording no analysis revision with the one its
-    /// writer emitted. Read
-    /// [`ReindexOptions::trust_writer_analysis`] before setting this: it
-    /// is unsound on a table whose history is not known.
-    pub fn trusting_writer_analysis(mut self) -> Self {
-        self.trust_writer_analysis = true;
         self
     }
 }

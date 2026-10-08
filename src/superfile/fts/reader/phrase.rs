@@ -16,15 +16,12 @@ use super::{
 use crate::superfile::{
     ReadError,
     error::FtsError,
-    fts::{
-        bm25,
-        positions::{GroupIndex, decode_run, skip_run},
-    },
+    fts::{bm25, positions::GroupIndex},
 };
 
 /// One member term of a [`PhraseCursor`]: its posting cursor, its
-/// fetched position runs, and a lazily-built per-block cache of each
-/// pair's run offset.
+/// fetched position groups, and the current block's group located for
+/// per-pair access.
 pub(super) struct PhraseMember {
     pub(super) cursor: TermCursor,
     /// A second cursor over the same postings for the block-at-a-time
@@ -33,36 +30,20 @@ pub(super) struct PhraseMember {
     /// which only ever moves to the docs that survive, for their tf and
     /// positions.
     pub(super) probe: TermCursor,
-    /// The term's complete position runs (empty for an inline df=1
+    /// The term's complete position groups (empty for an inline df=1
     /// member, whose single position is `inline_position`).
     pub(super) positions: Bytes,
     /// The term's parsed metadata header, re-parsed from the cursor's
     /// own bytes at member build — the source of the per-block
-    /// position-run offsets. `None` for an inline member (no postings
+    /// position-group offsets. `None` for an inline member (no postings
     /// bytes). Kept here, not on [`TermCursor`] or [`BlockMeta`]:
     /// plain term queries never touch positions, and their hot
     /// structures must not grow for the phrase path's benefit.
     pub(super) term_meta: Option<TermMeta>,
     /// The single position of an inline (df=1, tf=1) member — the
-    /// inline FST value's slot carries it instead of a tf. `None` for
+    /// inline dictionary entry's slot carries it instead of a tf. `None` for
     /// PFOR members.
     pub(super) inline_position: Option<u32>,
-    /// Byte offset of each decoded-block pair's run within
-    /// `positions`, valid for `run_offsets_block`. Rebuilt on block
-    /// crossings by one `skip_run` walk over the block's runs. Used by
-    /// the `V1`/`V2` fallback decode (no sub-index).
-    pub(super) run_offsets: Vec<u32>,
-    /// Which block index `run_offsets` / the sub-index cache covers
-    /// (`usize::MAX` = none).
-    pub(super) run_offsets_block: usize,
-    /// Sub-index decode (`V3`) cache: the last pair whose run offset was
-    /// resolved in `run_offsets_block`, and that run's byte offset. Pairs
-    /// are visited in ascending order within a block, so the next decode
-    /// skips from `max(this cached pair, the sub-index checkpoint)` —
-    /// dense reuse costs ~one `skip_run`, sparse access at most
-    /// `POSITION_SUBINDEX_STRIDE - 1`. `usize::MAX` = nothing cached.
-    pub(super) cached_pair: usize,
-    pub(super) cached_run_offset: u32,
     /// Scratch for the member's decoded positions at the aligned doc.
     pub(super) pos_scratch: Vec<u32>,
     /// The current block's position group located for per-run access,
@@ -72,7 +53,7 @@ pub(super) struct PhraseMember {
     pub(super) group_block: usize,
 }
 
-/// Sentinel for [`PhraseMember::run_offsets_block`]: no block cached.
+/// Sentinel for [`PhraseMember::group_block`]: no block located.
 const NO_BLOCK_CACHED: usize = usize::MAX;
 
 impl PhraseMember {
@@ -98,71 +79,26 @@ impl PhraseMember {
         let pair = self.cursor.pos;
         let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
 
-        // Grouped positions (V7): the block's runs are one group. It is
-        // located once per block and each pair's run read on its own —
-        // no run walk, no sub-index, and no decode of the runs a phrase
-        // never visits.
-        if term_meta.positions_grouped {
-            if self.group_block != block {
-                let mut at =
-                    term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
-                let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
-                self.group_index
-                    .locate(&self.positions, &mut at, tfs)
-                    .ok_or_else(|| {
-                        FtsError::Read(ReadError::Malformed(
-                            "position group truncated or undecodable".into(),
-                        ))
-                    })?;
-                self.group_block = block;
-            }
+        // The block's runs are one group. It is located once per block and
+        // each pair's run read on its own — no run walk, and no decode of
+        // the runs a phrase never visits.
+        if self.group_block != block {
+            let mut at =
+                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
+            let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
             self.group_index
-                .run_positions(
-                    &self.positions,
-                    pair,
-                    self.cursor.block_tfs[pair],
-                    &mut self.pos_scratch,
-                )
+                .locate(&self.positions, &mut at, tfs)
                 .ok_or_else(|| {
                     FtsError::Read(ReadError::Malformed(
-                        "position run truncated or overflowing".into(),
+                        "position group truncated or undecodable".into(),
                     ))
                 })?;
-            return Ok(());
+            self.group_block = block;
         }
-
-        // Fast path (VERSION_V3): the run-offset sub-index gives the
-        // nearest checkpoint at or before `pair`. Start the skip from
-        // whichever is closer to `pair` — that checkpoint, or the pair we
-        // resolved last in this same block (pairs are visited ascending,
-        // so the last one is `<= pair`). Dense reuse then costs ~one
-        // `skip_run`; sparse access at most `STRIDE - 1`. Returns an owned
-        // tuple, so no `term_meta` borrow is held across the decode below.
-        let subindex = term_meta.positions_subindex_offset(self.cursor.bytes.as_ref(), block, pair);
-        if let Some((checkpoint, runs_to_skip)) = subindex {
-            let checkpoint_pair = pair - runs_to_skip;
-            let (mut from_pair, mut at) = (checkpoint_pair, checkpoint as usize);
-            if self.run_offsets_block == block
-                && self.cached_pair >= checkpoint_pair
-                && self.cached_pair <= pair
-            {
-                from_pair = self.cached_pair;
-                at = self.cached_run_offset as usize;
-            }
-            for p in from_pair..pair {
-                skip_run(&self.positions, &mut at, self.cursor.block_tfs[p]).ok_or_else(|| {
-                    FtsError::Read(ReadError::Malformed(
-                        "position runs truncated within block".into(),
-                    ))
-                })?;
-            }
-            // Cache this pair's run start for the next (higher) pair.
-            self.run_offsets_block = block;
-            self.cached_pair = pair;
-            self.cached_run_offset = at as u32;
-            decode_run(
+        self.group_index
+            .run_positions(
                 &self.positions,
-                &mut at,
+                pair,
                 self.cursor.block_tfs[pair],
                 &mut self.pos_scratch,
             )
@@ -171,38 +107,6 @@ impl PhraseMember {
                     "position run truncated or overflowing".into(),
                 ))
             })?;
-            return Ok(());
-        }
-
-        // Fallback (V1/V2, no sub-index): build the block's run offsets by
-        // walking every run from the block's recorded first-run offset.
-        if self.run_offsets_block != block {
-            self.run_offsets.clear();
-            let block_first =
-                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
-            let mut at = block_first;
-            for i in 0..self.cursor.block_n {
-                self.run_offsets.push(at as u32);
-                skip_run(&self.positions, &mut at, self.cursor.block_tfs[i]).ok_or_else(|| {
-                    FtsError::Read(ReadError::Malformed(
-                        "position runs truncated within block".into(),
-                    ))
-                })?;
-            }
-            self.run_offsets_block = block;
-        }
-        let mut at = self.run_offsets[pair] as usize;
-        decode_run(
-            &self.positions,
-            &mut at,
-            self.cursor.block_tfs[pair],
-            &mut self.pos_scratch,
-        )
-        .ok_or_else(|| {
-            FtsError::Read(ReadError::Malformed(
-                "position run truncated or overflowing".into(),
-            ))
-        })?;
         Ok(())
     }
 }
@@ -223,10 +127,9 @@ pub(super) struct PhraseCursor {
     /// member, in `members` (query) order — strictly ascending, first
     /// entry `0`.
     ///
-    /// Named for the unit on purpose: [`PhraseMember`] also carries
-    /// `run_offsets` and `cached_run_offset`, which are **byte** offsets
-    /// into a term's positions blob. Confusing the two would be a
-    /// correctness bug, not a type error.
+    /// Named for the unit on purpose: a member's positions are addressed
+    /// by **byte** offsets into its positions blob. Confusing the two
+    /// would be a correctness bug, not a type error.
     ///
     /// Plain `0..n` for a phrase whose words were adjacent in the
     /// query, which is every phrase on a column with no analysis
@@ -308,10 +211,6 @@ impl PhraseCursor {
                     positions,
                     term_meta,
                     inline_position,
-                    run_offsets: Vec::new(),
-                    run_offsets_block: NO_BLOCK_CACHED,
-                    cached_pair: NO_BLOCK_CACHED,
-                    cached_run_offset: 0,
                     pos_scratch: Vec::new(),
                     group_index: GroupIndex::default(),
                     group_block: NO_BLOCK_CACHED,
@@ -768,14 +667,13 @@ impl AnyCursor {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use super::{super::test_util::*, *};
     use crate::superfile::{
         fts::{
             builder::FtsBuilder,
             reader::{FtsReader, core::ClauseLists, cursor::CursorUse},
-            tokenize::{AsciiLowerTokenizer, Phrase},
+            tokenize::Phrase,
         },
         id_space::FtsDocId,
     };
@@ -793,13 +691,9 @@ mod tests {
     /// path.
     #[tokio::test]
     async fn grouped_positions_reach_every_pair_across_blocks() {
-        use std::sync::Arc;
-
-        use crate::superfile::fts::{
-            builder::FtsBuilder, reader::cursor::SubindexKind, tokenize::AsciiLowerTokenizer,
-        };
+        use crate::superfile::fts::builder::FtsBuilder;
         let n_docs = 300u32;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         for i in 0..n_docs {
             let text = format!(
@@ -809,10 +703,9 @@ mod tests {
             );
             b.add_doc(0, i, &text).expect("doc");
         }
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        assert!(r.positions_grouped);
-        assert_eq!(r.subindex, SubindexKind::None);
         let phrases = phrase(&["alpha", "beta"]);
         let hits = r
             .search_excluding(
@@ -857,13 +750,9 @@ mod tests {
     /// every doc through both decode paths.
     #[tokio::test]
     async fn position_groups_verify_phrases_in_long_and_short_terms() {
-        use std::sync::Arc;
-
-        use crate::superfile::fts::{
-            builder::FtsBuilder, posting::BLOCK_LEN, tokenize::AsciiLowerTokenizer,
-        };
+        use crate::superfile::fts::{builder::FtsBuilder, posting::BLOCK_LEN};
         const N_DOCS: u32 = 200;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         for d in 0..N_DOCS {
             let alpha: Vec<u32> = match d < BLOCK_LEN as u32 {
@@ -883,7 +772,8 @@ mod tests {
             }
         }
         b.append_prebuilt_doc_lengths(0, &vec![(1 << 20) + 8; N_DOCS as usize]);
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
 
         let hits = r
@@ -929,13 +819,9 @@ mod tests {
     /// verify. Every k must match the unpruned walk's top-k.
     #[tokio::test]
     async fn ranked_phrase_block_pruning_agrees_with_the_unpruned_walk() {
-        use std::sync::Arc;
-
-        use crate::superfile::fts::{
-            builder::FtsBuilder, posting::BLOCK_LEN, tokenize::AsciiLowerTokenizer,
-        };
+        use crate::superfile::fts::{builder::FtsBuilder, posting::BLOCK_LEN};
         const N_DOCS: u32 = BLOCK_LEN as u32 * 40;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         for d in 0..N_DOCS {
             let hot = (d / (8 * BLOCK_LEN as u32)).is_multiple_of(5);
@@ -947,7 +833,8 @@ mod tests {
             };
             b.add_doc(0, d, text).expect("add doc");
         }
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let phrases = phrase(&["the", "movement"]);
         let clauses = || ClauseLists {
@@ -995,15 +882,11 @@ mod tests {
     /// above it.
     #[tokio::test]
     async fn batched_ranked_phrase_walk_matches_the_unranked_walk() {
-        use std::sync::Arc;
-
         use rand::{RngExt, SeedableRng, rngs::StdRng};
 
-        use crate::superfile::fts::{
-            bm25, builder::FtsBuilder, posting::BLOCK_LEN, tokenize::AsciiLowerTokenizer,
-        };
+        use crate::superfile::fts::{bm25, builder::FtsBuilder, posting::BLOCK_LEN};
         const N_DOCS: u32 = BLOCK_LEN as u32 * 60;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         for d in 0..N_DOCS {
             let text = match (d % 53, d % 2, d % 3) {
@@ -1015,7 +898,8 @@ mod tests {
             };
             b.add_doc(0, d, text).expect("add doc");
         }
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let phrases = phrase(&["the", "mid", "rare"]);
         let build = || async {
@@ -1124,13 +1008,11 @@ mod tests {
     /// directly so the fixture costs no tokenization.
     #[tokio::test]
     async fn a_block_with_very_long_runs_verifies_phrases() {
-        use std::sync::Arc;
-
-        use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
+        use crate::superfile::fts::builder::FtsBuilder;
         const N_DOCS: u32 = 129;
         const TF: u32 = 600;
         const OUTLIER_GAP: u32 = 1 << 25;
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         let alpha: Vec<u32> = (0..TF)
             .map(|j| match j + 1 == TF {
@@ -1146,7 +1028,8 @@ mod tests {
                 .expect("filler");
         }
         b.append_prebuilt_doc_lengths(0, &vec![2 * TF + OUTLIER_GAP; N_DOCS as usize]);
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
 
         let phrases = phrase(&["alpha", "filler"]);
@@ -1198,17 +1081,14 @@ mod tests {
     /// and breaks adjacency: `"cat dog"` must not match `cat 🙂 dog`.
     #[tokio::test]
     async fn an_emoji_between_two_words_breaks_the_phrase() {
-        use std::sync::Arc;
-
-        use crate::superfile::fts::{
-            builder::FtsBuilder, reader::BoolMode, tokenize::StandardTokenizer,
-        };
-        let mut b = FtsBuilder::new(Arc::new(StandardTokenizer));
+        use crate::superfile::fts::{builder::FtsBuilder, reader::BoolMode};
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         b.add_doc(0, 0, "cat 🙂 dog").expect("doc 0");
         b.add_doc(0, 1, "cat dog").expect("doc 1");
         b.add_doc(0, 2, "cat, dog").expect("doc 2");
-        let json = r#"[{"name":"title","tokenizer":"standard","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let phrases = phrase(&["cat", "dog"]);
         let hits = r
@@ -1306,12 +1186,15 @@ mod tests {
     #[tokio::test]
     async fn phrase_on_positionless_column_is_typed_error() {
         use crate::superfile::fts::builder::FtsBuilder;
-        let mut b = FtsBuilder::new(crate::test_helpers::default_tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), false).expect("register");
         b.add_doc(0, 0, "new york").expect("add doc");
         let blob = Bytes::from(b.finish().expect("finish"));
-        let r =
-            FtsReader::open(blob, r#"[{"name":"title","tokenizer":"ascii_lower"}]"#).expect("open");
+        let r = FtsReader::open(
+            blob,
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}]"#,
+        )
+        .expect("open");
         let phrases = phrase(&["new", "york"]);
         let err = r
             .search_excluding(
@@ -1353,12 +1236,13 @@ mod tests {
     }
 
     fn open_positional(docs: impl Iterator<Item = String>) -> FtsReader {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         for (i, text) in docs.enumerate() {
             b.add_doc(0, i as u32, &text).expect("add doc");
         }
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 

@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
-    Bm25SearchOptions, Bm25Stats, BoolMode, GcError, GcReport, InfinoError, MutationStats,
-    OptimizeError, OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
+    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
+    OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
     catalog::table::Table,
     dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
@@ -57,14 +57,9 @@ fn mode_str(mode: BoolMode) -> &'static str {
     }
 }
 
-/// Wire spelling for the BM25 statistics mode
-/// (`"per_superfile"` / `"global"`).
-fn stats_str(stats: Bm25Stats) -> &'static str {
-    match stats {
-        Bm25Stats::PerSuperfile => "per_superfile",
-        Bm25Stats::Global => "global",
-    }
-}
+/// BM25 statistics scope sent with every search. The hosted endpoint scores
+/// an omitted `stats` per superfile, so requests name table-wide statistics.
+const GLOBAL_STATS: &str = "global";
 
 /// Render a mutation predicate to SQL for the wire. The public API takes a
 /// DataFusion `Expr`, but the endpoint takes a SQL string (the server parses it
@@ -196,7 +191,7 @@ impl Table for RemoteTable {
             "query": query,
             "k": k,
             "mode": mode_str(opts.mode),
-            "stats": stats_str(opts.stats),
+            "stats": GLOBAL_STATS,
             "projection": projection,
         });
         let response = self.catalog.post_json("bm25_search", body)?;

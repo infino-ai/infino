@@ -5,19 +5,9 @@
 //! The parser lives here because the `+` / `-` clause sigils must be
 //! handled before tokenizing — the tokenizer splits on both.
 //!
-//! Ships two tokenizers: [`StandardTokenizer`] (the default) and
-//! [`AsciiLowerTokenizer`]. The [`Tokenizer`] trait is the extension
-//! point for ICU / language-aware stemmers / custom char filters
-//! under the same trait without touching FTS code.
-//!
-//! [`AsciiLowerTokenizer`] semantics:
-//!   - Split on any byte that isn't `[A-Za-z0-9]`.
-//!   - Lowercase each ASCII letter (bytes `b'A'..=b'Z'` → `b'a'..=b'z'`).
-//!   - Drop any token that contains a non-ASCII byte (high-bit set).
-//!     Non-ASCII tokens are silently dropped (not an error) — the
-//!     ASCII-only design is intentional; richer tokenizers can opt
-//!     into the trait without changing the FTS pipeline.
-//!   - Empty tokens are never emitted.
+//! Ships one base tokenizer, [`StandardTokenizer`]. The [`Tokenizer`]
+//! trait is the extension point for ICU / language-aware stemmers /
+//! custom char filters under the same trait without touching FTS code.
 //!
 //! [`StandardTokenizer`] semantics (Unicode-aware):
 //!   - Segment on Unicode text boundaries (UAX #29 word boundaries),
@@ -35,26 +25,15 @@
 //!     a normalizing analyzer plugs in through the [`Tokenizer`] trait
 //!     rather than altering `standard`'s semantics.
 
-use std::{
-    any::Any,
-    borrow::Cow,
-    collections::BTreeSet,
-    ops::Deref,
-    str::{from_utf8, from_utf8_unchecked},
-    sync::Arc,
-};
+use std::{any::Any, borrow::Cow, collections::BTreeSet, ops::Deref};
 
 use unicode_properties::{EmojiStatus, UnicodeEmoji};
 use unicode_segmentation::UnicodeSegmentation;
 use wide::u8x16;
 
-use super::{
-    analysis::{Base, Stemmer, Stopwords, chain_tokenizer},
-    reader::BoolMode,
-};
+use super::reader::BoolMode;
 
-/// Smallest byte value that is non-ASCII (has the high bit set). The
-/// v1 ASCII-only rule drops any token containing a byte `>= this`.
+/// Smallest byte value that is non-ASCII (has the high bit set).
 const NON_ASCII_BYTE_MIN: u8 = 0x80;
 
 /// Low-16-bit mask applied to a `u8x16` comparison bitmask, keeping
@@ -178,7 +157,7 @@ trait AsciiPieces<'a> {
 
 /// One ASCII word segment, case-folded and chopped at
 /// [`MAX_TOKEN_CHARS`], for every index-side and query-side ASCII fast
-/// path of both tokenizers. A segment that is already lowercase is cut
+/// path of the standard tokenizer. A segment that is already lowercase is cut
 /// in place and borrowed; one carrying an upper-case byte is folded into
 /// `scratch` first, which the caller reuses across segments so the
 /// index build allocates nothing per token. Returns the piece count,
@@ -238,28 +217,23 @@ impl<'q, F: FnMut(Cow<'q, str>)> AsciiPieces<'q> for QueryPieces<'_, F> {
 ///     callback a `&str` borrowed from an internal scratch buffer
 ///     (valid only for the duration of the call). Zero-alloc on the
 ///     hot ingest path. The default impl wraps `tokenize`; impls
-///     that can do better (like [`AsciiLowerTokenizer`]) override.
+///     that can do better (like [`StandardTokenizer`]) override.
 ///     The callback is `&mut dyn FnMut`, so each per-token call
 ///     pays one indirect dispatch and LLVM cannot inline the
 ///     callback body into the tokenizer scan loop.
 ///
 ///   - [`Tokenizer::as_any`] — downcast hatch so the FTS build path
-///     can take a monomorphic fast path for either shipped tokenizer.
+///     can take a monomorphic fast path for the shipped tokenizer.
 ///     It bypasses the `&mut dyn FnMut(&str)` indirection by calling
-///     the inherent `tokenize_each_inline` method
-///     ([`AsciiLowerTokenizer::tokenize_each_inline`],
-///     [`StandardTokenizer::tokenize_each_inline`]), whose
+///     the inherent [`StandardTokenizer::tokenize_each_inline`], whose
 ///     `F: FnMut(&str)` parameter lets LLVM inline the callback
 ///     body straight into the tokenizer's scan. Custom
 ///     tokenizers don't need to opt in — they just return `self`
 ///     and never get downcast.
 pub trait Tokenizer: Send + Sync + std::fmt::Debug + 'static {
-    /// Stable registry name recorded in a column's stored FTS config
-    /// (the `tokenizer` field of `inf.fts.columns`) and used to
-    /// reconstruct the matching tokenizer at read time via
-    /// [`tokenizer_for_name`]. Must round-trip:
-    /// `tokenizer_for_name(t.name())` yields a tokenizer of the same
-    /// kind as `t`.
+    /// Stable name of the analysis this tokenizer performs — `standard`,
+    /// or a chain's derived name (see `analysis::chain_name`). Two
+    /// tokenizers with the same name emit the same tokens.
     fn name(&self) -> &'static str;
 
     /// Yield each token as an owned `String` lower-cased per the
@@ -270,7 +244,7 @@ pub trait Tokenizer: Send + Sync + std::fmt::Debug + 'static {
     /// The positional index numbers tokens by the position this trait
     /// reports, and exact-phrase matching checks those numbers for
     /// adjacency. A tokenizer that *drops* an input token (a stopword
-    /// filter, a non-ASCII skip) must leave the dropped token's
+    /// filter) must leave the dropped token's
     /// ordinal behind as a hole, or the tokens on either side of it
     /// look adjacent and a phrase matches text that is not contiguous.
     /// [`Tokenizer::tokenize_each_positioned`] is that channel; a
@@ -459,231 +433,6 @@ pub(crate) fn unique_tokens<'a>(
         .collect()
 }
 
-/// ASCII whitespace + punctuation split, ASCII lowercase, no stemming,
-/// no stopwords. The simplest tokenizer that's still useful.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AsciiLowerTokenizer;
-
-impl AsciiLowerTokenizer {
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// Zero-alloc emission with a borrowed fast path, generic over
-    /// the callback type so LLVM can inline the callback body into
-    /// the per-byte scan loop. Same shape as the trait
-    /// [`Tokenizer::tokenize_each`] but takes `mut f: F` instead of
-    /// `f: &mut dyn FnMut(&str)`, which:
-    ///
-    ///   * eliminates the per-token indirect dispatch on the
-    ///     callback (~150M call sites on the 1M-doc bench);
-    ///   * lets LLVM CSE common subexpressions between the
-    ///     callback body (intern hash, dense_doc_tf load) and
-    ///     the scan loop, and hoist invariants like the
-    ///     interner / dense-array base pointers across iterations.
-    ///
-    /// The two byte-scan passes (skip non-token bytes; extend a
-    /// token run) are SIMD-accelerated via [`simd_skip_non_token`]
-    /// and [`simd_scan_token_run`] respectively — both process 16
-    /// bytes per `u8x16` chunk on AVX2 hosts, replacing the
-    /// previous one-byte-per-iteration scalar `while` loops. The
-    /// bench corpus has ~2 KB / doc of token bytes, so the
-    /// 16×-wide scan trades ~9.4M scalar branches per doc for
-    /// ~590K `u8x16` chunk ops + a scalar tail.
-    ///
-    /// Scans the input once. For each token-byte run:
-    ///   * If the run is **already lowercase ASCII** (the common case
-    ///     for log lines, telemetry tokens, "term00042"-shaped Zipfian
-    ///     bench corpora, and lower-cased ingestion pipelines) the
-    ///     callback gets a borrowed `&str` slicing directly into the
-    ///     input — zero copy, zero scratch-buf write.
-    ///   * If the run contains uppercase ASCII bytes, the run is
-    ///     copied into a reusable scratch `buf` while lower-casing in
-    ///     place. The callback then gets `&buf`.
-    ///   * If the run contains any non-ASCII byte (≥ 0x80), the whole
-    ///     run is dropped per the v1 ASCII-only rule.
-    ///
-    /// The borrowed/copied `&str` is only valid for that one callback
-    /// call. The next callback invocation may overwrite `buf` or hand
-    /// out a different slice; copy via bumpalo/Box if you need to
-    /// keep it.
-    #[inline]
-    pub fn tokenize_each_inline<F: FnMut(&str)>(&self, text: &str, mut f: F) {
-        // One scan implementation — delegate and discard the position
-        // ordinal so the positionless / query paths and the positional
-        // index build can never disagree on which tokens are emitted.
-        self.tokenize_each_inline_positioned(text, |tok, _position| f(tok));
-    }
-
-    /// Like [`Self::tokenize_each_inline`], but also hands each emitted
-    /// token its **position ordinal**: the count of token runs scanned
-    /// before it, *including runs this tokenizer drops*.
-    ///
-    /// A run that contains a non-ASCII byte is dropped (no token), but
-    /// it still consumes one ordinal — so a phrase never treats the
-    /// tokens on either side of a dropped word as adjacent. Without
-    /// this, `"new café york"` would tokenize to `new`, `york` at
-    /// positions 0, 1 and the phrase `"new york"` would wrongly match
-    /// it; with the gap they sit at 0 and 2. Used by the positional
-    /// index build. (A run consisting *only* of non-ASCII bytes carries
-    /// no ASCII token byte to anchor the scan and is treated as a
-    /// separator, not a gap — the ASCII tokenizer cannot represent such
-    /// text at all.)
-    ///
-    /// The borrowed/copied `&str` is valid only for that one callback
-    /// call, exactly as in [`Self::tokenize_each_inline`].
-    #[inline]
-    pub fn tokenize_each_inline_positioned<F: FnMut(&str, u64)>(&self, text: &str, mut f: F) {
-        let bytes = text.as_bytes();
-        let mut scratch = String::new();
-        let mut pos = 0;
-        let mut position: u64 = 0;
-        while pos < bytes.len() {
-            pos = simd_skip_non_token(bytes, pos);
-            if pos >= bytes.len() {
-                return;
-            }
-            let start = pos;
-            let (end, had_upper, had_non_ascii) = simd_scan_token_run(bytes, pos);
-            pos = end;
-            if start == pos {
-                continue;
-            }
-            // Every scanned run occupies at least one ordinal, dropped
-            // or not; a run long enough to be chopped occupies one per
-            // piece, so the pieces are adjacent to each other and to
-            // their neighbours rather than stacked on one position.
-            let this_position = position;
-            position += 1;
-            if had_non_ascii {
-                // Dropped per the v1 ASCII-only rule — the ordinal it
-                // just consumed is the phrase gap it leaves behind.
-                continue;
-            }
-            // SAFETY: `is_token_byte` only accepts ASCII alphanumerics,
-            // so every byte in `bytes[start..end]` is a single-byte
-            // ASCII codepoint: the slice is valid UTF-8, and `text`
-            // outlives the callback call.
-            let s = unsafe { from_utf8_unchecked(&bytes[start..end]) };
-            let mut at = this_position;
-            let mut emit = |piece: &str| {
-                f(piece, at);
-                at += 1;
-            };
-            position +=
-                emit_ascii_segment(s, had_upper, &mut scratch, &mut IndexPieces(&mut emit)) - 1;
-        }
-    }
-}
-
-/// SIMD scan: advance `pos` past non-token bytes, returning the
-/// index of the first ASCII alphanumeric byte (or `bytes.len()`).
-///
-/// Replaces a per-byte `while !is_ascii_alphanumeric(bytes[pos])`
-/// loop with a 16-byte `u8x16` chunked scan. Within each chunk we
-/// build an "is token byte" mask (`'0'..='9' | 'A'..='Z' |
-/// 'a'..='z'`) via three range comparisons + two ORs, then jump to
-/// the first set bit via `trailing_zeros`. Falls back to a scalar
-/// tail for `bytes.len() % 16` trailing bytes.
-#[inline(always)]
-fn simd_skip_non_token(bytes: &[u8], mut pos: usize) -> usize {
-    const LANES: usize = 16;
-    while pos + LANES <= bytes.len() {
-        // SAFETY: `pos + LANES <= bytes.len()` was checked above,
-        // so reading 16 bytes from `bytes.as_ptr().add(pos)` stays
-        // in-bounds. The cast to `*const [u8; LANES]` and deref
-        // produces a copy (the array is loaded by value into the
-        // SIMD register on the next line).
-        let arr: [u8; LANES] = unsafe { *(bytes.as_ptr().add(pos) as *const [u8; LANES]) };
-        let chunk = u8x16::from(arr);
-        let is_digit = chunk.simd_ge(u8x16::splat(b'0')) & chunk.simd_le(u8x16::splat(b'9'));
-        let is_upper = chunk.simd_ge(u8x16::splat(b'A')) & chunk.simd_le(u8x16::splat(b'Z'));
-        let is_lower = chunk.simd_ge(u8x16::splat(b'a')) & chunk.simd_le(u8x16::splat(b'z'));
-        let is_token = is_digit | is_upper | is_lower;
-        let mask = is_token.to_bitmask() & LANE_BITMASK;
-        if mask == 0 {
-            pos += LANES;
-        } else {
-            return pos + mask.trailing_zeros() as usize;
-        }
-    }
-    // Scalar tail.
-    while pos < bytes.len() && !bytes[pos].is_ascii_alphanumeric() {
-        pos += 1;
-    }
-    pos
-}
-
-/// SIMD scan: extend a token-byte run starting at `pos`, returning
-/// `(end, had_upper, had_non_ascii)`. The run extends as long as
-/// each byte is either an ASCII alphanumeric **or** a non-ASCII
-/// (high-bit) byte — the latter just sets the `had_non_ascii`
-/// drop-marker per the v1 ASCII-only rule. The run stops on the
-/// first ASCII separator (any non-alphanumeric byte `< 0x80`).
-///
-/// Equivalent to the scalar version above but with 16-byte
-/// chunked compares. Within each chunk:
-///   * build the "extend" mask (`is_token | is_high`);
-///   * if all 16 lanes extend, OR-in the `had_upper` /
-///     `had_non_ascii` flags from the full chunk and advance 16;
-///   * otherwise find the first separator lane via
-///     `trailing_zeros(!extend & 0xFFFF)`, mask the flag bitmasks
-///     to the consumed prefix only (so flags from bytes past the
-///     separator don't leak into this token), and return.
-#[inline(always)]
-fn simd_scan_token_run(bytes: &[u8], mut pos: usize) -> (usize, bool, bool) {
-    const LANES: usize = 16;
-    let mut had_upper = false;
-    let mut had_non_ascii = false;
-    while pos + LANES <= bytes.len() {
-        // SAFETY: bounds-checked at the loop guard above.
-        let arr: [u8; LANES] = unsafe { *(bytes.as_ptr().add(pos) as *const [u8; LANES]) };
-        let chunk = u8x16::from(arr);
-        let is_digit = chunk.simd_ge(u8x16::splat(b'0')) & chunk.simd_le(u8x16::splat(b'9'));
-        let is_upper = chunk.simd_ge(u8x16::splat(b'A')) & chunk.simd_le(u8x16::splat(b'Z'));
-        let is_lower = chunk.simd_ge(u8x16::splat(b'a')) & chunk.simd_le(u8x16::splat(b'z'));
-        // High-bit detect: mask high bit, compare equal to 0x80.
-        // `simd_eq` is bit-equality on signed/unsigned-agnostic
-        // `cmp_eq_mask_i8_m128i`, so this works for high bytes
-        // even though `simd_gt`/`simd_ge` against `0x80` would
-        // need an XOR-flip trick to handle signed-i8 wrap.
-        let is_high =
-            (chunk & u8x16::splat(NON_ASCII_BYTE_MIN)).simd_eq(u8x16::splat(NON_ASCII_BYTE_MIN));
-        let is_token = is_digit | is_upper | is_lower;
-        let is_extend = is_token | is_high;
-        let extend_mask = is_extend.to_bitmask() & LANE_BITMASK;
-        let upper_mask = is_upper.to_bitmask() & LANE_BITMASK;
-        let high_mask = is_high.to_bitmask() & LANE_BITMASK;
-        let non_extend = !extend_mask & LANE_BITMASK;
-        if non_extend == 0 {
-            had_upper |= upper_mask != 0;
-            had_non_ascii |= high_mask != 0;
-            pos += LANES;
-        } else {
-            let sep_idx = non_extend.trailing_zeros() as usize;
-            let prefix_mask: u32 = (1u32 << sep_idx).wrapping_sub(1);
-            had_upper |= (upper_mask & prefix_mask) != 0;
-            had_non_ascii |= (high_mask & prefix_mask) != 0;
-            pos += sep_idx;
-            return (pos, had_upper, had_non_ascii);
-        }
-    }
-    // Scalar tail (same logic as the scalar version).
-    while pos < bytes.len() {
-        let b = bytes[pos];
-        if is_token_byte(b) {
-            had_upper |= b.is_ascii_uppercase();
-            pos += 1;
-        } else if b >= NON_ASCII_BYTE_MIN {
-            had_non_ascii = true;
-            pos += 1;
-        } else {
-            break;
-        }
-    }
-    (pos, had_upper, had_non_ascii)
-}
-
 /// One quoted phrase: its terms in query order, plus each term's
 /// **offset** — how far that term sits from the phrase's first term in
 /// token positions.
@@ -703,8 +452,7 @@ fn simd_scan_token_run(bytes: &[u8], mut pos: usize) -> (usize, bool, bool) {
 /// lets the verifier subtract an offset from a position without
 /// underflowing near the start of a document.
 ///
-/// Without a chain every offset is its term's index, so a phrase
-/// behaves exactly as it did before offsets existed.
+/// Without a chain every offset is its term's index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Phrase<T> {
     /// The phrase's terms, in query order.
@@ -870,138 +618,9 @@ impl<'q> ParsedQuery<'q> {
     }
 }
 
-impl Tokenizer for AsciiLowerTokenizer {
-    fn name(&self) -> &'static str {
-        ASCII_LOWER_TOKENIZER
-    }
-
-    /// Collected rather than lazy, so this shares the one scan every
-    /// other entry point uses. It previously walked the input through a
-    /// second, independent iterator, which is a standing invitation for
-    /// the two to disagree about which tokens exist — and they did, the
-    /// moment a token-length cap landed in only one of them. A term
-    /// indexed one way and queried another is silent recall loss, so
-    /// the duplicate scan is not worth the laziness; the strings this
-    /// runs on are query-sized.
-    fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
-        let mut out = Vec::new();
-        self.tokenize_each_inline(text, |t| out.push(t.to_owned()));
-        Box::new(out.into_iter())
-    }
-
-    /// Trait-object dispatch path: delegates to the inherent
-    /// [`tokenize_each_inline`](Self::tokenize_each_inline) so the
-    /// body lives in one place. Callers that hold a concrete
-    /// [`AsciiLowerTokenizer`] (or successfully downcast a `&dyn
-    /// Tokenizer` via [`Tokenizer::as_any`]) should call the
-    /// inherent method directly to skip the per-token
-    /// `&mut dyn FnMut(&str)` indirection.
-    fn tokenize_each(&self, text: &str, f: &mut dyn FnMut(&str)) {
-        self.tokenize_each_inline(text, |s| f(s));
-    }
-
-    /// Overridden because this tokenizer drops non-ASCII runs: the
-    /// default consecutive numbering would report no hole where one
-    /// was left.
-    fn tokenize_each_positioned(&self, text: &str, f: &mut dyn FnMut(&str, u64)) {
-        self.tokenize_each_inline_positioned(text, |s, position| f(s, position));
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    /// Zero-copy override: an already-lowercase token borrows from
-    /// `text`; only a token that needs lowercasing is copied.
-    fn tokenize_each_query<'q>(&self, text: &'q str, f: &mut dyn FnMut(Cow<'q, str>)) {
-        // One scan implementation — delegate and discard the position,
-        // so the two query entry points cannot disagree about which
-        // tokens a query has.
-        self.tokenize_each_query_positioned(text, &mut |t, _position| f(t));
-    }
-
-    /// Zero-copy *and* gap-aware: the same borrowed-where-possible
-    /// tokens as [`Self::tokenize_each_query`], each with the
-    /// gap-inclusive ordinal a dropped non-ASCII run leaves behind.
-    ///
-    /// The gap is why this is overridden rather than left to the
-    /// trait's consecutive default. A phrase query is verified against
-    /// the positions the *index* recorded, and the index has always
-    /// left a hole for a dropped run — so numbering the query's
-    /// surviving tokens consecutively asks for them closer together
-    /// than they were indexed, and `"new café york"` could never match
-    /// the text it was copied from.
-    fn tokenize_each_query_positioned<'q>(
-        &self,
-        text: &'q str,
-        f: &mut dyn FnMut(Cow<'q, str>, u64),
-    ) {
-        let bytes = text.as_bytes();
-        let mut scratch = String::new();
-        let mut pos = 0;
-        let mut position: u64 = 0;
-        while pos < bytes.len() {
-            pos = simd_skip_non_token(bytes, pos);
-            if pos >= bytes.len() {
-                return;
-            }
-            let start = pos;
-            let (end, had_upper, had_non_ascii) = simd_scan_token_run(bytes, pos);
-            pos = end;
-            if start == pos {
-                continue;
-            }
-            // Every scanned run occupies one ordinal, dropped or not,
-            // and a chopped run one per piece — the same rule
-            // `tokenize_each_inline_positioned` follows, so query and
-            // index agree on the spacing.
-            let this_position = position;
-            position += 1;
-            if had_non_ascii {
-                continue;
-            }
-            let s: &'q str = from_utf8(&bytes[start..end]).expect("ASCII-only by construction");
-            let mut at = this_position;
-            let mut emit = |piece: Cow<'q, str>| {
-                f(piece, at);
-                at += 1;
-            };
-            position +=
-                emit_ascii_segment(s, had_upper, &mut scratch, &mut QueryPieces(&mut emit)) - 1;
-        }
-    }
-}
-
-/// `[A-Za-z0-9]` — the v1 token alphabet.
-#[inline]
-fn is_token_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric()
-}
-
-/// Name of the ASCII-only tokenizer in a column's FTS config.
-pub const ASCII_LOWER_TOKENIZER: &str = "ascii_lower";
-
-/// Name of the Unicode-aware standard tokenizer in a column's FTS
-/// config, and the analyzer a column gets when none is named.
+/// Name of the Unicode-aware standard tokenizer — the base of every
+/// column's analysis chain.
 pub const STANDARD_TOKENIZER: &str = "standard";
-
-/// Resolve an analyzer name to a tokenizer instance, or `None` for a
-/// name this engine cannot reproduce. The single routing point shared
-/// by the build path (mapping a chosen analyzer to the tokenizer used
-/// at index time) and the read path (reconstructing a column's
-/// tokenizer from the name recorded in its stored config). Callers
-/// translate `None` into their own error — a malformed-superfile read
-/// error, or an invalid-argument error at table-create time.
-///
-/// Resolves a **base tokenizer** name only. A column's stopword set and
-/// stemmer are separate persisted fields, so a chained column's
-/// tokenizer is built by [`chain_tokenizer`] from all three rather than
-/// resolved from a single string here — see
-/// [`crate::superfile::fts::analysis`].
-pub fn tokenizer_for_name(name: &str) -> Option<Arc<dyn Tokenizer>> {
-    let base = Base::from_name(name)?;
-    Some(chain_tokenizer(base, Stopwords::None, Stemmer::None))
-}
 
 // ── UAX #29 word breaks, restricted to ASCII ─────────────────────────
 //
@@ -1103,8 +722,7 @@ fn wb_joined(prev: u8, a: u8, b: u8, next: u8) -> bool {
 /// either side of them. A 16-byte window holding none of these and no
 /// non-ASCII byte contains only `WB_ALETTER`, `WB_NUMERIC` and
 /// `WB_OTHER`, and over just those classes UAX #29 collapses to
-/// WB5/WB8/WB9/WB10: maximal runs of `[A-Za-z0-9]`, which is exactly
-/// [`AsciiLowerTokenizer`]'s rule. That equivalence is what lets the
+/// WB5/WB8/WB9/WB10: maximal runs of `[A-Za-z0-9]`. That is what lets the
 /// vector lane below drive such windows from bitmasks and leave only
 /// the neighbourhood of a joiner to the byte-at-a-time path.
 const WB_JOINER_BYTES: [u8; 6] = [b'_', b':', b',', b';', b'.', b'\''];
@@ -1310,8 +928,7 @@ fn ascii_word_segments_scalar<F: FnMut(usize, usize, bool)>(bytes: &[u8], mut f:
 
 /// Unicode-aware tokenizer: UAX #29 word segmentation followed by full
 /// Unicode lowercasing, preserving non-ASCII text. See the module-level
-/// docs for the exact semantics and how it differs from
-/// [`AsciiLowerTokenizer`].
+/// docs for the exact semantics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StandardTokenizer;
 
@@ -1434,6 +1051,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::superfile::fts::analysis::{Stemmer, Stopwords, chain_tokenizer};
 
     /// A parsed query's phrases as plain term lists. `Phrase`'s own
     /// equality includes the offsets; these assertions are about which
@@ -1447,14 +1065,14 @@ mod tests {
     }
 
     fn tokens(text: &str) -> Vec<String> {
-        AsciiLowerTokenizer.tokenize(text).collect()
+        StandardTokenizer.tokenize(text).collect()
     }
 
     /// Collect `(token, position)` pairs from the positional scan.
     fn positioned(text: &str) -> Vec<(String, u64)> {
         let mut out = Vec::new();
-        AsciiLowerTokenizer
-            .tokenize_each_inline_positioned(text, |tok, pos| out.push((tok.to_owned(), pos)));
+        StandardTokenizer
+            .tokenize_each_positioned(text, &mut |tok, pos| out.push((tok.to_owned(), pos)));
         out
     }
 
@@ -1792,7 +1410,6 @@ mod tests {
             "a:b 1,000 x_y Z",
         ] {
             let baseline: Vec<String> = StandardTokenizer.tokenize(text).collect();
-            let ascii_baseline: Vec<String> = AsciiLowerTokenizer.tokenize(text).collect();
             // One extra stride so the tail length cycles through every
             // residue class mod 16.
             for pad in 1..=STRIDE + 1 {
@@ -1801,11 +1418,6 @@ mod tests {
                     StandardTokenizer.tokenize(&padded).collect::<Vec<_>>(),
                     baseline,
                     "standard tokens shifted at pad {pad} for {text:?}"
-                );
-                assert_eq!(
-                    AsciiLowerTokenizer.tokenize(&padded).collect::<Vec<_>>(),
-                    ascii_baseline,
-                    "ascii_lower tokens shifted at pad {pad} for {text:?}"
                 );
             }
         }
@@ -1972,7 +1584,7 @@ mod tests {
             (MAX_TOKEN_CHARS * 2 + 1, 3),
         ] {
             let text = "a".repeat(len);
-            for got in [std_tokens(&text), std_tokens_each(&text), tokens(&text)] {
+            for got in [std_tokens(&text), std_tokens_each(&text)] {
                 assert_eq!(got.len(), want_pieces, "len {len}");
                 assert!(got.iter().all(|p| p.chars().count() <= MAX_TOKEN_CHARS));
                 assert_eq!(got.concat(), text, "chopping must not lose text");
@@ -1983,8 +1595,8 @@ mod tests {
     #[test]
     fn query_paths_chop_like_the_index_paths() {
         // A query is tokenized by its own fast paths, and a run past the
-        // cap must come out as the same pieces the index wrote — for
-        // both analyzers, lowercase and mixed case, with the pieces at
+        // cap must come out as the same pieces the index wrote — in
+        // lowercase and mixed case, with the pieces at
         // consecutive positions. A query path that emitted the run
         // whole would look up a term the index never wrote.
         let text = format!(
@@ -1995,18 +1607,14 @@ mod tests {
         let want: Vec<String> = std_tokens(&text);
         assert_eq!(want.len(), 5, "index side: 2 + 2 pieces + tail");
         assert_eq!(want[3], "b".repeat(NEARLY_TWO_CAPS - MAX_TOKEN_CHARS));
-        assert_eq!(tokens(&text), want, "both analyzers index ASCII alike");
 
-        let mut ascii_query = Vec::new();
-        AsciiLowerTokenizer.tokenize_each_query(&text, &mut |t| ascii_query.push(t.into_owned()));
-        assert_eq!(ascii_query, want, "ascii_lower query path");
         let mut std_query = Vec::new();
         StandardTokenizer.tokenize_each_query(&text, &mut |t| std_query.push(t.into_owned()));
         assert_eq!(std_query, want, "standard query path");
 
         let expect: Vec<(String, u64)> = want.iter().cloned().zip(0u64..).collect();
         let mut queried = Vec::new();
-        AsciiLowerTokenizer
+        StandardTokenizer
             .tokenize_each_query_positioned(&text, &mut |t, p| queried.push((t.into_owned(), p)));
         assert_eq!(
             queried, expect,
@@ -2054,9 +1662,7 @@ mod tests {
         // collides with its last piece.
         let long = "a".repeat(OVER_CAP);
         let text = format!("alpha {long} omega");
-        let mut got: Vec<(String, u64)> = Vec::new();
-        AsciiLowerTokenizer
-            .tokenize_each_inline_positioned(&text, |t, p| got.push((t.to_owned(), p)));
+        let got = positioned(&text);
         let positions: Vec<u64> = got.iter().map(|(_, p)| *p).collect();
         assert_eq!(positions, vec![0, 1, 2, 3], "one ordinal per emitted piece");
         assert_eq!(got[0].0, "alpha");
@@ -2078,16 +1684,8 @@ mod tests {
 
     #[test]
     fn standard_keeps_non_ascii_lowercased() {
-        // The key divergence from AsciiLowerTokenizer, which drops these.
         assert_eq!(std_tokens("Café RÉSUMÉ"), vec!["café", "résumé"]);
         assert_eq!(std_tokens_each("Café RÉSUMÉ"), vec!["café", "résumé"]);
-        // AsciiLowerTokenizer drops the same tokens entirely.
-        assert_eq!(
-            AsciiLowerTokenizer
-                .tokenize("Café RÉSUMÉ")
-                .collect::<Vec<_>>(),
-            Vec::<String>::new()
-        );
     }
 
     #[test]
@@ -2153,17 +1751,6 @@ mod tests {
         assert_eq!(p.musts, vec!["ötzi"]);
     }
 
-    #[test]
-    fn tokenizer_for_name_resolves_known_and_rejects_unknown() {
-        assert!(tokenizer_for_name(ASCII_LOWER_TOKENIZER).is_some());
-        assert!(tokenizer_for_name(STANDARD_TOKENIZER).is_some());
-        assert!(tokenizer_for_name("nonesuch").is_none());
-        // The resolved standard tokenizer keeps non-ASCII through the
-        // trait object, confirming the right impl is wired.
-        let tok = tokenizer_for_name(STANDARD_TOKENIZER).expect("standard");
-        assert_eq!(tok.tokenize("Café").collect::<Vec<_>>(), vec!["café"]);
-    }
-
     /// A phrase's offsets on a chainless tokenizer are its terms'
     /// indices, and the parsed value equals the `adjacent` fixture the
     /// tests build — nothing about *how* a phrase was assembled
@@ -2183,28 +1770,26 @@ mod tests {
 
     /// A tokenizer that drops tokens reports holes, and the parser
     /// turns them into offsets normalized to the first surviving term.
-    /// `ascii_lower` drops non-ASCII runs, which is a hole with no
-    /// analysis chain involved — so the offset plumbing is exercised
-    /// by the tokenizer that has always left gaps.
     #[test]
     fn a_phrase_carries_the_holes_its_tokenizer_left() {
-        // `café` is dropped whole and consumes one ordinal, so `york`
-        // sits two positions after `new`.
-        let p = AsciiLowerTokenizer.parse("\"new café york\"");
+        let tok = chain_tokenizer(Stopwords::English, Stemmer::None);
+        // `the` is removed and consumes one ordinal, so `york` sits two
+        // positions after `new`.
+        let p = tok.parse("\"new the york\"");
         assert_eq!(phrase_terms(&p.positive_phrases), vec![vec!["new", "york"]]);
         assert_eq!(p.positive_phrases[0].offsets(), &[0, 2]);
-        // A *leading* dropped run is unobservable: there is nothing
+        // A *leading* removed token is unobservable: there is nothing
         // before it to space the phrase from, so the offsets still
         // start at 0.
-        let p = AsciiLowerTokenizer.parse("\"café new york\"");
+        let p = tok.parse("\"the new york\"");
         assert_eq!(p.positive_phrases[0].offsets(), &[0, 1]);
     }
 
     #[test]
-    fn positioned_leaves_a_gap_for_dropped_runs() {
-        // No drops: positions are dense emission ordinals, and the
-        // positioned scan emits exactly the same tokens as the plain
-        // one (delegation guarantees this).
+    fn positioned_ordinals_are_dense_emission_ordinals() {
+        // `standard` drops nothing, so positions are dense emission
+        // ordinals and the positioned scan emits exactly the plain
+        // scan's tokens.
         assert_eq!(
             positioned("the quick brown fox"),
             vec![
@@ -2214,28 +1799,6 @@ mod tests {
                 ("fox".into(), 3),
             ],
         );
-
-        // A dropped (non-ASCII) run consumes an ordinal but emits no
-        // token, so the neighbours are NOT adjacent: `york` is at 2,
-        // not 1 — this is what stops `"new york"` matching this text.
-        assert_eq!(
-            positioned("new café york"),
-            vec![("new".into(), 0), ("york".into(), 2)],
-        );
-        // Gap whether the dropped word leads, trails, or sits between.
-        assert_eq!(
-            positioned("café new york"),
-            vec![("new".into(), 1), ("york".into(), 2)],
-        );
-        assert_eq!(
-            positioned("new york café"),
-            vec![("new".into(), 0), ("york".into(), 1)],
-        );
-
-        // The plain scan still emits the same tokens (positions dropped).
-        let mut plain = Vec::new();
-        AsciiLowerTokenizer.tokenize_each_inline("new café york", |t| plain.push(t.to_owned()));
-        assert_eq!(plain, vec!["new".to_string(), "york".to_string()]);
     }
 
     #[test]
@@ -2255,7 +1818,7 @@ mod tests {
 
     #[test]
     fn unique_tokens_dedups_and_sorts_across_values() {
-        let tok = AsciiLowerTokenizer;
+        let tok = StandardTokenizer;
         // values share 'juice'; result is one sorted set, no repeat
         let got = unique_tokens(&tok, ["Orange Juice", "Apple Juice"]);
         assert_eq!(got, vec!["apple", "juice", "orange"]);
@@ -2272,7 +1835,7 @@ mod tests {
     #[test]
     fn punctuation_splits_tokens() {
         assert_eq!(
-            tokens("hello,world!foo;bar.baz?"),
+            tokens("hello,world!foo;bar?baz?"),
             vec!["hello", "world", "foo", "bar", "baz"]
         );
     }
@@ -2293,37 +1856,8 @@ mod tests {
     }
 
     #[test]
-    fn underscore_is_a_separator_in_v1() {
-        // `_` is not in `[A-Za-z0-9]` — it splits tokens. v2 may revisit.
-        assert_eq!(tokens("foo_bar"), vec!["foo", "bar"]);
-    }
-
-    #[test]
     fn dash_is_a_separator() {
         assert_eq!(tokens("rust-async"), vec!["rust", "async"]);
-    }
-
-    #[test]
-    fn non_ascii_token_is_dropped() {
-        // ASCII-only tokenizer: "café" has a non-ASCII byte, so the
-        // entire token is dropped.
-        assert_eq!(tokens("café"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn non_ascii_token_drops_only_that_token() {
-        // Surrounding ASCII tokens still come through.
-        assert_eq!(tokens("hello café world"), vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn cjk_input_yields_nothing() {
-        assert_eq!(tokens("日本語"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn emoji_input_yields_nothing() {
-        assert_eq!(tokens("hello 🚀 world"), vec!["hello", "world"]);
     }
 
     #[test]
@@ -2342,13 +1876,13 @@ mod tests {
     fn tokenizer_is_send_and_sync() {
         // Compile-time assertion via the Tokenizer trait bound.
         fn is_send_sync<T: Send + Sync>() {}
-        is_send_sync::<AsciiLowerTokenizer>();
+        is_send_sync::<StandardTokenizer>();
     }
 
     #[test]
     fn tokenizer_used_via_dyn_trait() {
         // The trait object form is what the FtsBuilder will hold.
-        let tok: Box<dyn Tokenizer> = Box::new(AsciiLowerTokenizer);
+        let tok: Box<dyn Tokenizer> = Box::new(StandardTokenizer);
         let v: Vec<String> = tok.tokenize("Hello WORLD").collect();
         assert_eq!(v, vec!["hello", "world"]);
     }
@@ -2358,7 +1892,7 @@ mod tests {
         // Rough scale-test: 1 MB of pseudo-text.
         let chunk = "lorem ipsum dolor sit amet, consectetur adipiscing elit. ";
         let big = chunk.repeat(20_000);
-        let count = AsciiLowerTokenizer.tokenize(&big).count();
+        let count = StandardTokenizer.tokenize(&big).count();
         // 8 tokens per chunk × 20_000 = 160_000.
         assert_eq!(count, 8 * 20_000);
     }
@@ -2366,7 +1900,7 @@ mod tests {
     // ---- parse (the `-` negation sigil) ----
 
     fn parse(query: &str) -> ParsedQuery<'_> {
-        AsciiLowerTokenizer.parse(query)
+        StandardTokenizer.parse(query)
     }
 
     #[test]
@@ -2380,7 +1914,7 @@ mod tests {
                 "plain_test"
             }
             fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
-                AsciiLowerTokenizer.tokenize(text)
+                StandardTokenizer.tokenize(text)
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -2645,8 +2179,8 @@ mod tests {
     }
 
     #[test]
-    fn into_clauses_legacy_shapes_unchanged() {
-        // Sigil-less queries resolve exactly as the pre-clause model:
+    fn into_clauses_without_sigils_follow_the_bool_mode() {
+        // Sigil-less queries resolve by mode:
         // Or ⇒ all shoulds (union), And ⇒ all musts (intersection).
         let c = parse("rust async").into_clauses(BoolMode::Or);
         assert!(c.musts.is_empty());
@@ -2678,7 +2212,7 @@ mod tests {
     /// lowercasing + separator splitting.
     #[test]
     fn dyn_tokenize_each_lowercases_and_splits() {
-        let tok = AsciiLowerTokenizer::new();
+        let tok = StandardTokenizer::new();
         let dynt: &dyn Tokenizer = &tok;
         let mut out = Vec::new();
         dynt.tokenize_each("Hello, World rust", &mut |s| out.push(s.to_string()));

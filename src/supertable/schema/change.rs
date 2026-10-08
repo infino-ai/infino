@@ -748,7 +748,7 @@ mod tests {
     use arrow_schema::{Field, Schema, TimeUnit};
 
     use super::*;
-    use crate::superfile::builder::FtsConfig;
+    use crate::superfile::{builder::FtsConfig, fts::analysis::Stopwords};
 
     fn table() -> TableSchema {
         TableSchema::from_options(
@@ -914,11 +914,10 @@ mod tests {
             merge(&t, &id_col, ctx(false)),
             Err(SchemaError::NameTaken { .. })
         ));
-        let analyzer = SchemaPatch {
+        let analysis = SchemaPatch {
             fields: vec![FieldPatch {
                 index: Some(ColumnIndex::Fts {
-                    analyzer: "ascii_lower".into(),
-                    stopwords: Default::default(),
+                    stopwords: Stopwords::English,
                     stemmer: Default::default(),
                     positions: false,
                     stored: true,
@@ -930,7 +929,7 @@ mod tests {
             max_depth: None,
         };
         assert!(matches!(
-            merge(&t, &analyzer, ctx(false)),
+            merge(&t, &analysis, ctx(false)),
             Err(SchemaError::IdentityChange { .. })
         ));
         let tighten = SchemaPatch {

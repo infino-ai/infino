@@ -35,10 +35,7 @@ use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::FtsConfig,
-        fts::{
-            reader::{Bm25Stats, BoolMode},
-            tokenize::Tokenizer,
-        },
+        fts::{reader::BoolMode, tokenize::Tokenizer},
     },
     supertable::{
         Supertable, SupertableOptions,
@@ -803,8 +800,7 @@ const FLOOR_TOP_K: usize = 5;
 const FLOOR_QUERY_ITERS: usize = 30;
 
 /// Deleting every high-scoring phrase doc in one superfile must not
-/// depress other superfiles' results through the shared floor — under
-/// either BM25 stats mode.
+/// depress other superfiles' results through the shared floor.
 #[test]
 fn tombstoned_superfile_does_not_raise_the_shared_phrase_floor() {
     let dir = TempDir::new().expect("tempdir");
@@ -865,47 +861,43 @@ fn tombstoned_superfile_does_not_raise_the_shared_phrase_floor() {
     w.commit().expect("commit delete");
     drop(w);
 
-    for stats in [Bm25Stats::Global, Bm25Stats::PerSuperfile] {
-        for _ in 0..FLOOR_QUERY_ITERS {
-            let batches = st
-                .reader()
-                .expect("reader")
-                .bm25_search(
-                    "title",
-                    "\"alpha beta\"",
-                    FLOOR_TOP_K,
-                    Bm25SearchOptions::new()
-                        .with_mode(BoolMode::Or)
-                        .with_stats(stats),
-                    Some(&["title"]),
-                )
-                .expect("phrase search");
-            let titles: Vec<String> = batches
-                .iter()
-                .flat_map(|b| {
-                    let arr = b
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<LargeStringArray>()
-                        .expect("title column");
-                    (0..b.num_rows())
-                        .map(|i| arr.value(i).to_string())
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            assert_eq!(
-                titles.len(),
+    for _ in 0..FLOOR_QUERY_ITERS {
+        let batches = st
+            .reader()
+            .expect("reader")
+            .bm25_search(
+                "title",
+                "\"alpha beta\"",
                 FLOOR_TOP_K,
-                "phrase top-k underflowed ({stats:?}): a tombstoned segment's \
-                 kernel scores leaked into the shared floor and pruned the \
-                 surviving docs"
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+                Some(&["title"]),
+            )
+            .expect("phrase search");
+        let titles: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let arr = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("title column");
+                (0..b.num_rows())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            titles.len(),
+            FLOOR_TOP_K,
+            "phrase top-k underflowed: a tombstoned segment's \
+             kernel scores leaked into the shared floor and pruned the \
+             surviving docs"
+        );
+        for t in &titles {
+            assert_ne!(
+                t, &doomed_title,
+                "a tombstoned row resurfaced in the phrase top-k"
             );
-            for t in &titles {
-                assert_ne!(
-                    t, &doomed_title,
-                    "a tombstoned row resurfaced in the phrase top-k ({stats:?})"
-                );
-            }
         }
     }
 }

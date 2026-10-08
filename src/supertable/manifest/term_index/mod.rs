@@ -811,7 +811,7 @@ mod tests {
             fault_storage::{FaultOp, FaultStorage},
             fid, old_format_fts_fixture, open_old_format_fts_fixture,
         },
-        utils::terms::FstValue,
+        utils::terms::DictEntry,
     };
 
     fn contribution(dir: &TempDir, id: u128, terms: &[(&str, &str, u64)]) -> Contribution {
@@ -1597,7 +1597,7 @@ mod tests {
         use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
         use datafusion::prelude::{col, lit};
 
-        use crate::{Bm25SearchOptions, superfile::fts::reader::Bm25Stats, supertable::Supertable};
+        use crate::{Bm25SearchOptions, supertable::Supertable};
 
         let (_dir, storage, st) = table_with(|o| {
             o.with_eager_load_threshold(0)
@@ -1646,7 +1646,7 @@ mod tests {
                 "title",
                 "zeta",
                 10,
-                Bm25SearchOptions::new().with_stats(Bm25Stats::PerSuperfile),
+                Bm25SearchOptions::new(),
                 Some(&["_id", "score"]),
             )
             .expect("search");
@@ -1943,12 +1943,11 @@ mod tests {
 
     /// Every ceiling the index computes is an upper bound on the score any
     /// document actually receives — for single terms, multi-term unions
-    /// and phrases, under per-superfile statistics and under table-wide
-    /// statistics, where the stored bound is rescaled from the superfile's
-    /// own idf to the query's.
+    /// and phrases under table-wide statistics, where the stored bound is
+    /// rescaled from the superfile's own idf to the query's.
     #[test]
-    fn query_ceilings_bound_real_scores_for_terms_and_phrases_under_both_stats() {
-        use crate::{Bm25SearchOptions, superfile::fts::reader::Bm25Stats};
+    fn query_ceilings_bound_real_scores_for_terms_and_phrases() {
+        use crate::Bm25SearchOptions;
 
         let (_dir, storage, st) = fresh_table();
         for segment in 0..SEGMENTS {
@@ -1971,8 +1970,8 @@ mod tests {
                 .map(|(sf, _, _)| *sf)
                 .expect("every hit falls in one superfile's id range")
         };
-        // Table-wide idf per term, as the query scores with under
-        // `Bm25Stats::Global`: N is the scored-document total, df the sum
+        // Table-wide idf per term, as the query scores with: N is the
+        // scored-document total, df the sum
         // over every live superfile's posting.
         let scored_total: u64 = entries
             .iter()
@@ -2007,39 +2006,34 @@ mod tests {
             ),
             ("beta \"shared s1d02\"", &["beta"], &[&["shared", "s1d02"]]),
         ];
-        for stats in [Bm25Stats::PerSuperfile, Bm25Stats::Global] {
-            for (query, terms, phrases) in &queries {
-                let phrases: Vec<Vec<&str>> = phrases.iter().map(|p| p.to_vec()).collect();
-                let idf_used = |term: &str, local: f32| match stats {
-                    Bm25Stats::PerSuperfile => local,
-                    Bm25Stats::Global => global_idf[term],
-                };
-                let ceilings = rt
-                    .block_on(index.query_ceilings(title, terms, &phrases, &entries, &idf_used))
-                    .expect("ceilings");
-                let batches = reader
-                    .bm25_search(
-                        "title",
-                        query,
-                        DOCS_PER_SEGMENT * SEGMENTS,
-                        Bm25SearchOptions::new().with_stats(stats),
-                        Some(&["_id", "score"]),
-                    )
-                    .expect("search");
-                let hits = hits_of(&batches);
-                assert!(!hits.is_empty(), "{query}: the fixture has hits");
-                for (id, score) in hits {
-                    let sf = superfile_of(id);
-                    let ceiling = ceilings[&sf];
-                    assert!(
-                        score <= ceiling,
-                        "{query} under {stats:?} in {sf}: score {score} exceeds ceiling {ceiling}"
-                    );
-                    assert!(
-                        ceiling.is_finite(),
-                        "{query}: a real ceiling, not the placeholder"
-                    );
-                }
+        for (query, terms, phrases) in &queries {
+            let phrases: Vec<Vec<&str>> = phrases.iter().map(|p| p.to_vec()).collect();
+            let idf_used = |term: &str, _local: f32| global_idf[term];
+            let ceilings = rt
+                .block_on(index.query_ceilings(title, terms, &phrases, &entries, &idf_used))
+                .expect("ceilings");
+            let batches = reader
+                .bm25_search(
+                    "title",
+                    query,
+                    DOCS_PER_SEGMENT * SEGMENTS,
+                    Bm25SearchOptions::new(),
+                    Some(&["_id", "score"]),
+                )
+                .expect("search");
+            let hits = hits_of(&batches);
+            assert!(!hits.is_empty(), "{query}: the fixture has hits");
+            for (id, score) in hits {
+                let sf = superfile_of(id);
+                let ceiling = ceilings[&sf];
+                assert!(
+                    score <= ceiling,
+                    "{query} in {sf}: score {score} exceeds ceiling {ceiling}"
+                );
+                assert!(
+                    ceiling.is_finite(),
+                    "{query}: a real ceiling, not the placeholder"
+                );
             }
         }
     }
@@ -2245,7 +2239,7 @@ mod tests {
             let by_sf = rt
                 .block_on(index.locations(title_id(), terms, &entries))
                 .expect("locations");
-            let pairs: Vec<(&str, u64, FstValue)> = by_sf[&entries[0].superfile_id]
+            let pairs: Vec<(&str, u64, DictEntry)> = by_sf[&entries[0].superfile_id]
                 .iter()
                 .filter_map(|(t, df, l)| l.to_dict_value().map(|v| (t.as_str(), *df, v)))
                 .collect();
@@ -2628,7 +2622,7 @@ mod tests {
             let bytes =
                 std::fs::read(dir.path().join(e.uri.storage_path())).expect("superfile bytes");
             let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
-            let pairs: Vec<(&str, u64, FstValue)> = by_sf[&e.superfile_id]
+            let pairs: Vec<(&str, u64, DictEntry)> = by_sf[&e.superfile_id]
                 .iter()
                 .filter_map(|(t, df, l)| l.to_dict_value().map(|v| (t.as_str(), *df, v)))
                 .collect();
@@ -2982,16 +2976,13 @@ mod tests {
     /// Every posting's bound is a true ceiling: for each term, the highest
     /// score any document in that superfile actually receives under the
     /// superfile's own statistics does not exceed the artifact's bound for
-    /// it. The oracle is the public search itself, run with per-superfile
-    /// statistics so its scores are in the scale the bounds were baked in;
-    /// hits map to superfiles through the entries' id ranges.
+    /// it. The oracle is each superfile searched on its own, so its scores
+    /// are in the scale the bounds were baked in.
     #[test]
     fn bounds_are_upper_bounds_on_real_scores() {
-        use arrow_array::{Array, Decimal128Array, Float32Array, Int64Array};
+        use crate::superfile::SuperfileReader;
 
-        use crate::{Bm25SearchOptions, superfile::fts::reader::Bm25Stats};
-
-        let (_dir, storage, st) = fresh_table();
+        let (dir, storage, st) = fresh_table();
         for segment in 0..SEGMENTS {
             commit_segment(&st, segment);
         }
@@ -2999,19 +2990,17 @@ mod tests {
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         let reader = st.reader().expect("reader");
-        let ranges: Vec<(Uuid, i128, i128)> = reader
+        let superfiles: Vec<(Uuid, SuperfileReader)> = reader
             .manifest()
             .get_all_superfiles()
             .iter()
-            .map(|e| (e.superfile_id, e.id_min, e.id_max))
+            .map(|e| {
+                let bytes =
+                    std::fs::read(dir.path().join(e.uri.storage_path())).expect("superfile bytes");
+                let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+                (e.superfile_id, sf)
+            })
             .collect();
-        let superfile_of = |id: i128| -> Uuid {
-            ranges
-                .iter()
-                .find(|(_, lo, hi)| *lo <= id && id <= *hi)
-                .map(|(sf, _, _)| *sf)
-                .expect("every hit falls in one superfile's id range")
-        };
         for term in ["shared", "alpha", "beta", "s1d00", "s2d04"] {
             let postings = rt
                 .block_on(index.postings(title_id(), term))
@@ -3027,41 +3016,22 @@ mod tests {
                     "{term} in {sf}: bound is a real ceiling, not the +inf placeholder"
                 );
             }
-            let batches = reader
-                .bm25_search(
-                    "title",
-                    term,
-                    DOCS_PER_SEGMENT * SEGMENTS,
-                    Bm25SearchOptions::new().with_stats(Bm25Stats::PerSuperfile),
-                    Some(&["_id", "score"]),
-                )
-                .expect("search");
-            let mut observed_max: HashMap<Uuid, f32> = HashMap::new();
-            for b in &batches {
-                let scores = b
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .expect("score");
-                let ids = b.column(0);
-                for i in 0..b.num_rows() {
-                    let id: i128 = if let Some(a) = ids.as_any().downcast_ref::<Decimal128Array>() {
-                        a.value(i)
-                    } else {
-                        ids.as_any()
-                            .downcast_ref::<Int64Array>()
-                            .expect("_id")
-                            .value(i) as i128
-                    };
-                    let sf = superfile_of(id);
-                    let e = observed_max.entry(sf).or_insert(0.0);
-                    *e = e.max(scores.value(i));
-                }
-            }
-            assert!(!observed_max.is_empty());
-            for (sf, observed) in observed_max {
+            let mut observed_any = false;
+            for (sf, superfile) in &superfiles {
+                let hits = rt
+                    .block_on(superfile.bm25_search_pretokenized(
+                        "title",
+                        &[term],
+                        DOCS_PER_SEGMENT,
+                        BoolMode::Or,
+                    ))
+                    .expect("search");
+                let Some(observed) = hits.iter().map(|(_, s)| *s).reduce(f32::max) else {
+                    continue;
+                };
+                observed_any = true;
                 let bound = bounds
-                    .get(&sf)
+                    .get(sf)
                     .copied()
                     .unwrap_or_else(|| panic!("{term}: a superfile with hits has a posting"));
                 assert!(
@@ -3069,8 +3039,10 @@ mod tests {
                     "{term} in {sf}: observed max {observed} exceeds bound {bound}"
                 );
             }
+            assert!(observed_any, "{term}: the fixture has hits");
         }
     }
+
     /// Like [`fresh_table`] with a ceiling-ordered open window of `window`
     /// superfiles (1 = strictly sequential, so skipping is observable).
     fn fresh_table_with_open_window(
@@ -3131,7 +3103,6 @@ mod tests {
         use crate::{
             Bm25SearchOptions,
             runtime_metrics::op_stats::{self, with_op_stats},
-            superfile::fts::reader::Bm25Stats,
         };
 
         let (_dir, _storage, st) = fresh_table_with_open_window(1);
@@ -3156,7 +3127,7 @@ mod tests {
                         "title",
                         "alpha",
                         k,
-                        Bm25SearchOptions::new().with_stats(Bm25Stats::PerSuperfile),
+                        Bm25SearchOptions::new(),
                         Some(&["_id", "score"]),
                     )
                     .expect("search");
@@ -3222,7 +3193,7 @@ mod tests {
                 locs.iter().all(|(t, _, _)| t != "absent"),
                 "an absent term has no location"
             );
-            let pairs: Vec<(&str, u64, FstValue)> = locs
+            let pairs: Vec<(&str, u64, DictEntry)> = locs
                 .iter()
                 .filter_map(|(t, df, l)| l.to_dict_value().map(|v| (t.as_str(), *df, v)))
                 .collect();
@@ -3246,22 +3217,22 @@ mod tests {
                 match (slot, fact.entry) {
                     (
                         FetchedTermSlot::Inline { doc_id, tf },
-                        FstValue::Inline { doc_id: d, tf: t },
+                        DictEntry::Inline { doc_id: d, tf: t },
                     ) => {
                         assert_eq!((doc_id, tf), (d, t));
                     }
                     (
                         FetchedTermSlot::Pfor { bytes, short, .. },
-                        FstValue::Pfor {
-                            postings_length_hint,
+                        DictEntry::Pfor {
+                            postings_length,
                             short: s,
                             ..
                         },
                     ) => {
                         assert_eq!(short, s);
                         assert_eq!(
-                            Some(bytes.len() as u32),
-                            postings_length_hint,
+                            bytes.len() as u32,
+                            postings_length,
                             "{name}: fetched exactly the postings range"
                         );
                     }
@@ -3570,7 +3541,7 @@ mod tests {
     fn old_format_tables_read_and_mix_with_the_new_format() {
         use std::path::Path;
 
-        use crate::{Bm25SearchOptions, superfile::fts::reader::Bm25Stats, supertable::Supertable};
+        use crate::{Bm25SearchOptions, supertable::Supertable};
 
         fn open(dir: &Path) -> (Arc<dyn StorageProvider>, Supertable) {
             open_old_format(dir, |o| o)
@@ -3615,9 +3586,7 @@ mod tests {
                             "title",
                             q,
                             DOCS_PER_SEGMENT * (SEGMENTS + 1),
-                            Bm25SearchOptions::new()
-                                .with_mode(*mode)
-                                .with_stats(Bm25Stats::Global),
+                            Bm25SearchOptions::new().with_mode(*mode),
                             Some(&["title", "score"]),
                         )
                         .expect("search");

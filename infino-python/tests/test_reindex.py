@@ -129,21 +129,6 @@ def test_a_rewrite_leaves_analysis_stale_superfiles_reported(tmp_path):
     assert not table.index_staleness().is_current
 
 
-def test_trusting_writer_analysis_reaches_the_engine_and_is_off_by_default(tmp_path):
-    # The fixture's superfiles record no analysis revision, but the engine that
-    # wrote them emitted the current one — so trusting the writer reads the
-    # table as current, and the default must not.
-    table = _old_format_table(tmp_path)
-    trusting = infino.ReindexOptions(trust_writer_analysis=True)
-
-    assert table.index_staleness(trusting).is_current
-    assert table.reindex_plan(trusting) == []
-
-    assert not table.index_staleness().is_current
-    assert not table.index_staleness(infino.ReindexOptions()).is_current
-    assert len(table.reindex_plan(infino.ReindexOptions())) == OLD_FORMAT_SUPERFILES
-
-
 def test_a_long_seal_timeout_is_passed_through(tmp_path):
     table = _old_format_table(tmp_path)
     report = table.reindex(infino.ReindexOptions(stale_seal_timeout_ms=LONG_SEAL_TIMEOUT_MS))

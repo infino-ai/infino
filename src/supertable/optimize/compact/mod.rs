@@ -74,6 +74,9 @@ use crate::{
     utils::trace::{RegionUsage, detail_span, record},
 };
 
+/// Number of seal/reseal/unseal requests to run in parallel at a time
+const MAX_CONCURRENT_SEAL_WRITES: usize = 64;
+
 /// Held for as long as one process is reshaping superfiles, and released
 /// on drop. Compaction and reindex share it: both rewrite superfiles and
 /// commit manifest swaps, so running them together would put two planners
@@ -683,7 +686,7 @@ impl Supertable {
                 false => tombstones.get(&superfile_id).map(Arc::clone),
             };
 
-            let reader = reader.map_err(|e| BuildError::Store(e.to_string()))?;
+            let reader = reader.map_err(BuildError::from)?;
             let superseded = superseded_map
                 .and_then(|m| m.get(&superfile_id))
                 .cloned()
@@ -863,30 +866,15 @@ impl Supertable {
         // goes stale.
         let compaction_id = Uuid::new_v4();
         let sealed_at = Utc::now();
-        let mut sealed: Vec<SealedInput> = Vec::with_capacity(inputs.len());
-        for entry in &inputs {
-            let (sidecar, etag) = match seal_with_bounded_retry(
-                &wal_store,
-                entry.superfile_id,
-                compaction_id,
-                sealed_at,
-                stale_seal_timeout,
-                max_retries,
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    unseal_all(&wal_store, sealed).await;
-                    return Err(e);
-                }
-            };
-            sealed.push(SealedInput {
-                superfile_id: entry.superfile_id,
-                bitmap: sidecar.bitmap,
-                etag,
-            });
-        }
+        let sealed = seal_inputs(
+            &wal_store,
+            &job.inputs,
+            compaction_id,
+            sealed_at,
+            stale_seal_timeout,
+            max_retries,
+        )
+        .await?;
 
         // The bitmaps `seal` GETs are the authoritative ones: read from
         // storage, under the seal, so nothing can land behind them.
@@ -906,7 +894,7 @@ impl Supertable {
             Err(BuildError::NoDocsToBuild) => None,
             Err(e) => {
                 unseal_all(&wal_store, sealed).await;
-                return Err(CompactionError::Build(e.to_string()));
+                return Err(CompactionError::from(e));
             }
         };
 
@@ -1108,7 +1096,7 @@ impl Supertable {
             // removal and must not address either.
             debug_assert_eq!(resolved.len(), batch.len());
             let mut dropped: Vec<PreparedJob> = Vec::with_capacity(stale.len());
-            for i in stale.into_iter().rev() {
+            for (i, _) in stale.into_iter().rev() {
                 dropped.push(batch.remove(i));
                 resolved.remove(i);
             }
@@ -1742,17 +1730,39 @@ impl CommitFence for SealFence<'_> {
             let stale = restamp_seals(self.wal_store, self.batch, Utc::now())
                 .await
                 .map_err(|e| CommitError::Encode(e.to_string()))?;
-            let Some(&i) = stale.first() else {
+            let Some(&(_, superfile_id)) = stale.first() else {
                 return Ok(());
             };
-            let superfile_id = self.batch[i]
-                .sealed
-                .first()
-                .map(|s| s.superfile_id)
-                .unwrap_or_default();
             Err(CommitError::InputsChanged { superfile_id })
         })
     }
+}
+
+/// Run `writes` up to [`MAX_CONCURRENT_SEAL_WRITES`] at a time. After the first
+/// failure `stop` is set and writes not yet started are skipped (`None`). Ones
+/// in flight still finish, since a cancelled write may have landed with a
+/// result we'd never learn, so every write that landed is reported. A write
+/// that retries can read `stop` to give up early.
+async fn write_until_failure<K, T, E, F>(
+    writes: Vec<(K, F)>,
+    stop: &AtomicBool,
+) -> Vec<(K, Option<Result<T, E>>)>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    stream::iter(writes.into_iter().map(|(key, write)| async move {
+        if stop.load(Ordering::Relaxed) {
+            return (key, None);
+        }
+        let result = write.await;
+        if result.is_err() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        (key, Some(result))
+    }))
+    .buffer_unordered(MAX_CONCURRENT_SEAL_WRITES)
+    .collect()
+    .await
 }
 
 /// Re-stamp every seal the batch still needs stamped, conditioned on the etag
@@ -1771,20 +1781,42 @@ impl CommitFence for SealFence<'_> {
 /// confirm what the clock already proves, and this runs on the critical path
 /// of every commit, serial single-job ones included.
 ///
-/// `Err` means storage failed rather than a writer winning, which proves
-/// nothing about who holds the sidecar. Any etags already re-stamped are
-/// written back through `batch` either way, so an unseal on the error path
-/// still clears them.
+/// Every due job's re-stamps run in one call, so a batch of small jobs still
+/// has many writes in flight. A lost write stops only the rest of its own
+/// job, which is dropped anyway; other jobs are still re-stamped in full. A
+/// storage error stops every write not yet sent, since it fails the call.
 ///
-/// The indices come back ascending and at most one per job, which is what lets
-/// the caller remove them back-to-front.
+/// `Err` means storage failed rather than a writer winning, which proves
+/// nothing about who holds the sidecar. It wins over a lost write in the same
+/// call: both are safe, and `Err` sends the whole batch back to be unsealed.
+/// Any etags already re-stamped are written back through `batch` either way,
+/// so that unseal still clears them.
+///
+/// Each dropped job comes back as its index and the input that lost. The
+/// indices come back ascending and at most one per job, which is what lets
+/// the caller remove them back-to-front. A dropped job keeps its old
+/// `sealed_at`, so a retry that still holds it re-stamps it again.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        name = "restamp_seals",
+        skip_all,
+        fields(
+            batch_size = batch.len(),
+        )
+    )
+)]
 async fn restamp_seals(
     wal_store: &WalStore,
     batch: &mut [PreparedJob],
     now: DateTime<Utc>,
-) -> Result<Vec<usize>, CompactionError> {
-    let mut stale = Vec::new();
-    for (i, prepared) in batch.iter_mut().enumerate() {
+) -> Result<Vec<(usize, Uuid)>, CompactionError> {
+    let mut due = vec![false; batch.len()];
+    // Set when a job loses a write, to skip the rest of that job only.
+    let job_lost: Vec<AtomicBool> = batch.iter().map(|_| AtomicBool::new(false)).collect();
+    // Keyed by (job, input) so each result finds its way back.
+    let mut reseals = Vec::new();
+    for (i, prepared) in batch.iter().enumerate() {
         if !seal_may_have_been_stolen(
             prepared.sealed_at,
             now,
@@ -1792,44 +1824,97 @@ async fn restamp_seals(
         ) {
             continue;
         }
+        due[i] = true;
         let compaction_id = prepared.compaction_id;
-        for input in prepared.sealed.iter_mut() {
-            match tombstones_admin::refresh_seal(
-                wal_store,
-                input.superfile_id,
-                compaction_id,
-                input.bitmap.clone(),
-                now,
-                &input.etag,
-            )
-            .await
-            {
-                Ok(etag) => input.etag = etag,
-                // The same condition the one-in-one-out carry raises as
-                // `SidecarChangedUnderSeal`, and the same answer: this job
-                // does not commit. A many-in-one merge cannot carry the bit
-                // to its output, so the inputs are merged again next pass
-                // with the tombstone in view.
-                Err(TombstonesAdminError::CasLost { .. }) => {
-                    warn!(
-                        error = %CompactionError::SidecarChangedUnderSeal {
-                            superfile_id: input.superfile_id,
-                        },
-                        "compact: dropping the job"
-                    );
-                    stale.push(i);
-                    break;
+        let job_lost = &job_lost[i];
+        for (k, input) in prepared.sealed.iter().enumerate() {
+            let wal_store = wal_store.clone();
+            let superfile_id = input.superfile_id;
+            let bitmap = input.bitmap.clone();
+            let etag = input.etag.clone();
+            // A lost write is an `Ok` outcome here, so it never stops other
+            // jobs; only a storage error reaches the shared stop as `Err`.
+            let reseal = async move {
+                if job_lost.load(Ordering::Relaxed) {
+                    return Ok(Reseal::Skipped);
                 }
-                Err(e) => return Err(CompactionError::Seal(e.to_string())),
-            }
-        }
-        // The seals are young again, so a later commit attempt skips them
-        // rather than re-stamping what it refreshed seconds ago.
-        if stale.last() != Some(&i) {
-            prepared.sealed_at = now;
+                match tombstones_admin::refresh_seal(
+                    &wal_store,
+                    superfile_id,
+                    compaction_id,
+                    bitmap,
+                    now,
+                    &etag,
+                )
+                .await
+                {
+                    Ok(etag) => Ok(Reseal::Stamped(etag)),
+                    Err(TombstonesAdminError::CasLost { .. }) => {
+                        job_lost.store(true, Ordering::Relaxed);
+                        Ok(Reseal::Lost)
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            reseals.push(((i, k), reseal));
         }
     }
+    let results = write_until_failure(reseals, &AtomicBool::new(false)).await;
+
+    let mut lost: Vec<Option<Uuid>> = vec![None; batch.len()];
+    let mut failed = None;
+    for ((i, k), result) in results {
+        match result {
+            // Not sent: either a storage error stopped everything (returned
+            // below) or the job already lost a write. Its etag is unchanged.
+            None | Some(Ok(Reseal::Skipped)) => {}
+            Some(Ok(Reseal::Stamped(etag))) => batch[i].sealed[k].etag = etag,
+            Some(Ok(Reseal::Lost)) => {
+                lost[i].get_or_insert(batch[i].sealed[k].superfile_id);
+            }
+            Some(Err(e)) => {
+                failed.get_or_insert(e);
+            }
+        }
+    }
+    if let Some(e) = failed {
+        return Err(CompactionError::Seal(e.to_string()));
+    }
+
+    let mut stale = Vec::new();
+    for (i, prepared) in batch.iter_mut().enumerate() {
+        if !due[i] {
+            continue;
+        }
+        // The same condition the one-in-one-out carry raises as
+        // `SidecarChangedUnderSeal`, and the same answer: this job does not
+        // commit. A many-in-one merge cannot carry the bit to its output, so
+        // the inputs are merged again next pass with the tombstone in view.
+        if let Some(superfile_id) = lost[i] {
+            warn!(
+                error = %CompactionError::SidecarChangedUnderSeal { superfile_id },
+                "compact: dropping the job"
+            );
+            stale.push((i, superfile_id));
+            continue;
+        }
+        // The seals are young again, so a later commit attempt skips them
+        // rather than re-stamping what it refreshed seconds ago. Only a
+        // storage error skips across jobs, and that returned above, so every
+        // job still here was re-stamped in full.
+        prepared.sealed_at = now;
+    }
     Ok(stale)
+}
+
+/// What one re-stamp did, short of a storage error.
+enum Reseal {
+    /// Won: the seal's new etag.
+    Stamped(Etag),
+    /// Lost the CAS: a writer changed the sidecar under the seal.
+    Lost,
+    /// Not sent: another input of the same job already lost.
+    Skipped,
 }
 
 /// Hand the writes a failed attempt did not land back to the jobs that owe
@@ -1946,14 +2031,9 @@ struct SealedInput {
     etag: Etag,
 }
 
-/// Cap on in-flight unseal calls. Single-writer model: one compactor
-/// commits at a time, so there's no throughput reason to fire every
-/// unseal at once.
-const MAX_CONCURRENT_UNSEALS: usize = 8;
-
 /// Best-effort: clear every seal this attempt placed. Each one is an
-/// independent sidecar, so order doesn't matter, but they're bounded
-/// to a small number in flight rather than all at once.
+/// independent sidecar, so order doesn't matter; they run up to
+/// [`MAX_CONCURRENT_SEAL_WRITES`] at a time.
 async fn unseal_all(wal_store: &WalStore, sealed: Vec<SealedInput>) {
     let results = stream::iter(sealed.into_iter().map(|s| {
         let wal_store = wal_store.clone();
@@ -1963,7 +2043,7 @@ async fn unseal_all(wal_store: &WalStore, sealed: Vec<SealedInput>) {
             (s.superfile_id, result)
         }
     }))
-    .buffer_unordered(MAX_CONCURRENT_UNSEALS)
+    .buffer_unordered(MAX_CONCURRENT_SEAL_WRITES)
     .collect::<Vec<_>>()
     .await;
     for (superfile_id, result) in results {
@@ -1992,16 +2072,83 @@ fn resolve_entries_to_remove(
         .collect()
 }
 
+/// Seal every input, up to [`MAX_CONCURRENT_SEAL_WRITES`] at a time. On any
+/// failure the seals that did land are cleared before the first error is
+/// returned, so a failed job leaves nothing sealed.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        name = "seal_inputs",
+        skip_all,
+        fields(
+            inputs = input_ids.len(),
+        )
+    )
+)]
+async fn seal_inputs(
+    wal_store: &WalStore,
+    input_ids: &[Uuid],
+    compaction_id: Uuid,
+    sealed_at: DateTime<Utc>,
+    stale_seal_timeout: Duration,
+    max_retries: u32,
+) -> Result<Vec<SealedInput>, CompactionError> {
+    let stop = &AtomicBool::new(false);
+    let seals: Vec<_> = input_ids
+        .iter()
+        .map(|&superfile_id| {
+            let wal_store = wal_store.clone();
+            let seal = async move {
+                seal_with_bounded_retry(
+                    &wal_store,
+                    superfile_id,
+                    compaction_id,
+                    sealed_at,
+                    stale_seal_timeout,
+                    max_retries,
+                    stop,
+                )
+                .await
+            };
+            (superfile_id, seal)
+        })
+        .collect();
+    let results = write_until_failure(seals, stop).await;
+    let mut sealed: Vec<SealedInput> = Vec::with_capacity(input_ids.len());
+    let mut failed = None;
+    for (superfile_id, result) in results {
+        match result {
+            // Never sent, so there is nothing to unseal.
+            None => {}
+            Some(Ok((sidecar, etag))) => sealed.push(SealedInput {
+                superfile_id,
+                bitmap: sidecar.bitmap,
+                etag,
+            }),
+            Some(Err(e)) => {
+                failed.get_or_insert(e);
+            }
+        }
+    }
+    if let Some(e) = failed {
+        unseal_all(wal_store, sealed).await;
+        return Err(e);
+    }
+    Ok(sealed)
+}
+
 /// Seal one input, retrying a CAS race with a writer up to `max_retries`
 /// times with backoff. `CasLost` just means a writer landed a tombstone
-/// bit between our read and write — not an abandoned compaction.
+/// bit between our read and write — not an abandoned compaction. Once
+/// `stop` is set another seal in the job has failed, so a retry gives up.
 async fn seal_with_bounded_retry(
     wal_store: &WalStore,
     superfile_id: Uuid,
     compaction_id: Uuid,
-    sealed_at: chrono::DateTime<Utc>,
+    sealed_at: DateTime<Utc>,
     stale_seal_timeout: Duration,
     max_retries: u32,
+    stop: &AtomicBool,
 ) -> Result<(TombstonesSidecar, Etag), CompactionError> {
     for attempt in 0..max_retries {
         match tombstones_admin::seal(
@@ -2014,8 +2161,14 @@ async fn seal_with_bounded_retry(
         .await
         {
             Ok(sealed) => return Ok(sealed),
-            Err(TombstonesAdminError::CasLost { .. }) if attempt + 1 < max_retries => {
+            Err(TombstonesAdminError::CasLost { .. })
+                if attempt + 1 < max_retries && !stop.load(Ordering::Relaxed) =>
+            {
                 time::sleep(backoff_delay(attempt)).await;
+                // Another seal may have failed while this one slept.
+                if stop.load(Ordering::Relaxed) {
+                    return Err(CompactionError::SealRetriesExhausted { superfile_id });
+                }
             }
             Err(TombstonesAdminError::CasLost { .. }) => {
                 return Err(CompactionError::SealRetriesExhausted { superfile_id });
@@ -2095,7 +2248,16 @@ async fn clear_completed_conversions(inner: &SupertableInner) -> Result<(), Comp
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, env, mem, str, sync::Arc, time::Duration};
+    use std::{
+        collections::HashSet,
+        env,
+        io::Error as IoError,
+        mem,
+        ops::Range,
+        str,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use arrow::util::pretty::pretty_format_batches;
     use arrow_array::{
@@ -2103,7 +2265,10 @@ mod tests {
         RecordBatch,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
+    use chrono::Duration as ChronoDuration;
     use datafusion::prelude::{col, lit};
+    use object_store::MultipartUpload;
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
     use tokio::task;
@@ -2113,12 +2278,13 @@ mod tests {
         *,
     };
     use crate::{
-        Bm25Stats, BoolMode, VectorSearchOptions,
+        BoolMode, VectorSearchOptions,
         config::{DEFAULT_GC_SAFETY_GAP, DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
         memory::ConnectionMemoryBudget,
+        storage::{ObjectMeta, StorageError},
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::{reader::Bm25SearchOptions, tokenize::STANDARD_TOKENIZER},
+            fts::reader::Bm25SearchOptions,
             reader::SuperfileReader,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
@@ -4277,9 +4443,7 @@ mod tests {
                     "title",
                     &token,
                     5,
-                    Bm25SearchOptions::new()
-                        .with_mode(BoolMode::And)
-                        .with_stats(Bm25Stats::Global),
+                    Bm25SearchOptions::new().with_mode(BoolMode::And),
                     Some(&["title"]),
                 )
                 .unwrap_or_else(|e| panic!("bm25_search for {token}: {e}"));
@@ -4370,14 +4534,10 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        let opts = SupertableOptions::new(
-            schema_id_title(),
-            vec![FtsConfig::new("title").analyzer(STANDARD_TOKENIZER)],
-            vec![],
-        )
-        .expect("options")
-        .with_writer_pool(pool)
-        .with_storage(Arc::clone(&storage));
+        let opts = SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
+            .expect("options")
+            .with_writer_pool(pool)
+            .with_storage(Arc::clone(&storage));
         let st = Supertable::create(opts).expect("create");
         let mut titles: Vec<String> = Vec::with_capacity(BATCHES * PER_BATCH);
         for b in 0..BATCHES {
@@ -4979,9 +5139,7 @@ mod tests {
                 "title",
                 query,
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25_search warmup");
@@ -4993,9 +5151,7 @@ mod tests {
                 "title",
                 query,
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25_search measured");
@@ -5961,6 +6117,379 @@ mod tests {
             assert!(
                 sealed.is_none(),
                 "superfile {id} is still sealed after its job was dropped"
+            );
+        }
+    }
+
+    /// Inputs in the stop-flag tests: twice the concurrency cap, so some are
+    /// still unsent when the first write fails.
+    const STOP_FLAG_INPUTS: usize = 2 * MAX_CONCURRENT_SEAL_WRITES;
+
+    /// How far past `writer_steal_timeout` the re-stamp tests date their
+    /// seals, so every one is old enough to be re-stamped whatever the config.
+    const SEAL_AGE_PAST_STEAL: Duration = Duration::from_secs(60);
+
+    /// Jobs in the cross-job re-stamp test. All their writes together fit
+    /// under the cap, so all are in flight at once.
+    const PAIR_JOBS: usize = 16;
+
+    /// Inputs per job in the multi-job re-stamp tests: the smallest
+    /// many-in-one merge.
+    const PAIR: usize = 2;
+
+    /// How long the cross-job re-stamp test waits. Re-stamping one job at a
+    /// time never finishes there: the gate holds the first job's writes until
+    /// the last job's write fails.
+    const CROSS_JOB_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Storage for the stop-flag tests. Every sidecar write waits until the
+    /// write for `failing` has failed, so that failure is always seen first,
+    /// and every sidecar that is written is recorded.
+    #[derive(Debug)]
+    struct GatedSidecarStorage {
+        inner: LocalFsStorageProvider,
+        failing: String,
+        error: fn(&str) -> StorageError,
+        gate: Semaphore,
+        written: Mutex<HashSet<String>>,
+    }
+
+    impl GatedSidecarStorage {
+        fn new(dir: &TempDir, failing: Uuid, error: fn(&str) -> StorageError) -> Arc<Self> {
+            Arc::new(Self {
+                inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+                failing: WalStore::tombstones_path(failing),
+                error,
+                gate: Semaphore::new(0),
+                written: Mutex::new(HashSet::new()),
+            })
+        }
+
+        fn written(&self) -> usize {
+            self.written.lock().expect("written lock").len()
+        }
+
+        /// Whether `id`'s sidecar was written through this store.
+        fn wrote(&self, id: Uuid) -> bool {
+            self.written
+                .lock()
+                .expect("written lock")
+                .contains(&WalStore::tombstones_path(id))
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for GatedSidecarStorage {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            self.inner.get(uri).await
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            if uri == self.failing {
+                self.gate.add_permits(Semaphore::MAX_PERMITS);
+                return Err((self.error)(uri));
+            }
+            drop(self.gate.acquire().await.expect("gate never closes"));
+            let etag = self.inner.put_if_match(uri, bytes, expected_etag).await?;
+            self.written
+                .lock()
+                .expect("written lock")
+                .insert(uri.to_string());
+            Ok(etag)
+        }
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+    }
+
+    fn transient(uri: &str) -> StorageError {
+        StorageError::TransientExhausted {
+            uri: uri.to_string(),
+            source: Box::new(IoError::other("injected fault")),
+        }
+    }
+
+    fn precondition(uri: &str) -> StorageError {
+        StorageError::PreconditionFailed {
+            uri: uri.to_string(),
+        }
+    }
+
+    /// A sidecar store over `dir` with no faults, for setting up seals.
+    fn plain_wal_store(dir: &TempDir) -> WalStore {
+        WalStore::new(Arc::new(
+            LocalFsStorageProvider::new(dir.path()).expect("provider"),
+        ))
+    }
+
+    /// A job holding real seals on `ids`, dated old enough to be re-stamped.
+    async fn aged_sealed_job(plain: &WalStore, ids: &[Uuid]) -> PreparedJob {
+        let compaction_id = Uuid::new_v4();
+        let age = ChronoDuration::from_std(
+            tombstones_admin::writer_steal_timeout() + SEAL_AGE_PAST_STEAL,
+        )
+        .expect("seal age fits");
+        let sealed_at = Utc::now() - age;
+        let sealed = seal_inputs(
+            plain,
+            ids,
+            compaction_id,
+            sealed_at,
+            DEFAULT_STALE_SEAL_TIMEOUT,
+            1,
+        )
+        .await
+        .expect("seal every input");
+        PreparedJob {
+            input_ids: ids.to_vec(),
+            compaction_id,
+            sealed_at,
+            carried_sidecar: None,
+            sealed,
+            new_entries: Vec::new(),
+            pending_storage_writes: Vec::new(),
+            bytes_for_store: None,
+            bytes_for_cache: None,
+            merged_superfile_id: Uuid::new_v4(),
+            term_contributions: Vec::new(),
+        }
+    }
+
+    /// Whether `id`'s sidecar still carries a seal.
+    async fn is_sealed(wal_store: &WalStore, id: Uuid) -> bool {
+        wal_store
+            .get_tombstones(id)
+            .await
+            .expect("get sidecar")
+            .and_then(|(sidecar, _)| sidecar.seal)
+            .is_some()
+    }
+
+    /// Once one seal fails, `seal_inputs` sends no new seals: only those
+    /// already in flight finish, and every one that landed is cleared.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seal_inputs_stops_sending_after_a_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let ids: Vec<Uuid> = (0..STOP_FLAG_INPUTS).map(|_| Uuid::new_v4()).collect();
+        let storage = GatedSidecarStorage::new(&dir, ids[0], transient);
+        let wal_store = WalStore::new(Arc::clone(&storage) as Arc<dyn StorageProvider>);
+
+        let result = seal_inputs(
+            &wal_store,
+            &ids,
+            Uuid::new_v4(),
+            Utc::now(),
+            DEFAULT_STALE_SEAL_TIMEOUT,
+            1,
+        )
+        .await;
+
+        assert!(result.is_err(), "the injected failure must surface");
+        assert!(
+            storage.written() <= MAX_CONCURRENT_SEAL_WRITES,
+            "only seals already in flight may be written, got {}",
+            storage.written()
+        );
+        for id in &ids {
+            assert!(
+                !is_sealed(&wal_store, *id).await,
+                "superfile {id} is still sealed after the job failed"
+            );
+        }
+    }
+
+    /// Once one re-stamp loses its write, `restamp_seals` sends no new ones.
+    /// The job is dropped, and every input's held etag still matches its
+    /// sidecar, so the unseal that follows clears all of them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restamp_seals_stops_sending_after_a_lost_write() {
+        let dir = TempDir::new().expect("tempdir");
+        let ids: Vec<Uuid> = (0..STOP_FLAG_INPUTS).map(|_| Uuid::new_v4()).collect();
+        let plain = plain_wal_store(&dir);
+        let mut batch = vec![aged_sealed_job(&plain, &ids).await];
+        let failing = batch[0].sealed[0].superfile_id;
+
+        let storage = GatedSidecarStorage::new(&dir, failing, precondition);
+        let wal_store = WalStore::new(Arc::clone(&storage) as Arc<dyn StorageProvider>);
+        let stale = restamp_seals(&wal_store, &mut batch, Utc::now())
+            .await
+            .expect("a lost write drops the job rather than failing");
+
+        assert_eq!(
+            stale,
+            vec![(0, failing)],
+            "the job that lost a write is dropped"
+        );
+        assert!(
+            storage.written() <= MAX_CONCURRENT_SEAL_WRITES,
+            "only re-stamps already in flight may be written, got {}",
+            storage.written()
+        );
+        for input in &batch[0].sealed {
+            let (_, etag) = plain
+                .get_tombstones(input.superfile_id)
+                .await
+                .expect("get sidecar")
+                .expect("sealed above");
+            assert_eq!(
+                input.etag, etag,
+                "superfile {} holds an etag its sidecar no longer has",
+                input.superfile_id
+            );
+        }
+
+        unseal_batch(&plain, batch).await;
+        for id in &ids {
+            assert!(
+                !is_sealed(&plain, *id).await,
+                "superfile {id} is still sealed after its job was dropped"
+            );
+        }
+    }
+
+    /// `restamp_seals` runs every job's re-stamps together, not one job after
+    /// another, and a lost write drops only the job it belongs to.
+    ///
+    /// The lost write is in the last job, and every other write waits for it.
+    /// Re-stamping job by job would wait on the first job forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restamp_seals_runs_every_jobs_writes_together() {
+        let dir = TempDir::new().expect("tempdir");
+        let plain = plain_wal_store(&dir);
+        let mut batch = Vec::with_capacity(PAIR_JOBS);
+        for _ in 0..PAIR_JOBS {
+            let ids: Vec<Uuid> = (0..PAIR).map(|_| Uuid::new_v4()).collect();
+            batch.push(aged_sealed_job(&plain, &ids).await);
+        }
+        let last = PAIR_JOBS - 1;
+        let failing = batch[last].sealed[0].superfile_id;
+
+        let storage = GatedSidecarStorage::new(&dir, failing, precondition);
+        let wal_store = WalStore::new(Arc::clone(&storage) as Arc<dyn StorageProvider>);
+        let now = Utc::now();
+        let stale = time::timeout(
+            CROSS_JOB_TIMEOUT,
+            restamp_seals(&wal_store, &mut batch, now),
+        )
+        .await
+        .expect("re-stamps across jobs must run together")
+        .expect("a lost write drops the job rather than failing");
+
+        assert_eq!(
+            stale,
+            vec![(last, failing)],
+            "only the job that lost a write is dropped"
+        );
+        for (i, prepared) in batch[..last].iter().enumerate() {
+            assert_eq!(
+                prepared.sealed_at, now,
+                "job {i} was fully re-stamped, so its seals are young again"
+            );
+        }
+    }
+
+    /// A lost write skips the rest of its own job only. A later job is still
+    /// re-stamped in full, so it keeps its place in the batch with a fresh
+    /// seal instead of riding into the upload on an old one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_write_does_not_skip_other_jobs() {
+        let dir = TempDir::new().expect("tempdir");
+        let plain = plain_wal_store(&dir);
+        // The losing job fills every slot and has more to send, so the other
+        // job's writes are only reached after the loss.
+        let ids: Vec<Uuid> = (0..STOP_FLAG_INPUTS).map(|_| Uuid::new_v4()).collect();
+        let pair: Vec<Uuid> = (0..PAIR).map(|_| Uuid::new_v4()).collect();
+        let mut batch = vec![
+            aged_sealed_job(&plain, &ids).await,
+            aged_sealed_job(&plain, &pair).await,
+        ];
+        let failing = batch[0].sealed[0].superfile_id;
+        let lost_job_sealed_at = batch[0].sealed_at;
+
+        let storage = GatedSidecarStorage::new(&dir, failing, precondition);
+        let wal_store = WalStore::new(Arc::clone(&storage) as Arc<dyn StorageProvider>);
+        let now = Utc::now();
+        let stale = restamp_seals(&wal_store, &mut batch, now)
+            .await
+            .expect("a lost write drops the job rather than failing");
+
+        assert_eq!(
+            stale,
+            vec![(0, failing)],
+            "only the job that lost a write is dropped"
+        );
+        // On the fence path the dropped job stays in the batch for the retry,
+        // which must re-stamp it again rather than trust a fresh-looking seal.
+        assert_eq!(
+            batch[0].sealed_at, lost_job_sealed_at,
+            "the job that lost a write must keep its old seal time"
+        );
+        let lost_job_writes = ids.iter().filter(|id| storage.wrote(**id)).count();
+        assert!(
+            lost_job_writes <= MAX_CONCURRENT_SEAL_WRITES,
+            "the losing job's unsent re-stamps must be skipped, got {lost_job_writes}"
+        );
+        for id in &pair {
+            assert!(
+                storage.wrote(*id),
+                "the other job's {id} must be re-stamped"
+            );
+        }
+        assert_eq!(
+            batch[1].sealed_at, now,
+            "the other job was re-stamped in full, so its seals are young again"
+        );
+    }
+
+    /// A storage error stops every write not yet sent, in every job, since it
+    /// fails the whole call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_storage_error_stops_every_job() {
+        let dir = TempDir::new().expect("tempdir");
+        let plain = plain_wal_store(&dir);
+        // The failing job fills every slot, so the other job is never sent.
+        let ids: Vec<Uuid> = (0..MAX_CONCURRENT_SEAL_WRITES)
+            .map(|_| Uuid::new_v4())
+            .collect();
+        let pair: Vec<Uuid> = (0..PAIR).map(|_| Uuid::new_v4()).collect();
+        let mut batch = vec![
+            aged_sealed_job(&plain, &ids).await,
+            aged_sealed_job(&plain, &pair).await,
+        ];
+        let failing = batch[0].sealed[0].superfile_id;
+
+        let storage = GatedSidecarStorage::new(&dir, failing, transient);
+        let wal_store = WalStore::new(Arc::clone(&storage) as Arc<dyn StorageProvider>);
+        let result = restamp_seals(&wal_store, &mut batch, Utc::now()).await;
+
+        assert!(result.is_err(), "a storage error fails the call");
+        for id in &pair {
+            assert!(
+                !storage.wrote(*id),
+                "the other job's {id} must not be sent after a storage error"
             );
         }
     }

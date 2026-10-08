@@ -157,7 +157,7 @@ fn build_positional_test_bytes() -> Bytes {
 
 #[tokio::test]
 async fn open_lazy_reads_positional_v2_blob_like_eager() {
-    // The v2 header extension and the shifted FST prefetch range are
+    // The v2 header extension and the shifted dictionary prefetch range are
     // lazy-open-specific code paths; this pins them against the eager
     // open on the same bytes, including a term resolution (postings
     // fetch through the lazy source with the positional term-meta
@@ -454,7 +454,7 @@ async fn cold_open_lazy_within_documented_range_budget_for_vec_plus_fts() {
     //   1 footer tail
     //   3 vector metadata ranges (outer header, directory+crc, subheader;
     //     +1 more for Sq8 codec_meta on Sq8 superfiles)
-    //   3 FTS metadata ranges (header, FST directory, doc-length tail)
+    //   3 FTS metadata ranges (header, dictionary directory, doc-length tail)
     //
     // This tiny fixture uses a non-Sq8 vector superfile, so the expected
     // combined budget is 7. The production latency target is governed by

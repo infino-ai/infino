@@ -12,15 +12,18 @@
 use std::fmt;
 
 use super::{
-    core::{FtsReader, fetch_source_range, header_postings_length},
-    cursor::{SubindexKind, TermMeta},
+    core::{FtsReader, fetch_source_range},
+    cursor::TermMeta,
 };
 use crate::{
     superfile::{
         ReadError,
         bits::width_of,
         error::FtsError,
-        format::{self, FST_SEPARATOR, fts::POSITION_SUBINDEX_ENTRIES_PER_BLOCK},
+        format::{
+            self, KEY_SEPARATOR,
+            fts::{coarse_slot, skip_entry},
+        },
         fts::{
             builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
             posting::{
@@ -30,7 +33,7 @@ use crate::{
             short::{decode_short, short_df},
         },
     },
-    utils::terms::FstValue,
+    utils::terms::DictEntry,
 };
 
 /// Upper edges of the document-frequency bands a term is filed under.
@@ -65,11 +68,10 @@ pub struct DfBucket {
     /// Terms in the short form and their body bytes.
     pub short_terms: u64,
     pub short_bytes: u64,
-    /// Long-form fixed overhead: metadata headers, skip entries, position
-    /// sub-index rows, coarse slots, block headers.
+    /// Long-form fixed overhead: metadata headers, skip entries, coarse
+    /// slots, block headers.
     pub meta_bytes: u64,
     pub skip_bytes: u64,
-    pub subindex_bytes: u64,
     pub coarse_bytes: u64,
     pub block_header_bytes: u64,
     /// Long-form payload: packed doc-id lanes, packed tf lanes, bitset
@@ -113,7 +115,6 @@ impl DfBucket {
         self.short_bytes += o.short_bytes;
         self.meta_bytes += o.meta_bytes;
         self.skip_bytes += o.skip_bytes;
-        self.subindex_bytes += o.subindex_bytes;
         self.coarse_bytes += o.coarse_bytes;
         self.block_header_bytes += o.block_header_bytes;
         self.docid_bytes += o.docid_bytes;
@@ -141,7 +142,6 @@ impl DfBucket {
         self.short_bytes
             + self.meta_bytes
             + self.skip_bytes
-            + self.subindex_bytes
             + self.coarse_bytes
             + self.block_header_bytes
             + self.docid_bytes
@@ -151,11 +151,7 @@ impl DfBucket {
 
     /// Long-form bytes that are neither doc ids, tfs nor a bitset.
     pub fn fixed_overhead_bytes(&self) -> u64 {
-        self.meta_bytes
-            + self.skip_bytes
-            + self.subindex_bytes
-            + self.coarse_bytes
-            + self.block_header_bytes
+        self.meta_bytes + self.skip_bytes + self.coarse_bytes + self.block_header_bytes
     }
 }
 
@@ -175,7 +171,7 @@ pub struct ColumnSizeBreakdown {
 pub struct FtsSizeBreakdown {
     pub n_docs: u64,
     pub n_terms: u64,
-    pub fst_bytes: u64,
+    pub dict_bytes: u64,
     pub postings_region_bytes: u64,
     pub positions_region_bytes: u64,
     pub columns: Vec<ColumnSizeBreakdown>,
@@ -206,17 +202,13 @@ impl FtsReader {
     /// Walks the whole dictionary and fetches every term range; a
     /// report, not a query.
     pub fn size_breakdown(&self) -> Result<FtsSizeBreakdown, FtsError> {
-        let fst_bytes = self.dict_bytes()?;
-        let dict = self.open_dict(&fst_bytes)?;
+        let dict_bytes = self.dict_bytes()?;
+        let dict = Self::open_dict(&dict_bytes)?;
         let mut columns = Vec::with_capacity(self.columns.len());
         for col in &self.columns {
             let positional = col.positions;
-            let subindex = match positional {
-                true => self.subindex,
-                false => SubindexKind::None,
-            };
             let mut prefix = col.name.as_bytes().to_vec();
-            prefix.push(FST_SEPARATOR);
+            prefix.push(KEY_SEPARATOR);
             let mut buckets: Vec<DfBucket> = DF_BAND_LABELS
                 .iter()
                 .map(|&label| DfBucket {
@@ -229,30 +221,20 @@ impl FtsReader {
             for (key, packed) in dict.iter_prefix(&prefix) {
                 let key_bytes = (key.len() - prefix.len()) as u64;
                 match packed {
-                    FstValue::Inline { .. } => {
+                    DictEntry::Inline { .. } => {
                         let b = &mut buckets[band_of(1)];
                         b.terms += 1;
                         b.postings += 1;
                         b.key_bytes += key_bytes;
                         b.inline_terms += 1;
                     }
-                    FstValue::Pfor {
+                    DictEntry::Pfor {
                         metadata_offset,
-                        postings_length_hint,
+                        postings_length,
                         short,
                     } => {
                         let start = self.postings_range.start + metadata_offset as usize;
-                        let len = match postings_length_hint {
-                            Some(l) => l as usize,
-                            None => header_postings_length(
-                                fetch_source_range(
-                                    &self.source,
-                                    start..start + TERM_META_SIZE,
-                                    "fts/size header",
-                                )?
-                                .as_ref(),
-                            )?,
-                        };
+                        let len = postings_length as usize;
                         let bytes =
                             fetch_source_range(&self.source, start..start + len, "fts/size term")?;
                         let tb = bytes.as_ref();
@@ -282,14 +264,7 @@ impl FtsReader {
                                 .unwrap_or(0);
                             continue;
                         }
-                        let meta = TermMeta::parse(
-                            tb,
-                            0,
-                            positional,
-                            subindex,
-                            self.bounds,
-                            self.positions_grouped,
-                        )?;
+                        let meta = TermMeta::parse(tb, 0, positional)?;
                         let nb = meta.num_blocks as u64;
                         let b = &mut buckets[band_of(meta.df)];
                         b.terms += 1;
@@ -301,25 +276,16 @@ impl FtsReader {
                             true => TERM_META_POSITIONAL_SIZE,
                             false => TERM_META_SIZE,
                         } as u64;
-                        b.skip_bytes += nb * meta.skip.entry_bytes(positional) as u64;
-                        b.subindex_bytes += nb
-                            * (POSITION_SUBINDEX_ENTRIES_PER_BLOCK * subindex.entry_bytes()) as u64;
-                        if meta.has_coarse {
-                            b.coarse_bytes += nb
-                                .div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN as u64)
-                                * meta.skip.coarse_slot_bytes() as u64;
-                        }
+                        b.skip_bytes += nb * skip_entry::bytes(positional) as u64;
+                        b.coarse_bytes += nb.div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN as u64)
+                            * coarse_slot::BYTES as u64;
                         b.positions_bytes += u64::from(meta.positions_length);
                         let mut prev_end: Option<usize> = None;
                         for i in 0..meta.num_blocks {
                             let range = meta.block_range_in_term(tb, i, prev_end);
                             prev_end = Some(range.end);
                             let block = &tb[range];
-                            let hdr = BlockHeader::parse(
-                                block,
-                                meta.block_layout,
-                                meta.prev_last_doc_id(tb, i),
-                            );
+                            let hdr = BlockHeader::parse(block, meta.prev_last_doc_id(tb, i));
                             let doc_count = hdr.count() as u64;
                             b.block_header_bytes += hdr.payload() as u64;
                             if doc_count < LANES {
@@ -396,13 +362,9 @@ impl FtsReader {
         Ok(FtsSizeBreakdown {
             n_docs: u64::from(self.n_docs),
             n_terms: u64::from(self.n_terms_total),
-            fst_bytes: self.fst_range.len() as u64,
+            dict_bytes: self.dict_range.len() as u64,
             postings_region_bytes: self.postings_range.len() as u64,
-            positions_region_bytes: self
-                .positions_range
-                .as_ref()
-                .map(|r| r.len() as u64)
-                .unwrap_or(0),
+            positions_region_bytes: self.positions_range.len() as u64,
             columns,
         })
     }
@@ -417,9 +379,9 @@ impl fmt::Display for FtsSizeBreakdown {
         writeln!(f, "fts blob: {} docs, {} terms", self.n_docs, self.n_terms)?;
         writeln!(
             f,
-            "  fst        {:>12} B  {:>9.2} MiB",
-            self.fst_bytes,
-            mib(self.fst_bytes)
+            "  dict       {:>12} B  {:>9.2} MiB",
+            self.dict_bytes,
+            mib(self.dict_bytes)
         )?;
         writeln!(
             f,
@@ -443,7 +405,7 @@ impl fmt::Display for FtsSizeBreakdown {
             )?;
             writeln!(
                 f,
-                "  {:<12} {:>9} {:>11} {:>7} {:>7} | {:>8} {:>8} | {:>7} {:>7} {:>7} {:>7} {:>7} | {:>8} {:>8} {:>8} {:>7} {:>8} | {:>8} | {:>8}",
+                "  {:<12} {:>9} {:>11} {:>7} {:>7} | {:>8} {:>8} | {:>7} {:>7} {:>7} {:>7} | {:>8} {:>8} {:>8} {:>7} {:>8} | {:>8} | {:>8}",
                 "band",
                 "terms",
                 "postings",
@@ -453,7 +415,6 @@ impl fmt::Display for FtsSizeBreakdown {
                 "keyMiB",
                 "metaMiB",
                 "skipMiB",
-                "subMiB",
                 "crsMiB",
                 "hdrMiB",
                 "docidMiB",
@@ -470,7 +431,7 @@ impl fmt::Display for FtsSizeBreakdown {
                 }
                 writeln!(
                     f,
-                    "  {:<12} {:>9} {:>11} {:>7} {:>7} | {:>8.2} {:>8.2} | {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} | {:>8.2} {:>8.2} {:>8.2} {:>7.2} {:>8.2} | {:>8.2} | {:>8.2}",
+                    "  {:<12} {:>9} {:>11} {:>7} {:>7} | {:>8.2} {:>8.2} | {:>7.2} {:>7.2} {:>7.2} {:>7.2} | {:>8.2} {:>8.2} {:>8.2} {:>7.2} {:>8.2} | {:>8.2} | {:>8.2}",
                     b.label,
                     b.terms,
                     b.postings,
@@ -480,7 +441,6 @@ impl fmt::Display for FtsSizeBreakdown {
                     mib(b.key_bytes),
                     mib(b.meta_bytes),
                     mib(b.skip_bytes),
-                    mib(b.subindex_bytes),
                     mib(b.coarse_bytes),
                     mib(b.block_header_bytes),
                     mib(b.docid_bytes),
@@ -552,12 +512,11 @@ impl fmt::Display for FtsSizeBreakdown {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use bytes::Bytes;
 
     use super::*;
-    use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
+    use crate::superfile::fts::builder::FtsBuilder;
 
     #[test]
     fn patched_form_is_granted_only_under_the_posting_cap() {
@@ -566,7 +525,7 @@ mod tests {
         // carry one large delta among small ones, exactly the shape the
         // patched form is for. `rare` sits under the cap and takes it;
         // `common` is over it and stays plain, the histograms tally.
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("text".into(), false).expect("register");
         for i in 0..24_000u32 {
             let in_hole = i % 4_000 >= 3_000;
@@ -582,7 +541,7 @@ mod tests {
             }
             b.add_doc(0, i, &text).expect("doc");
         }
-        let json = r#"[{"name":"text","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"text","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let s = r.size_breakdown().expect("breakdown");
         let c = &s.columns[0];
@@ -630,7 +589,7 @@ mod tests {
 
     #[test]
     fn every_postings_byte_is_attributed_and_forms_are_told_apart() {
-        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), true).expect("register");
         // `only` inlines (df=1, tf=1); `pair` is short (df=2); `every`
         // spans two blocks (long form).
@@ -642,7 +601,7 @@ mod tests {
             };
             b.add_doc(0, i, text).expect("doc");
         }
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let s = r.size_breakdown().expect("breakdown");
         assert_eq!(s.columns.len(), 1);

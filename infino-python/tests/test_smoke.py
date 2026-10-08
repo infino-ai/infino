@@ -74,45 +74,12 @@ def test_memory_roundtrip():
 
 
 def test_fts_standard_analyzer_keeps_non_ascii():
-    # The `analyzer` kwarg selects the tokenizer. The default, standard
-    # (UAX #29 + lowercase), keeps non-ASCII; ascii_lower drops it, so
-    # "café" is unsearchable under it.
+    # Every column is analyzed by `standard` (UAX #29 + lowercase), which
+    # keeps non-ASCII, so "café" is searchable.
     db = infino.connect("memory://")
-
-    std_tbl = db.create_table(
-        "std", _title_schema(), infino.IndexSpec().fts("title", analyzer="standard")
-    )
-    std_tbl.append(_title_batch(["café latte"]))
-    assert std_tbl.bm25_search("title", "café", 10).num_rows == 1
-
-    ascii_tbl = db.create_table(
-        "ascii", _title_schema(), infino.IndexSpec().fts("title", analyzer="ascii_lower")
-    )
-    ascii_tbl.append(_title_batch(["café latte"]))
-    try:
-        ascii_hits = ascii_tbl.bm25_search("title", "café", 10).num_rows
-    except infino.InfinoError:
-        ascii_hits = 0
-    assert ascii_hits == 0
-
-
-def test_bm25_stats_kwarg():
-    # `stats` selects the BM25 corpus statistics. Both modes return the
-    # matching docs; the default is global. Correctness of the
-    # global ranking is covered by the Rust oracle; here we just exercise
-    # the binding and the string parsing.
-    db = infino.connect("memory://")
-    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
-    for title in ["the quick brown fox", "a lazy dog", "the quick red fox"]:
-        t.append(_title_batch([title]))
-
-    default_hits = t.bm25_search("title", "fox", 10)
-    per_sf = t.bm25_search("title", "fox", 10, stats="per_superfile")
-    global_hits = t.bm25_search("title", "fox", 10, stats="global")
-
-    assert default_hits.num_rows == 2
-    assert per_sf.num_rows == 2
-    assert global_hits.num_rows == 2
+    tbl = db.create_table("std", _title_schema(), infino.IndexSpec().fts("title"))
+    tbl.append(_title_batch(["café latte"]))
+    assert tbl.bm25_search("title", "café", 10).num_rows == 1
 
 
 def test_bm25_params_declared_and_overridden():
@@ -153,15 +120,10 @@ def test_fts_positional_arguments_keep_their_meaning():
     # repositions `stored` / `k1` / `b` for downstream positional callers
     # and no test fails. This pins the order so that change has to break
     # here first.
-    #
-    # It has happened: the stopwords/stemmer/positions options were first
-    # added *before* `stored`, which turned `fts("body", "standard",
-    # False)` into a `TypeError` — caught in review, not by CI.
     db = infino.connect("memory://")
     titles = ["the quick brown fox", "a lazy dog", "quick thinking about foxes"]
 
-    # Slot 3 is `stored`, so a bool is accepted there. Under the broken
-    # signature this raised TypeError before doing anything.
+    # Slot 3 is `stored`, so a bool is accepted there.
     index_only = db.create_table(
         "index_only", _title_schema(), infino.IndexSpec().fts("title", "standard", False)
     )
@@ -222,7 +184,7 @@ def test_analysis_options_are_keyword_only():
     # as more options are added — the next one cannot repeat the
     # mid-signature insertion that broke it.
     with pytest.raises(TypeError):
-        infino.IndexSpec().fts("title", "standard", True, 1.6, 0.4, "english")
+        infino.IndexSpec().fts("title", True, 1.6, 0.4, "english")
     # And they still work by keyword, in any combination.
     spec = infino.IndexSpec().fts(
         "title", stopwords="english", stemmer="english", positions=True
@@ -277,21 +239,12 @@ def test_bm25_params_out_of_range_is_rejected():
             )
 
 
-def test_bm25_unknown_stats_is_rejected():
-    # An unknown stats mode is a configuration error, surfaced as ValueError.
+def test_fts_accepts_only_the_standard_analyzer():
     db = infino.connect("memory://")
-    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
-    t.append(_title_batch(["the quick brown fox"]))
-    with pytest.raises(ValueError):
-        t.bm25_search("title", "fox", 10, stats="nonesuch")
-
-
-def test_fts_unknown_analyzer_is_rejected():
-    # An unknown analyzer is a configuration error, surfaced as ValueError.
-    db = infino.connect("memory://")
-    with pytest.raises(ValueError):
+    db.create_table("pinned", _title_schema(), infino.IndexSpec().fts("title", analyzer="standard"))
+    with pytest.raises(ValueError, match="ascii_lower"):
         db.create_table(
-            "bad", _title_schema(), infino.IndexSpec().fts("title", analyzer="nonesuch")
+            "other", _title_schema(), infino.IndexSpec().fts("title", analyzer="ascii_lower")
         )
 
 

@@ -118,7 +118,7 @@ use crate::{
         format::{
             CRC_BYTES,
             footer::read_kv_metadata,
-            fts::{HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, U64_BYTES, hdr},
+            fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr},
             kv,
             vec::{
                 CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE,
@@ -126,6 +126,7 @@ use crate::{
                 sub_hdr,
             },
         },
+        fts::builder::DOC_LENGTHS_ENTRY_SIZE,
         reader::vector_layout_from_kv,
         vector::{
             builder::{
@@ -169,7 +170,7 @@ use crate::{
                 PartitionStrategy, WIDTH_LAW_KS,
             },
             listed_once, options_hash,
-            part::{self as part_mod, ContentHash, PartId},
+            part::{self as part_mod, PartId},
             superfile_stem,
             term_index::{self, Contribution as TermContribution, TermIndexError},
             term_stats,
@@ -373,8 +374,8 @@ const BUILD_SCALAR_NUM: usize = 5;
 // f32 vector payload, rebuilt as quantized + rerank codecs alongside the raw input: ~6.5x.
 const BUILD_VECTOR_NUM: usize = 13;
 
-// FTS text, ~1.5x for the FST + postings structures. Added on top of the scalar factor, not
-// instead of it: the same text bytes are held as a column and drive the index build at once.
+// FTS text, ~1.5x for the term dictionary + postings structures. Added on top of the scalar factor,
+// not instead of it: the same text bytes are held as a column and drive the index build at once.
 const BUILD_FTS_NUM: usize = 3;
 
 /// Single-writer append + commit handle.
@@ -2338,15 +2339,15 @@ impl SupertableWriter {
         }
 
         // The commit's payload, read off the taken buffer before either
-        // shard-count helper is consulted, so both arms price the same
-        // number. Deliberately not the sealed output: every shard carries
-        // its own dictionary, FST and index headers, so sealed bytes scale
-        // with the shard split — and the split follows the writer pool's
-        // width. On a shared-vocabulary corpus the same input seals to
-        // roughly four times more bytes at width 16 than at width 1, so
-        // pricing off sealed bytes makes an identical append plan more
-        // requests on a wider host, which is precisely what the write-side
-        // determinism contract forbids.
+        // shard-count helper is consulted, so both arms price the same number.
+        // Deliberately not the sealed output: every shard carries its own
+        // Parquet dictionaries, term dictionary and index headers, so sealed
+        // bytes scale with the shard split — and the split follows the writer
+        // pool's width. On a shared-vocabulary corpus the same input seals to
+        // roughly four times more bytes at width 16 than at width 1, so pricing
+        // off sealed bytes makes an identical append plan more requests on a
+        // wider host, which is precisely what the write-side determinism
+        // contract forbids.
         let payload_bytes = buffered_payload_bytes(buffer);
 
         let list_metadata = CommitListMetadata {
@@ -3187,11 +3188,6 @@ fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>>
     if blob.len() < FTS_HEADER_SIZE {
         return None;
     }
-    let version = read_u32_le(blob.get(hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES)?);
-    let header_size = match version == crate::superfile::format::fts::VERSION_V1_LEGACY {
-        true => FTS_HEADER_SIZE,
-        false => crate::superfile::format::fts::HEADER_SIZE_V2,
-    };
     let n_columns =
         read_u32_le(blob.get(hdr::N_COLUMNS_OFF..hdr::N_COLUMNS_OFF + U32_BYTES)?) as usize;
     let doc_lengths_offset =
@@ -3199,13 +3195,13 @@ fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>>
             as usize;
     // Entries plus the directory's CRC.
     let dir_len = n_columns
-        .checked_mul(crate::superfile::fts::builder::DOC_LENGTHS_ENTRY_SIZE)?
+        .checked_mul(DOC_LENGTHS_ENTRY_SIZE)?
         .checked_add(4)?;
-    if header_size > blob.len() || doc_lengths_offset.checked_add(dir_len)? > blob.len() {
+    if doc_lengths_offset.checked_add(dir_len)? > blob.len() {
         return None;
     }
     Some(merge_ranges(vec![
-        (off, header_size as u64),
+        (off, FTS_HEADER_SIZE as u64),
         (off + doc_lengths_offset as u64, dir_len as u64),
     ]))
 }
@@ -3432,7 +3428,7 @@ async fn write_superfile_terms(
         })
         .collect();
     columns.sort();
-    let fst_bytes = fts
+    let dict_bytes = fts
         .dict_bytes_async()
         .await
         .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
@@ -3441,7 +3437,7 @@ async fn write_superfile_terms(
         loop {
             let chunk = fts
                 .term_index_facts_after(
-                    &fst_bytes,
+                    &dict_bytes,
                     column,
                     after.as_deref(),
                     TERM_INDEX_BATCH_TERMS,
@@ -4539,16 +4535,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 remote_state.checkpoint.shard_count
             )));
         }
-        // Same acceptance rule as reopening the table: a checkpoint
-        // written before the engine's current options encoding still
-        // identifies this table, so a drain that spans an upgrade
-        // resumes instead of wedging on a re-encoded digest.
-        let checkpoint_hash = ContentHash::from_hex(&remote_state.checkpoint.options_hash);
-        let recognized = checkpoint_hash.is_some_and(|stored| {
-            options_hash::verify_options_hash(user_inner.options.as_ref(), &user_strategy, stored)
-                .is_ok()
-        });
-        if !recognized {
+        if remote_state.checkpoint.options_hash != current_options_hash {
             return Err(BuildError::Store(format!(
                 "drain checkpoint options hash {} != current {}",
                 remote_state.checkpoint.options_hash, current_options_hash
@@ -4897,10 +4884,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 .get(&entry.storage_path())
                                 .await
                                 .map_err(|e| BuildError::Store(e.to_string()))?;
-                            Arc::new(
-                                SuperfileReader::open(bytes)
-                                    .map_err(|e| BuildError::Store(e.to_string()))?,
-                            )
+                            Arc::new(SuperfileReader::open(bytes).map_err(BuildError::from)?)
                         }
                     };
                     // Write-path materialization: no per-query collector.
@@ -5975,7 +5959,7 @@ async fn open_ivf_reader_with_tombstones(
         ReadIntent::Warm,
     )
     .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
+    .map_err(BuildError::from)?;
     Ok((reader, bitmap))
 }
 
@@ -6099,7 +6083,7 @@ async fn cell_doc_counts_via_reader(
         ReadIntent::Warm,
     )
     .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
+    .map_err(BuildError::from)?;
     let v = reader
         .vec()
         .ok_or_else(|| BuildError::Store("IVF entry missing vector index".into()))?;
@@ -9445,7 +9429,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             )
             .instrument(open_span.clone())
             .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+            .map_err(BuildError::from)?;
             let mut bases = HashMap::new();
             if let Some(vr) = reader.vec() {
                 if let Some(cluster_vecs) = vr.resident_fine_cluster_vectors(column.as_str()) {
@@ -9671,7 +9655,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             entry,
         )
         .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+        .map_err(BuildError::from)?;
         // `None` here is a legacy single-cell layout — skip its depth
         // observation; the finish fallback keeps the previous depth law
         // rather than shallowing it on partial evidence.
@@ -12125,7 +12109,7 @@ mod tests {
         config::Config,
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
+            fts::reader::{Bm25SearchOptions, BoolMode},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -12781,9 +12765,7 @@ mod tests {
                 "title",
                 "alpha",
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 over one-piece commit");
@@ -14214,8 +14196,8 @@ mod tests {
             .expect("title FTS summary present");
 
         // Each doc's title is "doc <i> alpha"; tokenized with
-        // ASCII-lower, distinct terms include "doc", "alpha",
-        // and digits 0-3. The FST will dedupe; n_terms_distinct
+        // `standard`, distinct terms include "doc", "alpha",
+        // and digits 0-3. The term dictionary will dedupe; n_terms_distinct
         // is at least 3 (doc, alpha, plus some digit tokens).
         assert!(
             fts.n_terms_distinct >= 3,
@@ -14226,7 +14208,10 @@ mod tests {
         assert!(fts.may_contain(b"alpha"));
         assert!(fts.may_contain(b"doc"));
         // Lex range should be present and consistent.
-        let (min_term, max_term) = fts.term_range.as_ref().expect("non-empty FST has a range");
+        let (min_term, max_term) = fts
+            .term_range
+            .as_ref()
+            .expect("non-empty dictionary has a range");
         assert!(!min_term.is_empty());
         assert!(!max_term.is_empty());
         assert!(min_term <= max_term, "min_term <= max_term invariant");

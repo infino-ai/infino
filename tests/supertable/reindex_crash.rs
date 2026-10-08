@@ -15,11 +15,9 @@
 //!
 //! `supertable_commit_crash_localfs.rs` wraps the storage provider and
 //! aborts immediately after a chosen PUT, which places the kill exactly.
-//! Neither half of that works here. A corpus table is opened through the
-//! catalog, and `connect_with` takes a URI rather than a provider, so
-//! there is nowhere to hang a wrapper. And a table this engine wrote is
-//! never stale, so a fixture built in-process would plan no jobs at all —
-//! the input has to be bytes an older release wrote.
+//! That does not work here: the fixture is opened through the catalog,
+//! and `connect_with` takes a URI rather than a provider, so there is
+//! nowhere to hang a wrapper.
 //!
 //! So the child watches its own table directory and aborts once a chosen
 //! number of rewritten superfiles have appeared. `abort()` raises SIGABRT
@@ -40,13 +38,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use infino::{ReindexOptions, connect, superfile::format::fts::VERSION_CURRENT};
+use infino::{ReindexOptions, connect, test_helpers::copy_dir_recursive};
 use tempfile::TempDir;
 
 use crate::{
-    corpus_shapes::{
-        N_DOCS, TABLE, assert_scores_equivalent, blob_versions, copy_tree, corpus_dir, hits,
-        scores_by_id, superfile_paths,
+    reindex_fixture::{
+        N_DOCS, Staleness, TABLE, assert_scores_equivalent, file_revisions, hits, scores_by_id,
+        superfile_paths, write_stale_table,
     },
     reindex_invariance::{DELETED_DOCS, delete_leading_rows, rows_by_id},
 };
@@ -55,21 +53,17 @@ use crate::{
 /// makes the child a child.
 const ENV_DIR: &str = "INFINO_REINDEX_CRASH_DIR";
 
-/// The shape this runs against: five superfiles, so a run has jobs left to
-/// resume after the kill. A single-superfile table would make "interrupted"
-/// and "not started" the same state.
-const CRASH_SHAPE: &str = "v2_positions_region";
-/// Blob version that shape carries before the migration.
-const CRASH_SHAPE_VERSION: u32 = 2;
-/// Superfiles the corpus shape holds.
-const CRASH_SHAPE_SUPERFILES: usize = 5;
+/// The staleness this runs against. The fixture holds several superfiles,
+/// so a run has jobs left to resume after the kill: a single-superfile
+/// table would make "interrupted" and "not started" the same state.
+const CRASH_STALENESS: Staleness = Staleness::Analysis;
 
 /// Rewritten superfiles that must appear before the child aborts.
 ///
-/// Two, so the kill lands with at least one job committed and at least two
-/// still to do — the state the resume has to pick up. One would leave the
-/// crash indistinguishable from a run that never started; five would leave
-/// nothing to resume.
+/// Two, so the kill lands with at least one job committed and more still
+/// to do — the state the resume has to pick up. One would leave the crash
+/// indistinguishable from a run that never started; all of them would
+/// leave nothing to resume.
 const ABORT_AFTER_REWRITES: usize = 2;
 
 /// How often the watcher counts superfiles on disk.
@@ -91,9 +85,9 @@ const WATCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// manifest.
 fn run_reindex_crash_child(dir: PathBuf) -> ! {
     let watch_root = dir.clone();
+    let target = superfile_paths(&watch_root).len() + ABORT_AFTER_REWRITES;
     thread::spawn(move || {
         let deadline = Instant::now() + WATCH_TIMEOUT;
-        let target = CRASH_SHAPE_SUPERFILES + ABORT_AFTER_REWRITES;
         while Instant::now() < deadline {
             if superfile_paths(&watch_root).len() >= target {
                 // No unwinding, no destructors, no flush: the process is
@@ -106,8 +100,8 @@ fn run_reindex_crash_child(dir: PathBuf) -> ! {
     });
 
     let db = connect(dir.to_str().expect("utf-8 path")).expect("child connects");
-    let table = db.open_table(TABLE).expect("child opens the corpus table");
-    let _ = table.reindex(&ReindexOptions::rewriting());
+    let table = db.open_table(TABLE).expect("child opens the fixture table");
+    let _ = table.reindex(&ReindexOptions::default());
 
     // Reaching here means the whole run landed before the watcher fired.
     // Exiting zero makes the parent fail loudly rather than pass on a
@@ -128,15 +122,12 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
     if dispatch_child_if_set().is_some() {
         return;
     }
-    let Some(src) = corpus_dir(CRASH_SHAPE) else {
-        return;
-    };
-
     // The ranking the table must still produce after being killed, taken
     // from an untouched copy of the same bytes rather than from the copy
     // the child is about to damage.
     let pristine = TempDir::new().expect("tempdir");
-    copy_tree(&src, pristine.path());
+    let superfiles = write_stale_table(pristine.path(), CRASH_STALENESS);
+    let stale_revision = file_revisions(pristine.path())[0];
     let db = connect(pristine.path().to_str().expect("utf-8 path")).expect("connect to pristine");
     let baseline = scores_by_id(
         &db.open_table(TABLE).expect("open pristine"),
@@ -149,7 +140,7 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
     // `keep` leaks the directory so it survives for the parent's
     // inspection; a guard would drop it before the assertions run.
     let victim = TempDir::new().expect("tempdir").keep();
-    copy_tree(&src, &victim);
+    copy_dir_recursive(pristine.path(), &victim);
 
     let exe = env::current_exe().expect("current_exe");
     let status = Command::new(&exe)
@@ -192,21 +183,18 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
     // superfile is either one the run had not reached or one it finished —
     // a third value would mean a partially written file had been published.
     table.gc(Duration::ZERO).expect("collect orphans");
-    let after_crash = blob_versions(&victim);
+    let after_crash = file_revisions(&victim);
     assert_eq!(
         after_crash.len(),
-        CRASH_SHAPE_SUPERFILES,
+        superfiles,
         "the live superfile count changed across the crash: {after_crash:?}"
     );
-    let migrated = after_crash
-        .iter()
-        .filter(|v| **v == VERSION_CURRENT)
-        .count();
+    let migrated = after_crash.iter().filter(|r| **r > stale_revision).count();
     assert!(
         after_crash
             .iter()
-            .all(|v| *v == VERSION_CURRENT || *v == CRASH_SHAPE_VERSION),
-        "a superfile is at neither the old nor the new version: {after_crash:?}"
+            .all(|r| *r == stale_revision || *r == stale_revision + 1),
+        "a superfile records neither the stale nor the current revision: {after_crash:?}"
     );
     assert!(
         migrated >= 1,
@@ -214,7 +202,7 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
          to resume from: {after_crash:?}"
     );
     assert!(
-        migrated < CRASH_SHAPE_SUPERFILES,
+        migrated < superfiles,
         "the run finished before the kill, so there was nothing left to \
          resume: {after_crash:?}"
     );
@@ -225,22 +213,18 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
     // live owner and a dead one look identical from here. So the resume
     // honours it, migrates everything else, and says what it had to leave.
     let report = table
-        .reindex(&ReindexOptions::rewriting())
+        .reindex(&ReindexOptions::default())
         .expect("a resume makes progress rather than failing on the dead run's seal");
-    // The rewrites the dead run finished are not redone. `already_current`
-    // stays zero throughout and is not the check: it counts files current
-    // on *both* axes, and every file here keeps the analysis revision it
-    // was written at, so none of them ever qualifies. What the resume owes
-    // is that it touches exactly the containers still behind.
+    // The rewrites the dead run finished are not redone: the resume
+    // touches exactly the files still behind.
     assert_eq!(
-        report.rewritten + report.held_by_another_run,
-        CRASH_SHAPE_SUPERFILES - migrated,
-        "the resume did not account for everything the crash left behind"
+        report.already_current, migrated,
+        "the resume did not recognise the dead run's finished rewrites: {report:?}"
     );
     assert_eq!(
-        report.awaiting_reanalysis, CRASH_SHAPE_SUPERFILES,
-        "every file in this shape predates the analysis revision, so a \
-         container rewrite leaves all of them waiting"
+        report.rewritten + report.held_by_another_run,
+        superfiles - migrated,
+        "the resume did not account for everything the crash left behind: {report:?}"
     );
     assert!(
         report.held_by_another_run <= 1,
@@ -252,16 +236,19 @@ fn an_interrupted_reindex_keeps_its_finished_rewrites_and_resumes() {
     // what an operator does when the crash is known rather than suspected;
     // zero is that knob taken to its limit, and the run then takes the
     // file over and finishes the table.
-    let takeover = ReindexOptions::rewriting().with_stale_seal_timeout_ms(0);
+    let takeover = ReindexOptions::default().with_stale_seal_timeout_ms(0);
     table
         .reindex(&takeover)
         .expect("an abandoned seal is taken over once it is stale");
 
     table.gc(Duration::ZERO).expect("collect superseded bytes");
-    let after_resume = blob_versions(&victim);
     assert!(
-        after_resume.iter().all(|v| *v == VERSION_CURRENT),
-        "the table is not fully migrated after the resume: {after_resume:?}"
+        table
+            .index_staleness(&ReindexOptions::default())
+            .expect("assess the resumed table")
+            .is_current(),
+        "the table is not fully repaired after the resume: {:?}",
+        file_revisions(&victim)
     );
     assert_eq!(
         hits(&table, "body", "common"),
@@ -284,12 +271,9 @@ fn an_interrupted_reindex_never_resurrects_a_deleted_row() {
     if dispatch_child_if_set().is_some() {
         return;
     }
-    let Some(src) = corpus_dir(CRASH_SHAPE) else {
-        return;
-    };
-
     let victim = TempDir::new().expect("tempdir").keep();
-    copy_tree(&src, &victim);
+    let superfiles = write_stale_table(&victim, CRASH_STALENESS);
+    let stale_revision = file_revisions(&victim)[0];
 
     // Tombstone rows, and record which, before anything is killed.
     let deleted: Vec<i128> = {
@@ -343,27 +327,30 @@ fn an_interrupted_reindex_never_resurrects_a_deleted_row() {
     // Confirm the kill landed mid-migration; untouched or fully migrated
     // would let this pass without the window ever opening.
     table.gc(Duration::ZERO).expect("collect orphans");
-    let after_crash_versions = blob_versions(&victim);
-    let migrated = after_crash_versions
+    let after_crash_revisions = file_revisions(&victim);
+    let migrated = after_crash_revisions
         .iter()
-        .filter(|v| **v == VERSION_CURRENT)
+        .filter(|r| **r > stale_revision)
         .count();
     assert!(
-        (1..CRASH_SHAPE_SUPERFILES).contains(&migrated),
-        "the crash left the table either untouched or fully migrated, so the \
-         window this test is about was never open: {after_crash_versions:?}"
+        (1..superfiles).contains(&migrated),
+        "the crash left the table either untouched or fully repaired, so the \
+         window this test is about was never open: {after_crash_revisions:?}"
     );
 
-    let takeover = ReindexOptions::rewriting().with_stale_seal_timeout_ms(0);
+    let takeover = ReindexOptions::default().with_stale_seal_timeout_ms(0);
     table
         .reindex(&takeover)
         .expect("a resume finishes a table with deletions");
     table.gc(Duration::ZERO).expect("collect superseded bytes");
 
-    let after_resume = blob_versions(&victim);
     assert!(
-        after_resume.iter().all(|v| *v == VERSION_CURRENT),
-        "the table is not fully migrated after the resume: {after_resume:?}"
+        table
+            .index_staleness(&ReindexOptions::default())
+            .expect("assess the resumed table")
+            .is_current(),
+        "the table is not fully repaired after the resume: {:?}",
+        file_revisions(&victim)
     );
     let after_resume_ids = live_ids(&victim);
     assert!(
