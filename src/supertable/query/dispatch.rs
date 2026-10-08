@@ -494,7 +494,7 @@ async fn stable_ids_for_tagged_hits(
 /// Record one superfile open on the operation's stats, when metered.
 fn note_superfile_opened(op_stats: Option<&Arc<OpStatsCollector>>) {
     if let Some(stats) = op_stats {
-        stats.add_superfiles_opened(1);
+        stats.add_score_pruning_survived(1);
     }
 }
 

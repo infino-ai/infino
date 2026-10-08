@@ -410,7 +410,7 @@ pub(crate) async fn select_superfiles(
     // genuinely be in every superfile.
     if let Some(stats) = op_stats::current() {
         stats.add_superfiles_considered(considered);
-        stats.add_superfiles_pruned(considered - kept.len() as u64);
+        stats.add_presence_pruning_survived(kept.len() as u64);
     }
     Ok(kept)
 }

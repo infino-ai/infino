@@ -83,7 +83,7 @@ fn count_and_opens(st: &Supertable, query: &str) -> (u64, u64) {
             .count("title", query, BoolMode::Or)
             .expect("count")
     });
-    (counted, stats.superfiles_opened)
+    (counted, stats.score_pruning_survived)
 }
 
 /// The count a full fan-out would produce, for the shortcut to be checked
