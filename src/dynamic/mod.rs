@@ -492,6 +492,9 @@ fn flatten<'a>(
                     // for the same reason — a body is bounded while it is
                     // read, not after it has been read.
                     let mut per_path: Vec<(String, Vec<Option<&'a Value>>)> = Vec::new();
+                    // Leaves of this array the table does not have, which are
+                    // the columns it would add.
+                    let mut added = 0u32;
                     // Keyed by an owned path: a borrow into `per_path` would
                     // dangle the moment a push reallocates it.
                     let mut at_path: HashMap<String, usize> = HashMap::new();
@@ -519,16 +522,29 @@ fn flatten<'a>(
                             match at_path.get(leaf_path.as_str()) {
                                 Some(&index) => per_path[index].1.extend(values),
                                 None => {
-                                    // Every distinct leaf of this array is a
-                                    // column the resolver would add, so the
-                                    // cap bounds them here rather than after
-                                    // the whole document is flattened.
-                                    if per_path.len() as u32 >= max_fields {
-                                        return Err(SchemaError::FieldCapExceeded {
-                                            cap: max_fields,
-                                            current: per_path.len() as u32,
-                                            fields: vec![leaf_path],
-                                        });
+                                    // A leaf the table does not have is a
+                                    // column the resolver would add, and the
+                                    // cap bounds those here rather than after
+                                    // the whole document is flattened: the
+                                    // null-fill below costs one slot per
+                                    // element already seen, so an array of
+                                    // distinct keys is quadratic long before
+                                    // the check after `flatten` is reached.
+                                    //
+                                    // Counted against the table's live
+                                    // fields, not against this array's leaf
+                                    // count: a row whose leaves all exist
+                                    // adds nothing, whatever the cap is now.
+                                    if schema.id_of(&leaf_path).is_none() {
+                                        added += 1;
+                                        let live = schema.fields().len() as u32;
+                                        if live + added > max_fields {
+                                            return Err(SchemaError::FieldCapExceeded {
+                                                cap: max_fields,
+                                                current: live,
+                                                fields: vec![leaf_path],
+                                            });
+                                        }
                                     }
                                     // A path first seen on a later element
                                     // is null in the elements before it.
@@ -2699,6 +2715,61 @@ mod tests {
         let err = rows_to_batch(&[json!({"xs": [wide]})], &capped)
             .expect_err("the element carries more leaves than the table admits");
         assert_eq!(err.kind(), "FieldCapExceeded");
+    }
+
+    /// The bound is what keeps the null-fill from running away. Each new
+    /// leaf of an array of objects is filled with one null per element
+    /// already seen, so an array of distinct keys costs the square of its
+    /// length — and the check after `flatten` only runs once the whole
+    /// document has been flattened, which is too late. With the cap applied
+    /// as the leaves appear, the work stops at the cap however long the
+    /// array is.
+    #[test]
+    fn an_array_of_distinct_keys_stops_at_the_cap_however_long_it_is() {
+        const CAP: u32 = 64;
+        let capped = table(Vec::new())
+            .apply(&[SchemaChange::SetMaxFields(CAP)])
+            .expect("set the cap");
+        for length in [CAP as usize * 4, CAP as usize * 64] {
+            let items: Vec<Value> = (0..length).map(|i| json!({ format!("k{i}"): 0 })).collect();
+            let err = rows_to_batch(&[json!({"xs": items})], &capped)
+                .expect_err("an array of distinct keys is bounded by the cap");
+            assert!(
+                matches!(&err, SchemaError::FieldCapExceeded { cap, fields, .. }
+                    if *cap == CAP && fields == &[format!("xs.k{CAP}")]),
+                "length {length}: the refusal fires at the cap: {err:?}"
+            );
+        }
+    }
+
+    /// The cap counts columns the document would add, not the leaves the
+    /// array happens to carry. A row whose leaves the table already has adds
+    /// nothing, so it lands whatever the cap has since been lowered to —
+    /// counting the array's own leaves refused it, and reported the leaf
+    /// count as the table's width.
+    #[test]
+    fn an_array_whose_leaves_the_table_has_adds_nothing_to_count() {
+        let fields: Vec<(&str, DataType)> = vec![
+            ("xs.a", DataType::Int64),
+            ("xs.b", DataType::Int64),
+            ("xs.c", DataType::Int64),
+        ];
+        let narrowed = table(fields)
+            .apply(&[SchemaChange::SetMaxFields(2)])
+            .expect("a cap below the table's own width");
+        let batch = rows_to_batch(&[json!({"xs": [{"a": 1, "b": 2, "c": 3}]})], &narrowed)
+            .expect("every leaf exists, so the row adds no column");
+        assert_eq!(batch.num_columns(), 3);
+
+        // One leaf the table does not have is one column, and it is counted
+        // against the table's live width rather than the array's.
+        let err = rows_to_batch(&[json!({"xs": [{"a": 1, "d": 4}]})], &narrowed)
+            .expect_err("`xs.d` would be a fourth column under a cap of two");
+        assert!(
+            matches!(&err, SchemaError::FieldCapExceeded { cap, current, fields }
+                if *cap == 2 && *current == 3 && fields == &["xs.d".to_string()]),
+            "the refusal reports the table's width, not the array's: {err:?}"
+        );
     }
 
     /// Each refusal names its cause, so a caller can tell one from another
