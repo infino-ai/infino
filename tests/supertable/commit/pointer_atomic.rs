@@ -174,10 +174,9 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
         format_version: LIST_FORMAT_VERSION.into(),
         manifest_id,
         options_hash: ContentHash([0u8; 32]),
-        schema: Vec::new(),
+        schema: None,
         id_column: "doc_id".into(),
-        fts_columns: vec![],
-        vector_columns: vec![],
+        commit_token: Uuid::nil(),
         partition_strategy: PartitionStrategy::Hash {
             column: "doc_id".into(),
             n_buckets: DEFAULT_HASH_N_BUCKETS,
@@ -485,6 +484,14 @@ impl StorageProvider for BarrierMockStorage {
         Ok(Some("mock-etag".into()))
     }
 
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        let prior = self.put_calls.fetch_add(1, Ordering::AcqRel);
+        if prior < PARALLEL_PUT_COUNT_BEFORE_POINTER {
+            self.barrier.wait().await;
+        }
+        self.objects.lock().await.insert(uri.into(), bytes);
+        Ok(())
+    }
     async fn put_if_match(
         &self,
         uri: &str,

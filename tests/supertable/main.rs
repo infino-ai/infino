@@ -48,6 +48,7 @@ mod query;
 mod reindex;
 mod reindex_crash;
 mod reindex_invariance;
+mod schema;
 mod storage;
 mod update_crash_property;
 mod vector_cosine_normalize;

@@ -200,6 +200,14 @@ impl StorageProvider for FaultStorage {
         }
         self.inner.put_atomic(uri, bytes).await
     }
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        // Shares `PutAtomic`'s fault point: both are "write these bytes at
+        // this key", and a test injecting a write fault wants both.
+        if self.check(FaultOp::PutAtomic, uri)? {
+            let _ = self.inner.put_overwrite(uri, bytes.clone()).await;
+        }
+        self.inner.put_overwrite(uri, bytes).await
+    }
     async fn put_if_match(
         &self,
         uri: &str,

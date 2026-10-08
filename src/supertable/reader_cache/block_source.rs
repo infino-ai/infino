@@ -728,6 +728,9 @@ mod tests {
             ) -> Result<Option<String>, StorageError> {
                 Err(unimplemented_err(uri))
             }
+            async fn put_overwrite(&self, uri: &str, _b: Bytes) -> Result<(), StorageError> {
+                Err(unimplemented_err(uri))
+            }
             async fn put_if_match(
                 &self,
                 uri: &str,

@@ -132,19 +132,17 @@ pub(crate) fn verify_superfile_vector_codecs(
     reader: &SuperfileReader,
     expected: &[VectorConfig],
 ) -> Result<(), QueryError> {
-    if expected.is_empty() {
+    // A file written before a vector column existed holds no index for it
+    // and contributes nothing to a search on it; only the columns a file
+    // does hold are checked.
+    let Some(vector) = reader.vec() else {
         return Ok(());
-    }
-    let vector = reader.vec().ok_or_else(|| {
-        QueryError::Internal("superfile is missing configured vector index".into())
-    })?;
+    };
     for config in expected {
-        let mut matched = false;
         for column in vector
             .vector_columns_config()
             .filter(|column| column.name == config.column)
         {
-            matched = true;
             let stored = column.rerank_codec;
             let usable = stored.supports_metric(config.metric)
                 && (!vector.is_multi_cell() || stored.is_ivf_mergeable());
@@ -161,12 +159,6 @@ pub(crate) fn verify_superfile_vector_codecs(
                     },
                 )));
             }
-        }
-        if !matched {
-            return Err(QueryError::Internal(format!(
-                "superfile is missing configured vector column {:?}",
-                config.column
-            )));
         }
     }
     Ok(())
@@ -553,7 +545,7 @@ impl FanoutContext {
             store: Arc::clone(&manifest.options.store),
             disk_cache: manifest.options.disk_cache.as_ref().map(Arc::clone),
             storage: manifest.options.storage.as_ref().map(Arc::clone),
-            vector_columns: Arc::new(manifest.options.vector_columns.clone()),
+            vector_columns: Arc::new(manifest.vector_configs()),
             tombstone_cache,
             op_stats: reader.op_stats.clone(),
             now,

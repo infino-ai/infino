@@ -134,8 +134,17 @@ pub enum ReadError {
         column: String, // empty if not column-scoped
     },
 
-    #[error("malformed format-version string {0:?}")]
-    MalformedVersion(String),
+    /// The superfile's bytes do not match its format: an offset or length out
+    /// of range, a region shorter than declared, a codec id it never defined,
+    /// or JSON or a format version that does not parse. Required KV keys that
+    /// are missing or mistyped are [`Self::MalformedKv`].
+    #[error("malformed superfile: {0}")]
+    Malformed(String),
+
+    /// A read that does not support the column's rerank codec was called on
+    /// it: a caller bug, not a problem with the file.
+    #[error("this read does not support the column's codec: {0}")]
+    WrongCodecPath(String),
 
     #[error("io error during read: {0}")]
     Io(#[from] std::io::Error),
@@ -179,6 +188,18 @@ impl ReadError {
             ReadError::Vector(v) => v.over_budget(),
             ReadError::Fts(f) => f.over_budget(),
             _ => None,
+        }
+    }
+
+    /// Whether this, or the read error a vector or FTS error wraps, is the
+    /// engine breaking its own invariant: a doc id past the superfile's end,
+    /// or a read called on a codec it does not support. Retrying cannot help.
+    pub(crate) fn is_internal(&self) -> bool {
+        match self {
+            ReadError::DocIdOutOfRange { .. } | ReadError::WrongCodecPath(_) => true,
+            ReadError::Vector(v) => matches!(v.as_ref(), VectorError::Read(r) if r.is_internal()),
+            ReadError::Fts(f) => matches!(f.as_ref(), FtsError::Read(r) if r.is_internal()),
+            _ => false,
         }
     }
 }

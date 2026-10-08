@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "apache-avro",
  "arc-swap",
@@ -2176,7 +2176,7 @@ dependencies = [
 
 [[package]]
 name = "infino-node"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2186,6 +2186,7 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "serde_json",
 ]
 
 [[package]]

@@ -3782,8 +3782,11 @@ mod tests {
         let reader_b = VectorReader::open(blob_b, &json).expect("open B");
 
         // Merge: B's local ids shift by `na` (its doc_id_offset).
-        let merged = merge_sq8_ivf_subsections(&[(&reader_a, "v", 0), (&reader_b, "v", na as u32)])
-            .expect("merge");
+        let merged = merge_sq8_ivf_subsections(&[
+            (&reader_a, "v", 0, None),
+            (&reader_b, "v", na as u32, None),
+        ])
+        .expect("merge");
         assert_eq!(merged.n_docs as usize, na + nb);
 
         let mut wb = VectorBuilder::new();

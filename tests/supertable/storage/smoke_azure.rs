@@ -654,6 +654,9 @@ impl StorageProvider for CountingStorage {
         self.inner.put_atomic(uri, bytes).await
     }
 
+    async fn put_overwrite(&self, uri: &str, bytes: bytes::Bytes) -> Result<(), StorageError> {
+        self.inner.put_overwrite(uri, bytes).await
+    }
     async fn put_if_match(
         &self,
         uri: &str,

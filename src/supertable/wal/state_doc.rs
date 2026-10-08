@@ -354,6 +354,12 @@ pub struct WalStateDoc {
     #[serde(default)]
     pub new_row_content_hash: Option<String>,
 
+    /// The `schema_id` the sidecar's rows were resolved against when the
+    /// update was buffered. Replay resolves them again against the schema
+    /// it finds, so this records provenance; it decides nothing.
+    #[serde(default)]
+    pub schema_id: Option<u32>,
+
     /// UUID v4 minted at the caller's `update()` entry; the
     /// dedicated superfile the UPDATE's new rows will land in.
     /// Stored before any I/O so recovery produces bit-identical
@@ -542,6 +548,7 @@ mod tests {
                     tombstoned_in_superfile: None,
                 },
             ],
+            schema_id: None,
         }
     }
 

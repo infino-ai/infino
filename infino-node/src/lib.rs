@@ -49,8 +49,8 @@ use datafusion::logical_expr::Expr;
 use infino::{
     Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
     InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
-    RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions, Stemmer,
-    Stopwords,
+    RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions,
+    SchemaPatch, Stemmer, Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,6 +66,12 @@ use infino::{
 //
 // TODO: refine into distinct JS `Error` subclasses once the surface settles,
 // matching Python's `InfinoError` base + `ConnectionMemoryBudgetError`.
+/// The rows a JSON array text carries.
+fn parse_rows(rows_json: &str) -> Result<Vec<serde_json::Value>> {
+    serde_json::from_str::<Vec<serde_json::Value>>(rows_json)
+        .map_err(|e| Error::new(Status::InvalidArg, format!("rows: {e}")))
+}
+
 fn map_err(e: InfinoError) -> Error {
     match e {
         InfinoError::NotFound(m) => Error::new(Status::GenericFailure, format!("NotFound: {m}")),
@@ -75,7 +81,10 @@ fn map_err(e: InfinoError) -> Error {
         InfinoError::AlreadyExists(m) => {
             Error::new(Status::InvalidArg, format!("AlreadyExists: {m}"))
         }
-        InfinoError::Schema(m) | InfinoError::Cardinality(m) | InfinoError::Query(m) => {
+        // The schema cause is typed on the Rust side; JS gets its message,
+        // which names the column, cap or version at fault.
+        InfinoError::Schema(e) => Error::new(Status::InvalidArg, e.to_string()),
+        InfinoError::Cardinality(m) | InfinoError::Query(m) => {
             Error::new(Status::InvalidArg, m)
         }
         InfinoError::Io(m) | InfinoError::Backend(m) => Error::new(Status::GenericFailure, m),
@@ -994,6 +1003,34 @@ impl Connection {
         Ok(Table { inner })
     }
 
+    /// The table's schema document as JSON text, or — with `patch_json`, a
+    /// patch in the same shape — the document after merging the patch into
+    /// the schema (creating the table when there is none). The JS wrapper
+    /// parses the result and stringifies the patch; `expected_schema_id` is
+    /// a compare-and-set against the current `schema_id`.
+    #[napi]
+    pub fn schema(
+        &self,
+        name: String,
+        patch_json: Option<String>,
+        expected_schema_id: Option<u32>,
+    ) -> Result<String> {
+        let doc = match patch_json {
+            None => self.inner.schema(&name).map_err(map_err)?,
+            Some(text) => {
+                let invalid =
+                    |e: String| Error::new(Status::InvalidArg, format!("schema patch: {e}"));
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|e| invalid(e.to_string()))?;
+                let patch = SchemaPatch::from_json(&value).map_err(invalid)?;
+                self.inner
+                    .apply_schema(&name, &patch, expected_schema_id)
+                    .map_err(map_err)?
+            }
+        };
+        Ok(doc.to_json().to_string())
+    }
+
     /// Drop a table. `purge` defaults to `true`, which also deletes the
     /// table's storage subtree after the catalog commit, reclaiming the bytes;
     /// pass `false` to only unregister it from the catalog and keep the bytes.
@@ -1041,8 +1078,44 @@ impl Table {
             return Ok(());
         }
         self.inner
-            .append(&self.align_batches(batches)?)
+            .append(&self.merge_batches(batches)?)
             .map_err(map_err)
+    }
+
+    /// Append rows given as a JSON array of objects (the text the JS wrapper
+    /// produces with `JSON.stringify`): nested objects flatten to dot paths,
+    /// arrays become list columns, a key the table has not seen adds a
+    /// column typed from its values, and a value whose type disagrees with
+    /// the column's is refused.
+    #[napi]
+    pub fn append_rows(&self, rows_json: String) -> Result<()> {
+        let rows = parse_rows(&rows_json)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.inner.append_rows(&rows).map_err(map_err)
+    }
+
+    /// `appendRows`, naming the source the rows came from as `appendNamed`
+    /// does.
+    #[napi]
+    pub fn append_rows_named(&self, rows_json: String, source_name: String) -> Result<()> {
+        let rows = parse_rows(&rows_json)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .append_rows_named(&rows, &source_name)
+            .map_err(map_err)
+    }
+
+    /// `update` with the replacement rows as a JSON array of objects, mapped
+    /// as `appendRows` maps them.
+    #[napi]
+    pub fn update_rows(&self, predicate: String, rows_json: String) -> Result<MutationStats> {
+        let expr = self.parse_predicate(&predicate)?;
+        let rows = parse_rows(&rows_json)?;
+        Ok(self.inner.update_rows(expr, &rows).map_err(map_err)?.into())
     }
 
     /// `append`, naming the source the rows came from: the superfiles this
@@ -1057,7 +1130,7 @@ impl Table {
             return Ok(());
         }
         self.inner
-            .append_named(&self.align_batches(batches)?, &source_name)
+            .append_named(&self.merge_batches(batches)?, &source_name)
             .map_err(map_err)
     }
 
@@ -1262,7 +1335,7 @@ impl Table {
         let aligned = if batches.is_empty() {
             RecordBatch::new_empty(self.inner.schema())
         } else {
-            self.align_batches(batches)?
+            self.merge_batches(batches)?
         };
         Ok(self.inner.update(expr, &aligned).map_err(map_err)?.into())
     }
@@ -1356,19 +1429,16 @@ impl Table {
 }
 
 impl Table {
-    /// Merge IPC batches into one and re-wrap under the table's declared
-    /// schema, so the exact-schema check accepts otherwise-nullable inputs (a
-    /// genuine type mismatch still errors). Caller guarantees `batches` is
-    /// non-empty. Shared by `append` and `update`.
-    fn align_batches(&self, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
-        let declared = self.inner.schema();
-        let merged = if batches.len() == 1 {
-            batches.into_iter().next().expect("len == 1")
-        } else {
-            let schema = batches[0].schema();
-            concat_batches(&schema, &batches).map_err(arrow_err)?
-        };
-        RecordBatch::try_new(declared, merged.columns().to_vec()).map_err(arrow_err)
+    /// Merge IPC batches into one. The engine brings the result to the
+    /// table's shape (a column it does not have joins the schema, an absent
+    /// nullable one is null-filled), so nothing is re-wrapped here. Caller
+    /// guarantees `batches` is non-empty. Shared by `append` and `update`.
+    fn merge_batches(&self, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+        if batches.len() == 1 {
+            return Ok(batches.into_iter().next().expect("len == 1"));
+        }
+        let schema = batches[0].schema();
+        concat_batches(&schema, &batches).map_err(arrow_err)
     }
 
     /// Parse a SQL predicate string into a DataFusion `Expr`, resolved against

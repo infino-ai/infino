@@ -15,6 +15,7 @@
 
 use std::{error::Error, fmt::Display, path::PathBuf};
 
+use arrow_schema::ArrowError;
 use datafusion::error::DataFusionError;
 use thiserror::Error;
 
@@ -24,6 +25,7 @@ use crate::{
     supertable::{
         ManifestLoadError,
         manifest::{part, term_stats::TermStatsError},
+        schema::error::SchemaError,
     },
 };
 
@@ -33,6 +35,22 @@ use crate::{
 pub enum BuildError {
     #[error("no documents to build")]
     NoDocsToBuild,
+
+    #[error(
+        "hydrate requires a SQL-only table with no index; this table declares \
+         {fts} full-text and {vector} vector column(s). Use `append` for an \
+         indexed table."
+    )]
+    HydrateRequiresNoIndex { fts: usize, vector: usize },
+
+    #[error("hydrate target_rows must be at least 1")]
+    HydrateZeroTargetRows,
+
+    #[error("a hydrate chunk has {rows} rows; one superfile holds at most {max}")]
+    HydrateChunkTooLarge { rows: usize, max: u32 },
+
+    #[error("reading a hydrate input batch: {0}")]
+    HydrateInputRead(#[source] ArrowError),
 
     #[error("schema is missing the declared id_column {0:?}")]
     MissingIdColumn(String),
@@ -110,8 +128,14 @@ pub enum BuildError {
     )]
     UnknownAnalyzer { column: String, analyzer: String },
 
-    #[error("input RecordBatch schema does not match the supertable's declared schema")]
-    BatchSchemaMismatch,
+    #[error("{0}")]
+    Schema(#[from] SchemaError),
+
+    #[error(
+        "the table's schema moved from {expected} to {current} while this commit was built; \
+         it is rebuilt against the current schema"
+    )]
+    SchemaMoved { expected: u32, current: u32 },
 
     #[error("error from underlying superfile layer: {0}")]
     Superfile(#[from] SuperfileBuildError),
@@ -201,6 +225,10 @@ impl BuildError {
             // Another writer holds this table's single writer slot: the same
             // retry-after-the-other-writer answer as a lost commit race.
             BuildError::WriteContention | BuildError::SupertableInUse => true,
+            // The schema moved under this build: rebuilding against the
+            // winner's schema and reissuing can succeed.
+            BuildError::SchemaMoved { .. } => true,
+            BuildError::Schema(SchemaError::SchemaConflict { .. }) => true,
             BuildError::StorageConstruction(e) => e.is_conflict(),
             _ => false,
         }
@@ -237,6 +265,9 @@ impl From<CommitError> for BuildError {
     fn from(e: CommitError) -> Self {
         match e {
             CommitError::PointerVanished => BuildError::TableGone,
+            CommitError::SchemaMoved { expected, current } => {
+                BuildError::SchemaMoved { expected, current }
+            }
             other if other.is_conflict() => BuildError::WriteContention,
             other if other.is_permission_denied() => {
                 BuildError::PermissionDenied(other.to_string())
@@ -297,6 +328,9 @@ pub enum CommitError {
     /// seal moved and committing the rest.
     #[error("input {superfile_id} changed under this commit's seal")]
     InputsChanged { superfile_id: uuid::Uuid },
+
+    #[error("the table's schema moved from {expected} to {current} under this commit")]
+    SchemaMoved { expected: u32, current: u32 },
 }
 
 impl CommitError {
@@ -308,8 +342,10 @@ impl CommitError {
     /// both shapes are classified together.
     pub(crate) fn is_conflict(&self) -> bool {
         match self {
-            // Both are a race lost to another writer with nothing published.
-            CommitError::WriteContentionExhausted | CommitError::InputsChanged { .. } => true,
+            // All three are a race lost to another writer with nothing published.
+            CommitError::WriteContentionExhausted
+            | CommitError::InputsChanged { .. }
+            | CommitError::SchemaMoved { .. } => true,
             CommitError::Storage(e) => e.is_conflict(),
             CommitError::Build(b) => b.is_conflict(),
             _ => false,
@@ -708,7 +744,7 @@ impl From<QueryError> for DataFusionError {
 /// | over the connection's memory budget | `OverBudget` |
 /// | an FTS query the column cannot answer: a phrase without positions, nothing positive to rank | `InvalidQuery`: the caller's |
 /// | the store refused our credentials | `PermissionDenied` |
-/// | a local doc id past the superfile's end: our bug, retrying cannot help | `Internal` |
+/// | a local doc id past the superfile's end, or a read called on a codec it does not support: our bug, retrying cannot help | `Internal` |
 /// | anything else | `Parquet`: a read failed |
 impl From<ReadError> for QueryError {
     fn from(e: ReadError) -> Self {
@@ -726,7 +762,7 @@ impl From<ReadError> for QueryError {
         if permission_denied_in_chain(&e) {
             return QueryError::PermissionDenied(e.to_string());
         }
-        if matches!(e, ReadError::DocIdOutOfRange { .. }) {
+        if e.is_internal() {
             return QueryError::Internal(e.to_string());
         }
         QueryError::Parquet(e.to_string())
@@ -909,6 +945,14 @@ mod tests {
                 doc_id: 9,
                 n_docs: 4
             }),
+            QueryError::Internal(_)
+        ));
+        // So is asking a read path for a codec it does not support, which
+        // the vector reader raises wrapped in its own error.
+        assert!(matches!(
+            QueryError::from(VectorError::Read(ReadError::WrongCodecPath(
+                "fp32 only".into()
+            ))),
             QueryError::Internal(_)
         ));
     }

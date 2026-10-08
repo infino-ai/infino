@@ -112,6 +112,8 @@ pub mod config;
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) mod config;
 
+pub(crate) mod dynamic;
+
 #[cfg(feature = "test-helpers")]
 pub mod storage;
 #[cfg(not(feature = "test-helpers"))]
@@ -175,8 +177,14 @@ pub use config::{
     CompactionSettings, GcSettings, OptimizeOptions, RecalibratePolicy, ReindexMode,
     ReindexOptions, ReindexTarget, SuperfileIndex,
 };
+/// Rows as JSON documents, mapped to one Arrow batch under a table's schema
+/// — what [`Supertable::append_rows`] does before it appends. For a server
+/// that accounts for a batch before writing it.
+pub use dynamic::rows_to_batch;
 /// The single public error type for the curated API.
 pub use error::InfinoError;
+/// JSON documents for `append_rows` / `update_rows`; import as `infino::serde_json`.
+pub use serde_json;
 // `VectorSearchOptions` (probe width / rerank budget) is deliberately
 // NOT part of the public surface: serving is drain-calibrated, and
 // manual tuning is a test-and-bench-only instrument (recall sweeps,
@@ -191,12 +199,17 @@ pub use superfile::{
         bm25::Bm25Params,
         reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
     },
-    vector::distance::Metric,
+    vector::{distance::Metric, rerank_codec::RerankCodec},
 };
 pub use supertable::{
     Consistency, GcError, GcReport, MutationStats, OptimizeError, ReindexError,
     query::vector::VectorFilter,
     reindex::{PlannedRepair, ReindexReport, StalenessReport},
+    schema::{
+        ColumnIndex, FieldDef, FieldId, TableSchema,
+        change::{FieldPatch, SchemaPatch},
+        error::SchemaError,
+    },
 };
 
 /// Convenience builders for test fixtures. Visible to:

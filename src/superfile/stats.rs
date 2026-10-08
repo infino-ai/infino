@@ -5,7 +5,10 @@ use std::collections::HashMap;
 
 use arrow_array::{Decimal128Array, RecordBatch};
 
-use crate::{superfile::BuildError, supertable::ScalarStatsAgg};
+use crate::{
+    superfile::BuildError,
+    supertable::{ScalarStatsAgg, schema::FieldId},
+};
 
 /// Statistics for a superfile, including the number of documents,
 /// id range, and scalar statistics. Usually used during build time.
@@ -15,7 +18,7 @@ pub struct SuperfileStats {
     pub n_docs: u64,
     pub id_min: i128,
     pub id_max: i128,
-    pub scalar_stats: HashMap<String, ScalarStatsAgg>,
+    pub scalar_stats: HashMap<FieldId, ScalarStatsAgg>,
     // TODO: Vector & FTS related stats could also be added here
 }
 
@@ -58,7 +61,7 @@ impl SuperfileStats {
         let mut n_docs: u64 = 0;
         let mut id_min = i128::MAX;
         let mut id_max = i128::MIN;
-        let mut scalar_stats: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        let mut scalar_stats: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
         for stat in stats {
             n_docs += stat.n_docs;
             id_min = id_min.min(stat.id_min);
@@ -82,14 +85,14 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
-    use crate::test_helpers::decimal128_ids;
+    use crate::{superfile::builder::stamp_ids_by_position, test_helpers::decimal128_ids};
 
     #[test]
     fn try_compute_from_record_batch_single_row() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = stamp_ids_by_position(&Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
             Field::new("title", DataType::LargeUtf8, false),
-        ]));
+        ])));
         let ids = decimal128_ids(vec![42u64]);
         let titles = LargeStringArray::from(vec!["hello"]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
@@ -100,16 +103,16 @@ mod tests {
         assert_eq!(stats.id_min, 42);
         assert_eq!(stats.id_max, 42);
         assert_eq!(stats.scalar_stats.len(), 2);
-        assert!(stats.scalar_stats.contains_key("doc_id"));
-        assert!(stats.scalar_stats.contains_key("title"));
+        assert!(stats.scalar_stats.contains_key(&FieldId::ID_COLUMN));
+        assert!(stats.scalar_stats.contains_key(&FieldId(1)));
     }
 
     #[test]
     fn try_compute_from_record_batch_multiple_rows() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = stamp_ids_by_position(&Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
             Field::new("text", DataType::LargeUtf8, false),
-        ]));
+        ])));
         let ids = decimal128_ids(vec![10u64, 50, 30]);
         let text = LargeStringArray::from(vec!["a", "b", "c"]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(text)])
@@ -123,10 +126,10 @@ mod tests {
 
     #[test]
     fn try_compute_from_record_batch_non_decimal128_id_column_errors() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = stamp_ids_by_position(&Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Int64, false),
             Field::new("text", DataType::LargeUtf8, false),
-        ]));
+        ])));
         let ids = arrow_array::Int64Array::from(vec![1i64, 2, 3]);
         let text = LargeStringArray::from(vec!["a", "b", "c"]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(text)])
@@ -139,11 +142,11 @@ mod tests {
 
     #[test]
     fn try_compute_from_record_batch_computes_scalar_stats() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = stamp_ids_by_position(&Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
             Field::new("title", DataType::LargeUtf8, false),
             Field::new("count", DataType::Int64, false),
-        ]));
+        ])));
         let ids = decimal128_ids(vec![5u64, 10, 15]);
         let titles = LargeStringArray::from(vec!["apple", "banana", "cherry"]);
         let counts = arrow_array::Int64Array::from(vec![1i64, 2, 3]);
@@ -155,9 +158,9 @@ mod tests {
 
         let stats = SuperfileStats::try_compute_from_record_batch(&batch).expect("compute stats");
         assert_eq!(stats.scalar_stats.len(), 3);
-        assert!(stats.scalar_stats.contains_key("doc_id"));
-        assert!(stats.scalar_stats.contains_key("title"));
-        assert!(stats.scalar_stats.contains_key("count"));
+        assert!(stats.scalar_stats.contains_key(&FieldId::ID_COLUMN));
+        assert!(stats.scalar_stats.contains_key(&FieldId(1)));
+        assert!(stats.scalar_stats.contains_key(&FieldId(2)));
     }
 
     #[test]
@@ -171,10 +174,10 @@ mod tests {
 
     #[test]
     fn from_children_single_stat_preserves_values() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = stamp_ids_by_position(&Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
             Field::new("title", DataType::LargeUtf8, false),
-        ]));
+        ])));
         let ids = decimal128_ids(vec![100u64, 200]);
         let titles = LargeStringArray::from(vec!["first", "second"]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
@@ -191,10 +194,10 @@ mod tests {
 
     #[test]
     fn from_children_multiple_stats_sums_n_docs() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = stamp_ids_by_position(&Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
             Field::new("title", DataType::LargeUtf8, false),
-        ]));
+        ])));
 
         let stats1 = {
             let ids = decimal128_ids(vec![10u64, 20]);
@@ -218,10 +221,10 @@ mod tests {
 
     #[test]
     fn from_children_multiple_stats_computes_id_min_max() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = stamp_ids_by_position(&Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
             Field::new("text", DataType::LargeUtf8, false),
-        ]));
+        ])));
 
         let stats1 = {
             let ids = decimal128_ids(vec![50u64, 75]);
@@ -246,10 +249,10 @@ mod tests {
 
     #[test]
     fn from_children_multiple_stats_merges_scalar_stats() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = stamp_ids_by_position(&Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
             Field::new("value", DataType::Int64, false),
-        ]));
+        ])));
 
         let stats1 = {
             let ids = decimal128_ids(vec![1u64, 2]);
@@ -269,16 +272,16 @@ mod tests {
 
         let merged = SuperfileStats::from_children(&[stats1, stats2]);
         assert_eq!(merged.scalar_stats.len(), 2);
-        assert!(merged.scalar_stats.contains_key("doc_id"));
-        assert!(merged.scalar_stats.contains_key("value"));
+        assert!(merged.scalar_stats.contains_key(&FieldId::ID_COLUMN));
+        assert!(merged.scalar_stats.contains_key(&FieldId(1)));
     }
 
     #[test]
     fn from_children_three_stats_maintains_correct_min_max() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = stamp_ids_by_position(&Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
             Field::new("text", DataType::LargeUtf8, false),
-        ]));
+        ])));
 
         let stats1 = {
             let ids = decimal128_ids(vec![50u64]);

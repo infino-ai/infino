@@ -33,7 +33,7 @@ use std::{
 };
 
 use arrow::record_batch::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dashmap::DashMap;
 use datafusion::{
     common::tree_node::{TreeNode, TreeNodeRecursion},
@@ -55,6 +55,7 @@ use datafusion::{
     },
 };
 use futures::future::try_join_all;
+pub(crate) use index_spec::DEFAULT_ROT_SEED;
 pub use index_spec::{FtsField, IndexSpec};
 use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
@@ -113,6 +114,7 @@ use crate::{
         options::SupertableOptions,
         query::{exec::common::collect_plan_metered, sql::sql_session_context},
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
+        schema::{ColumnIndex, TableSchema, change::SchemaPatch, error::SchemaError},
     },
     utils::trace::{self, CloseOut, detail_span},
 };
@@ -740,6 +742,93 @@ impl Connection {
         Ok(Supertable::from_local(self.open_table_handle(name)?))
     }
 
+    /// The schema document of table `name`: its live columns with their
+    /// ids, types, nullability and indexes, the field cap, and the
+    /// `schema_id` a write can compare against. What this returns is also
+    /// what [`Connection::apply_schema`] accepts, so a document read back
+    /// applies as a no-op.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # db.create_table("posts", schema, IndexSpec::new().fts("body"))?;
+    /// let doc = db.schema("posts")?;
+    /// assert_eq!(doc.fields()[0].name, "body");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn schema(&self, name: &str) -> Result<TableSchema, InfinoError> {
+        #[cfg(feature = "remote")]
+        if let CatalogStore::Remote(_) = &self.inner.store {
+            return Err(remote_schema_unsupported("schema", name));
+        }
+        let handle = self.open_table_handle(name)?;
+        Ok((*handle.table_schema()).clone())
+    }
+
+    /// Change the schema of table `name` by merging `patch` into it, or
+    /// create the table from `patch` when there is none. The result is the
+    /// document the table holds afterwards.
+    ///
+    /// Each field in the patch is matched to a live column by `id` when it
+    /// carries one and by `name` otherwise. An unmatched field adds a
+    /// column; a matched field with another name (possible only by id)
+    /// renames it; another type changes it; `dropped` retires it; a field
+    /// not mentioned is untouched. Nothing is dropped by omission, and a
+    /// patch that changes nothing commits nothing. `expected` is an
+    /// optional compare-and-set against the current `schema_id`; it fails
+    /// with [`InfinoError::Conflict`] when the schema has moved.
+    ///
+    /// ```
+    /// # use infino::arrow_schema::DataType;
+    /// # use infino::{connect, FieldPatch, SchemaPatch};
+    /// # let db = connect("memory://")?;
+    /// let patch = SchemaPatch::new(vec![
+    ///     FieldPatch::named("body")
+    ///         .with_type(DataType::LargeUtf8)
+    ///         .with_nullable(false),
+    /// ]);
+    /// let doc = db.apply_schema("posts", &patch, None)?;
+    /// assert_eq!(doc.schema_id(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn apply_schema(
+        &self,
+        name: &str,
+        patch: &SchemaPatch,
+        expected: Option<u32>,
+    ) -> Result<TableSchema, InfinoError> {
+        #[cfg(feature = "remote")]
+        if let CatalogStore::Remote(_) = &self.inner.store {
+            return Err(remote_schema_unsupported("apply_schema", name));
+        }
+        let handle = match self.open_table_handle(name) {
+            Ok(handle) => handle,
+            Err(InfinoError::NotFound(_)) => {
+                if let Some(expected) = expected {
+                    return Err(InfinoError::Conflict(
+                        SchemaError::SchemaConflict {
+                            expected,
+                            current: 0,
+                        }
+                        .to_string(),
+                    )
+                    .with_context("apply_schema", Some(name)));
+                }
+                let (schema, indexes) = seed_from_patch(patch)
+                    .map_err(|e| e.with_context("apply_schema", Some(name)))?;
+                self.create_table(name, schema, indexes)?;
+                // The seed carries the columns; the cap and anything else the
+                // patch sets lands by the same merge an existing table takes.
+                self.open_table_handle(name)?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok((*handle.apply_schema(patch, expected)?).clone())
+    }
+
     /// Rotate the GCS bearer token in place, returning `true` when it was
     /// swapped. Only the bearer (`google_bearer_token`) is honored; any other
     /// key in `storage_options` is ignored on this path. Returns `false` when
@@ -1081,17 +1170,22 @@ impl Connection {
                 .instrument(detail_span!("sql.execute"))
                 .await
                 .map_err(|e| datafusion_error(&e))?;
-            if batches.is_empty() {
-                // An empty Vec carries no schema, so hand back one empty batch
-                // instead. Its schema comes from the physical plan, not the
-                // DataFrame: the scan types scalar strings as `Utf8View`, and
-                // `expand_views_at_output` undoes that during optimization,
-                // which the DataFrame's logical plan predates.
-                let output_schema: SchemaRef = plan.schema();
-                Ok(vec![RecordBatch::new_empty(output_schema)])
+            // An empty Vec carries no schema, so hand back one empty batch
+            // instead. Its schema comes from the physical plan, not the
+            // DataFrame: the scan types scalar strings as `Utf8View`, and
+            // `expand_views_at_output` undoes that during optimization,
+            // which the DataFrame's logical plan predates.
+            let batches = if batches.is_empty() {
+                vec![RecordBatch::new_empty(plan.schema())]
             } else {
-                Ok(batches)
-            }
+                batches
+            };
+            // Field ids are the engine's bookkeeping; a result carries the
+            // caller's columns.
+            Ok(batches
+                .into_iter()
+                .map(crate::supertable::schema::strip_field_ids)
+                .collect::<Vec<_>>())
         };
         // A query that names a `FROM` catalog table drives on that table's
         // runtime; otherwise the connection's own. The fallback still has to
@@ -1536,14 +1630,88 @@ fn validate_name(name: &str) -> Result<(), InfinoError> {
 /// table built from one fails on the ambiguous column. Catching it here turns
 /// a table that would otherwise error on every read into a create-time
 /// rejection.
+/// The seed `create_table` takes for `patch`: every listed column with its
+/// type (a new table's columns all need one), and the indexes they declare.
+/// Fields marked `dropped` are left out.
+fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), InfinoError> {
+    let mut fields = Vec::with_capacity(patch.fields.len());
+    let mut indexes = IndexSpec::new();
+    for field in patch.fields.iter().filter(|f| !f.dropped) {
+        let data_type = field.data_type.clone().ok_or_else(|| {
+            InfinoError::Schema(SchemaError::TypeRequired {
+                column: field.name.clone(),
+            })
+        })?;
+        match &field.index {
+            Some(ColumnIndex::Fts {
+                analyzer,
+                stopwords,
+                stemmer,
+                positions,
+                stored,
+                bm25,
+            }) => {
+                indexes = indexes.fts(
+                    FtsField::new(field.name.clone())
+                        .analyzer(analyzer.clone())
+                        .stopwords(*stopwords)
+                        .stemmer(*stemmer)
+                        .positions(*positions)
+                        .stored(*stored)
+                        .bm25(bm25.k1, bm25.b),
+                );
+            }
+            Some(ColumnIndex::Vector {
+                metric,
+                rot_seed,
+                rerank_codec,
+            }) => {
+                let DataType::FixedSizeList(_, dim) = &data_type else {
+                    return Err(InfinoError::Schema(SchemaError::InvalidIndex {
+                        column: field.name.clone(),
+                        reason: "a vector index needs a vector column".to_owned(),
+                    }));
+                };
+                // Carry what the document recorded. Taking the defaults
+                // instead would accept a patch naming a seed or a codec and
+                // silently build the table with different ones, so cloning a
+                // table's schema onto a new one would not reproduce it.
+                indexes = indexes.vector_as_recorded(
+                    field.name.clone(),
+                    *dim as usize,
+                    *metric,
+                    *rot_seed,
+                    *rerank_codec,
+                );
+            }
+            None => {}
+        }
+        fields.push(Field::new(
+            &field.name,
+            data_type,
+            field.nullable.unwrap_or(true),
+        ));
+    }
+    Ok((Arc::new(Schema::new(fields)), indexes))
+}
+
+/// The schema document is served by the engine; a hosted connection does
+/// not carry it over the wire yet.
+#[cfg(feature = "remote")]
+fn remote_schema_unsupported(operation: &'static str, name: &str) -> InfinoError {
+    InfinoError::Backend(
+        "the schema document is not available over a hosted connection yet".to_string(),
+    )
+    .with_context(operation, Some(name))
+}
+
 fn validate_schema(schema: &SchemaRef) -> Result<(), InfinoError> {
     let mut seen = HashSet::new();
     for field in schema.fields() {
         if !seen.insert(field.name().as_str()) {
-            return Err(InfinoError::Schema(format!(
-                "duplicate column name: {}",
-                field.name()
-            )));
+            return Err(InfinoError::Schema(SchemaError::DuplicateColumn {
+                name: field.name().clone(),
+            }));
         }
     }
     Ok(())
@@ -4809,17 +4977,17 @@ mod tests {
         );
     }
 
-    /// A filter that fails on the table's own values is the caller's mistake,
-    /// even though DataFusion pushes it into the parquet scan, which hands the
-    /// failure back as text. The message check pins that text: if a DataFusion
-    /// upgrade rewords it, this fails instead of the error silently turning
+    /// A filter that fails on the table's own values is the caller's mistake.
+    /// The filter runs in the `FilterExec` above the scan, so the failure is
+    /// Arrow's cast error itself; the message check pins that, so a DataFusion
+    /// upgrade that rewords it fails here instead of the error silently turning
     /// into an engine fault.
     #[test]
     fn query_sql_reports_a_filter_that_fails_on_the_data_as_the_callers() {
         let conn = conn_with_docs();
         let err = conn.query_sql("SELECT title FROM docs WHERE CAST(title AS BIGINT) = 1");
         assert!(
-            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("Error evaluating filter predicate")),
+            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("Cannot cast string")),
             "got {err:?}"
         );
         // A regex the caller wrote that does not parse: DataFusion returns the

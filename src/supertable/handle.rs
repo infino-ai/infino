@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
@@ -73,6 +73,7 @@ use crate::{
             lease::DEFAULT_LEASE_DURATION,
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
         },
+        writer::builder_options_of,
     },
     utils::trace::{CloseOut, TableRole, record},
 };
@@ -243,10 +244,11 @@ pub(super) struct SupertableInner {
     /// and purged elsewhere. Latched: the handle can only be discarded, and
     /// `Connection::open_table` checks this before serving it from cache.
     pub(super) pointer_vanished: OnceLock<()>,
-    /// Cached SQL schemas, built once from the immutable `options` (lock-free
-    /// lazy init). A pure function of the schema, so no snapshot invalidation
-    /// (unlike `sql_session_cache`). See [`SqlSchemas`].
-    pub(super) sql_schemas: OnceLock<Arc<SqlSchemas>>,
+    /// Cached SQL schemas, keyed by the `schema_id` they were built from:
+    /// a pure function of the table's schema, rebuilt when it changes and
+    /// otherwise shared (unlike `sql_session_cache`, which follows the
+    /// snapshot). See [`SqlSchemas`].
+    pub(super) sql_schemas: ArcSwapOption<(u32, Arc<SqlSchemas>)>,
     /// Decoded hidden deleted-`_id` set, cached per hidden manifest version.
     /// The set is a deliberate duplicate of the user-table tombstones, carried
     /// INLINE in the hidden manifest so hidden vector search drops deleted rows
@@ -263,9 +265,7 @@ impl SupertableInner {
     /// of the current manifest, so the new file bakes — and is scored at
     /// — the corpus average rather than its own.
     pub(super) fn builder_options(&self) -> BuilderOptions {
-        self.options
-            .builder_options()
-            .with_fts_corpus_stats(self.manifest.load().fts_corpus_stats(&HashSet::new()))
+        builder_options_of(&self.manifest.load())
     }
 
     /// Runtime driving the sync API's async kernels when the caller
@@ -295,10 +295,17 @@ impl SupertableInner {
     /// The table's cached SQL schemas, built once from the immutable options.
     /// Cheap `Arc` clone on every call after the first.
     pub(super) fn sql_schemas(&self) -> Arc<SqlSchemas> {
-        Arc::clone(
-            self.sql_schemas
-                .get_or_init(|| Arc::new(build_sql_schemas(&self.options))),
-        )
+        let manifest = self.manifest.load();
+        let schema_id = manifest.table_schema().schema_id();
+        if let Some(cached) = self.sql_schemas.load().as_ref()
+            && cached.0 == schema_id
+        {
+            return Arc::clone(&cached.1);
+        }
+        let built = Arc::new(build_sql_schemas(&manifest));
+        self.sql_schemas
+            .store(Some(Arc::new((schema_id, Arc::clone(&built)))));
+        built
     }
 
     /// Push the current manifest's tombstone-seq view into the
@@ -919,7 +926,7 @@ impl Supertable {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn schema(&self) -> SchemaRef {
-        self.inner.options.user_schema()
+        self.inner.manifest.load().user_schema()
     }
 
     /// Cached per-table SQL schemas (scan view + scalar schema).
@@ -1000,7 +1007,7 @@ impl Supertable {
             vcfg.search_mode,
             vcfg.ivf_router,
             vcfg.global_fine_fanout,
-            &self.inner.options.vector_columns,
+            &self.inner.manifest.load().vector_configs(),
         ) else {
             return;
         };
@@ -1660,15 +1667,15 @@ pub(crate) fn hidden_vector_index_compaction_settings(
 /// existing user-table IVF summary. Hidden commits use
 /// [`super::opann`] MVCC maintenance — never call this per commit.
 pub(crate) fn train_global_centroids(
-    user_opts: &SupertableOptions,
     manifest: &super::manifest::ManifestSnapshot,
     n_cells: usize,
 ) -> Option<super::manifest::ClusterCentroids> {
-    let vc = user_opts.vector_columns.first()?;
+    let vc = manifest.vector_configs().into_iter().next()?;
+    let vc_id = manifest.field_id(&vc.column)?;
     let mut all_centroids = Vec::new();
     let mut dim = 0usize;
     for entry in manifest.superfiles.iter() {
-        let Some(vs) = entry.vector_summary.get(&vc.column) else {
+        let Some(vs) = entry.vector_summary.get(&vc_id) else {
             continue;
         };
         for cell in &vs.cells {
@@ -1800,7 +1807,7 @@ fn build_vector_index_options(
     }
     if let Some(manifest) = user_manifest
         && let Some(clusters) =
-            train_global_centroids(user_opts, manifest, hidden_vector_cell_count(user_opts))
+            train_global_centroids(manifest, hidden_vector_cell_count(user_opts))
     {
         hidden_opts = hidden_opts.with_partition_strategy(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {
@@ -1851,7 +1858,7 @@ async fn build_handle(
         superseded: Mutex::default(),
         pointer_vanished: OnceLock::new(),
         hidden_deleted_cache: Mutex::new(None),
-        sql_schemas: OnceLock::new(),
+        sql_schemas: ArcSwapOption::empty(),
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };
@@ -2460,6 +2467,7 @@ mod tests {
             opann::MODALITY_MIN_CELL_DOCS,
             options::Consistency,
             query::dispatch::open_reader,
+            schema::LegacyNames,
         },
         test_helpers::default_tokenizer,
     };
@@ -2510,6 +2518,7 @@ mod tests {
     fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -5325,6 +5334,7 @@ mod tests {
                 hidden_storage.as_ref(),
                 uri,
                 &hash,
+                &LegacyNames::none(),
             ))
             .expect("slow state loads");
         assert!(
@@ -5386,6 +5396,22 @@ mod tests {
                 });
             }
             self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_overwrite(
+            &self,
+            uri: &str,
+            bytes: bytes::Bytes,
+        ) -> Result<(), crate::storage::StorageError> {
+            if self
+                .fail_data_puts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && uri.contains("data/")
+            {
+                return Err(crate::storage::StorageError::NotFound {
+                    uri: format!("injected data PUT failure: {uri}"),
+                });
+            }
+            self.inner.put_overwrite(uri, bytes).await
         }
         async fn put_if_match(
             &self,
@@ -5553,6 +5579,7 @@ mod tests {
                 hidden_storage.as_ref(),
                 uri,
                 &hash,
+                &LegacyNames::none(),
             ))
             .expect("slow state loads");
         assert!(
@@ -6258,6 +6285,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let no_removals = Vec::new();
         // The hidden table's own scoped provider — its pointer file, not the
@@ -6459,6 +6488,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden
@@ -6537,6 +6568,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let zero_manifest = hidden
             .block_on_query(persist_commit_async(
@@ -6740,6 +6773,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden
@@ -6922,6 +6957,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let hidden_storage = hidden
             .inner()
@@ -7664,7 +7701,7 @@ mod tests {
             assert!(
                 !entry
                     .vector_summary
-                    .get("emb")
+                    .get(&manifest.field_id("emb").expect("emb id"))
                     .map(|v| v.cells.iter().all(|cell| cell.clusters.is_empty()))
                     .unwrap_or(true),
                 "packed shard missing cluster summary"
@@ -7904,7 +7941,7 @@ mod tests {
             .flat_map(|entry| {
                 entry
                     .vector_summary
-                    .get("emb")
+                    .get(&manifest.field_id("emb").expect("emb id"))
                     .into_iter()
                     .flat_map(|summary| summary.cells.iter())
             })
@@ -8271,7 +8308,8 @@ mod tests {
         let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
         assert!(!manifest.superfiles.is_empty(), "drain built cell files");
         for entry in manifest.superfiles.iter() {
-            let vs = entry.vector_summary.get("emb").unwrap_or_else(|| {
+            let emb = manifest.field_id("emb").expect("emb id");
+            let vs = entry.vector_summary.get(&emb).unwrap_or_else(|| {
                 panic!(
                     "drain-built hidden superfile {} has NO vector_summary",
                     entry.superfile_id
@@ -8856,6 +8894,10 @@ mod tests {
             self.inner.put_atomic(uri, bytes).await
         }
 
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+
         async fn put_if_match(
             &self,
             uri: &str,
@@ -9031,6 +9073,10 @@ mod tests {
             bytes: Bytes,
         ) -> Result<Option<String>, StorageError> {
             self.inner.put_atomic(uri, bytes).await
+        }
+
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
         }
         async fn put_if_match(
             &self,

@@ -75,7 +75,7 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        options::SupertableOptions,
+        manifest::ManifestSnapshot,
         query::{
             covered_agg::CoveredAggregateRewrite,
             exec::{
@@ -116,16 +116,13 @@ impl SqlSchemas {
 /// Build the [`SqlSchemas`] for `options`. Called once per table; the result is
 /// cached on the handle. This is the one place that walks the full column set,
 /// so a wide (thousands of columns) table pays it once, not per query.
-pub(crate) fn build_sql_schemas(options: &SupertableOptions) -> SqlSchemas {
+pub(crate) fn build_sql_schemas(manifest: &ManifestSnapshot) -> SqlSchemas {
     // Stored shape: index-only FTS columns are absent from Parquet, so
     // SQL never sees them — selecting or filtering one fails at plan
     // time like any unknown column.
-    let scalar = options.stored_schema();
-    let fts: HashSet<&str> = options
-        .fts_columns
-        .iter()
-        .map(|c| c.column.as_str())
-        .collect();
+    let scalar = manifest.stored_schema();
+    let fts_configs = manifest.fts_configs();
+    let fts: HashSet<&str> = fts_configs.iter().map(|c| c.column.as_str()).collect();
     let scan = view_string_schema(&scalar, &fts);
     SqlSchemas { scalar, scan }
 }
@@ -415,9 +412,13 @@ impl SupertableReader {
             .create_physical_plan()
             .await
             .map_err(QueryError::DataFusion)?;
-        collect_plan_metered(&plan, task_ctx, op_stats)
+        let batches = collect_plan_metered(&plan, task_ctx, op_stats)
             .await
-            .map_err(QueryError::DataFusion)
+            .map_err(QueryError::DataFusion)?;
+        Ok(batches
+            .into_iter()
+            .map(crate::supertable::schema::strip_field_ids)
+            .collect())
     }
 
     /// Resolve a predicate to the matching `_id` values. Used by
@@ -573,6 +574,7 @@ mod tests {
         },
         supertable::{
             Supertable, SupertableOptions,
+            manifest::ManifestSnapshot,
             query::{candidate::LIKE_MAX_TERMS, sql::build_sql_schemas},
         },
     };
@@ -931,24 +933,22 @@ mod tests {
     }
 
     #[test]
-    fn query_sql_row_filter_carries_the_predicate_once() {
-        // A predicate the index cannot bound (a scalar column) runs as a
-        // Parquet row filter: DataFusion's filter pushdown offers the
-        // `FilterExec` predicate to the scan, the scan accepts it, and the
-        // node is dropped. The provider used to attach its own copy of the
-        // same conjunction first, so the row filter read `p AND p` and
-        // evaluated the predicate twice. The scan line must carry exactly
-        // one `predicate=` with no self-conjunction, and the `FilterExec`
-        // must be gone.
+    fn query_sql_scalar_predicate_runs_above_the_scan() {
+        // `category = 'y'`: a scalar column, so the index cannot bound it.
+        //  - DataFusion keeps a `FilterExec` above the scan and evaluates the
+        //    predicate there, not as a Parquet row filter inside the scan.
+        //  - the scan carries the predicate once, for statistics pruning; the
+        //    provider adds no copy of its own, so never `p AND p`.
+        // This test pins the plan shape and the rows.
         let st = seeded(&["x", "y", "y"], &["alpha", "beta", "gamma"]);
         let plan = explain_physical(&st, "SELECT title FROM supertable WHERE category = 'y'");
         let scan = plan
             .lines()
             .find(|l| l.contains("DataSourceExec"))
             .expect("a DataSourceExec in the physical plan");
-        assert!(!plan.contains("FilterExec"), "{plan}");
-        // The row-filter predicate prints as `, predicate=<expr>`, ahead of
-        // the statistics `pruning_predicate=` DataFusion derives from it.
+        assert!(plan.contains("FilterExec"), "{plan}");
+        // The scan prints `, predicate=<expr>` ahead of the `pruning_predicate=`
+        // DataFusion derives from it.
         let predicate = scan
             .split_once(", predicate=")
             .map(|(_, rest)| rest.split(", pruning_predicate=").next().unwrap_or(rest))
@@ -959,9 +959,8 @@ mod tests {
                 && !predicate.contains(" AND "),
             "{scan}"
         );
-        // The single-copy row filter still returns exactly the matching
-        // rows. (A `COUNT(*)` would not do here: the covered-aggregate
-        // rewrite answers it from manifest value counts without a scan.)
+        // A `COUNT(*)` would not do here: the covered-aggregate rewrite answers
+        // it from manifest value counts without a scan.
         let rows: HashSet<String> = st
             .reader()
             .expect("reader")
@@ -972,9 +971,8 @@ mod tests {
             .collect();
         assert_eq!(rows, HashSet::from(["beta".to_owned(), "gamma".to_owned()]));
 
-        // Control: an index-bounded predicate keeps the `FilterExec` and
-        // the scan gets no row filter of ours; the `predicate=` DataFusion
-        // stores there is for statistics pruning only.
+        // Control: an index-bounded predicate keeps the `FilterExec` too; it
+        // verifies the access plan's candidates.
         let bounded = explain_physical(&st, "SELECT title FROM supertable WHERE title = 'beta'");
         assert!(bounded.contains("FilterExec"), "{bounded}");
     }
@@ -1398,7 +1396,7 @@ mod tests {
     /// per table.
     #[test]
     fn build_sql_schemas_views_scan_and_keeps_scalar() {
-        let s = build_sql_schemas(&options_id_cat_title());
+        let s = build_sql_schemas(&ManifestSnapshot::empty(Arc::new(options_id_cat_title())));
         // scan: `category` (non-FTS string) viewed; `title` (FTS) kept.
         assert_eq!(
             s.scan()
@@ -2206,8 +2204,8 @@ mod tests {
     #[test]
     fn an_exact_ilike_is_checked_nowhere_and_a_count_reads_no_text() {
         // An exact filter leaves nothing in the plan that evaluates it: no
-        // `FilterExec`, no Parquet row filter, no pruning predicate. A
-        // verified one shows up in one of those, as `ILIKE`.
+        // `FilterExec`, no pruning predicate. A verified one shows up in one
+        // of those, as `ILIKE`.
         let (st, oracle) = exact_ilike_table(STANDARD_TOKENIZER);
         for sql in [
             "SELECT title FROM supertable WHERE title ILIKE '%bbc%'",
@@ -2538,8 +2536,8 @@ mod tests {
     fn query_sql_like_mixes_bounded_and_unbounded_superfiles() {
         // The first superfile holds more distinct terms containing `zz`
         // than a LIKE token may widen to, so `%zz%` is unbounded there and
-        // that superfile scans with the row filter; the second holds two
-        // such terms and is bounded. One query spans both paths and must
+        // that superfile scans in full; the second holds two such terms and
+        // is bounded. One query spans both paths and must
         // still be exact. A prefix pattern flips the roles: bounded in the
         // first, empty in the second (no term starts with `q1`), which
         // skips it outright.
@@ -2572,43 +2570,28 @@ mod tests {
     }
 
     #[test]
-    fn query_sql_row_filter_attaches_only_where_a_plan_is_unbounded() {
-        // DataFusion's Parquet row filter pays only when the index found
-        // no bound: a LIKE token past the cap in some superfile, or a plan
-        // that was never bounded. A bounded plan leaves it off, and so
-        // does a plan the selectivity gate sends to a scan for being
-        // dense — there the filter would keep nearly every row and only
-        // add its own decode pass.
-        //
-        // The witness is the `FilterExec` node: with the row filter on,
-        // DataFusion pushes the filter into the scan (the source accepts
-        // row filters) and drops the node; with it off the node stays
-        // above the scan. The scan prints `predicate=` either way — every
-        // filter is kept there for statistics pruning — so that text
-        // proves nothing. The probes project a column so no query folds
-        // to a manifest count without a scan.
+    fn query_sql_filter_exec_stays_above_the_scan_bounded_or_not() {
+        // Five predicates the index treats differently, one plan shape:
+        //  - a LIKE token past the cap in the wide superfile, so it scans,
+        //  - a prefix LIKE bounded in both superfiles,
+        //  - equality on the FTS column, bounded,
+        //  - `IN ('lorem', 'plain')`, dense, sent to a scan by the gate,
+        //  - a scalar column, never bounded.
+        // Each keeps a `FilterExec` above the scan, the witness that the source
+        // took no row filter. The probes project a column so none folds to a
+        // manifest count.
         let st = mixed_like_table();
-        let expect_row_filter = |sql: &str, on: bool| {
+        for sql in [
+            "SELECT title FROM supertable WHERE title LIKE '%zz%'",
+            "SELECT title FROM supertable WHERE title LIKE 'q1%'",
+            "SELECT title FROM supertable WHERE title = 'fizz'",
+            "SELECT title FROM supertable WHERE title IN ('lorem', 'plain')",
+            "SELECT title FROM supertable WHERE category = 'y'",
+        ] {
             let plan = explain_physical(&st, sql);
             assert!(plan.contains("DataSourceExec"), "{sql}\n{plan}");
-            assert_eq!(!plan.contains("FilterExec"), on, "{sql}\n{plan}");
-        };
-        // Over the cap in the wide superfile ⇒ on.
-        expect_row_filter("SELECT title FROM supertable WHERE title LIKE '%zz%'", true);
-        // Bounded in both superfiles (prefix subtree walk; empty in the
-        // narrow one) ⇒ off.
-        expect_row_filter("SELECT title FROM supertable WHERE title LIKE 'q1%'", false);
-        // Equality on the FTS column, bounded ⇒ off.
-        expect_row_filter("SELECT title FROM supertable WHERE title = 'fizz'", false);
-        // A dense predicate nearly every row of both superfiles satisfies
-        // (`lorem` is in every filler row): the gate sends them to a scan,
-        // and the row filter stays off.
-        expect_row_filter(
-            "SELECT title FROM supertable WHERE title IN ('lorem', 'plain')",
-            false,
-        );
-        // Never bounded (a non-FTS column) ⇒ on, as before.
-        expect_row_filter("SELECT title FROM supertable WHERE category = 'y'", true);
+            assert!(plan.contains("FilterExec"), "{sql}\n{plan}");
+        }
     }
 
     #[test]

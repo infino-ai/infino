@@ -13,7 +13,12 @@ use std::{borrow::Cow, mem::size_of, str, sync::Arc};
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 
-use super::{core::*, cursor::TermCursor, metadata::ColumnMeta, work::MatchWork};
+use super::{
+    core::*,
+    cursor::{CursorUse, TermCursor},
+    metadata::ColumnMeta,
+    work::MatchWork,
+};
 use crate::{
     memory::{ConnectionMemoryBudget, OverBudget, Reservation},
     runtime_bridge::run_on_pool,
@@ -330,7 +335,7 @@ impl Collected {
 /// output, so one that fails is a damaged dictionary; skipping it could
 /// drop the rows it indexes, so a walk fails instead.
 fn non_utf8_key() -> FtsError {
-    FtsError::Read(ReadError::MalformedVersion(
+    FtsError::Read(ReadError::Malformed(
         "fts dictionary key is not UTF-8".into(),
     ))
 }
@@ -727,7 +732,7 @@ impl FtsReader {
                             None,
                             UNWEIGHTED,
                             header_probed,
-                            true,
+                            CursorUse::Count,
                         )?;
                         // The bitset spans this blob's documents; a list
                         // reaching past them is a damaged blob, refused
@@ -762,7 +767,7 @@ impl FtsReader {
 
 /// A posting that names a document past the end of its blob.
 fn posting_past_documents() -> FtsError {
-    FtsError::Read(ReadError::MalformedVersion(
+    FtsError::Read(ReadError::Malformed(
         "fts posting names a document past the blob's end".into(),
     ))
 }
@@ -1445,7 +1450,7 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("{walk:?} / {keep:?} skipped the key"));
             assert!(
-                matches!(err, FtsError::Read(ReadError::MalformedVersion(_))),
+                matches!(err, FtsError::Read(ReadError::Malformed(_))),
                 "{walk:?}: {err}"
             );
         }

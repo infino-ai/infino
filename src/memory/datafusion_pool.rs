@@ -146,6 +146,11 @@ pub(crate) fn budgeted_session_context(
         .execution
         .skip_partial_aggregation_probe_ratio_threshold = PARTIAL_AGG_SKIP_PROBE_RATIO;
 
+    // Predicates run in a `FilterExec` above the scan, never as Parquet row
+    // filters inside it (see `SupertableProvider::scan`). Pinned here because
+    // the source's own flag is ORed with this session option.
+    config.options_mut().execution.parquet.pushdown_filters = false;
+
     // Appended after DataFusion's own rules: the round-robin repartition it
     // removes is one `EnforceDistribution` adds above a sorted result, which
     // splits an `ORDER BY` back into partitions collected in completion order.
