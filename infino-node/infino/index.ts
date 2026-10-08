@@ -18,7 +18,7 @@ const STREAM = "stream";
 // Options the engine no longer takes, with what replaces each. The addon
 // drops unknown keys, so these throw rather than be silently ignored.
 const REMOVED_SEARCH_OPTIONS: Record<string, string> = {
-  stats: "BM25 statistics are always table-wide",
+  stats: "term search scores with table-wide statistics; prefix search and lazily loaded tables score each segment with its own",
 };
 const REMOVED_REINDEX_OPTIONS: Record<string, string> = {
   trustWriterAnalysis: "every superfile records its analysis revision",

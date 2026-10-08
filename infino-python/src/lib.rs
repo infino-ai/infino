@@ -919,9 +919,10 @@ impl Table {
     /// keep belongs on the column (`IndexSpec.fts`), where the bounds
     /// are built with it and the correction disappears.
     ///
-    /// Every segment scores against table-wide statistics gathered across
-    /// all segments, so a fragmented table ranks like a single unified
-    /// corpus.
+    /// A term search on a fully loaded table scores every segment against
+    /// table-wide statistics, so a fragmented table ranks like one corpus.
+    /// Prefix search, and a table opened with a lazily loaded manifest,
+    /// score each segment with its own statistics.
     #[pyo3(signature = (column, query, k, mode=None, projection=None, *, k1=None, b=None))]
     #[allow(clippy::too_many_arguments)]
     fn bm25_search<'py>(
