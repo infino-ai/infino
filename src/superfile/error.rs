@@ -148,8 +148,10 @@ pub enum ReadError {
     WrongCodecPath(String),
 
     #[error(
-        "FTS column {column:?} uses the removed {analyzer:?} analyzer; \
-         re-create the table under \"standard\""
+        "FTS column {column:?} uses the removed {analyzer:?} analyzer; copy the \
+         table's rows out with infino {repair_release} before upgrading, then \
+         re-create it under \"standard\"",
+        repair_release = REPAIR_RELEASE
     )]
     RemovedAnalyzer { column: String, analyzer: String },
 
@@ -326,8 +328,9 @@ pub enum FtsError {
     /// nothing a query does can.
     #[error(
         "full-text index (blob version {version}) was written by infino < {min_release}; \
-         reindex the table with infino {repair_release} before upgrading, and \
-         re-create any table that uses the `ascii_lower` analyzer under `standard`",
+         reindex the table with infino {repair_release} before upgrading; for a \
+         table that uses the `ascii_lower` analyzer, copy its rows out with that \
+         release instead and re-create it under `standard`",
         min_release = VERSION_MIN_RELEASE,
         repair_release = REPAIR_RELEASE
     )]

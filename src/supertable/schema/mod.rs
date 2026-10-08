@@ -43,6 +43,7 @@ use crate::{
     catalog::DEFAULT_ROT_SEED,
     superfile::{
         builder::FtsConfig,
+        format::fts::REPAIR_RELEASE,
         fts::{
             analysis::{Stemmer, Stopwords, chain_tokenizer},
             bm25::Bm25Params,
@@ -654,7 +655,9 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
                 && name != STANDARD_TOKENIZER
             {
                 return Err(format!(
-                    "index uses the removed analyzer '{name}'; re-create the table under \"standard\""
+                    "index uses the removed analyzer '{name}'; copy the table's rows out \
+                     with infino {REPAIR_RELEASE} before upgrading, then re-create it \
+                     under \"standard\""
                 ));
             }
             Ok(ColumnIndex::Fts {

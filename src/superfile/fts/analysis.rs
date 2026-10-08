@@ -518,6 +518,7 @@ impl Stemmer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::superfile::format::fts::REPAIR_RELEASE;
 
     /// Build the chain whose derived name is `name`. A test lookup, not
     /// a parser — nothing in the engine turns a name back into
@@ -875,8 +876,12 @@ mod tests {
             .expect_err("a removed analyzer is refused")
             .to_string();
         assert!(
-            msg.contains("\"ascii_lower\"") && msg.contains("re-create"),
-            "the error names the analyzer and the fix: {msg}"
+            msg.contains("\"ascii_lower\"")
+                && msg.contains(&format!(
+                    "copy the table's rows out with infino {REPAIR_RELEASE}"
+                ))
+                && msg.contains("re-create"),
+            "the error names the analyzer, the release to copy out with, and the fix: {msg}"
         );
     }
 }
