@@ -246,11 +246,16 @@ pub enum FtsError {
     /// before the rebuild, because a caller reading it is usually a model
     /// mid-question: told only to rebuild, it gave up on the phrase, and the
     /// words' rows narrowed by a substring filter find it on the table as
-    /// built.
+    /// built. The filter is `ILIKE`, not `LIKE`: the tokenizers lowercase
+    /// the text, so a phrase matches regardless of case and a case-sensitive
+    /// filter would drop its capitalised rows (a heading, a sentence start).
+    /// It still only approximates the phrase, which also matches across
+    /// punctuation (`national-defense`), and the message says so.
     #[error(
         "phrase query on column {column:?}, which was indexed without token \
          positions: to find the phrase, token_match its words and keep the rows \
-         whose {column} contains it (LIKE '%<phrase>%'); a rebuild with \
+         whose {column} contains it (ILIKE '%<phrase>%', which approximates the \
+         phrase: it misses the words joined by punctuation); a rebuild with \
          positions enabled lets a search quote it"
     )]
     PositionsUnavailable { column: String },
