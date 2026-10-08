@@ -2214,6 +2214,43 @@ mod tests {
         assert_eq!(batch.schema().field(0).name(), "title");
     }
 
+    /// A projection naming only columns this file predates resolves to no
+    /// columns at all. There is nothing to read, but the batch still has to
+    /// report the rows the caller asked for: it null-fills to that count, and
+    /// a batch saying it has none drops the hits instead.
+    ///
+    /// On the cold path specifically. The resident reader has its own arm for
+    /// this, and a `memory://` table only ever takes that one, so a search
+    /// through the public API cannot reach here — this is the path an
+    /// object-store or cache-cold read uses, which is the one production
+    /// takes.
+    #[tokio::test]
+    async fn take_rows_object_store_empty_projection_keeps_the_row_count() {
+        let bytes = titled_superfile_bytes();
+        let (schema, n_docs) = schema_and_n_docs(&bytes);
+        let (store, path) = object_store_with(&bytes).await;
+        let ids: Vec<u32> = (0..n_docs as u32).collect();
+
+        let batch = take_rows_object_store(
+            store,
+            path,
+            Some(bytes.len() as u64),
+            &schema,
+            n_docs,
+            &ids,
+            &[],
+        )
+        .await
+        .expect("a projection of no columns is a batch of no columns");
+
+        assert_eq!(batch.num_columns(), 0, "nothing was asked for");
+        assert_eq!(
+            batch.num_rows(),
+            ids.len(),
+            "the rows asked for are still counted, so the caller null-fills them"
+        );
+    }
+
     #[tokio::test]
     async fn take_rows_object_store_out_of_range_id_errors() {
         let bytes = titled_superfile_bytes();
