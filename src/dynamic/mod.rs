@@ -245,7 +245,7 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
             reason: "a row is a JSON object".to_owned(),
         })?;
         let mut leaves = Vec::new();
-        flatten(object, "", 1, schema, &mut leaves)?;
+        flatten(object, "", schema, &mut leaves)?;
         for (path, leaf) in leaves {
             let index = match by_path.get(&path) {
                 Some(&i) => i,
@@ -419,12 +419,10 @@ fn json_kind_name(value: &Value) -> &'static str {
     }
 }
 
-/// Flatten `object` to dot paths under `prefix`. `depth` is the object's
-/// nesting level, `1` for a document itself.
+/// Flatten `object` to dot paths under `prefix`.
 fn flatten<'a>(
     object: &'a Map<String, Value>,
     prefix: &str,
-    depth: u32,
     schema: &TableSchema,
     out: &mut Vec<(String, Leaf<'a>)>,
 ) -> Result<(), SchemaError> {
@@ -436,19 +434,21 @@ fn flatten<'a>(
         } else {
             format!("{prefix}.{key}")
         };
-        // A dotted key is nesting the caller spelled out rather than nested,
-        // and it reaches the same column: `{"a.b": 1}` and `{"a": {"b": 1}}`
-        // both make the path `a.b`. The cap counts the path, so one spelling
-        // cannot buy depth the other is refused.
+        // The one depth check, on the path rather than on the nesting that
+        // produced it. `{"a.b": 1}` and `{"a": {"b": 1}}` reach the same
+        // column, so the cap counts the dots in the path and neither
+        // spelling buys depth the other is refused. The path already carries
+        // every level the recursion has descended, so there is nothing a
+        // separate nesting counter could add.
         //
-        // Only for a path the table does not have. The cap bounds how deep a
+        // Skipped for a path the table has. The cap bounds how deep a
         // document may *grow* the schema, not how deep a column's name may
-        // be: a column called `a.b.c` is a column whatever the cap is — only
-        // `schema_ipc` or a patch can declare one, both of which need
-        // `manage` — and a write into it adds nothing to bound.
-        let live = schema.id_of(&path).is_some();
-        let spelled = path.chars().filter(|c| *c == '.').count() as u32 + 1;
-        if !live && spelled.max(depth) > max_depth {
+        // be: only `schema_ipc` or a patch can declare a column called
+        // `a.b.c`, both of which need `manage`, and a write into it adds
+        // nothing to bound.
+        if schema.id_of(&path).is_none()
+            && path.chars().filter(|c| *c == '.').count() as u32 + 1 > max_depth
+        {
             return Err(SchemaError::DepthExceeded {
                 cap: max_depth,
                 path,
@@ -465,13 +465,7 @@ fn flatten<'a>(
                     out.push((path, Leaf::Object(value)));
                     continue;
                 }
-                if depth + 1 > max_depth {
-                    return Err(SchemaError::DepthExceeded {
-                        cap: max_depth,
-                        path,
-                    });
-                }
-                flatten(inner, &path, depth + 1, schema, out)?;
+                flatten(inner, &path, schema, out)?;
             }
             Value::Array(items) => {
                 if items.is_empty() {
@@ -504,13 +498,7 @@ fn flatten<'a>(
                     for (element, item) in items.iter().enumerate() {
                         let mut leaves = Vec::new();
                         let inner = item.as_object().expect("every item is an object");
-                        if depth + 1 > max_depth {
-                            return Err(SchemaError::DepthExceeded {
-                                cap: max_depth,
-                                path,
-                            });
-                        }
-                        flatten(inner, &path, depth + 1, schema, &mut leaves)?;
+                        flatten(inner, &path, schema, &mut leaves)?;
                         let before: Vec<usize> = per_path.iter().map(|(_, v)| v.len()).collect();
                         for (leaf_path, leaf) in leaves {
                             let values = match leaf {
@@ -1629,7 +1617,9 @@ mod tests {
     fn depth_is_capped_and_an_empty_document_adds_nothing() {
         let t = table(vec![]);
         let deep = json!({"a": {"b": {"c": {"d": 1}}}});
-        // Depth counts objects: the document is 1, `a` 2, `b` 3, `c` 4.
+        // Depth counts the path's segments: `a.b.c.d` is four, however the
+        // document spelled it. The refusal names the path that is too deep,
+        // not the one it nests under.
         let mut doc = t.to_json();
         doc["max_depth"] = json!(4);
         let four = TableSchema::from_json(&doc).expect("schema");
@@ -1638,7 +1628,7 @@ mod tests {
         let three = TableSchema::from_json(&doc).expect("schema");
         assert!(matches!(
             rows_to_batch(&[deep], &three),
-            Err(SchemaError::DepthExceeded { cap: 3, path }) if path == "a.b.c"
+            Err(SchemaError::DepthExceeded { cap: 3, path }) if path == "a.b.c.d"
         ));
         let empty = rows_to_batch(&[json!({}), json!({"z": null, "e": []})], &t).expect("map");
         assert_eq!(empty.num_columns(), 0);
@@ -2619,15 +2609,37 @@ mod tests {
         .apply(&[SchemaChange::SetMaxDepth(2)])
         .expect("set the cap");
 
-        let batch = rows_to_batch(&[json!({"a.b.c": 1})], &declared)
-            .expect("a write into a declared column is not schema growth");
-        assert_eq!(types(&batch)["a.b.c"], DataType::Int64);
+        // Either spelling, since both reach the same column.
+        for row in [json!({"a.b.c": 1}), json!({"a": {"b": {"c": 1}}})] {
+            let batch = rows_to_batch(std::slice::from_ref(&row), &declared)
+                .unwrap_or_else(|e| panic!("{row}: a write into a declared column: {e}"));
+            assert_eq!(types(&batch)["a.b.c"], DataType::Int64, "{row}");
+        }
 
         // A path the table does not have is still bounded, which is what the
         // cap is for.
         let err = rows_to_batch(&[json!({"x.y.z": 1})], &declared)
             .expect_err("a new path past the cap is refused");
         assert_eq!(err.kind(), "DepthExceeded");
+    }
+
+    /// Nesting that reaches no key past the cap adds no path, so there is
+    /// nothing to bound. The checks on the nesting that used to sit beside
+    /// the one on the path refused these before any key was looked at.
+    ///
+    /// A key *is* a path, so `{"a": {"b": {}}}` is still refused at `a.b`
+    /// under a cap of one: the document named that path, whatever its value
+    /// turned out to yield.
+    #[test]
+    fn nesting_that_reaches_no_key_is_not_capped() {
+        let shallow = TableSchema::from_user_schema(&Schema::new(Vec::<Field>::new()))
+            .apply(&[SchemaChange::SetMaxDepth(1)])
+            .expect("set the cap");
+        for row in [json!({"a": {}}), json!({"x": [{}]})] {
+            let batch = rows_to_batch(std::slice::from_ref(&row), &shallow)
+                .unwrap_or_else(|e| panic!("{row}: {e}"));
+            assert_eq!(batch.num_columns(), 0, "{row}: no column was added");
+        }
     }
 
     /// A dotted key is nesting the caller spelled out, and reaches the same
@@ -2644,11 +2656,16 @@ mod tests {
         rows_to_batch(&[json!({"a": {"b": 1}})], &shallow).expect("nested, at the cap");
         rows_to_batch(&[json!({"a.b": 1})], &shallow).expect("dotted, at the cap");
 
-        // Three is past it, spelled either way.
+        // Three is past it, spelled either way, and the refusal names the
+        // same path both times — one check, on the path.
         for row in [json!({"a": {"b": {"c": 1}}}), json!({"a.b.c": 1})] {
             let err = rows_to_batch(std::slice::from_ref(&row), &shallow)
                 .expect_err("three levels is past the cap");
-            assert_eq!(err.kind(), "DepthExceeded", "{row}: {err:?}");
+            assert!(
+                matches!(&err, SchemaError::DepthExceeded { cap, path }
+                    if *cap == 2 && path == "a.b.c"),
+                "{row}: {err:?}"
+            );
         }
     }
 
