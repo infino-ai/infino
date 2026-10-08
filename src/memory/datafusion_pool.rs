@@ -42,7 +42,10 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 
-use crate::{memory::ConnectionMemoryBudget, supertable::query::sorted_root::KeepSortedRoot};
+use crate::{
+    memory::ConnectionMemoryBudget,
+    supertable::query::{sorted_root::KeepSortedRoot, values_subquery::ValuesSubqueryRewrite},
+};
 
 /// A DataFusion memory pool over a [`ConnectionMemoryBudget`]: measured never
 /// refuses, bounded refuses at the 90% gate (DataFusion then spills, or errors
@@ -143,6 +146,11 @@ pub(crate) fn budgeted_session_context(
         .execution
         .skip_partial_aggregation_probe_ratio_threshold = PARTIAL_AGG_SKIP_PROBE_RATIO;
 
+    // Predicates run in a `FilterExec` above the scan, never as Parquet row
+    // filters inside it (see `SupertableProvider::scan`). Pinned here because
+    // the source's own flag is ORed with this session option.
+    config.options_mut().execution.parquet.pushdown_filters = false;
+
     // Appended after DataFusion's own rules: the round-robin repartition it
     // removes is one `EnforceDistribution` adds above a sorted result, which
     // splits an `ORDER BY` back into partitions collected in completion order.
@@ -150,6 +158,10 @@ pub(crate) fn budgeted_session_context(
         .with_config(config)
         .with_runtime_env(budgeted_runtime(budget)?)
         .with_default_features()
+        // A scalar subquery in a `VALUES` cell would be evaluated while the
+        // list is planned, before the subquery has run; this plans such a
+        // list as one-row projections instead (see the rule's module).
+        .with_optimizer_rule(Arc::new(ValuesSubqueryRewrite))
         .with_physical_optimizer_rule(Arc::new(KeepSortedRoot))
         .build();
     Ok(SessionContext::new_with_state(state))

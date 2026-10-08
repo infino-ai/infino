@@ -131,7 +131,11 @@ use crate::{
             rerank_codec::RerankCodec,
         },
     },
-    utils::{terms::validate_column_name, trace::detail_span},
+    supertable::schema::{FieldId, field_id_of, map::FileSchemaMap, with_field_id},
+    utils::{
+        terms::validate_column_name,
+        trace::{detail_span, record},
+    },
 };
 
 /// Merges below this many surviving documents keep arrival order: a
@@ -167,7 +171,7 @@ const REORDER_TERM_BUCKET_BITS: u32 = 22;
 /// document lengths and the chosen order are all indexed by the number
 /// this returns, so two copies drifting apart would put a posting under
 /// the wrong document.
-fn survivor_rows(
+pub(crate) fn survivor_rows(
     n_local: u32,
     deleted: Option<&RoaringBitmap>,
     base: u32,
@@ -284,6 +288,10 @@ pub(crate) enum CarryScope {
     /// Copy only the columns whose text is absent, and leave the rest for
     /// the caller to re-analyze from the batch.
     UnstoredOnly,
+    /// Copy nothing: every column is analyzed from the batch. For an input
+    /// whose index is not the output's (a column's index added, dropped or
+    /// renamed since the file was written), where there is nothing to carry.
+    Reanalyze,
 }
 
 impl CarryScope {
@@ -292,6 +300,7 @@ impl CarryScope {
         match self {
             Self::AllColumns => true,
             Self::UnstoredOnly => !column.stored,
+            Self::Reanalyze => false,
         }
     }
 }
@@ -548,6 +557,15 @@ pub struct BuilderOptions {
     pub id_page_size_limit: usize,
     /// Embedded vector blob layout. Default IVF.
     pub(crate) vector_layout: VectorLayout,
+    /// The table schema version the superfile is written under, stamped
+    /// in the footer as provenance.
+    pub(crate) schema_id: u32,
+    /// The field id of each column this builder's `schema` does not
+    /// carry, by name: vector columns (they live in the vector blob) and
+    /// index-only FTS columns (their text lives in no body at all). The
+    /// footer records their ids from here, so every column of a written
+    /// file is identified the same way.
+    pub(crate) field_ids_outside_schema: HashMap<String, FieldId>,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -617,6 +635,15 @@ impl BuilderOptions {
         fts_columns: Vec<FtsConfig>,
         vector_columns: Vec<VectorConfig>,
     ) -> Self {
+        // A schema the caller never stamped (a standalone superfile, or a
+        // test) gets ids by position: the first field is the id column, the
+        // rest are `1..=n`. Stats and the footer are then keyed the same
+        // way for every superfile, whatever built it.
+        let schema = if schema.fields().iter().any(|f| field_id_of(f).is_some()) {
+            schema
+        } else {
+            stamp_ids_by_position(&schema)
+        };
         Self {
             schema,
             id_column: id_column.into(),
@@ -629,12 +656,44 @@ impl BuilderOptions {
             id_page_size_limit: DEFAULT_ID_PAGE_SIZE_LIMIT,
             vector_layout: VectorLayout::Ivf,
             fts_corpus_stats: HashMap::new(),
+            schema_id: 1,
+            field_ids_outside_schema: HashMap::new(),
         }
+    }
+
+    /// Record the field id of each column the schema does not carry (see
+    /// [`BuilderOptions::field_ids_outside_schema`]). Called once per
+    /// builder; later calls replace the map.
+    pub(crate) fn with_field_ids_outside_schema(
+        mut self,
+        ids: impl IntoIterator<Item = (String, FieldId)>,
+    ) -> Self {
+        self.field_ids_outside_schema = ids.into_iter().collect();
+        self
     }
 
     pub(crate) fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
         self.vector_layout = layout;
         self
+    }
+
+    pub(crate) fn with_schema_id(mut self, schema_id: u32) -> Self {
+        self.schema_id = schema_id;
+        self
+    }
+
+    /// The field id of `column`: the one recorded for a column outside
+    /// the schema, else the one stamped on the schema's field.
+    pub(crate) fn field_id_of_column(&self, column: &str) -> Option<FieldId> {
+        self.field_ids_outside_schema
+            .get(column)
+            .copied()
+            .or_else(|| {
+                self.schema
+                    .field_with_name(column)
+                    .ok()
+                    .and_then(field_id_of)
+            })
     }
 
     /// Lower each FTS column's carried analysis revision to the lowest
@@ -791,6 +850,22 @@ impl BuilderOptions {
             (Vec::new(), VectorLayout::Ivf)
         };
 
+        // The ids of the columns `reader.schema()` does not carry: the
+        // vector columns, and the FTS columns whose text is not stored.
+        let outside_schema: Vec<(String, FieldId)> = reader
+            .vec()
+            .into_iter()
+            .flat_map(|vec| vec.vector_columns_config())
+            .filter_map(|v| Some((v.name.clone(), v.field_id?)))
+            .chain(
+                reader
+                    .fts()
+                    .into_iter()
+                    .flat_map(|fts| fts.fts_columns_config())
+                    .filter(|c| !c.stored)
+                    .filter_map(|c| Some((c.name.clone(), c.field_id?))),
+            )
+            .collect();
         BuilderOptions::new(
             reader.schema().clone(),
             reader.id_column(),
@@ -798,6 +873,48 @@ impl BuilderOptions {
             vector_columns,
         )
         .with_vector_layout(vector_layout)
+        .with_field_ids_outside_schema(outside_schema)
+    }
+
+    /// These options as a merge's output shape: the body the inputs
+    /// actually carry. An index-only FTS column's text is in no file body,
+    /// so it is not a column a merge input can supply — its postings are
+    /// carried across prebuilt instead — while `schema` on the ingest path
+    /// stays the contract that the text must arrive to be indexed. The
+    /// column keeps its id here, so the merged file identifies it exactly
+    /// as its inputs did.
+    pub(crate) fn into_merge_source_shape(mut self) -> Self {
+        let index_only: Vec<&FtsConfig> = self
+            .fts_columns
+            .iter()
+            .filter(|c| !c.stored && self.schema.index_of(&c.column).is_ok())
+            .collect();
+        if index_only.is_empty() {
+            return self;
+        }
+        let mut ids: Vec<(String, FieldId)> = Vec::with_capacity(index_only.len());
+        for column in &index_only {
+            if let Ok(field) = self.schema.field_with_name(&column.column)
+                && let Some(id) = field_id_of(field)
+            {
+                ids.push((column.column.clone(), id));
+            }
+        }
+        let names: HashSet<&str> = index_only.iter().map(|c| c.column.as_str()).collect();
+        let fields: Vec<Arc<Field>> = self
+            .schema
+            .fields()
+            .iter()
+            .filter(|f| !names.contains(f.name().as_str()))
+            .cloned()
+            .collect();
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            self.schema.metadata().clone(),
+        ));
+        self.field_ids_outside_schema.extend(ids);
+        self.schema = schema;
+        self
     }
 
     /// Verify a merge input's per-column FTS configuration is
@@ -821,6 +938,18 @@ impl BuilderOptions {
     /// Inputs from one table can never disagree (the table's options
     /// identity pins the per-column config), so every error here is a
     /// misuse of the merge entry points — made loud instead of silent.
+    /// Whether `reader`'s posting lists can be carried into a file built
+    /// with these options: the same full-text columns under the same
+    /// analysis. A file written before a column's index was added or
+    /// after it was dropped, or whose column has since been renamed, fails
+    /// this and is re-encoded from its rows instead.
+    pub(crate) fn fts_carry_compatible(&self, reader: &SuperfileReader) -> bool {
+        let remote = reader
+            .fts()
+            .map(|f| f.fts_columns_config().collect::<Vec<_>>());
+        self.check_fts_carry_compat(remote.as_deref()).is_ok()
+    }
+
     fn check_fts_carry_compat(&self, remote: Option<&[&ColumnMeta]>) -> Result<(), BuildError> {
         let remote = remote.unwrap_or(&[]);
         if self.fts_columns.len() != remote.len() {
@@ -831,9 +960,26 @@ impl BuilderOptions {
             )));
         }
         for (own, other) in self.fts_columns.iter().zip(remote.iter()) {
-            if own.column != other.name {
+            // Columns are the same column when their ids agree; a label
+            // change is not a change of terms, so a renamed column's
+            // postings still carry. Files written before ids compare by
+            // name, which is what identified a column then.
+            //
+            // That name is matched against the table's live columns, so it
+            // carries the limitation `LegacyNames` documents: a name the
+            // table has since given to a different column matches here, and
+            // the retired column's postings carry into the new one. It is
+            // confined to files that predate ids and clears once compaction
+            // rewrites them. The scalar path next door decides by id for
+            // exactly this reason; this one cannot, because a file that
+            // predates ids has no id to decide with.
+            let same_column = match (self.field_id_of_column(&own.column), other.field_id) {
+                (Some(own_id), Some(other_id)) => own_id == other_id,
+                _ => own.column == other.name,
+            };
+            if !same_column {
                 return Err(BuildError::FTSSchemaMismatch(format!(
-                    "mismatched column name. self {} vs other {}",
+                    "mismatched column. self {} vs other {}",
                     own.column, other.name
                 )));
             }
@@ -863,60 +1009,6 @@ impl BuilderOptions {
             }
         }
         Ok(())
-    }
-
-    fn check_mergeability(
-        &self,
-        remote_id_col: &str,
-        remote_schema: &Arc<Schema>,
-        remote_fts_columns: Option<Vec<&ColumnMeta>>,
-        remote_vector_columns: Option<Vec<&ColumnReader>>,
-    ) -> Result<bool, BuildError> {
-        if self.id_column != *remote_id_col {
-            return Err(BuildError::IdColumnMismatch(
-                self.id_column.clone(),
-                remote_id_col.to_string(),
-            ));
-        }
-
-        if self.schema.fields() != remote_schema.fields() {
-            return Err(BuildError::SchemaMismatch {
-                mine: self.schema.to_string(),
-                other: remote_schema.to_string(),
-            });
-        }
-
-        self.check_fts_carry_compat(remote_fts_columns.as_deref())?;
-
-        if let Some(remote_vector_columns) = remote_vector_columns {
-            let self_vec_columns = &self.vector_columns;
-            if self_vec_columns.len() != remote_vector_columns.len() {
-                return Err(BuildError::VectorSchemaMismatch(format!(
-                    "mismatched column len. self {} vs other {}",
-                    self_vec_columns.len(),
-                    remote_vector_columns.len()
-                )));
-            }
-
-            for (self_vec_column, remote_vector_column) in
-                self_vec_columns.iter().zip(remote_vector_columns.iter())
-            {
-                if self_vec_column.column != remote_vector_column.name {
-                    return Err(BuildError::VectorSchemaMismatch(format!(
-                        "mismatched column name. self {} vs other {}",
-                        self_vec_column.column, remote_vector_column.name
-                    )));
-                }
-                if self_vec_column.dim != remote_vector_column.dim {
-                    return Err(BuildError::VectorSchemaMismatch(format!(
-                        "mismatched column dim. self {} vs other {}",
-                        self_vec_column.dim, remote_vector_column.dim
-                    )));
-                }
-            }
-        }
-
-        Ok(true)
     }
 }
 
@@ -1173,7 +1265,7 @@ impl SuperfileBuilder {
         vectors: &[&[f32]],
         index_fts: bool,
     ) -> Result<(), BuildError> {
-        if batch.schema().fields() != self.opts.schema.fields() {
+        if !same_shape(&batch.schema(), &self.opts.schema) {
             return Err(BuildError::BatchSchemaMismatch {
                 batch: batch.schema().to_string(),
                 builder: self.opts.schema.to_string(),
@@ -1236,7 +1328,7 @@ impl SuperfileBuilder {
     /// tokenizes, so feeding it rows without also carrying their postings
     /// under-indexes the file.
     pub(crate) fn add_batch_ids_only(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
-        if batch.schema().fields() != self.opts.schema.fields() {
+        if !same_shape(&batch.schema(), &self.opts.schema) {
             return Err(BuildError::BatchSchemaMismatch {
                 batch: batch.schema().to_string(),
                 builder: self.opts.schema.to_string(),
@@ -1259,6 +1351,12 @@ impl SuperfileBuilder {
                 .expect("projection indices are derived from the validated schema"),
             None => batch.clone(),
         };
+        // Rewrapped under the builder's own Parquet schema, which carries
+        // the field ids: the caller's batch was checked to have the same
+        // shape and need not carry any metadata of its own.
+        let stored =
+            RecordBatch::try_new(Arc::clone(&self.parquet_schema), stored.columns().to_vec())
+                .expect("same shape as the validated batch, differing only in field metadata");
         self.batches.push(stored);
     }
 
@@ -1459,7 +1557,7 @@ impl SuperfileBuilder {
                     return Ok(());
                 };
                 let term_str = from_utf8(term).map_err(|_| {
-                    FtsError::Read(ReadError::MalformedVersion(
+                    FtsError::Read(ReadError::Malformed(
                         "non-utf8 term in FTS merge input".into(),
                     ))
                 })?;
@@ -1471,7 +1569,7 @@ impl SuperfileBuilder {
                     fb.add_prebuilt_term_posting(column_id, term_str, out_doc, tf, positions)
                 {
                     push_err = Some(e);
-                    return Err(FtsError::Read(ReadError::MalformedVersion(
+                    return Err(FtsError::Read(ReadError::Malformed(
                         "prebuilt push aborted".into(),
                     )));
                 }
@@ -1558,12 +1656,16 @@ impl SuperfileBuilder {
     /// average over everything that remains beside it.
     ///
     /// Merge Sq8 IVF superfiles without fp32 corpus decode — byte-splices
-    /// per-cluster IVF blocks and remaps doc ids.
+    /// per-cluster IVF blocks, drops tombstoned rows and remaps doc ids.
     pub fn build_from_sq8_ivf_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
-        let stats = Self::build_from_sq8_ivf_readers_to(readers, &HashMap::new(), &mut buf)?;
+        let inputs = same_shape_inputs(readers);
+        let base = BuilderOptions::new_from_reader(
+            &inputs.first().ok_or(BuildError::BatchReadError)?.reader,
+        );
+        let stats = Self::build_from_sq8_ivf_readers_to(&inputs, base, &mut buf)?;
         Ok((buf, stats))
     }
 
@@ -1571,15 +1673,19 @@ impl SuperfileBuilder {
     /// [`build_from_sq8_ivf_readers`](Self::build_from_sq8_ivf_readers): writes
     /// the merged superfile to `output` instead of returning a `Vec<u8>`, so
     /// the compaction caller can stream to a temp file.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "sq8_merge", skip_all, fields(inputs = inputs.len()))
+    )]
     pub(crate) fn build_from_sq8_ivf_readers_to<W: Write>(
-        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-        fts_corpus: &HashMap<String, ColumnLengthStats>,
+        inputs: &[MergeInput],
+        base: BuilderOptions,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        let builder_opts = merge_builder_opts(readers, fts_corpus)?;
+        let builder_opts = merge_builder_opts(inputs, base)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
-        let (first, _) = readers.first().ok_or(BuildError::BatchReadError)?;
+        let first = &inputs.first().ok_or(BuildError::BatchReadError)?.reader;
         let vec_col = first
             .vec()
             .and_then(|v| v.vector_columns_config().next())
@@ -1589,27 +1695,29 @@ impl SuperfileBuilder {
         }
         let column = vec_col.name.clone();
 
-        let mut stats_collector = Vec::with_capacity(readers.len());
-        let mut merge_inputs: Vec<(&VectorReader, String, u32)> = Vec::with_capacity(readers.len());
+        let mut stats_collector = Vec::with_capacity(inputs.len());
+        let mut merge_inputs: Vec<(&VectorReader, &str, u32, Option<Arc<RoaringBitmap>>)> =
+            Vec::with_capacity(inputs.len());
         let mut local_base = 0u32;
 
-        for (idx, (reader, deleted)) in readers.iter().enumerate() {
+        let read_span = detail_span!(
+            "sq8_merge.read_inputs",
+            rows = tracing::field::Empty,
+            deleted_rows = tracing::field::Empty,
+        )
+        .entered();
+        for input in inputs {
+            let (reader, deleted) = (&input.reader, &input.deleted);
             // Compaction opens its inputs eagerly (see
             // `query::dispatch::open_compaction_input`), so `get_record_batch`
             // resolves off resident bytes. A lazy reader here is a caller bug,
             // not something to paper over — surface it with context.
-            let record_batch = reader.get_record_batch(deleted.clone()).map_err(|e| {
-                BuildError::Io(Error::other(format!(
-                    "sq8 merge input {idx}: read RecordBatch failed (n_docs={}, eager={}): {e}",
-                    reader.n_docs(),
-                    reader.parquet_bytes().is_some(),
-                )))
-            })?;
+            let record_batch = input.batch(&superfile_builder.opts)?;
             let stats = SuperfileStats::try_compute_from_record_batch(&record_batch)?;
             stats_collector.push(stats);
 
             let v = reader.vec().ok_or(BuildError::VectorReadError)?;
-            merge_inputs.push((v, column.clone(), local_base));
+            merge_inputs.push((v, column.as_str(), local_base, deleted.clone()));
 
             // FTS rides out of band like the vector blob: carry the input's
             // prebuilt postings (aligned with the surviving rows the batch
@@ -1618,14 +1726,20 @@ impl SuperfileBuilder {
             superfile_builder.add_batch_ids_only(&record_batch)?;
             local_base += record_batch.num_rows() as u32;
         }
+        record("rows", local_base);
+        record(
+            "deleted_rows",
+            inputs
+                .iter()
+                .filter_map(|input| input.deleted.as_ref().map(|d| d.len()))
+                .sum::<u64>(),
+        );
+        drop(read_span);
 
-        let merge_refs: Vec<(&VectorReader, &str, u32)> = merge_inputs
-            .iter()
-            .map(|(v, col, off)| (*v, col.as_str(), *off))
-            .collect();
-        let merged_sub = merge_sq8_ivf_subsections(&merge_refs)?;
+        let merged_sub = merge_sq8_ivf_subsections(&merge_inputs)?;
         superfile_builder.set_prebuilt_ivf_subsection(0, merged_sub)?;
 
+        let _write_span = detail_span!("sq8_merge.write").entered();
         superfile_builder.finish_to(output)?;
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
@@ -1646,10 +1760,14 @@ impl SuperfileBuilder {
         superseded_per_reader: &[BTreeSet<u32>],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
+        let inputs = same_shape_inputs(readers);
+        let base = BuilderOptions::new_from_reader(
+            &inputs.first().ok_or(BuildError::BatchReadError)?.reader,
+        );
         let stats = Self::build_from_multi_cell_sq8_ivf_readers_to(
-            readers,
+            &inputs,
             superseded_per_reader,
-            &HashMap::new(),
+            base,
             &mut buf,
         )?;
         Ok((buf, stats))
@@ -1658,13 +1776,26 @@ impl SuperfileBuilder {
     /// Streaming counterpart of
     /// [`build_from_multi_cell_sq8_ivf_readers`](Self::build_from_multi_cell_sq8_ivf_readers):
     /// writes the merged superfile to `output` instead of returning a `Vec<u8>`.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "multi_cell_merge",
+            skip_all,
+            fields(
+                inputs = inputs.len(),
+                tombstones = tracing::field::Empty,
+                splice_cells = tracing::field::Empty,
+                rebuild_cells = tracing::field::Empty,
+            )
+        )
+    )]
     pub(crate) fn build_from_multi_cell_sq8_ivf_readers_to<W: Write>(
-        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        inputs: &[MergeInput],
         superseded_per_reader: &[BTreeSet<u32>],
-        fts_corpus: &HashMap<String, ColumnLengthStats>,
+        base: BuilderOptions,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        let builder_opts = merge_builder_opts(readers, fts_corpus)?;
+        let builder_opts = merge_builder_opts(inputs, base)?;
         if builder_opts.vector_layout != VectorLayout::MultiCellIvf {
             return Err(BuildError::VectorSchemaMismatch(
                 "build_from_multi_cell_sq8_ivf_readers requires multi-cell inputs".into(),
@@ -1679,18 +1810,38 @@ impl SuperfileBuilder {
             .ok_or(BuildError::VectorReadError)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
-        let any_tombstones = readers
+        let any_tombstones = inputs
             .iter()
-            .any(|(_, deleted)| deleted.as_ref().is_some_and(|b| !b.is_empty()));
+            .any(|input| input.deleted.as_ref().is_some_and(|b| !b.is_empty()));
 
-        let mut stats_collector = Vec::with_capacity(readers.len());
-        let mut scalar_batches = Vec::with_capacity(readers.len());
-        for (idx, (reader, deleted)) in readers.iter().enumerate() {
-            let record_batch = reader.get_record_batch(deleted.clone()).map_err(|e| {
-                BuildError::Io(Error::other(format!(
-                    "multi-cell merge input {idx}: read RecordBatch failed: {e}"
-                )))
-            })?;
+        record("tombstones", any_tombstones);
+        // One span per merged cell: whether it spliced or rebuilt, and (for a
+        // rebuild) the cell builder's phase timings, which it records here.
+        // Without `detailed-tracing` the span takes no fields.
+        #[cfg_attr(not(feature = "detailed-tracing"), allow(unused_variables))]
+        let cell_span = |cell_id: u32, fragments: usize, rows: usize| {
+            detail_span!(
+                "merge_cell",
+                cell = cell_id,
+                fragments = fragments,
+                rows = rows,
+                path = tracing::field::Empty,
+                sample_ms = tracing::field::Empty,
+                train_ms = tracing::field::Empty,
+                n_cent = tracing::field::Empty,
+                bucket_ms = tracing::field::Empty,
+                fsync_ms = tracing::field::Empty,
+                write_ms = tracing::field::Empty,
+                crc_ms = tracing::field::Empty,
+            )
+        };
+
+        let read_span = detail_span!("multi_cell_merge.read_inputs").entered();
+        let mut stats_collector = Vec::with_capacity(inputs.len());
+        let mut scalar_batches = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let reader = &input.reader;
+            let record_batch = input.batch(&superfile_builder.opts)?;
             stats_collector.push(SuperfileStats::try_compute_from_record_batch(
                 &record_batch,
             )?);
@@ -1711,6 +1862,7 @@ impl SuperfileBuilder {
                 .check_fts_carry_compat(remote_cfg.as_deref())?;
             scalar_batches.push(record_batch);
         }
+        drop(read_span);
 
         let mut packed_cells: Vec<(u32, MergedIvfSubsection)> = Vec::new();
         let mut all_stable_ids: Vec<i128> = Vec::new();
@@ -1720,8 +1872,11 @@ impl SuperfileBuilder {
             // The fine-cluster count is re-derived from the surviving row count at
             // rebuild time (see the build loop) so a merged cell is re-clustered
             // to the fine-run byte target rather than inheriting a source width.
-            let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
-            for (reader_idx, (reader, deleted)) in readers.iter().enumerate() {
+            // Per cell: how many fragments fed it, and its surviving rows.
+            let mut by_cell: HashMap<u32, (usize, Vec<MaterializedIvfRow>)> = HashMap::new();
+            let materialize_span = detail_span!("multi_cell_merge.materialize").entered();
+            for (reader_idx, input) in inputs.iter().enumerate() {
+                let (reader, deleted) = (&input.reader, &input.deleted);
                 let v = reader.vec().ok_or(BuildError::VectorReadError)?;
                 let superseded = superseded_per_reader.get(reader_idx);
                 let mut file_doc_base = 0u32;
@@ -1743,14 +1898,21 @@ impl SuperfileBuilder {
                     if rows.is_empty() {
                         continue;
                     }
-                    by_cell.entry(cell_id).or_default().extend(rows);
+                    let (fragments, cell_rows) = by_cell.entry(cell_id).or_default();
+                    *fragments += 1;
+                    cell_rows.extend(rows);
                 }
             }
+            drop(materialize_span);
 
             let mut cell_ids: Vec<u32> = by_cell.keys().copied().collect();
             cell_ids.sort_unstable();
+            record("splice_cells", 0);
+            record("rebuild_cells", cell_ids.len());
             for cell_id in cell_ids {
-                let mut rows = by_cell.remove(&cell_id).expect("cell present");
+                let (fragments, mut rows) = by_cell.remove(&cell_id).expect("cell present");
+                let _span = cell_span(cell_id, fragments, rows.len()).entered();
+                record("path", "rebuild");
                 for (i, row) in rows.iter_mut().enumerate() {
                     row.local_doc_id = i as u32;
                 }
@@ -1776,8 +1938,8 @@ impl SuperfileBuilder {
             // its parsed merge input: fragments that agree on fine `n_cent`
             // byte-splice, disagreeing ones re-materialize from those sources.
             let mut by_cell: HashMap<u32, Vec<(usize, usize, Sq8IvfMergeInput)>> = HashMap::new();
-            for (reader_idx, (reader, _)) in readers.iter().enumerate() {
-                let v = reader.vec().ok_or(BuildError::VectorReadError)?;
+            for (reader_idx, input) in inputs.iter().enumerate() {
+                let v = input.reader.vec().ok_or(BuildError::VectorReadError)?;
                 let superseded = superseded_per_reader.get(reader_idx);
                 for (ci, &cell_id) in v.packed_cell_ids().iter().enumerate() {
                     if superseded.is_some_and(|s| s.contains(&cell_id)) {
@@ -1803,6 +1965,9 @@ impl SuperfileBuilder {
             let mut __rebuild_ns: u128 = 0;
             for cell_id in cell_ids {
                 let sources = by_cell.remove(&cell_id).expect("cell present");
+                let merged_docs: usize =
+                    sources.iter().map(|(_, _, inp)| inp.n_docs as usize).sum();
+                let _span = cell_span(cell_id, sources.len(), merged_docs).entered();
                 let __mt = std::time::Instant::now();
                 let same_shape = sources
                     .windows(2)
@@ -1822,11 +1987,17 @@ impl SuperfileBuilder {
                 // the capped count, so a raw-target gate would reject the splice
                 // and rebuild it on every compaction only to re-derive that same
                 // capped count.
-                let merged_docs: usize =
-                    sources.iter().map(|(_, _, inp)| inp.n_docs as usize).sum();
                 let fits_target =
                     effective_fine_n_cent(sources[0].2.dim, sources[0].2.rerank_codec, merged_docs)
                         <= sources[0].2.n_cent;
+                record(
+                    "path",
+                    if same_shape && fits_target {
+                        "splice"
+                    } else {
+                        "rebuild"
+                    },
+                );
                 if same_shape && fits_target {
                     let mut inputs: Vec<Sq8IvfMergeInput> =
                         sources.into_iter().map(|(_, _, inp)| inp).collect();
@@ -1858,8 +2029,8 @@ impl SuperfileBuilder {
                 // merged row count — same path the tombstone branch uses.
                 let mut rows: Vec<MaterializedIvfRow> = Vec::new();
                 for (reader_idx, ci, _) in sources {
-                    let v = readers[reader_idx]
-                        .0
+                    let v = inputs[reader_idx]
+                        .reader
                         .vec()
                         .ok_or(BuildError::VectorReadError)?;
                     rows.extend(v.materialized_cell_rows_at(ci)?);
@@ -1886,6 +2057,8 @@ impl SuperfileBuilder {
                 __rebuild_ns += __mt.elapsed().as_nanos();
                 __rebuild_cells += 1;
             }
+            record("splice_cells", __splice_cells);
+            record("rebuild_cells", __rebuild_cells);
             if __merge_timers {
                 eprintln!(
                     "[optmerge] cells splice {} ({:.1}s)  rebuild {} ({:.1}s)",
@@ -1907,6 +2080,7 @@ impl SuperfileBuilder {
             return Ok(SuperfileStats::from_children(&[]));
         }
 
+        let _write_span = detail_span!("multi_cell_merge.write").entered();
         // Carry FTS postings across in the packed output order. Unlike the
         // concatenating merges, output rows follow `all_stable_ids`
         // (cell-directory order), so the remap is stable-id → output
@@ -1934,7 +2108,8 @@ impl SuperfileBuilder {
                 .map_err(|_| BuildError::MissingIdColumn(id_column.clone()))?;
             let n_fts_columns = superfile_builder.opts.fts_columns.len();
             let mut out_lengths: Vec<Vec<u32>> = vec![vec![0; n_out]; n_fts_columns];
-            for (idx, (reader, deleted)) in readers.iter().enumerate() {
+            for (idx, input) in inputs.iter().enumerate() {
+                let (reader, deleted) = (&input.reader, &input.deleted);
                 let Some(fts) = reader.fts() else {
                     continue;
                 };
@@ -2044,7 +2219,7 @@ impl SuperfileBuilder {
         reader: &SuperfileReader,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<SuperfileStats, BuildError> {
-        self.add_batch_from_reader_scoped(reader, deleted_docs_bitmap, CarryScope::AllColumns)
+        self.add_batch_from_reader_scoped(reader, deleted_docs_bitmap, None, CarryScope::AllColumns)
     }
 
     /// As [`Self::add_batch_from_reader`], but `scope` decides which FTS
@@ -2056,25 +2231,56 @@ impl SuperfileBuilder {
     /// append tokenizes the ones still present — `index_fts_batch` skips
     /// any column absent from the schema, which is precisely the set the
     /// carry handled.
+    /// The output column, if any, whose postings this input holds and
+    /// which re-analysis cannot rebuild: one whose text is not stored, so
+    /// neither the batch nor the carry can supply its terms. A column the
+    /// input does not hold has nothing to lose, and a stored one is
+    /// rebuilt from its text.
+    fn unrebuildable_column(&self, reader: &SuperfileReader) -> Option<String> {
+        let held: Vec<&ColumnMeta> = reader
+            .fts()
+            .map(|fts| fts.fts_columns_config().collect())
+            .unwrap_or_default();
+        self.opts
+            .fts_columns
+            .iter()
+            .filter(|c| !c.stored)
+            .find(|c| {
+                let id = self.opts.field_id_of_column(&c.column);
+                held.iter().any(|other| match (id, other.field_id) {
+                    (Some(own), Some(other)) => own == other,
+                    _ => c.column == other.name,
+                })
+            })
+            .map(|c| c.column.clone())
+    }
+
     pub(crate) fn add_batch_from_reader_scoped(
         &mut self,
         reader: &SuperfileReader,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+        adapter: Option<&FileSchemaMap>,
         scope: CarryScope,
     ) -> Result<SuperfileStats, BuildError> {
-        self.opts.check_mergeability(
-            reader.id_column(),
-            reader.schema(),
-            reader
-                .fts()
-                .map(|f| f.fts_columns_config().collect::<Vec<_>>()),
-            reader
-                .vec()
-                .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
-        )?;
-        let record_batch = reader
-            .get_record_batch(deleted_docs_bitmap.clone())
-            .map_err(|_| BuildError::BatchReadError)?;
+        if scope != CarryScope::Reanalyze {
+            self.opts.check_fts_carry_compat(
+                reader
+                    .fts()
+                    .map(|f| f.fts_columns_config().collect::<Vec<_>>())
+                    .as_deref(),
+            )?;
+        } else if let Some(column) = self.unrebuildable_column(reader) {
+            // Re-analysis reads each column's text from the batch. An
+            // index-only column has none there — carrying its postings is
+            // what this scope already ruled out — so the output would be
+            // missing that column's terms with nothing to say so. Refuse
+            // instead: the text itself is the only source left.
+            return Err(BuildError::FTSSchemaMismatch(format!(
+                "column {column}: its postings cannot be carried from this file and its text is \
+                 not stored, so they cannot be rebuilt here; re-ingest the column's text"
+            )));
+        }
+        let record_batch = adapted_batch(reader, deleted_docs_bitmap.clone(), adapter, &self.opts)?;
 
         let superfile_stats = SuperfileStats::try_compute_from_record_batch(&record_batch)?;
 
@@ -2128,7 +2334,9 @@ impl SuperfileBuilder {
         // the merge is cheaper, byte-faithful to the input's index, and an
         // unstored column — whose text isn't in the batch at all — still
         // merges losslessly.
-        self.carry_fts_from_reader_scoped(reader, deleted_docs_bitmap.as_deref(), scope)?;
+        if scope != CarryScope::Reanalyze {
+            self.carry_fts_from_reader_scoped(reader, deleted_docs_bitmap.as_deref(), scope)?;
+        }
         // Re-analyze exactly what the carry left behind.
         let index_fts = scope != CarryScope::AllColumns;
         self.add_batch_inner(&record_batch, &slices, index_fts)?;
@@ -2145,7 +2353,11 @@ impl SuperfileBuilder {
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
-        let stats = Self::build_from_readers_to(readers, &HashMap::new(), &mut buf)?;
+        let inputs = same_shape_inputs(readers);
+        let base = BuilderOptions::new_from_reader(
+            &inputs.first().ok_or(BuildError::BatchReadError)?.reader,
+        );
+        let stats = Self::build_from_readers_to(&inputs, base, &mut buf)?;
         Ok((buf, stats))
     }
 
@@ -2155,16 +2367,28 @@ impl SuperfileBuilder {
     /// to a temp file and never hold the merged superfile in RAM. Returns the
     /// merged [`SuperfileStats`].
     pub(crate) fn build_from_readers_to<W: Write>(
-        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-        fts_corpus: &HashMap<String, ColumnLengthStats>,
+        inputs: &[MergeInput],
+        base: BuilderOptions,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        let builder_opts = merge_builder_opts(readers, fts_corpus)?;
+        let builder_opts = merge_builder_opts(inputs, base)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
-        let mut stats_collector = Vec::with_capacity(readers.len());
-        for reader in readers {
-            let stats = superfile_builder.add_batch_from_reader(&reader.0, reader.1.clone())?;
+        let mut stats_collector = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            // An input whose index is the output's lends its postings; one
+            // whose index is not is analyzed from its rows.
+            let scope = if superfile_builder.opts.fts_carry_compatible(&input.reader) {
+                CarryScope::AllColumns
+            } else {
+                CarryScope::Reanalyze
+            };
+            let stats = superfile_builder.add_batch_from_reader_scoped(
+                &input.reader,
+                input.deleted.clone(),
+                input.adapter.as_ref(),
+                scope,
+            )?;
             stats_collector.push(stats);
         }
 
@@ -2344,23 +2568,23 @@ impl SuperfileBuilder {
 
     test_visible! {
     fn build_from_readers_fts_merge_to<W: Write>(
-        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-        fts_corpus: &HashMap<String, ColumnLengthStats>,
+        inputs: &[MergeInput],
+        base: BuilderOptions,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        Self::fts_merge_to(readers, fts_corpus, output, PostingMerge::TermByTerm)
+        Self::fts_merge_to(inputs, base, output, PostingMerge::TermByTerm)
     }
     }
 
     /// [`Self::build_from_readers_fts_merge_to`] with the posting path
     /// chosen by `merge`.
     fn fts_merge_to<W: Write>(
-        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-        fts_corpus: &HashMap<String, ColumnLengthStats>,
+        inputs: &[MergeInput],
+        base: BuilderOptions,
         output: W,
         merge: PostingMerge,
     ) -> Result<SuperfileStats, BuildError> {
-        let builder_opts = merge_builder_opts(readers, fts_corpus)?;
+        let builder_opts = merge_builder_opts(inputs, base)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         // Encode the Parquet body incrementally: each input's surviving rows are
@@ -2380,7 +2604,7 @@ impl SuperfileBuilder {
             )?
         };
 
-        let mut stats_collector = Vec::with_capacity(readers.len());
+        let mut stats_collector = Vec::with_capacity(inputs.len());
         // Stream the stable-id sidecar from the merged rows as they are written
         // to the body, in the same order — so the compacted superfile resolves
         // `_id` from the sidecar just like a fresh build. `ids_ok` clears on the
@@ -2393,9 +2617,10 @@ impl SuperfileBuilder {
         // The output row every input document becomes, numbered once and
         // shared by the order and the carry below, so the two cannot
         // disagree about which document a posting belongs to.
-        let mut rows_of: Vec<Vec<Option<RowId>>> = Vec::with_capacity(readers.len());
+        let mut rows_of: Vec<Vec<Option<RowId>>> = Vec::with_capacity(inputs.len());
         let mut n_out_docs: u32 = 0;
-        for (reader, deleted) in readers {
+        for input in inputs {
+            let (reader, deleted) = (&input.reader, &input.deleted);
             let n_local = reader.fts().map_or(0, |f| f.n_docs());
             let (rows, kept) = survivor_rows(n_local, deleted.as_deref(), n_out_docs);
             n_out_docs += kept;
@@ -2405,7 +2630,13 @@ impl SuperfileBuilder {
         // `order[new_id]` is the row that doc id carries. `None` leaves
         // the blob in arrival order, exactly as before.
         let order = match superfile_builder.fts_builder.is_some() {
-            true => Self::merge_doc_order(readers, n_fts_columns, n_out_docs, &rows_of)?,
+            true => {
+                let readers: Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> = inputs
+                    .iter()
+                    .map(|input| (Arc::clone(&input.reader), input.deleted.clone()))
+                    .collect();
+                Self::merge_doc_order(&readers, n_fts_columns, n_out_docs, &rows_of)?
+            }
             false => None,
         };
         // The inverse, which is what the per-input remap needs: the doc
@@ -2444,23 +2675,16 @@ impl SuperfileBuilder {
             write_parquet = 0
         )
         .entered();
-        for (idx, (reader, deleted)) in readers.iter().enumerate() {
-            superfile_builder.opts.check_mergeability(
-                reader.id_column(),
-                reader.schema(),
+        for (idx, input) in inputs.iter().enumerate() {
+            let (reader, deleted) = (&input.reader, &input.deleted);
+            superfile_builder.opts.check_fts_carry_compat(
                 reader
                     .fts()
-                    .map(|f| f.fts_columns_config().collect::<Vec<_>>()),
-                reader
-                    .vec()
-                    .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
+                    .map(|f| f.fts_columns_config().collect::<Vec<_>>())
+                    .as_deref(),
             )?;
             let start = std::time::Instant::now();
-            let record_batch = reader.get_record_batch(deleted.clone()).map_err(|e| {
-                BuildError::Io(Error::other(format!(
-                    "fts merge input {idx}: read RecordBatch failed: {e}"
-                )))
-            })?;
+            let record_batch = input.batch(&superfile_builder.opts)?;
             timings.read_parquet += start.elapsed();
 
             let start = std::time::Instant::now();
@@ -2609,8 +2833,46 @@ impl SuperfileBuilder {
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let mut buf = Vec::new();
-        let stats = Self::build_from_readers_fts_merge_to(readers, &HashMap::new(), &mut buf)?;
+        let inputs = same_shape_inputs(readers);
+        let base = BuilderOptions::new_from_reader(
+            &inputs.first().ok_or(BuildError::BatchReadError)?.reader,
+        );
+        let stats = Self::build_from_readers_fts_merge_to(&inputs, base, &mut buf)?;
         Ok((buf, stats))
+    }
+
+    /// Hydrate: build one no-blob superfile straight from Arrow batches whose
+    /// `_id` column is already prepended at index 0. Batches are streamed through
+    /// [`ParquetBodyEncoder`], so the build adds only the running row group and
+    /// the id sidecar (16 B per row) on top of the caller's batches.
+    /// [`finish`](Self::finish) instead buffers a second copy of the data.
+    ///
+    /// `opts` must carry empty FTS and vector columns (no-blob). The superfile is
+    /// streamed to `output`; the returned [`ParquetLayout`] gives its size and
+    /// blob offsets for manifest metadata.
+    pub(crate) fn build_no_blob_from_batches_to<W: Write>(
+        opts: BuilderOptions,
+        batches: &[RecordBatch],
+        output: W,
+    ) -> Result<ParquetLayout, BuildError> {
+        let n_docs: u32 = batches.iter().map(|b| b.num_rows() as u32).sum();
+        let mut sb = SuperfileBuilder::new(opts)?;
+        let id_page_limit = [(sb.opts.id_column.as_str(), sb.opts.id_page_size_limit)];
+        let mut encoder = ParquetBodyEncoder::new(
+            &sb.opts.schema,
+            sb.opts.compression,
+            sb.opts.row_group_size,
+            &id_page_limit,
+        )?;
+        for batch in batches {
+            encoder.write_batch(batch)?;
+        }
+        let ids = stable_id_sidecar_bytes(batches, &sb.opts.id_column);
+        let body = encoder.finish()?;
+        // `finish_to_with_body` writes `self.next_local_doc_id` as the doc count
+        // and emits empty FTS/vector blobs because `opts` has none.
+        sb.next_local_doc_id = n_docs;
+        sb.finish_to_with_body(body, &ids, output)
     }
 
     /// Consume the builder and emit one self-contained superfile.
@@ -2976,19 +3238,20 @@ fn superfile_kvs(
         (kv::ID_COLUMN.into(), options.id_column.clone()),
         (kv::N_DOCS.into(), n_docs.to_string()),
         (kv::BUILDER.into(), crate::BUILDER_ID.to_string()),
+        (kv::SCHEMA_ID.into(), options.schema_id.to_string()),
     ];
     if !options.fts_columns.is_empty() {
         // Each column records its own analyzer name (per-field analysis);
         // `fts_tokenizers` is aligned 1:1 with `fts_columns`.
         kvs.push((
             kv::FTS_COLUMNS.into(),
-            fts_columns_json(&options.fts_columns),
+            fts_columns_json(&options.fts_columns, |c| options.field_id_of_column(c)),
         ));
     }
     if !options.vector_columns.is_empty() {
         kvs.push((
             kv::VEC_COLUMNS.into(),
-            vec_columns_json(&options.vector_columns),
+            vec_columns_json(&options.vector_columns, |c| options.field_id_of_column(c)),
         ));
         if options.vector_layout != VectorLayout::Ivf {
             kvs.push((
@@ -3004,6 +3267,32 @@ fn superfile_kvs(
         }
     }
     Ok(kvs)
+}
+
+/// Whether two schemas declare the same columns in the same order: name,
+/// type and nullability per field. Field metadata is not compared, because
+/// the field ids the builder stamps are its own bookkeeping, not part of
+/// the shape a caller's batch has to match.
+pub(crate) fn same_shape(a: &Schema, b: &Schema) -> bool {
+    a.fields().len() == b.fields().len()
+        && a.fields().iter().zip(b.fields().iter()).all(|(x, y)| {
+            x.name() == y.name()
+                && x.data_type() == y.data_type()
+                && x.is_nullable() == y.is_nullable()
+        })
+}
+
+/// `schema` with field ids assigned by position: the first field (the id
+/// column) gets [`FieldId::ID_COLUMN`], the rest `1..=n`. This is exactly the
+/// numbering a table created from the same user schema would mint.
+pub(crate) fn stamp_ids_by_position(schema: &Arc<Schema>) -> Arc<Schema> {
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| Arc::new(with_field_id(f, FieldId(i as u32))))
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 /// Rebuild a scalar `RecordBatch` whose rows follow `ordered_ids`.
@@ -3304,19 +3593,127 @@ fn fts_param_json(v: f32) -> String {
 /// A merge's output is only as re-analyzed as its oldest input, and
 /// `new_from_reader` can only see one — see
 /// [`BuilderOptions::lower_analysis_revision_to`].
+/// The options a merge of `inputs` builds its output with: `base` — the
+/// table's schema and index config, as the snapshot derives them — laid
+/// out as the inputs are (a merge of packed multi-cell files writes a
+/// packed file), with every text column's analysis revision lowered to the
+/// oldest among the inputs so carried postings stay honest.
 pub(crate) fn merge_builder_opts(
-    readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-    fts_corpus: &HashMap<String, ColumnLengthStats>,
+    inputs: &[MergeInput],
+    base: BuilderOptions,
 ) -> Result<BuilderOptions, BuildError> {
-    let (first, _) = readers.first().ok_or(BuildError::BatchReadError)?;
-    let mut opts = BuilderOptions::new_from_reader(first).with_fts_corpus_stats(fts_corpus.clone());
-    for (reader, _) in readers.iter().skip(1) {
-        opts.lower_analysis_revision_to(reader);
+    let first = inputs.first().ok_or(BuildError::BatchReadError)?;
+    let layout = match first.reader.vec() {
+        Some(v) if v.is_multi_cell() => VectorLayout::MultiCellIvf,
+        _ => base.vector_layout,
+    };
+    let mut opts = base.with_vector_layout(layout).into_merge_source_shape();
+    for input in inputs {
+        opts.lower_analysis_revision_to(&input.reader);
     }
     Ok(opts)
 }
 
-fn fts_columns_json(cols: &[FtsConfig]) -> String {
+/// One input to a merge: the file, the rows left out of the output, and
+/// how the file's columns line up with the output's.
+pub struct MergeInput {
+    pub reader: Arc<SuperfileReader>,
+    pub deleted: Option<Arc<RoaringBitmap>>,
+    /// Resolves the output's columns in this file. `None` when the file
+    /// must already have the output's shape, which is the case for a
+    /// merge of files the same builder options wrote.
+    pub adapter: Option<FileSchemaMap>,
+}
+
+impl MergeInput {
+    /// An input that must already have the output's shape.
+    pub fn same_shape(reader: Arc<SuperfileReader>, deleted: Option<Arc<RoaringBitmap>>) -> Self {
+        Self {
+            reader,
+            deleted,
+            adapter: None,
+        }
+    }
+
+    /// The input's surviving rows in the output's scalar shape.
+    pub(crate) fn batch(&self, opts: &BuilderOptions) -> Result<RecordBatch, BuildError> {
+        adapted_batch(
+            &self.reader,
+            self.deleted.clone(),
+            self.adapter.as_ref(),
+            opts,
+        )
+    }
+}
+
+/// Inputs that must already have the output's shape, from the readers a
+/// merge of same-table files hands in.
+pub fn same_shape_inputs(
+    readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+) -> Vec<MergeInput> {
+    readers
+        .iter()
+        .map(|(reader, deleted)| MergeInput::same_shape(Arc::clone(reader), deleted.clone()))
+        .collect()
+}
+
+/// `reader`'s rows (minus `deleted`) reshaped to `opts.schema`: as read
+/// when the file already has that shape, else through `adapter`, which
+/// null-fills a column the file predates, casts one it holds in another
+/// type, and finds a renamed one by id. The id column is the table's
+/// identity and is matched by name: a file whose id column is named
+/// otherwise belongs to another table.
+fn adapted_batch(
+    reader: &SuperfileReader,
+    deleted: Option<Arc<RoaringBitmap>>,
+    adapter: Option<&FileSchemaMap>,
+    opts: &BuilderOptions,
+) -> Result<RecordBatch, BuildError> {
+    if reader.id_column() != opts.id_column {
+        return Err(BuildError::IdColumnMismatch(
+            opts.id_column.clone(),
+            reader.id_column().to_string(),
+        ));
+    }
+    let batch = reader
+        .get_record_batch(deleted)
+        .map_err(|_| BuildError::BatchReadError)?;
+    // The adapter decides by id. A name the file shares with the table can
+    // belong to a column that was dropped and added again under a new id,
+    // whose old values must not ride through under the new column, so the
+    // shape check alone admits a batch only when there is no adapter to ask.
+    if let Some(map) = adapter
+        && !map.is_identity()
+    {
+        return map
+            .adapt(&batch, &opts.schema)
+            .map_err(|e| BuildError::SchemaMismatch {
+                mine: opts.schema.to_string(),
+                other: format!("{} ({e})", batch.schema()),
+            });
+    }
+    if same_shape(&batch.schema(), &opts.schema) {
+        return Ok(batch);
+    }
+    match adapter {
+        Some(map) => map
+            .adapt(&batch, &opts.schema)
+            .map_err(|e| BuildError::SchemaMismatch {
+                mine: opts.schema.to_string(),
+                other: format!("{} ({e})", batch.schema()),
+            }),
+        None => Err(BuildError::SchemaMismatch {
+            mine: opts.schema.to_string(),
+            other: batch.schema().to_string(),
+        }),
+    }
+}
+
+/// The per-column FTS config the footer carries. `field_id_of` supplies
+/// each column's stable id; a column without one (a builder over a schema
+/// that was never stamped) is written without the key, which readers
+/// treat as "resolve by name".
+fn fts_columns_json(cols: &[FtsConfig], field_id_of: impl Fn(&str) -> Option<FieldId>) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
@@ -3324,7 +3721,12 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         }
         s.push_str(r#"{"name":""#);
         s.push_str(&escape_json(&c.column));
-        s.push_str(r#"","tokenizer":""#);
+        s.push('"');
+        if let Some(id) = field_id_of(&c.column) {
+            s.push_str(r#","field_id":"#);
+            s.push_str(&id.to_string());
+        }
+        s.push_str(r#","tokenizer":""#);
         s.push_str(&escape_json(&c.analyzer));
         s.push('"');
         // Always emitted — see the function docs.
@@ -3382,7 +3784,10 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
 /// The reader at open time parses this back for the column name, dim, rot_seed,
 /// and metric; the physical centroid count comes from each subsection's own
 /// on-disk directory, not from this record.
-fn vec_columns_json(cols: &[VectorConfig]) -> String {
+fn vec_columns_json(
+    cols: &[VectorConfig],
+    field_id_of: impl Fn(&str) -> Option<FieldId>,
+) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
@@ -3390,7 +3795,12 @@ fn vec_columns_json(cols: &[VectorConfig]) -> String {
         }
         s.push_str(r#"{"column":""#);
         s.push_str(&escape_json(&c.column));
-        s.push_str(r#"","dim":"#);
+        s.push('"');
+        if let Some(id) = field_id_of(&c.column) {
+            s.push_str(r#","field_id":"#);
+            s.push_str(&id.to_string());
+        }
+        s.push_str(r#","dim":"#);
         s.push_str(&c.dim.to_string());
         s.push_str(r#","rot_seed":"#);
         s.push_str(&c.rot_seed.to_string());
@@ -3480,6 +3890,45 @@ mod tests {
             vec![FtsConfig::new("title")],
             vec![],
         )
+    }
+
+    /// Hydrate build path: stream Arrow batches (with `_id` prepended) straight
+    /// into one no-blob superfile and read it back. Proves the isolated
+    /// `build_no_blob_from_batches_to` produces a valid, queryable superfile
+    /// with empty FTS/vector blobs, without going through `add_batch`/`finish`.
+    #[test]
+    fn hydrate_build_no_blob_from_batches_reads_back() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Decimal128(38, 0), false),
+            Field::new("n", DataType::Int64, false),
+            Field::new("s", DataType::LargeUtf8, false),
+        ]));
+        let n: i64 = 1000;
+        let ids = Decimal128Array::from((0..n as i128).collect::<Vec<_>>())
+            .with_precision_and_scale(38, 0)
+            .expect("decimal precision/scale");
+        let nums = Int64Array::from((0..n).collect::<Vec<_>>());
+        let strs = LargeStringArray::from((0..n).map(|i| format!("r{i}")).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(nums), Arc::new(strs)],
+        )
+        .expect("valid batch");
+
+        let opts = BuilderOptions::new(schema, "_id", vec![], vec![]);
+        let mut buf = Vec::new();
+        let layout = SuperfileBuilder::build_no_blob_from_batches_to(
+            opts,
+            std::slice::from_ref(&batch),
+            &mut buf,
+        )
+        .expect("hydrate build");
+        assert!(layout.total_size > 0, "wrote a non-empty superfile");
+        assert_eq!(layout.fts_length, 0, "no-blob: empty fts");
+        assert_eq!(layout.vec_length, 0, "no-blob: empty vector");
+
+        let reader = SuperfileReader::open(Bytes::from(buf)).expect("open hydrated superfile");
+        assert_eq!(reader.n_docs(), n as u64, "all rows present");
     }
 
     /// User column names may not contain the FST separator byte or the
@@ -3725,6 +4174,96 @@ mod tests {
         assert!(!kv.contains_key("inf.vec.offset"));
     }
 
+    /// A schema stamped with field ids writes them into every place a
+    /// reader can resolve a column by identity: the Parquet field id (read
+    /// back as field metadata), the FTS column config, and the provenance
+    /// stamp of the table schema version.
+    #[test]
+    fn stamped_field_ids_round_trip_through_footer_and_schema() {
+        let user = schema_with_fts();
+        let stamped: Vec<Arc<Field>> = user
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == "title" {
+                    Arc::new(with_field_id(f, FieldId(7)))
+                } else {
+                    Arc::clone(f)
+                }
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(stamped));
+        let opts = BuilderOptions::new(
+            schema.clone(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        )
+        .with_schema_id(3);
+        let mut b = SuperfileBuilder::new(opts).expect("new builder");
+        b.add_batch(&batch_two_rows(&schema), &[])
+            .expect("add_batch");
+        let bytes = b.finish().expect("finish builder");
+
+        let kv = read_kv_metadata(&bytes).expect("read kv metadata");
+        assert_eq!(kv.get(kv::SCHEMA_ID).map(String::as_str), Some("3"));
+        let fts_json = kv.get(kv::FTS_COLUMNS).expect("fts columns kv");
+        assert!(
+            fts_json.contains(r#""name":"title","field_id":7,"#),
+            "field id rides next to the name: {fts_json}"
+        );
+
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+        let title = reader
+            .schema()
+            .field_with_name("title")
+            .expect("title field");
+        assert_eq!(field_id_of(title), Some(FieldId(7)));
+        let id_col = reader
+            .schema()
+            .field_with_name("doc_id")
+            .expect("id column");
+        assert_eq!(
+            field_id_of(id_col),
+            None,
+            "the id column carries no field id"
+        );
+    }
+
+    /// A schema without ids (a standalone superfile, or a test) gets them by
+    /// position, so the footer and the stored schema are keyed exactly as a
+    /// table created from the same columns would key them: the id column is
+    /// the reserved id, the user columns count from one.
+    #[test]
+    fn an_unstamped_schema_is_stamped_by_position() {
+        let mut b = SuperfileBuilder::new(opts_minimal()).expect("new SuperfileBuilder");
+        let schema = schema_with_fts();
+        b.add_batch(&batch_two_rows(&schema), &[])
+            .expect("add_batch");
+        let bytes = b.finish().expect("finish builder");
+        let kv = read_kv_metadata(&bytes).expect("read kv metadata");
+        assert!(
+            kv.get(kv::FTS_COLUMNS)
+                .expect("fts kv")
+                .contains(r#""name":"title","field_id":1,"#)
+        );
+        assert_eq!(kv.get(kv::SCHEMA_ID).map(String::as_str), Some("1"));
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+        let stored = reader.schema();
+        assert_eq!(
+            field_id_of(stored.field_with_name("doc_id").expect("id column")),
+            Some(FieldId::ID_COLUMN)
+        );
+        assert_eq!(
+            field_id_of(stored.field_with_name("title").expect("title")),
+            Some(FieldId(1))
+        );
+        assert_eq!(
+            field_id_of(stored.field_with_name("body").expect("body")),
+            Some(FieldId(2))
+        );
+    }
+
     #[test]
     fn finish_emits_kv_pointers_for_vectors() {
         let opts = BuilderOptions::new(
@@ -3759,13 +4298,16 @@ mod tests {
     /// unrecorded column with the revision its writer would have emitted.
     #[test]
     fn every_column_records_its_analysis_revision() {
-        let fresh = fts_columns_json(&[FtsConfig::new("title")]);
+        let fresh = fts_columns_json(&[FtsConfig::new("title")], |_| None);
         assert!(
             fresh.contains(r#""analysis_revision":1"#),
             "a freshly analyzed column records this engine's revision: {fresh}"
         );
 
-        let carried = fts_columns_json(&[FtsConfig::new("title").carried_analysis_revision(0)]);
+        let carried = fts_columns_json(
+            &[FtsConfig::new("title").carried_analysis_revision(0)],
+            |_| None,
+        );
         assert!(
             carried.contains(r#""analysis_revision":0"#),
             "a known-stale column records the zero rather than omitting it: {carried}"
@@ -3904,7 +4446,7 @@ mod tests {
     #[test]
     fn fts_columns_json_round_trip_shape() {
         let cols = vec![FtsConfig::new("title"), FtsConfig::new("body")];
-        let s = fts_columns_json(&cols);
+        let s = fts_columns_json(&cols, |_| None);
         assert!(s.starts_with('['));
         assert!(s.contains(r#""name":"title""#));
         assert!(s.contains(r#""name":"body""#));
@@ -3924,7 +4466,7 @@ mod tests {
             FtsConfig::new("title").positions(true),
             FtsConfig::new("body"),
         ];
-        let s = fts_columns_json(&cols);
+        let s = fts_columns_json(&cols, |_| None);
         assert!(
             s.contains(
                 r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true,"analysis_revision":1}"#
@@ -3948,7 +4490,7 @@ mod tests {
             FtsConfig::new("title").analyzer("standard"),
             FtsConfig::new("body").analyzer("ascii_lower"),
         ];
-        let s = fts_columns_json(&cols);
+        let s = fts_columns_json(&cols, |_| None);
         assert!(
             s.contains(
                 r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
@@ -3971,7 +4513,7 @@ mod tests {
             FtsConfig::new("title"),
             FtsConfig::new("body").stored(false),
         ];
-        let s = fts_columns_json(&cols);
+        let s = fts_columns_json(&cols, |_| None);
         assert!(
             s.contains(
                 r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
@@ -4297,7 +4839,7 @@ mod tests {
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
         }];
-        let s = vec_columns_json(&cols);
+        let s = vec_columns_json(&cols, |_| None);
         assert!(s.contains(r#""column":"emb""#));
         assert!(s.contains(r#""dim":384"#));
         assert!(
@@ -4356,15 +4898,15 @@ mod tests {
             "scalar_stats should have column entries"
         );
         assert!(
-            stats.scalar_stats.contains_key("doc_id"),
+            stats.scalar_stats.contains_key(&FieldId::ID_COLUMN),
             "scalar_stats should contain id_column"
         );
         assert!(
-            stats.scalar_stats.contains_key("title"),
+            stats.scalar_stats.contains_key(&FieldId(1)),
             "scalar_stats should contain FTS column"
         );
         assert!(
-            stats.scalar_stats.contains_key("body"),
+            stats.scalar_stats.contains_key(&FieldId(2)),
             "scalar_stats should contain body column"
         );
 
@@ -4372,7 +4914,7 @@ mod tests {
         // doc_id: IDs are [10, 11], so min=10, max=11
         let id_agg = stats
             .scalar_stats
-            .get("doc_id")
+            .get(&FieldId::ID_COLUMN)
             .expect("doc_id should have stats");
         let (id_min_arr, id_max_arr) = (&id_agg.min, &id_agg.max);
         let id_min = id_min_arr
@@ -4391,7 +4933,7 @@ mod tests {
         // title: ["hello world", "rust async"], so min="hello world", max="rust async"
         let title_agg = stats
             .scalar_stats
-            .get("title")
+            .get(&FieldId(1))
             .expect("title should have stats");
         let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
@@ -4413,7 +4955,7 @@ mod tests {
         // body: ["foo bar", "baz quux"], so min="baz quux", max="foo bar"
         let body_agg = stats
             .scalar_stats
-            .get("body")
+            .get(&FieldId(2))
             .expect("body should have stats");
         let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
@@ -4876,9 +5418,9 @@ mod tests {
         assert_eq!(stats.n_docs, 2);
         assert_eq!(stats.id_min, 10);
         assert_eq!(stats.id_max, 11);
-        assert!(stats.scalar_stats.contains_key("doc_id"));
-        assert!(stats.scalar_stats.contains_key("title"));
-        assert!(stats.scalar_stats.contains_key("body"));
+        assert!(stats.scalar_stats.contains_key(&FieldId::ID_COLUMN));
+        assert!(stats.scalar_stats.contains_key(&FieldId(1)));
+        assert!(stats.scalar_stats.contains_key(&FieldId(2)));
 
         // Verify data is preserved
         let merged_reader =
@@ -5811,18 +6353,20 @@ mod tests {
     fn assert_merge_paths_write_same_bytes(
         inputs: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Vec<u8> {
+        let merge_inputs = same_shape_inputs(inputs);
+        let base = || BuilderOptions::new_from_reader(&merge_inputs[0].reader);
         let mut accumulator = Vec::new();
         SuperfileBuilder::fts_merge_to(
-            inputs,
-            &HashMap::new(),
+            &merge_inputs,
+            base(),
             &mut accumulator,
             PostingMerge::Accumulator,
         )
         .expect("accumulator merge");
         let mut sorted = Vec::new();
         SuperfileBuilder::fts_merge_to(
-            inputs,
-            &HashMap::new(),
+            &merge_inputs,
+            base(),
             &mut sorted,
             PostingMerge::TermByTerm,
         )
@@ -6073,10 +6617,12 @@ mod tests {
                 .build()
                 .expect("thread pool");
             let mut out = Vec::new();
+            let merge_inputs = same_shape_inputs(&inputs);
+            let base = BuilderOptions::new_from_reader(&merge_inputs[0].reader);
             pool.install(|| {
                 SuperfileBuilder::fts_merge_to(
-                    &inputs,
-                    &HashMap::new(),
+                    &merge_inputs,
+                    base,
                     &mut out,
                     PostingMerge::TermByTerm,
                 )
@@ -6665,7 +7211,10 @@ mod tests {
                 .expect("build_from_readers");
 
         // Verify doc_id min/max (10, 11)
-        let doc_id_agg = stats.scalar_stats.get("doc_id").expect("doc_id column");
+        let doc_id_agg = stats
+            .scalar_stats
+            .get(&FieldId::ID_COLUMN)
+            .expect("doc_id column");
         let (doc_id_min_arr, doc_id_max_arr) = (&doc_id_agg.min, &doc_id_agg.max);
         let doc_id_min = doc_id_min_arr
             .as_ref()
@@ -6683,7 +7232,7 @@ mod tests {
         assert_eq!(doc_id_max, 11, "doc_id max should be 11");
 
         // Verify title min/max (from batch_two_rows: ["hello world", "rust async"])
-        let title_agg = stats.scalar_stats.get("title").expect("title column");
+        let title_agg = stats.scalar_stats.get(&FieldId(1)).expect("title column");
         let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_ref()
@@ -6704,7 +7253,7 @@ mod tests {
         assert_eq!(title_max, "rust async", "title max should be 'rust async'");
 
         // Verify body min/max (from batch_two_rows: ["foo bar", "baz quux"])
-        let body_agg = stats.scalar_stats.get("body").expect("body column");
+        let body_agg = stats.scalar_stats.get(&FieldId(2)).expect("body column");
         let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_ref()
@@ -6761,7 +7310,10 @@ mod tests {
         .expect("build_from_readers");
 
         // Verify doc_id: min should be 10, max should be 21 (merged from both readers)
-        let doc_id_agg = stats.scalar_stats.get("doc_id").expect("doc_id column");
+        let doc_id_agg = stats
+            .scalar_stats
+            .get(&FieldId::ID_COLUMN)
+            .expect("doc_id column");
         let (doc_id_min_arr, doc_id_max_arr) = (&doc_id_agg.min, &doc_id_agg.max);
         let doc_id_min = doc_id_min_arr
             .as_ref()
@@ -6779,7 +7331,7 @@ mod tests {
         assert_eq!(doc_id_max, 21, "merged doc_id max should be 21");
 
         // Verify title: min should be "alpha", max should be "zeta" (lexicographically from both readers)
-        let title_agg = stats.scalar_stats.get("title").expect("title column");
+        let title_agg = stats.scalar_stats.get(&FieldId(1)).expect("title column");
         let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_ref()
@@ -6797,7 +7349,7 @@ mod tests {
         assert_eq!(title_max, "zeta", "merged title max should be 'zeta'");
 
         // Verify body: min should be "aaa", max should be "zzz" (lexicographically from both readers)
-        let body_agg = stats.scalar_stats.get("body").expect("body column");
+        let body_agg = stats.scalar_stats.get(&FieldId(2)).expect("body column");
         let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_ref()
@@ -6844,7 +7396,7 @@ mod tests {
                 .expect("build_from_readers");
 
         // Verify title min/max (values: ["zebra", "apple"] => min="apple", max="zebra")
-        let title_agg = stats.scalar_stats.get("title").expect("title column");
+        let title_agg = stats.scalar_stats.get(&FieldId(1)).expect("title column");
         let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_ref()
@@ -6862,7 +7414,7 @@ mod tests {
         assert_eq!(title_max, "zebra", "title max should be 'zebra'");
 
         // Verify body min/max (values: ["xyz", "abc"] => min="abc", max="xyz")
-        let body_agg = stats.scalar_stats.get("body").expect("body column");
+        let body_agg = stats.scalar_stats.get(&FieldId(2)).expect("body column");
         let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_ref()
@@ -6952,6 +7504,215 @@ mod tests {
             .expect("vector search on merged Sq8 superfile");
         assert!(!hits.is_empty(), "search should return at least one result");
         assert_eq!(hits[0].0, 0, "top hit for axis-0 query must be doc 0");
+    }
+
+    /// Tombstones drop rows from the merged Parquet body, so the spliced
+    /// vector index must drop the same rows: every surviving vector has to
+    /// resolve to its own row's `_id`, and a deleted vector must not come
+    /// back. Regression: the splice copied every vector row and offset later
+    /// inputs by the surviving row count, so ids after a delete pointed at
+    /// the wrong rows, or past the last row when the last input had deletes.
+    #[tokio::test]
+    async fn sq8_merge_drops_tombstoned_vectors_with_their_rows() {
+        const DIM: usize = 16;
+        /// Probe every cluster, so only the doc-id mapping decides the hit.
+        const ALL_PROBES: usize = 64;
+        const RERANK_MULT: usize = 100;
+        /// The axes are orthogonal, so a self-match and a hit on another axis
+        /// score a full cosine apart; half of that separates them.
+        const MIN_SCORE_GAP: f32 = 0.5;
+        // r1: id 10 on axis 0, id 11 on axis 1. r2: id 20 on axis 2, id 21 on axis 3.
+        const IDS: [(usize, i128); 4] = [(0, 10), (1, 11), (2, 20), (3, 21)];
+
+        let make_file = |codec: RerankCodec, id0: u64, axis0: usize| {
+            let opts = BuilderOptions::new(
+                schema_with_fts(),
+                "doc_id",
+                vec![],
+                vec![default_vector_config("emb", 7).with_rerank_codec(codec)],
+            );
+            let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+            let batch = RecordBatch::try_new(
+                b.opts.schema.clone(),
+                vec![
+                    Arc::new(decimal128_ids(vec![id0, id0 + 1])),
+                    Arc::new(LargeStringArray::from(vec!["a", "b"])),
+                    Arc::new(LargeStringArray::from(vec!["c", "d"])),
+                ],
+            )
+            .expect("batch");
+            // Each row's vector is a unit axis, so a self-query has one exact hit.
+            let mut v = vec![0.0f32; 2 * DIM];
+            v[axis0] = 1.0;
+            v[DIM + axis0 + 1] = 1.0;
+            b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+            Arc::new(SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"))
+        };
+
+        for codec in [
+            RerankCodec::Sq16,
+            RerankCodec::Sq16Adaptive,
+            RerankCodec::Sq8Residual,
+            RerankCodec::Sq8FixedResidual,
+        ] {
+            // Delete the first row of the first input (later rows of that
+            // input shift onto the next one), then of the last input (its
+            // later rows shift past the end).
+            for (r1_deleted, r2_deleted, deleted_id) in
+                [(&[0u32][..], &[][..], 10i128), (&[], &[0], 20)]
+            {
+                let case = format!("{codec:?}, deleted _id {deleted_id}");
+                let (merged_bytes, stats) = SuperfileBuilder::build_from_sq8_ivf_readers(&[
+                    (make_file(codec, 10, 0), tombstones(r1_deleted)),
+                    (make_file(codec, 20, 2), tombstones(r2_deleted)),
+                ])
+                .expect("sq8 merge with a tombstoned input");
+                assert_eq!(stats.n_docs, 3, "{case}");
+
+                let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+                assert_eq!(
+                    merged.n_docs(),
+                    3,
+                    "{case}: merged Parquet keeps the 3 live rows"
+                );
+                let vec_reader = merged.vec().expect("vector index present");
+                let col = vec_reader
+                    .vector_columns_config()
+                    .next()
+                    .expect("has column");
+                assert_eq!(
+                    col.n_docs, 3,
+                    "{case}: vector index keeps the same 3 live rows"
+                );
+
+                let full = merged.get_record_batch(None).expect("full batch");
+                let idx = full.schema().index_of("doc_id").expect("doc_id column");
+                let ids = full
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("decimal ids");
+
+                let mut self_score = None;
+                let mut deleted_score = None;
+                for (axis, id) in IDS {
+                    let mut query = vec![0.0f32; DIM];
+                    query[axis] = 1.0;
+                    let hits = vec_reader
+                        .search("emb", &query, 1, ALL_PROBES, RERANK_MULT)
+                        .await
+                        .expect("vector search on merged superfile");
+                    let (local, score) = *hits.first().expect("one hit");
+                    let local = local as usize;
+                    assert!(
+                        local < ids.len(),
+                        "{case}: hit {local} is past the last Parquet row"
+                    );
+                    if id == deleted_id {
+                        deleted_score = Some(score);
+                    } else {
+                        self_score = Some(score);
+                        assert_eq!(
+                            ids.value(local),
+                            id,
+                            "{case}: axis-{axis} vector must resolve to its own row's _id"
+                        );
+                    }
+                }
+                // A deleted vector left in the index would self-match its
+                // axis, under whatever live row its doc id points at.
+                let (self_score, deleted_score) = (
+                    self_score.expect("live axes"),
+                    deleted_score.expect("deleted axis"),
+                );
+                assert!(
+                    (deleted_score - self_score).abs() > MIN_SCORE_GAP,
+                    "{case}: the deleted vector came back (score {deleted_score}, \
+                     self-match {self_score})"
+                );
+            }
+        }
+    }
+
+    /// A fully tombstoned input contributes no vector rows, and the next
+    /// input's rows keep their own `_id`s. With every input tombstoned the
+    /// merge is empty (0 docs), which compaction turns into "remove the
+    /// inputs, write nothing".
+    #[tokio::test]
+    async fn sq8_merge_drops_a_fully_tombstoned_input() {
+        const ALL_PROBES: usize = 64;
+        const RERANK_MULT: usize = 100;
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7).with_rerank_codec(RerankCodec::Sq16)],
+        );
+        let dim = opts.vector_columns[0].dim;
+        // Rows `id0` and `id0 + 1` on unit axes `axis0` and `axis0 + 1`.
+        let make_file = |id0: u64, axis0: usize| {
+            let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+            let batch = RecordBatch::try_new(
+                b.opts.schema.clone(),
+                vec![
+                    Arc::new(decimal128_ids(vec![id0, id0 + 1])),
+                    Arc::new(LargeStringArray::from(vec!["a", "b"])),
+                    Arc::new(LargeStringArray::from(vec!["c", "d"])),
+                ],
+            )
+            .expect("batch");
+            let mut v = vec![0.0f32; 2 * dim];
+            v[axis0] = 1.0;
+            v[dim + axis0 + 1] = 1.0;
+            b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+            Arc::new(SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"))
+        };
+
+        let (merged_bytes, stats) = SuperfileBuilder::build_from_sq8_ivf_readers(&[
+            (make_file(10, 0), tombstones(&[0, 1])),
+            (make_file(20, 2), None),
+        ])
+        .expect("sq8 merge with a fully tombstoned input");
+        assert_eq!(stats.n_docs, 2);
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        let vec_reader = merged.vec().expect("vector index present");
+        let col = vec_reader
+            .vector_columns_config()
+            .next()
+            .expect("has column");
+        assert_eq!(
+            col.n_docs, 2,
+            "vector index keeps only the live input's rows"
+        );
+        let full = merged.get_record_batch(None).expect("full batch");
+        let idx = full.schema().index_of("doc_id").expect("doc_id column");
+        let ids = full
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal ids");
+        for (axis, want_id) in [(2usize, 20i128), (3, 21)] {
+            let mut query = vec![0.0f32; dim];
+            query[axis] = 1.0;
+            let hits = vec_reader
+                .search("emb", &query, 1, ALL_PROBES, RERANK_MULT)
+                .await
+                .expect("vector search on merged superfile");
+            let local = hits.first().expect("one hit").0 as usize;
+            assert_eq!(
+                ids.value(local),
+                want_id,
+                "axis-{axis} vector must resolve to its own row's _id"
+            );
+        }
+
+        let (merged_bytes, stats) = SuperfileBuilder::build_from_sq8_ivf_readers(&[
+            (make_file(10, 0), tombstones(&[0, 1])),
+            (make_file(20, 2), tombstones(&[0, 1])),
+        ])
+        .expect("an all-deleted merge is not an error");
+        assert_eq!(stats.n_docs, 0);
+        assert!(merged_bytes.is_empty(), "nothing to write");
     }
 
     /// SQL-shaped tables carry FTS text columns *and* an Sq8 vector column.

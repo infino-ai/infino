@@ -71,7 +71,7 @@ use crate::{
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::{OpStatsCollector, timed_section},
     superfile::{
-        SuperfileReader,
+        ReadError, SuperfileReader,
         lazy_source::Source,
         reader::{rank_back_indices, row_selection_for_ids},
     },
@@ -79,12 +79,12 @@ use crate::{
         error::QueryError,
         handle::{SupertableReader, WeakReader},
         manifest::{ManifestSnapshot, SuperfileUri},
-        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
             SuperfileHit, candidate::CandidatePlan, exec::metered_exec::MeteredExec,
             superfile_reader::superfile_reader, vector::row_id_from_manifest_entry,
         },
         reader_cache::ReadIntent,
+        schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, PhysicalSchema, map::FileSchemaMap},
     },
     utils::trace::record,
 };
@@ -360,7 +360,7 @@ pub(crate) async fn resolve_hits_named(
 ) -> Result<RecordBatch, QueryError> {
     // Stored shape: an index-only FTS column has no Parquet data to
     // project, so its name is rejected up front like any unknown column.
-    let scalar_schema = reader.options().stored_schema();
+    let scalar_schema = reader.manifest().stored_schema();
     let output_schema = output_schema_with_score(&scalar_schema);
     // `None` is the engine-native result: `_id` + `score` only.
     // `_id` decodes from its own dedicated id pages (cheap by
@@ -440,7 +440,7 @@ impl SupertableReader {
     /// is the same one [`resolve_hits_named`] checks at output materialization,
     /// so the two share one source of truth and the error message is identical.
     pub(crate) fn check_projection(&self, projection: Option<&[&str]>) -> Result<(), QueryError> {
-        let output_schema = output_schema_with_score(&self.options().stored_schema());
+        let output_schema = output_schema_with_score(&self.manifest().stored_schema());
         validate_projection(
             projection,
             self.options().id_column.as_str(),
@@ -467,7 +467,7 @@ pub(crate) fn candidate_plan_for_filters(
         .map(|c| c.column.as_str())
         .collect();
     CandidatePlan::from_filters(filters, &fts_cols, &|col| {
-        manifest.options.try_fts_tokenizer_for(col)
+        manifest.try_fts_tokenizer_for(col)
     })
 }
 
@@ -993,11 +993,15 @@ async fn resolve_columns(
     let store = &manifest.options.store;
     let disk_cache = manifest.options.disk_cache.as_ref();
     let storage = manifest.options.storage.as_ref();
+    let table = manifest.table_schema();
+    let legacy = manifest.options.legacy_names();
+    let out_schema = hit_output_schema(&manifest.stored_schema(), names)?;
     let decoded_cache = reader.decoded_scalar_cache();
+    let schema_id = manifest.table_schema().schema_id();
     let mut slots: Vec<Option<RecordBatch>> = vec![None; seg_order.len()];
     let mut misses = Vec::new();
     for (index, (&uri, locals)) in seg_order.iter().zip(&seg_locals).enumerate() {
-        if let Some(batch) = decoded_cache.get(uri, locals, names) {
+        if let Some(batch) = decoded_cache.get(uri, schema_id, locals, names) {
             slots[index] = Some(batch);
         } else {
             misses.push((index, uri));
@@ -1045,14 +1049,28 @@ async fn resolve_columns(
     // Both waves run concurrently and stitch back in `seg_order`
     // order. Superfile count here is bounded by the global top-k (one
     // entry per distinct hit-bearing superfile), so the fan-out is small.
-    let mut warm_inputs: Vec<(usize, Arc<SuperfileReader>, Vec<u32>)> = Vec::new();
-    let mut cold_units: Vec<(usize, &Arc<SuperfileReader>, &[u32])> = Vec::new();
+    // A file whose columns match the table's reads by name as it always
+    // has; any other file reads through its map: the table's columns are
+    // projected under the file's names and reshaped to the table's.
+    let adapter_for = |rd: &SuperfileReader| -> Option<FileSchemaMap> {
+        let map = FileSchemaMap::new(
+            &table,
+            &manifest.options.id_column,
+            &PhysicalSchema::of_reader(rd, &legacy),
+        );
+        (!map.is_identity()).then_some(map)
+    };
+    let mut warm_inputs: Vec<(usize, Arc<SuperfileReader>, Vec<u32>, Option<FileSchemaMap>)> =
+        Vec::new();
+    let mut cold_units: Vec<(usize, &Arc<SuperfileReader>, &[u32], Option<FileSchemaMap>)> =
+        Vec::new();
     for (i, rd) in &opened {
         let locals = &seg_locals[*i];
+        let adapter = adapter_for(rd);
         if rd.can_take_by_local_doc_ids() {
-            warm_inputs.push((*i, Arc::clone(rd), locals.clone()));
+            warm_inputs.push((*i, Arc::clone(rd), locals.clone(), adapter));
         } else {
-            cold_units.push((*i, rd, locals.as_slice()));
+            cold_units.push((*i, rd, locals.as_slice(), adapter));
         }
     }
 
@@ -1064,6 +1082,7 @@ async fn resolve_columns(
         let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
         let pool = Arc::clone(&manifest.options.reader_pool);
         let inputs = warm_inputs;
+        let out_schema = Arc::clone(&out_schema);
         run_on_pool(
             Some(&pool),
             "resolve decode: reader pool dropped result",
@@ -1071,11 +1090,18 @@ async fn resolve_columns(
                 let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
                 let result: Result<Vec<((usize, RecordBatch), u64)>, _> = inputs
                     .into_par_iter()
-                    .map(|(i, sf, locals)| {
+                    .map(|(i, sf, locals, adapter)| {
                         // Per-superfile bracket: the resident decode is
                         // this wave's kernel section, one chunk per file.
-                        let (batch, ns) =
-                            timed_section(|| sf.take_by_local_doc_ids(&locals, &name_refs));
+                        let (batch, ns) = timed_section(|| match &adapter {
+                            None => sf.take_by_local_doc_ids(&locals, &name_refs),
+                            Some(map) => {
+                                let physical = map.stored_names(&name_refs);
+                                let read = sf.take_by_local_doc_ids(&locals, &physical)?;
+                                map.adapt(&read, &out_schema)
+                                    .map_err(|e| ReadError::Columnar(e.to_string()))
+                            }
+                        });
                         batch.map(|batch| ((i, batch), ns))
                     })
                     .collect();
@@ -1087,11 +1113,21 @@ async fn resolve_columns(
         .map_err(|e| QueryError::from(e).into())
     };
 
-    let cold_wave = try_join_all(cold_units.into_iter().map(|(i, rd, locals)| async move {
-        take_rows_byte_source(rd, locals, names)
-            .await
-            .map(|batch| (i, batch))
-    }));
+    let out_schema_ref = &out_schema;
+    let cold_wave = try_join_all(cold_units.into_iter().map(
+        |(i, rd, locals, adapter)| async move {
+            let batch = match &adapter {
+                None => take_rows_byte_source(rd, locals, names).await?,
+                Some(map) => {
+                    let physical = map.stored_names(names);
+                    let read = take_rows_byte_source(rd, locals, &physical).await?;
+                    map.adapt(&read, out_schema_ref)
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?
+                }
+            };
+            Ok::<_, DataFusionError>((i, batch))
+        },
+    ));
 
     let (warm_done, cold_done) = tokio::join!(warm_wave, cold_wave);
     let warm_done = warm_done?;
@@ -1103,7 +1139,13 @@ async fn resolve_columns(
         .map(|(item, _)| item)
         .chain(cold_done?)
     {
-        decoded_cache.insert(seg_order[i], &seg_locals[i], names, batch.clone());
+        decoded_cache.insert(
+            seg_order[i],
+            schema_id,
+            &seg_locals[i],
+            names,
+            batch.clone(),
+        );
         slots[i] = Some(batch);
     }
     let per_superfile: Vec<RecordBatch> = slots
@@ -1128,6 +1170,21 @@ async fn resolve_columns(
 /// Parquet async reader backed by the `SuperfileReader`'s existing byte source.
 /// For disk-cache readers this preserves the block-cache layer instead of
 /// bypassing it with a new object-store handle on every scalar projection.
+/// The fields a hit batch carries for `names`, in that order: the table's
+/// stored columns, which is the shape every adapted file reads into.
+fn hit_output_schema(stored: &Schema, names: &[&str]) -> DfResult<SchemaRef> {
+    let fields = names
+        .iter()
+        .map(|name| {
+            stored
+                .field_with_name(name)
+                .map(|f| Arc::new(f.clone()))
+                .map_err(|_| DataFusionError::Execution(format!("unknown column {name}")))
+        })
+        .collect::<DfResult<Vec<_>>>()?;
+    Ok(Arc::new(Schema::new(fields)))
+}
+
 struct ByteSourceAsyncReader {
     source: Source,
     metadata: Arc<ParquetMetaData>,
@@ -1807,7 +1864,7 @@ mod tests {
         let st = demo(16);
         let reader = st.reader().expect("reader");
         let hits = two_hits(&reader);
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
         let score_idx = scalar_schema.fields().len();
 
@@ -1846,7 +1903,7 @@ mod tests {
                 crate::supertable::query::dispatch::attach_stable_ids_to_hits(&reader, &mut hits),
             )
             .expect("stamp stable ids before scalar resolution");
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
 
         let batch = reader
@@ -1874,7 +1931,7 @@ mod tests {
         let st = demo(16);
         let reader = st.reader().expect("reader");
         let hits = two_hits(&reader);
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
 
         let batch = reader

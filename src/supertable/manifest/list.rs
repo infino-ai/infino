@@ -18,6 +18,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Arc,
 };
 
 use arrow::compute::concat;
@@ -28,6 +29,7 @@ use arrow_schema::{DataType, Schema};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use datafusion::scalar::ScalarValue;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -49,6 +51,7 @@ use crate::{
             term_range::prefix_overlaps_range,
         },
         opann::RERANK_LAW_POOL_CELLS,
+        schema::{FieldId, LegacyNames, TableSchema, field_id_of, parse_wire_key, wire_key},
     },
 };
 
@@ -58,9 +61,12 @@ use crate::{
 /// accepted (deny-unknown-major / allow-unknown-minor — same
 /// shape as the [`super::part::FORMAT_VERSION`] policy for
 /// manifest parts).
-pub const FORMAT_VERSION: &str = "1.0";
-/// Reserved list-aggregate key carrying each part's superfile birth range.
-pub(crate) const BIRTH_VERSION_AGGREGATE_COLUMN: &str = "__infino_birth_version";
+pub const FORMAT_VERSION: &str = "2.0";
+
+/// The major this engine wrote before summary keys became field ids. Lists
+/// at this major key their aggregates by column name, which
+/// [`decode`] resolves through the table's [`LegacyNames`].
+const FORMAT_MAJOR_NAMED: &str = "1";
 /// Maximum distinct values retained as an exact per-column frequency table.
 /// Columns crossing the cap carry no table, so high-cardinality data has
 /// bounded manifest cost.
@@ -106,19 +112,17 @@ pub struct Manifest {
     /// — guards against schema/column-config drift across
     /// process restarts.
     pub options_hash: ContentHash,
-    /// Arrow-IPC bytes of the supertable's user schema.
-    /// Stored as bytes so we don't depend on Arrow's
-    /// JSON-schema serializer (which doesn't round-trip
-    /// `FixedSizeList<Float32>` correctly in 0.x).
-    pub schema: Vec<u8>,
+    /// The table's schema document: its columns with their ids, types and
+    /// indexes. `None` on a list written before the list carried it; the
+    /// options then derive the schema from the catalog's creation record,
+    /// and the first commit fills the slot.
+    pub schema: Option<Arc<TableSchema>>,
     /// Name of the user-supplied id column.
     pub id_column: String,
-    /// Per-FTS-column configuration. Stable across the
-    /// supertable's lifetime — schema change requires
-    /// external compaction.
-    pub fts_columns: Vec<FtsColumnInfo>,
-    /// Per-vector-column configuration.
-    pub vector_columns: Vec<VectorColumnInfo>,
+    /// Minted fresh for every list a commit writes, so a writer whose
+    /// pointer swap went through but whose response was lost can recognise
+    /// its own list on reload. Nil on a list written before tokens.
+    pub commit_token: Uuid,
     /// How superfiles are grouped into manifest parts. Locked
     /// at supertable creation; see
     /// [`crate::supertable::options::SupertableOptions::effective_partition_strategy`]
@@ -231,6 +235,15 @@ pub struct Manifest {
     /// contents are unchanged. Self-invalidating: a cell's fingerprint moves
     /// when its superfiles change, and an unknown cell is simply re-checked.
     pub split_checks: BTreeMap<u32, CellSplitCheck>,
+}
+
+impl Manifest {
+    /// Make this list the next generation: it takes `manifest_id` and a
+    /// fresh commit token.
+    pub(crate) fn start_generation(&mut self, manifest_id: u64) {
+        self.manifest_id = manifest_id;
+        self.commit_token = Uuid::new_v4();
+    }
 }
 
 /// A cached split-check result for one cell. `fingerprint` identifies the
@@ -393,21 +406,6 @@ impl DrainedVersionRanges {
         }
         self.ranges = merged;
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FtsColumnInfo {
-    pub column: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct VectorColumnInfo {
-    pub column: String,
-    pub dim: usize,
-    pub rot_seed: u64,
-    /// `"cosine"`, `"l2sq"`, or `"negdot"` — matches the
-    /// `VectorConfig::metric` shape.
-    pub metric: String,
 }
 
 /// Canonical `k` points the drain calibrates the probe-width law at.
@@ -692,16 +690,16 @@ pub struct ManifestPartEntry {
     /// Per-scalar-column aggregate min/max across all
     /// superfiles in this part. An empty map is interpreted as
     /// "always-keep" by the list-level pruner.
-    pub scalar_stats_agg: HashMap<String, ScalarStatsAgg>,
+    pub scalar_stats_agg: HashMap<FieldId, ScalarStatsAgg>,
     /// Per-FTS-column aggregate bloom-union + range-union.
     /// Empty → always-keep.
-    pub fts_summary_agg: BTreeMap<String, FtsSummaryAgg>,
+    pub fts_summary_agg: BTreeMap<FieldId, FtsSummaryAgg>,
 }
 
 impl ManifestPartEntry {
     /// Inclusive birth-version range for list-level drain pruning.
     pub(crate) fn birth_version_range(&self) -> Option<(u64, u64)> {
-        let aggregate = self.scalar_stats_agg.get(BIRTH_VERSION_AGGREGATE_COLUMN)?;
+        let aggregate = self.scalar_stats_agg.get(&FieldId::BIRTH_VERSION)?;
         let min = aggregate.min.as_any().downcast_ref::<UInt64Array>()?;
         let max = aggregate.max.as_any().downcast_ref::<UInt64Array>()?;
         Some((min.value(0), max.value(0)))
@@ -941,7 +939,7 @@ impl ScalarStatsAgg {
     pub fn from_batch(
         scalar_schema: &Schema,
         batch: &RecordBatch,
-    ) -> HashMap<String, ScalarStatsAgg> {
+    ) -> HashMap<FieldId, ScalarStatsAgg> {
         ScalarStatsAgg::from_batches(scalar_schema, &[batch])
     }
 
@@ -954,19 +952,30 @@ impl ScalarStatsAgg {
     pub fn from_batches(
         scalar_schema: &Schema,
         batches: &[&RecordBatch],
-    ) -> HashMap<String, ScalarStatsAgg> {
+    ) -> HashMap<FieldId, ScalarStatsAgg> {
         let mut out = HashMap::new();
         if batches.is_empty() {
             return out;
         }
-        for (idx, field) in scalar_schema.fields().iter().enumerate() {
-            // A batch shorter than the schema (malformed input) doesn't carry
-            // this column. Use a checked lookup and skip the column rather
-            // than panicking via `RecordBatch::column` — missing stats are the
-            // safe default (the prune planner treats them as "can't prune").
+        for field in scalar_schema.fields() {
+            // Stats are keyed by the field id stamped on the stored schema;
+            // a field without one is not a column the table tracks.
+            let Some(id) = field_id_of(field) else {
+                continue;
+            };
+            // Columns are looked up by name, so a batch in another column
+            // order, or one that does not carry this column at all, can never
+            // attribute one column's values to another. A column absent from
+            // any batch gets no stats, which the prune planner treats as
+            // "can't prune".
             let Some(arrays) = batches
                 .iter()
-                .map(|b| b.columns().get(idx).map(|c| c.as_ref()))
+                .map(|b| {
+                    b.schema()
+                        .index_of(field.name())
+                        .ok()
+                        .map(|idx| b.column(idx).as_ref())
+                })
                 .collect::<Option<Vec<&dyn Array>>>()
             else {
                 continue;
@@ -976,7 +985,7 @@ impl ScalarStatsAgg {
                 Err(_) => continue,
             };
             if let Some(agg) = ScalarStatsAgg::from_column(&combined) {
-                out.insert(field.name().to_string(), agg);
+                out.insert(id, agg);
             }
         }
         out
@@ -1035,7 +1044,7 @@ impl ScalarStatsAgg {
     }
 
     /// Merge two per-column scalar-stats tables
-    /// (`HashMap<String, ScalarStatsAgg>`), folding `other` into `into`.
+    /// (`HashMap<FieldId, ScalarStatsAgg>`), folding `other` into `into`.
     ///
     /// Column **union**: a column present only in `other` is inserted; a
     /// column present in both is merged per-column via
@@ -1047,8 +1056,8 @@ impl ScalarStatsAgg {
     /// an absent column is "no info" to the pruner (always keep), which is
     /// conservative; keeping unsound bounds could drop matching rows.
     pub fn merge(
-        into: &mut HashMap<String, ScalarStatsAgg>,
-        other: &HashMap<String, ScalarStatsAgg>,
+        into: &mut HashMap<FieldId, ScalarStatsAgg>,
+        other: &HashMap<FieldId, ScalarStatsAgg>,
     ) {
         for (col, other_agg) in other {
             if let Some(existing) = into.get_mut(col) {
@@ -1056,7 +1065,7 @@ impl ScalarStatsAgg {
                     into.remove(col);
                 }
             } else {
-                into.insert(col.clone(), other_agg.clone());
+                into.insert(*col, other_agg.clone());
             }
         }
     }
@@ -1202,8 +1211,8 @@ impl FtsSummaryAgg {
     /// bloom — an absent column is "no info" to the pruner (always keep), which
     /// is conservative and equivalent.
     pub fn merge(
-        into: &mut BTreeMap<String, FtsSummaryAgg>,
-        other: &BTreeMap<String, FtsSummaryAgg>,
+        into: &mut BTreeMap<FieldId, FtsSummaryAgg>,
+        other: &BTreeMap<FieldId, FtsSummaryAgg>,
     ) {
         for (col, other_agg) in other {
             if let Some(existing) = into.get_mut(col) {
@@ -1212,7 +1221,7 @@ impl FtsSummaryAgg {
                     into.remove(col);
                 }
             } else {
-                into.insert(col.clone(), other_agg.clone());
+                into.insert(*col, other_agg.clone());
             }
         }
     }
@@ -1343,10 +1352,12 @@ struct ManifestDto {
     format_version: String,
     manifest_id: u64,
     options_hash: String, // "blake3:<64hex>"
-    schema: String,       // base64
+    /// The schema document; a string or null on a list written before it.
+    #[serde(default)]
+    schema: Value,
     id_column: String,
-    fts_columns: Vec<FtsColumnInfo>,
-    vector_columns: Vec<VectorColumnInfoDto>,
+    #[serde(default)]
+    commit_token: Option<String>,
     #[serde(default)]
     vector_index_storage_prefix: Option<String>,
     #[serde(default)]
@@ -1396,35 +1407,6 @@ struct GlobalVectorIndexDto {
     /// Absent on manifests written before the user-side grid existed.
     #[serde(default)]
     user_grid_b64: Option<String>,
-}
-
-// VectorColumnInfo's `dim` is `usize` in memory but JSON should
-// canonicalize as `u64` so round-trip on 32-bit hosts isn't a footgun.
-#[derive(Serialize, Deserialize)]
-struct VectorColumnInfoDto {
-    column: String,
-    dim: u64,
-    rot_seed: u64,
-    metric: String,
-}
-
-impl Serialize for FtsColumnInfo {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut st = s.serialize_struct("FtsColumnInfo", 1)?;
-        use serde::ser::SerializeStruct;
-        st.serialize_field("column", &self.column)?;
-        st.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for FtsColumnInfo {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Inner {
-            column: String,
-        }
-        Inner::deserialize(d).map(|i| Self { column: i.column })
-    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1651,16 +1633,17 @@ fn encode_scalar_array(
 
 fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncodeError> {
     let mut scalar_stats_agg = BTreeMap::new();
-    for (k, v) in &e.scalar_stats_agg {
+    for (id, v) in &e.scalar_stats_agg {
+        let k = wire_key(*id);
         let sum = match &v.sum {
             None => None,
-            Some(s) => Some(encode_scalar_array(k, "scalar_stats_agg.sum", s)?),
+            Some(s) => Some(encode_scalar_array(&k, "scalar_stats_agg.sum", s)?),
         };
         scalar_stats_agg.insert(
             k.clone(),
             ScalarStatsAggDto {
-                min: encode_scalar_array(k, "scalar_stats_agg.min", &v.min)?,
-                max: encode_scalar_array(k, "scalar_stats_agg.max", &v.max)?,
+                min: encode_scalar_array(&k, "scalar_stats_agg.min", &v.min)?,
+                max: encode_scalar_array(&k, "scalar_stats_agg.max", &v.max)?,
                 null_count: v.null_count,
                 sum,
                 hll: v.hll.as_deref().map(encode_b64),
@@ -1694,7 +1677,7 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
             .iter()
             .map(|(k, v)| {
                 (
-                    k.clone(),
+                    wire_key(*k),
                     FtsSummaryAggDto {
                         term_bloom_union: v
                             .term_bloom
@@ -1717,7 +1700,10 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
     })
 }
 
-fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListParseError> {
+fn entry_from_dto(
+    d: ManifestPartEntryDto,
+    legacy: Option<&LegacyNames>,
+) -> Result<ManifestPartEntry, ListParseError> {
     let part_id =
         PartId(Uuid::parse_str(&d.part_id).map_err(|e| ListParseError::BadPartId(e.to_string()))?);
     let content_hash = decode_hash(&d.content_hash)?;
@@ -1746,8 +1732,11 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
                 )?,
             ),
         };
+        let Some(id) = parse_wire_key(&k, legacy) else {
+            continue;
+        };
         scalar_stats_agg.insert(
-            k,
+            id,
             ScalarStatsAgg {
                 min,
                 max,
@@ -1774,8 +1763,11 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
     }
     let mut fts_summary_agg = BTreeMap::new();
     for (k, v) in d.fts_summary_agg {
+        let Some(id) = parse_wire_key(&k, legacy) else {
+            continue;
+        };
         fts_summary_agg.insert(
-            k,
+            id,
             FtsSummaryAgg {
                 term_bloom: {
                     let bytes = decode_b64(&v.term_bloom_union, "term_bloom_union")?;
@@ -1928,22 +1920,19 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
         .map(entry_to_dto)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ManifestDto {
-        format_version: l.format_version.clone(),
+        // Stamped at the one wire exit, whatever the decoded list carried, so
+        // no construction site can write id-keyed aggregates under the older
+        // name-keyed major. A maintenance publish (term stats, term index, a
+        // schema stamp) clones a decoded list and edits it in place; carrying
+        // its version forward would label new content with the old major, and
+        // the next decode would resolve id keys as column names and silently
+        // drop every aggregate. Mirrors `part::encode_with_mode`.
+        format_version: FORMAT_VERSION.to_owned(),
         manifest_id: l.manifest_id,
         options_hash: encode_hash(&l.options_hash),
-        schema: encode_b64(&l.schema),
+        schema: l.schema.as_ref().map_or(Value::Null, |s| s.to_json()),
         id_column: l.id_column.clone(),
-        fts_columns: l.fts_columns.clone(),
-        vector_columns: l
-            .vector_columns
-            .iter()
-            .map(|c| VectorColumnInfoDto {
-                column: c.column.clone(),
-                dim: c.dim as u64,
-                rot_seed: c.rot_seed,
-                metric: c.metric.clone(),
-            })
-            .collect(),
+        commit_token: Some(l.commit_token.to_string()),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
         vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
         global_vector_index: l
@@ -2002,13 +1991,26 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
     })
 }
 
-fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
+fn list_from_dto(d: ManifestDto, legacy: &LegacyNames) -> Result<Manifest, ListParseError> {
     check_major(&d.format_version)?;
+    // A list from before field ids keys its aggregates by column name.
+    let legacy = (d.format_version.split('.').next() == Some(FORMAT_MAJOR_NAMED)).then_some(legacy);
     let options_hash = decode_hash(&d.options_hash)?;
-    let schema = decode_b64(&d.schema, "schema")?;
+    let schema = match &d.schema {
+        Value::Object(_) => Some(Arc::new(
+            TableSchema::from_json(&d.schema)
+                .map_err(|e| ListParseError::BadFieldValue("schema", e))?,
+        )),
+        _ => None,
+    };
+    let commit_token = match d.commit_token.as_deref() {
+        None => Uuid::nil(),
+        Some(token) => Uuid::parse_str(token)
+            .map_err(|e| ListParseError::BadFieldValue("commit_token", e.to_string()))?,
+    };
     let mut parts = Vec::with_capacity(d.parts.len());
     for entry in d.parts {
-        parts.push(entry_from_dto(entry)?);
+        parts.push(entry_from_dto(entry, legacy)?);
     }
     Ok(Manifest {
         format_version: d.format_version,
@@ -2016,17 +2018,7 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
         options_hash,
         schema,
         id_column: d.id_column,
-        fts_columns: d.fts_columns,
-        vector_columns: d
-            .vector_columns
-            .into_iter()
-            .map(|c| VectorColumnInfo {
-                column: c.column,
-                dim: c.dim as usize,
-                rot_seed: c.rot_seed,
-                metric: c.metric,
-            })
-            .collect(),
+        commit_token,
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
         vector_index_storage_prefix: d.vector_index_storage_prefix,
         global_vector_index: d
@@ -2165,9 +2157,9 @@ pub fn encode(list: &Manifest) -> Result<Vec<u8>, ListEncodeError> {
 
 /// JSON-decode a manifest list. Verifies major-version
 /// compatibility; allows unknown minor versions.
-pub fn decode(bytes: &[u8]) -> Result<Manifest, ListParseError> {
+pub fn decode(bytes: &[u8], legacy: &LegacyNames) -> Result<Manifest, ListParseError> {
     let dto: ManifestDto = serde_json::from_slice(bytes)?;
-    list_from_dto(dto)
+    list_from_dto(dto, legacy)
 }
 
 fn check_major(fv: &str) -> Result<(), ListParseError> {
@@ -2176,7 +2168,7 @@ fn check_major(fv: &str) -> Result<(), ListParseError> {
         .next()
         .expect("constant has a dot");
     let got_major = fv.split('.').next().unwrap_or("");
-    if got_major != supported_major {
+    if got_major != supported_major && got_major != FORMAT_MAJOR_NAMED {
         return Err(ListParseError::IncompatibleMajorVersion {
             got: fv.to_string(),
             supported: FORMAT_VERSION.to_string(),
@@ -2217,6 +2209,10 @@ mod tests {
         },
         *,
     };
+    use crate::{
+        supertable::schema::{FieldId, LegacyNames, TableSchema},
+        test_helpers::fid,
+    };
 
     /// Build a per-column aggregate from a plain `i64` array (no nulls).
     fn agg_i64(vals: Vec<i64>) -> ScalarStatsAgg {
@@ -2240,7 +2236,7 @@ mod tests {
         let mut entry = rich_entry(1);
         let mut stats = HashMap::new();
         stats.insert(
-            BIRTH_VERSION_AGGREGATE_COLUMN.to_string(),
+            FieldId::BIRTH_VERSION,
             ScalarStatsAgg {
                 min: Arc::new(UInt64Array::from(vec![10u64])) as ArrayRef,
                 max: Arc::new(UInt64Array::from(vec![20u64])) as ArrayRef,
@@ -2314,10 +2310,13 @@ mod tests {
 
     #[test]
     fn scalar_agg_from_batch_builds_each_column() {
-        let schema = Schema::new(vec![
-            Field::new("x", DataType::Int64, true),
-            Field::new("y", DataType::Int64, true),
-        ]);
+        let schema = {
+            let user = Schema::new(vec![
+                Field::new("x", DataType::Int64, true),
+                Field::new("y", DataType::Int64, true),
+            ]);
+            (*TableSchema::from_user_schema(&user).stamp_field_ids(&user, "_id")).clone()
+        };
         let batch = RecordBatch::try_new(
             Arc::new(schema.clone()),
             vec![
@@ -2328,15 +2327,18 @@ mod tests {
         .expect("batch");
         let table = ScalarStatsAgg::from_batch(&schema, &batch);
         assert_eq!(table.len(), 2);
-        assert_eq!(i64_at0(&table["x"].min), 1);
-        assert_eq!(i64_at0(&table["x"].max), 7);
-        assert_eq!(i64_at0(&table["y"].min), 5);
-        assert_eq!(i64_at0(&table["y"].max), 20);
+        assert_eq!(i64_at0(&table[&FieldId(1)].min), 1);
+        assert_eq!(i64_at0(&table[&FieldId(1)].max), 7);
+        assert_eq!(i64_at0(&table[&FieldId(2)].min), 5);
+        assert_eq!(i64_at0(&table[&FieldId(2)].max), 20);
     }
 
     #[test]
     fn scalar_agg_from_batches_concats_then_aggregates() {
-        let schema = Schema::new(vec![Field::new("x", DataType::Int64, true)]);
+        let schema = {
+            let user = Schema::new(vec![Field::new("x", DataType::Int64, true)]);
+            (*TableSchema::from_user_schema(&user).stamp_field_ids(&user, "_id")).clone()
+        };
         let b1 = RecordBatch::try_new(
             Arc::new(schema.clone()),
             vec![Arc::new(Int64Array::from(vec![10, 50])) as ArrayRef],
@@ -2348,9 +2350,9 @@ mod tests {
         )
         .expect("b2");
         let table = ScalarStatsAgg::from_batches(&schema, &[&b1, &b2]);
-        assert_eq!(i64_at0(&table["x"].min), 5);
-        assert_eq!(i64_at0(&table["x"].max), 200);
-        assert_eq!(i64_at0(table["x"].sum.as_ref().expect("sum")), 265); // 10+50+5+200
+        assert_eq!(i64_at0(&table[&FieldId(1)].min), 5);
+        assert_eq!(i64_at0(&table[&FieldId(1)].max), 200);
+        assert_eq!(i64_at0(table[&FieldId(1)].sum.as_ref().expect("sum")), 265); // 10+50+5+200
 
         // Empty input yields an empty table.
         assert!(ScalarStatsAgg::from_batches(&schema, &[]).is_empty());
@@ -2412,21 +2414,21 @@ mod tests {
 
     #[test]
     fn merge_tables_unions_columns_and_merges_shared() {
-        let mut t1: HashMap<String, ScalarStatsAgg> = HashMap::new();
-        t1.insert("a".into(), agg_i64(vec![10, 50]));
+        let mut t1: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
+        t1.insert(fid("a"), agg_i64(vec![10, 50]));
 
-        let mut t2: HashMap<String, ScalarStatsAgg> = HashMap::new();
-        t2.insert("a".into(), agg_i64(vec![5, 30]));
-        t2.insert("b".into(), agg_i64(vec![100, 200]));
+        let mut t2: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
+        t2.insert(fid("a"), agg_i64(vec![5, 30]));
+        t2.insert(fid("b"), agg_i64(vec![100, 200]));
 
         ScalarStatsAgg::merge(&mut t1, &t2);
         assert_eq!(t1.len(), 2);
         // Shared column "a" is merged per-column (extremes kept).
-        assert_eq!(i64_at0(&t1["a"].min), 5);
-        assert_eq!(i64_at0(&t1["a"].max), 50);
+        assert_eq!(i64_at0(&t1[&fid("a")].min), 5);
+        assert_eq!(i64_at0(&t1[&fid("a")].max), 50);
         // Column "b", present only in t2, is inserted.
-        assert_eq!(i64_at0(&t1["b"].min), 100);
-        assert_eq!(i64_at0(&t1["b"].max), 200);
+        assert_eq!(i64_at0(&t1[&fid("b")].min), 100);
+        assert_eq!(i64_at0(&t1[&fid("b")].max), 200);
     }
 
     // ---- from_column: per-type branch coverage ----
@@ -2500,10 +2502,13 @@ mod tests {
         // The schema names two columns, but the second batch carries only
         // the first. The lookup for column index 1 must skip, not panic via
         // `RecordBatch::column`.
-        let schema = Schema::new(vec![
-            Field::new("x", DataType::Int64, true),
-            Field::new("y", DataType::Int64, true),
-        ]);
+        let schema = {
+            let user = Schema::new(vec![
+                Field::new("x", DataType::Int64, true),
+                Field::new("y", DataType::Int64, true),
+            ]);
+            (*TableSchema::from_user_schema(&user).stamp_field_ids(&user, "_id")).clone()
+        };
         let b1 = RecordBatch::try_new(
             Arc::new(schema.clone()),
             vec![
@@ -2519,9 +2524,9 @@ mod tests {
         .expect("b2");
         let table = ScalarStatsAgg::from_batches(&schema, &[&b1, &b2]);
         // "x" is in both batches → aggregated; "y" is absent from b2 → skipped.
-        assert!(table.contains_key("x"));
+        assert!(table.contains_key(&FieldId(1)));
         assert!(
-            !table.contains_key("y"),
+            !table.contains_key(&FieldId(2)),
             "a column missing from a batch is skipped, not panicked"
         );
     }
@@ -2581,19 +2586,19 @@ mod tests {
 
     #[test]
     fn merge_tables_keeps_columns_only_in_self() {
-        let mut t1: HashMap<String, ScalarStatsAgg> = HashMap::new();
-        t1.insert("a".into(), agg_i64(vec![1, 5]));
-        t1.insert("c".into(), agg_i64(vec![7, 9]));
-        let mut t2: HashMap<String, ScalarStatsAgg> = HashMap::new();
-        t2.insert("a".into(), agg_i64(vec![0, 3]));
+        let mut t1: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
+        t1.insert(fid("a"), agg_i64(vec![1, 5]));
+        t1.insert(fid("c"), agg_i64(vec![7, 9]));
+        let mut t2: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
+        t2.insert(fid("a"), agg_i64(vec![0, 3]));
 
         ScalarStatsAgg::merge(&mut t1, &t2);
         // "c" exists only in self → untouched.
-        assert_eq!(i64_at0(&t1["c"].min), 7);
-        assert_eq!(i64_at0(&t1["c"].max), 9);
+        assert_eq!(i64_at0(&t1[&fid("c")].min), 7);
+        assert_eq!(i64_at0(&t1[&fid("c")].max), 9);
         // "a" merged.
-        assert_eq!(i64_at0(&t1["a"].min), 0);
-        assert_eq!(i64_at0(&t1["a"].max), 5);
+        assert_eq!(i64_at0(&t1[&fid("a")].min), 0);
+        assert_eq!(i64_at0(&t1[&fid("a")].max), 5);
     }
 
     #[test]
@@ -2601,18 +2606,15 @@ mod tests {
         // Same column name, incompatible Arrow types across the two tables.
         // The column must be dropped (→ "no info", always keep) rather than
         // kept with stale, under-covering bounds.
-        let mut t1: HashMap<String, ScalarStatsAgg> = HashMap::new();
-        t1.insert("x".into(), agg_i64(vec![1, 10]));
-        let mut t2: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        let mut t1: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
+        t1.insert(fid("x"), agg_i64(vec![1, 10]));
+        let mut t2: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
         let utf8: ArrayRef = Arc::new(StringArray::from(vec!["a", "z"]));
-        t2.insert(
-            "x".into(),
-            ScalarStatsAgg::from_column(&utf8).expect("utf8"),
-        );
+        t2.insert(fid("x"), ScalarStatsAgg::from_column(&utf8).expect("utf8"));
 
         ScalarStatsAgg::merge(&mut t1, &t2);
         assert!(
-            !t1.contains_key("x"),
+            !t1.contains_key(&fid("x")),
             "type-mismatched column is dropped, not kept with stale bounds"
         );
     }
@@ -2667,7 +2669,7 @@ mod tests {
         let bad: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
         entry
             .scalar_stats_agg
-            .get_mut("ts")
+            .get_mut(&fid("ts"))
             .expect("ts present")
             .min = bad;
         list.parts = vec![entry];
@@ -2702,7 +2704,8 @@ mod tests {
         v["parts"][0]["scalar_stats_agg"][key.as_str()]["min"] =
             serde_json::Value::String(garbage_b64);
         let tampered = serde_json::to_vec(&v).expect("reserialize");
-        let err = decode(&tampered).expect_err("corrupt min must fail decode");
+        let err =
+            decode(&tampered, &LegacyNames::none()).expect_err("corrupt min must fail decode");
         assert!(
             matches!(
                 err,
@@ -2725,10 +2728,9 @@ mod tests {
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
-            schema: Vec::new(),
+            schema: None,
             id_column: "doc_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "doc_id".into(),
                 n_buckets: 64,
@@ -2755,7 +2757,7 @@ mod tests {
         let mut scalar = HashMap::new();
         for col in ["ts", "amount", "_id"] {
             scalar.insert(
-                col.to_string(),
+                fid(col),
                 ScalarStatsAgg {
                     min: Arc::new(Int64Array::from(vec![i64::from(seed)])) as ArrayRef,
                     max: Arc::new(Int64Array::from(vec![i64::from(seed) + 1_000])) as ArrayRef,
@@ -2774,7 +2776,7 @@ mod tests {
         let mut title_bloom = BloomBuilder::with_n_blocks(16);
         title_bloom.insert(format!("title_{seed}").as_bytes());
         fts.insert(
-            "title".into(),
+            fid("title"),
             FtsSummaryAgg {
                 term_bloom: Some(title_bloom.finish()),
                 n_terms_distinct: 1_048_576,
@@ -2787,7 +2789,7 @@ mod tests {
         );
         // "body": no bloom info, no range (the all-None / always-keep shape).
         fts.insert(
-            "body".into(),
+            fid("body"),
             FtsSummaryAgg {
                 term_bloom: None,
                 n_terms_distinct: 0,
@@ -2819,21 +2821,11 @@ mod tests {
         let mut list = empty_list();
         list.manifest_id = 42;
         list.options_hash = ContentHash([0xab; 32]);
-        list.schema = vec![0x01, 0x02, 0x03, 0xff, 0xfe];
-        list.fts_columns = vec![
-            FtsColumnInfo {
-                column: "title".into(),
-            },
-            FtsColumnInfo {
-                column: "body".into(),
-            },
-        ];
-        list.vector_columns = vec![VectorColumnInfo {
-            column: "emb".into(),
-            dim: 384,
-            rot_seed: 7,
-            metric: "cosine".into(),
-        }];
+        list.schema = Some(Arc::new(TableSchema::from_user_schema(&Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("amount", DataType::Int64, true),
+        ]))));
+        list.commit_token = Uuid::from_u128(0xC0FFEE);
         list.partition_strategy = PartitionStrategy::TimeRange {
             column: "ts".into(),
             granularity_secs: 86_400,
@@ -2867,8 +2859,7 @@ mod tests {
         assert_eq!(a.options_hash, b.options_hash);
         assert_eq!(a.schema, b.schema);
         assert_eq!(a.id_column, b.id_column);
-        assert_eq!(a.fts_columns, b.fts_columns);
-        assert_eq!(a.vector_columns, b.vector_columns);
+        assert_eq!(a.commit_token, b.commit_token);
         assert_eq!(a.vector_index_storage_prefix, b.vector_index_storage_prefix);
         assert_eq!(a.partition_strategy, b.partition_strategy);
         assert_eq!(a.parts.len(), b.parts.len());
@@ -2881,7 +2872,7 @@ mod tests {
     fn empty_list_roundtrip() {
         let list = empty_list();
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_lists_equal(&decoded, &list);
     }
 
@@ -2900,7 +2891,8 @@ mod tests {
             json.get("slow_vector_state_graphs_uri").is_none(),
             "absent graph ref must be omitted from the wire form (pre-feature shape)"
         );
-        let decoded = decode(&bytes).expect("pre-feature manifest must decode");
+        let decoded =
+            decode(&bytes, &LegacyNames::none()).expect("pre-feature manifest must decode");
         assert!(decoded.slow_vector_state_graphs.is_none());
     }
 
@@ -2908,7 +2900,7 @@ mod tests {
     fn rich_list_roundtrip_multiple_parts() {
         let list = rich_list(5);
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_lists_equal(&decoded, &list);
     }
 
@@ -2918,7 +2910,7 @@ mod tests {
         list.tombstone_seqs.insert(Uuid::from_u128(0x42), 7);
         list.tombstone_seqs.insert(Uuid::from_u128(0x43), 9);
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.tombstone_seqs, list.tombstone_seqs);
     }
 
@@ -2930,7 +2922,7 @@ mod tests {
         list.superseded_cells
             .insert(Uuid::from_u128(0x43), [1u32].into_iter().collect());
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.superseded_cells, list.superseded_cells);
     }
 
@@ -2952,7 +2944,7 @@ mod tests {
             },
         );
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.split_checks, list.split_checks);
     }
 
@@ -2968,7 +2960,7 @@ mod tests {
             .expect("object")
             .remove("split_checks");
         let bytes = serde_json::to_vec(&value).expect("reserialize");
-        let decoded = decode(&bytes).expect("decode legacy manifest");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode legacy manifest");
         assert!(decoded.split_checks.is_empty());
     }
 
@@ -2980,7 +2972,7 @@ mod tests {
             granularity_secs: 3600,
         };
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.partition_strategy, list.partition_strategy);
     }
 
@@ -2992,7 +2984,7 @@ mod tests {
             n_buckets: 1024,
         };
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.partition_strategy, list.partition_strategy);
     }
 
@@ -3013,7 +3005,7 @@ mod tests {
             },
         };
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         let PartitionStrategy::VectorCell { routing, .. } = &decoded.partition_strategy else {
             panic!("VectorCell strategy must survive the round-trip");
         };
@@ -3025,7 +3017,8 @@ mod tests {
         let s = from_utf8(&bytes).expect("utf8");
         let stripped = s.replace("\"slack\": 0.0,", "");
         assert_ne!(stripped, s, "fixture must actually strip the field");
-        let legacy = decode(stripped.as_bytes()).expect("decode without slack");
+        let legacy =
+            decode(stripped.as_bytes(), &LegacyNames::none()).expect("decode without slack");
         let PartitionStrategy::VectorCell { routing, .. } = &legacy.partition_strategy else {
             panic!("VectorCell strategy must survive the stripped decode");
         };
@@ -3053,7 +3046,7 @@ mod tests {
             },
         };
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         let PartitionStrategy::VectorCell { routing, .. } = &decoded.partition_strategy else {
             panic!("VectorCell strategy must survive the round-trip");
         };
@@ -3077,7 +3070,8 @@ mod tests {
             let close = key + stripped[key..].find(']').expect("array close") + 1;
             stripped = format!("{}{}", &stripped[..comma], &stripped[close..]);
         }
-        let legacy = decode(stripped.as_bytes()).expect("decode without either law");
+        let legacy =
+            decode(stripped.as_bytes(), &LegacyNames::none()).expect("decode without either law");
         let PartitionStrategy::VectorCell { routing, .. } = &legacy.partition_strategy else {
             panic!("VectorCell strategy must survive the stripped decode");
         };
@@ -3324,7 +3318,7 @@ mod tests {
             ],
         };
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.partition_strategy, list.partition_strategy);
     }
 
@@ -3343,7 +3337,7 @@ mod tests {
             routing: CellRoutingParams::default(),
         };
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.partition_strategy, list.partition_strategy);
     }
 
@@ -3362,7 +3356,7 @@ mod tests {
             user_grid: None,
         });
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.global_vector_index, list.global_vector_index);
         // With no user grid, the user side falls back to the drain grid.
         let fallback = decoded
@@ -3381,7 +3375,7 @@ mod tests {
             g.user_grid = Some(user_grid.clone());
         }
         let bytes = encode(&list).expect("encode with user grid");
-        let decoded = decode(&bytes).expect("decode with user grid");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode with user grid");
         assert_eq!(decoded.global_vector_index, list.global_vector_index);
         assert_eq!(
             *decoded
@@ -3405,7 +3399,7 @@ mod tests {
             content_hash: ContentHash([8u8; 32]),
         });
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.slow_vector_state_uri, list.slow_vector_state_uri);
         assert_eq!(
             decoded.slow_vector_state_content_hash,
@@ -3424,7 +3418,7 @@ mod tests {
                 .contains("slow_vector_state_centroids"),
             "absent section ref must not serialize null fields"
         );
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert!(decoded.slow_vector_state_uri.is_none());
         assert!(decoded.slow_vector_state_content_hash.is_none());
         assert!(decoded.slow_vector_state_centroids.is_none());
@@ -3442,7 +3436,8 @@ mod tests {
         let full = "09".repeat(BLAKE3_DIGEST_BYTES);
         let tampered = s.replacen(&format!("blake3:{full}"), "blake3:xyz", 1);
         assert_ne!(tampered, s, "tamper must change the bytes");
-        let err = decode(tampered.as_bytes()).expect_err("bad slow-state hash");
+        let err =
+            decode(tampered.as_bytes(), &LegacyNames::none()).expect_err("bad slow-state hash");
         assert!(
             matches!(err, ListParseError::BadContentHash(_)),
             "expected BadContentHash, got {err:?}"
@@ -3457,7 +3452,7 @@ mod tests {
             content_hash: ContentHash([7u8; 32]),
         });
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.term_stats, list.term_stats);
         // A manifest without the field decodes to None (older writers).
         let empty_bytes = encode(&empty_list()).expect("encode empty");
@@ -3467,7 +3462,7 @@ mod tests {
             "absent ref must not appear on the wire (older manifests stay byte-identical)"
         );
         assert!(
-            decode(&empty_bytes)
+            decode(&empty_bytes, &LegacyNames::none())
                 .expect("decode empty")
                 .term_stats
                 .is_none()
@@ -3477,7 +3472,7 @@ mod tests {
         let with_ref = from_utf8(&bytes).expect("utf8");
         let uri_only = with_ref.replacen("term_stats_content_hash", "term_stats_ignored", 1);
         assert!(
-            decode(uri_only.as_bytes())
+            decode(uri_only.as_bytes(), &LegacyNames::none())
                 .expect("decode uri-only")
                 .term_stats
                 .is_none()
@@ -3493,7 +3488,7 @@ mod tests {
         });
         list.term_index_complete = true;
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.term_index, list.term_index);
         assert!(
             decoded.term_index_complete,
@@ -3507,7 +3502,7 @@ mod tests {
             !s.contains("term_index"),
             "absent ref and false flag must not appear on the wire (older manifests stay byte-identical)"
         );
-        let empty = decode(&empty_bytes).expect("decode empty");
+        let empty = decode(&empty_bytes, &LegacyNames::none()).expect("decode empty");
         assert!(empty.term_index.is_none());
         assert!(!empty.term_index_complete);
         // One half without the other is treated as no ref, like the
@@ -3515,7 +3510,7 @@ mod tests {
         let with_ref = from_utf8(&bytes).expect("utf8");
         let uri_only = with_ref.replacen("term_index_content_hash", "term_index_ignored", 1);
         assert!(
-            decode(uri_only.as_bytes())
+            decode(uri_only.as_bytes(), &LegacyNames::none())
                 .expect("decode uri-only")
                 .term_index
                 .is_none()
@@ -3583,7 +3578,7 @@ mod tests {
         list.drained_ranges =
             DrainedVersionRanges::from_intervals(vec![(1, 4), (7, 9)]).expect("valid intervals");
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.drained_ranges, list.drained_ranges);
         assert!(empty_list().drained_ranges.is_empty());
     }
@@ -3607,15 +3602,15 @@ mod tests {
         let bytes = encode(&list).expect("encode");
         let s = from_utf8(&bytes).expect("utf8");
         let body_fts = serde_json::from_slice::<serde_json::Value>(&bytes).expect("json");
-        let fts_agg = &body_fts["parts"][0]["fts_summary_agg"]["body"];
+        let fts_agg = &body_fts["parts"][0]["fts_summary_agg"][wire_key(fid("body"))];
         assert!(
             fts_agg.get("term_range_union").is_none(),
             "term_range_union must be absent in json when None; got body fts_agg = {body_fts:#}"
         );
-        let title_agg = &body_fts["parts"][0]["fts_summary_agg"]["title"];
+        let title_agg = &body_fts["parts"][0]["fts_summary_agg"][wire_key(fid("title"))];
         assert!(title_agg.get("term_range_union").is_some());
         assert!(s.contains("\"term_bloom_union\""));
-        let _ = decode(&bytes).expect("decode still works");
+        let _ = decode(&bytes, &LegacyNames::none()).expect("decode still works");
     }
 
     fn fts_agg(terms: &[&[u8]], n_blocks: usize, range: Option<(&[u8], &[u8])>) -> FtsSummaryAgg {
@@ -3818,12 +3813,22 @@ mod tests {
         assert_eq!(bytes_a, bytes_b, "byte-equal JSON for byte-equal input");
     }
 
+    /// Rewrite the stamped version in encoded list bytes. `encode` always
+    /// stamps the current version, so a test that needs another one patches
+    /// the wire bytes rather than the struct.
+    fn restamped(list: &Manifest, version: &str) -> Vec<u8> {
+        let bytes = encode(list).expect("encode");
+        let text = String::from_utf8(bytes).expect("utf8");
+        let from = format!("\"format_version\": \"{FORMAT_VERSION}\"");
+        let to = format!("\"format_version\": \"{version}\"");
+        assert!(text.contains(&from), "encode stamps {FORMAT_VERSION}");
+        text.replacen(&from, &to, 1).into_bytes()
+    }
+
     #[test]
     fn incompatible_major_version_rejected() {
-        let mut list = empty_list();
-        list.format_version = "2.0".into();
-        let bytes = encode(&list).expect("encode");
-        let err = decode(&bytes).expect_err("major 2 must reject");
+        let bytes = restamped(&empty_list(), "3.0");
+        let err = decode(&bytes, &LegacyNames::none()).expect_err("major 3 must reject");
         assert!(
             matches!(err, ListParseError::IncompatibleMajorVersion { .. }),
             "expected IncompatibleMajorVersion, got {err:?}"
@@ -3832,11 +3837,26 @@ mod tests {
 
     #[test]
     fn minor_version_compatible() {
-        let mut list = empty_list();
-        list.format_version = "1.99".into();
-        let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("minor 99 must accept");
+        let bytes = restamped(&empty_list(), "1.99");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("minor 99 must accept");
         assert_eq!(decoded.format_version, "1.99");
+    }
+
+    /// A list decoded from the name-keyed major and re-encoded must come back
+    /// at the id-keyed major, because the encoder always writes id keys. The
+    /// maintenance publishes (term stats, term index, a schema stamp) clone a
+    /// decoded list and edit it, so this is the shape they take.
+    #[test]
+    fn a_re_encoded_legacy_list_carries_the_current_major() {
+        let bytes = restamped(&empty_list(), "1.0");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode the old major");
+        assert_eq!(decoded.format_version, "1.0", "decode keeps what it read");
+        let round = encode(&decoded).expect("re-encode");
+        let again = decode(&round, &LegacyNames::none()).expect("decode the re-encode");
+        assert_eq!(
+            again.format_version, FORMAT_VERSION,
+            "a re-encode stamps the major its own keys are written in"
+        );
     }
 
     #[test]
@@ -3858,8 +3878,8 @@ mod tests {
 
         let b_v42 = encode(&list_v42).expect("encode v42");
         let b_v43 = encode(&list_v43).expect("encode v43");
-        let d_v42 = decode(&b_v42).expect("decode v42");
-        let d_v43 = decode(&b_v43).expect("decode v43");
+        let d_v42 = decode(&b_v42, &LegacyNames::none()).expect("decode v42");
+        let d_v43 = decode(&b_v43, &LegacyNames::none()).expect("decode v43");
 
         assert_eq!(d_v42.parts.len(), 1);
         assert_eq!(d_v43.parts.len(), 1);
@@ -3881,8 +3901,7 @@ mod tests {
             "options_hash",
             "schema",
             "id_column",
-            "fts_columns",
-            "vector_columns",
+            "commit_token",
             "vector_index_storage_prefix",
             "partition_strategy",
             "parts",
@@ -3903,22 +3922,36 @@ mod tests {
     fn vector_index_storage_prefix_roundtrip() {
         let mut list = empty_list();
         list.vector_index_storage_prefix = Some("_infino_deadbeef_vector_index".into());
-        let got = decode(&encode(&list).expect("encode")).expect("decode");
+        let got = decode(&encode(&list).expect("encode"), &LegacyNames::none()).expect("decode");
         assert_eq!(
             got.vector_index_storage_prefix,
             list.vector_index_storage_prefix
         );
     }
 
+    /// The schema slot carries the document as JSON and the commit token
+    /// rides next to it; a list written before either (an empty string
+    /// where the document goes, no token) reads back with neither.
     #[test]
-    fn binary_safe_schema_roundtrip() {
-        // Arrow-IPC bytes contain arbitrary u8 — base64 must
-        // preserve the full byte range in both directions.
-        let mut list = empty_list();
-        list.schema = (0u8..=255).collect();
+    fn schema_document_and_commit_token_round_trip_and_default_when_absent() {
+        let list = rich_list(0);
         let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.schema, list.schema);
+        assert_eq!(decoded.commit_token, Uuid::from_u128(0xC0FFEE));
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["schema"]["fields"][0]["name"], "title");
+
+        let mut legacy = json;
+        legacy["schema"] = serde_json::Value::from("");
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("commit_token");
+        let legacy = serde_json::to_vec(&legacy).expect("json");
+        let decoded = decode(&legacy, &LegacyNames::none()).expect("decode");
+        assert!(decoded.schema.is_none(), "an empty slot is no document");
+        assert!(decoded.commit_token.is_nil());
     }
 
     #[test]
@@ -3926,11 +3959,34 @@ mod tests {
         let list = rich_list(1);
         let bytes = encode(&list).expect("encode");
         let s = from_utf8(&bytes).expect("utf8");
-        let tampered = s.replacen("\"schema\": \"", "\"schema\": \"!!!!", 1);
-        let err = decode(tampered.as_bytes()).expect_err("must fail");
+        assert!(
+            s.contains("\"min\": \""),
+            "the fixture carries a base64 field"
+        );
+        let tampered = s.replacen("\"min\": \"", "\"min\": \"!!!!", 1);
+        let err = decode(tampered.as_bytes(), &LegacyNames::none()).expect_err("must fail");
         assert!(
             matches!(err, ListParseError::Base64 { .. }),
             "expected Base64 error, got {err:?}"
+        );
+    }
+
+    /// A schema document that is an object but not a document is a typed
+    /// error on the slot, never an empty slot.
+    #[test]
+    fn malformed_schema_document_surfaces_typed_error() {
+        let list = rich_list(1);
+        let bytes = encode(&list).expect("encode");
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        json["schema"] = serde_json::json!({ "fields": [] });
+        let err = decode(
+            &serde_json::to_vec(&json).expect("json"),
+            &LegacyNames::none(),
+        )
+        .expect_err("must fail");
+        assert!(
+            matches!(err, ListParseError::BadFieldValue("schema", _)),
+            "expected a schema error, got {err:?}"
         );
     }
 
@@ -3956,7 +4012,7 @@ mod tests {
             tampered, s,
             "test fixture must contain an empty bloom union"
         );
-        let err = decode(tampered.as_bytes()).expect_err("malformed bloom");
+        let err = decode(tampered.as_bytes(), &LegacyNames::none()).expect_err("malformed bloom");
         assert!(
             matches!(err, ListParseError::InvalidBloom(3)),
             "expected InvalidBloom(3), got {err:?}"
@@ -3972,7 +4028,7 @@ mod tests {
         let s = from_utf8(&bytes).expect("utf8");
         // rich_list stamps options_hash = blake3:abab...; drop the prefix.
         let tampered = s.replacen("\"blake3:", "\"nothex:", 1);
-        let err = decode(tampered.as_bytes()).expect_err("missing prefix");
+        let err = decode(tampered.as_bytes(), &LegacyNames::none()).expect_err("missing prefix");
         assert!(
             matches!(err, ListParseError::BadContentHash(_)),
             "expected BadContentHash, got {err:?}"
@@ -3991,7 +4047,7 @@ mod tests {
         let full = "0".repeat(BLAKE3_HEX_LEN);
         let tampered = s.replacen(&format!("blake3:{full}"), "blake3:00", 1);
         assert_ne!(tampered, s, "tamper must change the bytes");
-        let err = decode(tampered.as_bytes()).expect_err("short hash");
+        let err = decode(tampered.as_bytes(), &LegacyNames::none()).expect_err("short hash");
         assert!(
             matches!(err, ListParseError::BadContentHash(_)),
             "expected BadContentHash, got {err:?}"
@@ -4007,7 +4063,7 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         v["parts"][0]["id_range"][0] = serde_json::Value::String("not-an-int".into());
         let tampered = serde_json::to_vec(&v).expect("reencode");
-        let err = decode(&tampered).expect_err("bad id_range");
+        let err = decode(&tampered, &LegacyNames::none()).expect_err("bad id_range");
         assert!(
             matches!(err, ListParseError::BadFieldValue("id_range[0]", _)),
             "expected BadFieldValue, got {err:?}"
@@ -4023,7 +4079,7 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         v["parts"][0]["id_range"][1] = serde_json::Value::String("xyz".into());
         let tampered = serde_json::to_vec(&v).expect("reencode");
-        let err = decode(&tampered).expect_err("bad id_range upper");
+        let err = decode(&tampered, &LegacyNames::none()).expect_err("bad id_range upper");
         assert!(
             matches!(err, ListParseError::BadFieldValue("id_range[1]", _)),
             "expected BadFieldValue, got {err:?}"
@@ -4053,10 +4109,10 @@ mod tests {
             term_range: Some((b"apple".to_vec(), b"zebra".to_vec())),
             length_stats: None,
         };
-        other.insert("col1".to_string(), summary.clone());
+        other.insert(fid("col1"), summary.clone());
         FtsSummaryAgg::merge(&mut into, &other);
         assert_eq!(into.len(), 1);
-        assert_eq!(into["col1"], summary);
+        assert_eq!(into[&fid("col1")], summary);
     }
 
     #[test]
@@ -4072,10 +4128,10 @@ mod tests {
             term_range: Some((b"a".to_vec(), b"z".to_vec())),
             length_stats: None,
         };
-        into.insert("only_in_into".to_string(), summary.clone());
+        into.insert(fid("only_in_into"), summary.clone());
         FtsSummaryAgg::merge(&mut into, &other);
         assert_eq!(into.len(), 1);
-        assert_eq!(into["only_in_into"], summary);
+        assert_eq!(into[&fid("only_in_into")], summary);
     }
 
     #[test]
@@ -4100,12 +4156,12 @@ mod tests {
             term_range: Some((b"banana".to_vec(), b"zebra".to_vec())),
             length_stats: None,
         };
-        into.insert("shared".to_string(), summary1);
-        other.insert("shared".to_string(), summary2);
+        into.insert(fid("shared"), summary1);
+        other.insert(fid("shared"), summary2);
         FtsSummaryAgg::merge(&mut into, &other);
         assert_eq!(into.len(), 1);
         // After merge: ranges should widen, distinct count should be max
-        let merged = &into["shared"];
+        let merged = &into[&fid("shared")];
         assert_eq!(merged.n_terms_distinct, 15);
         assert_eq!(
             merged.term_range.as_ref().expect("should be present").0,
@@ -4139,11 +4195,11 @@ mod tests {
             term_range: Some((b"a".to_vec(), b"z".to_vec())),
             length_stats: None,
         };
-        into.insert("col".to_string(), summary1);
-        other.insert("col".to_string(), summary2);
+        into.insert(fid("col"), summary1);
+        other.insert(fid("col"), summary2);
         FtsSummaryAgg::merge(&mut into, &other);
         // Mismatched shapes fold to the smaller and union — the column survives.
-        let merged = into.get("col").expect("column kept via fold+union");
+        let merged = into.get(&fid("col")).expect("column kept via fold+union");
         let bloom = merged.term_bloom.as_ref().expect("folded union bloom");
         assert_eq!(bloom.n_blocks(), 8, "folded to the smaller block count");
         assert!(bloom.contains(b"test1"));
@@ -4158,7 +4214,7 @@ mod tests {
         b.insert(b"test");
         let bloom = b.finish();
         into.insert(
-            "col1".to_string(),
+            fid("col1"),
             FtsSummaryAgg {
                 term_bloom: Some(bloom.clone()),
                 n_terms_distinct: 10,
@@ -4167,7 +4223,7 @@ mod tests {
             },
         );
         other.insert(
-            "col2".to_string(),
+            fid("col2"),
             FtsSummaryAgg {
                 term_bloom: Some(bloom),
                 n_terms_distinct: 20,
@@ -4177,8 +4233,8 @@ mod tests {
         );
         FtsSummaryAgg::merge(&mut into, &other);
         assert_eq!(into.len(), 2);
-        assert!(into.contains_key("col1"));
-        assert!(into.contains_key("col2"));
+        assert!(into.contains_key(&fid("col1")));
+        assert!(into.contains_key(&fid("col2")));
     }
 
     #[test]
@@ -4197,8 +4253,8 @@ mod tests {
             term_range: None,
             length_stats: None,
         };
-        into.insert("col".to_string(), summary1);
-        other.insert("col".to_string(), summary2);
+        into.insert(fid("col"), summary1);
+        other.insert(fid("col"), summary2);
         FtsSummaryAgg::merge(&mut into, &other);
         // Both had None blooms, result should be None (dropped)
         assert!(into.is_empty());

@@ -23,7 +23,6 @@
 
 use std::{error::Error, io};
 
-use arrow_schema::ArrowError;
 use datafusion::error::DataFusionError;
 use object_store::Error as ObjectStoreError;
 
@@ -37,19 +36,9 @@ use crate::{
         },
         manifest::ManifestLoadError,
         mutations::{CommitError as MutationCommitError, MutationError},
+        schema::error::SchemaError,
     },
 };
-
-/// The text DataFusion's parquet row filter wraps a pushed-down predicate's
-/// failure in: `Error evaluating filter predicate: {e:?}`, the predicate's
-/// own `DataFusionError` in `Debug` form inside an `ArrowError::ComputeError`.
-/// The type does not survive that hop, so this text is the one way to tell a
-/// predicate that failed on the caller's data from a scan that failed.
-const PUSHED_DOWN_PREDICATE_FAILED: &str = "Error evaluating filter predicate: ";
-
-/// How the wrapped error starts when an arrow kernel (a cast, a divide)
-/// rejected the caller's values, in that `Debug` form.
-const FAILED_ON_THE_DATA: &str = "ArrowError(";
 
 /// Coarse, stable error type returned by every public infino method.
 ///
@@ -67,9 +56,15 @@ pub enum InfinoError {
     #[error("already exists: {0}")]
     AlreadyExists(String),
 
-    /// Schema or column validation failed.
+    /// Schema or column validation failed: a row that does not fit the
+    /// table's schema, or a schema write the table refused.
+    ///
+    /// The cause is carried typed, so a caller can tell a field-cap breach
+    /// from a compare-and-set conflict from a type mismatch and answer each
+    /// differently, instead of matching on the message text. Causes the
+    /// engine does not classify further arrive as [`SchemaError::Invalid`].
     #[error("schema: {0}")]
-    Schema(String),
+    Schema(SchemaError),
 
     /// A predicate matched a different row count than required, or
     /// exceeded the mutation cap.
@@ -148,7 +143,11 @@ impl InfinoError {
         match self {
             Self::NotFound(m) => Self::NotFound(format!("{prefix}: {m}")),
             Self::AlreadyExists(m) => Self::AlreadyExists(format!("{prefix}: {m}")),
-            Self::Schema(m) => Self::Schema(format!("{prefix}: {m}")),
+            // The only variant carrying a typed cause rather than a message.
+            // Prefixing would mean flattening it back to text, which is the
+            // thing this variant exists to avoid, so it passes through: the
+            // schema error names its own column or cap already.
+            Self::Schema(e) => Self::Schema(e),
             Self::Cardinality(m) => Self::Cardinality(format!("{prefix}: {m}")),
             Self::Io(m) => Self::Io(format!("{prefix}: {m}")),
             Self::PermissionDenied(m) => Self::PermissionDenied(format!("{prefix}: {m}")),
@@ -276,9 +275,6 @@ fn classify_datafusion_error(e: &DataFusionError, planning: bool) -> InfinoError
             | DataFusionError::Configuration(_)
             | DataFusionError::ArrowError(..)
             | DataFusionError::External(_) => InfinoError::Query,
-            DataFusionError::ParquetError(_) if pushed_down_predicate_failed_on_the_data(e) => {
-                InfinoError::Query
-            }
             DataFusionError::Execution(_) if planning => InfinoError::Query,
             _ => InfinoError::Backend,
         }
@@ -298,21 +294,6 @@ fn is_failed_read(link: &(dyn Error + 'static)) -> bool {
         );
     }
     link.is::<StorageError>() || link.is::<io::Error>()
-}
-
-/// True when a parquet scan failed because a predicate pushed into it
-/// rejected the caller's values, not because the read or the engine failed.
-/// See [`PUSHED_DOWN_PREDICATE_FAILED`].
-fn pushed_down_predicate_failed_on_the_data(e: &DataFusionError) -> bool {
-    error_chain(e).any(|link| {
-        matches!(
-            link.downcast_ref::<ArrowError>(),
-            Some(ArrowError::ComputeError(message))
-                if message
-                    .strip_prefix(PUSHED_DOWN_PREDICATE_FAILED)
-                    .is_some_and(|inner| inner.starts_with(FAILED_ON_THE_DATA))
-        )
-    })
 }
 
 impl From<ManifestLoadError> for InfinoError {
@@ -343,9 +324,51 @@ fn manifest_load_variant(e: &ManifestLoadError) -> fn(String) -> InfinoError {
     }
 }
 
+/// A superfile build failure, by whose it is: the caller's schema or data
+/// (`Schema`), a valid choice we do not run yet (`Unsupported`), or ours
+/// (`Backend`: an I/O or encoding failure while writing). A refused
+/// credential under any of them keeps its own class. Exhaustive on purpose,
+/// so a new variant has to be classified rather than read as the caller's.
 impl From<SuperfileBuildError> for InfinoError {
     fn from(e: SuperfileBuildError) -> Self {
-        InfinoError::Schema(e.to_string())
+        if permission_denied_in_chain(&e) {
+            return InfinoError::PermissionDenied(e.to_string());
+        }
+        match &e {
+            SuperfileBuildError::MissingIdColumn(_)
+            | SuperfileBuildError::IdColumnWrongType(..)
+            | SuperfileBuildError::IdColumnMismatch(..)
+            | SuperfileBuildError::FtsColumnMustBeLargeUtf8 { .. }
+            | SuperfileBuildError::FtsColumnTypeInvalid { .. }
+            | SuperfileBuildError::FTSSchemaMismatch(_)
+            | SuperfileBuildError::DuplicateColumnName(_)
+            | SuperfileBuildError::DuplicateLogicalName(_)
+            | SuperfileBuildError::ReservedSeparatorInColumnName(_)
+            | SuperfileBuildError::PositionOverflow { .. }
+            | SuperfileBuildError::SchemaMismatch { .. }
+            | SuperfileBuildError::ReservedPrefixInColumnName(_)
+            | SuperfileBuildError::VectorDimOutOfRange { .. }
+            | SuperfileBuildError::VectorDimMismatch { .. }
+            | SuperfileBuildError::VectorSchemaMismatch(_)
+            | SuperfileBuildError::VectorCountMismatch { .. }
+            | SuperfileBuildError::WrongRowShape { .. }
+            | SuperfileBuildError::BatchSchemaMismatch { .. }
+            | SuperfileBuildError::FtsColumnMissing(_) => {
+                InfinoError::Schema(SchemaError::Invalid {
+                    reason: e.to_string(),
+                })
+            }
+            SuperfileBuildError::UnknownAnalyzer { .. } => InfinoError::Config(e.to_string()),
+            SuperfileBuildError::VectorRerankCodecUnimplemented { .. } => {
+                InfinoError::Unsupported(e.to_string())
+            }
+            // Decoding a superfile we wrote, a missing internal builder or an
+            // empty merge input: never the caller's batch.
+            SuperfileBuildError::VectorReadError
+            | SuperfileBuildError::BatchReadError
+            | SuperfileBuildError::Io(_)
+            | SuperfileBuildError::Footer(_) => InfinoError::Backend(e.to_string()),
+        }
     }
 }
 
@@ -360,19 +383,67 @@ impl From<SupertableBuildError> for InfinoError {
         if e.is_conflict() {
             return InfinoError::Conflict(e.to_string());
         }
-        // A commit that found its table dropped and purged is not a schema
-        // problem; it is the name no longer resolving. Same answer the read
-        // path gives, so a caller can match one condition, not three.
-        if matches!(e, SupertableBuildError::TableGone) {
-            return InfinoError::NotFound(e.to_string());
+        // Exhaustive on purpose, so a new variant has to be classified rather
+        // than read as the caller's.
+        let message = e.to_string();
+        match e {
+            // The superfile layer classifies its own failures.
+            SupertableBuildError::Superfile(inner) => InfinoError::from(inner),
+            // A table that already exists is the one schema cause with an
+            // answer of its own.
+            SupertableBuildError::Schema(SchemaError::TableExists { .. }) => {
+                InfinoError::AlreadyExists(message)
+            }
+            // The cause is already classified; hand it to the caller whole
+            // rather than flattening it into its own message.
+            SupertableBuildError::Schema(schema) => InfinoError::Schema(schema),
+            // The caller's table shape, batch or parameters.
+            SupertableBuildError::NoDocsToBuild
+            | SupertableBuildError::MissingIdColumn(_)
+            | SupertableBuildError::IdColumnWrongType(..)
+            | SupertableBuildError::IdColumnReserved(_)
+            | SupertableBuildError::FtsColumnMissing { .. }
+            | SupertableBuildError::FtsColumnMustBeLargeUtf8 { .. }
+            | SupertableBuildError::FtsBm25ParamsOutOfRange { .. }
+            | SupertableBuildError::VectorColumnMissing { .. }
+            | SupertableBuildError::VectorColumnNotFixedSizeList { .. }
+            | SupertableBuildError::VectorColumnDimMismatch { .. }
+            | SupertableBuildError::VectorColumnHasNulls { .. }
+            | SupertableBuildError::VectorDimOutOfRange { .. }
+            | SupertableBuildError::DuplicateLogicalName(_)
+            | SupertableBuildError::ReservedSeparatorInColumnName(_)
+            | SupertableBuildError::ReservedPrefixInColumnName(_)
+            | SupertableBuildError::PartitionColumnMissing(_)
+            | SupertableBuildError::HydrateRequiresNoIndex { .. }
+            | SupertableBuildError::HydrateChunkTooLarge { .. } => {
+                InfinoError::Schema(SchemaError::Invalid { reason: message })
+            }
+            // A bad setting: an unknown analyzer name (the same class a bad
+            // connect option gets), or a zero hydrate `target_rows`.
+            SupertableBuildError::UnknownAnalyzer { .. }
+            | SupertableBuildError::HydrateZeroTargetRows => InfinoError::Config(message),
+            // The caller's input reader failing during hydrate: I/O on their side.
+            SupertableBuildError::HydrateInputRead(_) => InfinoError::Io(message),
+            // A commit that found its table dropped and purged: the name no
+            // longer resolves, the same answer the read path gives.
+            SupertableBuildError::TableGone => InfinoError::NotFound(message),
+            // Decided by the checks above, named here for completeness.
+            SupertableBuildError::OverBudget(_) => InfinoError::OverBudget(message),
+            SupertableBuildError::PermissionDenied(_) => InfinoError::PermissionDenied(message),
+            // A commit that lost the schema compare-and-set is a lost race like
+            // the other two: the writer retries it, and a caller that sees it
+            // has had the retries spent on its behalf.
+            SupertableBuildError::SupertableInUse
+            | SupertableBuildError::WriteContention
+            | SupertableBuildError::SchemaMoved { .. } => InfinoError::Conflict(message),
+            // Ours: a store, scratch file, thread pool or cache directory
+            // failing while the write ran, none of it the caller's to fix.
+            SupertableBuildError::Store(_)
+            | SupertableBuildError::ThreadPoolCreation(_)
+            | SupertableBuildError::ReadAfterCommit(_)
+            | SupertableBuildError::StorageConstruction(_)
+            | SupertableBuildError::DiskCacheRootUnwritable(_) => InfinoError::Backend(message),
         }
-        // A bad analyzer name is a configuration mistake, not a schema
-        // shape problem — surface it as the same class a bad connect
-        // option gets.
-        if matches!(e, SupertableBuildError::UnknownAnalyzer { .. }) {
-            return InfinoError::Config(e.to_string());
-        }
-        InfinoError::Schema(e.to_string())
     }
 }
 
@@ -421,7 +492,6 @@ impl From<MutationError> for InfinoError {
             MutationError::Storage(s) => InfinoError::from(s),
             MutationError::CardinalityMismatch { .. }
             | MutationError::MatchCountExceedsCap { .. } => InfinoError::Cardinality(msg),
-            MutationError::SchemaMismatch(_) => InfinoError::Schema(msg),
             // Classifies exactly as the same rows would through `append`.
             MutationError::InvalidNewRows(b) => InfinoError::from(b),
             // Matches the read path: a purged table's name resolves to nothing.
@@ -451,12 +521,19 @@ impl From<MutationCommitError> for InfinoError {
         ) {
             return InfinoError::NotFound(e.to_string());
         }
+        // A buffer the table's schema refuses at commit (a peer froze a
+        // column in another type first) classifies as the same batch would
+        // through a synchronous append.
+        if let MutationCommitError::AppendFlush(SupertableBuildError::Schema(schema)) = &e {
+            return InfinoError::from(SupertableBuildError::Schema(schema.clone()));
+        }
         InfinoError::Backend(e.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use arrow_schema::ArrowError;
     use parquet::errors::ParquetError;
     use uuid::Uuid;
 
@@ -480,7 +557,10 @@ mod tests {
             InfinoError::AlreadyExists("t".into()).to_string(),
             "already exists: t"
         );
-        assert_eq!(InfinoError::Schema("t".into()).to_string(), "schema: t");
+        assert_eq!(
+            InfinoError::Schema(SchemaError::Invalid { reason: "t".into() }).to_string(),
+            "schema: t"
+        );
         assert_eq!(
             InfinoError::Cardinality("t".into()).to_string(),
             "cardinality: t"
@@ -549,6 +629,65 @@ mod tests {
             InfinoError::from(SupertableBuildError::NoDocsToBuild),
             InfinoError::Schema(_)
         ));
+    }
+
+    /// A build failure on our side (a store, scratch file or encoding step
+    /// failing while the write ran) is `Backend`, never the `Schema` a
+    /// caller's own table shape gets; a valid choice we do not run yet is
+    /// `Unsupported`, and the superfile layer's failures keep their class
+    /// through the supertable's wrapper.
+    #[test]
+    fn a_build_failure_is_classified_by_whose_it_is() {
+        let io = || SuperfileBuildError::Io(io::Error::other("disk full"));
+        let codec = || SuperfileBuildError::VectorRerankCodecUnimplemented {
+            column: "emb".into(),
+            codec: "pq",
+        };
+        let cases: [(InfinoError, fn(&InfinoError) -> bool); 9] = [
+            (
+                InfinoError::from(SuperfileBuildError::BatchReadError),
+                |e| matches!(e, InfinoError::Backend(_)),
+            ),
+            (
+                InfinoError::from(SupertableBuildError::Store(
+                    "term-stats write timed out".into(),
+                )),
+                |e| matches!(e, InfinoError::Backend(_)),
+            ),
+            (
+                InfinoError::from(SupertableBuildError::ThreadPoolCreation(
+                    "no threads".into(),
+                )),
+                |e| matches!(e, InfinoError::Backend(_)),
+            ),
+            (InfinoError::from(io()), |e| {
+                matches!(e, InfinoError::Backend(_))
+            }),
+            (
+                InfinoError::from(SupertableBuildError::Superfile(io())),
+                |e| matches!(e, InfinoError::Backend(_)),
+            ),
+            (InfinoError::from(codec()), |e| {
+                matches!(e, InfinoError::Unsupported(_))
+            }),
+            (
+                InfinoError::from(SupertableBuildError::Superfile(codec())),
+                |e| matches!(e, InfinoError::Unsupported(_)),
+            ),
+            (
+                InfinoError::from(SupertableBuildError::Superfile(
+                    SuperfileBuildError::MissingIdColumn("c".into()),
+                )),
+                |e| matches!(e, InfinoError::Schema(_)),
+            ),
+            (
+                InfinoError::from(SupertableBuildError::MissingIdColumn("c".into())),
+                |e| matches!(e, InfinoError::Schema(_)),
+            ),
+        ];
+        for (got, expected) in cases {
+            assert!(expected(&got), "got {got:?}");
+        }
     }
 
     #[test]
@@ -852,26 +991,10 @@ mod tests {
         ));
     }
 
-    /// A predicate DataFusion pushed into the parquet scan comes back as text.
-    /// One that failed on the caller's values is theirs; any other is ours.
+    /// A parquet failure is a corrupt or unread file: the engine's, not the
+    /// caller's. Predicates never run inside the scan, so none can fail there.
     #[test]
-    fn a_pushed_down_predicate_that_failed_on_the_data_is_the_callers() {
-        let pushed_down = |inner: &str| {
-            DataFusionError::ParquetError(Box::new(ParquetError::External(Box::new(
-                ArrowError::ComputeError(format!("{PUSHED_DOWN_PREDICATE_FAILED}{inner}")),
-            ))))
-        };
-        assert!(matches!(
-            datafusion_error(&pushed_down(
-                r#"ArrowError(CastError("Cannot cast string 'alpha'"), None)"#
-            )),
-            InfinoError::Query(_)
-        ));
-        assert!(matches!(
-            datafusion_error(&pushed_down(r#"Execution("Partition 3 not found")"#)),
-            InfinoError::Backend(_)
-        ));
-        // A parquet failure that is not a predicate is a corrupt or unread file.
+    fn a_parquet_failure_is_the_engines() {
         assert!(matches!(
             datafusion_error(&DataFusionError::ParquetError(Box::new(
                 ParquetError::General("bad footer".into())
@@ -1074,10 +1197,6 @@ mod tests {
         assert!(matches!(
             InfinoError::from(MutationError::MatchCountExceedsCap { matched: 9, cap: 5 }),
             InfinoError::Cardinality(_)
-        ));
-        assert!(matches!(
-            InfinoError::from(MutationError::SchemaMismatch("s".into())),
-            InfinoError::Schema(_)
         ));
         assert!(matches!(
             InfinoError::from(MutationError::NoStorageAttached),

@@ -249,6 +249,18 @@ impl StorageProvider for LocalFsStorageProvider {
         out
     }
 
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        let path = Self::path(uri)?;
+        let opts = PutOptions {
+            mode: PutMode::Overwrite,
+            ..Default::default()
+        };
+        self.store
+            .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+            .await
+            .map(|_| ())
+            .map_err(|e| translate(uri, e))
+    }
     async fn put_if_match(
         &self,
         uri: &str,

@@ -1113,7 +1113,7 @@ fn a_like_predicate_is_answered_from_the_index() {
     // empty — but the index still hands the scan the rows holding a term
     // that starts with it, and only the FilterExec rejects them. Decoding
     // exactly those candidates is the signature of the index path: a plain
-    // scan with the row filter inside it would decode none.
+    // scan would decode every row.
     let (batches, prefix) = with_op_stats(|| {
         db.query_sql("SELECT title FROM docs WHERE title LIKE 'nimble%'")
             .expect("query_sql")

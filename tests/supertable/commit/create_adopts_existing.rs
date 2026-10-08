@@ -83,6 +83,10 @@ impl StorageProvider for PointerHiddenOnce {
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         self.inner.put_atomic(uri, bytes).await
     }
+
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        self.inner.put_overwrite(uri, bytes).await
+    }
     async fn put_if_match(
         &self,
         uri: &str,

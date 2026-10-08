@@ -332,6 +332,7 @@ async fn optimize_reaps_completed_wal_past_grace() {
             outcome: TombstoneOutcome::NotFound,
             tombstoned_in_superfile: None,
         }],
+        schema_id: None,
     };
     ws.create(&leftover).await.expect("seed leftover wal");
 

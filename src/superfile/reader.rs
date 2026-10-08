@@ -76,7 +76,7 @@ use crate::{
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
         },
     },
-    supertable::query::provider::tombstone_access_plan,
+    supertable::{query::provider::tombstone_access_plan, schema::FieldId},
     utils::terms::FstValue,
 };
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
@@ -270,9 +270,11 @@ impl SuperfileReader {
     /// 2. **3-4 GETs** for the embedded vector subsection, via
     ///    `VectorReader::open_lazy` (outer header, directory + CRC,
     ///    subsection headers, and Sq8 codec_meta when present).
-    /// 3. **3 GETs** for the embedded FTS subsection, via
-    ///    `FtsReader::open_lazy` (header, FST dictionary, doc-length
-    ///    tail; postings stay lazy until search).
+    /// 3. **2-3 GETs** for the embedded FTS subsection, via
+    ///    `FtsReader::open_lazy` (header, doc-lengths directory, and the
+    ///    doc-id map when the file has one; the dictionary, each column's
+    ///    length array and the postings stay lazy until a query needs
+    ///    them).
     ///
     /// Total open budget is small exact metadata ranges rather than
     /// whole-subsection/speculative slabs. Subsequent vector queries
@@ -328,8 +330,9 @@ impl SuperfileReader {
             )));
         }
         let version_str = kv_map.get(kv::FORMAT_VERSION).expect("checked above");
-        let version = format::Version::parse(version_str)
-            .ok_or_else(|| ReadError::MalformedVersion(version_str.clone()))?;
+        let version = format::Version::parse(version_str).ok_or_else(|| {
+            ReadError::Malformed(format!("format-version {version_str:?} does not parse"))
+        })?;
         if !version.is_compatible_with_current() {
             return Err(ReadError::UnsupportedVersion(version_str.clone()));
         }
@@ -463,8 +466,9 @@ impl SuperfileReader {
             )));
         }
         let version_str = kv_map.get(kv::FORMAT_VERSION).expect("checked above");
-        let version = format::Version::parse(version_str)
-            .ok_or_else(|| ReadError::MalformedVersion(version_str.clone()))?;
+        let version = format::Version::parse(version_str).ok_or_else(|| {
+            ReadError::Malformed(format!("format-version {version_str:?} does not parse"))
+        })?;
         if !version.is_compatible_with_current() {
             return Err(ReadError::UnsupportedVersion(version_str.clone()));
         }
@@ -685,6 +689,32 @@ impl SuperfileReader {
     }
 
     /// FTS column names in declaration order, or empty.
+    /// The name this file knows the column `id` by, for a caller holding
+    /// the table's current name for it. A file written before a rename
+    /// carries the old label in its FTS and vector blobs, which key their
+    /// columns by name; the id is what identifies the column across both.
+    /// Falls back to `name` for a file written before ids, whose labels
+    /// were the table's at the time.
+    pub(crate) fn column_alias<'a>(&'a self, id: Option<FieldId>, name: &'a str) -> &'a str {
+        let Some(id) = id else {
+            return name;
+        };
+        let fts = self
+            .fts()
+            .into_iter()
+            .flat_map(|fts| fts.fts_columns_config())
+            .find(|c| c.field_id == Some(id))
+            .map(|c| c.name.as_str());
+        fts.or_else(|| {
+            self.vec()
+                .into_iter()
+                .flat_map(|vec| vec.vector_columns_config())
+                .find(|c| c.field_id == Some(id))
+                .map(|c| c.name.as_str())
+        })
+        .unwrap_or(name)
+    }
+
     pub fn fts_columns(&self) -> Vec<&str> {
         match &self.fts {
             Some(r) => r.fts_columns().collect(),
@@ -3550,6 +3580,19 @@ mod tests {
         let bytes = superfile_with_kv(&kvs);
         let err = SuperfileReader::open(bytes).expect_err("expected error");
         assert!(matches!(err, ReadError::UnsupportedVersion(_)));
+    }
+
+    #[test]
+    fn open_with_rejects_a_format_version_that_does_not_parse() {
+        // Not a version at all: a malformed file, not one from another version.
+        let mut kvs = required_kv();
+        kvs[1] = (kv::FORMAT_VERSION.into(), "not-a-version".into());
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(
+            matches!(&err, ReadError::Malformed(m) if m.contains("not-a-version")),
+            "got {err:?}"
+        );
     }
 
     #[test]

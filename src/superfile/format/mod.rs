@@ -832,6 +832,12 @@ pub mod kv {
     /// Present iff vector blob uses a non-default layout (`ivf` default).
     pub const VEC_LAYOUT: &str = "inf.vec.layout";
 
+    /// The table schema version the superfile was written under
+    /// (string-encoded u32). Provenance only: a reader decides whether a
+    /// file matches the table by comparing physical schemas, never by
+    /// this number. Absent on superfiles written before it existed.
+    pub const SCHEMA_ID: &str = "inf.schema_id";
+
     /// Optional: JSON array of global cell ids packed into a multi-cell
     /// vector blob, in cell-directory order. Present when
     /// `inf.vec.layout = multi_cell_ivf`.

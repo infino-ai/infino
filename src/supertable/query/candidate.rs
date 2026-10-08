@@ -1429,6 +1429,7 @@ mod tests {
     /// scope reads only `uri` and `n_docs` of it.
     fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             superfile_id: Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             stem: None,

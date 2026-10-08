@@ -134,8 +134,17 @@ pub enum ReadError {
         column: String, // empty if not column-scoped
     },
 
-    #[error("malformed format-version string {0:?}")]
-    MalformedVersion(String),
+    /// The superfile's bytes do not match its format: an offset or length out
+    /// of range, a region shorter than declared, a codec id it never defined,
+    /// or JSON or a format version that does not parse. Required KV keys that
+    /// are missing or mistyped are [`Self::MalformedKv`].
+    #[error("malformed superfile: {0}")]
+    Malformed(String),
+
+    /// A read that does not support the column's rerank codec was called on
+    /// it: a caller bug, not a problem with the file.
+    #[error("this read does not support the column's codec: {0}")]
+    WrongCodecPath(String),
 
     #[error("io error during read: {0}")]
     Io(#[from] std::io::Error),
@@ -181,6 +190,18 @@ impl ReadError {
             _ => None,
         }
     }
+
+    /// Whether this, or the read error a vector or FTS error wraps, is the
+    /// engine breaking its own invariant: a doc id past the superfile's end,
+    /// or a read called on a codec it does not support. Retrying cannot help.
+    pub(crate) fn is_internal(&self) -> bool {
+        match self {
+            ReadError::DocIdOutOfRange { .. } | ReadError::WrongCodecPath(_) => true,
+            ReadError::Vector(v) => matches!(v.as_ref(), VectorError::Read(r) if r.is_internal()),
+            ReadError::Fts(f) => matches!(f.as_ref(), FtsError::Read(r) if r.is_internal()),
+            _ => false,
+        }
+    }
 }
 
 impl From<FtsError> for ReadError {
@@ -220,9 +241,22 @@ pub enum FtsError {
     /// without them (`FtsConfig::positions` was false). A typed error
     /// — never a silent bag-of-words fallback, which would return
     /// wrong matches.
+    ///
+    /// The message names the way to the phrase that needs no positions
+    /// before the rebuild, because a caller reading it is usually a model
+    /// mid-question: told only to rebuild, it gave up on the phrase, and the
+    /// words' rows narrowed by a substring filter find it on the table as
+    /// built. The filter is `ILIKE`, not `LIKE`: the tokenizers lowercase
+    /// the text, so a phrase matches regardless of case and a case-sensitive
+    /// filter would drop its capitalised rows (a heading, a sentence start).
+    /// It still only approximates the phrase, which also matches across
+    /// punctuation (`national-defense`), and the message says so.
     #[error(
         "phrase query on column {column:?}, which was indexed without token \
-         positions; rebuild with positions enabled to use phrase queries"
+         positions: to find the phrase, token_match its words and keep the rows \
+         whose {column} contains it (ILIKE '%<phrase>%', which approximates the \
+         phrase: it misses the words joined by punctuation); a rebuild with \
+         positions enabled lets a search quote it"
     )]
     PositionsUnavailable { column: String },
 

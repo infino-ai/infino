@@ -27,9 +27,9 @@ use rustc_hash::FxHashMap;
 
 use super::{
     bounds::StoredBound,
-    cursor::{SubindexKind, TermCursor, TermMeta},
+    cursor::{CursorUse, SubindexKind, TermCursor, TermMeta},
     filter::ExcludeFilter,
-    metadata::{ColumnLengthStats, ColumnMeta, FtsColumnConfig, OpenOptions},
+    metadata::{ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions},
     phrase::{AnyCursor, PhraseCursor},
     search::FetchedTermMemo,
     sink::{LiveFloor, TopKEntry, drain_top_k_desc},
@@ -59,6 +59,7 @@ use crate::{
         id_space::{DocMap, FtsDocId, RowId},
         lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
     },
+    supertable::schema::FieldId,
     utils::terms::{FstValue, TermDict, make_key},
 };
 
@@ -573,13 +574,12 @@ impl FtsReader {
     }
 
     /// Open from a range source without materializing the FTS
-    /// subsection. Three open-time GETs prefetch the only regions a
-    /// reader needs before it can serve queries: the fixed header, the
-    /// FST term directory (contiguous after the header), and the
-    /// doc-length tables (the trailing region, needed to build BM25
-    /// normalization). The postings region stays lazy — each query
-    /// term's bytes are fetched on demand by [`Self::fetch_term_postings`],
-    /// mirroring how the vector reader fetches only probed clusters.
+    /// subsection. The open reads only the fixed header and the doc-length
+    /// directory, which says where each column's length array sits. The
+    /// dictionary is fetched on the first lookup that needs it, each
+    /// column's length array on its first scored use, and each query term's
+    /// postings on demand by [`Self::fetch_term_postings`], mirroring how
+    /// the vector reader fetches only probed clusters.
     pub async fn open_lazy(
         source: Arc<dyn LazyByteSource>,
         columns_json: &str,
@@ -785,7 +785,7 @@ impl FtsReader {
             || positions_offset.is_some_and(|po| regions_end < po + 4)
             || doc_map_offset.is_some_and(|mo| doc_lengths_table_offset < mo + format::CRC_BYTES)
         {
-            return Err(FtsError::Read(ReadError::MalformedVersion(format!(
+            return Err(FtsError::Read(ReadError::Malformed(format!(
                 "fts header offsets out of range: fst={fst_offset}, postings={postings_offset}, \
                  positions={positions_offset:?}, doc_lengths={doc_lengths_table_offset}, \
                  blob_len={}",
@@ -860,12 +860,10 @@ impl FtsReader {
 
         // Parse columns_json.
         let cols: Vec<FtsColumnConfig> = serde_json::from_str(columns_json).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "inf.fts.columns JSON: {e}"
-            )))
+            FtsError::Read(ReadError::Malformed(format!("inf.fts.columns JSON: {e}")))
         })?;
         if cols.len() != n_columns {
-            return Err(FtsError::Read(ReadError::MalformedVersion(format!(
+            return Err(FtsError::Read(ReadError::Malformed(format!(
                 "inf.fts.columns has {} entries, header says {}",
                 cols.len(),
                 n_columns
@@ -874,17 +872,14 @@ impl FtsReader {
 
         // Read doc-lengths directory: n_columns × 16-byte entries + 4-byte CRC.
         //
-        // On the lazy open path this directory — and every per-column
-        // array fetched below — falls inside the
-        // `[doc_lengths_table_offset..fts_blob_len]` tail that
-        // `open_lazy` already fetched in one GET and installed in the
-        // overlay, so these `fetch_source_range` calls resolve from the
-        // overlay with **no** per-column GETs. On the eager path the
-        // whole subsection is in memory, so they are zero-copy slices.
+        // On the lazy open path `open_lazy` already fetched this directory
+        // and installed it in the overlay, so reading it here costs no GET.
+        // On the eager path the whole subsection is in memory, so every
+        // read below is a zero-copy slice.
         let dir_size = n_columns * DOC_LENGTHS_ENTRY_SIZE;
         let dir_end = doc_lengths_table_offset + dir_size;
         if dir_end + 4 > source_len {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "doc-lengths directory runs past blob end".into(),
             )));
         }
@@ -925,19 +920,19 @@ impl FtsReader {
 
             // Verify column_id matches the JSON's positional column_id.
             if column_id != i as u32 {
-                return Err(FtsError::Read(ReadError::MalformedVersion(format!(
+                return Err(FtsError::Read(ReadError::Malformed(format!(
                     "doc-lengths directory entry {i} has column_id {column_id}"
                 ))));
             }
 
             // Per-column doc-lengths array: 4 * n_docs bytes + 4-byte CRC.
-            // `doc_lengths_offset` lies within the prefetched doc-lengths
-            // tail, so on the lazy path this resolves from the overlay
-            // (see the directory comment above) — no per-column GET.
+            // Bounded here; read lazily on the column's first scored use,
+            // except that CRC verification reads it now to check it, which
+            // on the lazy path is one GET per column at open.
             let array_byte_len = doc_length_bytes * n_docs as usize;
             let array_end = doc_lengths_offset + array_byte_len;
             if array_end + 4 > source_len {
-                return Err(FtsError::Read(ReadError::MalformedVersion(format!(
+                return Err(FtsError::Read(ReadError::Malformed(format!(
                     "doc-lengths array {i} runs past blob end"
                 ))));
             }
@@ -945,13 +940,13 @@ impl FtsReader {
             let params = col_cfg.params();
             let declared = bounds.declares_scoring_average();
             let base = Base::from_name(&col_cfg.tokenizer).ok_or_else(|| {
-                FtsError::Read(ReadError::MalformedVersion(format!(
+                FtsError::Read(ReadError::Malformed(format!(
                     "inf.fts.columns: unknown tokenizer {:?} for column {:?}",
                     col_cfg.tokenizer, col_cfg.name
                 )))
             })?;
             let (stopwords, stemmer) = col_cfg.filters().map_err(|(field, value)| {
-                FtsError::Read(ReadError::MalformedVersion(format!(
+                FtsError::Read(ReadError::Malformed(format!(
                     "inf.fts.columns: unknown {field} {value:?} for column {:?}",
                     col_cfg.name
                 )))
@@ -969,6 +964,7 @@ impl FtsReader {
             // then runs when the array is first read.
             let column = ColumnMeta {
                 name: col_cfg.name.clone(),
+                field_id: col_cfg.field_id.map(FieldId),
                 doc_lengths_range: doc_lengths_offset..array_end,
                 params,
                 positions: col_cfg.positions,
@@ -989,11 +985,8 @@ impl FtsReader {
                 view_norms: Arc::new(OnceLock::new()),
             };
             if opts.verify_crc {
-                let array = fetch_source_range(
-                    &source,
-                    doc_lengths_offset..array_end + 4,
-                    "fts/doc_lengths_array",
-                )?;
+                let array =
+                    fetch_source_range(&source, doc_lengths_offset..array_end + 4, LENGTH_ARRAY)?;
                 column.check_array_crc(&array)?;
             }
             columns.push(column);
@@ -1011,7 +1004,7 @@ impl FtsReader {
                 // the directory too early for a map of this many
                 // documents to fit between it and the regions before it.
                 if doc_lengths_table_offset < doc_map_len {
-                    return Err(FtsError::Read(ReadError::MalformedVersion(format!(
+                    return Err(FtsError::Read(ReadError::Malformed(format!(
                         "fts doc-map of {doc_map_len} bytes for {n_docs} docs does not fit \
                          below the doc-lengths directory at {doc_lengths_table_offset}"
                     ))));
@@ -1097,14 +1090,18 @@ impl FtsReader {
         self.columns.iter()
     }
 
-    /// This superfile's document-length totals for `column`, as summed
-    /// when the reader opened. `None` if `column` is not an FTS column
-    /// here. The commit path records these on the manifest so table-wide
-    /// statistics are a fold over the summaries rather than a fan-out
-    /// that reopens every superfile.
-    pub fn column_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
-        let id = self.resolve_column_id(column).ok()?;
-        Some(self.columns[id as usize].length_stats())
+    /// This superfile's document-length totals for `column`, read from its
+    /// length array (now, if no query has). `None` if `column` is not an FTS
+    /// column here. The commit path records these on the manifest so
+    /// table-wide statistics are a fold over the summaries rather than a
+    /// fan-out that reopens every superfile, so an array that cannot be read
+    /// is an error, not a column with no tokens: a zero recorded there would
+    /// skew every query's statistics for as long as the superfile lives.
+    pub fn column_length_stats(&self, column: &str) -> Result<Option<ColumnLengthStats>, FtsError> {
+        let Ok(id) = self.resolve_column_id(column) else {
+            return Ok(None);
+        };
+        self.columns[id as usize].try_length_stats().map(Some)
     }
 
     test_visible! {
@@ -1163,11 +1160,8 @@ impl FtsReader {
         fst_bytes: &[u8],
         layout: DictLayout,
     ) -> Result<TermDict<'_>, FtsError> {
-        TermDict::open(fst_bytes, layout).map_err(|e| {
-            FtsError::Read(ReadError::MalformedVersion(format!(
-                "FST parse failed: {e}"
-            )))
-        })
+        TermDict::open(fst_bytes, layout)
+            .map_err(|e| FtsError::Read(ReadError::Malformed(format!("FST parse failed: {e}"))))
     }
 
     /// Build `column_id`'s norms from its length array if a scoring path has
@@ -1190,13 +1184,10 @@ impl FtsReader {
             .range_async(col.array_with_crc_range())
             .await
             .map_err(|e| FtsError::RangeFetch {
-                what: "fts/doc_lengths_array",
+                what: LENGTH_ARRAY,
                 source: e,
             })?;
-        col.check_array_crc(&array)?;
-        let norms = col.norms_from_array(&array[..col.array_len()]);
-        // A concurrent prewarm may have won; either set is the same table.
-        let _ = col.base_norms.set(norms);
+        col.install_norms(&array)?;
         Ok(())
     }
 
@@ -1260,7 +1251,7 @@ impl FtsReader {
                 Some(length) => length,
                 None => {
                     let header = probed.get(next_probe).ok_or_else(|| {
-                        FtsError::Read(ReadError::MalformedVersion(
+                        FtsError::Read(ReadError::Malformed(
                             "fetched fewer term metadata headers than probed".into(),
                         ))
                     })?;
@@ -1289,7 +1280,7 @@ impl FtsReader {
         let mut ranges: Vec<Range<usize>> = Vec::with_capacity(terms.len());
         for &(m, postings_length) in terms {
             if postings_length == 0 || m + postings_length > region_len {
-                return Err(FtsError::Read(ReadError::MalformedVersion(
+                return Err(FtsError::Read(ReadError::Malformed(
                     "term postings range runs past postings region".into(),
                 )));
             }
@@ -1323,7 +1314,7 @@ impl FtsReader {
             return Ok(vec![Bytes::new(); terms.len()]);
         }
         let region = self.positions_range.as_ref().ok_or_else(|| {
-            FtsError::Read(ReadError::MalformedVersion(
+            FtsError::Read(ReadError::Malformed(
                 "positional term in a blob with no positions region".into(),
             ))
         })?;
@@ -1334,7 +1325,7 @@ impl FtsReader {
             let off = off as usize;
             let len = len as usize;
             if off + len > region_len {
-                return Err(FtsError::Read(ReadError::MalformedVersion(
+                return Err(FtsError::Read(ReadError::Malformed(
                     "term positions range runs past positions region".into(),
                 )));
             }
@@ -1368,11 +1359,14 @@ impl FtsReader {
         phrases: &[Phrase<String>],
         global_idf: Option<&GlobalTermIdf>,
         prefetched: Option<&FetchedTermMemo>,
+        purpose: CursorUse,
     ) -> Result<(Vec<Option<AnyCursor>>, u64), FtsError> {
         let col_meta = &self.columns[column_id as usize];
-        // Atom walks score, so the norms are needed before any cursor is
-        // built.
-        self.ensure_norms(column_id).await?;
+        // A scored walk needs the norms before any cursor is built; an
+        // unranked match does not, and must not read the length array.
+        if purpose.scores() {
+            self.ensure_norms(column_id).await?;
+        }
         if !phrases.is_empty() && !col_meta.positions {
             return Err(FtsError::PositionsUnavailable {
                 column: col_meta.name.clone(),
@@ -1387,7 +1381,9 @@ impl FtsReader {
         // dictionary range for the whole batch.
         if !terms.is_empty() {
             let term_cursors = self
-                .build_term_cursors_opt(column_id, terms, global_idf, false, None, prefetched, None)
+                .build_term_cursors_opt(
+                    column_id, terms, global_idf, purpose, None, prefetched, None,
+                )
                 .await?;
             dict_ranges += 1;
             for cursor in term_cursors {
@@ -1401,7 +1397,14 @@ impl FtsReader {
             // per-member rescale ratio cancels out of the phrase's tf/length
             // bound. Build members with the same `global_idf` as bare terms.
             let cursors = self
-                .build_term_cursors(column_id, &member_refs, global_idf, false, None, prefetched)
+                .build_term_cursors(
+                    column_id,
+                    &member_refs,
+                    global_idf,
+                    purpose,
+                    None,
+                    prefetched,
+                )
                 .await?;
             dict_ranges += 1;
             if cursors.len() != member_refs.len() {
@@ -1444,8 +1447,8 @@ impl FtsReader {
                         let mut t = [0u32; BLOCK_LEN];
                         let decoded = decode_short(cursor.bytes.as_ref(), true, &mut d, &mut t)
                             .ok_or_else(|| {
-                                FtsError::Read(ReadError::MalformedVersion(
-                                    "malformed short-form term body".into(),
+                                FtsError::Read(ReadError::Malformed(
+                                    "short-form term body does not decode".into(),
                                 ))
                             })?;
                         inline_groups.push((
@@ -1636,8 +1639,8 @@ impl FtsReader {
                         let mut t = [0u32; BLOCK_LEN];
                         let decoded = decode_short(term_bytes.as_ref(), positional, &mut d, &mut t)
                             .ok_or_else(|| {
-                                FtsError::Read(ReadError::MalformedVersion(
-                                    "malformed short-form term body".into(),
+                                FtsError::Read(ReadError::Malformed(
+                                    "short-form term body does not decode".into(),
                                 ))
                             })?;
                         // A short body's positions are one group, inline
@@ -1648,8 +1651,8 @@ impl FtsReader {
                             group
                                 .locate(bytes.as_ref(), &mut 0, &t[..decoded.n])
                                 .ok_or_else(|| {
-                                    FtsError::Read(ReadError::MalformedVersion(
-                                        "malformed position group in merge read".into(),
+                                    FtsError::Read(ReadError::Malformed(
+                                        "position group in merge read does not decode".into(),
                                     ))
                                 })?;
                         }
@@ -1660,7 +1663,7 @@ impl FtsReader {
                                     group
                                         .run_positions(bytes.as_ref(), i, t[i], positions_buf)
                                         .ok_or_else(|| {
-                                            FtsError::Read(ReadError::MalformedVersion(
+                                            FtsError::Read(ReadError::Malformed(
                                                 "position run overflowing in merge read".into(),
                                             ))
                                         })?;
@@ -1687,7 +1690,7 @@ impl FtsReader {
                             self.positions_grouped,
                         )?;
                         let region = positions_region.as_ref().ok_or_else(|| {
-                            FtsError::Read(ReadError::MalformedVersion(
+                            FtsError::Read(ReadError::Malformed(
                                 "positional column missing a positions region".into(),
                             ))
                         })?;
@@ -1706,8 +1709,15 @@ impl FtsReader {
                     // This walk carries postings across into a merge; it
                     // reads doc ids, tfs and positions and never consults
                     // a score bound.
-                    let mut cursor =
-                        TermCursor::new(term_bytes, col_meta, self.bounds, None, 1, false, false)?;
+                    let mut cursor = TermCursor::new(
+                        term_bytes,
+                        col_meta,
+                        self.bounds,
+                        None,
+                        1,
+                        false,
+                        CursorUse::Match,
+                    )?;
                     // Grouped positions (V7): each block's runs are one
                     // group, decoded whole at the block's start and sliced
                     // per pair; older blobs are one run after another.
@@ -1719,8 +1729,8 @@ impl FtsReader {
                             group
                                 .locate(bytes.as_ref(), &mut pos_at, tfs)
                                 .ok_or_else(|| {
-                                    FtsError::Read(ReadError::MalformedVersion(
-                                        "malformed position group in merge read".into(),
+                                    FtsError::Read(ReadError::Malformed(
+                                        "position group in merge read does not decode".into(),
                                     ))
                                 })?;
                         }
@@ -1738,7 +1748,7 @@ impl FtsReader {
                                             positions_buf,
                                         )
                                         .ok_or_else(|| {
-                                            FtsError::Read(ReadError::MalformedVersion(
+                                            FtsError::Read(ReadError::Malformed(
                                                 "position run overflowing in merge read".into(),
                                             ))
                                         })?;
@@ -1748,7 +1758,7 @@ impl FtsReader {
                                     positions_buf.clear();
                                     decode_run(bytes.as_ref(), &mut pos_at, tf, positions_buf)
                                         .ok_or_else(|| {
-                                            FtsError::Read(ReadError::MalformedVersion(
+                                            FtsError::Read(ReadError::Malformed(
                                                 "truncated position run in merge read".into(),
                                             ))
                                         })?;
@@ -1813,8 +1823,8 @@ impl FtsReader {
                                 &mut tfs,
                             )
                             .ok_or_else(|| {
-                                FtsError::Read(ReadError::MalformedVersion(
-                                    "malformed short-form term body".into(),
+                                FtsError::Read(ReadError::Malformed(
+                                    "short-form term body does not decode".into(),
                                 ))
                             })?;
                             for &doc in &doc_ids[..decoded.n] {
@@ -1822,7 +1832,7 @@ impl FtsReader {
                             }
                             Ok(())
                         }
-                        // A count-only cursor decodes a block's doc ids and
+                        // A `Count` cursor decodes a block's doc ids and
                         // skips its tfs.
                         false => {
                             let mut cursor = TermCursor::new(
@@ -1832,7 +1842,7 @@ impl FtsReader {
                                 None,
                                 1,
                                 false,
-                                true,
+                                CursorUse::Count,
                             )?;
                             while !cursor.is_exhausted() {
                                 for &doc in &cursor.block_doc_ids[cursor.pos..cursor.block_n] {
@@ -1893,7 +1903,7 @@ impl FtsReader {
         let region = bytes.as_ref();
         let width = self.doc_length_bytes;
         if region.len() < n * width {
-            return Err(FtsError::Read(ReadError::MalformedVersion(
+            return Err(FtsError::Read(ReadError::Malformed(
                 "doc-lengths region shorter than n_docs entries".into(),
             )));
         }
@@ -2315,7 +2325,7 @@ pub(super) fn read_doc_length(region: &[u8], d: usize, width: usize) -> u32 {
 pub(super) fn header_postings_length(header: &[u8]) -> Result<usize, FtsError> {
     let field_end = term_meta::POSTINGS_LENGTH_OFF + U32_BYTES;
     if header.len() < field_end {
-        return Err(FtsError::Read(ReadError::MalformedVersion(
+        return Err(FtsError::Read(ReadError::Malformed(
             "term metadata header shorter than its postings_length field".into(),
         )));
     }
@@ -2792,7 +2802,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                FtsError::Read(ReadError::MalformedVersion(_))
+                FtsError::Read(ReadError::Malformed(_))
                     | FtsError::Read(ReadError::ChecksumMismatch { .. })
             ),
             "expected the moved boundary to be refused, got {err:?}"
@@ -2806,7 +2816,7 @@ mod tests {
             .copy_from_slice(&u32::MAX.to_le_bytes());
         let err = FtsReader::open(Bytes::from(huge_docs), json).expect_err("impossible map");
         assert!(
-            matches!(err, FtsError::Read(ReadError::MalformedVersion(_))),
+            matches!(err, FtsError::Read(ReadError::Malformed(_))),
             "expected a malformed-header failure, got {err:?}"
         );
     }
@@ -3728,10 +3738,7 @@ mod tests {
         // Header says n_columns=1; pass a 2-column JSON.
         let bad_json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower"}]"#;
         let err = FtsReader::open(blob, bad_json).expect_err("expected error");
-        assert!(matches!(
-            err,
-            FtsError::Read(ReadError::MalformedVersion(_))
-        ));
+        assert!(matches!(err, FtsError::Read(ReadError::Malformed(_))));
     }
 
     #[test]
@@ -4234,8 +4241,8 @@ mod tests {
     #[tokio::test]
     async fn open_lazy_round_trips_a_search() {
         // Wrap the eager blob in a whole-blob lazy source so the lazy
-        // open path (header + FST + doc-length tail prefetch) runs and
-        // serves a real query.
+        // open path (header and length directory, everything else on
+        // first use) runs and serves a real query.
         let (blob, json) = build_blob();
         let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob));
         let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
@@ -4437,27 +4444,177 @@ mod tests {
         }
     }
 
-    /// A length-array read that fails in the synchronous fallback scores
-    /// that call against the empty table and leaves the column's cell
-    /// empty, so the next read fills it: the failure is not what every
-    /// later query on the reader scores against.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_failed_fallback_read_of_the_norms_is_not_cached() {
+    /// A lazy reader over the test blob whose next read of the length array
+    /// fails once, armed after the open so that read is the first after it;
+    /// with the eager reader's length totals for `body`, the real ones.
+    async fn lazy_reader_failing_once_on_the_length_array() -> (FtsReader, Option<ColumnLengthStats>)
+    {
         let (blob, json) = build_blob();
         let eager = FtsReader::open(blob.clone(), &json).expect("eager open");
-        let lengths = eager.columns[0].doc_lengths_range.clone();
+        let real = eager.column_length_stats("body").expect("eager lengths");
         let source = Arc::new(FailingOnceSource {
             inner: BytesLazyByteSource::new(blob),
-            region: lengths,
+            region: eager.columns[0].doc_lengths_range.clone(),
             armed: AtomicBool::new(false),
         });
         let src: Arc<dyn LazyByteSource> = source.clone();
         let reader = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
             .await
             .expect("open_lazy");
-        // Armed after the open, so the first read of the array is the
-        // fallback's.
         source.armed.store(true, Ordering::SeqCst);
+        (reader, real)
+    }
+
+    /// The commit path records a column's length totals on the manifest, so a
+    /// length array that cannot be read is an error there, never a column with
+    /// no tokens; and like the scoring fallback, it is not cached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_length_array_is_an_error_not_empty_length_stats() {
+        let (reader, real) = lazy_reader_failing_once_on_the_length_array().await;
+        let err = reader
+            .column_length_stats("body")
+            .expect_err("an unreadable length array must not count as empty");
+        assert!(
+            matches!(
+                err,
+                FtsError::RangeFetch {
+                    what: "fts/doc_lengths_array",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            !reader.columns[0].norms_loaded(),
+            "the failure is not cached"
+        );
+        assert_eq!(
+            reader.column_length_stats("body").expect("the next read"),
+            real,
+            "the next read gets the real totals"
+        );
+    }
+
+    /// An unranked match (the matching rows, or their count, under OR or AND)
+    /// never scores, so it must not read the length array, even on a file
+    /// older than V6, whose bound scale is computed from the norms that array
+    /// holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unranked_match_never_reads_the_length_array() {
+        let (blob, json) = versioned_blob(BlobEra::V2ToV4);
+        let terms = ["common", "shared"];
+        let eager = FtsReader::open(blob.clone(), json).expect("eager open");
+        let source = Arc::new(FailingOnceSource {
+            inner: BytesLazyByteSource::new(blob),
+            region: eager.columns[0].doc_lengths_range.clone(),
+            armed: AtomicBool::new(false),
+        });
+        let src: Arc<dyn LazyByteSource> = source.clone();
+        let reader = FtsReader::open_lazy(src, json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        source.armed.store(true, Ordering::SeqCst);
+
+        for mode in [BoolMode::Or, BoolMode::And] {
+            let (want, _) = eager
+                .token_match("body", &terms, mode)
+                .await
+                .expect("eager");
+            let (got, _) = reader
+                .token_match("body", &terms, mode)
+                .await
+                .expect("match");
+            assert_eq!(got, want, "{mode:?} rows");
+            let (want, _) = eager
+                .token_match_count("body", &terms, mode)
+                .await
+                .expect("eager count");
+            let (got, _) = reader
+                .token_match_count("body", &terms, mode)
+                .await
+                .expect("count");
+            assert_eq!(got, want, "{mode:?} count");
+        }
+        assert!(
+            source.armed.load(Ordering::SeqCst),
+            "an unranked match must not read the length array"
+        );
+        assert!(!reader.columns[0].norms_loaded());
+    }
+
+    /// An unranked phrase or boolean match (the rows, or their count with a
+    /// negation) never scores, so it must not read the length array: on a
+    /// cold reader that read is a GET for nothing, and a failure there would
+    /// fail a match that needs no norms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unranked_phrase_or_boolean_match_never_reads_the_length_array() {
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), true).expect("register");
+        for doc in 0..64u32 {
+            let text = match doc % 4 {
+                0 => "the quick brown fox jumps",
+                1 => "a quick red fox",
+                2 => "brown dogs and a quick fox",
+                _ => "slow brown turtle",
+            };
+            b.add_doc(0, doc, text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        let eager = FtsReader::open(blob.clone(), json).expect("eager open");
+        let source = Arc::new(FailingOnceSource {
+            inner: BytesLazyByteSource::new(blob),
+            region: eager.columns[0].doc_lengths_range.clone(),
+            armed: AtomicBool::new(false),
+        });
+        let src: Arc<dyn LazyByteSource> = source.clone();
+        let reader = FtsReader::open_lazy(src, json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        source.armed.store(true, Ordering::SeqCst);
+
+        let quick_fox = vec![Phrase::adjacent(vec![
+            "quick".to_string(),
+            "fox".to_string(),
+        ])];
+        let slow_brown = vec![Phrase::adjacent(vec![
+            "slow".to_string(),
+            "brown".to_string(),
+        ])];
+        for mode in [BoolMode::Or, BoolMode::And] {
+            let (want, _) = eager
+                .atoms_match_ids("body", &["brown"], &quick_fox, mode)
+                .await
+                .expect("eager ids");
+            let (got, _) = reader
+                .atoms_match_ids("body", &["brown"], &quick_fox, mode)
+                .await
+                .expect("ids");
+            assert_eq!(got, want, "{mode:?} rows");
+            let (want, _) = eager
+                .atoms_match_count("body", &["brown"], &quick_fox, mode, &["dogs"], &slow_brown)
+                .await
+                .expect("eager count");
+            let (got, _) = reader
+                .atoms_match_count("body", &["brown"], &quick_fox, mode, &["dogs"], &slow_brown)
+                .await
+                .expect("count");
+            assert_eq!(got, want, "{mode:?} count");
+        }
+        assert!(
+            source.armed.load(Ordering::SeqCst),
+            "an unranked phrase or boolean match must not read the length array"
+        );
+        assert!(!reader.columns[0].norms_loaded());
+    }
+
+    /// A length-array read that fails in the synchronous fallback scores
+    /// that call against the empty table and leaves the column's cell
+    /// empty, so the next read fills it: the failure is not what every
+    /// later query on the reader scores against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_fallback_read_of_the_norms_is_not_cached() {
+        let (reader, _) = lazy_reader_failing_once_on_the_length_array().await;
         let column = &reader.columns[0];
 
         // The fallback survives the failure without publishing it.

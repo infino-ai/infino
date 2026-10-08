@@ -12,6 +12,7 @@ use std::str::from_utf8;
 use super::cursor::{SubindexKind, TermCursor, TermMeta};
 use super::{
     core::*,
+    cursor::CursorUse,
     filter::AtomExcludeFilter,
     options::BoolMode,
     phrase::AnyCursor,
@@ -160,9 +161,10 @@ impl FtsReader {
         mode: BoolMode,
     ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        // Unranked: idf is irrelevant to the match set, so build local.
+        // Unranked: built to match, so no global idf and no norms; the
+        // column's length array is never read.
         let (built, dict_ranges) = self
-            .build_atom_cursors(column_id, terms, phrases, None, None)
+            .build_atom_cursors(column_id, terms, phrases, None, None, CursorUse::Match)
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
         let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
@@ -194,9 +196,10 @@ impl FtsReader {
         neg_phrases: &[Phrase<String>],
     ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        // Unranked: idf is irrelevant to the match set, so build local.
+        // Unranked: built to match, so no global idf and no norms; the
+        // column's length array is never read.
         let (built, dict_ranges) = self
-            .build_atom_cursors(column_id, terms, phrases, None, None)
+            .build_atom_cursors(column_id, terms, phrases, None, None, CursorUse::Match)
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
         let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
@@ -213,7 +216,14 @@ impl FtsReader {
         let mut filter = None;
         if !neg_terms.is_empty() || !neg_phrases.is_empty() {
             let (neg_built, neg_dict_ranges) = self
-                .build_atom_cursors(column_id, neg_terms, neg_phrases, None, None)
+                .build_atom_cursors(
+                    column_id,
+                    neg_terms,
+                    neg_phrases,
+                    None,
+                    None,
+                    CursorUse::Match,
+                )
                 .await?;
             let neg_atoms: Vec<AnyCursor> = neg_built.into_iter().flatten().collect();
             // Count the negated clause's posting work the same way the
@@ -286,7 +296,7 @@ impl FtsReader {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true, None, prefetched)
+            .build_term_cursors(column_id, tokens, None, CursorUse::Count, None, prefetched)
             .await?;
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
@@ -301,7 +311,7 @@ impl FtsReader {
                 if cursors.len() != tokens.len() {
                     return Vec::new();
                 }
-                self.collect_and_intersect(column_id, cursors)
+                self.collect_and_intersect(cursors)
             }
             BoolMode::Or => or_merge_unranked(cursors)
                 .into_iter()
@@ -342,7 +352,7 @@ impl FtsReader {
             return Ok((0, MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true, None, prefetched)
+            .build_term_cursors(column_id, tokens, None, CursorUse::Count, None, prefetched)
             .await?;
         let mut work = MatchWork::for_cursors(&cursors);
         work.planned_ranges += dictionary_fetches(tokens, prefetched);
@@ -351,7 +361,7 @@ impl FtsReader {
                 if cursors.len() != tokens.len() {
                     return 0;
                 }
-                self.count_and_intersect(column_id, cursors)
+                self.count_and_intersect(cursors)
             }
             BoolMode::Or => or_count_unranked(cursors),
         });
@@ -405,7 +415,15 @@ impl FtsReader {
             .map(|token| dict.lookup(&make_key(&col_meta.name, token)))
             .collect();
         let cursors = self
-            .build_term_cursors_opt(column_id, tokens, None, false, None, None, Some(fst_bytes))
+            .build_term_cursors_opt(
+                column_id,
+                tokens,
+                None,
+                CursorUse::Score,
+                None,
+                None,
+                Some(fst_bytes),
+            )
             .await?;
         Ok(entries
             .into_iter()
@@ -487,7 +505,7 @@ impl FtsReader {
                 .iter()
                 .map(|&i| from_utf8(&out[i].0))
                 .collect::<Result<Vec<&str>, _>>()
-                .map_err(|_| FtsError::Read(ReadError::MalformedVersion("non-utf8 term".into())))?;
+                .map_err(|_| FtsError::Read(ReadError::Malformed("non-utf8 term".into())))?;
             self.term_index_facts_with(fst_bytes, column, &terms)
                 .await?
         };
@@ -587,7 +605,7 @@ impl FtsReader {
             let (decoded, decode_ns) = timed_section(|| {
                 for (fetched_idx, &(slot, short)) in pfor_slots.iter().enumerate() {
                     let header = fetched.get(fetched_idx).ok_or_else(|| {
-                        FtsError::Read(ReadError::MalformedVersion(
+                        FtsError::Read(ReadError::Malformed(
                             "term_dfs: fetched fewer headers than requested".into(),
                         ))
                     })?;
@@ -595,14 +613,14 @@ impl FtsReader {
                     let header_bytes = header.as_ref();
                     if short {
                         dfs[slot] = u64::from(short_df(header_bytes).ok_or_else(|| {
-                            FtsError::Read(ReadError::MalformedVersion(
-                                "term_dfs: malformed short-form term body".into(),
+                            FtsError::Read(ReadError::Malformed(
+                                "term_dfs: short-form term body does not decode".into(),
                             ))
                         })?);
                         continue;
                     }
                     if header_bytes.len() < U32_BYTES {
-                        return Err(FtsError::Read(ReadError::MalformedVersion(
+                        return Err(FtsError::Read(ReadError::Malformed(
                             "term_dfs: short postings header".into(),
                         )));
                     }
@@ -671,8 +689,8 @@ impl FtsReader {
         let bytes = fetched.pop().expect("one fetched range for one PFOR term");
         if short {
             let df = short_df(bytes.as_ref()).ok_or_else(|| {
-                FtsError::Read(ReadError::MalformedVersion(
-                    "term_layout: malformed short-form term body".into(),
+                FtsError::Read(ReadError::Malformed(
+                    "term_layout: short-form term body does not decode".into(),
                 ))
             })?;
             return Ok(Some(TermLayout {
@@ -697,7 +715,7 @@ impl FtsReader {
             None,
             1,
             postings_length_hint.is_none(),
-            true,
+            CursorUse::Count,
         )?;
         let mut layout = TermLayout {
             df: meta.df,
@@ -711,7 +729,7 @@ impl FtsReader {
                 ENCODING_PATCHED => layout.patched_blocks += 1,
                 ENCODING_BITSET => layout.bitset_blocks += 1,
                 other => {
-                    return Err(FtsError::Read(ReadError::MalformedVersion(format!(
+                    return Err(FtsError::Read(ReadError::Malformed(format!(
                         "term_layout: block {b} carries unknown encoding {other}"
                     ))));
                 }
@@ -1015,7 +1033,7 @@ mod tests {
         // Prove `mix` really has both encodings — else the test silently checks
         // nothing about the transition.
         let cursors = r
-            .build_term_cursors(0, &["mix"], None, true, None, None)
+            .build_term_cursors(0, &["mix"], None, CursorUse::Count, None, None)
             .await
             .expect("build cursors");
         let mix = &cursors[0];

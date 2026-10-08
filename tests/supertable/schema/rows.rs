@@ -1,0 +1,482 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+//! Rows as JSON documents: the mapper gives each path one type under the
+//! number rule, the caps refuse a
+//! document whole, and every refusal names the schema write that lets the
+//! same rows in.
+
+use std::{fs, path::Path, sync::Arc};
+
+use arrow_array::{Array, Float64Array, Int64Array, LargeStringArray, ListArray};
+use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{col, lit};
+use infino::{
+    Connection, FieldPatch, IndexSpec, InfinoError, SchemaError, SchemaPatch, connect,
+    serde_json::{self, Value, json},
+};
+use tempfile::TempDir;
+
+const TABLE: &str = "docs";
+/// Where the shared corpus and its frozen schema document live; the Python
+/// and Node suites read the same files.
+const FIXTURES: &str = "tests/fixtures/dynamic";
+/// Set to rewrite the frozen schema document from this engine's output.
+const UPDATE_FIXTURES: &str = "INFINO_UPDATE_FIXTURES";
+
+fn title_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new(
+        "title",
+        DataType::LargeUtf8,
+        false,
+    )]))
+}
+
+fn corpus() -> Vec<Value> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(FIXTURES)
+        .join("rows.jsonl");
+    fs::read_to_string(&path)
+        .expect("corpus")
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("a JSON document per line"))
+        .collect()
+}
+
+/// `column`'s values as strings in id order, `null` for nulls.
+fn column(db: &Connection, column: &str) -> Vec<String> {
+    let batches = db
+        .query_sql(&format!("SELECT \"{column}\" FROM {TABLE} ORDER BY _id"))
+        .expect("query");
+    let mut out = Vec::new();
+    for b in &batches {
+        let array = b.column(0);
+        for row in 0..b.num_rows() {
+            if array.is_null(row) {
+                out.push("null".to_string());
+            } else if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+                out.push(a.value(row).to_string());
+            } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+                out.push(a.value(row).to_string());
+            } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+                out.push(a.value(row).to_string());
+            } else {
+                out.push(format!("{:?}", array.slice(row, 1)));
+            }
+        }
+    }
+    out
+}
+
+fn schema_error(result: Result<(), InfinoError>, expected: &str) {
+    match result {
+        Err(InfinoError::Schema(e)) if e.to_string().contains(expected) => {}
+        other => panic!("expected a schema error mentioning {expected:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn documents_grow_the_schema_and_read_back() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
+        .expect("create");
+    docs.append_rows(&corpus()).expect("append rows");
+
+    let doc = db.schema(TABLE).expect("schema");
+    let names: Vec<&str> = doc.fields().iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "title",
+            "author.age",
+            "author.name",
+            "published",
+            "score",
+            "tags",
+            "views",
+            "meta.attempt",
+            "meta.source",
+            "author.handles",
+            "ratings",
+            "comments.stars",
+            "comments.user",
+        ],
+        "paths join as documents introduce them, sorted within a document; `notes` and `empty` add nothing"
+    );
+    let typed = |name: &str| {
+        doc.fields()
+            .iter()
+            .find(|f| f.name == name)
+            .expect(name)
+            .data_type
+            .clone()
+    };
+    assert_eq!(typed("views"), DataType::Int64);
+    assert_eq!(
+        typed("score"),
+        DataType::Float64,
+        "4.5 then 3: a number path is a float"
+    );
+    assert_eq!(typed("published"), DataType::Boolean);
+    assert!(
+        matches!(typed("tags"), DataType::List(item) if item.data_type() == &DataType::LargeUtf8)
+    );
+    assert!(
+        matches!(typed("ratings"), DataType::List(item) if item.data_type() == &DataType::Float64)
+    );
+    assert!(
+        matches!(typed("comments.stars"), DataType::List(item) if item.data_type() == &DataType::Int64)
+    );
+
+    assert_eq!(column(&db, "views"), vec!["10", "25", "null", "7"]);
+    assert_eq!(column(&db, "score"), vec!["4.5", "null", "3", "null"]);
+    assert_eq!(column(&db, "author.name"), vec!["ann", "bob", "cy", "null"]);
+    let hits = docs
+        .bm25_search("title", "post", 10, Default::default(), None)
+        .expect("search");
+    assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+}
+
+#[test]
+fn an_array_of_objects_lines_its_leaves_up_by_element() {
+    // Three comments, the middle one unrated. Every leaf of the array is as
+    // long as the array, so one position names one comment in all of them —
+    // a rating cannot slide onto the wrong author.
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new())
+        .expect("create");
+    docs.append_rows(&[json!({
+        "title": "a",
+        "comments": [
+            {"user": "ann", "stars": 5},
+            {"user": "bob"},
+            {"user": "cy", "stars": 3}
+        ]
+    })])
+    .expect("append rows");
+
+    let batches = db
+        .query_sql(&format!(
+            "SELECT \"comments.user\", \"comments.stars\" FROM {TABLE}"
+        ))
+        .expect("query");
+    let batch = batches.first().expect("one batch");
+    let users = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("a list of users")
+        .value(0);
+    let users = users
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .expect("strings");
+    let stars = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("a list of ratings")
+        .value(0);
+    let stars = stars.as_any().downcast_ref::<Int64Array>().expect("ints");
+
+    assert_eq!(stars.len(), users.len(), "one position per comment");
+    assert_eq!(users.value(1), "bob");
+    assert!(stars.is_null(1), "bob left no rating, in bob's place");
+    assert_eq!(stars.value(2), 3, "cy's rating stays with cy");
+}
+
+#[test]
+fn the_frozen_document_matches_the_shared_fixture() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
+        .expect("create");
+    docs.append_rows(&corpus()).expect("append rows");
+    let canonical = db.schema(TABLE).expect("schema").to_json().to_string();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(FIXTURES)
+        .join("schema.json");
+    if std::env::var_os(UPDATE_FIXTURES).is_some() {
+        fs::write(&path, format!("{canonical}\n")).expect("write fixture");
+    }
+    let frozen = fs::read_to_string(&path).expect("frozen schema document");
+    assert_eq!(
+        canonical,
+        frozen.trim(),
+        "the document this engine freezes for the corpus; rerun with {UPDATE_FIXTURES}=1 to refreeze"
+    );
+}
+
+#[test]
+fn every_refusal_names_the_schema_write_that_admits_the_rows() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new())
+        .expect("create");
+    docs.append_rows(&[json!({"title": "a", "n": 1})])
+        .expect("n is Int64 from here");
+
+    // A fraction, `5.0` and a string are all refused on an Int64 path, and
+    // a retype to Float64 admits the numbers.
+    schema_error(
+        docs.append_rows(&[json!({"title": "b", "n": 1.5})]),
+        "Int64",
+    );
+    schema_error(
+        docs.append_rows(&[json!({"title": "b", "n": 5.0})]),
+        "Int64",
+    );
+    schema_error(
+        docs.append_rows(&[json!({"title": "b", "n": "42"})]),
+        "Int64",
+    );
+    db.apply_schema(
+        TABLE,
+        &SchemaPatch::new(vec![FieldPatch::named("n").with_type(DataType::Float64)]),
+        None,
+    )
+    .expect("retype");
+    docs.append_rows(&[
+        json!({"title": "b", "n": 1.5}),
+        json!({"title": "c", "n": 5}),
+    ])
+    .expect("floats and integral literals fit a Float64 column");
+    assert_eq!(column(&db, "n"), vec!["1", "1.5", "5"]);
+
+    // A mixed array is refused outright.
+    schema_error(
+        docs.append_rows(&[json!({"title": "d", "x": [1, "a"]})]),
+        "more than one type",
+    );
+
+    // Caps refuse the document whole, and raising the cap admits it.
+    let caps = |max_fields: Option<u32>, max_depth: Option<u32>| {
+        let mut patch = SchemaPatch::new(vec![]);
+        patch.max_fields = max_fields;
+        patch.max_depth = max_depth;
+        patch
+    };
+    db.apply_schema(TABLE, &caps(Some(3), None), None)
+        .expect("cap");
+    schema_error(
+        docs.append_rows(&[json!({"title": "e", "p": 1, "q": 2})]),
+        "over its cap",
+    );
+    assert_eq!(
+        db.schema(TABLE).expect("schema").fields().len(),
+        2,
+        "nothing was added"
+    );
+    db.apply_schema(TABLE, &caps(Some(10), None), None)
+        .expect("raise");
+    docs.append_rows(&[json!({"title": "e", "p": 1, "q": 2})])
+        .expect("within the cap");
+
+    db.apply_schema(TABLE, &caps(None, Some(2)), None)
+        .expect("depth");
+    schema_error(
+        docs.append_rows(&[json!({"title": "f", "a": {"b": {"c": 1}}})]),
+        "nests deeper",
+    );
+    db.apply_schema(TABLE, &caps(None, Some(3)), None)
+        .expect("deeper");
+    docs.append_rows(&[json!({"title": "f", "a": {"b": {"c": 1}}})])
+        .expect("within the depth");
+    assert!(db.schema(TABLE).expect("schema").id_of("a.b.c").is_some());
+}
+
+#[test]
+fn update_rows_obey_the_same_rules() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf8")).expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
+        .expect("create");
+    docs.append_rows(&[json!({"title": "a", "n": 1}), json!({"title": "b", "n": 2})])
+        .expect("append");
+    let stats = docs
+        .update_rows(
+            col("title").eq(lit("a")),
+            &[json!({"title": "a", "note": "edited"})],
+        )
+        .expect("update with a new column");
+    assert_eq!(stats.matched(), 1);
+    // The replaced row lands as a new row, so it reads after `b`.
+    assert_eq!(column(&db, "note"), vec!["null", "edited"]);
+    assert_eq!(
+        column(&db, "n"),
+        vec!["2", "null"],
+        "replacement rows are whole rows"
+    );
+    let err = docs
+        .update_rows(
+            col("title").eq(lit("b")),
+            &[json!({"title": "b", "n": 2.5})],
+        )
+        .expect_err("a frozen type");
+    assert!(matches!(err, InfinoError::Schema(_)), "{err}");
+}
+
+/// A body where every row carries a different key is the worst case for the
+/// mapper: the field cap bounds how many columns it may discover, but the
+/// cells are the product of columns and rows, which the cap never sees. A
+/// dense cell per row per column made 2,000 small documents allocate four
+/// million cells to hold two thousand values. The cells are sparse, so the
+/// cost follows the values present, and the batch is still correct: one
+/// column per key, each with exactly one non-null row.
+#[test]
+fn a_body_of_distinct_keys_costs_its_values_not_rows_times_columns() {
+    const ROWS: usize = 2_000;
+
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new())
+        .expect("create");
+
+    let rows: Vec<Value> = (0..ROWS)
+        .map(|i| json!({ "title": "t", format!("k{i}"): i as i64 }))
+        .collect();
+    docs.append_rows(&rows).expect("append a sparse body");
+
+    let doc = db.schema(TABLE).expect("schema");
+    assert_eq!(
+        doc.fields().len(),
+        ROWS + 1,
+        "one column per key, plus title"
+    );
+
+    // Every key landed on its own row and nowhere else.
+    for probe in [0usize, ROWS / 2, ROWS - 1] {
+        let batches = db
+            .query_sql(&format!(
+                "SELECT COUNT(\"k{probe}\") AS present FROM {TABLE}"
+            ))
+            .expect("query");
+        let present: i64 = batches
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+            .map(|a| a.value(0))
+            .expect("a count");
+        assert_eq!(present, 1, "k{probe} is set on exactly one row");
+    }
+}
+
+/// The leaves of an array of objects line up one position per element, so
+/// that reading one position across them reads one element. A leaf that is
+/// itself an array wants several positions for one element: it used to be
+/// stored anyway, leaving `xs.a` two long and `xs.t` three long with no
+/// error, so position 1 held element 1's `a` beside element 0's second tag.
+/// The shape is refused instead.
+#[test]
+fn an_array_inside_an_array_of_objects_is_refused() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new())
+        .expect("create");
+
+    let err = docs
+        .append_rows(&[json!({
+            "title": "a",
+            "xs": [{"a": 1, "t": ["p", "q"]}, {"a": 2, "t": ["r"]}]
+        })])
+        .expect_err("a nested array has no single position per element");
+    assert!(
+        matches!(&err, InfinoError::Schema(SchemaError::NestedArray { path }) if path == "xs.t"),
+        "{err:?}"
+    );
+
+    // The scalar leaves of an array of objects still line up.
+    docs.append_rows(&[json!({
+        "title": "b",
+        "xs": [{"a": 1}, {"a": 2, "b": 3}]
+    })])
+    .expect("scalar leaves are positional");
+}
+
+/// A document fills a struct column the table declares. Documents flatten to
+/// dot paths, so `{"a": {"b": 1}}` against a declared `a: Struct{b}` used to
+/// put the value in a second column called `a.b`, which only a quoted name
+/// could read, while the natural `SELECT a.b` resolved to the struct's field
+/// and returned null: the value went where the caller was not looking. The
+/// flattening now stops at the struct and the object fills it, so the value
+/// is where `SELECT a.b` reads it and no shadow column exists.
+#[test]
+fn a_document_fills_a_struct_column_it_names() {
+    let db = connect("memory://").expect("connect");
+    let struct_type =
+        DataType::Struct(vec![Arc::new(Field::new("b", DataType::Int64, true))].into());
+    let docs = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, true),
+                Field::new("a", struct_type, true),
+            ])),
+            IndexSpec::new(),
+        )
+        .expect("create");
+
+    docs.append_rows(&[json!({"title": "x", "a": {"b": 1}})])
+        .expect("the document fills the struct it names");
+
+    // No shadow column was created, and the value reads back where the
+    // natural name resolves.
+    let doc = db.schema(TABLE).expect("schema");
+    let names: Vec<&str> = doc.fields().iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["title", "a"]);
+    // Unquoted, so SQL resolves it as the struct's field rather than a
+    // column whose name contains a dot — which is the read that used to
+    // return null while the value sat in the shadow column.
+    let batches = db
+        .query_sql(&format!("SELECT a.b FROM {TABLE}"))
+        .expect("query the struct field");
+    let field = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("b is Int64");
+    assert_eq!(field.value(0), 1);
+
+    // A key the struct does not declare is still refused: its fields are the
+    // table's, and storing the row without the key would lose the value.
+    let err = docs
+        .append_rows(&[json!({"title": "z", "a": {"c": 2}})])
+        .expect_err("`c` is not a field of the struct");
+    assert!(
+        matches!(
+            &err,
+            InfinoError::Schema(SchemaError::UnknownStructField { column, field })
+                if column == "a" && field == "c"
+        ),
+        "{err:?}"
+    );
+
+    // A scalar column is still not filled by an object: there is no shape to
+    // put one in, so the flattening and its refusal stand.
+    let flat = db
+        .create_table(
+            "flat",
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)])),
+            IndexSpec::new(),
+        )
+        .expect("create");
+    let err = flat
+        .append_rows(&[json!({"a": {"b": 1}})])
+        .expect_err("an object does not fill a scalar column");
+    assert!(
+        matches!(
+            &err,
+            InfinoError::Schema(SchemaError::PathShadowsColumn { path, column })
+                if path == "a.b" && column == "a"
+        ),
+        "{err:?}"
+    );
+
+    // A path that nests under nothing is still free to join.
+    docs.append_rows(&[json!({"title": "y", "meta": {"source": "s"}})])
+        .expect("a fresh nested path flattens as before");
+}
