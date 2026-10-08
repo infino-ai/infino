@@ -105,6 +105,7 @@ use crate::{
         fts::{
             analysis::{Stemmer, Stopwords, check_recorded_tokenizer},
             bm25,
+            tokenize::STANDARD_TOKENIZER,
         },
         vector::{builder::VectorConfig, distance::Metric},
     },
@@ -456,7 +457,10 @@ impl Connection {
                     schema_ipc: schema_to_ipc(&schema)
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns(),
-                    fts_analyzers: Vec::new(),
+                    fts_analyzers: vec![
+                        STANDARD_TOKENIZER.to_string();
+                        indexes.fts_columns().len()
+                    ],
                     fts_stopwords: indexes
                         .fts_stopwords()
                         .iter()
@@ -2389,7 +2393,7 @@ mod tests {
         .expect("write catalog");
     }
 
-    /// A new record names no base tokenizer, and a record that does is
+    /// A new record names `standard` per column, and a recorded name is
     /// checked on open: absent or `standard` opens, any other name refuses
     /// the table with the re-create instruction rather than querying it
     /// with `standard`.
@@ -2406,9 +2410,16 @@ mod tests {
 
         let mut written = None;
         edit_catalog_entry(dir.path(), |entry| {
-            written = Some(entry.contains_key("fts_analyzers"));
+            written = entry.get("fts_analyzers").cloned();
         });
-        assert_eq!(written, Some(false), "a new record names no analyzer");
+        assert_eq!(
+            written,
+            Some(json!(["standard", "standard"])),
+            "a new record names `standard` per column"
+        );
+        edit_catalog_entry(dir.path(), |entry| {
+            entry.remove("fts_analyzers");
+        });
         connect(&uri)
             .expect("reconnect")
             .open_table("docs")

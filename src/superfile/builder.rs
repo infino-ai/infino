@@ -105,6 +105,7 @@ use crate::{
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
             reorder::{ForwardIndex, bisect_order},
             sorted_merge::SortedInput,
+            tokenize::STANDARD_TOKENIZER,
         },
         id_space::{FtsDocId, RowId, StableId},
         ids,
@@ -3645,10 +3646,12 @@ fn adapted_batch(
 /// JSON per column.
 ///
 /// Output shape per column:
-/// `{"name":"<escaped>","field_id":<n>,"k1":<f>,"b":<f>}`.
+/// `{"name":"<escaped>","field_id":<n>,"tokenizer":"standard","k1":<f>,"b":<f>}`.
 /// `field_id` is the column's stable id, omitted when the builder's
-/// schema was never stamped; readers then resolve the column by name. The
-/// base tokenizer is always `standard` and is not recorded. A stopword set and a stemmer ride as
+/// schema was never stamped; readers then resolve the column by name.
+/// `tokenizer` is always `standard` today; recording it lets a future
+/// tokenizer be added without a format change. A stopword set and a
+/// stemmer ride as
 /// `"stopwords"` / `"stemmer"`, each emitted only when set; the reader
 /// reconstructs the column's tokenizer from them for query-time
 /// tokenization, and a missing filter field means the filter is off.
@@ -3676,6 +3679,9 @@ fn fts_columns_json(cols: &[FtsConfig], field_id_of: impl Fn(&str) -> Option<Fie
             s.push_str(r#","field_id":"#);
             s.push_str(&id.to_string());
         }
+        s.push_str(r#","tokenizer":""#);
+        s.push_str(STANDARD_TOKENIZER);
+        s.push('"');
         // Always emitted — see the function docs.
         s.push_str(r#","k1":"#);
         s.push_str(&fts_param_json(c.bm25.k1));
@@ -4368,8 +4374,8 @@ mod tests {
         assert!(s.starts_with('['));
         assert!(s.contains(r#""name":"title""#));
         assert!(s.contains(r#""name":"body""#));
-        // The base tokenizer is always `standard` and is not recorded.
-        assert!(!s.contains("tokenizer"));
+        // Every column records its base tokenizer.
+        assert_eq!(s.matches(r#""tokenizer":"standard""#).count(), cols.len());
         assert!(s.contains(r#""k1":1.2,"b":0.75"#));
         // Positionless columns emit no positions field at all.
         assert!(!s.contains("positions"));
@@ -4386,12 +4392,14 @@ mod tests {
         let s = fts_columns_json(&cols, |_| None);
         assert!(
             s.contains(
-                r#"{"name":"title","k1":1.2,"b":0.75,"positions":true,"analysis_revision":1}"#
+                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true,"analysis_revision":1}"#
             ),
             "positional column carries the flag: {s}"
         );
         assert!(
-            s.contains(r#"{"name":"body","k1":1.2,"b":0.75,"analysis_revision":1}"#),
+            s.contains(
+                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
+            ),
             "positionless column carries no positions key at all: {s}"
         );
     }
@@ -4408,12 +4416,14 @@ mod tests {
         ];
         let s = fts_columns_json(&cols, |_| None);
         assert!(
-            s.contains(r#"{"name":"title","k1":1.2,"b":0.75,"analysis_revision":1}"#),
+            s.contains(
+                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
+            ),
             "title records no filter: {s}"
         );
         assert!(
             s.contains(
-                r#"{"name":"body","k1":1.2,"b":0.75,"stopwords":"english","stemmer":"english","analysis_revision":1}"#
+                r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stopwords":"english","stemmer":"english","analysis_revision":1}"#
             ),
             "body records its filters: {s}"
         );
@@ -4429,11 +4439,13 @@ mod tests {
         ];
         let s = fts_columns_json(&cols, |_| None);
         assert!(
-            s.contains(r#"{"name":"title","k1":1.2,"b":0.75,"analysis_revision":1}"#),
+            s.contains(
+                r#"{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":1}"#
+            ),
             "stored column carries no stored key at all: {s}"
         );
         assert!(
-            s.contains(r#"{"name":"body","k1":1.2,"b":0.75,"stored":false,"analysis_revision":1}"#),
+            s.contains(r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stored":false,"analysis_revision":1}"#),
             "index-only column carries the flag: {s}"
         );
     }

@@ -579,6 +579,8 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
             bm25,
         } => {
             out.insert("kind".into(), Value::from("fts"));
+            // Recorded so a future tokenizer needs no format change.
+            out.insert("analyzer".into(), Value::from(STANDARD_TOKENIZER));
             if let Some(name) = stopwords.as_str() {
                 out.insert("stopwords".into(), Value::from(name));
             }

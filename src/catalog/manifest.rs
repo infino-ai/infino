@@ -53,10 +53,10 @@ pub(crate) struct TableEntry {
     pub(crate) schema_ipc: Vec<u8>,
     /// FTS-indexed column names.
     pub(crate) fts: Vec<String>,
-    /// Recorded FTS base tokenizer names, parallel to `fts`. A new table
-    /// records none, since the base is always `standard`; a recorded list
-    /// is written back unchanged on every catalog commit, so `open_table`
-    /// keeps refusing a table that names any analyzer other than `standard`.
+    /// FTS base tokenizer names, parallel to `fts`: `standard` for a new
+    /// table, recorded so a future tokenizer needs no format change;
+    /// missing reads as `standard`. Kept unchanged across
+    /// catalog commits, so a table naming another analyzer stays refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) fts_analyzers: Vec<String>,
     /// FTS stopword-set names, parallel to `fts`; an empty string

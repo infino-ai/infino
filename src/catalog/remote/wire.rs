@@ -22,7 +22,7 @@ use arrow_schema::Schema;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
-use crate::{IndexSpec, InfinoError, Metric};
+use crate::{IndexSpec, InfinoError, Metric, superfile::fts::tokenize::STANDARD_TOKENIZER};
 
 /// Content type for an Arrow IPC streaming body — the encoding for `append`
 /// bodies and read responses.
@@ -67,8 +67,7 @@ fn param_as_f64(v: f32) -> f64 {
 /// the stored score bounds, and a server that filled in its own default
 /// would build bounds the client never asked for.
 ///
-/// Every column is analyzed by `standard`, the only analyzer, so no
-/// `analyzer` key is sent and the server has none other to fill in. A
+/// Each entry names `analyzer: "standard"`, the only analyzer. A
 /// stopword set and a stemmer ride as their own `stopwords` / `stemmer`
 /// keys, each emitted only when set. A server that does not implement a named filter must reject the
 /// request rather than build a table analyzed differently than the
@@ -90,6 +89,7 @@ pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
                 |(((((column, stored), bm25), positions), stopwords), stemmer)| {
                     let mut entry = serde_json::Map::new();
                     entry.insert("column".to_string(), json!(column));
+                    entry.insert("analyzer".to_string(), json!(STANDARD_TOKENIZER));
                     entry.insert("k1".to_string(), json!(param_as_f64(bm25.k1)));
                     entry.insert("b".to_string(), json!(param_as_f64(bm25.b)));
                     if !stored {
@@ -218,7 +218,7 @@ mod tests {
         let json = index_spec_to_json(&spec);
         assert_eq!(
             json["fts"],
-            json!([{"column": "body", "k1": 1.2, "b": 0.75}])
+            json!([{"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75}])
         );
         assert_eq!(
             json["vector"][0],
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(
             index_spec_to_json(&spec)["fts"],
             json!([{
-                "column": "body",
+                "column": "body", "analyzer": "standard",
                 "k1": 1.2,
                 "b": 0.75,
                 "stopwords": "english",
@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(
             index_spec_to_json(&spec)["fts"],
             json!([{
-                "column": "body",
+                "column": "body", "analyzer": "standard",
                 "k1": 1.2, "b": 0.75, "stemmer": "english",
             }])
         );
@@ -263,7 +263,7 @@ mod tests {
         let spec = IndexSpec::new().fts("body");
         assert_eq!(
             index_spec_to_json(&spec)["fts"],
-            json!([{"column": "body", "k1": 1.2, "b": 0.75}])
+            json!([{"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75}])
         );
     }
 
@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(
             index_spec_to_json(&spec)["fts"],
             json!([
-                {"column": "body", "k1": 1.2, "b": 0.75, "stored": false}
+                {"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75, "stored": false}
             ])
         );
     }
@@ -292,8 +292,8 @@ mod tests {
         assert_eq!(
             index_spec_to_json(&spec)["fts"],
             json!([
-                {"column": "title", "k1": 1.6, "b": 0.4},
-                {"column": "body", "k1": 1.2, "b": 0.75}
+                {"column": "title", "analyzer": "standard", "k1": 1.6, "b": 0.4},
+                {"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75}
             ]),
             "the declared pair crosses per column, and a default column names the standard pair"
         );

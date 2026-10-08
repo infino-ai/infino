@@ -629,9 +629,8 @@ pub struct FtsColumnConfig {
     /// The column's stable id, when the writer stamped one.
     #[serde(default)]
     pub field_id: Option<u32>,
-    /// Recorded base tokenizer name, if any. Not written: the
-    /// base is always `standard`. Absent or `"standard"` opens; any other
-    /// name refuses the file (see `check_recorded_tokenizer`).
+    /// Base tokenizer name. Absent or `"standard"` opens; any other name
+    /// refuses the file (see `check_recorded_tokenizer`).
     #[serde(default)]
     pub tokenizer: Option<String>,
     /// Whether this column's index records token positions (phrase
