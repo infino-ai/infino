@@ -803,7 +803,6 @@ fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
                 FieldPatch::named("body")
                     .with_type(DataType::LargeUtf8)
                     .with_index(ColumnIndex::Fts {
-                        analyzer: "standard".into(),
                         stopwords: Stopwords::None,
                         stemmer: Stemmer::None,
                         positions: false,
@@ -834,7 +833,6 @@ fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
                 FieldPatch::named("title")
                     .with_id(id_of(&with_body, "title"))
                     .with_index(ColumnIndex::Fts {
-                        analyzer: "standard".into(),
                         stopwords: Stopwords::None,
                         stemmer: Stemmer::None,
                         positions: false,

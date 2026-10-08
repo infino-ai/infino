@@ -26,12 +26,9 @@ use std::{collections::HashSet, sync::Arc};
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
-    Bm25SearchOptions,
+    Bm25SearchOptions, Stemmer,
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::{
-        builder::FtsConfig,
-        fts::reader::{Bm25Stats, BoolMode},
-    },
+    superfile::{builder::FtsConfig, fts::reader::BoolMode},
     supertable::{
         SuperfileUri, Supertable, SupertableOptions,
         query::{
@@ -262,45 +259,32 @@ fn count_dedups_repeated_negatives_and_required_excluded() {
     );
 }
 
-/// BM25 with GLOBAL statistics gathers corpus-wide document frequencies
-/// across every superfile before scoring. Statistics change SCORES,
-/// never MEMBERSHIP: with `k` covering every match, the global-stats
-/// result holds the same number of rows as the per-superfile mode's hit
-/// set. The per-superfile arm is requested explicitly — `bm25_hits`
-/// scores with the crate default, which is `Global`, so relying on it
-/// here would compare global statistics against themselves and assert
-/// nothing.
+/// BM25 gathers corpus-wide document frequencies across every superfile
+/// before scoring. Statistics change SCORES, never MEMBERSHIP: with `k`
+/// covering every match, the ranked result holds exactly the unranked
+/// match set.
 #[test]
-fn bm25_global_stats_keeps_the_per_superfile_membership() {
+fn bm25_table_wide_stats_keep_the_match_set() {
     let st = demo_two_superfiles();
     let reader = st.reader().expect("reader");
-    let per_superfile_hits = reader
-        .bm25_hits(
-            "title",
-            "rust",
-            TOP_K,
-            Bm25SearchOptions::new()
-                .with_mode(BoolMode::Or)
-                .with_stats(Bm25Stats::PerSuperfile),
-        )
-        .expect("per-superfile bm25");
-    let global = reader
+    let matched = reader
+        .token_match("title", "rust", BoolMode::Or)
+        .expect("token_match");
+    let ranked = reader
         .bm25_search(
             "title",
             "rust",
             TOP_K,
-            Bm25SearchOptions::new()
-                .with_mode(BoolMode::Or)
-                .with_stats(Bm25Stats::Global),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
             None,
         )
-        .expect("global-stats bm25");
-    let global_rows: usize = global.iter().map(|b| b.num_rows()).sum();
-    assert!(!per_superfile_hits.is_empty(), "the corpus has rust docs");
+        .expect("bm25");
+    let ranked_rows: usize = ranked.iter().map(|b| b.num_rows()).sum();
+    assert!(!matched.is_empty(), "the corpus has rust docs");
     assert_eq!(
-        global_rows,
-        per_superfile_hits.len(),
-        "global statistics rescore the same match set"
+        ranked_rows,
+        matched.len(),
+        "table-wide statistics rescore the same match set"
     );
 }
 
@@ -449,25 +433,25 @@ fn filtered_knn_finds_sparse_matches_outside_the_probed_cells() {
     );
 }
 
-/// Notes text for [`two_analyzer_table`], parallel to [`SEG1_TITLES`].
-/// `café` appears in exactly two docs; the accent matters — under the
-/// `standard` analyzer it is a real term, under `ascii_lower` the token
-/// is dropped entirely.
+/// Notes text for [`title_notes_table`], parallel to [`SEG1_TITLES`].
+/// `café` appears in exactly two docs and in no title; so do the two
+/// inflections of `brew`, which the stemmed `notes` column indexes as one
+/// term.
 const NOTES: &[&str] = &[
-    "café menu",     // 0
-    "tea list",      // 1
-    "café hours",    // 2
-    "water only",    // 3
-    "juice board",   // 4
-    "espresso shot", // 5
-    "matcha bowl",   // 6
-    "cold brew",     // 7
+    "café menu",      // 0
+    "tea list",       // 1
+    "café hours",     // 2
+    "water only",     // 3
+    "juice board",    // 4
+    "espresso brews", // 5
+    "matcha bowl",    // 6
+    "cold brew",      // 7
 ];
 
-/// Schema `[title (ascii_lower FTS), notes (standard FTS), emb (vector)]`
-/// over [`SEG1_TITLES`] × [`NOTES`]: two FTS columns with DIFFERENT
-/// analyzers next to a vector column, one commit, one-hot embeddings.
-fn two_analyzer_table() -> Supertable {
+/// Schema `[title (FTS), notes (FTS, English stemmer), emb (vector)]`
+/// over [`SEG1_TITLES`] × [`NOTES`]: two FTS columns analyzed differently
+/// next to a vector column, one commit, one-hot embeddings.
+fn title_notes_table() -> Supertable {
     let writer_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(RAYON_POOL_THREADS)
@@ -484,7 +468,7 @@ fn two_analyzer_table() -> Supertable {
             schema.clone(),
             vec![
                 FtsConfig::new("title"),
-                FtsConfig::new("notes").analyzer("standard"),
+                FtsConfig::new("notes").stemmer(Stemmer::English),
             ],
             vec![default_vector_config("emb", VECTOR_ROT_SEED)],
         )
@@ -520,25 +504,19 @@ fn two_analyzer_table() -> Supertable {
     st
 }
 
-/// Regression: a `VectorFilter` predicate is tokenized with the FILTER
-/// COLUMN's analyzer, not any table-wide default. `café` is a real term
-/// only under the `standard` analyzer, so filtering on `notes`
-/// (standard) must return exactly the café rows, while the same
-/// predicate on `title` (ascii_lower, which drops non-ASCII tokens)
-/// must match nothing. The bug this pins: the predicate used to be
-/// tokenized with a single table-level tokenizer, so a filter on a
-/// standard-analyzer column silently tokenized to nothing and returned
-/// zero rows.
+/// A `VectorFilter` predicate matches against the filter column only:
+/// filtering on `notes` returns exactly the `café` rows, while the same
+/// predicate on `title`, which never holds `café`, matches nothing.
 #[test]
-fn vector_filter_tokenizes_with_the_filter_columns_analyzer() {
-    let st = two_analyzer_table();
+fn vector_filter_matches_against_the_filter_column() {
+    let st = title_notes_table();
     let reader = st.reader().expect("reader");
 
     // Ground truth from the engine's own per-column token match.
     let allowed = stable_ids(
         &reader
             .token_match("notes", "café", BoolMode::Or)
-            .expect("token_match on the standard column"),
+            .expect("token_match on notes"),
     );
     assert_eq!(allowed.len(), 2, "café appears in exactly two notes");
 
@@ -554,17 +532,15 @@ fn vector_filter_tokenizes_with_the_filter_columns_analyzer() {
                 mode: BoolMode::Or,
             }),
         )
-        .expect("filtered vector search on the standard column");
+        .expect("filtered vector search on notes");
     assert_eq!(
         stable_ids(&hits),
         allowed,
-        "the filter tokenized café with the notes column's standard \
-         analyzer and matched exactly its rows"
+        "the filter on notes matched exactly its café rows"
     );
 
-    // The same predicate against the ascii_lower column tokenizes to
-    // nothing (non-ASCII dropped) — per-column analysis, not a blanket
-    // standard default.
+    // The same predicate against `title` matches nothing: the filter
+    // reads its own column, not the table.
     let hits = reader
         .vector_hits(
             "emb",
@@ -577,11 +553,45 @@ fn vector_filter_tokenizes_with_the_filter_columns_analyzer() {
                 mode: BoolMode::Or,
             }),
         )
-        .expect("filtered vector search on the ascii column");
+        .expect("filtered vector search on title");
     assert!(
         hits.is_empty(),
-        "ascii_lower drops the non-ASCII token, so the predicate \
-         matches nothing on the title column"
+        "no title holds café, so the predicate matches nothing there"
+    );
+}
+
+/// A `VectorFilter` query is analyzed with its column's own chain:
+/// `brewing` reaches the stemmed `notes` rows indexed as `brew`, which an
+/// unstemmed analysis of the query would miss.
+#[test]
+fn vector_filter_analyzes_with_the_filter_columns_chain() {
+    let st = title_notes_table();
+    let reader = st.reader().expect("reader");
+
+    let allowed = stable_ids(
+        &reader
+            .token_match("notes", "brew", BoolMode::Or)
+            .expect("token_match on notes"),
+    );
+    assert_eq!(allowed.len(), 2, "two notes inflect brew");
+
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &one_hot(QUERY_DIM),
+            TOP_K,
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "notes",
+                query: "brewing",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search on notes");
+    assert_eq!(
+        stable_ids(&hits),
+        allowed,
+        "the filter stemmed brewing with the notes column's chain"
     );
 }
 

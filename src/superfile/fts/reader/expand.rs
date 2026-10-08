@@ -26,17 +26,13 @@ use crate::{
     superfile::{
         ReadError,
         error::FtsError,
-        format::fts::DictLayout,
         fts::{
             posting::BLOCK_LEN,
             tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER},
         },
         id_space::{DocMap, FtsDocId},
     },
-    utils::terms::{
-        make_key,
-        value::{FstValue, PFOR_LENGTH_UNKNOWN},
-    },
+    utils::terms::{make_key, value::DictEntry},
 };
 
 /// Long s (U+017F). Simple case folding puts it in `s`'s class;
@@ -62,11 +58,6 @@ pub(crate) const FOLD_PAIRS: &[(char, char)] = &[(LONG_S, 's'), (KELVIN_SIGN, 'k
 /// not). An `ILIKE` token holding it may be spelled with `ſ` in a
 /// matching row's term, so only a dictionary walk can find it.
 pub(crate) const LONG_S_ASCII: char = FOLD_PAIRS[0].1;
-
-/// Whether `c` is an ASCII letter with a non-ASCII fold partner.
-pub(crate) fn has_fold_partner(c: char) -> bool {
-    FOLD_PAIRS.iter().any(|&(_, ascii)| ascii == c)
-}
 
 /// Combining dot above (U+0307). `to_lowercase` turns `İ` (U+0130) into an
 /// `i` followed by this mark, so a term can hold an `i` its row spelled
@@ -287,10 +278,10 @@ struct Collected {
     /// Admitted terms' text, in lex order ([`Keep::Terms`]).
     terms: Vec<String>,
     /// Values of admitted terms whose rows match ([`Keep::Values`]).
-    proven: Vec<FstValue>,
+    proven: Vec<DictEntry>,
     /// Values of admitted terms whose rows may not match
     /// ([`Keep::Values`]).
-    doubtful: Vec<FstValue>,
+    doubtful: Vec<DictEntry>,
     too_many: bool,
 }
 
@@ -309,7 +300,7 @@ impl Collected {
     fn admit(
         &mut self,
         term: &str,
-        value: FstValue,
+        value: DictEntry,
         doubtful: bool,
         keep: Keep,
         max_terms: usize,
@@ -387,7 +378,7 @@ impl ValueCharge {
     fn cover(&mut self, values: usize) -> Result<(), FtsError> {
         while self.covered < values {
             self.held
-                .try_grow(VALUE_CHARGE_STEP * size_of::<FstValue>())
+                .try_grow(VALUE_CHARGE_STEP * size_of::<DictEntry>())
                 .map_err(|refusal| exact_over_budget("term values", refusal))?;
             self.covered += VALUE_CHARGE_STEP;
         }
@@ -400,36 +391,21 @@ impl ValueCharge {
 #[derive(Debug, Clone, Copy)]
 struct TermBody {
     metadata_offset: usize,
-    /// The body's length in bytes, when the dictionary slot could hold it.
-    length: Option<usize>,
+    /// The body's length in bytes.
+    length: usize,
     short: bool,
-}
-
-impl TermBody {
-    /// The bytes reserved for the body before it is fetched: its length,
-    /// or — when the slot could not hold it — the slot's limit, which such
-    /// a body is at least. Its wave's reservation grows to the bytes that
-    /// actually came once it is fetched.
-    fn budget_bytes(&self) -> usize {
-        self.length.unwrap_or(PFOR_LENGTH_UNKNOWN as usize)
-    }
 }
 
 /// How many of `bodies`, from the front, one fetch wave takes: bodies
 /// until their bytes would pass [`CONTAINS_FETCH_BATCH_BYTES`], and
-/// always at least one. A body whose length the slot could not hold is at
-/// least the slot's limit but could be any size past it, so it is fetched
-/// alone: several of them in one wave could pass the cap many times over.
+/// always at least one.
 fn wave_len(bodies: &[TermBody]) -> usize {
     let mut bytes = 0usize;
     bodies
         .iter()
-        .position(|body| match body.length {
-            None => true,
-            Some(length) => {
-                bytes += length;
-                bytes > CONTAINS_FETCH_BATCH_BYTES
-            }
+        .position(|body| {
+            bytes += body.length;
+            bytes > CONTAINS_FETCH_BATCH_BYTES
         })
         .map_or(bodies.len(), |past| past.max(1))
 }
@@ -456,17 +432,17 @@ impl FtsReader {
     /// is off (the caller judged that walk dearer than the scan it would
     /// replace). The caller falls back to scanning for that token.
     ///
-    /// An [`TermPattern::Exact`] token is its own expansion. A prefix
-    /// token walks only its own subtree. Every suffix or infix token is
-    /// tested against each key of one shared walk over the column's whole
-    /// range, so a multi-fragment `LIKE` pays for the vocabulary once, not
-    /// once per token. Under `fold` (`ILIKE`) terms are compared with `ſ`
-    /// and `K` folded to `s` and `k`, and an exact or prefix token holding
-    /// an `s` joins the shared walk (its `ſ` spelling sorts elsewhere).
-    /// The FST is fetched once when any pattern needs it (one planned
-    /// range, like a match's build).
+    /// An [`TermPattern::Exact`] token is its own expansion. A prefix token
+    /// walks only its own subtree. Every suffix or infix token is tested
+    /// against each key of one shared walk over the column's whole range, so a
+    /// multi-fragment `LIKE` pays for the vocabulary once, not once per token.
+    /// Under `fold` (`ILIKE`) terms are compared with `ſ` and `K` folded to `s`
+    /// and `k`, and an exact or prefix token holding an `s` joins the shared
+    /// walk (its `ſ` spelling sorts elsewhere). The term dictionary is fetched
+    /// once when any pattern needs it (one planned range, like a match's
+    /// build).
     ///
-    /// The FST fetch is I/O and stays on the calling runtime; the walk
+    /// The dictionary fetch is I/O and stays on the calling runtime; the walk
     /// itself is CPU — up to the column's whole vocabulary — and runs on
     /// `pool` (the configured reader pool, or rayon's global pool when
     /// `None`) behind a oneshot, so no tokio worker sits under it.
@@ -489,16 +465,14 @@ impl FtsReader {
             .iter()
             .any(|w| *w == Walk::Subtree || (*w == Walk::Full && allow_full_walk));
         let collected = if needs_dict {
-            let fst_bytes = self.dict_bytes_async().await?;
+            let dict_bytes = self.dict_bytes_async().await?;
             work.planned_ranges += 1;
             let column = column.to_owned();
             let owned: Vec<OwnedPattern> = patterns.iter().map(|p| p.into_owned()).collect();
             let walks = walks.clone();
-            let layout = self.dict_layout;
             run_on_pool(pool, "like expansion", move || {
                 walk_dictionary(
-                    &fst_bytes,
-                    layout,
+                    &dict_bytes,
                     &column,
                     &owned,
                     &walks,
@@ -527,12 +501,12 @@ impl FtsReader {
     }
 
     /// Every indexed term of `column` that begins with `term_prefix` (the
-    /// prefix as it appears in the FST — the caller lowercases it for the
-    /// column's analyzer), in lex order, without the column key prefix.
-    /// The prefix search's expansion. The FST fetch stays on the calling
+    /// prefix as it appears in the term dictionary — the caller lowercases it
+    /// for the column's analyzer), in lex order, without the column key prefix.
+    /// The prefix search's expansion. The dictionary fetch stays on the calling
     /// runtime; the subtree walk runs on `pool` behind a oneshot, like
-    /// [`Self::expand_terms`]. Empty when `column` is not FTS-indexed here
-    /// or no term matches.
+    /// [`Self::expand_terms`]. Empty when `column` is not FTS-indexed here or
+    /// no term matches.
     pub(crate) async fn terms_with_prefix(
         &self,
         column: &str,
@@ -542,12 +516,11 @@ impl FtsReader {
         if !self.has_column(column) {
             return Ok(Vec::new());
         }
-        let fst_bytes = self.dict_bytes_async().await?;
+        let dict_bytes = self.dict_bytes_async().await?;
         let column = column.to_owned();
         let term_prefix = term_prefix.to_vec();
-        let layout = self.dict_layout;
         run_on_pool(pool, "prefix expansion", move || {
-            collect_terms_with_prefix(&fst_bytes, layout, &column, &term_prefix)
+            collect_terms_with_prefix(&dict_bytes, &column, &term_prefix)
         })
         .await
         .map_err(|_| FtsError::TaskDropped("prefix expansion"))?
@@ -598,9 +571,8 @@ impl FtsReader {
         if needles.is_empty() {
             return Ok((Vec::new(), work));
         }
-        let fst_bytes = self.dict_bytes_async().await?;
+        let dict_bytes = self.dict_bytes_async().await?;
         work.planned_ranges += 1;
-        let layout = self.dict_layout;
         let owned_column = column.to_owned();
         let patterns: Vec<OwnedPattern> = needles
             .iter()
@@ -612,8 +584,7 @@ impl FtsReader {
         let (walked, walk_ns) = run_on_pool(pool, "contains walk", move || {
             timed_section(|| {
                 walk_dictionary(
-                    &fst_bytes,
-                    layout,
+                    &dict_bytes,
                     &owned_column,
                     &patterns,
                     &walks,
@@ -656,7 +627,7 @@ impl FtsReader {
     async fn union_rows(
         &self,
         col: &ColumnMeta,
-        values: Vec<FstValue>,
+        values: Vec<DictEntry>,
         pool: Option<&ThreadPool>,
         budget: Option<&Arc<ConnectionMemoryBudget>>,
         work: &mut MatchWork,
@@ -669,14 +640,14 @@ impl FtsReader {
         let mut bodies: Vec<TermBody> = Vec::new();
         for value in values {
             match value {
-                FstValue::Inline { doc_id, .. } => inline.push(doc_id),
-                FstValue::Pfor {
+                DictEntry::Inline { doc_id, .. } => inline.push(doc_id),
+                DictEntry::Pfor {
                     metadata_offset,
-                    postings_length_hint,
+                    postings_length,
                     short,
                 } => bodies.push(TermBody {
                     metadata_offset: metadata_offset as usize,
-                    length: postings_length_hint.map(|len| len as usize),
+                    length: postings_length as usize,
                     short,
                 }),
             }
@@ -689,49 +660,32 @@ impl FtsReader {
             let (wave, tail) = rest.split_at(wave_len(rest));
             rest = tail;
             // Released once this wave is unioned, before the next is fetched.
-            let mut held = reserve_exact(
+            let _held = reserve_exact(
                 budget,
-                wave.iter().map(TermBody::budget_bytes).sum(),
+                wave.iter().map(|body| body.length).sum(),
                 "postings",
             )?;
-            let refs: Vec<(usize, Option<usize>)> = wave
+            let refs: Vec<(usize, usize)> = wave
                 .iter()
                 .map(|body| (body.metadata_offset, body.length))
                 .collect();
             let fetched = self.fetch_term_postings(&refs).await?;
             let fetched_bytes: usize = fetched.iter().map(|b| b.len()).sum();
-            // A body of unknown length was reserved at its lower bound;
-            // charge what actually came before it is unioned.
-            if let Some(held) = held.as_mut() {
-                let short = fetched_bytes.saturating_sub(held.size());
-                held.try_grow(short)
-                    .map_err(|refusal| exact_over_budget("postings", refusal))?;
-            }
             work.postings_bytes += fetched_bytes as u64;
-            // One range per body, and one more for a header probed for a
-            // length the slot could not hold — as a match's build counts.
-            work.planned_ranges += wave
-                .iter()
-                .map(|body| 1 + u64::from(body.length.is_none()))
-                .sum::<u64>();
-            let forms: Vec<(bool, bool)> = wave
-                .iter()
-                .map(|body| (body.short, body.length.is_none()))
-                .collect();
+            // One range per body, as a match's build counts.
+            work.planned_ranges += wave.len() as u64;
+            let forms: Vec<bool> = wave.iter().map(|body| body.short).collect();
             let col = col.clone();
-            let stored = self.bounds;
             let (ored, ns) = run_on_pool(pool, "contains union", move || {
                 timed_section(|| {
                     let mut scratch = [0u32; BLOCK_LEN];
-                    for (bytes, (short, header_probed)) in fetched.into_iter().zip(forms) {
+                    for (bytes, short) in fetched.into_iter().zip(forms) {
                         let cursor = TermCursor::for_body(
                             bytes,
                             short,
                             &col,
-                            stored,
                             None,
                             UNWEIGHTED,
-                            header_probed,
                             CursorUse::Count,
                         )?;
                         // The bitset spans this blob's documents; a list
@@ -831,8 +785,7 @@ fn charge_admitted(
 /// with `FtsError::OverBudget`), and the charge comes back with the
 /// collectors for the caller to hold while it uses them.
 fn walk_dictionary(
-    fst_bytes: &[u8],
-    layout: DictLayout,
+    dict_bytes: &[u8],
     column: &str,
     patterns: &[OwnedPattern],
     walks: &[Walk],
@@ -842,7 +795,7 @@ fn walk_dictionary(
     keep: Keep,
     mut charge: Option<ValueCharge>,
 ) -> Result<(Vec<Collected>, Option<ValueCharge>), FtsError> {
-    let dict = FtsReader::open_dict_with(fst_bytes, layout)?;
+    let dict = FtsReader::open_dict(dict_bytes)?;
     let mut collected: Vec<Collected> = patterns.iter().map(|_| Collected::new()).collect();
     // Every key in the column's range starts with `<column>\x1F`; the
     // term is what follows. `for_each_prefix` only visits keys carrying
@@ -931,10 +884,14 @@ mod tests {
         },
         *,
     };
-    use crate::{superfile::fts::builder::BlobEra, utils::terms::DictBuilder};
+    use crate::utils::terms::TermDictBuilder;
 
     /// Generous cap so a test never trips the too-many fallback by accident.
     const MAX_TERMS: usize = 64;
+
+    /// A `body` column analyzed by `standard` plus the English stemmer.
+    const STEMMED_BODY_JSON: &str =
+        r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stemmer":"english"}]"#;
 
     fn expand_all(
         r: &FtsReader,
@@ -991,8 +948,8 @@ mod tests {
 
     #[test]
     fn several_patterns_expand_in_one_dictionary_pass() {
-        // Two open-left tokens, a prefix and an exact token: one FST fetch,
-        // each slot exactly what the single-pattern calls return.
+        // Two open-left tokens, a prefix and an exact token: one dictionary
+        // fetch, each slot exactly what the single-pattern calls return.
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let (out, work) = expand_all(
@@ -1015,15 +972,18 @@ mod tests {
                 owned(&["java"]),
             ]
         );
-        assert_eq!(work.planned_ranges, 1, "one FST fetch for the whole leaf");
+        assert_eq!(
+            work.planned_ranges, 1,
+            "one dictionary fetch for the whole leaf"
+        );
     }
 
     #[test]
     fn a_disallowed_full_walk_leaves_the_pattern_unanswered() {
         // The caller judged the whole-column walk dearer than the scan: the
         // suffix and infix tokens come back `None`, the prefix token still
-        // walks its subtree, the exact token is untouched, and the FST is
-        // still fetched once for the subtree walk.
+        // walks its subtree, the exact token is untouched, and the term
+        // dictionary is still fetched once for the subtree walk.
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let rt = Runtime::new().expect("runtime");
@@ -1159,7 +1119,7 @@ mod tests {
         // Too short to be a cut piece.
         assert!(!straddles_cut("xb", "xb", "bbc"));
         // One character past the cut length is not a piece either (a
-        // superfile built before the cut existed can hold such a term).
+        // dictionary may still hold such a term).
         let long = format!("{}b", "x".repeat(MAX_TOKEN_CHARS));
         assert!(!straddles_cut(&long, &long, "bbc"));
         // Counted in characters: 254 two-byte letters and a `b`.
@@ -1197,14 +1157,10 @@ mod tests {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let (_, walked) = expand_all(&r, &[TermPattern::Prefix("ru")], false, MAX_TERMS);
-        assert_eq!(walked.planned_ranges, 1, "one FST fetch per walk");
+        assert_eq!(walked.planned_ranges, 1, "one dictionary fetch per walk");
         let (_, exact) = expand_all(&r, &[TermPattern::Exact("rust")], false, MAX_TERMS);
         assert_eq!(exact.planned_ranges, 0, "no dictionary needed");
     }
-
-    /// Every blob era the builder writes: the kernel reads dictionary
-    /// values and posting bodies straight, so each layout must agree.
-    const ERAS: [BlobEra; 4] = [BlobEra::V7, BlobEra::V6, BlobEra::V5, BlobEra::V2ToV4];
 
     /// Rows of the contains fixture carrying the dense term, enough for
     /// several long-form posting blocks.
@@ -1288,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn contains_rows_brackets_arrows_ilike_on_every_era() {
+    fn contains_rows_brackets_arrows_ilike() {
         let docs = contains_docs();
         let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
         let planted = DENSE_ROWS as u32;
@@ -1301,47 +1257,39 @@ mod tests {
             planted + 5,
             planted + 6,
         );
-        for era in ERAS {
-            let (blob, json) = build_standard_blob_with(&refs, era, None);
-            let r = FtsReader::open(blob, &json).expect("open");
-            for needle in NEEDLES {
-                let (rows, work) = contains(&r, needle);
-                let oracle = arrow_ilike(&docs, needle);
-                assert_bracketed(&rows, &oracle, &format!("{needle} in {era:?}"));
-                assert!(work.planned_ranges >= 1, "the dictionary fetch is counted");
-            }
-            // The planted spellings land where the rule says.
-            let (bbc, _) = contains(&r, "bbc");
-            assert_eq!(
-                bbc.doubtful,
-                RoaringBitmap::from_iter([near_row, cut_row]),
-                "{era:?}: the cut match and the near miss beside a cut, nothing else"
-            );
-            assert!(arrow_ilike(&docs, "bbc").contains(cut_row));
-            assert!(!arrow_ilike(&docs, "bbc").contains(near_row));
-            let (xi, _) = contains(&r, "xi");
-            assert!(
-                xi.doubtful.contains(dotted_cut_row),
-                "{era:?}: `İ` at a cut"
-            );
-            assert!(!arrow_ilike(&docs, "xi").contains(dotted_cut_row));
-            let (taxi_rows, _) = contains(&r, "taxi");
-            assert!(taxi_rows.proven.contains(taxi), "{era:?}");
-            assert!(
-                taxi_rows.doubtful.contains(taxi_dotted),
-                "{era:?}: `İ` whole"
-            );
-            assert!(!arrow_ilike(&docs, "taxi").contains(taxi_dotted));
-            for needle in ["sun", "kelvin"] {
-                let (folded, _) = contains(&r, needle);
-                assert!(folded.proven.contains(fold_row), "{needle} in {era:?}");
-            }
-            // A needle no cut or dotted I can touch is decided outright.
-            for needle in ["common", "news", "zzq"] {
-                let (clean, _) = contains(&r, needle);
-                assert!(clean.doubtful.is_empty(), "{needle} in {era:?}");
-                assert_eq!(clean.proven, arrow_ilike(&docs, needle), "{needle}");
-            }
+        let (blob, json) = build_standard_blob(&refs);
+        let r = FtsReader::open(blob, &json).expect("open");
+        for needle in NEEDLES {
+            let (rows, work) = contains(&r, needle);
+            let oracle = arrow_ilike(&docs, needle);
+            assert_bracketed(&rows, &oracle, needle);
+            assert!(work.planned_ranges >= 1, "the dictionary fetch is counted");
+        }
+        // The planted spellings land where the rule says.
+        let (bbc, _) = contains(&r, "bbc");
+        assert_eq!(
+            bbc.doubtful,
+            RoaringBitmap::from_iter([near_row, cut_row]),
+            "the cut match and the near miss beside a cut, nothing else"
+        );
+        assert!(arrow_ilike(&docs, "bbc").contains(cut_row));
+        assert!(!arrow_ilike(&docs, "bbc").contains(near_row));
+        let (xi, _) = contains(&r, "xi");
+        assert!(xi.doubtful.contains(dotted_cut_row), "`İ` at a cut");
+        assert!(!arrow_ilike(&docs, "xi").contains(dotted_cut_row));
+        let (taxi_rows, _) = contains(&r, "taxi");
+        assert!(taxi_rows.proven.contains(taxi));
+        assert!(taxi_rows.doubtful.contains(taxi_dotted), "`İ` whole");
+        assert!(!arrow_ilike(&docs, "taxi").contains(taxi_dotted));
+        for needle in ["sun", "kelvin"] {
+            let (folded, _) = contains(&r, needle);
+            assert!(folded.proven.contains(fold_row), "{needle}");
+        }
+        // A needle no cut or dotted I can touch is decided outright.
+        for needle in ["common", "news", "zzq"] {
+            let (clean, _) = contains(&r, needle);
+            assert!(clean.doubtful.is_empty(), "{needle}");
+            assert_eq!(clean.proven, arrow_ilike(&docs, needle), "{needle}");
         }
     }
 
@@ -1354,7 +1302,7 @@ mod tests {
         let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
         let n = docs.len() as u32;
         let order: Vec<u32> = (0..n).rev().collect();
-        let (blob, json) = build_standard_blob_with(&refs, BlobEra::V7, Some(&order));
+        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
         let r = FtsReader::open(blob, &json).expect("open");
         assert!(r.has_doc_map(), "the fixture must reorder to mean anything");
         for needle in NEEDLES {
@@ -1397,12 +1345,12 @@ mod tests {
 
     #[test]
     fn contains_rows_refuses_a_column_indexed_by_another_analyzer() {
-        let (blob, json) = build_blob();
-        let r = FtsReader::open(blob, &json).expect("open");
+        let (blob, _) = build_blob();
+        let r = FtsReader::open(blob, STEMMED_BODY_JSON).expect("open");
         let rt = Runtime::new().expect("runtime");
         let err = rt
             .block_on(r.contains_rows("body", &["rust"], None, None))
-            .expect_err("ascii_lower column");
+            .expect_err("stemmed column");
         assert!(matches!(err, FtsError::ExactNeedsStandard { .. }), "{err}");
         let err = rt
             .block_on(r.contains_rows("nope", &["rust"], None, None))
@@ -1417,12 +1365,15 @@ mod tests {
     fn a_non_utf8_dictionary_key_fails_every_walk_rather_than_skip_its_rows() {
         // `body`'s terms: `rust`, and one that is `r` plus a byte no UTF-8
         // holds. Skipping the second could drop the rows it indexes.
-        let mut dict = DictBuilder::new();
-        dict.insert(&make_key("body", "rust"), FstValue::pack_inline(0, 1));
+        let mut dict = TermDictBuilder::new();
+        dict.insert(
+            &make_key("body", "rust"),
+            DictEntry::Inline { doc_id: 0, tf: 1 },
+        );
         let mut bad = make_key("body", "r");
         bad.push(NOT_UTF8_BYTE);
-        dict.insert(&bad, FstValue::pack_inline(1, 1));
-        let fst = dict.finish();
+        dict.insert(&bad, DictEntry::Inline { doc_id: 1, tf: 1 });
+        let dict_bytes = dict.finish();
         let walks = [
             // The LIKE expansion's shared walk and a prefix's subtree walk.
             (OwnedPattern::Contains("us".into()), Walk::Full, Keep::Terms),
@@ -1436,8 +1387,7 @@ mod tests {
         ];
         for (pattern, walk, keep) in walks {
             let err = walk_dictionary(
-                &fst,
-                DictLayout::Fst,
+                &dict_bytes,
                 "body",
                 &[pattern],
                 &[walk],
@@ -1458,7 +1408,7 @@ mod tests {
 
     #[test]
     fn a_value_charge_grows_a_step_ahead_and_refuses_past_the_budget() {
-        let step_bytes = VALUE_CHARGE_STEP * size_of::<FstValue>();
+        let step_bytes = VALUE_CHARGE_STEP * size_of::<DictEntry>();
         let measured = ConnectionMemoryBudget::measured();
         let mut charge = ValueCharge::new(&measured).expect("measured");
         charge.cover(1).expect("measured");
@@ -1487,11 +1437,10 @@ mod tests {
         let (blob, json) = build_standard_blob(&refs);
         let r = FtsReader::open(blob, &json).expect("open");
         let rt = Runtime::new().expect("runtime");
-        let fst = rt.block_on(r.dict_bytes_async()).expect("dictionary");
+        let dict_bytes = rt.block_on(r.dict_bytes_async()).expect("dictionary");
         let walk = |charge: Option<ValueCharge>| {
             walk_dictionary(
-                &fst,
-                r.dict_layout,
+                &dict_bytes,
                 "body",
                 &[OwnedPattern::Contains("common".into())],
                 &[Walk::Full],
@@ -1516,7 +1465,7 @@ mod tests {
         drop(charge);
         assert_eq!(measured.used_bytes(), 0);
         // Below one step, the first value admitted ends the walk.
-        let step_bytes = (VALUE_CHARGE_STEP * size_of::<FstValue>()) as u64;
+        let step_bytes = (VALUE_CHARGE_STEP * size_of::<DictEntry>()) as u64;
         let bounded = ConnectionMemoryBudget::with_limit(step_bytes);
         let err = walk(Some(ValueCharge::new(&bounded).expect("empty")))
             .err()
@@ -1561,28 +1510,21 @@ mod tests {
 
     #[test]
     fn a_fetch_wave_stops_at_the_byte_budget_and_always_takes_one_body() {
-        let body = |length: Option<usize>| TermBody {
+        let body = |length: usize| TermBody {
             metadata_offset: 0,
             length,
             short: false,
         };
         let half = CONTAINS_FETCH_BATCH_BYTES / 2;
-        let bodies = [body(Some(half)), body(Some(half)), body(Some(1))];
+        let bodies = [body(half), body(half), body(1)];
         assert_eq!(wave_len(&bodies), 2, "exactly the budget fits");
         assert_eq!(wave_len(&bodies[2..]), 1);
-        let oversized = [body(Some(CONTAINS_FETCH_BATCH_BYTES + 1)), body(Some(1))];
+        let oversized = [body(CONTAINS_FETCH_BATCH_BYTES + 1), body(1)];
         assert_eq!(
             wave_len(&oversized),
             1,
             "one body over the budget goes alone"
         );
-        // A body too long for its slot could be any size past its limit,
-        // so it goes alone, and a wave of known lengths stops before it.
-        let unknown = [body(None); 8];
-        assert_eq!(wave_len(&unknown), 1, "an unknown length goes alone");
-        let mixed = [body(Some(1)), body(Some(1)), body(None), body(Some(1))];
-        assert_eq!(wave_len(&mixed), 2, "known lengths stop before it");
-        assert_eq!(wave_len(&mixed[2..]), 1);
     }
 
     #[test]

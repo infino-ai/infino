@@ -35,7 +35,7 @@ use crate::{
         fts::{positions::TermRuns, reader::FtsReader},
         id_space::FtsDocId,
     },
-    utils::terms::FstValue,
+    utils::terms::DictEntry,
 };
 
 /// Terms each input cursor reads from its dictionary at a time.
@@ -123,7 +123,7 @@ pub(crate) fn merge_column<S: Send, T: Send>(
     };
     let mut batch = Batch::default();
     // The current term's inputs, gathered before it joins a batch.
-    let mut term_inputs: Vec<(usize, FstValue)> = Vec::new();
+    let mut term_inputs: Vec<(usize, DictEntry)> = Vec::new();
     while let Some(Reverse((term, first))) = heap.pop() {
         term_inputs.clear();
         let mut term_postings = 0u64;
@@ -194,7 +194,7 @@ struct Batch {
     terms: Vec<PendingTerm>,
     term_bytes: Vec<u8>,
     /// `(input, that input's dictionary value)` for every term's inputs.
-    inputs: Vec<(usize, FstValue)>,
+    inputs: Vec<(usize, DictEntry)>,
     postings: u64,
 }
 
@@ -307,7 +307,7 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
     fn merge_term<T>(
         &self,
         term: &[u8],
-        term_inputs: &[(usize, FstValue)],
+        term_inputs: &[(usize, DictEntry)],
         work: &mut TermWork,
         state: &mut S,
     ) -> Result<Option<T>, BuildError>
@@ -420,9 +420,9 @@ fn push_run_values(out: &mut Vec<u32>, positions: &[u32]) {
 struct TermChunks<'a> {
     fts: &'a FtsReader,
     /// The input's dictionary, fetched once rather than per chunk.
-    fst_bytes: Bytes,
+    dict_bytes: Bytes,
     column_id: u32,
-    chunk: vec::IntoIter<(Vec<u8>, FstValue)>,
+    chunk: vec::IntoIter<(Vec<u8>, DictEntry)>,
     /// Last term of the latest chunk; the next chunk starts after it.
     resume: Vec<u8>,
     started: bool,
@@ -433,7 +433,7 @@ impl<'a> TermChunks<'a> {
     fn new(fts: &'a FtsReader, column_id: u32) -> Result<Self, FtsError> {
         Ok(Self {
             fts,
-            fst_bytes: fts.dict_bytes()?,
+            dict_bytes: fts.dict_bytes()?,
             column_id,
             chunk: Vec::new().into_iter(),
             resume: Vec::new(),
@@ -442,7 +442,7 @@ impl<'a> TermChunks<'a> {
         })
     }
 
-    fn next(&mut self) -> Result<Option<(Vec<u8>, FstValue)>, FtsError> {
+    fn next(&mut self) -> Result<Option<(Vec<u8>, DictEntry)>, FtsError> {
         loop {
             if let Some(entry) = self.chunk.next() {
                 return Ok(Some(entry));
@@ -451,7 +451,7 @@ impl<'a> TermChunks<'a> {
                 return Ok(None);
             }
             let terms = self.fts.column_terms_from(
-                &self.fst_bytes,
+                &self.dict_bytes,
                 self.column_id,
                 &self.resume,
                 TERMS_PER_CHUNK,

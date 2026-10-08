@@ -1119,8 +1119,9 @@ pub struct FtsSummaryAgg {
     /// HyperLogLog-estimated distinct term count. `0` for the `Default`
     /// shape and currently for the part-level rollup (deferred).
     pub n_terms_distinct: u64,
-    /// `(min, max)` lex term range. `None` if the FST was empty for this
-    /// column (per-superfile) or every superfile's FST was empty (part).
+    /// `(min, max)` lex term range. `None` if the term dictionary was empty for
+    /// this column (per-superfile) or every superfile's term dictionary was
+    /// empty (part).
     pub term_range: Option<(Vec<u8>, Vec<u8>)>,
     /// This column's token total and count of documents carrying
     /// tokens. Unlike the rest of this struct these drive *scoring*,
@@ -1130,10 +1131,8 @@ pub struct FtsSummaryAgg {
     /// at, so a document scores the same way regardless of which
     /// superfile it happens to live in.
     ///
-    /// `None` on a summary written before the totals were recorded. The
-    /// table-wide fold is then unknown: a query weights terms with the
-    /// row count instead, and the next superfile averages over itself —
-    /// the old numbers, until a rewrite backfills the totals.
+    /// Every persisted per-superfile summary carries them; `None` means
+    /// unknown, and an unknown side makes any fold over it unknown.
     pub length_stats: Option<ColumnLengthStats>,
 }
 
@@ -1267,9 +1266,9 @@ impl FtsSummaryAgg {
 
     /// Whether this summary's lex term range *could* contain a term starting
     /// with `prefix` (i.e. `[prefix, prefix_upper_bound)` overlaps the range).
-    /// A `None` range means the FST was empty for this column — nothing
-    /// matches, so this returns `false` (prune). The per-term-range primitive
-    /// both the superfile-level (`fts_prefix_skip`) and list-level
+    /// A `None` range means the term dictionary was empty for this column —
+    /// nothing matches, so this returns `false` (prune). The per-term-range
+    /// primitive both the superfile-level (`fts_prefix_skip`) and list-level
     /// (`part_overlaps_prefix`) prefix skips build on.
     pub fn may_match_prefix(&self, prefix: &[u8]) -> bool {
         match self.term_range.as_ref() {
@@ -1571,8 +1570,8 @@ struct FtsSummaryAggDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     term_range_union: Option<TermRangeUnionDto>,
     /// Token total and count of documents carrying tokens, for scoring
-    /// rather than pruning. `None` ↔ field absent, which is how a part
-    /// written before the totals existed decodes.
+    /// rather than pruning. `None` ↔ field absent: the part's fold met an
+    /// unknown side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     length_stats: Option<ColumnLengthStatsDto>,
 }
@@ -3703,28 +3702,24 @@ mod tests {
 
     #[test]
     fn one_summary_without_totals_makes_the_rollup_unknown() {
-        // The rule that keeps a partially backfilled manifest honest. A
-        // contributor written before the totals existed has nothing to
-        // add, and folding it in as zero would quietly shrink both the
-        // average and the collection size — producing a number that is
-        // neither the table-wide statistic nor the per-superfile one,
-        // with no error to notice. Unknown on either side means unknown,
-        // and the next superfile then averages over itself.
+        // Folding an unknown side in as zero would quietly shrink both
+        // the average and the collection size, so unknown on either side
+        // means unknown.
         let mut a = fts_agg(&[b"alpha"], 16, Some((b"alpha", b"mango")));
         a.length_stats = Some(ColumnLengthStats {
             total_tokens: 100,
             n_scored_docs: 10,
         });
-        let mut legacy = fts_agg(&[b"omega"], 16, Some((b"beta", b"zulu")));
-        legacy.length_stats = None;
+        let mut unknown = fts_agg(&[b"omega"], 16, Some((b"beta", b"zulu")));
+        unknown.length_stats = None;
 
         let mut known_then_unknown = a.clone();
-        known_then_unknown.merge_with(&legacy);
+        known_then_unknown.merge_with(&unknown);
         assert_eq!(known_then_unknown.length_stats, None);
 
         // And in the other order, so the fold cannot depend on which
         // superfile the manifest happens to list first.
-        let mut unknown_then_known = legacy.clone();
+        let mut unknown_then_known = unknown.clone();
         unknown_then_known.merge_with(&a);
         assert_eq!(unknown_then_known.length_stats, None);
 
@@ -3797,7 +3792,7 @@ mod tests {
         );
         assert!(!agg.may_match_prefix(b"zulu"), "above max → no overlap");
         assert!(!agg.may_match_prefix(b"alpha"), "below min → no overlap");
-        // No range (empty FST) → nothing matches → prune.
+        // No range (empty dictionary) → nothing matches → prune.
         assert!(!FtsSummaryAgg::default().may_match_prefix(b"echo"));
     }
 

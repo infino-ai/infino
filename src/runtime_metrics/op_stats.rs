@@ -235,12 +235,12 @@ pub struct OpStats {
     /// The object term is derived from the buffered input rather than the
     /// sealed output, and that distinction is load-bearing rather than
     /// cosmetic. Per-superfile overhead is not a fixed footer: every shard
-    /// carries its own dictionary, FST and index headers, so on a corpus
-    /// whose vocabulary is shared across rows the same input seals to
-    /// roughly four times more bytes at pool width 16 than at width 1.
-    /// Dividing that by the target would make an identical append plan
-    /// more requests on a wider host — the exact width-dependence this
-    /// counter exists to avoid.
+    /// carries its own Parquet dictionaries, term dictionary and index headers,
+    /// so on a corpus whose vocabulary is shared across rows the same input
+    /// seals to roughly four times more bytes at pool width 16 than at width 1.
+    /// Dividing that by the target would make an identical append plan more
+    /// requests on a wider host — the exact width-dependence this counter
+    /// exists to avoid.
     ///
     /// Requests are a real and material share of write cost — a PUT is
     /// 12.5x a GET in the bench cost model, and unlike a warm read's

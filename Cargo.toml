@@ -1,6 +1,6 @@
 [package]
 name = "infino"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 # Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
 # uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
@@ -21,15 +21,10 @@ categories = ["database", "database-implementations"]
 # small JS script that regenerates it) at runtime; both are kept out of
 # the published crate — they would push the tarball past the registry
 # size limit and aren't needed to build the library or the example.
-# The corpus generators are standalone crates pinning old published
-# releases, built by `tests/corpus/generate.sh` and never by this package.
-# Their lockfiles alone are ~700 KB of vendored dependency graphs that no
-# crate consumer can use.
 exclude = [
     "infino-python/",
     "examples/locomo-recall/fixture.json",
     "examples/locomo-recall/embed.mjs",
-    "tests/corpus/generators/",
 ]
 # Disable cargo's auto-discovery of `benches/*.rs` as bench
 # binaries — every bench target is declared explicitly via
@@ -149,7 +144,7 @@ rustix = { version = "1", features = ["time"] }
 static_assertions = "1"
 
 # Tokenization: UAX#29 word segmentation for the Unicode-aware standard
-# analyzer (keeps non-ASCII text), alongside the built-in ASCII tokenizer.
+# analyzer (keeps non-ASCII text).
 unicode-segmentation = "1"
 # Snowball stemmers for the per-column analysis chain's `stem=` filter.
 # The de-facto Rust snowball port, dual MIT / BSD-3-Clause, and its only

@@ -5,7 +5,6 @@ from pyarrow import RecordBatch, Schema, Table as ArrowTable
 
 Metric: TypeAlias = Literal["cosine", "l2sq", "l2", "negdot", "dot"]
 BoolMode: TypeAlias = Literal["or", "and"]
-Bm25Stats: TypeAlias = Literal["per_superfile", "global"]
 # How much a reindex repairs: "auto" gives each superfile the cheapest repair
 # that makes it current; "rewrite" brings layouts current and leaves superfiles
 # whose terms are stale (reported); "reanalyze" re-tokenizes every stale
@@ -117,8 +116,9 @@ class IndexSpec:
     # text is never kept, so it cannot be selected, projected, or filtered on.
     # `k1` / `b` are the column's BM25 similarity parameters (defaults 1.2 and
     # 0.75); pass both or neither. The stored score bounds are built with them.
-    # The three analysis options are keyword-only and come after `b`, so
-    # existing positional calls keep their meaning.
+    # `analyzer` names the base tokenizer; `"standard"`, the default, is the
+    # only one. The three analysis options are keyword-only and come after
+    # `b`, so existing positional calls keep their meaning.
     def fts(
         self,
         column: str,
@@ -149,7 +149,7 @@ class Table:
         k: int,
         mode: BoolMode | None = ...,
         projection: Sequence[str] | None = ...,
-        stats: Bm25Stats | None = ...,
+        *,
         k1: float | None = ...,
         b: float | None = ...,
     ) -> ArrowTable: ...
@@ -250,18 +250,11 @@ class OptimizeOptions:
     ) -> None: ...
 
 class ReindexOptions:
-    # `trust_writer_analysis=True` credits a superfile recording no analysis
-    # revision with the one its writer emitted. It is only sound when the table
-    # never held superfiles older than that writer: an older compaction can
-    # have folded stale terms into a newer-stamped file, and crediting it
-    # reports the table migrated with those terms still in place. Leave it off
-    # unless the table's whole history is known.
     def __init__(
         self,
         *,
         mode: ReindexMode | None = ...,
         stale_seal_timeout_ms: int | None = ...,
-        trust_writer_analysis: bool = ...,
     ) -> None: ...
 
 class ReindexReport:

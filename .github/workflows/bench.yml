@@ -76,10 +76,9 @@ jobs:
           # (stated here so the leg reads the same whatever the default).
           # The synthetic corpus draws every battery token from one Zipf,
           # so its "common-word" phrases pair near-universal terms whose
-          # per-superfile idf is degenerate (~0 and hypersensitive to shard
-          # df); grading FTS perf and quality there rewards scoring
-          # artifacts of that degeneracy instead of behavior on text-shaped
-          # term distributions.
+          # idf is ~0; grading FTS perf and quality there rewards scoring
+          # artifacts of that near-zero idf instead of behavior on
+          # text-shaped term distributions.
           # The FTS cell runs as two legs split by read phase. The realistic
           # corpus is ~6x the synthetic bytes at equal docs and cold
           # measurement pays per byte, so one combined leg overran the

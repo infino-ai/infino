@@ -94,7 +94,7 @@ use tokio::{
     },
     time::sleep,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, Span, debug, error, info, warn};
 use uuid::Uuid;
 
 #[cfg(not(test))]
@@ -118,7 +118,7 @@ use crate::{
         format::{
             CRC_BYTES,
             footer::read_kv_metadata,
-            fts::{HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, U64_BYTES, hdr},
+            fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr},
             kv,
             vec::{
                 CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE,
@@ -126,6 +126,7 @@ use crate::{
                 sub_hdr,
             },
         },
+        fts::builder::DOC_LENGTHS_ENTRY_SIZE,
         reader::vector_layout_from_kv,
         vector::{
             builder::{
@@ -169,7 +170,7 @@ use crate::{
                 PartitionStrategy, WIDTH_LAW_KS,
             },
             listed_once, options_hash,
-            part::{self as part_mod, ContentHash, PartId},
+            part::{self as part_mod, PartId},
             superfile_stem,
             term_index::{self, Contribution as TermContribution, TermIndexError},
             term_stats,
@@ -206,6 +207,7 @@ use crate::{
             },
         },
     },
+    utils::trace::{self, detail_span, record},
 };
 
 /// Multipart chunk size for large superfile uploads.
@@ -372,8 +374,8 @@ const BUILD_SCALAR_NUM: usize = 5;
 // f32 vector payload, rebuilt as quantized + rerank codecs alongside the raw input: ~6.5x.
 const BUILD_VECTOR_NUM: usize = 13;
 
-// FTS text, ~1.5x for the FST + postings structures. Added on top of the scalar factor, not
-// instead of it: the same text bytes are held as a column and drive the index build at once.
+// FTS text, ~1.5x for the term dictionary + postings structures. Added on top of the scalar factor,
+// not instead of it: the same text bytes are held as a column and drive the index build at once.
 const BUILD_FTS_NUM: usize = 3;
 
 /// Single-writer append + commit handle.
@@ -2337,15 +2339,15 @@ impl SupertableWriter {
         }
 
         // The commit's payload, read off the taken buffer before either
-        // shard-count helper is consulted, so both arms price the same
-        // number. Deliberately not the sealed output: every shard carries
-        // its own dictionary, FST and index headers, so sealed bytes scale
-        // with the shard split — and the split follows the writer pool's
-        // width. On a shared-vocabulary corpus the same input seals to
-        // roughly four times more bytes at width 16 than at width 1, so
-        // pricing off sealed bytes makes an identical append plan more
-        // requests on a wider host, which is precisely what the write-side
-        // determinism contract forbids.
+        // shard-count helper is consulted, so both arms price the same number.
+        // Deliberately not the sealed output: every shard carries its own
+        // Parquet dictionaries, term dictionary and index headers, so sealed
+        // bytes scale with the shard split — and the split follows the writer
+        // pool's width. On a shared-vocabulary corpus the same input seals to
+        // roughly four times more bytes at width 16 than at width 1, so pricing
+        // off sealed bytes makes an identical append plan more requests on a
+        // wider host, which is precisely what the write-side determinism
+        // contract forbids.
         let payload_bytes = buffered_payload_bytes(buffer);
 
         let list_metadata = CommitListMetadata {
@@ -3186,11 +3188,6 @@ fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>>
     if blob.len() < FTS_HEADER_SIZE {
         return None;
     }
-    let version = read_u32_le(blob.get(hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES)?);
-    let header_size = match version == crate::superfile::format::fts::VERSION_V1_LEGACY {
-        true => FTS_HEADER_SIZE,
-        false => crate::superfile::format::fts::HEADER_SIZE_V2,
-    };
     let n_columns =
         read_u32_le(blob.get(hdr::N_COLUMNS_OFF..hdr::N_COLUMNS_OFF + U32_BYTES)?) as usize;
     let doc_lengths_offset =
@@ -3198,13 +3195,13 @@ fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>>
             as usize;
     // Entries plus the directory's CRC.
     let dir_len = n_columns
-        .checked_mul(crate::superfile::fts::builder::DOC_LENGTHS_ENTRY_SIZE)?
+        .checked_mul(DOC_LENGTHS_ENTRY_SIZE)?
         .checked_add(4)?;
-    if header_size > blob.len() || doc_lengths_offset.checked_add(dir_len)? > blob.len() {
+    if doc_lengths_offset.checked_add(dir_len)? > blob.len() {
         return None;
     }
     Some(merge_ranges(vec![
-        (off, header_size as u64),
+        (off, FTS_HEADER_SIZE as u64),
         (off + doc_lengths_offset as u64, dir_len as u64),
     ]))
 }
@@ -3431,7 +3428,7 @@ async fn write_superfile_terms(
         })
         .collect();
     columns.sort();
-    let fst_bytes = fts
+    let dict_bytes = fts
         .dict_bytes_async()
         .await
         .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
@@ -3440,7 +3437,7 @@ async fn write_superfile_terms(
         loop {
             let chunk = fts
                 .term_index_facts_after(
-                    &fst_bytes,
+                    &dict_bytes,
                     column,
                     after.as_deref(),
                     TERM_INDEX_BATCH_TERMS,
@@ -4538,16 +4535,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 remote_state.checkpoint.shard_count
             )));
         }
-        // Same acceptance rule as reopening the table: a checkpoint
-        // written before the engine's current options encoding still
-        // identifies this table, so a drain that spans an upgrade
-        // resumes instead of wedging on a re-encoded digest.
-        let checkpoint_hash = ContentHash::from_hex(&remote_state.checkpoint.options_hash);
-        let recognized = checkpoint_hash.is_some_and(|stored| {
-            options_hash::verify_options_hash(user_inner.options.as_ref(), &user_strategy, stored)
-                .is_ok()
-        });
-        if !recognized {
+        if remote_state.checkpoint.options_hash != current_options_hash {
             return Err(BuildError::Store(format!(
                 "drain checkpoint options hash {} != current {}",
                 remote_state.checkpoint.options_hash, current_options_hash
@@ -4896,10 +4884,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 .get(&entry.storage_path())
                                 .await
                                 .map_err(|e| BuildError::Store(e.to_string()))?;
-                            Arc::new(
-                                SuperfileReader::open(bytes)
-                                    .map_err(|e| BuildError::Store(e.to_string()))?,
-                            )
+                            Arc::new(SuperfileReader::open(bytes).map_err(BuildError::from)?)
                         }
                     };
                     // Write-path materialization: no per-query collector.
@@ -4912,6 +4897,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             }))
             .buffered(read_concurrency)
             .collect::<Vec<_>>()
+            .instrument(detail_span!(
+                "drain_batch.open",
+                batch = batch_idx + 1,
+                superfiles = batch_sources.len(),
+            ))
             .await
             .into_iter()
             .collect::<Result<Vec<_>, BuildError>>()?;
@@ -5042,13 +5032,27 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     ))
                     .buffered(commit_write_concurrency().get())
                     .collect::<Vec<_>>()
+                    .instrument(detail_span!(
+                        "drain_batch.materialize",
+                        batch = batch_idx + 1,
+                        superfiles = readers.len(),
+                    ))
                     .await
                     .into_iter()
                     .collect::<Result<Vec<_>, BuildError>>()?;
                 let t_mat = batch_t0.elapsed().as_secs_f64() * 1e3;
 
+                let assign_spill_span = detail_span!(
+                    "drain_batch.assign_spill",
+                    batch = batch_idx + 1,
+                    rows = tracing::field::Empty,
+                    distinct_rows = tracing::field::Empty,
+                    spill_files = tracing::field::Empty,
+                )
+                .entered();
                 let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
                 let n_batch_rows = all_rows.len();
+                record("rows", n_batch_rows);
                 for writer in cell_spills.values_mut() {
                     writer.begin_batch();
                 }
@@ -5066,6 +5070,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     .iter()
                     .filter(|row| seen_stable_ids.insert(row.stable_id))
                     .collect();
+                record("distinct_rows", distinct_rows.len());
                 if assign_skip
                     && drain_replica_extra_budget(distinct_rows.len(), replica_target) == 0
                 {
@@ -5104,6 +5109,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     let use_graph_assign = drain_graph_assign
                         && metric == Metric::Cosine
                         && (clusters_ref.n_cent as usize) >= opann::GRAPH_ASSIGN_MIN_N_CENT;
+                    let assign_span = detail_span!(
+                        "drain_batch.assign",
+                        rows = distinct_rows.len(),
+                        graph = use_graph_assign,
+                    )
+                    .entered();
                     let assign_t0 = std::time::Instant::now();
                     let assignments: Vec<opann::BoundaryAssignment> = if distinct_rows.is_empty() {
                         // No rows to assign: never build the router (skip-empty).
@@ -5167,6 +5178,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         })
                     };
                     let assign_ms = assign_t0.elapsed().as_secs_f64() * 1e3;
+                    drop(assign_span);
                     drain_assign_total_ms += assign_ms;
                     if drain_timers {
                         debug!(
@@ -5234,6 +5246,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     );
                 }
                 local_checkpoint.spills = checkpointed_spills;
+                record("spill_files", cell_spills.len());
+                drop(assign_spill_span);
                 let t_spill = batch_t0.elapsed().as_secs_f64() * 1e3;
                 drain_mat_total_ms += t_mat;
                 drain_assign_spill_total_ms += t_spill - t_mat;
@@ -5254,7 +5268,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
         local_checkpoint.batches_done = batch_idx + 1;
         local_checkpoint.added_per_cell = added_per_cell.clone();
-        save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
+        {
+            let _span = detail_span!("drain_batch.checkpoint", batch = batch_idx + 1).entered();
+            save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
+        }
         #[cfg(test)]
         maybe_fail_drain_for_test(
             &remote_state.checkpoint.epoch_id,
@@ -5385,19 +5402,49 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
         freeze_ms += freeze_t0.elapsed().as_secs_f64() * 1e3;
         let width_law_ref = width_law.as_ref();
+        let cell_build_span = detail_span!(
+            "drain_cell_build",
+            shards = shard_sources.len(),
+            workers = hidden_inner.options.writer_pool.current_num_threads(),
+        )
+        .entered();
         let prepared_shards: Vec<PreparedSuperfile> = fanout_shards(
             &hidden_inner.options.writer_pool,
             &shard_sources,
             |(shard_id, cells)| {
+                let _shard_span = detail_span!(
+                    "drain_shard",
+                    parent: &cell_build_span,
+                    shard = *shard_id,
+                    cells = cells.len(),
+                )
+                .entered();
                 let mut packed = Vec::with_capacity(cells.len());
                 for (cell_id, source) in cells {
                     let cell = match source {
                         DrainCellSource::Packed(cell) => cell.clone(),
                         DrainCellSource::Rows(spill) => {
+                            let _cell_span = detail_span!(
+                                "drain_cell",
+                                cell = *cell_id,
+                                rows = spill.n_rows(),
+                                score_ms = tracing::field::Empty,
+                                sample_ms = tracing::field::Empty,
+                                train_ms = tracing::field::Empty,
+                                n_cent = tracing::field::Empty,
+                                bucket_ms = tracing::field::Empty,
+                                fsync_ms = tracing::field::Empty,
+                                write_ms = tracing::field::Empty,
+                                crc_ms = tracing::field::Empty,
+                                checkpoint_ms = tracing::field::Empty,
+                            )
+                            .entered();
                             // Calibration reads the spill the pack pass is
                             // about to read anyway (before remove_files).
                             if let Some(cal) = width_law_ref {
+                                let score_t0 = time::Instant::now();
                                 cal.score_cell(*cell_id, spill)?;
+                                record("score_ms", score_t0.elapsed().as_millis() as u64);
                             }
                             let cell = build_spilled_packed_cell_from_rows(
                                 scratch,
@@ -5405,6 +5452,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 spill,
                                 &vector_config,
                             )?;
+                            let checkpoint_t0 = time::Instant::now();
                             {
                                 let mut state = checkpoint.lock().map_err(|_| {
                                     BuildError::Store("drain checkpoint lock poisoned".into())
@@ -5420,14 +5468,17 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 );
                                 save_drain_local_checkpoint(&drain_scratch, &state)?;
                             }
+                            record("checkpoint_ms", checkpoint_t0.elapsed().as_millis() as u64);
                             spill.remove_files();
                             cell
                         }
                     };
                     packed.push((*cell_id, cell));
                 }
-                let prepared: PreparedSuperfile =
-                    build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)?;
+                let prepared: PreparedSuperfile = {
+                    let _span = detail_span!("drain_shard.assemble").entered();
+                    build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)?
+                };
                 // Depth-law observation: fine clusters exist only now that
                 // the shard is packed; record each surviving candidate's
                 // fine-centroid rank from the shard's own bytes.
@@ -5461,6 +5512,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 Ok::<_, BuildError>(prepared)
             },
         )?;
+        drop(cell_build_span);
         local_checkpoint = checkpoint
             .lock()
             .map_err(|_| BuildError::Store("drain checkpoint lock poisoned".into()))?
@@ -5507,9 +5559,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 }
             });
         let upload_t0 = time::Instant::now();
+        let upload_span = detail_span!("drain.upload", superfiles = entry_by_key.len());
         let mut uploads =
             stream::iter(put_futures).buffer_unordered(commit_write_concurrency().get());
-        while let Some(uploaded) = uploads.next().await {
+        while let Some(uploaded) = uploads.next().instrument(upload_span.clone()).await {
             let storage_key = uploaded?;
             let entry = entry_by_key.get(&storage_key).cloned().ok_or_else(|| {
                 BuildError::Store(format!("uploaded drain shard {storage_key} has no entry"))
@@ -5560,6 +5613,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             }
             save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
         }
+        trace::end(upload_span);
         upload_ms += upload_t0.elapsed().as_secs_f64() * 1e3;
         if new_entries.len() != expected_shards {
             return Err(BuildError::Store(format!(
@@ -5614,6 +5668,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // real cross-generation spread until a full rebuild recalibrates.
         // The alternative (rescoring every packed cell per incremental
         // drain) would make drain cost track table size, not delta size.
+        let finish_span = detail_span!("drain.calibrate_finish").entered();
         if let Some(cal) = width_law.take()
             && let Some(laws) = cal.finish(&running_clusters, None)
         {
@@ -5653,6 +5708,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 routing.rerank_for_k,
             );
         }
+        drop(finish_span);
         let mut list_metadata = CommitListMetadata {
             partition_strategy: Some(PartitionStrategy::VectorCell {
                 column: column.clone(),
@@ -5682,6 +5738,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let (prospective, _parts) = list_metadata
             .apply(&old_hidden)
             .update(&new_entries, &no_removals)
+            .instrument(detail_span!("drain.prospective_manifest"))
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
         // Opt-in gate: only build the resident data graph when queries will
@@ -5717,9 +5774,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             warm_cache_after_commit(&hidden_inner, cache, mem::take(&mut pending_cache_inserts));
         }
         let graph_ref = if building_graph {
-            build_hnsw_graph_ref(storage.as_ref(), &prospective).await
+            build_hnsw_graph_ref(storage.as_ref(), &prospective)
+                .instrument(detail_span!("drain.index_build", kind = "hnsw"))
+                .await
         } else if building_flat {
-            build_flat_index_ref(storage.as_ref(), &prospective).await
+            build_flat_index_ref(storage.as_ref(), &prospective)
+                .instrument(detail_span!("drain.index_build", kind = "flat"))
+                .await
         } else {
             None
         };
@@ -5737,6 +5798,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             list_metadata,
             Vec::new(),
         )
+        .instrument(detail_span!("drain.commit"))
         .await
         .map_err(BuildError::from)?;
         hidden_inner.manifest.store(new_manifest);
@@ -5762,6 +5824,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         if !pending_cache_inserts.is_empty()
             && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
         {
+            let _span = detail_span!("drain.cache_warm").entered();
             warm_cache_after_commit(&hidden_inner, cache, pending_cache_inserts);
         }
         if let Err(error) = fs::remove_dir_all(&drain_scratch)
@@ -5896,7 +5959,7 @@ async fn open_ivf_reader_with_tombstones(
         ReadIntent::Warm,
     )
     .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
+    .map_err(BuildError::from)?;
     Ok((reader, bitmap))
 }
 
@@ -6020,7 +6083,7 @@ async fn cell_doc_counts_via_reader(
         ReadIntent::Warm,
     )
     .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
+    .map_err(BuildError::from)?;
     let v = reader
         .vec()
         .ok_or_else(|| BuildError::Store("IVF entry missing vector index".into()))?;
@@ -7692,6 +7755,7 @@ fn plan_split_wave(
     metric: Metric,
     modality_d: f64,
 ) -> Vec<Result<PlannedCellSplit, u32>> {
+    let wave_span = Span::current();
     plan_inputs
         .into_par_iter()
         .map(|extracted| {
@@ -7700,12 +7764,21 @@ fn plan_split_wave(
                 parent_ids,
                 rows,
             } = extracted;
+            let _span = detail_span!(
+                "split_cell_plan",
+                parent: &wave_span,
+                cell = cell,
+                rows = rows.len(),
+                k = tracing::field::Empty,
+            )
+            .entered();
             let split_refs: Vec<&EncodedCellRow> = rows.iter().map(|r| &r.encoded).collect();
             let Some((k, self_tune)) =
                 opann::cell_split_plan(&split_refs, clusters.dim as usize, cell, modality_d)
             else {
                 return Err(cell);
             };
+            record("k", k);
             let (sub_centroids, assign) =
                 opann::plan_sq8_split_kway(&split_refs, clusters, cell, metric, k, self_tune);
             drop(split_refs);
@@ -8262,6 +8335,20 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
 /// its hooks ride this pass (offer at wave routing, score at shard pack,
 /// finish + stamp inside the commit; REPLACE semantics) — seams marked
 /// below.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        name = "split_repack",
+        skip_all,
+        fields(
+            candidates = candidates.len(),
+            budget_mb = split_batch_memory_budget_bytes() / MIB as u64,
+            waves = tracing::field::Empty,
+            cells_split = tracing::field::Empty,
+            children = tracing::field::Empty,
+        )
+    )
+)]
 pub(in crate::supertable) async fn split_repack_bulk(
     inner: &Arc<SupertableInner>,
     manifest: &ManifestSnapshot,
@@ -8335,6 +8422,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
     // stall on one oversized cell).
     let cell_bytes: HashMap<u32, u64> = candidates.iter().copied().collect();
     let mut queue: Vec<(u32, u64)> = candidates;
+    let mut wave = 0usize;
     while !queue.is_empty() {
         let mut wave_cells: Vec<u32> = Vec::new();
         let mut wave_bytes = 0u64;
@@ -8394,8 +8482,26 @@ pub(in crate::supertable) async fn split_repack_bulk(
             );
         }
 
+        wave += 1;
         let jobs = live_split_extraction_jobs(&wave_cells, parents_by_cell, superseded_map);
-        let extracted = extract_split_cell_rows(inner, &column, now, jobs).await?;
+        let extract_span = detail_span!(
+            "split_wave.extract",
+            wave = wave,
+            cells = wave_cells.len(),
+            parents = jobs.iter().map(|(_, parents)| parents.len()).sum::<usize>(),
+            estimated_mb = wave_bytes / MIB as u64,
+            rows = tracing::field::Empty,
+        );
+        let extracted = extract_split_cell_rows(inner, &column, now, jobs)
+            .instrument(extract_span.clone())
+            .await?;
+        // Recorded after the span's last poll, so `trace::end` re-enters it
+        // once: a trace writes a span's fields only when it enters or exits.
+        extract_span.record(
+            "rows",
+            extracted.iter().map(|item| item.rows.len()).sum::<usize>(),
+        );
+        trace::end(extract_span);
         let mut plan_inputs: Vec<ExtractedCellRows> = Vec::new();
         for item in extracted {
             if item.rows.len() < MIN_ROWS_TO_SPLIT_CELL {
@@ -8408,10 +8514,12 @@ pub(in crate::supertable) async fn split_repack_bulk(
             continue;
         }
         let plan_clusters = running_clusters.clone();
+        let plan_span = detail_span!("split_wave.plan", wave = wave, cells = plan_inputs.len());
         let planned_or_noop: Vec<Result<PlannedCellSplit, u32>> =
             run_on_pool(Some(maint_pool()?), "repack wave planning", move || {
                 plan_split_wave(plan_inputs, &plan_clusters, metric, modality_d)
             })
+            .instrument(plan_span)
             .await
             .map_err(|e| BuildError::Store(format!("repack wave planning: {e}")))?;
         let mut planned: Vec<PlannedCellSplit> = Vec::new();
@@ -8447,8 +8555,10 @@ pub(in crate::supertable) async fn split_repack_bulk(
         let wave_cfg = base_cfg.clone();
         let build_jobs: Vec<(PlannedCellSplit, Vec<u32>)> =
             planned.into_iter().zip(ids_per_split).collect();
+        let pack_span = detail_span!("split_wave.pack", wave = wave, cells = build_jobs.len());
         let repacked: Vec<RepackedSplit> =
             run_on_pool(Some(maint_pool()?), "repack wave child packs", move || {
+                let wave_span = Span::current();
                 build_jobs
                     .into_par_iter()
                     .map(|(split, child_ids)| {
@@ -8459,6 +8569,14 @@ pub(in crate::supertable) async fn split_repack_bulk(
                             assign,
                             ..
                         } = split;
+                        let _span = detail_span!(
+                            "split_cell_pack",
+                            parent: &wave_span,
+                            cell = cell,
+                            rows = rows.len(),
+                            children = child_ids.len(),
+                        )
+                        .entered();
                         let mut groups: Vec<Vec<MaterializedIvfRow>> =
                             (0..child_ids.len()).map(|_| Vec::new()).collect();
                         for (row, &side) in rows.into_iter().zip(assign.iter()) {
@@ -8497,6 +8615,19 @@ pub(in crate::supertable) async fn split_repack_bulk(
                                     )
                                 })?
                                 .finish()?;
+                            let _child_span = detail_span!(
+                                "split_child_pack",
+                                child = child_id,
+                                rows = spill.n_rows(),
+                                sample_ms = tracing::field::Empty,
+                                train_ms = tracing::field::Empty,
+                                n_cent = tracing::field::Empty,
+                                bucket_ms = tracing::field::Empty,
+                                fsync_ms = tracing::field::Empty,
+                                write_ms = tracing::field::Empty,
+                                crc_ms = tracing::field::Empty,
+                            )
+                            .entered();
                             let packed_cell = build_spilled_packed_cell_from_rows(
                                 &wave_scratch,
                                 child_id,
@@ -8516,6 +8647,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
                     })
                     .collect::<Result<Vec<RepackedSplit>, BuildError>>()
             })
+            .instrument(pack_span)
             .await
             .map_err(|e| BuildError::Store(format!("repack wave child packs: {e}")))??;
 
@@ -8545,6 +8677,9 @@ pub(in crate::supertable) async fn split_repack_bulk(
             packed_children.extend(split.packed);
         }
     }
+    record("waves", wave);
+    record("cells_split", committed_cells.len());
+    record("children", packed_children.len());
     if packed_children.is_empty() {
         return Ok(SplitBatchOutcome::no_op_cells(noop_cells));
     }
@@ -8575,6 +8710,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         .collect();
     // Join by shard id, not position: the cell → entry pairing must not
     // depend on the parallel collect preserving bucket order.
+    let assemble_span = detail_span!("split_repack.assemble", shards = buckets.len());
     let prepared: Vec<(u32, PreparedSuperfile)> =
         run_on_pool(Some(maint_pool()?), "repack shard assembly", move || {
             buckets
@@ -8585,6 +8721,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
                 })
                 .collect::<Result<Vec<(u32, PreparedSuperfile)>, BuildError>>()
         })
+        .instrument(assemble_span)
         .await
         .map_err(|e| BuildError::Store(format!("repack shard assembly: {e}")))??;
     let mut new_entries_by_cell: Vec<(u32, Arc<SuperfileEntry>)> = Vec::new();
@@ -8614,6 +8751,14 @@ pub(in crate::supertable) async fn split_repack_bulk(
     // them (abandon-based recovery).
     pin_uploaded_superfiles(inner, new_entries.clone(), true).await?;
     let multipart_threshold = inner.options.put_multipart_threshold_bytes;
+    let upload_span = detail_span!(
+        "split_repack.upload",
+        superfiles = pending_storage_writes.len(),
+        bytes = pending_storage_writes
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>(),
+    );
     let uploads = pending_storage_writes
         .into_iter()
         .map(|(storage_key, bytes)| {
@@ -8625,12 +8770,13 @@ pub(in crate::supertable) async fn split_repack_bulk(
             }
         });
     let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency().get());
-    while let Some(landed) = in_flight.next().await {
+    while let Some(landed) = in_flight.next().instrument(upload_span.clone()).await {
         if let Err(error) = landed {
             drop(in_flight);
             return Err(unpin_after_failed_publish(inner, error).await);
         }
     }
+    trace::end(upload_span);
     drop(in_flight);
 
     // ONE OCC commit for the whole reshape: shard entries + grown grid +
@@ -8662,6 +8808,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         list_metadata,
         term_contributions,
     )
+    .instrument(detail_span!("split_repack.commit"))
     .await
     {
         Ok(manifest) => manifest,
@@ -9048,6 +9195,18 @@ pub(in crate::supertable) async fn split_overflow_cells(
 /// the calibration entry point; this pass only refreshes.
 ///
 /// Returns whether a new law was stamped.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        skip_all,
+        fields(
+            superfiles = tracing::field::Empty,
+            cells = tracing::field::Empty,
+            docs = tracing::field::Empty,
+            fanout = tracing::field::Empty,
+        )
+    )
+)]
 pub(in crate::supertable) async fn recalibrate_probe_laws(
     inner: &Arc<SupertableInner>,
 ) -> Result<bool, BuildError> {
@@ -9116,6 +9275,12 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     if work.is_empty() || total_docs == 0 {
         return Ok(false);
     }
+    record("superfiles", work.len());
+    record(
+        "cells",
+        work.iter().map(|(_, cells)| cells.len()).sum::<usize>(),
+    );
+    record("docs", total_docs);
 
     // Evidence basis for the width stamp below: the exact superfile set
     // this scan measures. A drain that commits between the scan and the
@@ -9156,10 +9321,12 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             base = end;
         }
     }
+    let sample_span = detail_span!("recalibrate.sample", cells = picks.len());
     for (&(ei, cell), ordinals) in &picks {
         let (entry, cells) = &work[ei];
         let rows =
             load_materialized_rows_from_ivf_superfile(inner, entry, &column, now, Some(&[cell]))
+                .instrument(sample_span.clone())
                 .await?;
         if rows.is_empty() {
             continue;
@@ -9189,6 +9356,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             cal.offer(&rows[idx]);
         }
     }
+    trace::end(sample_span);
     // Freeze rotates every sampled query and ranks it against the full
     // grid — CPU work, bridged onto the maintenance pool via
     // `run_on_pool` like every other compute wave in this pass (this IS
@@ -9208,6 +9376,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         cal.freeze(&clusters_for_freeze, rot_seed, pool_hint);
         (cal, clusters_for_freeze)
     })
+    .instrument(detail_span!("recalibrate.freeze"))
     .await
     .map_err(|e| BuildError::Store(format!("recalibration freeze: {e}")))?;
     // Centroid-router fanout calibration rides the SAME scan: build the router
@@ -9250,6 +9419,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         // pin the entire hidden index in RAM.
         let mut router_cluster_vecs: Vec<(usize, u32, Vec<f32>)> = Vec::new();
         flat_base_by_si = Vec::with_capacity(work.len());
+        let open_span = detail_span!("recalibrate.router_open", superfiles = work.len());
         for (si, (entry, cells)) in work.iter().enumerate() {
             let reader = open_compaction_input(
                 &inner.options.store,
@@ -9257,8 +9427,9 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 inner.options.storage.as_ref(),
                 entry,
             )
+            .instrument(open_span.clone())
             .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+            .map_err(BuildError::from)?;
             let mut bases = HashMap::new();
             if let Some(vr) = reader.vec() {
                 if let Some(cluster_vecs) = vr.resident_fine_cluster_vectors(column.as_str()) {
@@ -9275,6 +9446,12 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             flat_base_by_si.push(bases);
             drop(reader);
         }
+        drop(open_span);
+        let _router_span = detail_span!(
+            "recalibrate.router_build",
+            fine_clusters = router_cluster_vecs.len(),
+        )
+        .entered();
         match crate::supertable::query::vector::build_centroid_router_from_cluster_vectors(
             router_cluster_vecs,
             dim,
@@ -9322,6 +9499,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         None
     };
     let did_fanout = fanout_calib.is_some();
+    record("fanout", did_fanout);
 
     // Shared handle for the scoring sweep: chunks are MOVED onto the
     // maintenance pool and awaited over a oneshot, so the tokio worker
@@ -9337,12 +9515,21 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // the maintenance pool (`vector.maintenance_threads`), and transient
     // memory stays bounded at one chunk of materialized cells.
     let chunk_cells = pool.current_num_threads().max(1);
+    // Each pass alternates loading a chunk of cells here with scoring it on
+    // the pool; `load_ms` and `pool_ms` split the pass's wall between them.
+    let shortlist_span = detail_span!(
+        "recalibrate.shortlist",
+        load_ms = tracing::field::Empty,
+        pool_ms = tracing::field::Empty,
+    );
+    let (mut load_ms, mut pool_ms) = (0u64, 0u64);
     // Pass 1: cheap 1-bit estimate over every live cell -> per-query top-CAP
     // shortlist (also feeds the rerank histogram). No fanout here — the router
     // prefix pool is collected in pass 2 alongside the exact rescore.
     for (entry, cells) in &work {
         for chunk in cells.chunks(chunk_cells) {
             let mut loaded: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::with_capacity(chunk.len());
+            let load_t0 = time::Instant::now();
             for &(cell, _) in chunk {
                 let rows = load_materialized_rows_from_ivf_superfile(
                     inner,
@@ -9351,26 +9538,43 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                     now,
                     Some(&[cell]),
                 )
+                .instrument(shortlist_span.clone())
                 .await?;
                 loaded.push((cell, rows));
             }
+            load_ms += load_t0.elapsed().as_millis() as u64;
             let chunk_cal = Arc::clone(&cal);
+            let pool_t0 = time::Instant::now();
             run_on_pool(Some(pool), "recalibration shortlist", move || {
                 loaded
                     .par_iter()
                     .for_each(|(cell, rows)| chunk_cal.shortlist_rows(*cell, rows));
                 drop(chunk_cal);
             })
+            .instrument(shortlist_span.clone())
             .await
             .map_err(|e| BuildError::Store(format!("recalibration shortlist: {e}")))?;
+            pool_ms += pool_t0.elapsed().as_millis() as u64;
         }
     }
+    shortlist_span.record("load_ms", load_ms);
+    shortlist_span.record("pool_ms", pool_ms);
+    // Re-enter once so the fields recorded after the last poll are written.
+    trace::end(shortlist_span);
     // Pass 2: exact-rescore only the survivors (populating `tops` for the
     // width/fine/rerank laws) and, when the router was built, collect the
     // fanout prefix pool from those same survivors — the exact top-k NNs the
     // fanout knee reads are always survivors, so the survivor-only prefix pool
     // is equivalent to the exhaustive one for the law. Then observe fine ranks.
     let survivors = Arc::new(cal.survivors_by_cell());
+    let rescore_span = detail_span!(
+        "recalibrate.rescore",
+        cells = survivors.len(),
+        load_ms = tracing::field::Empty,
+        pool_ms = tracing::field::Empty,
+        depth_ms = tracing::field::Empty,
+    );
+    let (mut load_ms, mut pool_ms, mut depth_ms) = (0u64, 0u64, 0u64);
     for (si, (entry, cells)) in work.iter().enumerate() {
         // Per-superfile flat-cluster base for the router prefix tag: a cell's
         // global flat cluster is `flat_base + row.cluster`. Absent for a v1
@@ -9381,6 +9585,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         for chunk in cells.chunks(chunk_cells) {
             let mut loaded: Vec<(u32, Option<u32>, Vec<MaterializedIvfRow>)> =
                 Vec::with_capacity(chunk.len());
+            let load_t0 = time::Instant::now();
             for &(cell, _) in chunk {
                 // A cell with no survivor contributes nothing to any query's
                 // top-k — skip its reload entirely.
@@ -9394,11 +9599,14 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                     now,
                     Some(&[cell]),
                 )
+                .instrument(rescore_span.clone())
                 .await?;
                 let flat_base = flat_bases.and_then(|m| m.get(&cell).copied());
                 loaded.push((cell, flat_base, rows));
             }
+            load_ms += load_t0.elapsed().as_millis() as u64;
             if !loaded.is_empty() {
+                let pool_t0 = time::Instant::now();
                 let chunk_cal = Arc::clone(&cal);
                 let chunk_survivors = Arc::clone(&survivors);
                 // Clone the shared selection handle + cap for this chunk; `si`
@@ -9424,10 +9632,13 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                     });
                     drop(chunk_cal);
                 })
+                .instrument(rescore_span.clone())
                 .await
                 .map_err(|e| BuildError::Store(format!("recalibration rescore: {e}")))?;
+                pool_ms += pool_t0.elapsed().as_millis() as u64;
             }
         }
+        let depth_t0 = time::Instant::now();
         // Depth observation runs once per entry, after all its chunks have
         // rescored (so `tops` is fully populated for this entry's cells). The
         // fine observation reads subsection/stable-id bytes SYNCHRONOUSLY
@@ -9444,7 +9655,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             entry,
         )
         .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+        .map_err(BuildError::from)?;
         // `None` here is a legacy single-cell layout — skip its depth
         // observation; the finish fallback keeps the previous depth law
         // rather than shallowing it on partial evidence.
@@ -9461,10 +9672,16 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 observe_cal.observe_shard_views(&views);
                 drop(observe_cal);
             })
+            .instrument(rescore_span.clone())
             .await
             .map_err(|e| BuildError::Store(format!("recalibration depth observation: {e}")))?;
         }
+        depth_ms += depth_t0.elapsed().as_millis() as u64;
     }
+    rescore_span.record("load_ms", load_ms);
+    rescore_span.record("pool_ms", pool_ms);
+    rescore_span.record("depth_ms", depth_ms);
+    trace::end(rescore_span);
     // Every chunk's oneshot was awaited, so this is the last reference.
     let cal = Arc::into_inner(cal)
         .ok_or_else(|| BuildError::Store("recalibration state still shared".into()))?;
@@ -11892,7 +12109,7 @@ mod tests {
         config::Config,
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
+            fts::reader::{Bm25SearchOptions, BoolMode},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -12548,9 +12765,7 @@ mod tests {
                 "title",
                 "alpha",
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 over one-piece commit");
@@ -13981,8 +14196,8 @@ mod tests {
             .expect("title FTS summary present");
 
         // Each doc's title is "doc <i> alpha"; tokenized with
-        // ASCII-lower, distinct terms include "doc", "alpha",
-        // and digits 0-3. The FST will dedupe; n_terms_distinct
+        // `standard`, distinct terms include "doc", "alpha",
+        // and digits 0-3. The term dictionary will dedupe; n_terms_distinct
         // is at least 3 (doc, alpha, plus some digit tokens).
         assert!(
             fts.n_terms_distinct >= 3,
@@ -13993,7 +14208,10 @@ mod tests {
         assert!(fts.may_contain(b"alpha"));
         assert!(fts.may_contain(b"doc"));
         // Lex range should be present and consistent.
-        let (min_term, max_term) = fts.term_range.as_ref().expect("non-empty FST has a range");
+        let (min_term, max_term) = fts
+            .term_range
+            .as_ref()
+            .expect("non-empty dictionary has a range");
         assert!(!min_term.is_empty());
         assert!(!max_term.is_empty());
         assert!(min_term <= max_term, "min_term <= max_term invariant");

@@ -2,29 +2,6 @@ pub mod infino
 pub use infino::arrow_array
 pub use infino::arrow_schema
 pub use infino::serde_json
-pub enum infino::Bm25Stats
-pub infino::Bm25Stats::Global
-pub infino::Bm25Stats::PerSuperfile
-impl core::clone::Clone for infino::Bm25Stats
-pub fn infino::Bm25Stats::clone(&self) -> Self
-impl core::cmp::Eq for infino::Bm25Stats
-impl core::cmp::PartialEq for infino::Bm25Stats
-pub fn infino::Bm25Stats::eq(&self, &Self) -> bool
-impl core::convert::From<&str> for infino::Bm25Stats
-pub fn infino::Bm25Stats::from(&str) -> Self
-impl core::default::Default for infino::Bm25Stats
-pub fn infino::Bm25Stats::default() -> Self
-impl core::fmt::Debug for infino::Bm25Stats
-pub fn infino::Bm25Stats::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Copy for infino::Bm25Stats
-impl core::marker::StructuralPartialEq for infino::Bm25Stats
-impl core::marker::Freeze for infino::Bm25Stats
-impl core::marker::Send for infino::Bm25Stats
-impl core::marker::Sync for infino::Bm25Stats
-impl core::marker::Unpin for infino::Bm25Stats
-impl core::marker::UnsafeUnpin for infino::Bm25Stats
-impl core::panic::unwind_safe::RefUnwindSafe for infino::Bm25Stats
-impl core::panic::unwind_safe::UnwindSafe for infino::Bm25Stats
 pub enum infino::BoolMode
 pub infino::BoolMode::And
 pub infino::BoolMode::Or
@@ -72,7 +49,6 @@ impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
 #[non_exhaustive] pub enum infino::ColumnIndex
 pub infino::ColumnIndex::Fts
-pub infino::ColumnIndex::Fts::analyzer: alloc::string::String
 pub infino::ColumnIndex::Fts::bm25: infino::Bm25Params
 pub infino::ColumnIndex::Fts::positions: bool
 pub infino::ColumnIndex::Fts::stemmer: infino::Stemmer
@@ -197,6 +173,7 @@ pub infino::OptimizeError::SidecarConflict
 pub infino::OptimizeError::SidecarConflict::existing_compaction_id: uuid::Uuid
 pub infino::OptimizeError::SidecarConflict::superfile_id: uuid::Uuid
 pub infino::OptimizeError::SuperfileNotFound(uuid::Uuid)
+pub infino::OptimizeError::Unsupported(alloc::string::String)
 pub infino::OptimizeError::WalGc(infino::supertable::wal::gc::GcError)
 impl core::convert::From<infino::GcError> for infino::OptimizeError
 pub fn infino::OptimizeError::from(infino::GcError) -> Self
@@ -246,6 +223,7 @@ pub infino::ReindexError::NoStorage
 pub infino::ReindexError::Rewrite
 pub infino::ReindexError::Rewrite::cause: alloc::string::String
 pub infino::ReindexError::Rewrite::superfile_id: uuid::Uuid
+pub infino::ReindexError::Unsupported(alloc::string::String)
 impl core::error::Error for infino::ReindexError
 impl core::fmt::Debug for infino::ReindexError
 pub fn infino::ReindexError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -516,12 +494,10 @@ impl core::panic::unwind_safe::UnwindSafe for infino::Bm25Params
 #[non_exhaustive] pub struct infino::Bm25SearchOptions
 pub infino::Bm25SearchOptions::bm25: core::option::Option<infino::Bm25Params>
 pub infino::Bm25SearchOptions::mode: infino::BoolMode
-pub infino::Bm25SearchOptions::stats: infino::Bm25Stats
 impl infino::Bm25SearchOptions
 pub fn infino::Bm25SearchOptions::new() -> Self
 pub fn infino::Bm25SearchOptions::with_bm25(self, f32, f32) -> Self
 pub fn infino::Bm25SearchOptions::with_mode(self, infino::BoolMode) -> Self
-pub fn infino::Bm25SearchOptions::with_stats(self, infino::Bm25Stats) -> Self
 impl core::clone::Clone for infino::Bm25SearchOptions
 pub fn infino::Bm25SearchOptions::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::Bm25SearchOptions
@@ -836,11 +812,9 @@ impl core::panic::unwind_safe::UnwindSafe for infino::PlannedRepair
 pub infino::ReindexOptions::mode: infino::ReindexMode
 pub infino::ReindexOptions::stale_seal_timeout_ms: core::option::Option<u64>
 pub infino::ReindexOptions::target: infino::ReindexTarget
-pub infino::ReindexOptions::trust_writer_analysis: bool
 impl infino::ReindexOptions
 pub fn infino::ReindexOptions::reanalyzing() -> Self
 pub fn infino::ReindexOptions::rewriting() -> Self
-pub fn infino::ReindexOptions::trusting_writer_analysis(self) -> Self
 pub fn infino::ReindexOptions::with_mode(self, infino::ReindexMode) -> Self
 pub fn infino::ReindexOptions::with_stale_seal_timeout_ms(self, u64) -> Self
 pub fn infino::ReindexOptions::with_target(self, infino::ReindexTarget) -> Self

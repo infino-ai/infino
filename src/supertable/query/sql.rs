@@ -569,7 +569,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::tokenize::{ASCII_LOWER_TOKENIZER, MAX_TOKEN_CHARS, STANDARD_TOKENIZER},
+            fts::{analysis::Stemmer, tokenize::MAX_TOKEN_CHARS},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -585,10 +585,10 @@ mod tests {
     /// Titles for the `LIKE` oracle, chosen so the index superset and the
     /// exact match differ: `fox` as a whole word, as a head (`foxes`), a
     /// tail (`firefox`), an infix (`outfoxed`), glued to punctuation the
-    /// analyzers treat differently (`a.fox.b`, `don't`), capitalised
-    /// (`LIKE` is case-sensitive, the index is not), inside a run the
-    /// default analyzer drops (`Firefox—the`), and a Greek word whose final
-    /// sigma lowercases by position.
+    /// word rules join (`a.fox.b`, `don't`), capitalised (`LIKE` is
+    /// case-sensitive, the index is not), beside non-ASCII punctuation
+    /// (`Firefox—the`), and a Greek word whose final sigma lowercases by
+    /// position.
     const LIKE_TITLES: &[&str] = &[
         "firefox browser",
         "the fox jumped",
@@ -632,10 +632,8 @@ mod tests {
     /// ways: a long s (`ſun riſe`, which Arrow matches against `sun`), a
     /// Kelvin sign U+212A (written as an escape — the glyph passes for an
     /// ASCII `K`, which would make every Kelvin case here vacuous: `Kelvin
-    /// K`, matched against `k`; `K b`, whose only `k` is the sign — under
-    /// `ascii_lower` that run is dropped and only `b` is indexed, so
-    /// requiring `k` of the row would lose it), and Greek with a final
-    /// sigma, beside plain mixed case.
+    /// K`, matched against `k`; `K b`, whose only `k` is the sign), and
+    /// Greek with a final sigma, beside plain mixed case.
     const FOLD_TITLES: &[&str] = &[
         "sun set",
         "SUN RISE",
@@ -743,7 +741,7 @@ mod tests {
     }
 
     fn options_id_cat_title() -> SupertableOptions {
-        options_id_cat_title_with(ASCII_LOWER_TOKENIZER)
+        options_id_cat_title_with(Stemmer::None)
     }
 
     /// Single-threaded writer pool so each commit produces exactly one
@@ -757,11 +755,11 @@ mod tests {
         )
     }
 
-    /// [`options_id_cat_title`] with `title` analyzed by the named analyzer.
-    fn options_id_cat_title_with(analyzer: &str) -> SupertableOptions {
+    /// [`options_id_cat_title`] with `title` stemmed by `stemmer`.
+    fn options_id_cat_title_with(stemmer: Stemmer) -> SupertableOptions {
         SupertableOptions::new(
             schema_id_cat_title(),
-            vec![FtsConfig::new("title").analyzer(analyzer)],
+            vec![FtsConfig::new("title").stemmer(stemmer)],
             vec![],
         )
         .expect("valid options")
@@ -775,28 +773,17 @@ mod tests {
     // reader. The returned `TempDir` guard must be held: dropping it deletes the
     // store the reader is still reading through.
     fn zero_gate_reader_after_ingest(batch: &RecordBatch) -> (tempfile::TempDir, Supertable) {
-        zero_gate_reader_after_ingest_with(batch, ASCII_LOWER_TOKENIZER)
-    }
-
-    /// [`zero_gate_reader_after_ingest`] with `title` analyzed by the named
-    /// analyzer.
-    fn zero_gate_reader_after_ingest_with(
-        batch: &RecordBatch,
-        analyzer: &str,
-    ) -> (tempfile::TempDir, Supertable) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
 
-        let ingest = Supertable::create(
-            options_id_cat_title_with(analyzer).with_storage(Arc::clone(&storage)),
-        )
-        .expect("create");
+        let ingest = Supertable::create(options_id_cat_title().with_storage(Arc::clone(&storage)))
+            .expect("create");
         let mut w = ingest.writer().expect("writer");
         w.append(batch).expect("append");
         w.commit().expect("commit");
 
-        let mut qopts = options_id_cat_title_with(analyzer).with_storage(storage);
+        let mut qopts = options_id_cat_title().with_storage(storage);
         qopts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
         (dir, Supertable::open(qopts).expect("open"))
     }
@@ -1192,10 +1179,8 @@ mod tests {
         // The exact path charges its term values, postings and bitsets to the
         // connection budget while the plan is built, so its refusal comes out
         // of planning, and it is a budget refusal there too, not a plan error.
-        let (_dir, st) = zero_gate_reader_after_ingest_with(
-            &build_cat_batch(0, &["x", "y"], &["BBC News", "other"]),
-            STANDARD_TOKENIZER,
-        );
+        let (_dir, st) =
+            zero_gate_reader_after_ingest(&build_cat_batch(0, &["x", "y"], &["BBC News", "other"]));
         let err = st
             .reader()
             .expect("reader")
@@ -1901,16 +1886,14 @@ mod tests {
     }
 
     #[test]
-    fn query_sql_like_matches_a_brute_force_oracle_under_both_analyzers() {
-        // The index bounds a LIKE differently per analyzer (the default
-        // one only through complete tokens, `standard` through prefix /
-        // suffix / infix expansion), and every bound is a superset the
-        // FilterExec narrows. Whatever the plan, the rows must be exactly
-        // the textbook LIKE matches — checked against an independent
-        // oracle for every pattern under both analyzers.
-        let analyzers = [ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER];
-        for name in analyzers {
-            let st = Supertable::create(options_id_cat_title_with(name)).expect("create");
+    fn query_sql_like_matches_a_brute_force_oracle_with_and_without_a_chain() {
+        // The index bounds a LIKE on a plain column through prefix /
+        // suffix / infix expansion and leaves a stemmed one unbounded;
+        // every bound is a superset the FilterExec narrows. Whatever the
+        // plan, the rows must be exactly the textbook LIKE matches —
+        // checked against an independent oracle for every pattern on both.
+        for stemmer in [Stemmer::None, Stemmer::English] {
+            let st = Supertable::create(options_id_cat_title_with(stemmer)).expect("create");
             let mut w = st.writer().expect("writer");
             let titles = with_walk_filler(LIKE_TITLES);
             let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
@@ -1934,7 +1917,7 @@ mod tests {
                     .expect("query");
                 let got = title_set(&batches);
                 let got: HashSet<&str> = got.iter().map(String::as_str).collect();
-                assert_eq!(got, expected, "LIKE {pattern:?} under {name}");
+                assert_eq!(got, expected, "LIKE {pattern:?} under {stemmer:?}");
             }
         }
     }
@@ -1992,10 +1975,10 @@ mod tests {
         // plain in-memory table: whatever Arrow's `LIKE` / `ILIKE` kernels
         // decide — including the long s and the Kelvin sign that Unicode
         // case folding matches against `s` and `k` — the index-bounded
-        // plan must return exactly that, under both analyzers.
+        // plan must return exactly that, with and without a stemmer.
         let rt = Runtime::new().expect("runtime");
-        let analyzers = [ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER];
-        for name in analyzers {
+        for stemmer in [Stemmer::None, Stemmer::English] {
+            let name = &format!("{stemmer:?}");
             let titles = with_walk_filler(FOLD_TITLES);
             let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
             let cats: Vec<&str> = title_refs.iter().map(|_| "x").collect();
@@ -2008,7 +1991,7 @@ mod tests {
             // Two superfiles: the second holds only rows whose every
             // spelling an ASCII token misses, so an unsound term-bloom or
             // term-range leaf would prune it whole and lose its rows.
-            let st = Supertable::create(options_id_cat_title_with(name)).expect("create");
+            let st = Supertable::create(options_id_cat_title_with(stemmer)).expect("create");
             let mut w = st.writer().expect("writer");
             w.append(&batch).expect("append");
             w.commit().expect("commit");
@@ -2066,8 +2049,9 @@ mod tests {
             ("ILIKE", format!("%{long_word}%")),
             ("LIKE", format!("%{long_word}")),
         ];
-        for name in [ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER] {
-            let st = Supertable::create(options_id_cat_title_with(name)).expect("create");
+        for stemmer in [Stemmer::None, Stemmer::English] {
+            let name = &format!("{stemmer:?}");
+            let st = Supertable::create(options_id_cat_title_with(stemmer)).expect("create");
             let mut w = st.writer().expect("writer");
             w.append(&batch).expect("append");
             w.commit().expect("commit");
@@ -2131,12 +2115,12 @@ mod tests {
         "%\u{17F}un%",
     ];
 
-    /// The fixture committed as [`EXACT_FIXTURE_COMMITS`] superfiles under
-    /// analyzer `name`, categories alternating `x` / `y`, and a DataFusion
-    /// oracle over the same rows.
-    fn exact_ilike_table(name: &str) -> (Supertable, SessionContext) {
+    /// The fixture committed as [`EXACT_FIXTURE_COMMITS`] superfiles with
+    /// `title` stemmed by `stemmer`, categories alternating `x` / `y`, and a
+    /// DataFusion oracle over the same rows.
+    fn exact_ilike_table(stemmer: Stemmer) -> (Supertable, SessionContext) {
         let titles = exact_ilike_titles();
-        let st = Supertable::create(options_id_cat_title_with(name)).expect("create");
+        let st = Supertable::create(options_id_cat_title_with(stemmer)).expect("create");
         let mut batches = Vec::new();
         let mut offset = 0;
         for chunk in titles.chunks(titles.len().div_ceil(EXACT_FIXTURE_COMMITS)) {
@@ -2163,11 +2147,12 @@ mod tests {
         // `col ILIKE '%word%'` on a `standard` column is answered from the
         // dictionary and reported exact, so nothing re-checks it: every
         // shape of query over it must still return exactly DataFusion's
-        // rows, as must every control that stays verified, under both
-        // analyzers.
+        // rows, as must every control that stays verified, with and
+        // without a stemmer.
         let rt = Runtime::new().expect("runtime");
-        for name in [STANDARD_TOKENIZER, ASCII_LOWER_TOKENIZER] {
-            let (st, oracle) = exact_ilike_table(name);
+        for stemmer in [Stemmer::None, Stemmer::English] {
+            let name = &format!("{stemmer:?}");
+            let (st, oracle) = exact_ilike_table(stemmer);
             for pattern in EXACT_ILIKE_PATTERNS {
                 let like = format!("title ILIKE '{pattern}'");
                 for sql in [
@@ -2206,7 +2191,7 @@ mod tests {
         // An exact filter leaves nothing in the plan that evaluates it: no
         // `FilterExec`, no pruning predicate. A verified one shows up in one
         // of those, as `ILIKE`.
-        let (st, oracle) = exact_ilike_table(STANDARD_TOKENIZER);
+        let (st, oracle) = exact_ilike_table(Stemmer::None);
         for sql in [
             "SELECT title FROM supertable WHERE title ILIKE '%bbc%'",
             "SELECT COUNT(*) FROM supertable WHERE title ILIKE '%bbc%'",
@@ -2236,8 +2221,8 @@ mod tests {
         );
         assert!(mixed.contains("category@"), "{mixed}");
         // Every control keeps its check, and so does a cast column; under
-        // another analyzer nothing is exact.
-        let (ascii, _) = exact_ilike_table(ASCII_LOWER_TOKENIZER);
+        // an analysis chain nothing is exact.
+        let (stemmed, _) = exact_ilike_table(Stemmer::English);
         for (table, sql) in [
             (&st, "SELECT title FROM supertable WHERE title ILIKE 'bbc%'"),
             (&st, "SELECT title FROM supertable WHERE title ILIKE '%bbc'"),
@@ -2258,7 +2243,7 @@ mod tests {
                 "SELECT title FROM supertable WHERE CAST(title AS VARCHAR) ILIKE '%bbc%'",
             ),
             (
-                &ascii,
+                &stemmed,
                 "SELECT title FROM supertable WHERE title ILIKE '%bbc%'",
             ),
         ] {
@@ -2299,8 +2284,9 @@ mod tests {
     #[test]
     fn query_sql_exact_ilike_trees_match_datafusion_on_a_memtable() {
         let rt = Runtime::new().expect("runtime");
-        for name in [STANDARD_TOKENIZER, ASCII_LOWER_TOKENIZER] {
-            let (st, oracle) = exact_ilike_table(name);
+        for stemmer in [Stemmer::None, Stemmer::English] {
+            let name = &format!("{stemmer:?}");
+            let (st, oracle) = exact_ilike_table(stemmer);
             for tree in EXACT_ILIKE_TREES {
                 for sql in [
                     format!("SELECT title FROM supertable WHERE {tree}"),
@@ -2317,7 +2303,7 @@ mod tests {
 
     #[test]
     fn an_exact_ilike_tree_is_checked_nowhere_and_a_mixed_one_keeps_its_check() {
-        let (st, _) = exact_ilike_table(STANDARD_TOKENIZER);
+        let (st, _) = exact_ilike_table(Stemmer::None);
         for tree in &EXACT_ILIKE_TREES[..6] {
             assert_answered_exactly(&st, &format!("SELECT title FROM supertable WHERE {tree}"));
         }
@@ -2388,10 +2374,7 @@ mod tests {
         let st = Supertable::create(
             SupertableOptions::new(
                 schema_title_body(),
-                vec![
-                    FtsConfig::new("title").analyzer(STANDARD_TOKENIZER),
-                    FtsConfig::new("body").analyzer(STANDARD_TOKENIZER),
-                ],
+                vec![FtsConfig::new("title"), FtsConfig::new("body")],
                 vec![],
             )
             .expect("valid options")
@@ -2511,7 +2494,7 @@ mod tests {
     /// narrow one with two such terms (plus the filler rows that let it
     /// walk its dictionary).
     fn mixed_like_table() -> Supertable {
-        let st = Supertable::create(options_id_cat_title_with(STANDARD_TOKENIZER)).expect("create");
+        let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         let filler = WALK_FILLER_WORDS.join(" ");
         let wide: Vec<String> = (0..OVER_CAP_ROWS)

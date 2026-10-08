@@ -7,9 +7,17 @@
 //! type without circular imports; the constructors are in the
 //! modules that produce each error.
 
+use std::error::Error as StdError;
+
 use thiserror::Error;
 
-use crate::superfile::LazyByteSourceError;
+use crate::{
+    storage::error_chain,
+    superfile::{
+        LazyByteSourceError,
+        format::fts::{REPAIR_RELEASE, VERSION_MIN_RELEASE},
+    },
+};
 
 /// Errors that can occur while building a superfile.
 #[derive(Debug, Error)]
@@ -34,13 +42,6 @@ pub enum BuildError {
 
     #[error("duplicate column name {0:?}")]
     DuplicateColumnName(String),
-
-    #[error(
-        "FTS column {column:?}: unknown analyzer {analyzer:?} (valid: \
-         \"standard\", \"ascii_lower\"; stopwords and stemming are \
-         separate options, not part of this name)"
-    )]
-    UnknownAnalyzer { column: String, analyzer: String },
 
     #[error("logical name {0:?} duplicated across fts_columns and vector_columns")]
     DuplicateLogicalName(String),
@@ -146,6 +147,14 @@ pub enum ReadError {
     #[error("this read does not support the column's codec: {0}")]
     WrongCodecPath(String),
 
+    #[error(
+        "FTS column {column:?} uses the removed {analyzer:?} analyzer; copy the \
+         table's rows out with infino {repair_release} before upgrading, then \
+         re-create it under \"standard\"",
+        repair_release = REPAIR_RELEASE
+    )]
+    RemovedAnalyzer { column: String, analyzer: String },
+
     #[error("io error during read: {0}")]
     Io(#[from] std::io::Error),
 
@@ -202,6 +211,31 @@ impl ReadError {
             _ => false,
         }
     }
+
+    /// Whether this, or the read error an FTS error wraps, is a superfile in
+    /// a format this engine does not read: a full-text index older than it
+    /// reads, or one under a removed analyzer. Neither a retry nor a
+    /// different query can help; the message says what does.
+    pub(crate) fn is_unreadable_format(&self) -> bool {
+        match self {
+            ReadError::RemovedAnalyzer { .. } => true,
+            ReadError::Fts(f) => match f.as_ref() {
+                FtsError::IndexTooOld { .. } => true,
+                FtsError::Read(r) => r.is_unreadable_format(),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+/// Whether a [`ReadError`] anywhere under `e` is
+/// [unreadable](ReadError::is_unreadable_format), for classifying a failure
+/// that wrapped a superfile read (a cache or compaction open) by its cause.
+pub(crate) fn unreadable_format_in_chain(e: &(dyn StdError + 'static)) -> bool {
+    error_chain(e)
+        .filter_map(|link| link.downcast_ref::<ReadError>())
+        .any(ReadError::is_unreadable_format)
 }
 
 impl From<FtsError> for ReadError {
@@ -287,6 +321,20 @@ pub enum FtsError {
     /// `InfinoError::OverBudget` via [`FtsError::over_budget`].
     #[error("{0}")]
     OverBudget(String),
+
+    /// The full-text index blob is older than the oldest version this
+    /// engine reads (`format::fts::VERSION_MIN`). Rewriting the table's
+    /// indexes with an engine that reads both versions brings it forward;
+    /// nothing a query does can.
+    #[error(
+        "full-text index (blob version {version}) was written by infino < {min_release}; \
+         reindex the table with infino {repair_release} before upgrading; for a \
+         table that uses the `ascii_lower` analyzer, copy its rows out with that \
+         release instead and re-create it under `standard`",
+        min_release = VERSION_MIN_RELEASE,
+        repair_release = REPAIR_RELEASE
+    )]
+    IndexTooOld { version: u32 },
 
     #[error("read error: {0}")]
     Read(#[from] ReadError),

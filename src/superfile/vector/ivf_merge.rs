@@ -14,32 +14,35 @@ use bytemuck::cast_slice;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
-use crate::superfile::{
-    BuildError,
-    builder::survivor_rows,
-    format::{
-        CRC_BYTES,
-        checksum::crc32c,
-        vec::{
-            CLUSTER_IDX_ENTRY_BYTES, DOC_ID_BYTES, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES,
-            U64_BYTES, sub_hdr,
+use crate::{
+    superfile::{
+        BuildError,
+        builder::survivor_rows,
+        format::{
+            CRC_BYTES,
+            checksum::crc32c,
+            vec::{
+                CLUSTER_IDX_ENTRY_BYTES, DOC_ID_BYTES, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES,
+                U64_BYTES, sub_hdr,
+            },
+        },
+        id_space::RowId,
+        vector::{
+            builder::{
+                IvfSubsectionLayout, alloc_ivf_subsection_with_header, centroid_storage_order,
+                effective_cell_n_cent, fixed_sq8_quantizer, write_ivf_cluster_blocks,
+            },
+            cell_posting::{EncodedCellRow, sq8_quant_params_equal},
+            distance::{
+                Metric, add_weighted_f32_to_f64_acc, decode_f32_le_into, decode_f32_le_vec,
+                f64_acc_mean_into_f32, mean_f32_cluster_major,
+            },
+            quant::BitQuantizer,
+            reader::{VectorReader, read_cluster_entry},
+            rerank_codec::RerankCodec,
         },
     },
-    id_space::RowId,
-    vector::{
-        builder::{
-            IvfSubsectionLayout, alloc_ivf_subsection_with_header, centroid_storage_order,
-            effective_cell_n_cent, fixed_sq8_quantizer, write_ivf_cluster_blocks,
-        },
-        cell_posting::{EncodedCellRow, sq8_quant_params_equal},
-        distance::{
-            Metric, add_weighted_f32_to_f64_acc, decode_f32_le_into, decode_f32_le_vec,
-            f64_acc_mean_into_f32, mean_f32_cluster_major,
-        },
-        quant::BitQuantizer,
-        reader::{VectorReader, read_cluster_entry},
-        rerank_codec::RerankCodec,
-    },
+    utils::trace::{detail_span, record},
 };
 
 /// Read a fragment's stable id at `src_local` (a doc id decoded from stored
@@ -193,6 +196,14 @@ pub(crate) fn merge_sq8_ivf_subsections(
             "merge requires at least one IVF input".into(),
         ));
     }
+    // Each input's subsection is copied out of its reader here, so this
+    // phase's time and `copied_bytes` show what the copy costs.
+    let parse_span = detail_span!(
+        "ivf_merge.copy_inputs",
+        inputs = inputs.len(),
+        copied_bytes = tracing::field::Empty,
+    )
+    .entered();
     let parsed: Vec<Sq8IvfMergeInput> = inputs
         .iter()
         .map(|(r, col, off, deleted)| {
@@ -203,7 +214,21 @@ pub(crate) fn merge_sq8_ivf_subsections(
             Ok(inp)
         })
         .collect::<Result<_, BuildError>>()?;
-    merge_sq8_ivf_subsections_from_parsed(&parsed)
+    record(
+        "copied_bytes",
+        parsed.iter().map(|p| p.sub.len() as u64).sum::<u64>(),
+    );
+    drop(parse_span);
+
+    let _splice_span = detail_span!(
+        "ivf_merge.splice",
+        n_cent = parsed[0].n_cent,
+        out_bytes = tracing::field::Empty,
+    )
+    .entered();
+    let merged = merge_sq8_ivf_subsections_from_parsed(&parsed)?;
+    record("out_bytes", merged.bytes.len() as u64);
+    Ok(merged)
 }
 
 /// Same as [`merge_sq8_ivf_subsections`], but takes already-parsed cell IVFs

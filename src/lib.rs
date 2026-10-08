@@ -197,7 +197,7 @@ pub use superfile::{
     fts::{
         analysis::{Stemmer, Stopwords},
         bm25::Bm25Params,
-        reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
+        reader::{Bm25SearchOptions, BoolMode},
     },
     vector::{distance::Metric, rerank_codec::RerankCodec},
 };

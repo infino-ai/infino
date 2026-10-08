@@ -21,9 +21,7 @@
 //!   (`stored_len`): exact below 16 tokens, truncated downward by up to
 //!   one bucket above. On a corpus with realistic length variation this
 //!   reorders near-ties.
-//! * **Statistics scope.** Under [`Bm25Stats::PerSuperfile`] each
-//!   superfile scores with its own document count and term frequencies.
-//!   Under [`Bm25Stats::Global`] idf is table-wide, and each superfile
+//! * **Average length.** idf is table-wide, but each superfile
 //!   normalizes lengths with the average it *declares*: the table-wide
 //!   average as of its commit (every superfile already committed plus its
 //!   own documents), rounded to the fixed point the file stores. A file
@@ -39,10 +37,9 @@
 //!
 //! | column | definition |
 //! |---|---|
-//! | recall vs BM25 | engine top-k under `Global` graded against T — the user-facing quality, including the quantization and average-length costs |
-//! | recall (per-superfile stats) | the same under `PerSuperfile` — the opt-in mode's sharded-idf drift |
-//! | recall vs engine BM25 | engine top-k under `Global` graded against Q — must be 1.0; a drop is a kernel or pruning bug. **Gated.** |
-//! | max score Δ | largest relative gap between an engine score and Q for the same document (`Global`). **Gated** at f32 noise. |
+//! | recall vs BM25 | engine top-k graded against T — the user-facing quality, including the quantization and average-length costs |
+//! | recall vs engine BM25 | engine top-k graded against Q — must be 1.0; a drop is a kernel or pruning bug. **Gated.** |
+//! | max score Δ | largest relative gap between an engine score and Q for the same document. **Gated** at f32 noise. |
 //! | count | the unranked count kernels' answer against the oracle's match count. **Gated** equal where the tier's count surface expresses the shape. |
 //! | order | hits must come back in descending engine score, and adjacent pairs must agree with Q's order beyond the tie tolerance. **Gated** at zero faults. |
 //!
@@ -91,7 +88,7 @@ use infino::{
         format::fts::DOC_LENGTH_STORED_MAX,
         fts::{
             bm25::{stored_avgdl, stored_len},
-            reader::{Bm25Stats, BoolMode, ColumnLengthStats, FtsReader},
+            reader::{BoolMode, ColumnLengthStats, FtsReader},
             tokenize::Tokenizer,
         },
     },
@@ -128,13 +125,13 @@ const B: f64 = 0.75;
 const TIE_TOLERANCE: f64 = 1e-4;
 
 /// Gate: every query × k must reach this recall against the engine-model
-/// reference (Q) under `Global` statistics. Q is exact, so every expected
+/// reference (Q). Q is exact, so every expected
 /// slot must be filled; a miss is a document the formula the kernels
 /// implement would not have returned.
 const MIN_ENGINE_MODEL_RECALL: f64 = 1.0;
 
 /// Gate: the largest relative gap between an engine score and Q over the
-/// returned documents, under `Global`. Q reproduces every input the engine
+/// returned documents. Q reproduces every input the engine
 /// scores with (table-wide idf, the stored length, the declared average),
 /// so what remains is f32 arithmetic: idf and the length normalizer held
 /// as `f32`, the per-term sum accumulated in `f32`. Those are parts per
@@ -1021,19 +1018,17 @@ struct EngineHit {
 }
 
 /// One tier's answers to the battery. `hits` returns the ranked hits at
-/// `k` under `stats`, or `None` where the tier cannot express the shape
-/// (the superfile tier has no query-time parameter override); `count`
-/// returns the unranked match count, or `None` where the tier's count
-/// surface cannot express the shape. `per_superfile_stats` adds the
-/// opt-in statistics scope's column.
+/// `k`, or `None` where the tier cannot express the shape (the superfile
+/// tier has no query-time parameter override); `count` returns the
+/// unranked match count, or `None` where the tier's count surface cannot
+/// express the shape.
 struct TierSurface<'a> {
     hits: &'a HitSource<'a>,
     count: &'a CountSource<'a>,
-    per_superfile_stats: bool,
 }
 
-/// A tier's ranked hits for a shape at `k` under a statistics scope.
-type HitSource<'a> = dyn Fn(&QualityQuery, usize, Bm25Stats) -> Option<Vec<EngineHit>> + 'a;
+/// A tier's ranked hits for a shape at `k`.
+type HitSource<'a> = dyn Fn(&QualityQuery, usize) -> Option<Vec<EngineHit>> + 'a;
 /// A tier's unranked match count for a shape.
 type CountSource<'a> = dyn Fn(&QualityQuery) -> Option<u64> + 'a;
 
@@ -1046,9 +1041,8 @@ fn supertable_hits(
     column: &str,
     q: &QualityQuery,
     k: usize,
-    stats: Bm25Stats,
 ) -> Vec<EngineHit> {
-    let mut options = Bm25SearchOptions::new().with_mode(q.mode).with_stats(stats);
+    let mut options = Bm25SearchOptions::new().with_mode(q.mode);
     if let Some(pair) = q.bm25 {
         options = options.with_bm25(pair.k1 as f32, pair.b as f32);
     }
@@ -1185,8 +1179,6 @@ pub struct GradedRow {
     pub k: usize,
     pub n_matches: usize,
     pub recall_textbook: f64,
-    /// `None` on the superfile tier, where statistics have one scope.
-    pub recall_per_superfile_stats: Option<f64>,
     pub recall_engine_model: f64,
     pub max_delta: f64,
     /// The engine's unranked match count, where the tier's count surface
@@ -1266,7 +1258,7 @@ fn grade_with(
         let engine_model_of = |row| oracle.score_row(row, &rq).map(|(_, e)| e);
         for (ki, &k) in QUALITY_KS.iter().enumerate() {
             let expected = k.min(top.n_matches);
-            let Some(global) = (tier.hits)(q, k, Bm25Stats::Global) else {
+            let Some(hits) = (tier.hits)(q, k) else {
                 eprintln!(
                     "[{log_prefix}] quality: shape {} is not expressible on this tier; skipped",
                     q.name
@@ -1274,33 +1266,20 @@ fn grade_with(
                 break;
             };
             let recall_textbook = tie_aware_recall(
-                &global,
+                &hits,
                 expected,
                 top.textbook_kth[ki],
                 TIE_TOLERANCE,
                 textbook_of,
             );
-            let recall_per_superfile_stats = tier
-                .per_superfile_stats
-                .then(|| (tier.hits)(q, k, Bm25Stats::PerSuperfile))
-                .flatten()
-                .map(|per_superfile| {
-                    tie_aware_recall(
-                        &per_superfile,
-                        expected,
-                        top.textbook_kth[ki],
-                        TIE_TOLERANCE,
-                        textbook_of,
-                    )
-                });
             let recall_engine_model = tie_aware_recall(
-                &global,
+                &hits,
                 expected,
                 top.engine_model_kth[ki],
                 TIE_TOLERANCE,
                 engine_model_of,
             );
-            let max_delta = global
+            let max_delta = hits
                 .iter()
                 .map(|h| match engine_model_of(h.row) {
                     Some(e) => (h.score - e).abs() / e.max(MIN_SCORE_FOR_RELATIVE_DELTA),
@@ -1312,19 +1291,17 @@ fn grade_with(
                 k,
                 n_matches: top.n_matches,
                 recall_textbook,
-                recall_per_superfile_stats,
                 recall_engine_model,
                 max_delta,
                 count,
-                order_faults: order_faults(&global, engine_model_of),
+                order_faults: order_faults(&hits, engine_model_of),
             });
         }
     }
     rows
 }
 
-/// Grade through a supertable reader's public search and count paths,
-/// under both statistics scopes.
+/// Grade through a supertable reader's public search and count paths.
 pub fn grade(
     oracle: &Oracle,
     reader: &SupertableReader,
@@ -1334,7 +1311,7 @@ pub fn grade(
     log_prefix: &str,
 ) -> Vec<GradedRow> {
     let tier = TierSurface {
-        hits: &|q, k, stats| Some(supertable_hits(reader, column, q, k, stats)),
+        hits: &|q, k| Some(supertable_hits(reader, column, q, k)),
         count: &|q| {
             Some(
                 reader
@@ -1342,7 +1319,6 @@ pub fn grade(
                     .expect("quality count"),
             )
         },
-        per_superfile_stats: true,
     };
     grade_with(oracle, tokenizer, battery, &tier, log_prefix)
 }
@@ -1357,7 +1333,7 @@ pub fn grade_superfile(
     log_prefix: &str,
 ) -> Vec<GradedRow> {
     let tier = TierSurface {
-        hits: &|q, k, _| {
+        hits: &|q, k| {
             q.bm25
                 .is_none()
                 .then(|| superfile_hits(reader, column, q, k))
@@ -1369,7 +1345,6 @@ pub fn grade_superfile(
                 .expect("quality token_match_count");
             Some(count)
         },
-        per_superfile_stats: false,
     };
     grade_with(oracle, tokenizer, battery, &tier, log_prefix)
 }
@@ -1537,7 +1512,6 @@ pub fn run(
         "each superfile's declared average, both read back from the table and verified against \
          the oracle's own tokenization",
         &rows,
-        true,
     );
     assert_gates(&rows, log_prefix);
 }
@@ -1605,30 +1579,18 @@ pub fn run_superfile(
         "the file's own declared average, both read back from the file and verified against the \
          oracle's own tokenization",
         &rows,
-        false,
     );
     assert_gates(&rows, log_prefix);
 }
 
 /// Emit one tier's quality section. `engine_avgdl` names the average
-/// length Q normalizes with on that tier, for the note; `per_superfile`
-/// adds the opt-in statistics scope's column.
-fn emit(
-    report: &mut Report,
-    anchor: &str,
-    title: String,
-    engine_avgdl: &str,
-    rows: &[GradedRow],
-    per_superfile: bool,
-) {
+/// length Q normalizes with on that tier, for the note.
+fn emit(report: &mut Report, anchor: &str, title: String, engine_avgdl: &str, rows: &[GradedRow]) {
     let mut headers = vec![
         "Query".to_string(),
         "matches".to_string(),
         "recall vs BM25".to_string(),
     ];
-    if per_superfile {
-        headers.push("recall (per-superfile stats)".to_string());
-    }
     headers.push("recall vs engine BM25".to_string());
     headers.push("max score Δ".to_string());
     headers.push("count".to_string());
@@ -1647,12 +1609,6 @@ fn emit(
                         text(fmt_count(r.n_matches)),
                         recall_cell(r.recall_textbook, r.k >= TEXTBOOK_FLOOR_MIN_K),
                     ];
-                    if per_superfile {
-                        cells.push(match r.recall_per_superfile_stats {
-                            Some(recall) => recall_cell(recall, false),
-                            None => text("–"),
-                        });
-                    }
                     cells.push(recall_cell(r.recall_engine_model, true));
                     cells.push(metric(
                         r.max_delta,
@@ -1673,12 +1629,6 @@ fn emit(
                 .collect(),
         })
         .collect();
-    let per_superfile_note = if per_superfile {
-        " `recall (per-superfile stats)` = the same under segment-local `PerSuperfile` idf (the \
-         pre-0.7 default)."
-    } else {
-        ""
-    };
     report.emit(&Section {
         anchor: anchor.into(),
         title,
@@ -1688,7 +1638,7 @@ fn emit(
              `recall vs BM25` = textbook BM25 with exact doc lengths and the corpus-wide average \
              length — the user-facing quality, which pays for the one-byte length quantization \
              and for each file normalizing with the average it declares; a tripwire floor of \
-             {textbook_floor:.2} applies from k = {floor_k}.{per_superfile_note} \
+             {textbook_floor:.2} applies from k = {floor_k}. \
              `recall vs engine BM25` = BM25 with the engine's stored (quantized) lengths and \
              {engine_avgdl} — gated at {floor:.1}: a miss is a document the kernels' own formula \
              would not have returned. `max score Δ` = largest relative gap between an engine \
