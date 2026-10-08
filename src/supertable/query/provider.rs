@@ -24,9 +24,9 @@
 //!      `ParquetSource` via an in-memory object store. DataFusion's
 //!      own filter pushdown hands the `FilterExec` predicate to that
 //!      source, where `PruningPredicate` prunes row groups and pages.
-//!      A predicate the index could not bound is evaluated by
-//!      DataFusion's `FilterExec` above the scan, never as a Parquet
-//!      row filter inside it.
+//!      A predicate the index could not bound runs in DataFusion's
+//!      `FilterExec` above the scan, or as a Parquet row filter under
+//!      `ORDER BY ... LIMIT` (`RowFilterUnderTopK`).
 //!      We deliberately do **not** reimplement this commodity layer.
 //!
 //! Correctness is independent of either tier: every pushed filter
@@ -120,7 +120,7 @@ use crate::{
             df_object_store::SuperfileObjectStore,
             exec::{
                 common::{BoundPredicate, PushedPredicate, take_rows},
-                metered_exec::MeteredExec,
+                metered_exec::{MeteredExec, ScanFooters},
             },
             fts::{memos_from_plan_locations, plan_locations_for},
             prune::{PruneLeaf, select_superfiles},
@@ -257,7 +257,7 @@ pub(crate) struct SupertableProvider {
     /// a path→source map for every SQL statement.
     scan_store: Arc<SuperfileObjectStore>,
     /// Open-time Parquet metadata shared by every scan and residual provider.
-    scan_metas: Arc<DashMap<ObjPath, Arc<ParquetMetaData>>>,
+    scan_metas: Arc<ScanFooters>,
     /// Exact table-level low-cardinality frequencies, merged lazily per
     /// column from this provider's immutable manifest snapshot.
     scalar_value_counts: Arc<DashMap<String, Option<Arc<ScalarValueCounts>>>>,
@@ -1417,11 +1417,8 @@ impl TableProvider for SupertableProvider {
         //               (exact ones are not checked again)
         //
         // No predicate is attached to the source. DataFusion hands it the
-        // `FilterExec` predicate for statistics pruning only; it never runs as
-        // a Parquet row filter (`pushdown_filters` is pinned off on the SQL
-        // session). A row filter pays only when a predicate keeps a handful
-        // of rows. On one that keeps a few percent of rows spread over every
-        // row group it skips no page and costs a multiple of the plain scan.
+        // `FilterExec` predicate for statistics pruning, and as a row filter
+        // only under `ORDER BY ... LIMIT` (see `RowFilterUnderTopK`).
         let mut source = ParquetSource::new(Arc::clone(&self.schema));
         // Serve DataFusion's opener the index-complete footers the
         // readers already parsed — without this the opener re-reads +
@@ -1477,9 +1474,12 @@ impl TableProvider for SupertableProvider {
         let scan = DataSourceExec::from_data_source(config);
         let op_stats = self.scan_store.op_stats();
         Ok(if filters.is_empty() {
-            Arc::new(MeteredExec::new(scan, op_stats))
+            Arc::new(MeteredExec::new(scan, op_stats).with_footers(Arc::clone(&self.scan_metas)))
         } else {
-            Arc::new(MeteredExec::without_limit_pushdown(scan, op_stats))
+            Arc::new(
+                MeteredExec::without_limit_pushdown(scan, op_stats)
+                    .with_footers(Arc::clone(&self.scan_metas)),
+            )
         })
     }
 }
@@ -1601,7 +1601,7 @@ fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
 /// [`SuperfileReader`]: crate::superfile::SuperfileReader
 struct CachedMetadataReaderFactory {
     store: Arc<dyn OsObjectStore>,
-    metas: Arc<DashMap<ObjPath, Arc<ParquetMetaData>>>,
+    metas: Arc<ScanFooters>,
 }
 
 impl fmt::Debug for CachedMetadataReaderFactory {

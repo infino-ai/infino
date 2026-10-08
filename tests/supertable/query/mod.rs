@@ -19,4 +19,5 @@ mod stats_fold;
 mod stored_fields;
 mod term_stats;
 pub mod tombstone_filter;
+mod topk_row_filter;
 mod values_scalar_subquery;

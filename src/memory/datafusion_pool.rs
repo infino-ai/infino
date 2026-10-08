@@ -39,12 +39,16 @@ use datafusion::{
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
         session_state::SessionStateBuilder,
     },
+    physical_optimizer::optimizer::PhysicalOptimizer,
     prelude::{SessionConfig, SessionContext},
 };
 
 use crate::{
     memory::ConnectionMemoryBudget,
-    supertable::query::{sorted_root::KeepSortedRoot, values_subquery::ValuesSubqueryRewrite},
+    supertable::query::{
+        sorted_root::KeepSortedRoot, topk_row_filter::RowFilterUnderTopK,
+        values_subquery::ValuesSubqueryRewrite,
+    },
 };
 
 /// A DataFusion memory pool over a [`ConnectionMemoryBudget`]: measured never
@@ -146,25 +150,30 @@ pub(crate) fn budgeted_session_context(
         .execution
         .skip_partial_aggregation_probe_ratio_threshold = PARTIAL_AGG_SKIP_PROBE_RATIO;
 
-    // Predicates run in a `FilterExec` above the scan, never as Parquet row
-    // filters inside it (see `SupertableProvider::scan`). Pinned here because
-    // the source's own flag is ORed with this session option.
+    // Predicates run in a `FilterExec` above the scan, not as Parquet row
+    // filters, except under `ORDER BY ... LIMIT` (see `RowFilterUnderTopK`).
+    // Pinned off here because the scan's own flag is ORed with this option.
     config.options_mut().execution.parquet.pushdown_filters = false;
 
-    // Appended after DataFusion's own rules: the round-robin repartition it
-    // removes is one `EnforceDistribution` adds above a sorted result, which
-    // splits an `ORDER BY` back into partitions collected in completion order.
-    let state = SessionStateBuilder::new()
+    // DataFusion's rules, with ours at both ends:
+    //  - `RowFilterUnderTopK` first, so DataFusion's filter pushdown sees the
+    //    marked scans and drops their `FilterExec`.
+    //  - `KeepSortedRoot` last, to remove the round-robin repartition that
+    //    `EnforceDistribution` adds above a sorted result, which would return
+    //    an `ORDER BY` out of order.
+    let mut rules = PhysicalOptimizer::new().rules;
+    rules.insert(0, Arc::new(RowFilterUnderTopK));
+    rules.push(Arc::new(KeepSortedRoot));
+    let mut builder = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(budgeted_runtime(budget)?)
         .with_default_features()
         // A scalar subquery in a `VALUES` cell would be evaluated while the
         // list is planned, before the subquery has run; this plans such a
         // list as one-row projections instead (see the rule's module).
-        .with_optimizer_rule(Arc::new(ValuesSubqueryRewrite))
-        .with_physical_optimizer_rule(Arc::new(KeepSortedRoot))
-        .build();
-    Ok(SessionContext::new_with_state(state))
+        .with_optimizer_rule(Arc::new(ValuesSubqueryRewrite));
+    *builder.physical_optimizers() = Some(PhysicalOptimizer::with_rules(rules));
+    Ok(SessionContext::new_with_state(builder.build()))
 }
 
 #[cfg(test)]
