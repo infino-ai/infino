@@ -669,6 +669,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for infino::FieldPatch
 impl core::panic::unwind_safe::UnwindSafe for infino::FieldPatch
 pub struct infino::FtsField
 impl infino::FtsField
+pub fn infino::FtsField::analyzer(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::FtsField::bm25(self, f32, f32) -> Self
 pub fn infino::FtsField::new(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::FtsField::positions(self, bool) -> Self

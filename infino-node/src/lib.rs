@@ -47,10 +47,9 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError,
-    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
-    RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions,
-    SchemaPatch, Stemmer, Stopwords,
+    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError, InfinoError, Metric,
+    OptimizeError, OptimizeOptions as InfinoOptimizeOptions, RecalibratePolicy, ReindexError,
+    ReindexMode, ReindexOptions as InfinoReindexOptions, SchemaPatch, Stemmer, Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -84,9 +83,7 @@ fn map_err(e: InfinoError) -> Error {
         // The schema cause is typed on the Rust side; JS gets its message,
         // which names the column, cap or version at fault.
         InfinoError::Schema(e) => Error::new(Status::InvalidArg, e.to_string()),
-        InfinoError::Cardinality(m) | InfinoError::Query(m) => {
-            Error::new(Status::InvalidArg, m)
-        }
+        InfinoError::Cardinality(m) | InfinoError::Query(m) => Error::new(Status::InvalidArg, m),
         InfinoError::Io(m) | InfinoError::Backend(m) => Error::new(Status::GenericFailure, m),
         // A recoverable connection-memory-budget refusal. Prefixed with the same
         // name Python raises (`ConnectionMemoryBudgetError`) so the concept reads
@@ -767,6 +764,8 @@ struct FtsDecl {
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct FtsOptions {
+    /// Base tokenizer: `"standard"`, the default, is the only one.
+    pub analyzer: Option<String>,
     /// Remove this column's stopwords — the very common words whose
     /// presence says almost nothing about what a document is about.
     /// `"english"` is the only set; omit for none (the default).
@@ -853,6 +852,7 @@ impl IndexSpec {
         let mut spec = infino::IndexSpec::new();
         for FtsDecl { column, options } in &self.fts {
             let FtsOptions {
+                analyzer,
                 stopwords,
                 stemmer,
                 positions,
@@ -863,6 +863,9 @@ impl IndexSpec {
             let mut field = infino::FtsField::new(column.clone())
                 .positions(positions.unwrap_or(false))
                 .stored(stored.unwrap_or(true));
+            if let Some(name) = analyzer {
+                field = field.analyzer(name.clone());
+            }
             if let Some(name) = stopwords {
                 field = field.stopwords(stopwords_from_name(name)?);
             }

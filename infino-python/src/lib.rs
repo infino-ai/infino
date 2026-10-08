@@ -34,8 +34,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use infino::{
-    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
-    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
+    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, GcError,
+    InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
     ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions, SchemaPatch, Stemmer,
     Stopwords, VectorFilter,
 };
@@ -278,11 +278,12 @@ fn connect(
 }
 
 /// One declared FTS column, as its keyword arguments arrived.
-/// `stopwords` / `stemmer` `None` mean no filter;
-/// `k1` / `b` `None` mean the column takes the standard BM25 pair.
+/// `analyzer` `None` means `standard`; `stopwords` / `stemmer` `None`
+/// mean no filter; `k1` / `b` `None` mean the standard BM25 pair.
 #[derive(Clone)]
 struct FtsDecl {
     column: String,
+    analyzer: Option<String>,
     stopwords: Option<String>,
     stemmer: Option<String>,
     positions: bool,
@@ -332,6 +333,7 @@ impl IndexSpec {
 
     /// Mark `column` (a UTF-8 string column) as full-text indexed,
     /// tokenized by the Unicode-aware UAX #29 `standard` tokenizer.
+    /// `analyzer` names it; `"standard"`, the default, is the only one.
     /// `stored=False` makes the column index-only: searchable, but the
     /// raw text is never kept in the table, so it cannot be selected,
     /// projected, or filtered on (append/update batches still carry it).
@@ -369,10 +371,12 @@ impl IndexSpec {
     /// may still score with a different pair (see `bm25_search`), which
     /// is the shape to reach for while tuning; declare the pair here
     /// once it is settled.
+    // `analyzer` keeps its original slot so positional calls still bind.
     // The analysis options sit behind `*`, keyword-only, so a new option
     // can never reposition `stored` / `k1` / `b` for a positional caller.
     #[pyo3(signature = (
         column,
+        analyzer = None,
         stored = true,
         k1 = None,
         b = None,
@@ -385,6 +389,7 @@ impl IndexSpec {
     fn fts(
         &self,
         column: String,
+        analyzer: Option<String>,
         stored: bool,
         k1: Option<f32>,
         b: Option<f32>,
@@ -395,6 +400,7 @@ impl IndexSpec {
         let mut next = self.clone();
         next.fts.push(FtsDecl {
             column,
+            analyzer,
             stopwords,
             stemmer,
             positions,
@@ -422,6 +428,7 @@ impl IndexSpec {
         for decl in &self.fts {
             let FtsDecl {
                 column,
+                analyzer,
                 stopwords,
                 stemmer,
                 positions,
@@ -432,6 +439,9 @@ impl IndexSpec {
             let mut field = infino::FtsField::new(column.clone())
                 .positions(*positions)
                 .stored(*stored);
+            if let Some(name) = analyzer {
+                field = field.analyzer(name.clone());
+            }
             if let Some(name) = stopwords {
                 field = field.stopwords(stopwords_from_name(name)?);
             }

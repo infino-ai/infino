@@ -6,13 +6,17 @@
 //! [`Connection::create_table`](crate::Connection::create_table) alongside
 //! the Arrow schema.
 
-use crate::superfile::{
-    builder::FtsConfig,
-    fts::{
-        analysis::{Stemmer, Stopwords},
-        bm25::Bm25Params,
+use crate::{
+    InfinoError,
+    superfile::{
+        builder::FtsConfig,
+        fts::{
+            analysis::{Stemmer, Stopwords},
+            bm25::Bm25Params,
+            tokenize::STANDARD_TOKENIZER,
+        },
+        vector::{builder::VectorConfig, distance::Metric, rerank_codec::RerankCodec},
     },
-    vector::{builder::VectorConfig, distance::Metric, rerank_codec::RerankCodec},
 };
 
 /// Default rotation-matrix RNG seed for vector columns. The seed only
@@ -50,6 +54,7 @@ struct VectorIndex {
 #[derive(Debug, Clone)]
 pub struct FtsField {
     column: String,
+    analyzer: String,
     stopwords: Stopwords,
     stemmer: Stemmer,
     positions: bool,
@@ -65,12 +70,20 @@ impl FtsField {
     pub fn new(column: impl Into<String>) -> Self {
         Self {
             column: column.into(),
+            analyzer: STANDARD_TOKENIZER.to_string(),
             stopwords: Stopwords::None,
             stemmer: Stemmer::None,
             positions: false,
             stored: true,
             bm25: Bm25Params::STANDARD,
         }
+    }
+
+    /// Name the column's base tokenizer. `"standard"`, the default, is the
+    /// only one; any other name is refused at `create_table`.
+    pub fn analyzer(mut self, name: impl Into<String>) -> Self {
+        self.analyzer = name.into();
+        self
     }
 
     /// Remove this column's stopwords — the very common words whose
@@ -275,6 +288,17 @@ impl IndexSpec {
             rerank_codec: Some(rerank_codec),
         });
         self
+    }
+
+    /// Refuses an FTS column that names an analyzer other than `standard`.
+    pub(crate) fn check_analyzers(&self) -> Result<(), InfinoError> {
+        match self.fts.iter().find(|f| f.analyzer != STANDARD_TOKENIZER) {
+            Some(f) => Err(InfinoError::Config(format!(
+                "FTS column {:?}: unsupported analyzer {:?}; the only analyzer is {STANDARD_TOKENIZER:?}",
+                f.column, f.analyzer
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// FTS column names, in declaration order.

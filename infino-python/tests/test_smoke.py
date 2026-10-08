@@ -123,21 +123,21 @@ def test_fts_positional_arguments_keep_their_meaning():
     db = infino.connect("memory://")
     titles = ["the quick brown fox", "a lazy dog", "quick thinking about foxes"]
 
-    # Slot 2 is `stored`, so a bool is accepted there.
+    # Slot 3 is `stored`, so a bool is accepted there.
     index_only = db.create_table(
-        "index_only", _title_schema(), infino.IndexSpec().fts("title", False)
+        "index_only", _title_schema(), infino.IndexSpec().fts("title", "standard", False)
     )
     for title in titles:
         index_only.append(_title_batch([title]))
     # Searchable, since `stored` governs readback and not the index.
     assert index_only.bm25_search("title", "quick", 10).num_rows == 2
 
-    # Slots 3 and 4 are `k1` and `b`. Checked by ranking rather than by
+    # Slots 4 and 5 are `k1` and `b`. Checked by ranking rather than by
     # the call merely succeeding: two floats would be accepted by any
     # signature whose tail is float-shaped, so only the scores prove the
     # values landed on the parameters they were meant for.
     positional = db.create_table(
-        "positional", _title_schema(), infino.IndexSpec().fts("title", True, 1.6, 0.4)
+        "positional", _title_schema(), infino.IndexSpec().fts("title", "standard", True, 1.6, 0.4)
     )
     keyword = db.create_table(
         "keyword", _title_schema(), infino.IndexSpec().fts("title", k1=1.6, b=0.4)
@@ -239,10 +239,13 @@ def test_bm25_params_out_of_range_is_rejected():
             )
 
 
-def test_fts_takes_no_analyzer():
-    # There is no tokenizer to choose: `standard` analyzes every column.
-    with pytest.raises(TypeError):
-        infino.IndexSpec().fts("title", analyzer="standard")
+def test_fts_accepts_only_the_standard_analyzer():
+    db = infino.connect("memory://")
+    db.create_table("pinned", _title_schema(), infino.IndexSpec().fts("title", analyzer="standard"))
+    with pytest.raises(ValueError, match="ascii_lower"):
+        db.create_table(
+            "other", _title_schema(), infino.IndexSpec().fts("title", analyzer="ascii_lower")
+        )
 
 
 def test_connect_accepts_cache_options(tmp_path):

@@ -22,17 +22,15 @@ const durableTable = () =>
     new IndexSpec().fts("title"),
   );
 
-test("IndexSpec.fts refuses `analyzer`", () => {
-  assert.throws(() => new IndexSpec().fts("title", { analyzer: "standard" }), (e) => {
-    assert.ok(e instanceof TypeError);
-    assert.match(e.message, /IndexSpec\.fts: option `analyzer` is not supported/);
-    return true;
-  });
-});
-
-test("IndexSpec.fts refuses `analyzer` on a chained call", () => {
-  const spec = new IndexSpec().fts("title");
-  assert.throws(() => spec.fts("body", { analyzer: "ascii_lower" }), /option `analyzer`/);
+test("createTable accepts only the standard analyzer", () => {
+  const db = connect("memory://");
+  assert.doesNotThrow(() =>
+    db.createTable("pinned", titleSchema(), new IndexSpec().fts("title", { analyzer: "standard" })),
+  );
+  assert.throws(
+    () => db.createTable("other", titleSchema(), new IndexSpec().fts("title", { analyzer: "ascii_lower" })),
+    /unsupported analyzer "ascii_lower"/,
+  );
 });
 
 test("IndexSpec.fts still takes its current options", () => {

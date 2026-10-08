@@ -396,6 +396,9 @@ impl Connection {
     ) -> Result<Supertable, InfinoError> {
         validate_name(name).map_err(|e| e.with_context("create_table", Some(name)))?;
         validate_schema(&schema).map_err(|e| e.with_context("create_table", Some(name)))?;
+        indexes
+            .check_analyzers()
+            .map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
 
         match &self.inner.store {
@@ -1972,6 +1975,40 @@ mod tests {
             conn.open_table("docs"),
             Err(InfinoError::NotFound(_))
         ));
+    }
+
+    /// `standard` may be named explicitly; any other analyzer is refused
+    /// at create, naming the column.
+    #[test]
+    fn create_table_accepts_only_the_standard_analyzer() {
+        let conn = connect("memory://").expect("connect");
+        conn.create_table(
+            "pinned",
+            schema_id_title(),
+            IndexSpec::new().fts(FtsField::new("title").analyzer("standard")),
+        )
+        .expect("an explicit standard is accepted");
+
+        let err = conn
+            .create_table(
+                "other",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").analyzer("ascii_lower")),
+            )
+            .expect_err("a non-standard analyzer is refused");
+        assert!(matches!(err, InfinoError::Config(_)), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("title") && msg.contains("ascii_lower"),
+            "names the column and analyzer: {msg}"
+        );
+        assert!(
+            !conn
+                .list_tables()
+                .expect("list")
+                .contains(&"other".to_string()),
+            "a refused create registers nothing"
+        );
     }
 
     /// Stemming, end to end: one inflection finds the others because

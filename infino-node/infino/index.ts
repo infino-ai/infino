@@ -17,9 +17,6 @@ const STREAM = "stream";
 
 // Options the engine no longer takes, with what replaces each. The addon
 // drops unknown keys, so these throw rather than be silently ignored.
-const REMOVED_FTS_OPTIONS: Record<string, string> = {
-  analyzer: "every column uses the standard analyzer; tune it with `stopwords` and `stemmer`",
-};
 const REMOVED_SEARCH_OPTIONS: Record<string, string> = {
   stats: "BM25 statistics are always table-wide",
 };
@@ -37,13 +34,6 @@ function rejectRemovedOptions(call: string, opts: object | null | undefined, rem
   }
 }
 
-// `IndexSpec` is the addon's class, so its option check wraps the native method.
-const nativeFts = IndexSpec.prototype.fts;
-IndexSpec.prototype.fts = function (this: IndexSpec, column: string, options?: Parameters<typeof nativeFts>[1]) {
-  rejectRemovedOptions("IndexSpec.fts", options, REMOVED_FTS_OPTIONS);
-  return nativeFts.call(this, column, options);
-};
-
 // --- public types ---
 
 /** Vector distance metric. `l2` and `dot` are accepted spellings of `l2sq`
@@ -60,7 +50,7 @@ export type AppendData = RowRecord[] | arrow.Table | arrow.RecordBatch | Buffer 
 
 /** A column's index in the schema document: full-text or vector. */
 export type ColumnIndex =
-  | { kind: "fts"; stopwords?: string; stemmer?: string; positions: boolean; stored: boolean; k1: number; b: number }
+  | { kind: "fts"; analyzer: string; stopwords?: string; stemmer?: string; positions: boolean; stored: boolean; k1: number; b: number }
   | { kind: "vector"; metric: Metric; rot_seed: string; rerank_codec: string };
 /** One field of the schema document. `type` is the document's type vocabulary (`"i64"`, `"large_utf8"`, …); a vector column carries `dim`. */
 export interface SchemaField {
