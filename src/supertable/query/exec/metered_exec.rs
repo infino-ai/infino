@@ -47,7 +47,6 @@ use std::{
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use dashmap::DashMap;
 use datafusion::{
     common::{Statistics, config::ConfigOptions},
     error::{DataFusionError, Result as DfResult},
@@ -64,16 +63,14 @@ use datafusion::{
     },
 };
 use futures::Stream;
-use object_store::path::Path as ObjPath;
-use parquet::file::metadata::ParquetMetaData;
 
-use crate::runtime_metrics::{
-    cpu,
-    op_stats::{OpStatsCollector, OuterBracketGuard, metering_active, outer_bracket_active},
+use crate::{
+    runtime_metrics::{
+        cpu,
+        op_stats::{OpStatsCollector, OuterBracketGuard, metering_active, outer_bracket_active},
+    },
+    supertable::query::provider::ScanFooters,
 };
-
-/// The parsed footer of every superfile a table's scans have read, by path.
-pub(crate) type ScanFooters = DashMap<ObjPath, Arc<ParquetMetaData>>;
 
 /// Wraps `input`, metering every partition's poll time into `op_stats`.
 #[derive(Debug)]

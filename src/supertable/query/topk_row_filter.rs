@@ -25,33 +25,48 @@
 //!     `FilterExec`, which would hold rows back from the sort until it has a
 //!     full batch, so the cutoff would never tighten.
 //!   - walks down only through filters, projections and our scan meter. A join,
-//!     an aggregate or another sort stops it.
+//!     an aggregate or another sort stops it. Through a projection, a sort
+//!     column becomes the scan columns it's computed from (`length(s)` → `s`).
+//!   - skips the scan if part of the `WHERE` can't move into it, like
+//!     `random()` or a list column. That part stays in a `FilterExec`, which
+//!     holds rows back from the sort, so the cutoff never tightens.
 //!   - only fires for a `LIMIT` up to [`MAX_FETCH`]. A bigger limit keeps a
 //!     loose cutoff that drops few rows, and the row filter's second read pass
 //!     then costs more than it saves on object storage.
 //!   - only fires when the columns it can skip hold at least [`MIN_SKIP_RATIO`]
 //!     times the bytes of the sort's columns. The cutoff reads those anyway, so
 //!     a scan of small extra columns gains less than the second pass costs.
+//!     Bytes are uncompressed, as that's what decoding costs. A cold read pays
+//!     compressed bytes, so if the skipped columns compress well, the ratio
+//!     overstates what we save.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     datasource::{
-        physical_plan::{FileScanConfig, FileScanConfigBuilder, ParquetSource},
+        physical_plan::{
+            FileScanConfig, FileScanConfigBuilder, FileSource, ParquetSource,
+            parquet::can_expr_be_pushed_down_with_schemas,
+        },
         source::DataSourceExec,
     },
     error::Result as DfResult,
     object_store::path::Path as ObjPath,
-    physical_expr::utils::collect_columns,
+    physical_expr::{
+        PhysicalExpr,
+        utils::{collect_columns, split_conjunction},
+    },
+    physical_expr_common::physical_expr::is_volatile,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
         ExecutionPlan, filter::FilterExec, projection::ProjectionExec, sorts::sort::SortExec,
     },
 };
+use rustc_hash::FxHashSet;
 
-use crate::supertable::query::exec::metered_exec::{MeteredExec, ScanFooters};
+use crate::supertable::query::{exec::metered_exec::MeteredExec, provider::ScanFooters};
 
 /// Rule name, as DataFusion lists it in `EXPLAIN VERBOSE`.
 const RULE_NAME: &str = "RowFilterUnderTopK";
@@ -81,17 +96,13 @@ impl PhysicalOptimizerRule for RowFilterUnderTopK {
             else {
                 return Ok(Transformed::no(node));
             };
-            // Columns the cutoff reads.
-            let sort_columns: HashSet<String> = sort
-                .expr()
-                .iter()
-                .flat_map(|e| collect_columns(&e.expr))
-                .map(|c| c.name().to_owned())
-                .collect();
-            Ok(match row_filtered(sort.input(), &sort_columns)? {
-                Some(input) => Transformed::yes(Arc::clone(&node).with_new_children(vec![input])?),
-                None => Transformed::no(node),
-            })
+            let sort_columns = column_names(sort.expr().iter().map(|e| &e.expr));
+            let Some(input) = row_filtered(sort.input(), sort_columns, Vec::new())? else {
+                return Ok(Transformed::no(node));
+            };
+            Ok(Transformed::yes(
+                Arc::clone(&node).with_new_children(vec![input])?,
+            ))
         })
         .map(|t| t.data)
     }
@@ -106,10 +117,12 @@ impl PhysicalOptimizerRule for RowFilterUnderTopK {
 }
 
 /// `plan` with the row filter turned on in the scan at the bottom, or `None`
-/// when the walk stops before reaching one.
+/// if the walk stops first. `sort_columns` are the sort's columns as `plan`
+/// names them; `filters` are the `WHERE` parts seen on the way down.
 fn row_filtered(
     plan: &Arc<dyn ExecutionPlan>,
-    sort_columns: &HashSet<String>,
+    mut sort_columns: FxHashSet<String>,
+    mut filters: Vec<Arc<dyn PhysicalExpr>>,
 ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
     // Reached our table scan: the meter and the Parquet scan it wraps.
     if let Some(meter) = plan.downcast_ref::<MeteredExec>() {
@@ -119,41 +132,74 @@ fn row_filtered(
         ) else {
             return Ok(None);
         };
-        return with_row_filter(scan, footers, sort_columns)
+        return with_row_filter(scan, footers, &sort_columns, &filters)
             .map(|scan| Arc::clone(plan).with_new_children(vec![scan]))
             .transpose();
     }
-    // A node that groups, joins or reorders rows ends the walk.
-    if !passes_rows_through(plan) {
+    if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+        // Collect the `WHERE` parts; the scan checks they can all move into it.
+        filters.extend(split_conjunction(filter.predicate()).into_iter().cloned());
+    } else if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+        // A filter above uses this projection's names, not the scan's, so we
+        // can't check it. Rare; stop.
+        if !filters.is_empty() {
+            return Ok(None);
+        }
+        // Map each sort column to the scan columns it's computed from:
+        // `l = length(s)` becomes `s`.
+        sort_columns = column_names(
+            projection
+                .expr()
+                .iter()
+                .filter(|e| sort_columns.contains(&e.alias))
+                .map(|e| &e.expr),
+        );
+    } else {
+        // A join, an aggregate or another sort ends the walk. Repartitions and
+        // coalesces come later, from DataFusion's rules.
         return Ok(None);
     }
     let [child] = plan.children()[..] else {
         return Ok(None);
     };
     // Rebuild this node over the marked scan below it.
-    row_filtered(child, sort_columns)?
+    row_filtered(child, sort_columns, filters)?
         .map(|child| Arc::clone(plan).with_new_children(vec![child]))
         .transpose()
 }
 
-/// Nodes that pass rows on one at a time, so the cutoff means the same thing at
-/// the scan. Repartitions and coalesces are added later, by DataFusion's rules.
-fn passes_rows_through(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    plan.downcast_ref::<FilterExec>().is_some() || plan.downcast_ref::<ProjectionExec>().is_some()
+/// Columns the `exprs` read, by name.
+fn column_names<'a>(exprs: impl Iterator<Item = &'a Arc<dyn PhysicalExpr>>) -> FxHashSet<String> {
+    exprs
+        .flat_map(collect_columns)
+        .map(|c| c.name().to_owned())
+        .collect()
 }
 
 /// `scan` with its row filter turned on, or `None` to leave it as it is.
 fn with_row_filter(
     scan: &DataSourceExec,
     footers: &ScanFooters,
-    sort_columns: &HashSet<String>,
+    sort_columns: &FxHashSet<String>,
+    filters: &[Arc<dyn PhysicalExpr>],
 ) -> Option<Arc<dyn ExecutionPlan>> {
     // Only a Parquet scan has a row filter.
     let config = scan.data_source().downcast_ref::<FileScanConfig>()?;
     let parquet = config.file_source().downcast_ref::<ParquetSource>()?;
+    // Every part of the `WHERE` must move into the scan, so no `FilterExec`
+    // is left.
+    let schema = parquet.table_schema().table_schema();
+    if !filters
+        .iter()
+        .all(|f| !is_volatile(f) && can_expr_be_pushed_down_with_schemas(f, schema))
+    {
+        return None;
+    }
     // Worth it only when the columns the cutoff doesn't read are big enough.
     let (sort_bytes, skippable_bytes) = column_bytes(config, footers, sort_columns)?;
-    if skippable_bytes < MIN_SKIP_RATIO * sort_bytes.max(1) {
+    // Zero sort bytes means the sort reads no column (`ORDER BY random()`).
+    // No cutoff reaches the scan, so the row filter would only run the `WHERE`.
+    if sort_bytes == 0 || skippable_bytes < MIN_SKIP_RATIO * sort_bytes {
         return None;
     }
     // The `WHERE` itself arrives later, from DataFusion's filter pushdown.
@@ -168,57 +214,33 @@ fn with_row_filter(
 }
 
 /// Stored bytes of the columns `config` reads, as `(sort's columns, the rest)`,
-/// summed over the scan's files. One pass per footer, so a wide table with
-/// many files stays cheap to plan.
-///
-/// Columns match by top-level name, so `ORDER BY` an alias counts the aliased
-/// column as skippable. That can only turn on a row filter that saves little;
-/// the rows are the same either way.
+/// over the scan's files. Each footer has its column totals, so this costs
+/// files x columns.
 fn column_bytes(
     config: &FileScanConfig,
     footers: &ScanFooters,
-    sort_columns: &HashSet<String>,
+    sort_columns: &FxHashSet<String>,
 ) -> Option<(u64, u64)> {
     let schema = config.projected_schema().ok()?;
-    let read: HashSet<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let read: FxHashSet<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     // A file split into byte ranges sits in several groups; count it once.
-    let paths: HashSet<&ObjPath> = config
+    let paths: FxHashSet<&ObjPath> = config
         .file_groups
         .iter()
         .flat_map(|group| group.iter())
         .map(|file| &file.object_meta.location)
         .collect();
     let (mut sort_bytes, mut skippable_bytes) = (0, 0);
-    // Per leaf column: `Some(true)` the sort reads it, `Some(false)` it can be
-    // skipped, `None` the scan doesn't read it.
-    let mut is_sort: Vec<Option<bool>> = Vec::new();
     for path in paths {
         // Take the footer out, so the cache's lock isn't held while summing.
         let Some(footer) = footers.get(path).map(|f| Arc::clone(f.value())) else {
             continue;
         };
-        // A nested column's leaves are named `item` and the like; its first
-        // path part is the column.
-        is_sort.clear();
-        is_sort.extend(
-            footer
-                .file_metadata()
-                .schema_descr()
-                .columns()
-                .iter()
-                .map(|leaf| {
-                    let column = leaf.path().parts().first()?.as_str();
-                    read.contains(column).then(|| sort_columns.contains(column))
-                }),
-        );
-        for row_group in footer.row_groups() {
-            for (chunk, is_sort) in row_group.columns().iter().zip(&is_sort) {
-                let bytes = chunk.uncompressed_size().max(0) as u64;
-                match is_sort {
-                    Some(true) => sort_bytes += bytes,
-                    Some(false) => skippable_bytes += bytes,
-                    None => {}
-                }
+        for (column, bytes) in footer.columns().filter(|(c, _)| read.contains(c)) {
+            if sort_columns.contains(column) {
+                sort_bytes += bytes;
+            } else {
+                skippable_bytes += bytes;
             }
         }
     }

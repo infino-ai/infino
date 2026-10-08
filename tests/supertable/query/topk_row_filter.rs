@@ -11,7 +11,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
+use arrow_array::{
+    Array, Int64Array, LargeStringArray, ListArray, RecordBatch, StringArray, types::Int64Type,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::{col, lit};
 use infino::{ConnectOptions, Connection, Consistency, IndexSpec, Supertable, connect_with};
@@ -37,23 +39,30 @@ fn schema() -> SchemaRef {
         Field::new("n", DataType::Int64, false),
         Field::new("m", DataType::Int64, false),
         Field::new("s", DataType::LargeUtf8, false),
+        Field::new(
+            "l",
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
+            false,
+        ),
     ]))
 }
 
 /// Rows `n` in `[lo, lo + ROWS_PER_APPEND)` in shuffled order, `m = n % 10`,
-/// `s = "r<n>" + PAD`.
+/// `s = "r<n>" + PAD`, `l = [n]`. `l` is a list, which a row filter can't read.
 fn batch(lo: i64) -> RecordBatch {
     let n: Vec<i64> = (0..ROWS_PER_APPEND)
         .map(|i| lo + (i * SHUFFLE) % ROWS_PER_APPEND)
         .collect();
     let m: Vec<i64> = n.iter().map(|v| v % 10).collect();
     let s: Vec<String> = n.iter().map(|v| format!("r{v}{PAD}")).collect();
+    let l = ListArray::from_iter_primitive::<Int64Type, _, _>(n.iter().map(|v| Some([Some(*v)])));
     RecordBatch::try_new(
         schema(),
         vec![
             Arc::new(Int64Array::from(n)),
             Arc::new(Int64Array::from(m)),
             Arc::new(LargeStringArray::from(s)),
+            Arc::new(l),
         ],
     )
     .expect("valid batch")
@@ -232,6 +241,59 @@ fn a_computed_column_between_sort_and_scan_keeps_the_row_filter() {
     let got = n_values(&db.query_sql(&sql).expect("sql"));
     assert_eq!(got, expected(false, &[]));
     assert!(row_filter_ran(&db, &sql), "no row filter for: {sql}");
+}
+
+#[test]
+fn a_computed_sort_key_is_costed_on_the_columns_it_reads() {
+    // `WHERE s LIKE '%7%' ORDER BY <computed> LIMIT 5`.
+    //  - `length(s), n` reads `s` and `n`: nothing left to skip, no row filter.
+    //  - `n + 0 DESC` reads `n`: `s` is left to skip, row filter on.
+    //  - `random()` reads no column: no cutoff reaches the scan, no row filter.
+    // This test pins the rows and that the cost check counts scan columns.
+    let (_dir, db, _table) = fixture();
+    for (sql, want, ran) in [
+        (
+            format!(
+                "SELECT n, length(s) AS l FROM t WHERE s LIKE '%{DIGIT}%' ORDER BY l, n LIMIT {FETCH}"
+            ),
+            vec![7, 17, 27, 37, 47],
+            false,
+        ),
+        (
+            format!(
+                "SELECT n + 0 AS k, s FROM t WHERE s LIKE '%{DIGIT}%' ORDER BY k DESC LIMIT {FETCH}"
+            ),
+            expected(true, &[]),
+            true,
+        ),
+    ] {
+        let got = n_values(&db.query_sql(&sql).expect("sql"));
+        assert_eq!(got, want, "{sql}");
+        assert_eq!(row_filter_ran(&db, &sql), ran, "{sql}");
+    }
+    let sql =
+        format!("SELECT n, s FROM t WHERE s LIKE '%{DIGIT}%' ORDER BY random() LIMIT {FETCH}");
+    assert_eq!(n_values(&db.query_sql(&sql).expect("sql")).len(), FETCH);
+    assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
+}
+
+#[test]
+fn a_conjunct_the_scan_cant_take_gets_no_row_filter() {
+    // `WHERE s LIKE '%7%' AND <x> ORDER BY n LIMIT 5`, `<x>` can't move into
+    // the scan.
+    //  - `random() >= 0` is volatile; `array_length(l) = 1` reads a list.
+    //  - `<x>` stays in a `FilterExec`, which holds rows back from the sort.
+    //  - so the rule leaves the scan alone.
+    // This test pins the rows and that no row filter runs.
+    let (_dir, db, _table) = fixture();
+    for conjunct in ["random() >= 0", "array_length(l) = 1"] {
+        let sql = format!(
+            "SELECT n, s FROM t WHERE s LIKE '%{DIGIT}%' AND {conjunct} ORDER BY n LIMIT {FETCH}"
+        );
+        let got = n_values(&db.query_sql(&sql).expect("sql"));
+        assert_eq!(got, expected(false, &[]), "{sql}");
+        assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
+    }
 }
 
 #[test]

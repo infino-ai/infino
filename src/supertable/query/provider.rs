@@ -120,7 +120,7 @@ use crate::{
             df_object_store::SuperfileObjectStore,
             exec::{
                 common::{BoundPredicate, PushedPredicate, take_rows},
-                metered_exec::{MeteredExec, ScanFooters},
+                metered_exec::MeteredExec,
             },
             fts::{memos_from_plan_locations, plan_locations_for},
             prune::{PruneLeaf, select_superfiles},
@@ -256,8 +256,8 @@ pub(crate) struct SupertableProvider {
     /// Prepared files populate it once; scans reuse it rather than rebuilding
     /// a path→source map for every SQL statement.
     scan_store: Arc<SuperfileObjectStore>,
-    /// Open-time Parquet metadata shared by every scan and residual provider.
-    scan_metas: Arc<ScanFooters>,
+    /// Open-time Parquet footers shared by every scan and residual provider.
+    scan_footers: Arc<ScanFooters>,
     /// Exact table-level low-cardinality frequencies, merged lazily per
     /// column from this provider's immutable manifest snapshot.
     scalar_value_counts: Arc<DashMap<String, Option<Arc<ScalarValueCounts>>>>,
@@ -328,7 +328,7 @@ impl SupertableProvider {
             segment_filter: None,
             prepared_scan_files: Arc::new(DashMap::new()),
             scan_store: Arc::new(SuperfileObjectStore::new()),
-            scan_metas: Arc::new(DashMap::new()),
+            scan_footers: Arc::new(DashMap::new()),
             scalar_value_counts: Arc::new(DashMap::new()),
         }
     }
@@ -355,7 +355,7 @@ impl SupertableProvider {
         restricted.segment_filter = Some(segments);
         restricted.prepared_scan_files = Arc::clone(&self.prepared_scan_files);
         restricted.scan_store = Arc::clone(&self.scan_store);
-        restricted.scan_metas = Arc::clone(&self.scan_metas);
+        restricted.scan_footers = Arc::clone(&self.scan_footers);
         restricted.scalar_value_counts = Arc::clone(&self.scalar_value_counts);
         restricted
     }
@@ -588,7 +588,7 @@ impl SupertableProvider {
         let disk_cache = self.disk_cache.clone();
         let storage = self.manifest.options.storage.clone();
         let scan_store = Arc::clone(&self.scan_store);
-        let scan_metas = Arc::clone(&self.scan_metas);
+        let scan_footers = Arc::clone(&self.scan_footers);
         let entry = Arc::clone(entry);
         let prepared = cell
             .get_or_try_init(|| async move {
@@ -623,7 +623,7 @@ impl SupertableProvider {
                     .collect::<Vec<_>>()
                     .into();
                 scan_store.insert_source(path.clone(), source);
-                scan_metas.insert(path.clone(), parquet_meta);
+                scan_footers.insert(path.clone(), Arc::new(ScanFooter::new(parquet_meta)));
                 Ok::<Arc<PreparedScanFile>, DataFusionError>(Arc::new(PreparedScanFile {
                     path,
                     size,
@@ -976,22 +976,51 @@ fn full_walk_pays(terms: u64, bytes: u64) -> bool {
     terms == 0 || bytes / terms >= LIKE_WALK_MIN_BYTES_PER_TERM
 }
 
-/// Stored (uncompressed) bytes of `column`'s data pages across a
-/// superfile's row groups — the volume a scan of that column decodes.
-/// `None` when the footer has no leaf column of that name.
-fn column_stored_bytes(meta: &ParquetMetaData, column: &str) -> Option<u64> {
-    let index = meta
-        .file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .position(|descr| descr.name() == column)?;
-    Some(
-        meta.row_groups()
+/// Footers of the files this table's scans have opened, by path.
+pub(crate) type ScanFooters = DashMap<ObjPath, Arc<ScanFooter>>;
+
+/// A file's Parquet footer, and how many bytes each column takes in it.
+#[derive(Debug)]
+pub(crate) struct ScanFooter {
+    meta: Arc<ParquetMetaData>,
+    /// Bytes per column before compression. Added up once when the file is
+    /// opened, so planning a query doesn't have to.
+    leaf_bytes: Box<[u64]>,
+}
+
+impl ScanFooter {
+    fn new(meta: Arc<ParquetMetaData>) -> Self {
+        let mut leaf_bytes = vec![0; meta.file_metadata().schema_descr().num_columns()];
+        for row_group in meta.row_groups() {
+            for (bytes, chunk) in leaf_bytes.iter_mut().zip(row_group.columns()) {
+                *bytes += chunk.uncompressed_size().max(0) as u64;
+            }
+        }
+        Self {
+            meta,
+            leaf_bytes: leaf_bytes.into(),
+        }
+    }
+
+    /// `(column name, bytes)` for each column in the file. A list or struct
+    /// column is stored in parts, and each part comes back under its name.
+    pub(crate) fn columns(&self) -> impl Iterator<Item = (&str, u64)> {
+        let leaves = self.meta.file_metadata().schema_descr().columns();
+        leaves
             .iter()
-            .map(|rg| rg.column(index).uncompressed_size().max(0) as u64)
-            .sum(),
-    )
+            .zip(&self.leaf_bytes)
+            .filter_map(|(leaf, &bytes)| Some((leaf.path().parts().first()?.as_str(), bytes)))
+    }
+
+    /// Bytes of `column` in this file, or `None` if the file doesn't have it.
+    fn column_bytes(&self, column: &str) -> Option<u64> {
+        let mut leaves = self
+            .columns()
+            .filter(|(name, _)| *name == column)
+            .peekable();
+        leaves.peek()?;
+        Some(leaves.map(|(_, bytes)| bytes).sum())
+    }
 }
 
 /// Extract a UTF-8 string literal from a scalar value, if it is one.
@@ -1237,19 +1266,19 @@ impl TableProvider for SupertableProvider {
                             // vocabulary; judged per column from the manifest's
                             // term count and the Parquet footer's column size,
                             // neither of which costs a read.
-                            let meta = self
-                                .scan_metas
+                            let footer = self
+                                .scan_footers
                                 .get(&prepared.path)
-                                .map(|m| Arc::clone(m.value()));
+                                .map(|f| Arc::clone(f.value()));
                             let full_walk_pays = |column: &str| {
                                 let terms = self
                                     .manifest
                                     .field_id(column)
                                     .and_then(|id| entry.fts_summary.get(&id))
                                     .map_or(0, |summary| summary.n_terms_distinct);
-                                let bytes = meta
+                                let bytes = footer
                                     .as_ref()
-                                    .and_then(|m| column_stored_bytes(m, column))
+                                    .and_then(|f| f.column_bytes(column))
                                     .unwrap_or(0);
                                 full_walk_pays(terms, bytes)
                             };
@@ -1428,7 +1457,7 @@ impl TableProvider for SupertableProvider {
         // lazily-opened readers (a cache-state-dependent priced counter).
         source = source.with_parquet_file_reader_factory(Arc::new(CachedMetadataReaderFactory {
             store: Arc::clone(&store),
-            metas: Arc::clone(&self.scan_metas),
+            footers: Arc::clone(&self.scan_footers),
         }));
 
         // ManifestSnapshot-derived statistics for the scan node. Exact only
@@ -1474,11 +1503,11 @@ impl TableProvider for SupertableProvider {
         let scan = DataSourceExec::from_data_source(config);
         let op_stats = self.scan_store.op_stats();
         Ok(if filters.is_empty() {
-            Arc::new(MeteredExec::new(scan, op_stats).with_footers(Arc::clone(&self.scan_metas)))
+            Arc::new(MeteredExec::new(scan, op_stats).with_footers(Arc::clone(&self.scan_footers)))
         } else {
             Arc::new(
                 MeteredExec::without_limit_pushdown(scan, op_stats)
-                    .with_footers(Arc::clone(&self.scan_metas)),
+                    .with_footers(Arc::clone(&self.scan_footers)),
             )
         })
     }
@@ -1601,13 +1630,13 @@ fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
 /// [`SuperfileReader`]: crate::superfile::SuperfileReader
 struct CachedMetadataReaderFactory {
     store: Arc<dyn OsObjectStore>,
-    metas: Arc<ScanFooters>,
+    footers: Arc<ScanFooters>,
 }
 
 impl fmt::Debug for CachedMetadataReaderFactory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CachedMetadataReaderFactory")
-            .field("superfiles", &self.metas.len())
+            .field("superfiles", &self.footers.len())
             .finish()
     }
 }
@@ -1661,9 +1690,9 @@ impl ParquetFileReaderFactory for CachedMetadataReaderFactory {
         }
         Ok(Box::new(CachedMetadataReader {
             meta: self
-                .metas
+                .footers
                 .get(location)
-                .map(|meta| Arc::clone(meta.value())),
+                .map(|footer| Arc::clone(&footer.meta)),
             inner,
         }))
     }
@@ -3203,7 +3232,7 @@ mod tests {
         let store: Arc<dyn OsObjectStore> = Arc::new(InMemory::new());
         let factory = CachedMetadataReaderFactory {
             store,
-            metas: Arc::new(DashMap::new()),
+            footers: Arc::new(DashMap::new()),
         };
         let dbg = format!("{factory:?}");
         assert!(
