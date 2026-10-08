@@ -149,6 +149,7 @@ class Table:
         k: int,
         mode: BoolMode | None = ...,
         projection: Sequence[str] | None = ...,
+        *,
         k1: float | None = ...,
         b: float | None = ...,
     ) -> ArrowTable: ...

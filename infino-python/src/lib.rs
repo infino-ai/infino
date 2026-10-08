@@ -922,7 +922,7 @@ impl Table {
     /// Every segment scores against table-wide statistics gathered across
     /// all segments, so a fragmented table ranks like a single unified
     /// corpus.
-    #[pyo3(signature = (column, query, k, mode=None, projection=None, k1=None, b=None))]
+    #[pyo3(signature = (column, query, k, mode=None, projection=None, *, k1=None, b=None))]
     #[allow(clippy::too_many_arguments)]
     fn bm25_search<'py>(
         &self,
