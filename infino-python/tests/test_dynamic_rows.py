@@ -145,31 +145,62 @@ def test_a_schema_refusal_is_still_a_value_error():
     assert issubclass(infino.SchemaError, ValueError)
 
 
-def test_a_missing_value_in_a_frame_is_stored_as_null():
+def test_a_frames_missing_value_is_stored_as_null():
     """A pandas frame marks a missing number with NaN, which JSON cannot
     spell. It means the row carries nothing there, so it is written as null —
-    the same as a key a dict leaves out, and the same as Node, whose
-    `JSON.stringify` nulls it before the binding sees it."""
-    import math
-
+    the same as a key a dict leaves out."""
     import pandas as pd
 
     db = infino.connect("memory://")
     docs = db.create_table("docs", _title_schema(), infino.IndexSpec())
-    frame = pd.DataFrame(
-        {"title": ["a", "b"], "score": [1.5, float("nan")]}
-    )
-    docs.append(frame)
+    docs.append(pd.DataFrame({"title": ["a", "b"], "score": [1.5, float("nan")]}))
     rows = db.query_sql("SELECT title, score FROM docs ORDER BY _id").to_pylist()
     assert rows[0]["score"] == 1.5
     assert rows[1]["score"] is None, "NaN is the absence of a value, so null"
 
-    # A list of dicts carrying NaN reads the same way, and so does an
-    # infinity, which JSON cannot spell either.
-    docs.append([{"title": "c", "score": float("nan")}, {"title": "d", "score": math.inf}])
-    rows = db.query_sql("SELECT title, score FROM docs ORDER BY _id").to_pylist()
-    assert rows[2]["score"] is None
-    assert rows[3]["score"] is None
+
+def test_only_a_frames_nan_is_read_as_missing():
+    """An infinity is a number a Float64 column holds, and a NaN a caller
+    wrote in a list of dicts is a value rather than pandas' marker for one
+    they left out. Neither is rewritten; both reach the column as sent."""
+    import math
+
+    import pandas as pd
+    import pyarrow as pa
+
+    scored = pa.schema(
+        [
+            pa.field("title", pa.large_utf8(), nullable=False),
+            pa.field("score", pa.float64(), nullable=True),
+        ]
+    )
+
+    db = infino.connect("memory://")
+    docs = db.create_table("docs", scored, infino.IndexSpec())
+    docs.append([{"title": "a", "score": math.inf}, {"title": "b", "score": float("nan")}])
+    rows = db.query_sql("SELECT score FROM docs ORDER BY _id").to_pylist()
+    assert rows[0]["score"] == math.inf, "an infinity is stored, not nulled"
+    assert math.isnan(rows[1]["score"]), "a NaN a caller wrote is stored too"
+
+    # Including in a frame: only the missing marker is a missing value.
+    db = infino.connect("memory://")
+    docs = db.create_table("docs", scored, infino.IndexSpec())
+    docs.append(pd.DataFrame({"title": ["a", "b"], "score": [math.inf, float("nan")]}))
+    rows = db.query_sql("SELECT score FROM docs ORDER BY _id").to_pylist()
+    assert rows[0]["score"] == math.inf
+    assert rows[1]["score"] is None
+
+
+def test_a_value_json_cannot_spell_on_a_new_column_is_refused():
+    """The typed path fills columns the table declares and invents none, so a
+    value it carries cannot also bring a column with it. Before, the whole
+    column was silently dropped."""
+    import math
+
+    db = infino.connect("memory://")
+    docs = db.create_table("docs", _title_schema(), infino.IndexSpec())
+    with pytest.raises(ValueError, match="score"):
+        docs.append([{"title": "a", "score": math.inf}])
 
 
 def test_a_frame_with_a_nan_is_serialized_twice_not_three_times():
@@ -186,16 +217,16 @@ def test_a_frame_with_a_nan_is_serialized_twice_not_three_times():
         calls.append(kwargs.get("allow_nan"))
         return original(*args, **kwargs)
 
+    import pandas as pd
+
     db = infino.connect("memory://")
     docs = db.create_table("docs", _title_schema(), infino.IndexSpec())
     json_module.dumps = counting
     try:
-        # One row carries a real value, so the column exists to read back:
-        # a column whose every value is null is never created.
-        docs.append([
-            {"title": "a", "score": 1.5},
-            {"title": "b", "score": float("nan")},
-        ])
+        # A frame, since that is where a NaN is a missing value. One row
+        # carries a real number so the column exists to read back: a column
+        # whose every value is null is never created.
+        docs.append(pd.DataFrame({"title": ["a", "b"], "score": [1.5, float("nan")]}))
     finally:
         json_module.dumps = original
 
@@ -216,11 +247,13 @@ def test_a_frame_without_a_nan_is_serialized_once():
         calls.append(kwargs.get("allow_nan"))
         return original(*args, **kwargs)
 
+    import pandas as pd
+
     db = infino.connect("memory://")
     docs = db.create_table("docs", _title_schema(), infino.IndexSpec())
     json_module.dumps = counting
     try:
-        docs.append([{"title": "a", "score": 1.5}])
+        docs.append(pd.DataFrame({"title": ["a", "b"], "score": [1.5, 2.5]}))
     finally:
         json_module.dumps = original
 

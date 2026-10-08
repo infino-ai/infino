@@ -1596,18 +1596,22 @@ fn append_input(
     match json.call_method("dumps", (&records,), Some(&strict)) {
         Ok(text) => rows_from_json(&text.extract::<String>()?),
         Err(_) => {
-            // A missing value in a pandas frame is a non-finite float, and
-            // it means the row carries nothing there - the same as a key a
-            // dict leaves out. Writing it as null keeps that meaning, keeps
-            // the document path (which grows the schema, where the typed
-            // path only fills columns the table already declares), and
-            // agrees with Node, whose `JSON.stringify` nulls a NaN before
-            // the binding ever sees it.
-            match nulled_non_finite(py, &json, &strict, &records) {
+            // A pandas frame marks a missing value with `NaN`, so one there
+            // means the row carries nothing in that column, the same as a
+            // key a dict leaves out. Writing it as null keeps that meaning
+            // and keeps the document path, which grows the schema where the
+            // typed path only fills columns the table declares.
+            //
+            // Nothing else is rewritten. Node nulls an infinity too, but
+            // that is `JSON.stringify` having nowhere to put it, not a rule
+            // worth copying.
+            match nulled_missing(py, &json, &strict, &records, is_frame) {
                 Ok(text) => rows_from_json(&text),
-                // Not a non-finite float, then: a value JSON has no spelling
-                // for at all (bytes, Decimal, datetime, a numpy scalar),
-                // which only the typed path carries.
+                // Not a frame's missing value, then: an infinity, a `NaN` a
+                // caller wrote in a list of dicts, or a value JSON has no
+                // spelling for at all (bytes, Decimal, datetime, a numpy
+                // scalar). The typed path carries each into a declared
+                // column and refuses an undeclared one.
                 Err(_) => typed_batch_input(py, data, schema, is_frame, &table_cls),
             }
         }
@@ -1626,30 +1630,42 @@ fn rows_from_json(text: &str) -> PyResult<AppendInput> {
     })
 }
 
-/// The Python function that replaces every non-finite float with `None`.
+/// The Python function that replaces pandas' missing marker with `None`.
 ///
 /// Compiled once for the process rather than per call: the source is
-/// constant, and an append carrying a `NaN` would otherwise pay a module
-/// compile on top of the walk.
+/// constant, and an append carrying a missing value would otherwise pay a
+/// module compile on top of the walk.
 static NULLED: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
-/// `records` serialized with every non-finite float written as `null`.
+/// `records` serialized with every `NaN` written as `null`, for a frame.
+///
+/// Only a frame, and only `NaN`: that pairing is pandas' own marker for an
+/// absent value, and nothing else here is one. An infinity is a number a
+/// `Float64` column holds, and a `NaN` in a list of dicts is a value the
+/// caller wrote rather than a marker for one they left out; both raise out
+/// of here, and the caller takes the typed path, which carries them into a
+/// declared column and refuses an undeclared one.
 ///
 /// Returns the text rather than the cleaned object: proving the result
 /// serializes and producing the bytes to parse are the same `dumps`, and a
-/// frame of any size pays for each one. An error means the obstacle was
-/// never a `NaN`, which is the caller's signal to take the typed path.
-fn nulled_non_finite(
+/// frame of any size pays for each one.
+fn nulled_missing(
     py: Python<'_>,
     json: &Bound<'_, PyAny>,
     strict: &Bound<'_, PyDict>,
     records: &Bound<'_, PyAny>,
+    is_frame: bool,
 ) -> PyResult<String> {
+    if !is_frame {
+        return Err(PyValueError::new_err(
+            "only a frame's NaN marks a missing value",
+        ));
+    }
     const SANITIZE: &str = r#"
 import math
 
 def nulled(value):
-    if isinstance(value, float) and not math.isfinite(value):
+    if isinstance(value, float) and math.isnan(value):
         return None
     if isinstance(value, dict):
         return {k: nulled(v) for k, v in value.items()}
