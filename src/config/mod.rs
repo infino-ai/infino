@@ -288,7 +288,9 @@ const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFIL
 pub const DEFAULT_STALE_SEAL_TIMEOUT_MS: u64 = 2 * 60 * 1000;
 
 /// Compaction settings: target size, fill floor, and memory budget.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+// Not `Eq`: `reorder_convergence` is a ratio, and the vector settings already
+// carry floats for the same reason.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct CompactionSettings {
     /// Target size of a compacted superfile, in MiB.
@@ -316,6 +318,20 @@ pub struct CompactionSettings {
     /// not govern how many merges run at once: the runner admits them against
     /// the host's free memory.
     pub max_memory_mb: u64,
+    /// Stop a split's document-reordering move loop once a round improves the
+    /// layout by less than this fraction of what that split's own first round
+    /// improved it.
+    ///
+    /// A ratio rather than a round count on purpose: how many rounds are worth
+    /// running depends on how much structure a corpus has, so a count tuned on
+    /// one body of text does not transfer, while "keep going until the
+    /// returns have fallen off by this much" does. `0.0` disables the test and
+    /// runs every split to `reorder_max_rounds`.
+    pub reorder_convergence: f32,
+    /// Hard ceiling on a split's move rounds, whatever the convergence test
+    /// says. A backstop against a corpus whose rounds keep paying, not the
+    /// working limit — `reorder_convergence` is what normally ends a split.
+    pub reorder_max_rounds: u32,
     /// How many of a pass's merge jobs may be in flight at once.
     ///
     /// `None` (the default) derives the ceiling from the maintenance pool and
@@ -338,11 +354,24 @@ impl Default for CompactionSettings {
             min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
             min_superfiles_for_merge: DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE,
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
+            reorder_convergence: DEFAULT_REORDER_CONVERGENCE,
+            reorder_max_rounds: DEFAULT_REORDER_MAX_ROUNDS,
             max_concurrent_jobs: None,
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
         }
     }
 }
+
+/// Default reorder convergence ratio. Measured on a 5M-document body of text:
+/// at this value a build spends about a tenth less time compacting and lands a
+/// marginally smaller index, with no query-latency difference the measurement
+/// could resolve.
+const DEFAULT_REORDER_CONVERGENCE: f32 = 0.05;
+
+/// Default ceiling on a split's move rounds. Equal to the fixed count the
+/// bisection used before the convergence test existed, so a deployment that
+/// sets `reorder_convergence: 0.0` reproduces the old behaviour exactly.
+const DEFAULT_REORDER_MAX_ROUNDS: u32 = 20;
 
 /// Minimum age an unreferenced object must reach before [`crate::Supertable::optimize`] deletes it.
 pub const DEFAULT_GC_SAFETY_GAP: Duration = Duration::from_secs(86_400);

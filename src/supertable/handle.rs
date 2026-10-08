@@ -4365,6 +4365,8 @@ mod tests {
             min_fill_percent: 1,
             min_superfiles_for_merge: 2,
             max_memory_mb: 64,
+            reorder_convergence: 0.05,
+            reorder_max_rounds: 20,
             max_concurrent_jobs: Some(1),
             stale_seal_timeout_ms: crate::config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         };

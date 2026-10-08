@@ -133,6 +133,18 @@ compaction:
   # Maximum memory budget for materializing inputs during a single merge, in MiB.
   max_memory_mb: 3072
 
+  # Stop a split's document-reordering move loop once a round improves the
+  # layout by less than this fraction of what that split's own first round
+  # improved it. A ratio rather than a round count, because how many rounds are
+  # worth running depends on how much structure a corpus has: a count tuned on
+  # one body of text does not carry to another, a diminishing-returns test does.
+  # 0.0 disables the test and runs every split to reorder_max_rounds.
+  reorder_convergence: 0.05
+
+  # Hard ceiling on a split's move rounds, whatever the convergence test says.
+  # A backstop, not the working limit.
+  reorder_max_rounds: 20
+
 # Vector-index build / search / drain tuning. Every value below
 # defaults to the engine's built-in behavior — a fresh install never
 # needs to touch this section. These are the levers that used to be

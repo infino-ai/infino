@@ -107,7 +107,7 @@ use crate::{
             bm25,
             builder::FtsBuilder,
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
-            reorder::{ForwardIndex, bisect_order},
+            reorder::{BisectParams, ForwardIndex, bisect_order},
             sorted_merge::SortedInput,
             tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
         },
@@ -142,16 +142,49 @@ use crate::{
 /// corpus this small has short gaps already and nothing to regroup.
 const REORDER_MIN_DOCS: usize = 4_096;
 
-/// Terms per document the bisection is given. Bounding the forward
-/// index by documents rather than by postings is what keeps the pass a
-/// fixed size whatever the corpus holds: at four bytes a slot this is
-/// about 64 MiB per million documents, and it does not grow with how
-/// much text a document carries.
+/// Share of a merge's memory budget the bisection's forward index may take.
 ///
-/// The terms kept are the most selective a document has, which is where
-/// the grouping signal is. A document with fewer eligible terms
-/// contributes what it has.
-const REORDER_TERMS_PER_DOC: usize = 16;
+/// Sized so a few-million-document merge lands near the sixteen slots a
+/// document used to get unconditionally, while a merge large enough to exceed
+/// the budget now takes fewer slots, or declines to reorder, instead of
+/// demanding memory without limit. The old fixed count asked for four bytes a
+/// slot times sixteen times the document count with nothing to stop it — about
+/// 134 GiB at two billion documents.
+const REORDER_FORWARD_INDEX_BUDGET_SHARE: u64 = 10;
+
+/// Fewer slots than this carry too little of a document to group it by, so a
+/// merge that cannot afford this many keeps arrival order rather than paying
+/// for a pass that cannot pay back.
+const REORDER_MIN_TERMS_PER_DOC: usize = 4;
+
+/// Slots per document the bisection is given, or `None` to keep arrival order.
+///
+/// Two bounds, and whichever is tighter wins. A document cannot contribute
+/// more terms than it has, so a corpus of short or term-poor documents gets
+/// slots sized to what its documents actually carry rather than a count tuned
+/// on somebody else's text. And the forward index has to fit the merge's
+/// memory budget, which is what bounds a corpus whose documents are rich
+/// enough to fill any number of slots.
+///
+/// The terms kept are the most selective a document has, which is where the
+/// grouping signal is.
+fn reorder_terms_per_doc(n_docs: usize, eligible_postings: u64) -> Option<usize> {
+    let budget_bytes = crate::config::global()
+        .compaction
+        .max_memory_mb
+        .saturating_mul(1 << 20)
+        / REORDER_FORWARD_INDEX_BUDGET_SHARE;
+    let per_doc_bytes = (n_docs as u64).saturating_mul(size_of::<u32>() as u64);
+    let affordable = budget_bytes.checked_div(per_doc_bytes).unwrap_or(0) as usize;
+
+    // What the documents actually carry, rounded up so a corpus averaging a
+    // fraction over a whole number is not truncated down to it.
+    let carried = eligible_postings.div_ceil(n_docs.max(1) as u64) as usize;
+
+    // `filled` and `worst` index a document's slots in a `u8`.
+    let slots = carried.min(affordable).min(u8::MAX as usize);
+    (slots >= REORDER_MIN_TERMS_PER_DOC).then_some(slots)
+}
 
 /// Bits of bucket space the bisection groups terms in. Terms are hashed
 /// into it rather than interned, so the vocabulary costs nothing to
@@ -2488,6 +2521,22 @@ impl SuperfileBuilder {
             d >= 2 && d <= too_common
         };
 
+        // How many terms the corpus actually offers per document, summed over
+        // the buckets rather than over the postings, so this costs a walk of
+        // the degree table and not a third pass over the index.
+        let eligible_postings: u64 = df
+            .iter()
+            .enumerate()
+            .filter(|&(t, _)| eligible(t as u32))
+            .map(|(_, &d)| u64::from(d))
+            .sum();
+        let Some(terms_per_doc) = reorder_terms_per_doc(n_out_docs as usize, eligible_postings)
+        else {
+            // The forward index will not fit the merge's budget at a width
+            // worth having; arrival order it is.
+            return Ok(None);
+        };
+
         // Pass two: keep each document's most selective terms, in a
         // fixed number of slots per document. `worst` tracks the slot
         // holding the least selective term kept so far, so a posting
@@ -2496,7 +2545,7 @@ impl SuperfileBuilder {
         // `displaced` counts the kept terms that later lost their slot.
         let pick_span = detail_span!("merge_order_pick_terms").entered();
         let n = n_out_docs as usize;
-        let mut slots: Vec<u32> = vec![0; n * REORDER_TERMS_PER_DOC];
+        let mut slots: Vec<u32> = vec![0; n * terms_per_doc];
         let mut filled: Vec<u8> = vec![0; n];
         let mut worst: Vec<u8> = vec![0; n];
         for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
@@ -2512,9 +2561,9 @@ impl SuperfileBuilder {
                         return;
                     };
                     let row = row.get() as usize;
-                    let slot_base = row * REORDER_TERMS_PER_DOC;
+                    let slot_base = row * terms_per_doc;
                     let used = filled[row] as usize;
-                    if used < REORDER_TERMS_PER_DOC {
+                    if used < terms_per_doc {
                         slots[slot_base + used] = t;
                         if used == 0
                             || df[t as usize] > df[slots[slot_base + worst[row] as usize] as usize]
@@ -2533,7 +2582,7 @@ impl SuperfileBuilder {
                     // The worst moved; find it again over the fixed,
                     // small slot count.
                     let mut w = 0usize;
-                    for i in 1..REORDER_TERMS_PER_DOC {
+                    for i in 1..terms_per_doc {
                         if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize] {
                             w = i;
                         }
@@ -2552,7 +2601,7 @@ impl SuperfileBuilder {
 
         let docs: Vec<&[u32]> = (0..n)
             .map(|row| {
-                let lo = row * REORDER_TERMS_PER_DOC;
+                let lo = row * terms_per_doc;
                 &slots[lo..lo + filled[row] as usize]
             })
             .collect();
@@ -2563,7 +2612,7 @@ impl SuperfileBuilder {
         drop(docs);
         drop(slots);
         let _bisect_span = detail_span!("merge_order_bisect", docs = n).entered();
-        Ok(Some(bisect_order(&fwd)))
+        Ok(Some(bisect_order(&fwd, BisectParams::default())))
     }
 
     test_visible! {
@@ -5830,6 +5879,37 @@ mod tests {
     /// arrival order groups nothing. The pair "t0 t1" recurs, giving a
     /// phrase to look for that is not simply every document carrying
     /// both words.
+    /// The forward index is bounded from two directions, and a merge that
+    /// cannot afford a useful width declines instead of allocating anyway.
+    /// The old fixed sixteen slots asked for `16 * 4 * n_docs` bytes with
+    /// nothing to stop it, which is over a hundred gigabytes at two billion
+    /// documents.
+    #[test]
+    fn terms_per_document_follows_the_corpus_and_the_budget() {
+        // Term-poor documents get what they carry, not a borrowed constant.
+        assert_eq!(reorder_terms_per_doc(1_000, 5_000), Some(5));
+
+        // Term-rich documents are held to what the budget affords; at a few
+        // million documents that lands on the width this used to take flat.
+        let rich = reorder_terms_per_doc(5_000_000, 5_000_000 * 200)
+            .expect("a five-million-document merge can afford to reorder");
+        assert!(
+            (12..=20).contains(&rich),
+            "budget-bound width drifted far from the historical sixteen: {rich}"
+        );
+
+        // A document's slots are indexed by a u8.
+        assert!(reorder_terms_per_doc(1_000, 1_000 * 10_000).unwrap() <= u8::MAX as usize);
+
+        // Too little to group by: keep arrival order rather than pay for a
+        // pass that cannot pay back.
+        assert_eq!(reorder_terms_per_doc(1_000, 2_000), None);
+        assert_eq!(
+            reorder_terms_per_doc(2_000_000_000, 2_000_000_000 * 50),
+            None
+        );
+    }
+
     fn reorder_corpus_title(id: u64) -> String {
         let topic = (id % 4) as u32;
         let base = topic * 40;

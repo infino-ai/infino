@@ -46,10 +46,32 @@ use rayon::{join, prelude::*};
 /// worth, and the gaps inside a group this small are already short.
 const MIN_PARTITION: usize = 32;
 
-/// Move rounds per split. The first round captures nearly all of the
-/// available gain and later ones taper sharply, so this trades a long
-/// tail of tiny improvements for a bounded cost per level.
-const MAX_ROUNDS: usize = 20;
+/// How hard the bisection works a split, and when it decides a split has
+/// stopped paying.
+///
+/// Both come from configuration rather than from a constant here, because the
+/// right amount of work depends on how much structure a corpus has. A round
+/// count tuned on one body of text does not carry to another; a
+/// diminishing-returns ratio does, which is why `convergence` is the working
+/// limit and `max_rounds` only a backstop.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BisectParams {
+    /// Stop once a round's realised gain falls below this fraction of that
+    /// split's first round. `0.0` disables the test.
+    pub(crate) convergence: f32,
+    /// Ceiling on a split's move rounds whatever `convergence` says.
+    pub(crate) max_rounds: usize,
+}
+
+impl Default for BisectParams {
+    fn default() -> Self {
+        let c = &crate::config::global().compaction;
+        Self {
+            convergence: c.reorder_convergence.max(0.0),
+            max_rounds: c.reorder_max_rounds.max(1) as usize,
+        }
+    }
+}
 
 /// Recursion depth cap, so a pathological corpus cannot drive the
 /// splitting arbitrarily deep. At this depth a partition is `2^-24` of
@@ -139,7 +161,7 @@ impl ForwardIndex {
 ///
 /// The identity when there is nothing to gain, which is a corpus too
 /// small to split or one whose documents share no terms.
-pub(crate) fn bisect_order(fwd: &ForwardIndex) -> Vec<u32> {
+pub(crate) fn bisect_order(fwd: &ForwardIndex, params: BisectParams) -> Vec<u32> {
     let n = fwd.len();
     let mut order: Vec<u32> = (0..n as u32).collect();
     if n <= MIN_PARTITION {
@@ -149,27 +171,76 @@ pub(crate) fn bisect_order(fwd: &ForwardIndex) -> Vec<u32> {
         n_terms: fwd.n_terms,
         free: Mutex::new(Vec::new()),
     };
-    split_parallel(fwd, &mut order, 0, &pool);
+    split_parallel(fwd, &mut order, 0, &pool, params);
     order
 }
 
 /// Split `order` as [`BisectState::split`] does, running the two halves
 /// of a large partition in parallel.
-fn split_parallel(fwd: &ForwardIndex, order: &mut [u32], depth: u32, pool: &StatePool) {
-    if order.len() < PARALLEL_MIN_PARTITION {
-        pool.with_state(|state| state.split_localized(fwd, order, depth));
+fn split_parallel(
+    fwd: &ForwardIndex,
+    order: &mut [u32],
+    depth: u32,
+    pool: &StatePool,
+    params: BisectParams,
+) {
+    if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
         return;
     }
-    if depth >= MAX_DEPTH {
+    if localizing_pays(fwd, order) {
+        let local = pool.with_state(|state| state.localize(fwd, order));
+        let mut inner: Vec<u32> = (0..order.len() as u32).collect();
+        let inner_pool = StatePool {
+            n_terms: local.n_terms,
+            free: Mutex::new(Vec::new()),
+        };
+        split_parallel(&local, &mut inner, depth, &inner_pool, params);
+        apply_inner_order(order, &inner);
+        return;
+    }
+    if order.len() < PARALLEL_MIN_PARTITION {
+        pool.with_state(|state| state.split(fwd, order, depth, params));
         return;
     }
     let mid = order.len() / 2;
-    pool.with_state(|state| state.refine(fwd, order, mid, true));
+    pool.with_state(|state| state.refine(fwd, order, mid, true, params));
     let (left, right) = order.split_at_mut(mid);
     join(
-        || split_parallel(fwd, left, depth + 1, pool),
-        || split_parallel(fwd, right, depth + 1, pool),
+        || split_parallel(fwd, left, depth + 1, pool, params),
+        || split_parallel(fwd, right, depth + 1, pool, params),
     );
+}
+
+/// Whether renumbering this partition's terms would pay for itself.
+///
+/// The degree and move-gain tables are sized by the vocabulary they are
+/// indexed against, and a partition can carry no more distinct terms than it
+/// has postings. So when the postings cannot fill half the current table,
+/// renumbering is guaranteed to at least halve it, and one pass over the
+/// partition buys every split below a table that sits closer to cache.
+///
+/// Expressing the trigger as "the vocabulary has shrunk by half" rather than
+/// as a document count is what makes it travel between corpora: it fires on
+/// the relationship between a partition and its vocabulary, which is the thing
+/// that actually decides whether the tables are oversized. Halving at minimum
+/// also bounds how often it can fire on any root-to-leaf path.
+fn localizing_pays(fwd: &ForwardIndex, order: &[u32]) -> bool {
+    // An empty table cannot shrink, and without this a partition carrying no
+    // terms at all satisfies the test against its own renumbering forever.
+    if fwd.n_terms == 0 {
+        return false;
+    }
+    let postings: usize = order.iter().map(|&d| fwd.doc(d).len()).sum();
+    postings.saturating_mul(2) <= fwd.n_terms
+}
+
+/// Apply a permutation computed over a partition's own positions back onto
+/// the caller's slice.
+fn apply_inner_order(order: &mut [u32], inner: &[u32]) {
+    let was: Vec<u32> = order.to_vec();
+    for (slot, &i) in order.iter_mut().zip(inner.iter()) {
+        *slot = was[i as usize];
+    }
 }
 
 /// Scratch states shared by the parallel splits. A split takes one and
@@ -240,31 +311,25 @@ impl BisectState {
         }
     }
 
-    /// Split a partition small enough to own its vocabulary: renumber the
-    /// terms it actually carries into a dense range and run the whole
-    /// subtree against that instead of against the corpus vocabulary.
+    /// Renumber the terms this partition carries into a dense range and
+    /// return the partition as its own index, documents numbered by position.
     ///
-    /// The degree and move-gain tables are indexed by term id, so over the
-    /// shared vocabulary they stay `n_terms` entries wide however few
-    /// documents a partition holds — tens of megabytes that every round
-    /// walks at random and misses cache on, even once a partition is down
-    /// to a few thousand documents. Renumbering costs one pass over this
-    /// partition's postings, and every split beneath it inherits tables
-    /// sized to the terms actually present.
+    /// The degree and move-gain tables are indexed by term id, so against a
+    /// shared vocabulary they stay as wide as the whole corpus however few
+    /// documents a partition holds — megabytes walked at random by every
+    /// round, missing cache on nearly every lookup. One pass over the
+    /// partition's postings buys tables sized to the terms actually present,
+    /// and every split below inherits them.
     ///
     /// Renumbering is a bijection, so every degree, gain and comparison is
     /// unchanged, and the terms within a document keep their order, so the
     /// gain sums add in the same sequence and to the same float.
-    fn split_localized(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32) {
-        if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
-            return;
-        }
-
-        // Outside a refine `deg_left` is all zeros — `clear_degrees` leaves
-        // it that way and this runs in a refine's place — so it serves as
-        // the global-to-local term map without a second table that size.
-        // Zero means "not seen here"; a local id is held as `id + 1`.
-        let mut terms: Vec<u32> = Vec::with_capacity(order.len() * 8);
+    fn localize(&mut self, fwd: &ForwardIndex, order: &[u32]) -> ForwardIndex {
+        // Outside a refine `deg_left` is all zeros — `clear_degrees` leaves it
+        // that way and this runs in a refine's place — so it serves as the
+        // global-to-local term map without a second table that size. Zero
+        // means "not seen here"; a local id is held as `id + 1`.
+        let mut terms: Vec<u32> = Vec::with_capacity(order.len());
         let mut starts: Vec<u32> = Vec::with_capacity(order.len() + 1);
         starts.push(0);
         let mut n_local = 0u32;
@@ -284,38 +349,42 @@ impl BisectState {
             self.deg_left[t as usize] = 0;
         }
         self.touched.clear();
-
-        let local = ForwardIndex {
+        ForwardIndex {
             terms,
             starts,
             n_terms: n_local as usize,
-        };
-        // Positions within this partition, permuted by the subtree and then
-        // applied to the caller's slice.
-        let mut local_order: Vec<u32> = (0..order.len() as u32).collect();
-        BisectState::new(local.n_terms).split(&local, &mut local_order, depth);
-
-        let was: Vec<u32> = order.to_vec();
-        for (slot, &l) in order.iter_mut().zip(local_order.iter()) {
-            *slot = was[l as usize];
         }
     }
 
-    fn split(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32) {
+    fn split(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, params: BisectParams) {
         if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
             return;
         }
+        if localizing_pays(fwd, order) {
+            let local = self.localize(fwd, order);
+            let mut inner: Vec<u32> = (0..order.len() as u32).collect();
+            BisectState::new(local.n_terms).split(&local, &mut inner, depth, params);
+            apply_inner_order(order, &inner);
+            return;
+        }
         let mid = order.len() / 2;
-        self.refine(fwd, order, mid, false);
+        self.refine(fwd, order, mid, false, params);
         let (left, right) = order.split_at_mut(mid);
-        self.split(fwd, left, depth + 1);
-        self.split(fwd, right, depth + 1);
+        self.split(fwd, left, depth + 1, params);
+        self.split(fwd, right, depth + 1, params);
     }
 
     /// Move documents across the split while it lowers the cost, then
     /// leave the two halves in `order`. `parallel` spreads each round's
     /// gains and sorts across threads.
-    fn refine(&mut self, fwd: &ForwardIndex, order: &mut [u32], mid: usize, parallel: bool) {
+    fn refine(
+        &mut self,
+        fwd: &ForwardIndex,
+        order: &mut [u32],
+        mid: usize,
+        parallel: bool,
+        params: BisectParams,
+    ) {
         self.count_degrees(fwd, order, mid);
         let n_left = mid as f32;
         let n_right = (order.len() - mid) as f32;
@@ -328,12 +397,17 @@ impl BisectState {
         let mut left_gains = mem::take(&mut self.left_gains);
         let mut right_gains = mem::take(&mut self.right_gains);
         let mut last_swaps = 0usize;
+        // A round's realised gain is the sum of the pair gains it accepted,
+        // in the units of the cost this is minimising. The swap loop already
+        // computes them, so the convergence test is a running total and a
+        // comparison.
+        let mut first_gain = 0.0f64;
 
-        for _ in 0..MAX_ROUNDS {
+        for round in 0..params.max_rounds {
             // A document's gain is what the cost drops by if it moves:
             // its terms get one rarer on this side and one commoner on
             // the other. Positive means the move is worth making.
-            let moved = {
+            let (moved, round_gain) = {
                 self.compute_move_gains(n_left, n_right);
                 let (left, right) = order.split_at_mut(mid);
                 rank_by_gain(fwd, left, &self.move_gain_left, parallel, &mut left_gains);
@@ -356,6 +430,7 @@ impl BisectState {
                 order_leading_gains(&mut right_gains, ready, parallel);
 
                 let mut swaps = 0usize;
+                let mut gain = 0.0f64;
                 while swaps < pairs {
                     if swaps == ready {
                         ready = (ready * 2).min(pairs);
@@ -367,6 +442,7 @@ impl BisectState {
                         break;
                     }
                     swaps += 1;
+                    gain += f64::from(l.0 + r.0);
                     let (li, ri) = (l.1 as usize, r.1 as usize);
                     let (ld, rd) = (left[li], right[ri]);
                     // The degree tables follow the documents across.
@@ -381,10 +457,19 @@ impl BisectState {
                     left[li] = rd;
                     right[ri] = ld;
                 }
-                swaps
+                (swaps, gain)
             };
             last_swaps = moved;
             if moved == 0 {
+                break;
+            }
+            if round == 0 {
+                first_gain = round_gain;
+            } else if params.convergence > 0.0
+                && round_gain < f64::from(params.convergence) * first_gain
+            {
+                // The returns have fallen off far enough that the rounds still
+                // available are not worth their pass over the partition.
                 break;
             }
         }
@@ -581,6 +666,16 @@ mod tests {
 
     use super::*;
 
+    /// Every round, every split: the shape the oracle implements. The
+    /// convergence test is a deliberate change of behaviour and is covered on
+    /// its own, so the equivalence tests switch it off.
+    fn exhaustive() -> BisectParams {
+        BisectParams {
+            convergence: 0.0,
+            max_rounds: REF_MAX_ROUNDS,
+        }
+    }
+
     /// Documents drawn from `n_clusters` vocabularies, shuffled so the
     /// clusters are scattered through arrival order. A correct
     /// reordering pulls each cluster back together.
@@ -612,7 +707,7 @@ mod tests {
             (500, 4),
         ] {
             let (fwd, _) = clustered(n, clusters, 7);
-            let order = bisect_order(&fwd);
+            let order = bisect_order(&fwd, exhaustive());
             assert_eq!(order.len(), n, "n={n}");
             let mut seen = order.clone();
             seen.sort_unstable();
@@ -626,7 +721,7 @@ mod tests {
     fn a_corpus_too_small_to_split_keeps_its_order() {
         let (fwd, _) = clustered(MIN_PARTITION, 2, 3);
         assert_eq!(
-            bisect_order(&fwd),
+            bisect_order(&fwd, exhaustive()),
             (0..MIN_PARTITION as u32).collect::<Vec<_>>()
         );
     }
@@ -635,7 +730,7 @@ mod tests {
     fn documents_without_terms_are_handled() {
         let docs: Vec<Vec<u32>> = (0..200).map(|_| Vec::new()).collect();
         let fwd = ForwardIndex::from_docs(&docs);
-        let order = bisect_order(&fwd);
+        let order = bisect_order(&fwd, exhaustive());
         assert_eq!(order.len(), 200);
         let mut seen = order.clone();
         seen.sort_unstable();
@@ -648,7 +743,7 @@ mod tests {
         for seed in 0..4u64 {
             let (fwd, _) = clustered(2_000, 5, seed);
             let arrival: Vec<u32> = (0..fwd.len() as u32).collect();
-            let reordered = bisect_order(&fwd);
+            let reordered = bisect_order(&fwd, exhaustive());
             let before = order_cost(&fwd, &arrival, 128);
             let after = order_cost(&fwd, &reordered, 128);
             assert!(
@@ -665,7 +760,7 @@ mod tests {
         // sits near 1/clusters; a working bisection is far above it.
         const CLUSTERS: usize = 5;
         let (fwd, cluster_of) = clustered(2_000, CLUSTERS, 11);
-        let order = bisect_order(&fwd);
+        let order = bisect_order(&fwd, exhaustive());
         let same = |o: &[u32]| {
             o.windows(2)
                 .filter(|w| cluster_of[w[0] as usize] == cluster_of[w[1] as usize])
@@ -684,7 +779,10 @@ mod tests {
     #[test]
     fn the_order_is_deterministic() {
         let (fwd, _) = clustered(1_000, 3, 5);
-        assert_eq!(bisect_order(&fwd), bisect_order(&fwd));
+        assert_eq!(
+            bisect_order(&fwd, exhaustive()),
+            bisect_order(&fwd, exhaustive())
+        );
     }
 
     #[test]
@@ -708,7 +806,11 @@ mod tests {
         }
     }
 
-    /// Today's bisection, kept verbatim as an oracle.
+    /// The round ceiling the bisection used before the convergence test, so
+    /// the oracle stays the algorithm the optimizations are measured against.
+    const REF_MAX_ROUNDS: usize = 20;
+
+    /// The unoptimized bisection, kept verbatim as an oracle.
     ///
     /// Every optimization in this module is required to leave the chosen
     /// order byte-for-byte unchanged — that is what lets them ship without
@@ -767,7 +869,7 @@ mod tests {
             fill_cost_table(&mut self.cost_left, n_left);
             fill_cost_table(&mut self.cost_right, n_right);
 
-            for _ in 0..MAX_ROUNDS {
+            for _ in 0..REF_MAX_ROUNDS {
                 for &t in &self.touched {
                     let t = t as usize;
                     let (dl, dr) = (self.deg_left[t], self.deg_right[t]);
@@ -859,18 +961,47 @@ mod tests {
         ] {
             let (fwd, _) = clustered(docs, clusters, seed);
             assert_eq!(
-                bisect_order(&fwd),
+                bisect_order(&fwd, exhaustive()),
                 reference_order(&fwd),
                 "order diverged at docs={docs} clusters={clusters} seed={seed}"
             );
         }
     }
 
+    /// The convergence test must actually end splits early and must still
+    /// leave the corpus better grouped than it found it — the point is to stop
+    /// paying for rounds that have stopped earning, not to stop reordering.
+    #[test]
+    fn converging_early_still_lowers_the_cost() {
+        let (fwd, _) = clustered(20_000, 9, 21);
+        let arrival: Vec<u32> = (0..fwd.len() as u32).collect();
+        let eager = bisect_order(
+            &fwd,
+            BisectParams {
+                convergence: 0.5,
+                max_rounds: REF_MAX_ROUNDS,
+            },
+        );
+        let full = bisect_order(&fwd, exhaustive());
+
+        // Stopping early is a different order from running every round; if it
+        // were not, the test would be proving nothing.
+        assert_ne!(eager, full, "convergence never fired");
+
+        let cost = |o: &[u32]| order_cost(&fwd, o, 64);
+        assert!(
+            cost(&eager) < cost(&arrival),
+            "early convergence left the order no better than arrival: {} vs {}",
+            cost(&eager),
+            cost(&arrival)
+        );
+    }
+
     #[test]
     fn the_parallel_order_matches_the_serial_one() {
         let (fwd, _) = clustered(3 * PARALLEL_MIN_PARTITION, 20, 13);
         let mut serial: Vec<u32> = (0..fwd.len() as u32).collect();
-        BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0);
-        assert_eq!(bisect_order(&fwd), serial);
+        BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0, exhaustive());
+        assert_eq!(bisect_order(&fwd, exhaustive()), serial);
     }
 }
