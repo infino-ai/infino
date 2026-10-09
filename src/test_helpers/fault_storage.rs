@@ -18,10 +18,11 @@
 //! the inner one everywhere a test isn't deliberately failing it.
 
 use std::{
+    fmt::{Debug, Formatter, Result as FmtResult},
     io::Error as IoError,
     ops::Range,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -80,6 +81,20 @@ struct FaultRule {
     remaining: usize,
 }
 
+/// A closure run once, before the first `op` call whose URI contains
+/// `uri_fragment`.
+struct Hook {
+    op: FaultOp,
+    uri_fragment: String,
+    run: Box<dyn FnOnce() + Send>,
+}
+
+impl Debug for Hook {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "Hook({:?}, {:?})", self.op, self.uri_fragment)
+    }
+}
+
 /// See the module docs. Construct with [`FaultStorage::wrap`], arm with
 /// [`FaultStorage::fail`], and pass the `Arc` anywhere a
 /// `Arc<dyn StorageProvider>` goes.
@@ -87,6 +102,7 @@ struct FaultRule {
 pub struct FaultStorage {
     inner: Arc<dyn StorageProvider>,
     rules: Mutex<Vec<FaultRule>>,
+    hooks: Mutex<Vec<Hook>>,
     fired: AtomicUsize,
 }
 
@@ -95,6 +111,7 @@ impl FaultStorage {
         Arc::new(Self {
             inner,
             rules: Mutex::new(Vec::new()),
+            hooks: Mutex::new(Vec::new()),
             fired: AtomicUsize::new(0),
         })
     }
@@ -115,7 +132,7 @@ impl FaultStorage {
     /// [`Self::fail`]; use [`FaultKind::Precondition`] to model a peer
     /// writer winning the CAS instead of a broken store.
     pub fn fail_with(&self, kind: FaultKind, op: FaultOp, uri_fragment: &str, times: usize) {
-        self.rules_guard().push(FaultRule {
+        guard(&self.rules).push(FaultRule {
             op,
             kind,
             uri_fragment: uri_fragment.to_string(),
@@ -123,9 +140,19 @@ impl FaultStorage {
         });
     }
 
+    /// Run `hook` once, before the first `op` call whose URI contains
+    /// `uri_fragment` — e.g. to land a peer's commit mid-operation.
+    pub fn before(&self, op: FaultOp, uri_fragment: &str, hook: impl FnOnce() + Send + 'static) {
+        guard(&self.hooks).push(Hook {
+            op,
+            uri_fragment: uri_fragment.to_string(),
+            run: Box::new(hook),
+        });
+    }
+
     /// Disarm every remaining rule.
     pub fn clear(&self) {
-        self.rules_guard().clear();
+        guard(&self.rules).clear();
     }
 
     /// Total faults fired since construction — lets a test assert the
@@ -134,23 +161,23 @@ impl FaultStorage {
         self.fired.load(Ordering::SeqCst)
     }
 
-    /// The rules table, recovering from mutex poisoning: the helper's
-    /// contract is failures-as-clean-errors, so a panic elsewhere must not
-    /// turn every later storage call into a second panic. The state is
-    /// safe to reuse — mutations under the lock are single-field writes.
-    fn rules_guard(&self) -> MutexGuard<'_, Vec<FaultRule>> {
-        match self.rules.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-
     /// `Err` for a rule that fails the call, `Ok(true)` for a
     /// [`FaultKind::ResponseLost`] rule (the caller issues the call once and
     /// drops its result before issuing it again), `Ok(false)` when no rule
     /// matches.
     fn check(&self, op: FaultOp, uri: &str) -> Result<bool, StorageError> {
-        let mut rules = self.rules_guard();
+        let hook = {
+            let mut hooks = guard(&self.hooks);
+            hooks
+                .iter()
+                .position(|h| h.op == op && uri.contains(&h.uri_fragment))
+                .map(|i| hooks.remove(i))
+        };
+        // Run outside the lock: the hook may use this storage itself.
+        if let Some(hook) = hook {
+            (hook.run)();
+        }
+        let mut rules = guard(&self.rules);
         for rule in rules.iter_mut() {
             if rule.op == op && rule.remaining > 0 && uri.contains(&rule.uri_fragment) {
                 rule.remaining -= 1;
@@ -172,6 +199,14 @@ impl FaultStorage {
         }
         Ok(false)
     }
+}
+
+/// Lock `mutex`, recovering from poisoning: the helper's contract is
+/// failures-as-clean-errors, so a panic elsewhere must not turn every later
+/// storage call into a second panic. The state is safe to reuse — mutations
+/// under the locks are single-field writes or one push or remove.
+fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[async_trait]

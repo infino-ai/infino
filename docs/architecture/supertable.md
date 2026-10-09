@@ -272,7 +272,8 @@ So a visible superfile always has postings, a crash between the writes
 and the swap leaves only orphans for garbage collection, and a lost
 race is retried against the winner with re-puts of already-written
 slices as no-ops. A maintenance pass folds every delta into one base
-segment. A posting is followed only if its superfile is still live in
+segment; deltas committed while it runs stay after that base, padded so
+their ordinals hold, and the next pass folds them. A posting is followed only if its superfile is still live in
 the reader's manifest, so a removal never invalidates the index.
 
 Queries use it at every tier. Superfile selection for a term or prefix

@@ -384,26 +384,37 @@ pub(crate) struct BuiltSegment {
 }
 
 /// Merge contributions into a base root: one segment, ordinals from zero.
-///
-/// Optimize skips the rebuild when the current index already has this
-/// shape, so a change to what this writes reaches existing tables only if
-/// it also bumps `ROOT_FORMAT_VERSION`: an old root then fails to load and
-/// is rebuilt.
-#[cfg_attr(
-    feature = "detailed-tracing",
-    tracing::instrument(skip_all, fields(inputs = contributions.len()))
-)]
+#[cfg(test)]
 pub(crate) fn build(
     contributions: &[Contribution],
     policy: &BuildPolicy,
 ) -> Result<Built, TermIndexError> {
-    let built = build_segment(contributions, policy, 0)?;
+    build_onto(Root::default(), contributions, policy)
+}
+
+/// `base` with `contributions` merged into one more segment, whose
+/// ordinals continue from `base`'s superfile count. Onto an empty root this
+/// is a full build: one segment, ordinals from zero.
+///
+/// Optimize skips the rebuild when the current index already has a full
+/// build's shape, so a change to what this writes reaches existing tables
+/// only if it also bumps `ROOT_FORMAT_VERSION`: an old root then fails to
+/// load and is rebuilt.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(skip_all, fields(inputs = contributions.len()))
+)]
+pub(crate) fn build_onto(
+    mut base: Root,
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+) -> Result<Built, TermIndexError> {
+    let built = build_segment(contributions, policy, base.superfiles.len() as u32)?;
+    base.superfiles.extend(built.superfiles);
+    base.id_mins.extend(built.id_mins);
+    base.segments.push(built.segment);
     Ok(Built {
-        root: Root {
-            superfiles: built.superfiles,
-            id_mins: built.id_mins,
-            segments: vec![built.segment],
-        },
+        root: base,
         slices: built.slices,
     })
 }
