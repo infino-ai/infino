@@ -273,19 +273,32 @@ const DEFAULT_SUPERFILE_BUFFER_SPLIT_MB: u64 = 64;
 const DEFAULT_VERIFY_CRC_ON_OPEN: bool = true;
 
 // Compaction defaults
-const DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB: u64 = 1024;
+const DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB: u64 = 8192;
 const DEFAULT_COMPACTION_MIN_FILL_PERCENT: u8 = 80;
 /// Default fragment-count merge trigger for the user table: consolidate a
 /// partition once it accumulates this many sub-target superfiles, even when
 /// their combined live bytes are far below the size floor. Catches the
 /// small-append fragmentation that would otherwise never reach `min_fill_percent`.
 const DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE: u64 = 50;
-const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB + 2048;
+/// Raw input bytes one merge may take in, as a multiple of its output target.
+/// A merge stops adding inputs at whichever of target (live bytes) or this cap
+/// (raw bytes) it reaches first, so the cap must be the target divided by the
+/// inputs' live fraction for a full-size output. At 2, inputs that are half
+/// deleted still fill one.
+const COMPACTION_MAX_MEMORY_TARGET_MULTIPLE: u64 = 2;
+const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 =
+    DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB * COMPACTION_MAX_MEMORY_TARGET_MULTIPLE;
 
 /// How old a tombstone sidecar seal has to be before compaction treats
 /// its owner as dead and takes over, instead of backing off.
-/// Scale this up if target_superfile_size_mb is raised well past the default
-pub const DEFAULT_STALE_SEAL_TIMEOUT_MS: u64 = 2 * 60 * 1000;
+///
+/// A merge holds its inputs' seals for its whole run, so this has to outlast
+/// a merge at the default target: a seal taken over mid-merge makes the
+/// compactor drop the job and throw the merge away. Scale it up if
+/// target_superfile_size_mb is raised well past the default. The writer's
+/// sealed-retry budget must stay longer than this, which a compile-time
+/// assert in the WAL pipeline enforces for the shipped pair.
+pub const DEFAULT_STALE_SEAL_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 /// Compaction settings: target size, fill floor, and memory budget.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -507,16 +520,18 @@ const DEFAULT_VECTOR_HIDDEN_CELL_COUNT: usize = 256;
 /// to hold a full packed cell shard plus incremental deltas so the drain's
 /// base shard stays a merge candidate and absorbs later deltas rather than
 /// being sealed as over-target on the first pass.
-const DEFAULT_VECTOR_COMPACTION_TARGET_MB: u64 = 2048;
+const DEFAULT_VECTOR_COMPACTION_TARGET_MB: u64 = 8192;
 /// Default hidden vector-index fragment-count merge trigger: `2` means a cell
 /// consolidates on any two shards, so drain generations collapse and
 /// post-compact cold GET stays at the post-drain level. The hidden index keeps
 /// no byte floor of its own — it inherits the user table's `min_fill_percent`,
 /// which this count trigger dominates.
 const DEFAULT_VECTOR_COMPACTION_MIN_SUPERFILES_FOR_MERGE: u64 = 2;
-/// Default hidden vector-index compaction per-pass memory ceiling (MiB). Must
-/// stay >= the target or it caps the packed inputs below a full output.
-const DEFAULT_VECTOR_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_VECTOR_COMPACTION_TARGET_MB + 2048;
+/// Default hidden vector-index compaction per-pass memory ceiling (MiB). Twice
+/// the target, for the same reason as the user table's: below that, inputs
+/// that are half deleted cap the packed inputs below a full output.
+const DEFAULT_VECTOR_COMPACTION_MAX_MEMORY_MB: u64 =
+    DEFAULT_VECTOR_COMPACTION_TARGET_MB * COMPACTION_MAX_MEMORY_TARGET_MULTIPLE;
 
 /// How the writer aligns user-superfile vector clusters to the global
 /// cell grid. Selected by `vector.user_centroids`.
@@ -2246,7 +2261,7 @@ supertable:
         assert_eq!(c.min_fill_percent, DEFAULT_COMPACTION_MIN_FILL_PERCENT);
         assert_eq!(
             c.max_memory_mb, DEFAULT_COMPACTION_MAX_MEMORY_MB,
-            "target + 2048"
+            "twice the target"
         );
     }
 
@@ -2270,7 +2285,7 @@ supertable:
         let cfg = Config::from_figment(fig).expect("layered yaml");
         assert_eq!(cfg.compaction.target_superfile_size_mb, 2048);
         assert_eq!(cfg.compaction.min_fill_percent, 50);
-        assert_eq!(cfg.compaction.max_memory_mb, 3072);
+        assert_eq!(cfg.compaction.max_memory_mb, 16384);
     }
 
     #[test]

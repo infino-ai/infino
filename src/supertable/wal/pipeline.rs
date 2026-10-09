@@ -964,7 +964,11 @@ const LEASE_RENEW_FRACTION: i32 = 3;
 /// supertable surfaces a typed error rather than hanging the
 /// test process. The budget is high enough that a healthy
 /// compactor never exhausts it under realistic loads.
-pub(crate) const DEFAULT_MAX_SEALED_RETRIES: u32 = 16;
+///
+/// Sized against [`DEFAULT_STALE_SEAL_TIMEOUT_MS`]: 20 retries back off for
+/// about 5.5 minutes in total, enough to reach a 5-minute seal's staleness
+/// threshold and take it over (see the ordering assert below).
+pub(crate) const DEFAULT_MAX_SEALED_RETRIES: u32 = 20;
 
 /// Whether a sealed-retry attempt earns its budget back.
 ///
@@ -3266,7 +3270,7 @@ mod tests {
         // the bounded budget — surfacing a typed error.
         let (wal, etag) = create_delete_wal(&ws, 206, &[id_min]).await;
 
-        // We don't want to actually wait for 16 retries through
+        // We don't want to actually wait for the default retries through
         // the full exponential backoff (that would total minutes).
         // Run the orchestrator under a timeout that's just long
         // enough to confirm the seal IS being detected (i.e. the

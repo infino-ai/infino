@@ -303,7 +303,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
     }
 
     pub(in crate::supertable::optimize::compact) fn default_cfg() -> CompactionSettings {
-        CompactionSettings::default() // 1 GiB target, 80% floor
+        CompactionSettings::default() // 8 GiB target, 80% floor (6.4 GiB), 16 GiB input cap
     }
 
     #[test]
@@ -332,25 +332,25 @@ pub(in crate::supertable::optimize::compact) mod tests {
 
     #[test]
     fn below_fill_floor_skips() {
-        // 400 MiB total < 80% of 1 GiB.
-        let segs = vec![seg(1, 200, 1000, 0), seg(2, 200, 1000, 0)];
+        // 3200 MiB total < 80% of 8 GiB.
+        let segs = vec![seg(1, 1600, 1000, 0), seg(2, 1600, 1000, 0)];
         assert!(select(&segs, &default_cfg()).is_empty());
     }
 
     #[test]
     fn packs_one_job_and_leaves_remainder() {
-        // 6 × 200 MiB: one job of 5 (1000 MiB), 6th left over.
-        let segs: Vec<_> = (0..6).map(|i| seg(i, 200, 1000, 0)).collect();
+        // 6 × 1600 MiB: one job of 5 (8000 MiB), 6th left over.
+        let segs: Vec<_> = (0..6).map(|i| seg(i, 1600, 1000, 0)).collect();
         let jobs = select(&segs, &default_cfg());
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].inputs.len(), 5);
-        assert_eq!(jobs[0].estimated_output_bytes, mib(1000));
+        assert_eq!(jobs[0].estimated_output_bytes, mib(8000));
     }
 
     #[test]
     fn splits_many_superfiles_into_multiple_jobs() {
-        // 12 × 200 MiB: two jobs of 5, last 2 left over.
-        let segs: Vec<_> = (0..12).map(|i| seg(i, 200, 1000, 0)).collect();
+        // 12 × 1600 MiB: two jobs of 5, last 2 left over.
+        let segs: Vec<_> = (0..12).map(|i| seg(i, 1600, 1000, 0)).collect();
         let jobs = select(&segs, &default_cfg());
         assert_eq!(jobs.len(), 2);
         assert!(jobs.iter().all(|j| j.inputs.len() == 5));
@@ -358,9 +358,9 @@ pub(in crate::supertable::optimize::compact) mod tests {
 
     #[test]
     fn already_target_sized_superfile_is_never_re_compacted() {
-        let big = seg(99, 1024, 1_000_000, 0);
+        let big = seg(99, 8192, 1_000_000, 0);
         let mut segs = vec![big.clone()];
-        segs.extend((0..5).map(|i| seg(i, 200, 1000, 0)));
+        segs.extend((0..5).map(|i| seg(i, 1600, 1000, 0)));
         let jobs = select(&segs, &default_cfg());
         assert_eq!(jobs.len(), 1);
         assert!(!jobs[0].inputs.contains(&big.superfile_id));
@@ -368,18 +368,20 @@ pub(in crate::supertable::optimize::compact) mod tests {
 
     #[test]
     fn output_estimate_uses_live_bytes() {
-        // 5 × 400 MiB raw, half deleted → 200 MiB live each.
-        let segs: Vec<_> = (0..5).map(|i| seg(i, 400, 1000, 500)).collect();
+        // 5 × 3200 MiB raw, half deleted → 1600 MiB live each. The 16000 MiB
+        // raw total stays under the 16 GiB input cap, so the live bytes, not
+        // the raw bytes, decide how many inputs fit the target.
+        let segs: Vec<_> = (0..5).map(|i| seg(i, 3200, 1000, 500)).collect();
         let jobs = select(&segs, &default_cfg());
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].inputs.len(), 5);
-        assert_eq!(jobs[0].estimated_output_bytes, mib(1000));
+        assert_eq!(jobs[0].estimated_output_bytes, mib(8000));
     }
 
     #[test]
     fn prefers_most_deleted_first() {
-        let mut segs: Vec<_> = (0..9).map(|i| seg(i, 100, 1000, 0)).collect();
-        let dead_heavy = seg(100, 100, 1000, 900);
+        let mut segs: Vec<_> = (0..9).map(|i| seg(i, 800, 1000, 0)).collect();
+        let dead_heavy = seg(100, 800, 1000, 900);
         segs.push(dead_heavy.clone());
         let jobs = select(&segs, &default_cfg());
         assert_eq!(jobs[0].inputs[0], dead_heavy.superfile_id);
@@ -387,9 +389,9 @@ pub(in crate::supertable::optimize::compact) mod tests {
 
     #[test]
     fn sealed_by_other_is_excluded() {
-        let mut owned = seg(1, 200, 1000, 0);
+        let mut owned = seg(1, 1600, 1000, 0);
         owned.sealed_by_other = true;
-        let segs = vec![owned, seg(2, 200, 1000, 0), seg(3, 200, 1000, 0)];
+        let segs = vec![owned, seg(2, 1600, 1000, 0), seg(3, 1600, 1000, 0)];
         for job in select(&segs, &default_cfg()) {
             assert!(!job.inputs.contains(&Uuid::from_u128(1)));
         }
@@ -397,7 +399,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
 
     #[test]
     fn fewer_than_two_candidates_skips() {
-        assert!(select(&[seg(1, 200, 1000, 0)], &default_cfg()).is_empty());
+        assert!(select(&[seg(1, 1600, 1000, 0)], &default_cfg()).is_empty());
     }
 
     // ---- SuperfileStats live_docs / live_bytes -----------------------

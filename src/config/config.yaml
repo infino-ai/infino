@@ -118,11 +118,11 @@ storage:
 # Sizes are in mb (1 MiB = 1024 × 1024 bytes).
 compaction:
   # Size a compacted output aims for.
-  target_superfile_size_mb: 1024
+  target_superfile_size_mb: 8192
 
   # Minimum estimated live bytes to trigger a merge,
   # as a percentage of `target_superfile_size_mb`.
-  # E.g. at 80% with a 1 GiB target, two 200 MiB superfiles (400 MiB) do not compact.
+  # E.g. at 80% with an 8 GiB target, two 2 GiB superfiles (4 GiB) do not compact.
   min_fill_percent: 80
 
   # Fragment-count merge trigger: merge once a partition has this many
@@ -130,8 +130,9 @@ compaction:
   # so many tiny appends consolidate without lowering the floor. Min 2.
   min_superfiles_for_merge: 50
 
-  # Maximum memory budget for materializing inputs during a single merge, in MiB.
-  max_memory_mb: 3072
+  # Maximum raw input bytes a single merge may take in, in MiB. Twice the
+  # target, so inputs that are half deleted still fill a full-size output.
+  max_memory_mb: 16384
 
 # Vector-index build / search / drain tuning. Every value below
 # defaults to the engine's built-in behavior — a fresh install never
@@ -475,8 +476,8 @@ vector:
   # shard stays a merge candidate until it reaches compaction_target_mb,
   # so incremental deltas are absorbed into it instead of being sealed
   # off as separate fragments. compaction_max_memory_mb caps the input
-  # bytes packed into one merge pass and must stay >= the target, or the
-  # target is never reached.
+  # bytes packed into one merge pass. It is twice the target, so inputs
+  # that are half deleted still reach the target rather than the cap.
   #
   # The hidden index has no byte floor of its own: it derives min_fill_percent
   # from the top-level `compaction:` section, and compaction_min_superfiles_for_merge
@@ -486,9 +487,9 @@ vector:
   # append-child split (validated), so a merge that pushes a cell over the cap
   # (or into multimodality with the trigger on) splits it correctly rather than
   # hitting the old broken post-merge split path.
-  compaction_target_mb: 2048
+  compaction_target_mb: 8192
   compaction_min_superfiles_for_merge: 2
-  compaction_max_memory_mb: 4096
+  compaction_max_memory_mb: 16384
 
 # Diagnostic and hardware-capability toggles. Each gates
 # instrumentation or forces a slower code path for A/B measurement;

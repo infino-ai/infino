@@ -654,8 +654,8 @@ type CompactionStats = (f64, storage_meter::ObjectStoreMeter, u64, Option<f64>);
 /// largest superfile, not its size. Sizing the target from the table's own
 /// bytes per doc pins that count: two builds of the same corpus compact to
 /// the same shape even when one stores its index far denser, and the warm
-/// rows then compare readers rather than how many docs a 1 GiB output
-/// happened to absorb. Chosen to match what the default 1 GiB target yields
+/// rows then compare readers rather than how many docs a fixed-size output
+/// happened to absorb. Chosen to match what a 1 GiB target yields
 /// on the realistic FTS corpus, so the shape the gates have always measured
 /// is preserved.
 const COMPACTION_DOCS_PER_SUPERFILE: u64 = 200_000;
@@ -682,11 +682,11 @@ fn shape_pinned_compaction(table: &Supertable) -> CompactionSettings {
     let defaults = CompactionSettings::default();
     CompactionSettings {
         target_superfile_size_mb,
-        // Keep the merge's memory ceiling the same distance above the target
-        // as the defaults keep it, so a denser table's smaller target never
+        // Keep the merge's memory ceiling the same multiple of the target as
+        // the defaults keep it, so a denser table's smaller target never
         // tightens it and a larger one is never capped below a full output.
         max_memory_mb: defaults.max_memory_mb.max(
-            target_superfile_size_mb + (defaults.max_memory_mb - defaults.target_superfile_size_mb),
+            target_superfile_size_mb * defaults.max_memory_mb / defaults.target_superfile_size_mb,
         ),
         ..defaults
     }
