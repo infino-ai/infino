@@ -25,11 +25,7 @@ use crate::{
         BuildError as SuperfileBuildError, FtsError, ReadError, VectorError,
         unreadable_format_in_chain,
     },
-    supertable::{
-        ManifestLoadError,
-        manifest::{part, term_stats::TermStatsError},
-        schema::error::SchemaError,
-    },
+    supertable::{ManifestLoadError, manifest::part, schema::error::SchemaError},
 };
 
 /// Errors raised when constructing or operating against a
@@ -245,23 +241,6 @@ impl BuildError {
             BuildError::StorageConstruction(e) => e.is_permission_denied(),
             _ => false,
         }
-    }
-}
-
-impl From<TermStatsError> for BuildError {
-    /// The term-stats pass reaches the build path as `Store` carrying the
-    /// message, except a refused credential under it, which keeps its own
-    /// variant so the caller is told to fix the credentials, not to retry,
-    /// and a superfile in a format this engine does not read, which keeps
-    /// `Unsupported`.
-    fn from(e: TermStatsError) -> Self {
-        if e.is_permission_denied() {
-            return BuildError::PermissionDenied(e.to_string());
-        }
-        if let TermStatsError::Open(QueryError::Unsupported(m)) = e {
-            return BuildError::Unsupported(m);
-        }
-        BuildError::Store(e.to_string())
     }
 }
 
@@ -946,34 +925,6 @@ mod tests {
 
     use super::*;
     use crate::{superfile::LazyByteSourceError, supertable::reader_cache::disk::DiskCacheError};
-
-    /// The term-stats pass runs during optimize: a refused credential under
-    /// any of its failures (a dictionary read, a reader open, the artifact
-    /// write) reaches the build path as `PermissionDenied`, so the caller
-    /// fixes the credentials instead of retrying; anything else stays `Store`.
-    #[test]
-    fn a_refused_credential_in_the_term_stats_pass_stays_permission_denied() {
-        let refused = || StorageError::PermissionDenied { uri: "u".into() };
-        let read = TermStatsError::Read {
-            what: "dict fetch",
-            source: FtsError::RangeFetch {
-                what: "fts/dict",
-                source: LazyByteSourceError::Storage(refused()),
-            },
-        };
-        let open = TermStatsError::Open(QueryError::PermissionDenied("refused".into()));
-        for failure in [read, open, TermStatsError::Storage(refused())] {
-            assert!(
-                matches!(BuildError::from(failure), BuildError::PermissionDenied(_)),
-                "a refused credential must stay one"
-            );
-        }
-        let timeout = TermStatsError::Storage(StorageError::TransientExhausted {
-            uri: "u".into(),
-            source: "boom".into(),
-        });
-        assert!(matches!(BuildError::from(timeout), BuildError::Store(_)));
-    }
 
     /// A range fetch inside the FTS or vector reader keeps its kind through
     /// the reader's error: refused credentials are found under it, and any

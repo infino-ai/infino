@@ -125,7 +125,6 @@ parquet = { version = "58", features = ["async", "object_store"] }
 bitpacking = "0.9"
 crc-fast = "1.10.0"
 wide = "1"
-fst = "0.4"
 bytemuck = { version = "1", features = ["min_const_generics"] }
 
 # Allocator strategy: mimalloc as #[global_allocator], bumpalo for

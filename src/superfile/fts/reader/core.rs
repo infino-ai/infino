@@ -1338,18 +1338,6 @@ impl FtsReader {
         self.iter_terms_with_prefix(column, b"")
     }
 
-    /// [`Self::iter_column_terms`] over `dict_bytes`, this reader's
-    /// dictionary already fetched by the caller.
-    pub(crate) fn iter_column_terms_with(
-        &self,
-        dict_bytes: &[u8],
-        column: &str,
-    ) -> Result<Vec<Vec<u8>>, FtsError> {
-        self.debug_assert_own_dict(dict_bytes);
-        // An unregistered column has no keys, so the walk is empty.
-        collect_terms_with_prefix(dict_bytes, column, b"")
-    }
-
     /// Catches a caller handing in a dictionary of the wrong size, such as
     /// another reader's. A same-sized one is not caught.
     pub(super) fn debug_assert_own_dict(&self, dict_bytes: &[u8]) {
@@ -2157,7 +2145,6 @@ mod tests {
     }
     use std::{
         collections::{HashMap, HashSet},
-        str::from_utf8,
         sync::{
             Mutex,
             atomic::{AtomicBool, Ordering},
@@ -3683,11 +3670,10 @@ mod tests {
         );
     }
 
-    /// The optimizer's term passes read the dictionary once per superfile:
-    /// the caller's fetch serves the term walk, every df batch and every
-    /// facts batch, none of which fetch it again.
+    /// The term-index pass reads the dictionary once per superfile: the
+    /// caller's fetch serves every facts batch, none of which fetch it again.
     #[tokio::test]
-    async fn term_passes_read_the_dictionary_once() {
+    async fn term_index_pass_reads_the_dictionary_once() {
         // One term per batch, so every term is its own batch.
         const BATCH: usize = 1;
         let (blob, json) = build_mixed_df_blob();
@@ -3703,18 +3689,10 @@ mod tests {
         let opened = recording.len();
         let dict_bytes = r.dict_bytes_async().await.expect("dict");
 
-        let terms = r
-            .iter_column_terms_with(&dict_bytes, "body")
-            .expect("terms");
-        let names: Vec<&str> = terms.iter().map(|t| from_utf8(t).expect("utf8")).collect();
-        assert!(names.len() > BATCH, "the walk spans several batches");
-        for chunk in names.chunks(BATCH) {
-            r.term_dfs_with(&dict_bytes, "body", chunk)
-                .await
-                .expect("df batch");
-        }
+        let mut batches = 0;
         let mut after: Option<Vec<u8>> = None;
         loop {
+            batches += 1;
             let chunk = r
                 .term_index_facts_after(&dict_bytes, "body", after.as_deref(), BATCH)
                 .await
@@ -3725,6 +3703,7 @@ mod tests {
                 break;
             }
         }
+        assert!(batches > 1, "the pass spans several batches");
         assert_eq!(
             recording.touches(opened, &dictionary),
             1,

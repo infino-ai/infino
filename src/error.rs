@@ -658,7 +658,7 @@ mod tests {
             ),
             (
                 InfinoError::from(SupertableBuildError::Store(
-                    "term-stats write timed out".into(),
+                    "term-index write timed out".into(),
                 )),
                 |e| matches!(e, InfinoError::Backend(_)),
             ),

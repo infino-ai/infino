@@ -5,7 +5,7 @@
 //!
 //! Compaction is the one phase this module owns outright; it lives in
 //! [`compact`]. Every other phase (the hidden-cell drain, the
-//! centroid-router refresh, the term-stats rebuild, gc) is a maintenance
+//! centroid-router refresh, the term-index rebuild, gc) is a maintenance
 //! operation with callers of its own, sequenced here rather than
 //! implemented here.
 
@@ -74,12 +74,9 @@ impl Supertable {
                 "[optphase] router_cache"
             );
         }
-        // Refresh the term index, and the term-stats sidecar if the index
-        // is incomplete, over the post-merge membership (compaction's
-        // removals dropped any prior sidecar reference — see the manifest
-        // carry rule). Runs before gc so the sweep's live set names the
-        // fresh artifacts.
-        self.refresh_term_stats_sync()
+        // Rebuild the term index over the merged superfiles. Runs before gc
+        // so the sweep keeps the fresh index and removes the one it replaced.
+        self.refresh_term_index_sync()
             .map_err(OptimizeError::from)?;
         match self.gc(opts.gc.safety_gap) {
             Ok(_) | Err(GcError::NoStorage) => {}

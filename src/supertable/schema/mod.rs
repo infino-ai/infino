@@ -106,11 +106,10 @@ impl FieldId {
     /// birth-version range of its superfiles. Not a column.
     pub const BIRTH_VERSION: FieldId = FieldId(u32::MAX);
 
-    /// The key a table-level term artifact (the term index, the term-stats
-    /// sidecar) files `term` of this column under: the id in decimal, then
-    /// the same separator and term bytes as a superfile's own dictionary
-    /// key, so one encoding serves both tiers and a rename changes nothing
-    /// at the table level.
+    /// The key the table-level term index files `term` of this column under:
+    /// the id in decimal, then the same separator and term bytes as a
+    /// superfile's own dictionary key, so one encoding serves both tiers and
+    /// a rename changes nothing at the table level.
     pub(crate) fn term_key(self, term: &str) -> Vec<u8> {
         make_key(&self.to_string(), term)
     }

@@ -1259,10 +1259,9 @@ impl SupertableReader {
         // A complete term index already holds every term's gross df in
         // every live superfile — the same numbers a superfile's dictionary
         // would give — so the corpus-wide df is a sum over its postings and
-        // nothing is opened: no dictionary, no sidecar. The walk builds its
-        // memos from the index's locations. (A partial index, after a commit
-        // on a table the index did not yet cover in full, takes the wave
-        // below like a table with no index.)
+        // no dictionary is opened. The walk builds its memos from the
+        // index's locations. An incomplete index takes the wave below, like
+        // a table with no index.
         if manifest.term_index_complete()
             && let Some(index) = manifest.term_index().await
         {
@@ -1296,37 +1295,15 @@ impl SupertableReader {
             return Ok((map, None));
         }
 
-        // Maintenance-published corpus stats first: the sidecar sums gross
-        // df over its covered superfiles, so the wave below shrinks to the
-        // uncovered tail (recent commits) — and vanishes entirely on a
-        // table whose maintenance is current, restoring the single fully
-        // overlapped dispatch of the per-superfile plan. A load failure
-        // degrades to the full query-time wave.
-        // `term_stats_sidecar` hands back an artifact only when its
-        // covered set is still entirely listed by this manifest — it
-        // verifies that once per generation and caches the verdict, so
-        // a stale artifact reads as absent here and this wave falls
-        // back to every superfile's own dictionary.
-        let sidecar = self.term_stats_sidecar().await;
-        let covered: HashSet<Uuid> = sidecar
-            .as_ref()
-            .map(|s| s.covered().iter().copied().collect())
-            .unwrap_or_default();
-
         // Presence prune over the missing terms: every superfile whose
-        // bloom may contain any of them owes a df contribution — minus the
-        // sidecar-covered set, whose contribution is already summed.
+        // bloom may contain any of them owes a df contribution.
         let prune = PruneLeaf::TermPresence {
             column: column.to_owned(),
             terms: misses.clone(),
             mode: BoolMode::Or,
         };
         let presence: Vec<Arc<SuperfileEntry>> =
-            select_fts_superfiles(manifest, slice::from_ref(&prune), column)
-                .await?
-                .into_iter()
-                .filter(|e| !covered.contains(&e.superfile_id))
-                .collect();
+            select_fts_superfiles(manifest, slice::from_ref(&prune), column).await?;
         let kept_ids: HashSet<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
         let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column.to_owned());
@@ -1394,12 +1371,9 @@ impl SupertableReader {
         }
         let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(misses.len());
         for (i, t) in misses.iter().enumerate() {
-            // Sidecar-covered superfiles' contribution rides the artifact;
-            // the wave above summed only the uncovered tail. df can't
-            // exceed the collection size; clamp so idf's df <= n_docs
-            // invariant holds under gross-vs-live counts.
-            let sidecar_df = sidecar.as_ref().map_or(0, |s| s.df(column_id, t));
-            let df = (global_df[i] + sidecar_df).min(global_n);
+            // Clamp to the collection size: df counts tombstoned docs until
+            // compaction, and idf needs df <= n_docs.
+            let df = global_df[i].min(global_n);
             let idf = bm25::idf(global_n, df);
             map.insert(t.clone(), idf);
             fresh.push((t.as_str(), idf));
@@ -5416,10 +5390,6 @@ mod tests {
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         assert!(manifest.term_index_complete(), "every commit contributed");
-        assert!(
-            reader.manifest().term_stats_blob().is_none(),
-            "no maintenance has run, so there is no sidecar to sum from"
-        );
         let entries = manifest.get_all_superfiles().to_vec();
         let terms = ["alpha", "beta", "shared", "absent"];
 

@@ -5,14 +5,9 @@
 //! contain it, with the term's `df` in each, an upper bound on the score it
 //! can reach there, and where its postings sit in that superfile.
 //!
-//! One artifact answers three questions the manifest used to answer with
-//! three structures — *which superfiles hold this term* (the per-part and
-//! per-entry term blooms), *how often it occurs table-wide* (the term-stats
-//! sidecar's `df` sums), and *where its postings are* (the dictionary
-//! inlined into every manifest entry's open blob). Both blooms saturate on
-//! a large table and prune nothing; the inlined dictionary was most of a
-//! decoded manifest's bytes. This index replaces all three with something
-//! that is looked into, not loaded.
+//! One artifact answers three questions — *which superfiles hold this term*,
+//! *how often it occurs table-wide*, and *where its postings are* — and is
+//! looked into, not loaded.
 //!
 //! **Shape.** A small *root* stays resident: the covered superfiles (postings
 //! name them by ordinal) and, per segment, the key range and content hash of
@@ -26,10 +21,9 @@
 //!
 //! **Validity.** A posting is followed only if its superfile is live in the
 //! current manifest; postings for removed superfiles are simply ignored. So
-//! a removal never invalidates the artifact — unlike the term-stats sidecar,
-//! whose *sums* could not be attributed back to a departed superfile — and
-//! the reference carries forward across every commit. A superfile with no
-//! postings in any segment is uncovered and is probed directly.
+//! a removal never invalidates the artifact, and the reference carries
+//! forward across every commit. A superfile with no postings in any segment
+//! is uncovered and is probed directly.
 //!
 //! **Content addressing.** Root and slices are named by the blake3 of their
 //! bytes (`term-index/root-<hash>.bin`, `term-index/slice-<hash>.bin`), so a
@@ -68,7 +62,7 @@ use crate::{
 };
 
 /// Object-store directory prefix for term-index objects, sibling to the
-/// superfile data, manifest-parts and term-stats prefixes.
+/// superfile data and manifest-parts prefixes.
 pub(crate) const STORAGE_PREFIX: &str = "term-index/";
 
 /// Bytes of fetched slices kept resident per loaded index, least recently
@@ -1167,7 +1161,7 @@ mod tests {
     }
 
     /// Optimize options that merge nothing: the maintenance passes alone.
-    fn stats_only_options() -> OptimizeOptions {
+    fn maintenance_only_options() -> OptimizeOptions {
         OptimizeOptions::compact(CompactionSettings {
             min_fill_percent: 100,
             min_superfiles_for_merge: u64::MAX,
@@ -1176,8 +1170,8 @@ mod tests {
     }
 
     /// Compaction-free optimize: the maintenance passes alone.
-    fn stats_only_optimize(st: &crate::supertable::Supertable) {
-        st.optimize(&stats_only_options()).expect("optimize");
+    fn maintenance_only_optimize(st: &crate::supertable::Supertable) {
+        st.optimize(&maintenance_only_options()).expect("optimize");
     }
 
     /// The live superfile ids and the root's covered set, for comparison.
@@ -1237,7 +1231,7 @@ mod tests {
             st.reader().expect("reader").n_superfiles() >= SEGMENTS,
             "fixture must stay fragmented"
         );
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         (dir, storage, st, alpha_per_segment)
     }
 
@@ -1302,7 +1296,7 @@ mod tests {
             v.sort_unstable();
             v
         };
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
         assert_eq!(root.segments.len(), 1, "optimize rebuilds one base segment");
         assert_eq!(
@@ -1767,7 +1761,7 @@ mod tests {
             "the index already lists every live superfile"
         );
 
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         assert_eq!(
@@ -1807,7 +1801,7 @@ mod tests {
     ) -> bool {
         let fired_before = faults.fired();
         faults.fail(FaultOp::PutAtomic, STORAGE_PREFIX, 1);
-        let result = st.optimize(&stats_only_options());
+        let result = st.optimize(&maintenance_only_options());
         faults.clear();
         let rebuilt = faults.fired() > fired_before;
         if !rebuilt {
@@ -1828,7 +1822,7 @@ mod tests {
         for segment in 0..SEGMENTS {
             commit_segment(&st, segment);
         }
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         (dir, faults, storage, st)
     }
 
@@ -1896,7 +1890,7 @@ mod tests {
         );
 
         assert!(optimize_rebuilds_term_index(&st, &faults));
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
         let covered: HashSet<Uuid> = root.superfiles.iter().copied().collect();
         assert_eq!(covered, live, "the rebuild drops the removed superfile");
@@ -2456,7 +2450,7 @@ mod tests {
             "this commit's superfiles are"
         );
 
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         assert!(
@@ -2548,7 +2542,7 @@ mod tests {
     #[test]
     fn optimize_on_an_empty_table_publishes_no_index_and_a_repeat_is_a_no_op() {
         let (_dir, _storage, st) = fresh_table();
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         assert!(
             st.reader()
                 .expect("reader")
@@ -2558,12 +2552,12 @@ mod tests {
             "nothing to index"
         );
         commit_segment(&st, 0);
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         let reference = manifest.term_index_ref().cloned().expect("reference");
         let id = manifest.get_manifest_id();
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         assert_eq!(manifest.term_index_ref(), Some(&reference));
@@ -2699,7 +2693,7 @@ mod tests {
             w.append(&batch).expect("append");
             w.commit().expect("commit");
         }
-        st.refresh_term_stats_sync().expect("maintenance rebuild");
+        st.refresh_term_index_sync().expect("maintenance rebuild");
         let rt = tokio::runtime::Runtime::new().expect("rt");
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
@@ -3340,7 +3334,7 @@ mod tests {
     /// The old format keeps working under the new reader, and mixes with
     /// the new format without changing an answer. The fixture is a table
     /// written by the engine before the term index existed: blooms in its
-    /// parts, bloom unions in its list, a term-stats sidecar, no index.
+    /// parts, bloom unions in its list, no index.
     ///
     /// Four states of the same rows must answer every query identically:
     /// the fixture as written (blooms route); the fixture after the current
@@ -3383,7 +3377,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         copy_dir_recursive(&fixture, dir.path());
         let (storage, st) = open_old_format(dir.path(), |o| o);
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
 
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
@@ -3526,7 +3520,7 @@ mod tests {
             root_after.superfiles.iter().copied().collect();
         assert_eq!(covered, live_before);
 
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let reader = st.reader().expect("reader");
         assert!(
             reader.manifest().term_index_complete(),
@@ -3611,10 +3605,6 @@ mod tests {
                 manifest.term_index_ref().is_none(),
                 "the fixture predates the index"
             );
-            assert!(
-                manifest.term_stats_blob().is_some(),
-                "the fixture carries the term-stats sidecar"
-            );
             for e in manifest.get_all_superfiles() {
                 assert!(
                     e.fts_summary[&manifest.field_id("title").expect("title id")]
@@ -3659,7 +3649,7 @@ mod tests {
         let mixed_answers = answers(&st);
 
         // Cell 3: a maintenance rebuild covers everything and flips the flag.
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         {
             let manifest = st.reader().expect("reader").manifest().clone();
             assert!(
