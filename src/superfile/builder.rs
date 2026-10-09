@@ -1003,6 +1003,12 @@ struct FtsMergeTimings {
     write_parquet: Duration,
 }
 
+struct FtsParquetHalf {
+    body: Option<EncodedBody>,
+    ids_bytes: Option<Vec<u8>>,
+    stats_collector: SuperfileStats,
+}
+
 pub struct SuperfileBuilder {
     opts: BuilderOptions,
     /// Cached column indices for FTS columns, parallel to `opts.fts_columns`.
@@ -1358,6 +1364,7 @@ impl SuperfileBuilder {
     /// appends to the Parquet body; call this BEFORE the append advances
     /// `next_local_doc_id`. Doc-lengths are carried from the input's
     /// stored lengths, never recomputed.
+    #[allow(dead_code)]
     fn carry_fts_from_reader(
         &mut self,
         reader: &SuperfileReader,
@@ -1461,6 +1468,7 @@ impl SuperfileBuilder {
     /// finish sorts triples by `(term, doc)`, so feed order doesn't
     /// matter there, while the in-RAM accumulator preserves insertion
     /// order and requires per-term ascending doc ids.
+    #[allow(dead_code)]
     fn carry_fts_postings_with_remap(
         &mut self,
         reader: &SuperfileReader,
@@ -1654,53 +1662,46 @@ impl SuperfileBuilder {
         }
         let column = vec_col.name.clone();
 
-        let mut stats_collector = Vec::with_capacity(inputs.len());
+        let mut rows_of: Vec<Vec<Option<RowId>>> = Vec::with_capacity(inputs.len());
+        let mut n_out_docs = 0u32;
         let mut merge_inputs: Vec<(&VectorReader, &str, u32, Option<Arc<RoaringBitmap>>)> =
             Vec::with_capacity(inputs.len());
-        let mut local_base = 0u32;
-
-        let read_span = detail_span!(
-            "sq8_merge.read_inputs",
-            rows = tracing::field::Empty,
-            deleted_rows = tracing::field::Empty,
-        )
-        .entered();
         for input in inputs {
             let (reader, deleted) = (&input.reader, &input.deleted);
-            // Compaction opens its inputs eagerly (see
-            // `query::dispatch::open_compaction_input`), so `get_record_batch`
-            // resolves off resident bytes. A lazy reader here is a caller bug,
-            // not something to paper over — surface it with context.
-            let record_batch = input.batch(&superfile_builder.opts)?;
-            let stats = SuperfileStats::try_compute_from_record_batch(&record_batch)?;
-            stats_collector.push(stats);
-
+            let n_local = reader
+                .fts()
+                .map_or(reader.n_docs() as u32, |fts| fts.n_docs());
+            let (rows, kept) = survivor_rows(n_local, deleted.as_deref(), n_out_docs);
+            let local_base = n_out_docs;
+            n_out_docs += kept;
+            rows_of.push(rows);
             let v = reader.vec().ok_or(BuildError::VectorReadError)?;
             merge_inputs.push((v, column.as_str(), local_base, deleted.clone()));
-
-            // FTS rides out of band like the vector blob: carry the input's
-            // prebuilt postings (aligned with the surviving rows the batch
-            // holds) before the append advances the doc-id counter.
-            superfile_builder.carry_fts_from_reader(reader, deleted.as_deref())?;
-            superfile_builder.add_batch_ids_only(&record_batch)?;
-            local_base += record_batch.num_rows() as u32;
         }
-        record("rows", local_base);
-        record(
-            "deleted_rows",
-            inputs
-                .iter()
-                .filter_map(|input| input.deleted.as_ref().map(|d| d.len()))
-                .sum::<u64>(),
-        );
-        drop(read_span);
 
         let merged_sub = merge_sq8_ivf_subsections(&merge_inputs)?;
         superfile_builder.set_prebuilt_ivf_subsection(0, merged_sub)?;
 
-        let _write_span = detail_span!("sq8_merge.write").entered();
-        superfile_builder.finish_to(output)?;
-        Ok(SuperfileStats::from_children(stats_collector.as_slice()))
+        let half = Self::fts_and_parquet_merge_half(
+            &mut superfile_builder,
+            inputs,
+            rows_of,
+            n_out_docs,
+            PostingMerge::TermByTerm,
+            None,
+        )?;
+        if superfile_builder.next_local_doc_id == 0 {
+            return Ok(half.stats_collector);
+        }
+        let body = half.body.ok_or_else(|| {
+            BuildError::FTSSchemaMismatch("IVF merge produced no Parquet body".into())
+        })?;
+        superfile_builder.finish_to_with_body(
+            body,
+            half.ids_bytes.as_deref().unwrap_or(&[]),
+            output,
+        )?;
+        Ok(half.stats_collector)
     }
 
     /// A standalone merge: the output averages document length over its
@@ -1796,14 +1797,10 @@ impl SuperfileBuilder {
         };
 
         let read_span = detail_span!("multi_cell_merge.read_inputs").entered();
-        let mut stats_collector = Vec::with_capacity(inputs.len());
         let mut scalar_batches = Vec::with_capacity(inputs.len());
         for input in inputs {
             let reader = &input.reader;
             let record_batch = input.batch(&superfile_builder.opts)?;
-            stats_collector.push(SuperfileStats::try_compute_from_record_batch(
-                &record_batch,
-            )?);
             let v = reader.vec().ok_or(BuildError::VectorReadError)?;
             if !v.is_multi_cell() {
                 return Err(BuildError::VectorSchemaMismatch(
@@ -2039,88 +2036,6 @@ impl SuperfileBuilder {
             return Ok(SuperfileStats::from_children(&[]));
         }
 
-        let _write_span = detail_span!("multi_cell_merge.write").entered();
-        // Carry FTS postings across in the packed output order. Unlike the
-        // concatenating merges, output rows follow `all_stable_ids`
-        // (cell-directory order), so the remap is stable-id → output
-        // position and the per-input doc ids arrive OUT of order. The
-        // spilled FTS accumulator sorts triples by `(term, doc)` at finish,
-        // so force it on before feeding; the in-RAM accumulator preserves
-        // insertion order and would mis-sort the posting lists.
-        if superfile_builder.fts_builder.is_some() {
-            // 1 byte = the minimum allowed budget: the first push crosses
-            // it, so effectively the whole feed runs in spill mode.
-            superfile_builder.set_fts_spill_threshold_bytes(1);
-            let n_out = all_stable_ids.len();
-            // Claim map: each output row's postings come from exactly one
-            // input copy. A superseded parent cell and its drained
-            // replacement can both carry a stable id; whichever input
-            // claims it first feeds the (identical) row, the other maps to
-            // `None` — mirroring the single row the reordered scalar batch
-            // keeps.
-            let mut pos_of_id: HashMap<StableId, RowId> = HashMap::with_capacity(n_out);
-            for (pos, &sid) in all_stable_ids.iter().enumerate() {
-                pos_of_id.insert(StableId::new(sid), RowId::new(pos as u32));
-            }
-            let id_idx = scalar_schema
-                .index_of(&id_column)
-                .map_err(|_| BuildError::MissingIdColumn(id_column.clone()))?;
-            let n_fts_columns = superfile_builder.opts.fts_columns.len();
-            let mut out_lengths: Vec<Vec<u32>> = vec![vec![0; n_out]; n_fts_columns];
-            for (idx, input) in inputs.iter().enumerate() {
-                let (reader, deleted) = (&input.reader, &input.deleted);
-                let Some(fts) = reader.fts() else {
-                    continue;
-                };
-                let ids = scalar_batches[idx]
-                    .column(id_idx)
-                    .as_any()
-                    .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| BuildError::MissingIdColumn(id_column.clone()))?;
-                // Walk input-local doc ids; survivors line up with the
-                // tombstone-filtered batch rows (`rank`). A survivor whose
-                // stable id was already claimed (or whose cell was
-                // superseded out of the pack) maps to `None`.
-                let n_local = fts.n_docs();
-                let mut remap_by_row: Vec<Option<FtsDocId>> = vec![None; n_local as usize];
-                let mut rank: usize = 0;
-                for d in 0..n_local {
-                    let is_deleted = deleted.as_ref().is_some_and(|b| b.contains(d));
-                    if is_deleted {
-                        continue;
-                    }
-                    let sid = StableId::new(ids.value(rank));
-                    rank += 1;
-                    if let Some(row) = pos_of_id.remove(&sid) {
-                        // This merge appends in arrival order, so an output
-                        // row is the doc id the output blob stores it under.
-                        remap_by_row[d as usize] = Some(FtsDocId::new(row.get()));
-                    }
-                }
-                // The walk above is over rows: it reads a row-keyed
-                // tombstone bitmap and the row-ordered id column. Postings
-                // and lengths arrive under the input blob's own doc ids,
-                // so the input's map composes in -- a copy on any input
-                // that kept arrival order.
-                let remap = remap_by_blob_id(fts, &remap_by_row);
-                scatter_doc_lengths(
-                    fts,
-                    &remap,
-                    0,
-                    &format!("multi-cell merge input {idx}"),
-                    &mut out_lengths,
-                )?;
-                superfile_builder.carry_fts_postings_with_remap(reader, &remap)?;
-            }
-            append_doc_lengths(
-                superfile_builder
-                    .fts_builder
-                    .as_mut()
-                    .expect("checked Some above"),
-                &out_lengths,
-            );
-        }
-
         // Parquet rows must follow the same cell-directory order as the packed
         // IVF subsections. Hidden index files are `_id`-only; user MultiCell
         // files carry the full scalar schema (title, …) and must be reordered
@@ -2131,10 +2046,64 @@ impl SuperfileBuilder {
             &scalar_batches,
             &all_stable_ids,
         )?;
-        superfile_builder.add_batch_ids_only(&scalar_batch)?;
+        let id_idx = scalar_schema
+            .index_of(&id_column)
+            .map_err(|_| BuildError::MissingIdColumn(id_column.clone()))?;
+        let output_row_of_id: HashMap<StableId, RowId> = all_stable_ids
+            .iter()
+            .enumerate()
+            .map(|(row, &id)| (StableId::new(id), RowId::new(row as u32)))
+            .collect();
+        let rows_of: Vec<Vec<Option<RowId>>> = inputs
+            .iter()
+            .zip(&scalar_batches)
+            .map(|(input, batch)| {
+                let ids = batch
+                    .column(id_idx)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("validated id column");
+                let n_local = input
+                    .reader
+                    .fts()
+                    .map_or(ids.len() as u32, |fts| fts.n_docs());
+                let mut rank = 0usize;
+                (0..n_local)
+                    .map(|doc| {
+                        if input
+                            .deleted
+                            .as_ref()
+                            .is_some_and(|deleted| deleted.contains(doc))
+                        {
+                            None
+                        } else {
+                            let stable_id = ids.value(rank);
+                            let row = output_row_of_id.get(&StableId::new(stable_id)).copied();
+                            rank += 1;
+                            row
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let half = Self::fts_and_parquet_merge_half(
+            &mut superfile_builder,
+            inputs,
+            rows_of,
+            all_stable_ids.len() as u32,
+            PostingMerge::TermByTerm,
+            Some(scalar_batch),
+        )?;
         superfile_builder.set_prebuilt_multi_cell_ivfs(packed_cells)?;
-        superfile_builder.finish_to(output)?;
-        let mut stats = SuperfileStats::from_children(stats_collector.as_slice());
+        let body = half.body.ok_or_else(|| {
+            BuildError::FTSSchemaMismatch("multi-cell merge produced no Parquet body".into())
+        })?;
+        superfile_builder.finish_to_with_body(
+            body,
+            half.ids_bytes.as_deref().unwrap_or(&[]),
+            output,
+        )?;
+        let mut stats = half.stats_collector;
         if scalar_schema.fields().len() == 1 {
             // Hidden id-only index: the merged doc set is exactly `all_stable_ids`
             // (superseded cells were dropped from the packed subsections), so its
@@ -2546,6 +2515,44 @@ impl SuperfileBuilder {
         let builder_opts = merge_builder_opts(inputs, base)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
+        let mut rows_of = Vec::with_capacity(inputs.len());
+        let mut n_out_docs = 0u32;
+        for input in inputs {
+            let n_local = input.reader.fts().map_or(0, |fts| fts.n_docs());
+            let (rows, kept) = survivor_rows(n_local, input.deleted.as_deref(), n_out_docs);
+            n_out_docs += kept;
+            rows_of.push(rows);
+        }
+        let half = Self::fts_and_parquet_merge_half(
+            &mut superfile_builder,
+            inputs,
+            rows_of,
+            n_out_docs,
+            merge,
+            None,
+        )?;
+        if superfile_builder.next_local_doc_id == 0 {
+            return Ok(half.stats_collector);
+        }
+        let body = half.body.ok_or_else(|| {
+            BuildError::FTSSchemaMismatch("FTS merge produced no Parquet body".into())
+        })?;
+        superfile_builder.finish_to_with_body(
+            body,
+            half.ids_bytes.as_deref().unwrap_or(&[]),
+            output,
+        )?;
+        Ok(half.stats_collector)
+    }
+
+    fn fts_and_parquet_merge_half(
+        superfile_builder: &mut SuperfileBuilder,
+        inputs: &[MergeInput],
+        rows_of: Vec<Vec<Option<RowId>>>,
+        n_out_docs: u32,
+        merge: PostingMerge,
+        ordered_batch: Option<RecordBatch>,
+    ) -> Result<FtsParquetHalf, BuildError> {
         // Encode the Parquet body incrementally: each input's surviving rows are
         // written and dropped in the loop below, so the body holds at most one
         // input's batch plus the writer's row-group buffer — never the whole
@@ -2576,15 +2583,6 @@ impl SuperfileBuilder {
         // The output row every input document becomes, numbered once and
         // shared by the order and the carry below, so the two cannot
         // disagree about which document a posting belongs to.
-        let mut rows_of: Vec<Vec<Option<RowId>>> = Vec::with_capacity(inputs.len());
-        let mut n_out_docs: u32 = 0;
-        for input in inputs {
-            let (reader, deleted) = (&input.reader, &input.deleted);
-            let n_local = reader.fts().map_or(0, |f| f.n_docs());
-            let (rows, kept) = survivor_rows(n_local, deleted.as_deref(), n_out_docs);
-            n_out_docs += kept;
-            rows_of.push(rows);
-        }
         let n_fts_columns = superfile_builder.opts.fts_columns.len() as u32;
         // `order[new_id]` is the row that doc id carries. `None` leaves
         // the blob in arrival order, exactly as before.
@@ -2600,13 +2598,17 @@ impl SuperfileBuilder {
         };
         // The inverse, which is what the per-input remap needs: the doc
         // id a row is stored under.
-        let new_of_row: Option<Vec<u32>> = order.as_ref().map(|o| {
-            let mut inv = vec![0u32; o.len()];
-            for (new_id, &row) in o.iter().enumerate() {
-                inv[row as usize] = new_id as u32;
-            }
-            inv
-        });
+        let new_of_row: Option<Vec<u32>> = if ordered_batch.is_some() && order.is_none() {
+            Some((0..n_out_docs).collect())
+        } else {
+            order.as_ref().map(|o| {
+                let mut inv = vec![0u32; o.len()];
+                for (new_id, &row) in o.iter().enumerate() {
+                    inv[row as usize] = new_id as u32;
+                }
+                inv
+            })
+        };
         // Doc lengths are scattered rather than appended when the order
         // moves, so they are collected per column and pushed once.
         let mut out_lengths: Vec<Vec<u32>> = match new_of_row.is_some() {
@@ -2678,7 +2680,11 @@ impl SuperfileBuilder {
                     }
                     #[cfg(test)]
                     PostingMerge::Accumulator => {
-                        superfile_builder.carry_fts_from_reader(reader, deleted.as_deref())?;
+                        superfile_builder.carry_fts_from_reader_scoped(
+                            reader,
+                            deleted.as_deref(),
+                            CarryScope::AllColumns,
+                        )?;
                     }
                 },
                 // A chosen order sends this input's documents to output
@@ -2716,25 +2722,23 @@ impl SuperfileBuilder {
             }
             timings.fts += start.elapsed();
 
-            // Stream this input's surviving rows straight into the Parquet body
-            // and drop the batch — the corpus is never accumulated in RAM. The
-            // FTS index for these rows was already fed above from the input's
-            // prebuilt postings.
-            let n_rows = record_batch.num_rows() as u32;
-            let start = std::time::Instant::now();
-            body_encoder.write_batch(&record_batch)?;
-            timings.write_parquet += start.elapsed();
-
-            // Sidecar from the same rows, same order, before the batch is
-            // dropped. Read from `record_batch` (not the FTS remap) so it
-            // aligns with the body exactly.
-            if ids_ok && !append_stable_id_sidecar(&mut id_sidecar_bytes, &record_batch, &id_column)
-            {
-                ids_ok = false;
-                id_sidecar_bytes = Vec::new();
+            if ordered_batch.is_none() {
+                // Stream this input's surviving rows straight into the Parquet
+                // body and drop the batch. The FTS index for these rows was
+                // already fed above from the input's prebuilt postings.
+                let n_rows = record_batch.num_rows() as u32;
+                let start = std::time::Instant::now();
+                body_encoder.write_batch(&record_batch)?;
+                timings.write_parquet += start.elapsed();
+                if ids_ok
+                    && !append_stable_id_sidecar(&mut id_sidecar_bytes, &record_batch, &id_column)
+                {
+                    ids_ok = false;
+                    id_sidecar_bytes = Vec::new();
+                }
+                superfile_builder.next_local_doc_id += n_rows;
             }
             drop(record_batch);
-            superfile_builder.next_local_doc_id += n_rows;
         }
         copy_span.record("read_parquet", timings.read_parquet.as_millis());
         copy_span.record("fts", timings.fts.as_millis());
@@ -2742,14 +2746,12 @@ impl SuperfileBuilder {
         copy_span.record("stats_compute", timings.stats_compute.as_millis());
         drop(copy_span);
 
+        if new_of_row.is_some()
+            && let Some(fts_builder) = superfile_builder.fts_builder.as_mut()
+        {
+            append_doc_lengths(fts_builder, &out_lengths);
+        }
         if let Some(order) = order {
-            append_doc_lengths(
-                superfile_builder
-                    .fts_builder
-                    .as_mut()
-                    .expect("an order is only chosen when the FTS builder exists"),
-                &out_lengths,
-            );
             // The map is what lets the reader reach a row from a doc id,
             // and writing it is what makes the blob carry its own order.
             if let Some(fb) = superfile_builder.fts_builder.as_mut() {
@@ -2765,18 +2767,34 @@ impl SuperfileBuilder {
             fb.set_sorted_inputs(sorted_inputs);
         }
 
+        if let Some(batch) = ordered_batch {
+            let n_rows = batch.num_rows() as u32;
+            body_encoder.write_batch(&batch)?;
+            if ids_ok && !append_stable_id_sidecar(&mut id_sidecar_bytes, &batch, &id_column) {
+                ids_ok = false;
+                id_sidecar_bytes = Vec::new();
+            }
+            superfile_builder.next_local_doc_id = n_rows;
+        }
+
         let finish_span =
             detail_span!("merge_finish", rows = superfile_builder.next_local_doc_id).entered();
         // Every input fully tombstoned → no rows: match `finish_to`'s
         // empty-superfile contract (write nothing, return the merged stats).
         if superfile_builder.next_local_doc_id == 0 {
-            return Ok(SuperfileStats::from_children(stats_collector.as_slice()));
+            return Ok(FtsParquetHalf {
+                body: None,
+                ids_bytes: None,
+                stats_collector: SuperfileStats::from_children(stats_collector.as_slice()),
+            });
         }
         let body = body_encoder.finish()?;
-        let ids_bytes: &[u8] = if ids_ok { &id_sidecar_bytes } else { &[] };
-        superfile_builder.finish_to_with_body(body, ids_bytes, output)?;
         drop(finish_span);
-        Ok(SuperfileStats::from_children(stats_collector.as_slice()))
+        Ok(FtsParquetHalf {
+            body: Some(body),
+            ids_bytes: ids_ok.then_some(id_sidecar_bytes),
+            stats_collector: SuperfileStats::from_children(stats_collector.as_slice()),
+        })
     }
 
     /// A standalone merge: the output averages document length over its
