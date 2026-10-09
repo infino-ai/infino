@@ -17,17 +17,25 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
+    hash::Hash,
     sync::Arc,
 };
 
 use arrow::compute::concat;
 use arrow_array::{
-    Array, ArrayRef, Int64Array, LargeStringArray, RecordBatch, StringArray, UInt64Array,
+    Array, ArrayRef, ArrowPrimitiveType, RecordBatch, UInt64Array,
+    cast::AsArray,
+    types::{
+        Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
+        UInt32Type, UInt64Type,
+    },
 };
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use datafusion::scalar::ScalarValue;
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -727,88 +735,52 @@ pub(crate) struct ScalarValueCounts {
 }
 
 impl ScalarValueCounts {
+    /// Exact non-null value counts for one column. `None` when the type has no
+    /// counts or the column holds more than [`MAX_EXACT_VALUE_COUNTS`] distinct
+    /// values.
     fn from_column(column: &ArrayRef) -> Option<Self> {
-        if !exact_value_counts_type(column.data_type()) {
-            return None;
-        }
-        match column.data_type() {
-            DataType::Int64 => {
-                let array = column.as_any().downcast_ref::<Int64Array>()?;
-                return Self::from_int64(array);
-            }
-            DataType::Utf8 => {
-                let array = column.as_any().downcast_ref::<StringArray>()?;
-                return Self::from_strings(
-                    (0..array.len()).map(|row| (!array.is_null(row)).then(|| array.value(row))),
-                    ScalarValue::Utf8,
-                );
-            }
-            DataType::LargeUtf8 => {
-                let array = column.as_any().downcast_ref::<LargeStringArray>()?;
-                return Self::from_strings(
-                    (0..array.len()).map(|row| (!array.is_null(row)).then(|| array.value(row))),
-                    ScalarValue::LargeUtf8,
-                );
-            }
-            _ => {}
-        }
-        let mut counts: HashMap<ScalarValue, u64> = HashMap::new();
-        for row in 0..column.len() {
-            if column.is_null(row) {
-                continue;
-            }
-            let value = ScalarValue::try_from_array(column, row).ok()?;
-            if !counts.contains_key(&value) && counts.len() >= MAX_EXACT_VALUE_COUNTS {
-                return None;
-            }
-            let count = counts.entry(value).or_default();
-            *count = count.checked_add(1)?;
-        }
-        Self::from_entries(counts.into_iter().collect())
+        counter(column.data_type())?(column)
     }
 
-    fn from_int64(column: &Int64Array) -> Option<Self> {
-        let mut counts: HashMap<i64, u64> = HashMap::new();
-        for row in 0..column.len() {
-            if column.is_null(row) {
-                continue;
-            }
-            let value = column.value(row);
-            if !counts.contains_key(&value) && counts.len() >= MAX_EXACT_VALUE_COUNTS {
-                return None;
-            }
-            let count = counts.entry(value).or_default();
-            *count = count.checked_add(1)?;
-        }
-        Self::from_entries(
-            counts
-                .into_iter()
-                .map(|(value, count)| (ScalarValue::Int64(Some(value)), count))
-                .collect(),
-        )
+    /// [`ScalarValueCounts::count`] for a primitive column of type `T`.
+    fn primitive<T: ArrowPrimitiveType>(column: &ArrayRef) -> Option<Self>
+    where
+        T::Native: Hash + Eq,
+    {
+        Self::count(column, non_null(column.as_primitive_opt::<T>()?.iter()))
     }
 
-    fn from_strings<'a>(
-        values: impl IntoIterator<Item = Option<&'a str>>,
-        wrap: fn(Option<String>) -> ScalarValue,
+    /// Counts a column's `(row, value)` pairs by value, then turns each
+    /// distinct value into a `ScalarValue` from the row it first showed up in.
+    ///
+    /// Counting on the plain value matters: a `ScalarValue` per row, hashed
+    /// into a map, cost more than every other column stat put together.
+    fn count<V: Hash + Eq>(
+        column: &ArrayRef,
+        values: impl Iterator<Item = (usize, V)>,
     ) -> Option<Self> {
-        let mut counts: HashMap<String, u64> = HashMap::new();
-        for value in values.into_iter().flatten() {
-            if let Some(count) = counts.get_mut(value) {
-                *count = count.checked_add(1)?;
-                continue;
+        // value -> (count, first row it showed up in)
+        let mut counts: FxHashMap<V, (u64, usize)> = FxHashMap::default();
+        for (row, value) in values {
+            let distinct = counts.len();
+            match counts.entry(value) {
+                Entry::Occupied(mut seen) => {
+                    let count = &mut seen.get_mut().0;
+                    *count = count.checked_add(1)?;
+                }
+                Entry::Vacant(new) => {
+                    if distinct >= MAX_EXACT_VALUE_COUNTS {
+                        return None;
+                    }
+                    new.insert((1, row));
+                }
             }
-            if counts.len() >= MAX_EXACT_VALUE_COUNTS {
-                return None;
-            }
-            counts.insert(value.to_string(), 1);
         }
-        Self::from_entries(
-            counts
-                .into_iter()
-                .map(|(value, count)| (wrap(Some(value)), count))
-                .collect(),
-        )
+        let entries = counts
+            .into_values()
+            .map(|(count, row)| Some((ScalarValue::try_from_array(column, row).ok()?, count)))
+            .collect::<Option<Vec<_>>>()?;
+        Self::from_entries(entries)
     }
 
     pub(crate) fn from_entries(entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
@@ -855,22 +827,46 @@ impl ScalarValueCounts {
     }
 }
 
+/// `(row, value)` for each non-null value of an Arrow array iterator.
+fn non_null<V>(values: impl Iterator<Item = Option<V>>) -> impl Iterator<Item = (usize, V)> {
+    values
+        .enumerate()
+        .filter_map(|(row, value)| Some((row, value?)))
+}
+
+/// Counts one column's values, for [`ScalarValueCounts::from_column`].
+type Counter = fn(&ArrayRef) -> Option<ScalarValueCounts>;
+
+/// The counter for a column type, or `None` when the type carries no exact
+/// value counts. This is the one list of counted types.
+fn counter(data_type: &DataType) -> Option<Counter> {
+    let counter: Counter = match data_type {
+        DataType::Boolean => {
+            |column| ScalarValueCounts::count(column, non_null(column.as_boolean_opt()?.iter()))
+        }
+        DataType::Int8 => ScalarValueCounts::primitive::<Int8Type>,
+        DataType::Int16 => ScalarValueCounts::primitive::<Int16Type>,
+        DataType::Int32 => ScalarValueCounts::primitive::<Int32Type>,
+        DataType::Int64 => ScalarValueCounts::primitive::<Int64Type>,
+        DataType::UInt8 => ScalarValueCounts::primitive::<UInt8Type>,
+        DataType::UInt16 => ScalarValueCounts::primitive::<UInt16Type>,
+        DataType::UInt32 => ScalarValueCounts::primitive::<UInt32Type>,
+        DataType::UInt64 => ScalarValueCounts::primitive::<UInt64Type>,
+        DataType::Decimal128(_, _) => ScalarValueCounts::primitive::<Decimal128Type>,
+        DataType::Utf8 => |column| {
+            ScalarValueCounts::count(column, non_null(column.as_string_opt::<i32>()?.iter()))
+        },
+        DataType::LargeUtf8 => |column| {
+            ScalarValueCounts::count(column, non_null(column.as_string_opt::<i64>()?.iter()))
+        },
+        _ => return None,
+    };
+    Some(counter)
+}
+
+/// Whether a column type carries exact value counts.
 fn exact_value_counts_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Decimal128(_, _)
-    )
+    counter(data_type).is_some()
 }
 
 impl PartialEq for ScalarStatsAgg {
@@ -919,18 +915,6 @@ impl ScalarStatsAgg {
         })
     }
 
-    /// Build a per-column aggregate table from one `RecordBatch`, keyed by
-    /// column name. Columns whose type isn't orderable are skipped (no
-    /// entry), mirroring [`ScalarStatsAgg::from_column`]. Thin wrapper over
-    /// [`ScalarStatsAgg::from_batches`] (a single-array concat is a cheap
-    /// clone).
-    pub fn from_batch(
-        scalar_schema: &Schema,
-        batch: &RecordBatch,
-    ) -> HashMap<FieldId, ScalarStatsAgg> {
-        ScalarStatsAgg::from_batches(scalar_schema, &[batch])
-    }
-
     /// Build a per-column aggregate table across several `RecordBatch`es.
     ///
     /// Each column is concatenated across the batches before its stats are
@@ -941,42 +925,58 @@ impl ScalarStatsAgg {
         scalar_schema: &Schema,
         batches: &[&RecordBatch],
     ) -> HashMap<FieldId, ScalarStatsAgg> {
-        let mut out = HashMap::new();
         if batches.is_empty() {
-            return out;
+            return HashMap::new();
         }
-        for field in scalar_schema.fields() {
-            // Stats are keyed by the field id stamped on the stored schema;
-            // a field without one is not a column the table tracks.
-            let Some(id) = field_id_of(field) else {
-                continue;
-            };
-            // Columns are looked up by name, so a batch in another column
-            // order, or one that does not carry this column at all, can never
-            // attribute one column's values to another. A column absent from
-            // any batch gets no stats, which the prune planner treats as
-            // "can't prune".
-            let Some(arrays) = batches
-                .iter()
-                .map(|b| {
-                    b.schema()
-                        .index_of(field.name())
-                        .ok()
-                        .map(|idx| b.column(idx).as_ref())
-                })
-                .collect::<Option<Vec<&dyn Array>>>()
-            else {
-                continue;
-            };
-            let combined = match concat(&arrays) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            if let Some(agg) = ScalarStatsAgg::from_column(&combined) {
-                out.insert(id, agg);
-            }
+        scalar_schema
+            .fields()
+            .iter()
+            .filter_map(|field| ScalarStatsAgg::for_field(field, batches))
+            .collect()
+    }
+
+    /// [`ScalarStatsAgg::from_batches`] with one column per task on the current
+    /// rayon pool, so a build that leaves cores idle can use them for its stats.
+    ///
+    /// Call it from the reader pool. Anywhere else it runs on rayon's global
+    /// pool, which the build paths don't use.
+    pub(crate) fn from_batches_par(
+        scalar_schema: &Schema,
+        batches: &[&RecordBatch],
+    ) -> HashMap<FieldId, ScalarStatsAgg> {
+        if batches.is_empty() {
+            return HashMap::new();
         }
-        out
+        scalar_schema
+            .fields()
+            .par_iter()
+            .filter_map(|field| ScalarStatsAgg::for_field(field, batches))
+            .collect()
+    }
+
+    /// One column's stats across `batches`, keyed by its field id. `None` when
+    /// the field has no id, a batch doesn't have the column, or the column's
+    /// type has no stats.
+    fn for_field(field: &Field, batches: &[&RecordBatch]) -> Option<(FieldId, ScalarStatsAgg)> {
+        // Stats are keyed by the field id stamped on the stored schema;
+        // a field without one is not a column the table tracks.
+        let id = field_id_of(field)?;
+        // Columns are looked up by name, so a batch in another column
+        // order, or one that does not carry this column at all, can never
+        // attribute one column's values to another. A column absent from
+        // any batch gets no stats, which the prune planner treats as
+        // "can't prune".
+        let arrays = batches
+            .iter()
+            .map(|b| {
+                b.schema()
+                    .index_of(field.name())
+                    .ok()
+                    .map(|idx| b.column(idx).as_ref())
+            })
+            .collect::<Option<Vec<&dyn Array>>>()?;
+        let combined = concat(&arrays).ok()?;
+        Some((id, ScalarStatsAgg::from_column(&combined)?))
     }
 
     /// Merge `other` into `self` for the same column.
@@ -2183,7 +2183,11 @@ mod tests {
         sync::Arc,
     };
 
-    use arrow_array::{BinaryArray, BooleanArray, Int64Array, StringArray};
+    use arrow_array::{
+        BinaryArray, BooleanArray, Decimal128Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array, UInt16Array,
+        UInt32Array, UInt64Array,
+    };
     use arrow_schema::{DataType, Field};
     use uuid::Uuid;
 
@@ -2196,9 +2200,39 @@ mod tests {
         *,
     };
     use crate::{
-        supertable::schema::{FieldId, LegacyNames, TableSchema},
+        supertable::schema::{FieldId, LegacyNames, TableSchema, with_field_id},
         test_helpers::fid,
     };
+
+    /// Rows in each column the value-count tests build.
+    const COUNTED_ROWS: usize = 1_000;
+    /// Distinct values in those columns, well under the counts cap.
+    const COUNTED_DISTINCT: usize = 13;
+    /// Decimal precision and scale for the value-count tests.
+    const DECIMAL_PRECISION: u8 = 18;
+    const DECIMAL_SCALE: i8 = 4;
+
+    /// A low-cardinality value for row `i`: `0..COUNTED_DISTINCT`, shuffled.
+    fn low(i: usize) -> i64 {
+        (i * 7 % COUNTED_DISTINCT) as i64
+    }
+
+    /// Exact value counts built the slow way, one `ScalarValue` per row: the
+    /// reference the native-type counting must match.
+    fn counts_per_row(column: &ArrayRef) -> Option<ScalarValueCounts> {
+        if !exact_value_counts_type(column.data_type()) {
+            return None;
+        }
+        let mut counts: HashMap<ScalarValue, u64> = HashMap::new();
+        for row in (0..column.len()).filter(|&row| column.is_valid(row)) {
+            let value = ScalarValue::try_from_array(column, row).ok()?;
+            if !counts.contains_key(&value) && counts.len() >= MAX_EXACT_VALUE_COUNTS {
+                return None;
+            }
+            *counts.entry(value).or_default() += 1;
+        }
+        ScalarValueCounts::from_entries(counts.into_iter().collect())
+    }
 
     /// Build a per-column aggregate from a plain `i64` array (no nulls).
     fn agg_i64(vals: Vec<i64>) -> ScalarStatsAgg {
@@ -2311,7 +2345,7 @@ mod tests {
             ],
         )
         .expect("batch");
-        let table = ScalarStatsAgg::from_batch(&schema, &batch);
+        let table = ScalarStatsAgg::from_batches(&schema, &[&batch]);
         assert_eq!(table.len(), 2);
         assert_eq!(i64_at0(&table[&FieldId(1)].min), 1);
         assert_eq!(i64_at0(&table[&FieldId(1)].max), 7);
@@ -4247,5 +4281,122 @@ mod tests {
         FtsSummaryAgg::merge(&mut into, &other);
         // Both had None blooms, result should be None (dropped)
         assert!(into.is_empty());
+    }
+
+    /// The same columns counted two ways: on the native type, and with one
+    /// `ScalarValue` per row (how counts were built before):
+    ///   - every type that carries counts, plus a float column that doesn't;
+    ///   - nulls, an all-null column, and every column sliced, so the rows
+    ///     counted don't start at zero;
+    ///   - exactly [`MAX_EXACT_VALUE_COUNTS`] distinct values, and one more.
+    /// This test pins that counting on the native type gives the same counts,
+    /// each built from a row that holds its value.
+    #[test]
+    fn value_counts_match_a_per_row_count_for_every_type() {
+        let rows = 0..COUNTED_ROWS;
+        let decimals = Decimal128Array::from_iter_values(rows.clone().map(|i| i128::from(low(i))))
+            .with_precision_and_scale(DECIMAL_PRECISION, DECIMAL_SCALE)
+            .expect("valid decimal");
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(BooleanArray::from_iter(
+                rows.clone().map(|i| (i % 5 != 0).then_some(i % 3 == 0)),
+            )),
+            Arc::new(Int8Array::from_iter(
+                rows.clone()
+                    .map(|i| (i % 4 != 0).then_some(low(i) as i8 - 6)),
+            )),
+            Arc::new(Int16Array::from_iter_values(
+                rows.clone().map(|i| low(i) as i16 * -300),
+            )),
+            Arc::new(Int32Array::from_iter(
+                rows.clone().map(|i| (i % 9 != 0).then_some(low(i) as i32)),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                rows.clone().map(|i| low(i) - 6),
+            )),
+            Arc::new(UInt8Array::from_iter_values(
+                rows.clone().map(|i| low(i) as u8),
+            )),
+            Arc::new(UInt16Array::from_iter(
+                rows.clone().map(|i| (i % 2 == 0).then_some(low(i) as u16)),
+            )),
+            Arc::new(UInt32Array::from_iter_values(
+                rows.clone().map(|i| low(i) as u32 * 1_000),
+            )),
+            Arc::new(UInt64Array::from_iter_values(
+                rows.clone().map(|i| u64::MAX - low(i) as u64),
+            )),
+            Arc::new(decimals),
+            Arc::new(StringArray::from_iter(
+                rows.clone()
+                    .map(|i| (i % 6 != 0).then(|| format!("v{}", low(i)))),
+            )),
+            Arc::new(LargeStringArray::from_iter_values(
+                rows.clone().map(|i| format!("w{}", low(i))),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.clone().map(|i| low(i) as f64),
+            )),
+            Arc::new(Int32Array::from(vec![None::<i32>; COUNTED_DISTINCT])),
+        ];
+        for column in &columns {
+            let sliced = column.slice(1, column.len() - 2);
+            for column in [column, &sliced] {
+                assert_eq!(
+                    ScalarValueCounts::from_column(column),
+                    counts_per_row(column),
+                    "{} rows of {}",
+                    column.len(),
+                    column.data_type()
+                );
+            }
+        }
+
+        let at_cap: ArrayRef = Arc::new(Int32Array::from_iter_values(
+            0..MAX_EXACT_VALUE_COUNTS as i32,
+        ));
+        let past_cap: ArrayRef = Arc::new(Int32Array::from_iter_values(
+            0..=MAX_EXACT_VALUE_COUNTS as i32,
+        ));
+        assert_eq!(
+            ScalarValueCounts::from_column(&at_cap),
+            counts_per_row(&at_cap)
+        );
+        assert!(ScalarValueCounts::from_column(&at_cap).is_some());
+        assert!(ScalarValueCounts::from_column(&past_cap).is_none());
+    }
+
+    /// Two batches with the same columns, their stats built one column at a
+    /// time and split over columns:
+    ///   - an `Int16`, a low-cardinality `Utf8`, and a `Binary` column that
+    ///     gets no stats.
+    /// This test pins that splitting the stats over columns changes nothing.
+    #[test]
+    fn parallel_stats_match_serial_stats() {
+        let schema = Arc::new(Schema::new(vec![
+            with_field_id(&Field::new("a", DataType::Int16, true), fid("a")),
+            with_field_id(&Field::new("b", DataType::Utf8, true), fid("b")),
+            with_field_id(&Field::new("c", DataType::Binary, true), fid("c")),
+        ]));
+        let batch = |first: i16| {
+            let values = first..first + COUNTED_DISTINCT as i16 * 4;
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int16Array::from_iter_values(values.clone())) as ArrayRef,
+                    Arc::new(StringArray::from_iter_values(
+                        values.clone().map(|v| format!("s{}", v % 7)),
+                    )),
+                    Arc::new(BinaryArray::from_iter_values(values.map(|_| b"x"))),
+                ],
+            )
+            .expect("valid batch")
+        };
+        let (first, second) = (batch(0), batch(40));
+
+        let serial = ScalarStatsAgg::from_batches(&schema, &[&first, &second]);
+        let parallel = ScalarStatsAgg::from_batches_par(&schema, &[&first, &second]);
+        assert_eq!(serial.len(), 2, "`a` and `b` get stats, `c` doesn't");
+        assert_eq!(parallel, serial);
     }
 }

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::ArrowError;
 use bytes::Bytes;
-use rayon::prelude::*;
+use rayon::{join, prelude::*};
 use tracing::debug;
 
 use crate::{
@@ -312,13 +312,20 @@ fn build_hydrate_shard(
     // Stream into one no-blob superfile. Size the sink to the chunk's footprint:
     // the compressed output is smaller, so this just avoids reallocating mid-encode.
     let mut bytes: Vec<u8> = Vec::with_capacity(chunk.footprint() as usize);
-    SuperfileBuilder::build_no_blob_from_batches_to(base_opts.clone(), &ided, &mut bytes)?;
 
-    // Per-scalar-column min/max for skip pruning, over the id-prepended batches.
+    // Per-scalar-column stats for skip pruning, over the id-prepended batches.
     // Stats are keyed by the field ids on the table's schema; the batches carry none.
     let scalar_schema = manifest.scalar_schema();
     let scalar_refs: Vec<&RecordBatch> = ided.iter().collect();
-    let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &scalar_refs);
+
+    // Encode and build the stats at the same time, with the stats split over
+    // columns. The memory budget lets a wave build only a few superfiles at
+    // once, so this is what keeps the rest of the cores busy.
+    let (encoded, scalar_stats) = join(
+        || SuperfileBuilder::build_no_blob_from_batches_to(base_opts.clone(), &ided, &mut bytes),
+        || ScalarStatsAgg::from_batches_par(&scalar_schema, &scalar_refs),
+    );
+    encoded?;
 
     Ok(ShardOutput::new_with_params(
         Bytes::from(bytes),
@@ -398,10 +405,15 @@ impl<I: Iterator<Item = Result<RecordBatch, ArrowError>>> Iterator for CoalesceC
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc, time::Duration};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+        time::Duration,
+    };
 
     use arrow_array::{
-        Array, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
+        Array, Int16Array, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+        StringArray,
     };
     use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
     use tempfile::TempDir;
@@ -416,6 +428,7 @@ mod tests {
             hydrate::{
                 Chunk, CoalesceChunks, batch_data_bytes, hydrate_from_reader, hydrate_with_budget,
             },
+            manifest::ScalarStatsAgg,
             schema::{FieldId, field_id_of},
         },
     };
@@ -653,6 +666,77 @@ mod tests {
 
     /// Every hydrated superfile carries min/max for `_id` and each column, keyed
     /// by field id like `append`, so SQL can prune files and answer MIN/MAX from stats.
+    /// Distinct values in the low-cardinality columns of the stats test.
+    const LOW_CARDINALITY: i64 = 5;
+
+    /// `k` (`Int16`, few values, some null), `n` (`Int64`, one value per row)
+    /// and `s` (`Utf8`, few values, some null).
+    fn mixed_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int16, true),
+            Field::new("n", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, true),
+        ]))
+    }
+
+    /// A batch of rows `lo..=hi` over [`mixed_schema`].
+    fn mixed_batch(lo: i64, hi: i64) -> RecordBatch {
+        let k = Int16Array::from_iter(
+            (lo..=hi).map(|i| (i % 11 != 0).then_some((i % LOW_CARDINALITY) as i16)),
+        );
+        let n = Int64Array::from_iter_values(lo..=hi);
+        let s = StringArray::from_iter(
+            (lo..=hi).map(|i| (i % 7 != 0).then(|| format!("s{}", i % LOW_CARDINALITY))),
+        );
+        RecordBatch::try_new(mixed_schema(), vec![Arc::new(k), Arc::new(n), Arc::new(s)])
+            .expect("valid batch")
+    }
+
+    /// Every column's stats folded across the table's superfiles, without `_id`,
+    /// which each table mints on its own.
+    fn table_stats(table: &Supertable) -> HashMap<FieldId, ScalarStatsAgg> {
+        let manifest = table.inner().manifest.load();
+        let mut stats = HashMap::new();
+        for entry in manifest.get_all_superfiles() {
+            ScalarStatsAgg::merge(&mut stats, &entry.scalar_stats);
+        }
+        stats.remove(&FieldId::ID_COLUMN);
+        stats
+    }
+
+    /// The same rows go into two tables, one through `append` and one through
+    /// `hydrate`:
+    ///   - two low-cardinality columns with nulls, so exact value counts are in
+    ///     play, and one column with a value per row, past the counts cap;
+    ///   - stats compared after folding each table's superfiles together, since
+    ///     the two paths cut superfiles differently.
+    /// This test pins that hydrate's stats, built alongside the encode and split
+    /// over columns, are the same as append's.
+    #[test]
+    fn hydrate_stats_match_append_stats() {
+        let batches: Vec<RecordBatch> = (0..N_ROWS / BATCH_ROWS)
+            .map(|i| mixed_batch(i * BATCH_ROWS + 1, (i + 1) * BATCH_ROWS))
+            .collect();
+
+        let (_append_dir, _append_db, appended) = table_with(mixed_schema());
+        for batch in &batches {
+            appended.append(batch).expect("append");
+        }
+        let (_hydrate_dir, _hydrate_db, hydrated) = table_with(mixed_schema());
+        hydrate(&hydrated, mixed_schema(), batches, HYDRATE_TARGET_ROWS).expect("hydrate");
+
+        let want = table_stats(&appended);
+        assert_eq!(want.len(), 3, "`k`, `n` and `s` all carry stats");
+        assert!(
+            want.values()
+                .filter(|stats| stats.value_counts.is_some())
+                .count()
+                == 2,
+            "`k` and `s` carry exact value counts, `n` is past the cap"
+        );
+        assert_eq!(table_stats(&hydrated), want);
+    }
+
     #[test]
     fn hydrate_records_stats_for_every_column() {
         let (_dir, _db, table) = table_with(user_schema());
