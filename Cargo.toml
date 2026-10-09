@@ -87,6 +87,14 @@ test-helpers = []
 # (e.g. infino-platform Prometheus) without `test-helpers`.
 # Off the curated `public-api.txt` snapshot (default features only).
 metering = []
+# The resident adjacency index over an edge table — a table whose rows are
+# edges between rows, each the source row's table name and `_id` and the
+# destination's — built by `optimize()` the way the `hnsw` graph is built
+# over a vector column, and walked from SQL through `graph_walk` and
+# `graph_rank`. Turn this on to index a table whose rows are edges. OFF by
+# default: without an edge table the option and the walks have nothing to
+# index, so neither is on the curated surface.
+graph-index = []
 # Opt-in diagnostic benches that are useful for storage/request-shape
 # work or release-profile recall gates, but should not run as part of a
 # plain `cargo bench`.

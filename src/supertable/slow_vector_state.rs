@@ -31,6 +31,8 @@ use tempfile::NamedTempFile;
 use tokio::task::spawn_blocking;
 use uuid::Uuid;
 
+#[cfg(feature = "graph-index")]
+use crate::superfile::vector::adjacency;
 use crate::{
     config::{self, scratch_root},
     runtime_bridge::carry_span,
@@ -657,6 +659,10 @@ pub(crate) enum ResidentIndexKind {
     /// The flat 4-bit index: a nibble plane + ruler + node→doc-id map, and
     /// deliberately no Sq16 plane.
     Flat(flat::Sq4FlatIndex),
+    /// A knowledge graph's adjacency over an edge table: each node's table
+    /// and `_id`, plus the single-level graph the walks read.
+    #[cfg(feature = "graph-index")]
+    Adjacency(adjacency::AdjacencyIndex),
 }
 
 impl ResidentIndexKind {
@@ -669,6 +675,8 @@ impl ResidentIndexKind {
         match self {
             ResidentIndexKind::Graph(g) => Some(g),
             ResidentIndexKind::Flat(_) => None,
+            #[cfg(feature = "graph-index")]
+            ResidentIndexKind::Adjacency(_) => None,
         }
     }
 
@@ -677,6 +685,18 @@ impl ResidentIndexKind {
         match self {
             ResidentIndexKind::Flat(f) => Some(f),
             ResidentIndexKind::Graph(_) => None,
+            #[cfg(feature = "graph-index")]
+            ResidentIndexKind::Adjacency(_) => None,
+        }
+    }
+
+    /// The adjacency, or `None` when this generation published a vector
+    /// index.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn adjacency(&self) -> Option<&adjacency::AdjacencyIndex> {
+        match self {
+            ResidentIndexKind::Adjacency(a) => Some(a),
+            ResidentIndexKind::Graph(_) | ResidentIndexKind::Flat(_) => None,
         }
     }
 }
@@ -757,6 +777,14 @@ pub(crate) async fn hydrate_resident_index(
             Some((hnsw::PayloadKind::Flat, b)) => {
                 flat::Sq4FlatIndex::decode(b).map(ResidentIndexKind::Flat)
             }
+            // A build without the `graph-index` feature has no `Adjacency`
+            // kind: an edge table's envelope reads as an unknown payload
+            // there, and the generation serves no resident index, as a
+            // payload that failed to decode would.
+            #[cfg(feature = "graph-index")]
+            Some((hnsw::PayloadKind::Adjacency, b)) => {
+                adjacency::AdjacencyIndex::decode(b).map(ResidentIndexKind::Adjacency)
+            }
         };
         Ok::<_, SlowVectorStateError>((bundle.high_water_id, data))
     })
@@ -779,6 +807,12 @@ pub(crate) async fn hydrate_resident_index(
             residual = idx.has_residual(),
             resident_mib = idx.resident_bytes() / (1024 * 1024),
             "flat: resident index hydrated"
+        ),
+        #[cfg(feature = "graph-index")]
+        Some(ResidentIndexKind::Adjacency(idx)) => tracing::debug!(
+            nodes = idx.len(),
+            resident_graph_mib = idx.resident_graph_bytes() / (1024 * 1024),
+            "adjacency: resident index hydrated"
         ),
         None => {}
     }

@@ -1585,6 +1585,30 @@ impl ManifestSnapshot {
         self.list.as_ref()?.slow_vector_state_centroids.as_ref()
     }
 
+    /// Successor manifest (bumped id) with the resident-index ref replaced
+    /// by `reference` — the knowledge graph's adjacency, stamped by the
+    /// maintenance publish the way [`Self::with_term_stats`] stamps its
+    /// sidecar. The ref lives in the same list slot as the `hnsw` graph's: a
+    /// table carries one resident index, and an edge table has no vector
+    /// column to carry the other.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn with_adjacency_ref(&self, reference: RoutingRef) -> Self {
+        self.with_list_edited(true, |list| {
+            list.slow_vector_state_graphs = Some(reference);
+        })
+    }
+
+    /// Successor manifest (bumped id) with no resident-index ref: what an
+    /// edge table whose edges are all gone is stamped with, so a walk no
+    /// longer reads the adjacency of edges that no longer exist. The
+    /// superseded blob is then unreferenced, and gc reclaims it.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn without_adjacency_ref(&self) -> Self {
+        self.with_list_edited(true, |list| {
+            list.slow_vector_state_graphs = None;
+        })
+    }
+
     /// The graph-sections sibling ref (persisted `hnsw` HNSW graphs),
     /// or `None` on manifests written before it existed or above the
     /// data-graph scale ceiling. Consumers fall back to the lazy build /
@@ -3218,6 +3242,12 @@ pub struct SubsectionOffsets {
 pub struct SuperfileUri(pub Uuid);
 
 impl SuperfileUri {
+    /// The uri of a hit that is not placed yet — one known only by its
+    /// stable `_id`, as a graph walk reaches rows — which placement
+    /// (`user_placement_for_scalar_resolve`) resolves by that id. Never a
+    /// committed superfile's uri: those are v4 uuids.
+    pub(crate) const UNPLACED: Self = Self(Uuid::nil());
+
     /// Generate a fresh URI. Called by the writer at commit time
     /// when assigning a key for a new superfile's bytes.
     pub fn new_v4() -> Self {
