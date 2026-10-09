@@ -46,6 +46,14 @@ impl Supertable {
         // stick for compaction scaling — see DiagnosticsSettings.
         let phase_timers = crate::config::global().diagnostics.optimize_phase_timers;
         let mut __t = Instant::now();
+        // The edge columns are checked against the schema first: a wrong
+        // spec is the caller's error, and it fails here with nothing
+        // committed rather than after the compaction below.
+        #[cfg(feature = "graph-index")]
+        if let Some(spec) = &opts.adjacency {
+            self.check_adjacency_spec(spec)
+                .map_err(OptimizeError::from)?;
+        }
         self.drain_hidden_vector_cells_sync()
             .map_err(OptimizeError::from)?;
         if phase_timers {
@@ -78,6 +86,21 @@ impl Supertable {
         // so the sweep keeps the fresh index and removes the one it replaced.
         self.refresh_term_index_sync()
             .map_err(OptimizeError::from)?;
+        // The knowledge graph's adjacency over an edge table, rebuilt only
+        // when the rows, the deletes or the edge columns changed; before gc
+        // for the same reason. Best-effort like the hnsw build above: the
+        // compaction is committed by now, and the walks keep serving the
+        // prior generation until a later pass republishes, so a failed
+        // publish is logged rather than failing an optimize that is done.
+        #[cfg(feature = "graph-index")]
+        if let Some(spec) = &opts.adjacency
+            && let Err(e) = self.refresh_adjacency_sync(spec)
+        {
+            tracing::warn!(
+                "adjacency refresh failed: {e}; the walks keep the prior generation until a \
+                 later optimize republishes"
+            );
+        }
         match self.gc(opts.gc.safety_gap) {
             Ok(_) | Err(GcError::NoStorage) => {}
             Err(e) => return Err(OptimizeError::Gc(e)),

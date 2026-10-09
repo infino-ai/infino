@@ -100,6 +100,7 @@ jobs:
       - run: make doctest
       - run: make test-remote
       - run: make test-tracing
+      - run: make test-no-graph
       - name: RustFS storage wire + smoke tests
         run: cargo test --features test-helpers --test supertable 'storage::rustfs_s3_wire::|storage::smoke_rustfs::' -- --test-threads=1
 

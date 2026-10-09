@@ -33,6 +33,8 @@ use datafusion::{
 };
 
 use super::Connection;
+#[cfg(feature = "graph-index")]
+use crate::supertable::query::exec::graph_exec::{GraphFunc, Traversal};
 use crate::{
     InfinoError,
     runtime_metrics::op_stats::{self, OpStatsCollector},
@@ -199,6 +201,77 @@ pub(crate) fn register_search_tvfs(ctx: &SessionContext, conn: Connection) {
         HYBRID_SEARCH_UDTF,
         Arc::new(HybridSearchCatalogFunc { resolver }),
     );
+}
+
+/// Register `graph_walk` / `graph_rank` on `ctx`: the rows of a table of
+/// `tables` within some hops of seed rows, walked over the edge table of
+/// `graph`. Without `edge_table` the functions take the edge table's name
+/// first (`graph_walk('edges', table, seed_table, seed_ids, hops, k)`),
+/// like every search function names its table; with it they take
+/// `(table, seed_table, seed_ids, hops, k)` over that one edge table — the
+/// form a graph attached from another catalog is served in
+/// (`Connection::attach_graph`), where the edge table is not one the
+/// statement could name. Under one catalog `graph` and `tables` are the
+/// same connection.
+#[cfg(feature = "graph-index")]
+pub(crate) fn register_graph_tvfs(
+    ctx: &SessionContext,
+    graph: Connection,
+    tables: Connection,
+    edge_table: Option<String>,
+) {
+    let graph = Arc::new(TableResolver::new(graph));
+    let tables = Arc::new(TableResolver::new(tables));
+    for traversal in [Traversal::Walk, Traversal::Rank] {
+        ctx.register_udtf(
+            traversal.name(),
+            Arc::new(GraphCatalogFunc {
+                graph: Arc::clone(&graph),
+                tables: Arc::clone(&tables),
+                edge_table: edge_table.clone(),
+                traversal,
+            }),
+        );
+    }
+}
+
+#[cfg(feature = "graph-index")]
+#[derive(Debug)]
+struct GraphCatalogFunc {
+    /// Resolves the edge table.
+    graph: Arc<TableResolver>,
+    /// Resolves the table whose rows a walk returns.
+    tables: Arc<TableResolver>,
+    /// The edge table, when fixed at registration; else the leading argument.
+    edge_table: Option<String>,
+    traversal: Traversal,
+}
+
+#[cfg(feature = "graph-index")]
+impl TableFunctionImpl for GraphCatalogFunc {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let name = self.traversal.name();
+        let (edges, rest) = match &self.edge_table {
+            Some(edge_table) => (self.graph.resolve(edge_table)?, args.exprs()),
+            None => self.graph.split_leading(args.exprs(), name)?,
+        };
+        let first = rest.first().ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{name} expects the table whose rows to return: {name}('table', ...)"
+            ))
+        })?;
+        let target_name = arg_to_string(first, &format!("{name} table"))?;
+        let target = self.tables.resolve(&target_name)?;
+
+        GraphFunc::new(
+            edges.reader,
+            target.reader,
+            target_name,
+            target.scalar_schema,
+            self.traversal,
+        )
+        .call_with_args(TableFunctionArgs::new(&rest[1..], args.session()))
+    }
 }
 
 #[derive(Debug)]

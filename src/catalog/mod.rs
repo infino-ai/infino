@@ -22,6 +22,8 @@ mod search_tvf;
 mod table;
 mod uri;
 
+#[cfg(feature = "graph-index")]
+use std::sync::Weak;
 use std::{
     collections::{HashMap, HashSet},
     ops::ControlFlow,
@@ -213,6 +215,8 @@ pub fn connect_with(
             connection_memory_budget,
             usage_meter,
             gcs_credential,
+            #[cfg(feature = "graph-index")]
+            graph: Mutex::new(None),
         }),
     })
 }
@@ -245,6 +249,8 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             connection_memory_budget,
             usage_meter: UsageMeter::new(),
             gcs_credential: None,
+            #[cfg(feature = "graph-index")]
+            graph: Mutex::new(None),
         }),
     })
 }
@@ -278,6 +284,14 @@ struct ConnectionInner {
     usage_meter: Arc<UsageMeter>,
     /// Swappable GCS credential shared by every provider on this connection.
     gcs_credential: Option<Arc<SwappableGcpCredential>>,
+    /// A graph attached from another catalog (see [`Connection::attach_graph`]):
+    /// the connection it lives in and its edge table, served to this
+    /// connection's SQL as `graph_walk` / `graph_rank` with no table argument.
+    /// Held weakly: the caller keeps the graph's connection open, and a
+    /// strong handle here would let a connection attached to itself, or two
+    /// attached to each other, keep both alive for good.
+    #[cfg(feature = "graph-index")]
+    graph: Mutex<Option<(Weak<ConnectionInner>, String)>>,
 }
 
 /// Where the `name → table` map lives. Durable backends persist it on the
@@ -324,6 +338,31 @@ enum CatalogStore {
 }
 
 impl Connection {
+    /// Serve `table` of `graph` — an edge table over this connection's
+    /// rows that `graph` has indexed with `OptimizeOptions::with_adjacency`
+    /// — to this connection's [`query_sql`](Self::query_sql) as
+    /// `graph_walk(table, seed_table, seed_ids, hops, k)` and
+    /// `graph_rank(...)`, with no edge-table argument. The edge table
+    /// stays `graph`'s: it is not listed, opened or scanned here, and a
+    /// statement reaches it only through the two functions, which return
+    /// rows of this connection's tables. So a graph can live in a catalog
+    /// of its own and be walked from another. Attaching again replaces the
+    /// earlier graph.
+    ///
+    /// The graph's connection is held weakly: keep `graph` (or a clone)
+    /// open while it is attached. Once every handle to it is dropped, a
+    /// statement that calls the functions fails and says so. Behind the
+    /// `graph-index` feature, off the curated public surface.
+    #[cfg(feature = "graph-index")]
+    pub fn attach_graph(&self, graph: &Connection, table: &str) {
+        *self
+            .inner
+            .graph
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some((Arc::downgrade(&graph.inner), table.to_string()));
+    }
+
     /// Cumulative object-store usage for this connection (read-only snapshot).
     /// Shared by every table provider created through this connection; take
     /// two snapshots and call [`UsageSnapshot::since`] for a window delta.
@@ -1092,6 +1131,33 @@ impl Connection {
         // the catalog at call time (so a table named only inside a TVF —
         // not as a `FROM` relation — still resolves).
         search_tvf::register_search_tvfs(&ctx, self.clone());
+        // The graph functions walk an edge table of this catalog by name, or
+        // the one attached from another catalog with no name.
+        #[cfg(feature = "graph-index")]
+        {
+            let attached = self
+                .inner
+                .graph
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            match attached {
+                Some((graph, table)) => {
+                    let graph = graph
+                        .upgrade()
+                        .map(|inner| Connection { inner })
+                        .ok_or_else(|| {
+                            InfinoError::Query(
+                                "the attached graph's connection was dropped; keep it open while \
+                                 it is attached, or attach it again"
+                                    .to_string(),
+                            )
+                        })?;
+                    search_tvf::register_graph_tvfs(&ctx, graph, self.clone(), Some(table));
+                }
+                None => search_tvf::register_graph_tvfs(&ctx, self.clone(), self.clone(), None),
+            }
+        }
         trace::follow_spans_into_datafusion_tasks();
 
         // Caller-thread pickup, same as reader mint: the drive future may

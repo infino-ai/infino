@@ -925,6 +925,30 @@ impl Supertable {
         self.block_on_query(super::writer::stamp_term_index(&self.inner))
     }
 
+    /// Whether `spec` names four columns of this table of the right types
+    /// (see `graph_index::check_spec`). [`Supertable::optimize`] runs this
+    /// before it changes anything, so a wrong spec fails it with nothing
+    /// committed.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn check_adjacency_spec(
+        &self,
+        spec: &config::AdjacencySpec,
+    ) -> Result<(), BuildError> {
+        super::graph_index::check_spec(&self.inner.manifest.load(), spec)
+    }
+
+    /// Build and publish the adjacency index over this edge table's rows
+    /// (see `graph_index::stamp_adjacency`). Not part of the public API —
+    /// [`Supertable::optimize`] calls this after compaction when its options
+    /// name the edge columns.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn refresh_adjacency_sync(
+        &self,
+        spec: &config::AdjacencySpec,
+    ) -> Result<(), BuildError> {
+        self.block_on_query(super::graph_index::stamp_adjacency(self, spec))
+    }
+
     /// Route undrained user superfiles into the hidden per-cell index. Not part
     /// of the public API — [`Supertable::optimize`] calls this before compact;
     /// tests and benches may invoke it directly via

@@ -1,4 +1,5 @@
 .PHONY: check fmt test doctest doc \
+        test-remote test-tracing test-no-graph \
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update api-parity api-parity-update \
@@ -12,17 +13,22 @@ RUSTFMT_OPTS := imports_granularity=Crate,group_imports=StdExternalCrate
 
 check:
 	cargo fmt --all -- --check --config $(RUSTFMT_OPTS)
-	cargo clippy --all-targets --features test-helpers -- -D warnings
+	cargo clippy --all-targets --features test-helpers,graph-index -- -D warnings
 	# The `remote` transport is off in the shipped library, so the line above
 	# never lints it. Lint it explicitly (alongside `test-helpers`) or it rots.
-	cargo clippy --all-targets --features test-helpers,remote -- -D warnings
+	cargo clippy --all-targets --features test-helpers,graph-index,remote -- -D warnings
+	# `graph-index` is off by default, and the lanes that build without it
+	# (doctest, remote, storage, the recall tests) deny warnings too: an item
+	# only the feature uses must be gated with it, or those lanes see dead
+	# code. Lint the feature-off build so that surfaces here, not there.
+	cargo clippy --all-targets --features test-helpers -- -D warnings
 	# `detailed-tracing` and `metering` are off by default, so neither line
 	# above compiles the `tracing::instrument` attributes they gate. Those
 	# attributes name a function's parameters, so a signature change breaks
 	# them while every default build stays green — and the break only
 	# surfaces in a downstream build that turns the feature on. Check them
 	# here instead of finding out there.
-	cargo check --features metering,detailed-tracing
+	cargo check --features metering,detailed-tracing,graph-index
 	$(MAKE) api-parity
 	$(MAKE) version-sync
 	$(MAKE) bench-gate
@@ -95,7 +101,7 @@ doc-check:
 	RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --no-deps --lib
 
 test:
-	cargo test --features test-helpers
+	cargo test --features test-helpers,graph-index
 
 # Coverage (cargo-llvm-cov; install: cargo install cargo-llvm-cov)
 # Function coverage gates at 89, lines/regions at 90. The vector-distance SIMD
@@ -108,13 +114,13 @@ test:
 # rather than variant count, so they stay at 90. Revisit if the coverage job
 # moves to an AVX-512 runner with a multi-tier profdata merge.
 coverage:                      # CI gate: ≥90% lines/regions, ≥89% functions + lcov.info for codecov upload
-	cargo llvm-cov --summary-only --features test-helpers --fail-under-lines 90 --fail-under-functions 89 --fail-under-regions 90 --ignore-filename-regex "test_helpers/"
+	cargo llvm-cov --summary-only --features test-helpers,graph-index --fail-under-lines 90 --fail-under-functions 89 --fail-under-regions 90 --ignore-filename-regex "test_helpers/"
 
 coverage-ci:                    # the CI gate via nextest (same thresholds); needs cargo-nextest installed
-	cargo llvm-cov nextest --summary-only --features test-helpers --fail-under-lines 90 --fail-under-functions 89 --fail-under-regions 90 --ignore-filename-regex "test_helpers/"
+	cargo llvm-cov nextest --summary-only --features test-helpers,graph-index --fail-under-lines 90 --fail-under-functions 89 --fail-under-regions 90 --ignore-filename-regex "test_helpers/"
 
 coverage-summary:              # quick terminal summary
-	cargo llvm-cov --summary-only --features test-helpers
+	cargo llvm-cov --summary-only --features test-helpers,graph-index
 
 # Note: an earlier `coverage-arena` gate was retired when the
 # custom MemoryArena it covered was deleted. The remaining
@@ -125,10 +131,10 @@ coverage-summary:              # quick terminal summary
 
 # Benchmarks
 bench:
-	cargo bench --features test-helpers
+	cargo bench --features test-helpers,graph-index
 
 bench-quick:
-	INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --features test-helpers -- superfile fts warm
+	INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench --features test-helpers,graph-index -- superfile fts warm
 
 # Memory safety oracles for the FTS / format `unsafe` surface.
 # The remaining `unsafe` surface is one bumpalo lifetime
@@ -189,7 +195,14 @@ test-remote:
 # Tracing lane. `detailed-tracing` is off in the default gates, which only
 # compile it, so the spans a search exports are tested here.
 test-tracing:
-	cargo test --features test-helpers,metering,detailed-tracing --test search_spans
+	cargo test --features test-helpers,graph-index,metering,detailed-tracing --test search_spans
+
+# Feature-off lane. The shipped library has no `graph-index`, and every
+# test lane above turns it on, so the build a user gets only got linted.
+# This runs the library's unit tests without it: the strided graph alone,
+# a resident index of a kind the build does not know, no walks.
+test-no-graph:
+	cargo test --features test-helpers --lib
 
 # Build the API docs locally, exactly as docs.rs renders them: crate only
 # (`--no-deps`), default features, opened in a browser. The landing page is
@@ -302,7 +315,7 @@ node-verify:
 	cd infino-node && ./scripts/verify-pack.sh
 
 # Local "pre-PR" check — same gates CI runs
-ci: check doctest coverage test-remote test-tracing
+ci: check doctest coverage test-remote test-tracing test-no-graph
 	@echo "✓ ready to PR"
 
 clean:

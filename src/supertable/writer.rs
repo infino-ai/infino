@@ -10067,7 +10067,7 @@ async fn previous_centroid_section(
 /// deletes. A hash collision only ever costs a spurious reuse/rebuild, not
 /// correctness — the copy-flip and query-time doc-id dedup are the
 /// correctness guards.
-fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
+pub(in crate::supertable) fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
     let entries = manifest.get_all_superfiles();
     let count: u64 = entries.iter().map(|e| e.n_docs).sum();
     let min_id = entries.iter().map(|e| e.id_min).min().unwrap_or(0);
@@ -10097,7 +10097,7 @@ fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
 /// a flat publish logging as a graph publish is the same class of confusion
 /// the reasoned declines exist to remove — the log saying the mode you did not
 /// ask for.
-async fn publish_resident_index(
+pub(in crate::supertable) async fn publish_resident_index(
     storage: &dyn StorageProvider,
     population_key: u64,
     high_water: i128,
@@ -10261,6 +10261,8 @@ async fn build_hnsw_graph_ref(
         && let Some(prior_data) = sections.data.and_then(|kind| match kind {
             slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
             slow_vector_state::ResidentIndexKind::Flat(_) => None,
+            #[cfg(feature = "graph-index")]
+            slow_vector_state::ResidentIndexKind::Adjacency(_) => None,
         })
     {
         let prior_count = prior_data.doc_ids.len();
@@ -10337,7 +10339,7 @@ async fn build_hnsw_graph_ref(
 /// (`None` when nothing needs publishing), then CAS it in. A lost race
 /// derives the next attempt past any crash-orphaned list and retries
 /// with backoff; `what` names the artifact in the terminal error.
-async fn stamp_with_retries<F, Fut>(
+pub(in crate::supertable) async fn stamp_with_retries<F, Fut>(
     inner: &SupertableInner,
     storage: &Arc<dyn StorageProvider>,
     what: &str,
@@ -12327,6 +12329,8 @@ mod tests {
         .and_then(|kind| match kind {
             slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
             slow_vector_state::ResidentIndexKind::Flat(_) => None,
+            #[cfg(feature = "graph-index")]
+            slow_vector_state::ResidentIndexKind::Adjacency(_) => None,
         })
         .expect("data graph present after full build");
         assert!(
@@ -12424,6 +12428,8 @@ mod tests {
         .and_then(|kind| match kind {
             slow_vector_state::ResidentIndexKind::Flat(f) => Some(f),
             slow_vector_state::ResidentIndexKind::Graph(_) => None,
+            #[cfg(feature = "graph-index")]
+            slow_vector_state::ResidentIndexKind::Adjacency(_) => None,
         })
         .expect("the envelope must state Flat, and the payload decode as one");
 
