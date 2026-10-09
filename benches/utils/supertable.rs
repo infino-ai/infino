@@ -654,8 +654,8 @@ type CompactionStats = (f64, storage_meter::ObjectStoreMeter, u64, Option<f64>);
 /// largest superfile, not its size. Sizing the target from the table's own
 /// bytes per doc pins that count: two builds of the same corpus compact to
 /// the same shape even when one stores its index far denser, and the warm
-/// rows then compare readers rather than how many docs a 1 GiB output
-/// happened to absorb. Chosen to match what the default 1 GiB target yields
+/// rows then compare readers rather than how many docs a fixed-size output
+/// happened to absorb. Chosen to match what a 1 GiB target yields
 /// on the realistic FTS corpus, so the shape the gates have always measured
 /// is preserved.
 const COMPACTION_DOCS_PER_SUPERFILE: u64 = 200_000;

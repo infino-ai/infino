@@ -302,8 +302,16 @@ pub(in crate::supertable::optimize::compact) mod tests {
         );
     }
 
+    /// A 1 GiB target with an 80% floor. Pinned rather than read from
+    /// `CompactionSettings::default()`, so the packing arithmetic below does
+    /// not move when the shipped default does.
     pub(in crate::supertable::optimize::compact) fn default_cfg() -> CompactionSettings {
-        CompactionSettings::default() // 1 GiB target, 80% floor
+        CompactionSettings {
+            target_superfile_size_mb: 1024,
+            min_fill_percent: 80,
+            max_memory_mb: 3072,
+            ..CompactionSettings::default()
+        }
     }
 
     #[test]

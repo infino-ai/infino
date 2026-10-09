@@ -273,7 +273,7 @@ const DEFAULT_SUPERFILE_BUFFER_SPLIT_MB: u64 = 64;
 const DEFAULT_VERIFY_CRC_ON_OPEN: bool = true;
 
 // Compaction defaults
-const DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB: u64 = 1024;
+const DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB: u64 = 8192;
 const DEFAULT_COMPACTION_MIN_FILL_PERCENT: u8 = 80;
 /// Default fragment-count merge trigger for the user table: consolidate a
 /// partition once it accumulates this many sub-target superfiles, even when
@@ -507,7 +507,7 @@ const DEFAULT_VECTOR_HIDDEN_CELL_COUNT: usize = 256;
 /// to hold a full packed cell shard plus incremental deltas so the drain's
 /// base shard stays a merge candidate and absorbs later deltas rather than
 /// being sealed as over-target on the first pass.
-const DEFAULT_VECTOR_COMPACTION_TARGET_MB: u64 = 2048;
+const DEFAULT_VECTOR_COMPACTION_TARGET_MB: u64 = 8192;
 /// Default hidden vector-index fragment-count merge trigger: `2` means a cell
 /// consolidates on any two shards, so drain generations collapse and
 /// post-compact cold GET stays at the post-drain level. The hidden index keeps
@@ -2270,7 +2270,7 @@ supertable:
         let cfg = Config::from_figment(fig).expect("layered yaml");
         assert_eq!(cfg.compaction.target_superfile_size_mb, 2048);
         assert_eq!(cfg.compaction.min_fill_percent, 50);
-        assert_eq!(cfg.compaction.max_memory_mb, 3072);
+        assert_eq!(cfg.compaction.max_memory_mb, 10240);
     }
 
     #[test]
