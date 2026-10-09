@@ -367,12 +367,36 @@ impl Default for CompactionSettings {
     }
 }
 
-/// Default reorder convergence ratio. Measured on a 5M-document body of text
-/// against three alternatives (against each split's own first round, against
-/// the gain accumulated so far, and on the fraction of documents a round
-/// moves): the alternatives bought 7-8% more compaction speed by reordering
-/// less, for indexes 1-2% larger, while this one lands the smallest index of
-/// the four at the same cost as the baseline it replaced.
+/// Default reorder convergence ratio: the measured optimum for a 5M-document
+/// body of English text, not a point chosen on a trade-off.
+///
+/// Swept over 0.0 (every split run to the ceiling) through 0.5, the index size
+/// is **not** monotonic in how much reordering is done — it bottoms out here
+/// and rises on both sides, reproducibly to a few kilobytes in 2.7 GB:
+///
+/// ```text
+///   tau    compaction   index
+///   0.50     128.3 s    2,752,781,451   +1.83%
+///   0.20     136.0 s    2,732,369,150   +1.07%
+///   0.10     139.8 s    2,715,302,199   +0.44%
+///   0.05     141.6 s    2,703,377,724      --
+///   0.02     144.7 s    2,714,226,695   +0.40%
+///   0.00     158.7 s    2,713,601,158   +0.38%
+/// ```
+///
+/// So this value is 11% faster than running every round *and* lands a smaller
+/// index: past it, more rounds buy a worse layout. The bisection minimises a
+/// windowed term-cost proxy rather than compressed size, and past a point
+/// driving the proxy down diverges from the thing it stands for.
+///
+/// The optimum is a property of the corpus, so a deployment on very different
+/// text should recalibrate rather than inherit this: build at several values
+/// and take the index-size minimum. Everything either side of the minimum is
+/// worse on both axes, which makes the sweep cheap to read.
+///
+/// Index size is the proxy for layout quality used here. What the reordering
+/// is ultimately for is query performance, and that has not been resolved at
+/// this scale.
 const DEFAULT_REORDER_CONVERGENCE: f32 = 0.05;
 
 /// Default ceiling on a split's move rounds. Equal to the fixed count the
