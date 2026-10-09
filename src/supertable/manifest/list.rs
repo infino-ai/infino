@@ -3417,6 +3417,19 @@ mod tests {
         );
     }
 
+    /// A list carrying a key this engine does not know still decodes, and
+    /// re-encoding drops the key, so tables written by other engine versions
+    /// keep opening.
+    #[test]
+    fn unknown_keys_are_ignored_on_decode() {
+        let bytes = encode(&empty_list()).expect("encode");
+        let text = from_utf8(&bytes).expect("utf8");
+        let with_unknown = text.replacen('{', r#"{"not_a_manifest_key": "value","#, 1);
+        let decoded =
+            decode(with_unknown.as_bytes(), &LegacyNames::none()).expect("decode with unknown key");
+        assert_eq!(encode(&decoded).expect("re-encode"), bytes);
+    }
+
     #[test]
     fn term_index_ref_round_trips_and_requires_both_halves() {
         let mut list = empty_list();
