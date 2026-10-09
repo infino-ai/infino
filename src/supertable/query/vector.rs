@@ -8822,7 +8822,13 @@ mod tests {
         let dim = COLD_PLACEMENT_DIM;
         let schema = schema_with_vector(dim);
         let dir = TempDir::new().expect("tempdir");
-        let local = Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        // A meter of its own: `LocalFsStorageProvider::new` records into the
+        // process-wide default meter, so with the lib tests in one process
+        // the window below also counted other tests' GETs and the bound
+        // failed on reads this lookup never made.
+        let local = Arc::new(
+            LocalFsStorageProvider::new_with_meter(dir.path(), UsageMeter::new()).expect("storage"),
+        );
         let storage: Arc<dyn StorageProvider> = local.clone();
         {
             let st = Supertable::create(
@@ -9304,6 +9310,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
+        runtime_metrics::UsageMeter,
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
             manifest::{SuperfileEntry, SuperfileUri},
