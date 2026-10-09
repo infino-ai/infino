@@ -5899,7 +5899,9 @@ mod tests {
         );
 
         // A document's slots are indexed by a u8.
-        assert!(reorder_terms_per_doc(1_000, 1_000 * 10_000).unwrap() <= u8::MAX as usize);
+        let dense = reorder_terms_per_doc(1_000, 1_000 * 10_000)
+            .expect("a thousand term-rich documents can afford to reorder");
+        assert!(dense <= u8::MAX as usize);
 
         // Too little to group by: keep arrival order rather than pay for a
         // pass that cannot pay back.

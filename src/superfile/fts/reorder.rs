@@ -36,12 +36,13 @@
 
 use std::{
     mem,
-    sync::{Mutex, PoisonError},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
 };
 
 use rayon::{join, prelude::*};
-
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Documents below this per-partition size are left in the order they
 /// already have. Splitting further costs more than the grouping is

@@ -399,7 +399,6 @@ impl Default for CompactionSettings {
 ///
 /// Index size stands in for layout quality throughout. The reordering exists
 /// for query performance, which is not resolved at this scale.
-
 const DEFAULT_REORDER_CONVERGENCE: f32 = 0.05;
 
 /// Default ceiling on a split's move rounds. Equal to the fixed count the
