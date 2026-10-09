@@ -37,7 +37,7 @@ on:
         description: "Release scope (PACKAGE for make release-prep)"
         required: true
         type: choice
-        options: [crate, node, python, each, all]
+        options: [each, crate, node, python, all]
       version:
         description: "New version, plain X.Y.Z (leave empty for 'each')"
         required: false
