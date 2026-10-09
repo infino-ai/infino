@@ -42,15 +42,13 @@ use crate::{
     },
 };
 
-/// Rewrites between refreshes of the global term-statistics sidecar.
+/// Rewrites between term-index refreshes.
 ///
-/// The manifest drops its reference to that sidecar on **any** superfile
-/// removal, and every rewrite is a removal — so without this a migration
-/// would run its whole length with no sidecar, and every scored query
-/// would fall back to a gather wave. Refreshing after each rewrite would
-/// be correct and wasteful; refreshing never would be cheap and slow. This
-/// bounds the window to a handful of rewrites.
-const REWRITES_PER_TERM_STATS_REFRESH: usize = 16;
+/// On a table the index does not fully cover, every scored query reads df
+/// from each superfile's own dictionary, and each rewrite drops the
+/// term-stats sidecar that would otherwise spare it. A refresh makes the
+/// index complete; this bounds how many rewrites run before one.
+const REWRITES_PER_TERM_INDEX_REFRESH: usize = 16;
 
 /// Superfiles opened at once while deciding which are stale.
 ///
@@ -603,8 +601,8 @@ impl Supertable {
     /// - **Never opened** — the hidden vector index.
     /// - **Written to publish the result, not migrated** — one manifest
     ///   commit per superfile, each output's tombstone sidecar, and the
-    ///   table's term-statistics sidecar. These follow from replacing a
-    ///   file; their own formats are untouched.
+    ///   table's term index. These follow from replacing a file; their own
+    ///   formats are untouched.
     ///
     /// Superfiles are brought to the index layout this engine writes. One
     /// already at or above it is left alone, because a newer release may
@@ -751,27 +749,24 @@ impl Supertable {
                 report.rewritten += 1;
             }
 
-            // Bound how long the table runs without its term-statistics
-            // sidecar; see REWRITES_PER_TERM_STATS_REFRESH.
-            if (done + 1) % REWRITES_PER_TERM_STATS_REFRESH == 0 {
-                self.refresh_term_stats_best_effort();
+            // See REWRITES_PER_TERM_INDEX_REFRESH.
+            if (done + 1) % REWRITES_PER_TERM_INDEX_REFRESH == 0 {
+                self.refresh_term_index_best_effort();
             }
         }
         if report.rewritten > 0 {
-            self.refresh_term_stats_best_effort();
+            self.refresh_term_index_best_effort();
         }
         Ok(report)
     }
 
-    /// Rebuild the global term-statistics sidecar, logging rather than
-    /// failing.
+    /// Refresh the term index, logging a failure instead of returning it.
     ///
-    /// A missing sidecar costs latency, never correctness — queries fall
-    /// back to gathering the statistics live — so a refresh that fails is
-    /// not a reason to abandon a migration that is otherwise succeeding.
-    fn refresh_term_stats_best_effort(&self) {
-        if let Err(e) = self.refresh_term_stats_sync() {
-            warn!("[supertable reindex] term-stats refresh failed, queries gather live: {e}");
+    /// A stale index costs query latency, never correctness, so it is no
+    /// reason to abandon a migration that is otherwise succeeding.
+    fn refresh_term_index_best_effort(&self) {
+        if let Err(e) = self.refresh_term_index_sync() {
+            warn!("[supertable reindex] term-index refresh failed, queries gather live: {e}");
         }
     }
 }

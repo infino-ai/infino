@@ -946,22 +946,18 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
-    /// Rebuild the table-level term index over the current membership
-    /// (see `manifest::term_index`), and the global term-stats sidecar only
-    /// if the index still does not cover every superfile. Not part of the
-    /// public API — [`Supertable::optimize`] calls this after compaction so
-    /// the artifacts describe the post-merge superfile set.
+    /// Rebuild the term index over the current superfiles. If it now covers
+    /// every superfile, unpublish the term-stats sidecar; otherwise rebuild
+    /// the sidecar.
     ///
-    /// A complete index already holds every term's df in every superfile,
-    /// and queries sum global df from it without opening the sidecar, so
-    /// building the sidecar then is a full pass over every dictionary for
-    /// nothing. It stays the fallback for an index that is incomplete.
+    /// A complete index holds every term's df, so queries never read the
+    /// sidecar; keeping one only stops gc from deleting it.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
-    pub(crate) fn refresh_term_stats_sync(&self) -> Result<(), BuildError> {
+    pub(crate) fn refresh_term_index_sync(&self) -> Result<(), BuildError> {
         self.block_on_query(async {
             super::writer::stamp_term_index(&self.inner).await?;
             if self.inner.manifest.load().term_index_complete() {
-                return Ok(());
+                return super::writer::drop_term_stats(&self.inner).await;
             }
             super::writer::stamp_term_stats(&self.inner).await
         })

@@ -1514,13 +1514,8 @@ impl ManifestSnapshot {
         ))
     }
 
-    /// Centroid-section sibling of the slow-CAS blob (contiguous fp32 fine
-    /// centroids in `(entry, column, cell)` order) — the stripped-summary
-    /// admit rescore hydrates it once instead of fanning per-cell superfile
-    /// reads. `None` on manifests written before the sibling existed.
-    /// The manifest's global term-stats sidecar reference, when one is
-    /// stamped and still valid for this membership (the carry rule drops
-    /// it on any superfile removal). See `manifest::term_stats`.
+    /// The term-stats sidecar reference, while one is published. See
+    /// `manifest::term_stats` for when it is built and dropped.
     pub(crate) fn term_stats_blob(&self) -> Option<&RoutingRef> {
         self.list.as_ref().and_then(|l| l.term_stats.as_ref())
     }
@@ -1562,6 +1557,12 @@ impl ManifestSnapshot {
         self.with_list_edited(true, |list| list.term_stats = Some(reference))
     }
 
+    /// Successor manifest (bumped id) without the term-stats sidecar
+    /// reference, so gc may sweep the artifact once nothing names it.
+    pub(crate) fn without_term_stats(&self) -> Self {
+        self.with_list_edited(true, |list| list.term_stats = None)
+    }
+
     /// The manifest's term-index root reference, when one has been built.
     /// See `manifest::term_index`.
     pub(crate) fn term_index_ref(&self) -> Option<&RoutingRef> {
@@ -1597,6 +1598,10 @@ impl ManifestSnapshot {
         })
     }
 
+    /// Centroid-section sibling of the slow-CAS blob (contiguous fp32 fine
+    /// centroids in `(entry, column, cell)` order) — the stripped-summary
+    /// admit rescore hydrates it once instead of fanning per-cell superfile
+    /// reads. `None` on manifests written before the sibling existed.
     pub(crate) fn slow_vector_state_centroids_blob(&self) -> Option<&RoutingRef> {
         self.list.as_ref()?.slow_vector_state_centroids.as_ref()
     }

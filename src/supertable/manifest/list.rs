@@ -197,7 +197,8 @@ pub struct Manifest {
     /// **dropped by any commit that removes superfiles** (a removed
     /// superfile's contribution is baked into the sum and cannot be
     /// attributed, so only a fresh maintenance pass may republish).
-    /// Absent on older manifests and until the first maintenance pass.
+    /// Absent on older manifests, before the first maintenance pass, and
+    /// whenever the term index is complete.
     pub term_stats: Option<RoutingRef>,
     /// The table-level term index root (`manifest::term_index`), when
     /// one has been built. Carried across every commit: its postings are

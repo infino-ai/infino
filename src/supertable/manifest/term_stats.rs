@@ -14,7 +14,9 @@
 //! that removes superfiles drops the reference — a removed superfile's
 //! contribution is baked into the sums and cannot be attributed, so only
 //! a fresh maintenance pass may republish (see the carry rule in
-//! `ManifestSnapshot::update_inner`).
+//! `ManifestSnapshot::update_inner`). Maintenance builds it only while the
+//! term index is incomplete, and drops the reference once the index covers
+//! every superfile, since queries then read df from the index.
 //!
 //! Layout: a fixed header (magic, version, covered-superfile ids) then a
 //! standard FST map keyed `field_id <KEY_SEPARATOR> term → u64`

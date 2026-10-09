@@ -10389,6 +10389,24 @@ where
     )))
 }
 
+/// Remove the term-stats sidecar reference when the term index is complete,
+/// so gc can delete the file. Checked against each retry's manifest, so a
+/// racing commit that leaves the index incomplete keeps the sidecar.
+pub(in crate::supertable) async fn drop_term_stats(
+    inner: &SupertableInner,
+) -> Result<(), BuildError> {
+    let Some(storage) = inner.options.storage.clone() else {
+        return Ok(());
+    };
+    stamp_with_retries(inner, &storage, "term-stats drop", |old| async move {
+        if !old.term_index_complete() || old.term_stats_blob().is_none() {
+            return Ok(None);
+        }
+        Ok(Some(old.without_term_stats()))
+    })
+    .await
+}
+
 /// Build and publish the term-stats sidecar over the CURRENT
 /// membership, stamping its reference on a successor manifest (see
 /// `manifest::term_stats` for artifact semantics and the carry rule).

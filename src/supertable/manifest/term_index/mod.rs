@@ -2699,7 +2699,7 @@ mod tests {
             w.append(&batch).expect("append");
             w.commit().expect("commit");
         }
-        st.refresh_term_stats_sync().expect("maintenance rebuild");
+        st.refresh_term_index_sync().expect("maintenance rebuild");
         let rt = tokio::runtime::Runtime::new().expect("rt");
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
@@ -3398,6 +3398,46 @@ mod tests {
             shared.len(),
             live.len(),
             "`shared` is in every fixture superfile, filed under `title`'s id"
+        );
+    }
+
+    /// A table upgraded from before the term index carries a term-stats
+    /// sidecar. Once maintenance completes the index, the sidecar is
+    /// unpublished and gc deletes it; a second pass changes nothing.
+    #[test]
+    fn a_complete_term_index_retires_the_term_stats_sidecar() {
+        let fixture = old_format_fts_fixture();
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&fixture, dir.path());
+        let (_storage, st) = open_old_format(dir.path(), |o| o);
+        let sidecar = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_stats_blob()
+            .cloned()
+            .expect("the fixture carries a sidecar");
+        assert!(dir.path().join(&sidecar.uri).exists());
+
+        stats_only_optimize(&st);
+        let manifest = st.reader().expect("reader").manifest().clone();
+        assert!(manifest.term_index_complete());
+        assert!(
+            manifest.term_stats_blob().is_none(),
+            "a complete index retires the sidecar"
+        );
+
+        st.gc(Duration::ZERO).expect("gc");
+        assert!(
+            !dir.path().join(&sidecar.uri).exists(),
+            "gc deletes the unreferenced sidecar"
+        );
+
+        stats_only_optimize(&st);
+        assert_eq!(
+            st.reader().expect("reader").manifest().get_manifest_id(),
+            manifest.get_manifest_id(),
+            "nothing left to publish"
         );
     }
 
