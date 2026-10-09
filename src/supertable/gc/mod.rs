@@ -47,10 +47,6 @@ const RECLAIM_CONCURRENCY: usize = 32;
 /// more than this is already reported loudly, and a HEAD each for thousands would stall the sweep.
 const MAX_MISSING_SUPERFILE_PROBES: usize = 64;
 
-/// Prefix of term-statistics files written by older engines. Nothing names them any more, so the
-/// sweep deletes the ones left in existing tables.
-const LEGACY_TERM_STATS_PREFIX: &str = "term-stats/";
-
 /// A superfile deleted younger than this gets its own `info` line. Routine reclaim removes
 /// superseded files long after they were written, so a young one is the rare, risky case: a file
 /// whose commit was still in flight, or never landed. Three of the deferred sweep's grace windows
@@ -373,7 +369,6 @@ pub(super) async fn gc_storage_sweep_for_inner(
         MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
-        LEGACY_TERM_STATS_PREFIX,
         TERM_INDEX_STORAGE_PREFIX,
         // Tombstone sidecars under `superfiles/` (live set includes the
         // paths for current superfiles; orphans age out past the safety gap).
@@ -619,15 +614,11 @@ async fn absent_superfiles(
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{Array, Float32Array, LargeStringArray};
     use tempfile::tempdir;
-    use tokio::runtime::Runtime;
     use uuid::Uuid;
 
     use super::*;
     use crate::{
-        Bm25SearchOptions,
-        config::{CompactionSettings, OptimizeOptions},
         storage::{LocalFsStorageProvider, PrefixedStorageProvider, StorageProvider},
         supertable::{
             SupertableOptions,
@@ -640,14 +631,8 @@ mod tests {
             },
             slow_vector_state,
         },
-        test_helpers::{
-            copy_dir_recursive, default_supertable_options, old_format_fts_fixture,
-            open_old_format_fts_fixture,
-        },
+        test_helpers::default_supertable_options,
     };
-
-    /// More hits than the fixture has rows, so no answer is truncated.
-    const OLD_FORMAT_TOP_K: usize = 1_000;
 
     /// The hidden vector index sweeps through a `PrefixedStorageProvider`, which
     /// strips its sub-prefix on list. Its keys therefore reach the cache
@@ -1393,79 +1378,5 @@ mod tests {
             "the failed probe is visible: {logs}"
         );
         assert!(faulty.fired() > 0, "the probe ran and failed");
-    }
-
-    /// `(title, score)` for every query, best first, ties by title.
-    fn ranked_answers(st: &Supertable, queries: &[&str]) -> Vec<Vec<(String, f32)>> {
-        let reader = st.reader().expect("reader");
-        queries
-            .iter()
-            .map(|query| {
-                let batches = reader
-                    .bm25_search(
-                        "title",
-                        query,
-                        OLD_FORMAT_TOP_K,
-                        Bm25SearchOptions::new(),
-                        Some(&["title", "score"]),
-                    )
-                    .expect("search");
-                let mut hits = Vec::new();
-                for batch in &batches {
-                    let titles = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<LargeStringArray>()
-                        .expect("title");
-                    let scores = batch
-                        .column(1)
-                        .as_any()
-                        .downcast_ref::<Float32Array>()
-                        .expect("score");
-                    for i in 0..batch.num_rows() {
-                        hits.push((titles.value(i).to_owned(), scores.value(i)));
-                    }
-                }
-                hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                hits
-            })
-            .collect()
-    }
-
-    /// A table whose manifest still names a `term-stats/` file opens and
-    /// answers the same before and after a merging optimize, and gc then
-    /// deletes the file.
-    #[test]
-    fn old_term_stats_files_are_ignored_then_swept() {
-        let dir = tempdir().expect("tempdir");
-        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
-        let (storage, st) = open_old_format_fts_fixture(dir.path(), |o| o);
-        let rt = Runtime::new().expect("runtime");
-        let legacy_files = || {
-            rt.block_on(storage.list_with_prefix_metadata(LEGACY_TERM_STATS_PREFIX))
-                .expect("list")
-        };
-        assert!(
-            !legacy_files().is_empty(),
-            "the fixture holds a term-stats file"
-        );
-
-        let queries = ["shared", "alpha", "alpha shared", "beta s1d00", "s2d04"];
-        let before = ranked_answers(&st, &queries);
-        assert!(before.iter().all(|hits| !hits.is_empty()));
-
-        let superfiles = || st.reader().expect("reader").n_superfiles();
-        let superfiles_before = superfiles();
-        st.optimize(&OptimizeOptions::compact(CompactionSettings {
-            min_superfiles_for_merge: 2,
-            ..CompactionSettings::default()
-        }))
-        .expect("optimize");
-        assert!(superfiles() < superfiles_before, "optimize merged");
-        assert_eq!(ranked_answers(&st, &queries), before);
-
-        st.gc(Duration::ZERO).expect("gc");
-        assert!(legacy_files().is_empty(), "gc removed the term-stats file");
-        assert_eq!(ranked_answers(&st, &queries), before);
     }
 }

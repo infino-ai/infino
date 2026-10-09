@@ -14,8 +14,6 @@
   "deleted_user_ids_inline_b64": null,
   "slow_vector_state_uri": null,
   "slow_vector_state_content_hash": null,
-  "term_stats_uri": "term-stats/stats-1515b211131802ac9ab474d9bacea66c3eba583efee117ec9b89ce0f149d25e4.bin",
-  "term_stats_content_hash": "blake3:1515b211131802ac9ab474d9bacea66c3eba583efee117ec9b89ce0f149d25e4",
   "partition_strategy": {
     "kind": "ingestion_time",
     "granularity_secs": 86400
