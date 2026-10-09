@@ -2885,13 +2885,13 @@ mod tests {
         // handful of fragments instead of the default 50.
         let cfg = CompactionSettings {
             min_superfiles_for_merge: 3,
-            ..CompactionSettings::default() // 1 GiB target, 80% floor (819 MiB)
+            ..CompactionSettings::default() // 8 GiB target, 80% floor (6554 MiB)
         };
         // Two 1 MiB fragments: below the count trigger and far below the floor.
         let two = vec![seg(1, 1, 1000, 0), seg(2, 1, 1000, 0)];
         assert!(
             select(&two, &cfg).is_empty(),
-            "2 < min_superfiles_for_merge (3) and 2 MiB << 819 MiB floor: no merge"
+            "2 < min_superfiles_for_merge (3) and 2 MiB << 6554 MiB floor: no merge"
         );
         // A third fragment trips the count trigger even though 3 MiB << the floor.
         let three = vec![seg(1, 1, 1000, 0), seg(2, 1, 1000, 0), seg(3, 1, 1000, 0)];
@@ -2928,12 +2928,12 @@ mod tests {
     fn partitions_packed_independently() {
         let mut segs = Vec::new();
         for i in 0..5 {
-            let mut s = seg(i, 200, 1000, 0);
+            let mut s = seg(i, 1600, 1000, 0);
             s.partition_key = vec![0xA];
             segs.push(s);
         }
         for i in 5..10 {
-            let mut s = seg(i, 200, 1000, 0);
+            let mut s = seg(i, 1600, 1000, 0);
             s.partition_key = vec![0xB];
             segs.push(s);
         }
