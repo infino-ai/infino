@@ -682,11 +682,11 @@ fn shape_pinned_compaction(table: &Supertable) -> CompactionSettings {
     let defaults = CompactionSettings::default();
     CompactionSettings {
         target_superfile_size_mb,
-        // Keep the merge's memory ceiling the same distance above the target
-        // as the defaults keep it, so a denser table's smaller target never
+        // Keep the merge's memory ceiling the same multiple of the target as
+        // the defaults keep it, so a denser table's smaller target never
         // tightens it and a larger one is never capped below a full output.
         max_memory_mb: defaults.max_memory_mb.max(
-            target_superfile_size_mb + (defaults.max_memory_mb - defaults.target_superfile_size_mb),
+            target_superfile_size_mb * defaults.max_memory_mb / defaults.target_superfile_size_mb,
         ),
         ..defaults
     }

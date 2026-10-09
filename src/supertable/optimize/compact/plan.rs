@@ -303,7 +303,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
     }
 
     pub(in crate::supertable::optimize::compact) fn default_cfg() -> CompactionSettings {
-        CompactionSettings::default() // 8 GiB target, 80% floor (6.4 GiB), 10 GiB input cap
+        CompactionSettings::default() // 8 GiB target, 80% floor (6.4 GiB), 16 GiB input cap
     }
 
     #[test]
@@ -368,10 +368,10 @@ pub(in crate::supertable::optimize::compact) mod tests {
 
     #[test]
     fn output_estimate_uses_live_bytes() {
-        // 5 × 2000 MiB raw, a fifth deleted → 1600 MiB live each. The
-        // 10000 MiB raw total stays under the 10 GiB input cap, so the live
-        // bytes, not the raw bytes, decide how many inputs fit the target.
-        let segs: Vec<_> = (0..5).map(|i| seg(i, 2000, 1000, 200)).collect();
+        // 5 × 3200 MiB raw, half deleted → 1600 MiB live each. The 16000 MiB
+        // raw total stays under the 16 GiB input cap, so the live bytes, not
+        // the raw bytes, decide how many inputs fit the target.
+        let segs: Vec<_> = (0..5).map(|i| seg(i, 3200, 1000, 500)).collect();
         let jobs = select(&segs, &default_cfg());
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].inputs.len(), 5);

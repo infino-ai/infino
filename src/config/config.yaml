@@ -130,8 +130,9 @@ compaction:
   # so many tiny appends consolidate without lowering the floor. Min 2.
   min_superfiles_for_merge: 50
 
-  # Maximum memory budget for materializing inputs during a single merge, in MiB.
-  max_memory_mb: 10240
+  # Maximum raw input bytes a single merge may take in, in MiB. Twice the
+  # target, so inputs that are half deleted still fill a full-size output.
+  max_memory_mb: 16384
 
 # Vector-index build / search / drain tuning. Every value below
 # defaults to the engine's built-in behavior — a fresh install never
@@ -475,8 +476,8 @@ vector:
   # shard stays a merge candidate until it reaches compaction_target_mb,
   # so incremental deltas are absorbed into it instead of being sealed
   # off as separate fragments. compaction_max_memory_mb caps the input
-  # bytes packed into one merge pass and must stay >= the target, or the
-  # target is never reached.
+  # bytes packed into one merge pass. It is twice the target, so inputs
+  # that are half deleted still reach the target rather than the cap.
   #
   # The hidden index has no byte floor of its own: it derives min_fill_percent
   # from the top-level `compaction:` section, and compaction_min_superfiles_for_merge
@@ -488,7 +489,7 @@ vector:
   # hitting the old broken post-merge split path.
   compaction_target_mb: 8192
   compaction_min_superfiles_for_merge: 2
-  compaction_max_memory_mb: 10240
+  compaction_max_memory_mb: 16384
 
 # Diagnostic and hardware-capability toggles. Each gates
 # instrumentation or forces a slower code path for A/B measurement;
