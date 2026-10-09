@@ -6827,7 +6827,7 @@ fn build_prepared_from_spilled_cells(
                     .map_err(|e| BuildError::Store(format!("ids-only batch: {e}")))?;
             ScalarStatsAgg::merge(
                 &mut scalar_stats,
-                &ScalarStatsAgg::from_batch(&scalar_schema, &scalar),
+                &ScalarStatsAgg::from_batches(&scalar_schema, &[&scalar]),
             );
             builder.add_batch_ids_only(&scalar)?;
             ids_seen += take;

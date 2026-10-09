@@ -48,7 +48,7 @@ impl SuperfileStats {
         }
         n_docs += id_col.len() as u64;
 
-        let scalar_stats = ScalarStatsAgg::from_batch(&schema, batch);
+        let scalar_stats = ScalarStatsAgg::from_batches(&schema, &[batch]);
         Ok(Self {
             n_docs,
             id_min,
