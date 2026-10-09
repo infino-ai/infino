@@ -291,8 +291,14 @@ const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 =
 
 /// How old a tombstone sidecar seal has to be before compaction treats
 /// its owner as dead and takes over, instead of backing off.
-/// Scale this up if target_superfile_size_mb is raised well past the default
-pub const DEFAULT_STALE_SEAL_TIMEOUT_MS: u64 = 2 * 60 * 1000;
+///
+/// A merge holds its inputs' seals for its whole run, so this has to outlast
+/// a merge at the default target: a seal taken over mid-merge makes the
+/// compactor drop the job and throw the merge away. Scale it up if
+/// target_superfile_size_mb is raised well past the default. The writer's
+/// sealed-retry budget must stay longer than this, which a compile-time
+/// assert in the WAL pipeline enforces for the shipped pair.
+pub const DEFAULT_STALE_SEAL_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 /// Compaction settings: target size, fill floor, and memory budget.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
