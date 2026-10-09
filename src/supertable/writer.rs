@@ -3430,7 +3430,10 @@ async fn write_superfile_terms(
     let dict_bytes = fts
         .dict_bytes_async()
         .await
-        .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
+        .map_err(|source| TermIndexError::Read {
+            what: "term walk",
+            source,
+        })?;
     for (_, column, column_id) in &columns {
         let mut after: Option<Vec<u8>> = None;
         loop {
@@ -3442,7 +3445,10 @@ async fn write_superfile_terms(
                     TERM_INDEX_BATCH_TERMS,
                 )
                 .await
-                .map_err(|e| TermIndexError::Build(format!("term facts: {e}")))?;
+                .map_err(|source| TermIndexError::Read {
+                    what: "term facts",
+                    source,
+                })?;
             for (term, fact) in &chunk {
                 let term =
                     from_utf8(term).map_err(|_| TermIndexError::Build("non-utf8 term".into()))?;
@@ -10427,11 +10433,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                 &entries,
                 &old.options.legacy_names(),
             )
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-            let reference = term_index::write_built(storage.as_ref(), built)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+            .await?;
+            let reference = term_index::write_built(storage.as_ref(), built).await?;
             // The root is content-addressed, so an unchanged reference can
             // still sit beside a stale "incomplete" mark; this build covers
             // the whole membership, so publish whenever that mark is wrong.
@@ -10461,7 +10464,7 @@ async fn collect_and_build_term_index(
     for entry in entries {
         let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)
             .await
-            .map_err(|e| TermIndexError::Build(e.to_string()))?;
+            .map_err(TermIndexError::Open)?;
         // The walk reads most of the FTS section, whose reads skip the block
         // cache, so each would be its own GET. Fetch the section in bulk first.
         // On failure the walk still works, read by read.

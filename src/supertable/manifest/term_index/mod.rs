@@ -49,9 +49,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    storage::{StorageError, StorageProvider},
-    superfile::fts::{bm25::idf as bm25_idf, reader::BoolMode},
+    storage::{StorageError, StorageProvider, permission_denied_in_chain},
+    superfile::{
+        FtsError,
+        fts::{bm25::idf as bm25_idf, reader::BoolMode},
+    },
     supertable::{
+        error::QueryError,
         manifest::{
             ManifestSnapshot, RoutingRef, SuperfileEntry, disk_cache::ManifestDiskCache,
             part::ContentHash,
@@ -109,6 +113,15 @@ pub(crate) enum TermIndexError {
     /// The build's inputs were inconsistent.
     #[error("term-index build error: {0}")]
     Build(String),
+    /// Opening a superfile to read its terms failed.
+    #[error("term-index open: {0}")]
+    Open(#[source] QueryError),
+    /// Reading a superfile's dictionary failed; `what` names the read.
+    #[error("term-index {what} failed: {source}")]
+    Read {
+        what: &'static str,
+        source: FtsError,
+    },
     /// A spill file could not be written or read.
     #[error("term-index spill I/O: {0}")]
     Io(#[from] io::Error),
@@ -121,6 +134,15 @@ impl From<StorageError> for TermIndexError {
 }
 
 impl TermIndexError {
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            Self::Storage(e) => e.is_permission_denied(),
+            Self::Open(e) => e.is_permission_denied(),
+            other => permission_denied_in_chain(other),
+        }
+    }
+
     /// Whether this error says the object is gone or unusable — absent,
     /// unparseable, or not the bytes its hash promises — as opposed to a
     /// read that failed and may well succeed next time. A commit that
