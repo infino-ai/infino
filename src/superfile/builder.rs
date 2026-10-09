@@ -152,10 +152,13 @@ const REORDER_MIN_DOCS: usize = 4_096;
 /// 134 GiB at two billion documents.
 const REORDER_FORWARD_INDEX_BUDGET_SHARE: u64 = 10;
 
-/// Fewer slots than this carry too little of a document to group it by, so a
-/// merge that cannot afford this many keeps arrival order rather than paying
-/// for a pass that cannot pay back.
-const REORDER_MIN_TERMS_PER_DOC: usize = 4;
+/// A merge whose memory budget cannot buy this many slots per document keeps
+/// arrival order rather than paying for a pass that cannot pay back.
+///
+/// This floors what the budget *affords*, not what the documents carry.
+/// Documents holding two eligible terms apiece make a narrow forward index,
+/// not a useless one — those two terms are exactly what groups them.
+const REORDER_MIN_AFFORDABLE_TERMS_PER_DOC: usize = 4;
 
 /// Slots per document the bisection is given, or `None` to keep arrival order.
 ///
@@ -176,14 +179,16 @@ fn reorder_terms_per_doc(n_docs: usize, eligible_postings: u64) -> Option<usize>
         / REORDER_FORWARD_INDEX_BUDGET_SHARE;
     let per_doc_bytes = (n_docs as u64).saturating_mul(size_of::<u32>() as u64);
     let affordable = budget_bytes.checked_div(per_doc_bytes).unwrap_or(0) as usize;
+    if affordable < REORDER_MIN_AFFORDABLE_TERMS_PER_DOC {
+        return None;
+    }
 
     // What the documents actually carry, rounded up so a corpus averaging a
     // fraction over a whole number is not truncated down to it.
     let carried = eligible_postings.div_ceil(n_docs.max(1) as u64) as usize;
 
     // `filled` and `worst` index a document's slots in a `u8`.
-    let slots = carried.min(affordable).min(u8::MAX as usize);
-    (slots >= REORDER_MIN_TERMS_PER_DOC).then_some(slots)
+    Some(carried.clamp(1, affordable.min(u8::MAX as usize)))
 }
 
 /// Bits of bucket space the bisection groups terms in. Terms are hashed
@@ -5886,8 +5891,12 @@ mod tests {
     /// documents.
     #[test]
     fn terms_per_document_follows_the_corpus_and_the_budget() {
-        // Term-poor documents get what they carry, not a borrowed constant.
+        // Term-poor documents get what they carry, not a borrowed constant,
+        // and still reorder: the two terms a narrow document has are exactly
+        // the ones that group it.
         assert_eq!(reorder_terms_per_doc(1_000, 5_000), Some(5));
+        assert_eq!(reorder_terms_per_doc(1_000, 2_000), Some(2));
+        assert_eq!(reorder_terms_per_doc(1_000, 1_000), Some(1));
 
         // Term-rich documents are held to what the budget affords; at a few
         // million documents that lands on the width this used to take flat.
@@ -5903,9 +5912,9 @@ mod tests {
             .expect("a thousand term-rich documents can afford to reorder");
         assert!(dense <= u8::MAX as usize);
 
-        // Too little to group by: keep arrival order rather than pay for a
-        // pass that cannot pay back.
-        assert_eq!(reorder_terms_per_doc(1_000, 2_000), None);
+        // Only the budget declines: at two billion documents the forward
+        // index cannot be afforded at any width worth having, so the merge
+        // keeps arrival order rather than pay for a pass that cannot pay back.
         assert_eq!(
             reorder_terms_per_doc(2_000_000_000, 2_000_000_000 * 50),
             None
