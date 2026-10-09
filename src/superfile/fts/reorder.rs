@@ -49,14 +49,61 @@ use rayon::{join, prelude::*};
 /// worth, and the gaps inside a group this small are already short.
 const MIN_PARTITION: usize = 32;
 
+/// Divisor turning the whole-percent convergence into the ratio the
+/// round-gain test compares against.
+const PERCENT: f32 = 100.0;
+
+/// Reorder convergence ratio, in whole percent.
+///
+/// Swept from 0% (every split run to the round ceiling) to 50% on two corpora
+/// of the same document count but very different text — 5.03M documents of
+/// encyclopedia prose at 7.76 GiB, and the same count of web crawl at
+/// 17.70 GiB, so documents average 2.3x longer:
+///
+/// ```text
+///            encyclopedia              web crawl
+///   pct    compact   index vs best   compact   index vs best
+///     0    158.7 s      +0.38%       253.5 s      best
+///     2    144.7 s      +0.40%       245.4 s     +0.033%
+///     5    141.6 s       best        248.2 s     +0.066%
+///    10    139.8 s      +0.44%       235.0 s     +0.138%
+///    20    136.0 s      +1.07%       230.9 s     +0.270%
+///    50    128.3 s      +1.83%       223.7 s     +0.715%
+/// ```
+///
+/// The *shape* depends on the corpus: the first has an interior optimum, where
+/// reordering past it makes the index worse, and the second is monotonic, where
+/// more reordering always helps a little. So there is no ratio that is optimal
+/// everywhere, and nothing here should be read as claiming one.
+///
+/// What does hold on both is that the whole range is narrow — 1.8% and 0.7%
+/// end to end — and this value lands within 0.07% of each corpus's own best
+/// while running faster than doing every round on both. That is the reason it
+/// is a fixed value rather than something calibrated per corpus, and not a
+/// knob: the error from not knowing the text is far smaller than what
+/// measuring it would cost, and a service cannot sweep a customer's data
+/// before indexing it. What does adapt to the corpus is the bar this ratio is
+/// taken against, which is measured from the data on every run.
+///
+/// Index size stands in for layout quality throughout. The reordering exists
+/// for query performance, which is not resolved at this scale.
+const REORDER_CONVERGENCE_PERCENT: u8 = 5;
+
+/// Ceiling on a split's move rounds. Equal to the fixed count the bisection
+/// used before the convergence test existed, so setting
+/// [`REORDER_CONVERGENCE_PERCENT`] to zero reproduces the old behaviour
+/// exactly. A backstop against a corpus whose rounds keep paying, not the
+/// working limit — the convergence test is what normally ends a split.
+const REORDER_MAX_ROUNDS: usize = 20;
+
 /// How hard the bisection works a split, and when it decides a split has
 /// stopped paying.
 ///
-/// Both come from configuration rather than from a constant here, because the
-/// right amount of work depends on how much structure a corpus has. A round
-/// count tuned on one body of text does not carry to another; a
-/// diminishing-returns ratio does, which is why `convergence` is the working
-/// limit and `max_rounds` only a backstop.
+/// A diminishing-returns ratio is the working limit and the round count only a
+/// backstop, because how much work a split is worth depends on how much
+/// structure a corpus has: a round count tuned on one body of text does not
+/// carry to another, a ratio does. The tests override both; nothing else does,
+/// which is why these are constants rather than configuration.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BisectParams {
     /// Stop once a round's realised gain falls below this fraction of that
@@ -111,10 +158,9 @@ impl Bisect<'_> {
 
 impl Default for BisectParams {
     fn default() -> Self {
-        let c = &crate::config::global().compaction;
         Self {
-            convergence: c.reorder_convergence.max(0.0),
-            max_rounds: c.reorder_max_rounds.max(1) as usize,
+            convergence: f32::from(REORDER_CONVERGENCE_PERCENT) / PERCENT,
+            max_rounds: REORDER_MAX_ROUNDS,
         }
     }
 }

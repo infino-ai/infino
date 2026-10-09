@@ -288,9 +288,7 @@ const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFIL
 pub const DEFAULT_STALE_SEAL_TIMEOUT_MS: u64 = 2 * 60 * 1000;
 
 /// Compaction settings: target size, fill floor, and memory budget.
-// Not `Eq`: `reorder_convergence` is a ratio, and the vector settings already
-// carry floats for the same reason.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CompactionSettings {
     /// Target size of a compacted superfile, in MiB.
@@ -318,25 +316,6 @@ pub struct CompactionSettings {
     /// not govern how many merges run at once: the runner admits them against
     /// the host's free memory.
     pub max_memory_mb: u64,
-    /// Stop a split's document-reordering move loop once a round improves the
-    /// layout, per document, by less than this fraction of what the corpus
-    /// showed was available — the gain per document of the first split's first
-    /// round.
-    ///
-    /// A ratio rather than a round count on purpose: how many rounds are worth
-    /// running depends on how much structure a corpus has, so a count tuned on
-    /// one body of text does not transfer, while "keep going until the returns
-    /// have fallen off by this much" does. Measuring per document against one
-    /// bar for the whole run, rather than against each split's own first
-    /// round, is what keeps rounds going to the splits where they buy the most
-    /// — a large partition banks most of its gain in round one, so a bar set
-    /// by that round cuts it off while cheap deep splits keep running.
-    /// `0.0` disables the test and runs every split to `reorder_max_rounds`.
-    pub reorder_convergence: f32,
-    /// Hard ceiling on a split's move rounds, whatever the convergence test
-    /// says. A backstop against a corpus whose rounds keep paying, not the
-    /// working limit — `reorder_convergence` is what normally ends a split.
-    pub reorder_max_rounds: u32,
     /// How many of a pass's merge jobs may be in flight at once.
     ///
     /// `None` (the default) derives the ceiling from the maintenance pool and
@@ -359,52 +338,11 @@ impl Default for CompactionSettings {
             min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
             min_superfiles_for_merge: DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE,
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
-            reorder_convergence: DEFAULT_REORDER_CONVERGENCE,
-            reorder_max_rounds: DEFAULT_REORDER_MAX_ROUNDS,
             max_concurrent_jobs: None,
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
         }
     }
 }
-
-/// Default reorder convergence ratio.
-///
-/// Swept from 0.0 (every split run to the round ceiling) to 0.5 on two corpora
-/// of the same document count but very different text — 5.03M documents of
-/// encyclopedia prose at 7.76 GiB, and the same count of web crawl at
-/// 17.70 GiB, so documents average 2.3x longer:
-///
-/// ```text
-///            encyclopedia              web crawl
-///   tau    compact   index vs best   compact   index vs best
-///   0.00   158.7 s      +0.38%       253.5 s      best
-///   0.02   144.7 s      +0.40%       245.4 s     +0.033%
-///   0.05   141.6 s       best        248.2 s     +0.066%
-///   0.10   139.8 s      +0.44%       235.0 s     +0.138%
-///   0.20   136.0 s      +1.07%       230.9 s     +0.270%
-///   0.50   128.3 s      +1.83%       223.7 s     +0.715%
-/// ```
-///
-/// The *shape* depends on the corpus: the first has an interior optimum, where
-/// reordering past it makes the index worse, and the second is monotonic, where
-/// more reordering always helps a little. So there is no ratio that is optimal
-/// everywhere, and nothing here should be read as claiming one.
-///
-/// What does hold on both is that the whole range is narrow — 1.8% and 0.7%
-/// end to end — and this value lands within 0.07% of each corpus's own best
-/// while running faster than doing every round on both. That is the reason it
-/// is a fixed default rather than something calibrated per corpus: the error
-/// from not knowing the text is far smaller than what measuring it would cost,
-/// and a service cannot sweep a customer's data before indexing it.
-///
-/// Index size stands in for layout quality throughout. The reordering exists
-/// for query performance, which is not resolved at this scale.
-const DEFAULT_REORDER_CONVERGENCE: f32 = 0.05;
-
-/// Default ceiling on a split's move rounds. Equal to the fixed count the
-/// bisection used before the convergence test existed, so a deployment that
-/// sets `reorder_convergence: 0.0` reproduces the old behaviour exactly.
-const DEFAULT_REORDER_MAX_ROUNDS: u32 = 20;
 
 /// Minimum age an unreferenced object must reach before [`crate::Supertable::optimize`] deletes it.
 pub const DEFAULT_GC_SAFETY_GAP: Duration = Duration::from_secs(86_400);
