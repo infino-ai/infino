@@ -58,22 +58,24 @@ impl SuperfileStats {
     }
 
     pub fn from_children(stats: &[Self]) -> Self {
-        let mut n_docs: u64 = 0;
-        let mut id_min = i128::MAX;
-        let mut id_max = i128::MIN;
-        let mut scalar_stats: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
+        let mut total = Self {
+            n_docs: 0,
+            id_min: i128::MAX,
+            id_max: i128::MIN,
+            scalar_stats: HashMap::new(),
+        };
         for stat in stats {
-            n_docs += stat.n_docs;
-            id_min = id_min.min(stat.id_min);
-            id_max = id_max.max(stat.id_max);
-            ScalarStatsAgg::merge(&mut scalar_stats, &stat.scalar_stats);
+            total.merge(stat);
         }
-        Self {
-            n_docs,
-            id_min,
-            id_max,
-            scalar_stats,
-        }
+        total
+    }
+
+    /// Fold `other` into these stats, as if both covered one set of rows.
+    pub fn merge(&mut self, other: &Self) {
+        self.n_docs += other.n_docs;
+        self.id_min = self.id_min.min(other.id_min);
+        self.id_max = self.id_max.max(other.id_max);
+        ScalarStatsAgg::merge(&mut self.scalar_stats, &other.scalar_stats);
     }
 }
 

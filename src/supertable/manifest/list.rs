@@ -995,6 +995,8 @@ impl ScalarStatsAgg {
     /// this signals corruption or a logic bug; the caller decides how to
     /// degrade (see [`ScalarStatsAgg::merge_tables`]).
     pub fn merge_with(&mut self, other: &ScalarStatsAgg) -> Result<(), ScalarStatsMergeError> {
+        // Read before the bounds below are overwritten.
+        let (self_has_values, other_has_values) = (self.has_values(), other.has_values());
         // Resolve the bounds first; bail before mutating anything so a failed
         // merge can't leave half-updated, internally-inconsistent stats.
         let Some((min, max)) = merge_min_max_arrays(&self.min, &other.min, &self.max, &other.max)
@@ -1024,11 +1026,21 @@ impl ScalarStatsAgg {
             },
             _ => None,
         };
+        // A side with no non-null values has no counts to give, and adds
+        // nothing to the other side's.
         self.value_counts = match (&self.value_counts, &other.value_counts) {
             (Some(left), Some(right)) => left.merged_with(right),
+            (counts, None) if !other_has_values => counts.clone(),
+            (None, counts) if !self_has_values => counts.clone(),
             _ => None,
         };
         Ok(())
+    }
+
+    /// Whether the column holds any non-null value: min/max are null only
+    /// when it holds none.
+    fn has_values(&self) -> bool {
+        self.min.null_count() < self.min.len()
     }
 
     /// Merge two per-column scalar-stats tables
@@ -2384,6 +2396,36 @@ mod tests {
         assert!(a.null_count.is_none());
         assert!(a.hll.is_none());
         assert!(a.value_counts.is_none());
+    }
+
+    /// A side with no non-null values (an all-null batch of the column)
+    /// adds nothing to exact value counts, so merging it keeps them.
+    #[test]
+    fn scalar_agg_merge_keeps_value_counts_across_an_all_null_side() {
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["rust", "go", "rust"]));
+        let nulls: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>, None]));
+        let counted = ScalarStatsAgg::from_column(&values).expect("utf8 stats");
+        let all_null = ScalarStatsAgg::from_column(&nulls).expect("utf8 stats");
+        assert!(all_null.value_counts.is_none());
+        let want = [
+            (ScalarValue::Utf8(Some("go".into())), 1),
+            (ScalarValue::Utf8(Some("rust".into())), 2),
+        ];
+        for (mut left, right) in [
+            (counted.clone(), all_null.clone()),
+            (all_null.clone(), counted.clone()),
+        ] {
+            left.merge_with(&right).expect("same type merges");
+            assert_eq!(
+                left.value_counts.expect("counts kept").entries(),
+                &want,
+                "an all-null side adds nothing"
+            );
+            assert_eq!(left.null_count, Some(2));
+        }
+        let mut both = all_null.clone();
+        both.merge_with(&all_null).expect("same type merges");
+        assert!(both.value_counts.is_none(), "no values on either side");
     }
 
     #[test]

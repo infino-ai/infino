@@ -41,8 +41,8 @@ use parquet::{
     arrow::{
         ProjectionMask,
         arrow_reader::{
-            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
-            RowSelector,
+            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+            ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
         },
         async_reader::MetadataFetch,
         parquet_to_arrow_schema,
@@ -860,11 +860,32 @@ impl SuperfileReader {
         self.bytes = Some(bytes);
         Ok(())
     }
-    /// Returns a record batch containing all documents with all columns
+    /// Returns a record batch containing all documents with all columns.
+    /// Test-only: joining the batches overflows a `Utf8` column past 2 GiB,
+    /// so production code reads with `record_batches`.
+    #[cfg(test)]
     pub fn get_record_batch(
         &self,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<RecordBatch, ReadError> {
+        let reader = self.record_batches(deleted_docs_bitmap)?;
+        let read_schema = reader.schema();
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        let record_batch = concat_batches(&read_schema, &batches)
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+
+        Ok(record_batch)
+    }
+
+    /// All documents (minus `deleted_docs_bitmap`) with all columns, one
+    /// decoded batch at a time. The batches are never joined, so a string column past 2 GiB, more than
+    /// one `Utf8` array's 32-bit offsets can hold, still reads.
+    pub(crate) fn record_batches(
+        &self,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+    ) -> Result<ParquetRecordBatchReader, ReadError> {
         let bytes = self
             .bytes
             .as_ref()
@@ -894,17 +915,9 @@ impl SuperfileReader {
                 builder = builder.with_row_selection(selection);
             }
         }
-        let reader = builder
+        builder
             .build()
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
-        let read_schema = reader.schema();
-        let batches = reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
-        let record_batch = concat_batches(&read_schema, &batches)
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
-
-        Ok(record_batch)
+            .map_err(|e| ReadError::Columnar(e.to_string()))
     }
 
     /// A [`LazyByteSource`] over the **entire** superfile, regardless of
