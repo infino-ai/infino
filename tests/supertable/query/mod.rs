@@ -14,6 +14,7 @@ mod op_stats;
 mod phrase_prune;
 mod query_errors;
 mod query_surface;
+mod ranking_under_mutation;
 pub mod skip_pruning;
 mod stats_fold;
 mod stored_fields;
