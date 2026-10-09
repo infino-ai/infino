@@ -367,36 +367,39 @@ impl Default for CompactionSettings {
     }
 }
 
-/// Default reorder convergence ratio: the measured optimum for a 5M-document
-/// body of English text, not a point chosen on a trade-off.
+/// Default reorder convergence ratio.
 ///
-/// Swept over 0.0 (every split run to the ceiling) through 0.5, the index size
-/// is **not** monotonic in how much reordering is done — it bottoms out here
-/// and rises on both sides, reproducibly to a few kilobytes in 2.7 GB:
+/// Swept from 0.0 (every split run to the round ceiling) to 0.5 on two corpora
+/// of the same document count but very different text — 5.03M documents of
+/// encyclopedia prose at 7.76 GiB, and the same count of web crawl at
+/// 17.70 GiB, so documents average 2.3x longer:
 ///
 /// ```text
-///   tau    compaction   index
-///   0.50     128.3 s    2,752,781,451   +1.83%
-///   0.20     136.0 s    2,732,369,150   +1.07%
-///   0.10     139.8 s    2,715,302,199   +0.44%
-///   0.05     141.6 s    2,703,377,724      --
-///   0.02     144.7 s    2,714,226,695   +0.40%
-///   0.00     158.7 s    2,713,601,158   +0.38%
+///            encyclopedia              web crawl
+///   tau    compact   index vs best   compact   index vs best
+///   0.00   158.7 s      +0.38%       253.5 s      best
+///   0.02   144.7 s      +0.40%       245.4 s     +0.033%
+///   0.05   141.6 s       best        248.2 s     +0.066%
+///   0.10   139.8 s      +0.44%       235.0 s     +0.138%
+///   0.20   136.0 s      +1.07%       230.9 s     +0.270%
+///   0.50   128.3 s      +1.83%       223.7 s     +0.715%
 /// ```
 ///
-/// So this value is 11% faster than running every round *and* lands a smaller
-/// index: past it, more rounds buy a worse layout. The bisection minimises a
-/// windowed term-cost proxy rather than compressed size, and past a point
-/// driving the proxy down diverges from the thing it stands for.
+/// The *shape* depends on the corpus: the first has an interior optimum, where
+/// reordering past it makes the index worse, and the second is monotonic, where
+/// more reordering always helps a little. So there is no ratio that is optimal
+/// everywhere, and nothing here should be read as claiming one.
 ///
-/// The optimum is a property of the corpus, so a deployment on very different
-/// text should recalibrate rather than inherit this: build at several values
-/// and take the index-size minimum. Everything either side of the minimum is
-/// worse on both axes, which makes the sweep cheap to read.
+/// What does hold on both is that the whole range is narrow — 1.8% and 0.7%
+/// end to end — and this value lands within 0.07% of each corpus's own best
+/// while running faster than doing every round on both. That is the reason it
+/// is a fixed default rather than something calibrated per corpus: the error
+/// from not knowing the text is far smaller than what measuring it would cost,
+/// and a service cannot sweep a customer's data before indexing it.
 ///
-/// Index size is the proxy for layout quality used here. What the reordering
-/// is ultimately for is query performance, and that has not been resolved at
-/// this scale.
+/// Index size stands in for layout quality throughout. The reordering exists
+/// for query performance, which is not resolved at this scale.
+
 const DEFAULT_REORDER_CONVERGENCE: f32 = 0.05;
 
 /// Default ceiling on a split's move rounds. Equal to the fixed count the
