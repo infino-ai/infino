@@ -49,26 +49,22 @@ use rayon::{join, prelude::*};
 /// worth, and the gaps inside a group this small are already short.
 const MIN_PARTITION: usize = 32;
 
-/// Divisor turning the whole-percent convergence into the ratio the
-/// round-gain test compares against.
-const PERCENT: f32 = 100.0;
-
-/// Reorder convergence ratio, in whole percent.
+/// Reorder convergence ratio.
 ///
-/// Swept from 0% (every split run to the round ceiling) to 50% on two corpora
+/// Swept from 0.0 (every split run to the round ceiling) to 0.5 on two corpora
 /// of the same document count but very different text — 5.03M documents of
 /// encyclopedia prose at 7.76 GiB, and the same count of web crawl at
 /// 17.70 GiB, so documents average 2.3x longer:
 ///
 /// ```text
 ///            encyclopedia              web crawl
-///   pct    compact   index vs best   compact   index vs best
-///     0    158.7 s      +0.38%       253.5 s      best
-///     2    144.7 s      +0.40%       245.4 s     +0.033%
-///     5    141.6 s       best        248.2 s     +0.066%
-///    10    139.8 s      +0.44%       235.0 s     +0.138%
-///    20    136.0 s      +1.07%       230.9 s     +0.270%
-///    50    128.3 s      +1.83%       223.7 s     +0.715%
+///   ratio  compact   index vs best   compact   index vs best
+///   0.00   158.7 s      +0.38%       253.5 s      best
+///   0.02   144.7 s      +0.40%       245.4 s     +0.033%
+///   0.05   141.6 s       best        248.2 s     +0.066%
+///   0.10   139.8 s      +0.44%       235.0 s     +0.138%
+///   0.20   136.0 s      +1.07%       230.9 s     +0.270%
+///   0.50   128.3 s      +1.83%       223.7 s     +0.715%
 /// ```
 ///
 /// The *shape* depends on the corpus: the first has an interior optimum, where
@@ -87,13 +83,13 @@ const PERCENT: f32 = 100.0;
 ///
 /// Index size stands in for layout quality throughout. The reordering exists
 /// for query performance, which is not resolved at this scale.
-const REORDER_CONVERGENCE_PERCENT: u8 = 5;
+const REORDER_CONVERGENCE: f32 = 0.05;
 
 /// Ceiling on a split's move rounds. Equal to the fixed count the bisection
-/// used before the convergence test existed, so setting
-/// [`REORDER_CONVERGENCE_PERCENT`] to zero reproduces the old behaviour
-/// exactly. A backstop against a corpus whose rounds keep paying, not the
-/// working limit — the convergence test is what normally ends a split.
+/// used before the convergence test existed, so setting [`REORDER_CONVERGENCE`]
+/// to zero reproduces the old behaviour exactly. A backstop against a corpus
+/// whose rounds keep paying, not the working limit — the convergence test is
+/// what normally ends a split.
 const REORDER_MAX_ROUNDS: usize = 20;
 
 /// How hard the bisection works a split, and when it decides a split has
@@ -159,7 +155,7 @@ impl Bisect<'_> {
 impl Default for BisectParams {
     fn default() -> Self {
         Self {
-            convergence: f32::from(REORDER_CONVERGENCE_PERCENT) / PERCENT,
+            convergence: REORDER_CONVERGENCE,
             max_rounds: REORDER_MAX_ROUNDS,
         }
     }
