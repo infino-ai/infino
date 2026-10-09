@@ -5002,9 +5002,15 @@ mod tests {
         }
     }
 
+    /// How long compaction's background warm of its output may take to land
+    /// in the disk cache before the test counts it as never warmed.
+    const WARM_LANDS_WITHIN: Duration = Duration::from_secs(30);
+    /// How often the test looks for that warm to have landed.
+    const WARM_POLL: Duration = Duration::from_millis(10);
+
     /// Same as the in-memory case, but for a disk-cache-attached table:
-    /// the merged superfile should already be resident in the disk
-    /// cache right after compact, with no cold fetch needed.
+    /// the merged superfile is resident in the disk cache once
+    /// compaction's own warm lands, with no cold fetch needed.
     #[tokio::test(flavor = "multi_thread")]
     async fn compact_warms_merged_superfile_into_disk_cache() {
         use crate::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy};
@@ -5044,11 +5050,25 @@ mod tests {
             .await
             .expect("compact");
 
+        // The warm is spawned after the commit and waits on a process-wide
+        // pair of permits (`finalize_compaction_commit`), so it can land
+        // after `compact_async` returns. Wait for it: queried at once, the
+        // test raced the warm, and with the lib tests in one process other
+        // tests' warms held the permits and the query won.
+        let merged_uri = st.reader().expect("reader").manifest().superfiles[0].uri;
+        let deadline = Instant::now() + WARM_LANDS_WITHIN;
+        while !cache.is_cached(&merged_uri) {
+            assert!(
+                Instant::now() < deadline,
+                "compaction's warm of the merged superfile never landed in the disk cache"
+            );
+            time::sleep(WARM_POLL).await;
+        }
+
         let cold_fetches_after_compact = cache.stats().n_cold_fetches;
 
         // A query against the merged file must not trigger a cold
-        // fetch -- it should already be resident from compaction's
-        // own warm-up.
+        // fetch -- it is resident from compaction's own warm-up.
         let n: usize = st
             .token_match("title", "alpha", BoolMode::And, None)
             .expect("token_match")
