@@ -5882,11 +5882,6 @@ mod tests {
         }
     }
 
-    /// One document of the reordering corpus: drawn from a few
-    /// vocabularies and interleaved, so no input is a single topic and
-    /// arrival order groups nothing. The pair "t0 t1" recurs, giving a
-    /// phrase to look for that is not simply every document carrying
-    /// both words.
     /// The forward index is bounded from two directions, and a merge that
     /// cannot afford a useful width declines instead of allocating anyway.
     /// The old fixed sixteen slots asked for `16 * 4 * n_docs` bytes with
@@ -5924,6 +5919,11 @@ mod tests {
         );
     }
 
+    /// One document of the reordering corpus: drawn from a few
+    /// vocabularies and interleaved, so no input is a single topic and
+    /// arrival order groups nothing. The pair "t0 t1" recurs, giving a
+    /// phrase to look for that is not simply every document carrying
+    /// both words.
     fn reorder_corpus_title(id: u64) -> String {
         let topic = (id % 4) as u32;
         let base = topic * 40;
