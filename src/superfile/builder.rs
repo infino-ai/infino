@@ -88,7 +88,7 @@ use tempfile::NamedTempFile;
 
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::{
-    config::scratch_root,
+    config::{global, scratch_root},
     superfile::{
         BuildError, FtsError, ReadError, SuperfileReader,
         format::{
@@ -142,6 +142,9 @@ use crate::{
 /// corpus this small has short gaps already and nothing to regroup.
 const REORDER_MIN_DOCS: usize = 4_096;
 
+/// Bytes in a mebibyte, for the merge memory budget the config states in MiB.
+const BYTES_PER_MIB: u64 = 1 << 20;
+
 /// Share of a merge's memory budget the bisection's forward index may take.
 ///
 /// Sized so a few-million-document merge lands near the sixteen slots a
@@ -172,10 +175,10 @@ const REORDER_MIN_AFFORDABLE_TERMS_PER_DOC: usize = 4;
 /// The terms kept are the most selective a document has, which is where the
 /// grouping signal is.
 fn reorder_terms_per_doc(n_docs: usize, eligible_postings: u64) -> Option<usize> {
-    let budget_bytes = crate::config::global()
+    let budget_bytes = global()
         .compaction
         .max_memory_mb
-        .saturating_mul(1 << 20)
+        .saturating_mul(BYTES_PER_MIB)
         / REORDER_FORWARD_INDEX_BUDGET_SHARE;
     let per_doc_bytes = (n_docs as u64).saturating_mul(size_of::<u32>() as u64);
     let affordable = budget_bytes.checked_div(per_doc_bytes).unwrap_or(0) as usize;
@@ -1996,7 +1999,7 @@ impl SuperfileBuilder {
             // [optmerge] per-phase split: cells taking the cheap byte-splice
             // (I/O + memcpy) vs the full decode/re-cluster/re-encode rebuild, and
             // the wall in each. Gated, off by default.
-            let __merge_timers = crate::config::global().diagnostics.optimize_phase_timers;
+            let __merge_timers = global().diagnostics.optimize_phase_timers;
             let mut __splice_cells = 0usize;
             let mut __rebuild_cells = 0usize;
             let mut __splice_ns: u128 = 0;
