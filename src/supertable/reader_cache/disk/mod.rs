@@ -5,6 +5,8 @@
 //! eviction. Split across sibling files: `read` (open a superfile), `fetch` (cold-fetch it in), `budget`
 //! (reserve and evict), `store_files` (the on-disk directory), and `sources` (mmap).
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::HashSet,
     fmt, fs,
@@ -337,6 +339,15 @@ pub struct DiskCacheStore {
     unindexed: DashMap<SuperfileUri, UnindexedFile>,
     block_files: DashMap<SuperfileUri, UnindexedFile>,
     current_bytes: AtomicU64,
+    /// Bytes of fetched runs handed to the block-file writer and not written yet. Capped by
+    /// [`Self::try_admit_write_behind`], so a slow disk limits memory, not queries.
+    write_behind_bytes: AtomicU64,
+    /// Queued block-file writes not finished yet (index write included), and a wake-up when it
+    /// reaches zero; see [`Self::block_writes_settled`].
+    #[cfg(test)]
+    block_writes: AtomicUsize,
+    #[cfg(test)]
+    block_writes_idle: Notify,
     /// Live disk budget in bytes, seeded from `config.disk_budget_bytes`.
     /// An engine-managed (auto-sized) budget is raised — never lowered —
     /// by [`Self::reconcile_budget_floor`] as the table's on-storage
@@ -400,6 +411,9 @@ mod read;
 mod sources;
 mod store_files;
 
+#[cfg(test)]
+pub(crate) use budget::BlockWriteTicket;
+pub(crate) use budget::Reservation;
 pub(crate) use fetch::skip_background_fill;
 pub(crate) use sources::{ArcMmapOwner, mmap_readonly_bytes};
 
@@ -435,6 +449,11 @@ impl DiskCacheStore {
             unindexed: DashMap::new(),
             block_files: DashMap::new(),
             current_bytes: AtomicU64::new(0),
+            write_behind_bytes: AtomicU64::new(0),
+            #[cfg(test)]
+            block_writes: AtomicUsize::new(0),
+            #[cfg(test)]
+            block_writes_idle: Notify::new(),
             budget_bytes: AtomicU64::new(configured_budget),
             budget_auto_sized: AtomicBool::new(false),
             budget_warned: AtomicBool::new(false),
