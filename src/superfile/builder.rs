@@ -153,17 +153,19 @@ const BYTES_PER_MIB: u64 = 1 << 20;
 /// 134 GiB at two billion documents.
 const REORDER_FORWARD_INDEX_BUDGET_SHARE: u64 = 10;
 
-/// Width a merge gives each document once it is too large to reorder in one
-/// pass.
+/// Slots per document the bisection is given.
 ///
-/// This is what a few-million-document merge affords at the default budget,
-/// and the width the reordering was measured at.
-const REORDER_CHUNK_TERMS_PER_DOC: usize = 16;
-
-/// Narrowest a single pass over the whole merge is allowed to get. Below this
-/// a document would be grouped by too small a share of what it holds, and the
-/// merge is reordered in runs at a usable width instead.
-const REORDER_MIN_TERMS_PER_DOC: usize = 4;
+/// A fixed width, because it is the width every measurement of this
+/// reordering has been taken at, and nothing shows a wider one paying for
+/// itself. Letting the budget set it instead makes the width grow as the
+/// merge shrinks -- a hundred thousand documents would take 255 slots where
+/// five million take 16 -- so the smallest and most frequent merges would do
+/// the most work per document, which is backwards.
+///
+/// The budget still bounds the forward index. It bounds how many documents
+/// are reordered together, which is [`ReorderPlan::chunk_docs`], rather than
+/// how much of each one is read.
+const REORDER_TERMS_PER_DOC: usize = 16;
 
 /// Bytes the bisection's forward index may take.
 ///
@@ -193,18 +195,18 @@ struct ReorderPlan {
 /// How to reorder this merge, or `None` if there is nothing to group by.
 ///
 /// The forward index has to fit the merge's memory budget, and that is a
-/// bound on `documents * width`. Spending it all on width, as this used to,
-/// makes the width shrink as the merge grows and run out entirely a little
-/// past twenty million documents — which gave up on exactly the merges where
-/// reordering pays most, the long-lived packed bases with the longest posting
-/// lists and the most gaps to shorten.
+/// bound on `documents * width`. Spending it on width makes the width shrink
+/// as the merge grows -- and run out entirely a little past twenty million
+/// documents, which gave up on exactly the merges where reordering pays most,
+/// the long-lived packed bases with the longest posting lists and the most
+/// gaps to shorten.
 ///
-/// So the width holds and the document count gives way instead: a merge too
-/// large to hold at a width worth having is reordered in runs of as many
-/// documents as the budget does hold. Grouping is then confined to each run,
-/// which costs the gaps that a document could have closed against one far
-/// away in the merge, and keeps the ones it closes nearby — where a posting
-/// list's gaps are, and all a block of postings can express anyway.
+/// So the width is fixed and the document count gives way instead: a merge
+/// too large to hold is reordered in runs of as many documents as the budget
+/// does hold. Grouping is then confined to each run, which costs the gaps a
+/// document could have closed against one far away in the merge, and keeps
+/// the ones it closes nearby -- where a posting list's gaps are, and all a
+/// block of postings can express anyway.
 ///
 /// Chunking is near enough free to read: an input's rows land in one stretch
 /// of the output, so a run skips the inputs it does not cover and the
@@ -216,30 +218,15 @@ fn reorder_plan(n_docs: usize, eligible_postings: u64) -> Option<ReorderPlan> {
         return None;
     }
 
+    // A corpus holding less than the full width per document is read in full
+    // by a narrower index, and the slots it would not fill are not worth
+    // reserving: leaving them out is what lets such a merge stay in one run.
+    let terms_per_doc = carried.min(REORDER_TERMS_PER_DOC);
     let budget_slots = reorder_budget_bytes() / size_of::<u32>() as u64;
-
-    // `filled` and `worst` index a document's slots in a `u8`.
-    let affordable = budget_slots
-        .checked_div(n_docs.max(1) as u64)
-        .unwrap_or(0)
-        .min(u8::MAX as u64) as usize;
-
-    // One pass over the whole merge, as long as that leaves a width worth
-    // having. A corpus holding less than the floor per document is served by
-    // what it holds, so it is measured against that rather than the floor.
-    if affordable >= carried.min(REORDER_MIN_TERMS_PER_DOC) {
-        return Some(ReorderPlan {
-            terms_per_doc: affordable,
-            chunk_docs: n_docs,
-        });
-    }
-
-    // Too many documents to hold at any usable width. Keep the width and give
-    // up holding them all at once.
-    let width = carried.min(REORDER_CHUNK_TERMS_PER_DOC);
+    let holds = (budget_slots / terms_per_doc as u64).max(1) as usize;
     Some(ReorderPlan {
-        terms_per_doc: width,
-        chunk_docs: (budget_slots / width as u64).max(1) as usize,
+        terms_per_doc,
+        chunk_docs: holds.min(n_docs),
     })
 }
 
@@ -6110,10 +6097,9 @@ mod tests {
         }
     }
 
-    /// The forward index is bounded by the merge's memory budget. A merge
-    /// that fits spends the bound on width exactly as before; one that does
-    /// not spends it on documents per run instead of giving up, which is what
-    /// used to happen a little past twenty million documents.
+    /// The width is fixed and the budget decides how many documents are
+    /// reordered together, so a merge stays reorderable however large it
+    /// grows and a small one does no more work per document than a large one.
     #[test]
     fn a_merge_too_large_to_hold_is_reordered_in_runs() {
         let rich = 200;
@@ -6121,47 +6107,42 @@ mod tests {
             reorder_plan(docs, docs as u64 * rich)
                 .unwrap_or_else(|| panic!("{docs} documents still reorder"))
         };
+        let budget =
+            global().compaction.max_memory_mb * (1 << 20) / REORDER_FORWARD_INDEX_BUDGET_SHARE;
 
-        // Every size that reordered in one pass before still does, at the same
-        // width, including the size the reordering was measured at.
-        for (docs, want) in [(5_000_000usize, 16usize), (10_000_000, 8), (20_100_000, 4)] {
+        // Everything a production merge is actually made of reorders whole, at
+        // the one width this has ever been measured at. A merge a twentieth
+        // the size of another reads just as much of each document.
+        for docs in [89_034usize, 185_000, 355_000, 2_170_000, 5_000_000] {
             let p = plan(docs);
             assert_eq!(
                 (p.terms_per_doc, p.chunk_docs),
-                (want, docs),
-                "{docs} documents should still reorder whole at width {want}"
+                (REORDER_TERMS_PER_DOC, docs),
+                "{docs} documents should reorder whole at the fixed width"
             );
         }
 
-        // Past that the merge is reordered in runs at a usable width, where it
-        // used to keep arrival order however much reordering would have paid.
-        for docs in [20_200_000usize, 100_000_000, 2_000_000_000] {
+        // Past what the budget holds, the width stays and the runs get
+        // shorter, where this used to narrow the width until it gave up on
+        // reordering altogether.
+        for docs in [25_160_520usize, 100_000_000, 2_000_000_000] {
             let p = plan(docs);
             assert_eq!(
-                p.terms_per_doc, REORDER_CHUNK_TERMS_PER_DOC,
+                p.terms_per_doc, REORDER_TERMS_PER_DOC,
                 "{docs}: a chunked merge keeps the width"
             );
-            assert!(
-                p.chunk_docs < docs && p.chunk_docs >= 1_000_000,
-                "{docs}: runs of {}",
-                p.chunk_docs
-            );
-            let budget =
-                global().compaction.max_memory_mb * (1 << 20) / REORDER_FORWARD_INDEX_BUDGET_SHARE;
+            assert!(p.chunk_docs < docs, "{docs}: expected runs");
             let wants = p.chunk_docs as u64 * p.terms_per_doc as u64 * 4;
             assert!(wants <= budget, "{docs}: a run wants {wants} of {budget}");
         }
 
-        // Term-poor documents are served by what they hold, so a merge is
-        // neither chunked nor declined for affording less than the floor when
-        // the floor is more than its documents have.
+        // Documents holding less than the width are read in full by a
+        // narrower index, and not reserving the slots they cannot fill is
+        // what keeps such a merge in one run.
         let poor = reorder_plan(30_000_000, 30_000_000 * 2).expect("two terms apiece still group");
         assert_eq!((poor.terms_per_doc, poor.chunk_docs), (2, 30_000_000));
 
-        // A small merge may use the slack, capped by the u8 slot index.
-        assert_eq!(plan(1_000).terms_per_doc, u8::MAX as usize);
-
-        // Nothing eligible is the one case left with nothing to group by.
+        // Nothing eligible is the one case with nothing to group by.
         assert!(reorder_plan(1_000, 0).is_none());
     }
 
