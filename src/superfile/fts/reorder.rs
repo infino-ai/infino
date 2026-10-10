@@ -801,6 +801,35 @@ mod tests {
         (ForwardIndex::from_docs(&docs), cluster_of)
     }
 
+    /// The same clustered corpus, but with term ids scattered through the
+    /// bucket space a merge hashes its terms into instead of packed into a
+    /// dense range.
+    ///
+    /// This is the shape the bisection is handed in production, and the one
+    /// that makes renumbering pay at the top of the recursion rather than deep
+    /// inside it: the degree tables are sized by the bucket space, which a
+    /// corpus's own postings come nowhere near filling. A dense-id corpus
+    /// cannot reach that path at all, because a partition large enough for the
+    /// parallel splitter to still own it carries far more postings than such a
+    /// vocabulary has terms.
+    fn scattered_into_buckets(
+        n_docs: usize,
+        n_clusters: usize,
+        seed: u64,
+    ) -> (ForwardIndex, Vec<usize>) {
+        // Collisions merely merge two terms, and the oracle is handed the same
+        // index, so the comparison stays honest either way.
+        let bucket = |id: u32| -> u32 {
+            let h = u64::from(id).wrapping_mul(TERM_BUCKET_MIX);
+            (((h >> 32) as u32) ^ (h as u32)) & (TERM_BUCKETS - 1)
+        };
+        let (dense, cluster_of) = clustered(n_docs, n_clusters, seed);
+        let docs: Vec<Vec<u32>> = (0..dense.len() as u32)
+            .map(|d| dense.doc(d).iter().map(|&t| bucket(t)).collect())
+            .collect();
+        (ForwardIndex::from_docs(&docs), cluster_of)
+    }
+
     #[test]
     fn the_order_is_always_a_permutation() {
         for (n, clusters) in [
@@ -910,6 +939,13 @@ mod tests {
             );
         }
     }
+
+    /// Bucket space the merge hashes terms into, mirrored here so a test
+    /// corpus has the sparse vocabulary a real one does.
+    const TERM_BUCKETS: u32 = 1 << 22;
+
+    /// Odd multiplier spreading term ids over [`TERM_BUCKETS`].
+    const TERM_BUCKET_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
     /// The round ceiling the bisection used before the convergence test, so
     /// the oracle stays the algorithm the optimizations are measured against.
@@ -1100,6 +1136,24 @@ mod tests {
             cost(&eager),
             cost(&arrival)
         );
+    }
+
+    /// Renumbering at the top of the recursion, where the parallel splitter
+    /// still owns the partition, keeps the order the plain bisection produces.
+    ///
+    /// The dense-id cases cannot reach this: renumbering only fires for them
+    /// once the recursion has cut partitions down to a few dozen documents, by
+    /// which point the serial splitter has long since taken over.
+    #[test]
+    fn a_scattered_vocabulary_renumbers_at_the_top_and_keeps_the_order() {
+        let (fwd, _) = scattered_into_buckets(3 * PARALLEL_MIN_PARTITION, 11, 5);
+        let whole: Vec<u32> = (0..fwd.len() as u32).collect();
+        assert!(
+            localizing_pays(&fwd, &whole),
+            "this corpus no longer renumbers at the root, so it has stopped \
+             covering the path it exists for"
+        );
+        assert_eq!(bisect_order(&fwd, exhaustive()), reference_order(&fwd));
     }
 
     #[test]
