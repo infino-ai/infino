@@ -5,14 +5,9 @@
 //! contain it, with the term's `df` in each, an upper bound on the score it
 //! can reach there, and where its postings sit in that superfile.
 //!
-//! One artifact answers three questions the manifest used to answer with
-//! three structures — *which superfiles hold this term* (the per-part and
-//! per-entry term blooms), *how often it occurs table-wide* (the term-stats
-//! sidecar's `df` sums), and *where its postings are* (the dictionary
-//! inlined into every manifest entry's open blob). Both blooms saturate on
-//! a large table and prune nothing; the inlined dictionary was most of a
-//! decoded manifest's bytes. This index replaces all three with something
-//! that is looked into, not loaded.
+//! One artifact answers three questions — *which superfiles hold this term*,
+//! *how often it occurs table-wide*, and *where its postings are* — and is
+//! looked into, not loaded.
 //!
 //! **Shape.** A small *root* stays resident: the covered superfiles (postings
 //! name them by ordinal) and, per segment, the key range and content hash of
@@ -26,10 +21,9 @@
 //!
 //! **Validity.** A posting is followed only if its superfile is live in the
 //! current manifest; postings for removed superfiles are simply ignored. So
-//! a removal never invalidates the artifact — unlike the term-stats sidecar,
-//! whose *sums* could not be attributed back to a departed superfile — and
-//! the reference carries forward across every commit. A superfile with no
-//! postings in any segment is uncovered and is probed directly.
+//! a removal never invalidates the artifact, and the reference carries
+//! forward across every commit. A superfile with no postings in any segment
+//! is uncovered and is probed directly.
 //!
 //! **Content addressing.** Root and slices are named by the blake3 of their
 //! bytes (`term-index/root-<hash>.bin`, `term-index/slice-<hash>.bin`), so a
@@ -55,9 +49,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    storage::{StorageError, StorageProvider},
-    superfile::fts::{bm25::idf as bm25_idf, reader::BoolMode},
+    storage::{StorageError, StorageProvider, permission_denied_in_chain},
+    superfile::{
+        FtsError,
+        fts::{bm25::idf as bm25_idf, reader::BoolMode},
+    },
     supertable::{
+        error::QueryError,
         manifest::{
             ManifestSnapshot, RoutingRef, SuperfileEntry, disk_cache::ManifestDiskCache,
             part::ContentHash,
@@ -68,7 +66,7 @@ use crate::{
 };
 
 /// Object-store directory prefix for term-index objects, sibling to the
-/// superfile data, manifest-parts and term-stats prefixes.
+/// superfile data and manifest-parts prefixes.
 pub(crate) const STORAGE_PREFIX: &str = "term-index/";
 
 /// Bytes of fetched slices kept resident per loaded index, least recently
@@ -115,6 +113,15 @@ pub(crate) enum TermIndexError {
     /// The build's inputs were inconsistent.
     #[error("term-index build error: {0}")]
     Build(String),
+    /// Opening a superfile to read its terms failed.
+    #[error("term-index open: {0}")]
+    Open(#[source] QueryError),
+    /// Reading a superfile's dictionary failed; `what` names the read.
+    #[error("term-index {what} failed: {source}")]
+    Read {
+        what: &'static str,
+        source: FtsError,
+    },
     /// A spill file could not be written or read.
     #[error("term-index spill I/O: {0}")]
     Io(#[from] io::Error),
@@ -127,6 +134,15 @@ impl From<StorageError> for TermIndexError {
 }
 
 impl TermIndexError {
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            Self::Storage(e) => e.is_permission_denied(),
+            Self::Open(e) => e.is_permission_denied(),
+            other => permission_denied_in_chain(other),
+        }
+    }
+
     /// Whether this error says the object is gone or unusable — absent,
     /// unparseable, or not the bytes its hash promises — as opposed to a
     /// read that failed and may well succeed next time. A commit that
@@ -811,7 +827,7 @@ mod tests {
             fault_storage::{FaultOp, FaultStorage},
             fid, old_format_fts_fixture, open_old_format_fts_fixture,
         },
-        utils::terms::FstValue,
+        utils::terms::DictEntry,
     };
 
     fn contribution(dir: &TempDir, id: u128, terms: &[(&str, &str, u64)]) -> Contribution {
@@ -1167,7 +1183,7 @@ mod tests {
     }
 
     /// Optimize options that merge nothing: the maintenance passes alone.
-    fn stats_only_options() -> OptimizeOptions {
+    fn maintenance_only_options() -> OptimizeOptions {
         OptimizeOptions::compact(CompactionSettings {
             min_fill_percent: 100,
             min_superfiles_for_merge: u64::MAX,
@@ -1176,8 +1192,8 @@ mod tests {
     }
 
     /// Compaction-free optimize: the maintenance passes alone.
-    fn stats_only_optimize(st: &crate::supertable::Supertable) {
-        st.optimize(&stats_only_options()).expect("optimize");
+    fn maintenance_only_optimize(st: &crate::supertable::Supertable) {
+        st.optimize(&maintenance_only_options()).expect("optimize");
     }
 
     /// The live superfile ids and the root's covered set, for comparison.
@@ -1237,7 +1253,7 @@ mod tests {
             st.reader().expect("reader").n_superfiles() >= SEGMENTS,
             "fixture must stay fragmented"
         );
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         (dir, storage, st, alpha_per_segment)
     }
 
@@ -1302,7 +1318,7 @@ mod tests {
             v.sort_unstable();
             v
         };
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
         assert_eq!(root.segments.len(), 1, "optimize rebuilds one base segment");
         assert_eq!(
@@ -1597,7 +1613,7 @@ mod tests {
         use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
         use datafusion::prelude::{col, lit};
 
-        use crate::{Bm25SearchOptions, superfile::fts::reader::Bm25Stats, supertable::Supertable};
+        use crate::{Bm25SearchOptions, supertable::Supertable};
 
         let (_dir, storage, st) = table_with(|o| {
             o.with_eager_load_threshold(0)
@@ -1646,7 +1662,7 @@ mod tests {
                 "title",
                 "zeta",
                 10,
-                Bm25SearchOptions::new().with_stats(Bm25Stats::PerSuperfile),
+                Bm25SearchOptions::new(),
                 Some(&["_id", "score"]),
             )
             .expect("search");
@@ -1767,7 +1783,7 @@ mod tests {
             "the index already lists every live superfile"
         );
 
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         assert_eq!(
@@ -1807,7 +1823,7 @@ mod tests {
     ) -> bool {
         let fired_before = faults.fired();
         faults.fail(FaultOp::PutAtomic, STORAGE_PREFIX, 1);
-        let result = st.optimize(&stats_only_options());
+        let result = st.optimize(&maintenance_only_options());
         faults.clear();
         let rebuilt = faults.fired() > fired_before;
         if !rebuilt {
@@ -1828,7 +1844,7 @@ mod tests {
         for segment in 0..SEGMENTS {
             commit_segment(&st, segment);
         }
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         (dir, faults, storage, st)
     }
 
@@ -1896,7 +1912,7 @@ mod tests {
         );
 
         assert!(optimize_rebuilds_term_index(&st, &faults));
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
         let covered: HashSet<Uuid> = root.superfiles.iter().copied().collect();
         assert_eq!(covered, live, "the rebuild drops the removed superfile");
@@ -1943,12 +1959,11 @@ mod tests {
 
     /// Every ceiling the index computes is an upper bound on the score any
     /// document actually receives — for single terms, multi-term unions
-    /// and phrases, under per-superfile statistics and under table-wide
-    /// statistics, where the stored bound is rescaled from the superfile's
-    /// own idf to the query's.
+    /// and phrases under table-wide statistics, where the stored bound is
+    /// rescaled from the superfile's own idf to the query's.
     #[test]
-    fn query_ceilings_bound_real_scores_for_terms_and_phrases_under_both_stats() {
-        use crate::{Bm25SearchOptions, superfile::fts::reader::Bm25Stats};
+    fn query_ceilings_bound_real_scores_for_terms_and_phrases() {
+        use crate::Bm25SearchOptions;
 
         let (_dir, storage, st) = fresh_table();
         for segment in 0..SEGMENTS {
@@ -1971,8 +1986,8 @@ mod tests {
                 .map(|(sf, _, _)| *sf)
                 .expect("every hit falls in one superfile's id range")
         };
-        // Table-wide idf per term, as the query scores with under
-        // `Bm25Stats::Global`: N is the scored-document total, df the sum
+        // Table-wide idf per term, as the query scores with: N is the
+        // scored-document total, df the sum
         // over every live superfile's posting.
         let scored_total: u64 = entries
             .iter()
@@ -2007,39 +2022,34 @@ mod tests {
             ),
             ("beta \"shared s1d02\"", &["beta"], &[&["shared", "s1d02"]]),
         ];
-        for stats in [Bm25Stats::PerSuperfile, Bm25Stats::Global] {
-            for (query, terms, phrases) in &queries {
-                let phrases: Vec<Vec<&str>> = phrases.iter().map(|p| p.to_vec()).collect();
-                let idf_used = |term: &str, local: f32| match stats {
-                    Bm25Stats::PerSuperfile => local,
-                    Bm25Stats::Global => global_idf[term],
-                };
-                let ceilings = rt
-                    .block_on(index.query_ceilings(title, terms, &phrases, &entries, &idf_used))
-                    .expect("ceilings");
-                let batches = reader
-                    .bm25_search(
-                        "title",
-                        query,
-                        DOCS_PER_SEGMENT * SEGMENTS,
-                        Bm25SearchOptions::new().with_stats(stats),
-                        Some(&["_id", "score"]),
-                    )
-                    .expect("search");
-                let hits = hits_of(&batches);
-                assert!(!hits.is_empty(), "{query}: the fixture has hits");
-                for (id, score) in hits {
-                    let sf = superfile_of(id);
-                    let ceiling = ceilings[&sf];
-                    assert!(
-                        score <= ceiling,
-                        "{query} under {stats:?} in {sf}: score {score} exceeds ceiling {ceiling}"
-                    );
-                    assert!(
-                        ceiling.is_finite(),
-                        "{query}: a real ceiling, not the placeholder"
-                    );
-                }
+        for (query, terms, phrases) in &queries {
+            let phrases: Vec<Vec<&str>> = phrases.iter().map(|p| p.to_vec()).collect();
+            let idf_used = |term: &str, _local: f32| global_idf[term];
+            let ceilings = rt
+                .block_on(index.query_ceilings(title, terms, &phrases, &entries, &idf_used))
+                .expect("ceilings");
+            let batches = reader
+                .bm25_search(
+                    "title",
+                    query,
+                    DOCS_PER_SEGMENT * SEGMENTS,
+                    Bm25SearchOptions::new(),
+                    Some(&["_id", "score"]),
+                )
+                .expect("search");
+            let hits = hits_of(&batches);
+            assert!(!hits.is_empty(), "{query}: the fixture has hits");
+            for (id, score) in hits {
+                let sf = superfile_of(id);
+                let ceiling = ceilings[&sf];
+                assert!(
+                    score <= ceiling,
+                    "{query} in {sf}: score {score} exceeds ceiling {ceiling}"
+                );
+                assert!(
+                    ceiling.is_finite(),
+                    "{query}: a real ceiling, not the placeholder"
+                );
             }
         }
     }
@@ -2140,7 +2150,9 @@ mod tests {
                         Some(&["_id", "score"]),
                     )
                     .expect("search");
-                let opened = op_stats::current().expect("metered").superfiles_opened();
+                let opened = op_stats::current()
+                    .expect("metered")
+                    .score_pruning_survived();
                 (hits_of(&batches), opened)
             })
             .0
@@ -2243,7 +2255,7 @@ mod tests {
             let by_sf = rt
                 .block_on(index.locations(title_id(), terms, &entries))
                 .expect("locations");
-            let pairs: Vec<(&str, u64, FstValue)> = by_sf[&entries[0].superfile_id]
+            let pairs: Vec<(&str, u64, DictEntry)> = by_sf[&entries[0].superfile_id]
                 .iter()
                 .filter_map(|(t, df, l)| l.to_dict_value().map(|v| (t.as_str(), *df, v)))
                 .collect();
@@ -2460,7 +2472,7 @@ mod tests {
             "this commit's superfiles are"
         );
 
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         assert!(
@@ -2552,7 +2564,7 @@ mod tests {
     #[test]
     fn optimize_on_an_empty_table_publishes_no_index_and_a_repeat_is_a_no_op() {
         let (_dir, _storage, st) = fresh_table();
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         assert!(
             st.reader()
                 .expect("reader")
@@ -2562,12 +2574,12 @@ mod tests {
             "nothing to index"
         );
         commit_segment(&st, 0);
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         let reference = manifest.term_index_ref().cloned().expect("reference");
         let id = manifest.get_manifest_id();
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         assert_eq!(manifest.term_index_ref(), Some(&reference));
@@ -2626,7 +2638,7 @@ mod tests {
             let bytes =
                 std::fs::read(dir.path().join(e.uri.storage_path())).expect("superfile bytes");
             let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
-            let pairs: Vec<(&str, u64, FstValue)> = by_sf[&e.superfile_id]
+            let pairs: Vec<(&str, u64, DictEntry)> = by_sf[&e.superfile_id]
                 .iter()
                 .filter_map(|(t, df, l)| l.to_dict_value().map(|v| (t.as_str(), *df, v)))
                 .collect();
@@ -2703,7 +2715,7 @@ mod tests {
             w.append(&batch).expect("append");
             w.commit().expect("commit");
         }
-        st.refresh_term_stats_sync().expect("maintenance rebuild");
+        st.refresh_term_index_sync().expect("maintenance rebuild");
         let rt = tokio::runtime::Runtime::new().expect("rt");
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
@@ -2980,16 +2992,13 @@ mod tests {
     /// Every posting's bound is a true ceiling: for each term, the highest
     /// score any document in that superfile actually receives under the
     /// superfile's own statistics does not exceed the artifact's bound for
-    /// it. The oracle is the public search itself, run with per-superfile
-    /// statistics so its scores are in the scale the bounds were baked in;
-    /// hits map to superfiles through the entries' id ranges.
+    /// it. The oracle is each superfile searched on its own, so its scores
+    /// are in the scale the bounds were baked in.
     #[test]
     fn bounds_are_upper_bounds_on_real_scores() {
-        use arrow_array::{Array, Decimal128Array, Float32Array, Int64Array};
+        use crate::superfile::SuperfileReader;
 
-        use crate::{Bm25SearchOptions, superfile::fts::reader::Bm25Stats};
-
-        let (_dir, storage, st) = fresh_table();
+        let (dir, storage, st) = fresh_table();
         for segment in 0..SEGMENTS {
             commit_segment(&st, segment);
         }
@@ -2997,19 +3006,17 @@ mod tests {
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         let reader = st.reader().expect("reader");
-        let ranges: Vec<(Uuid, i128, i128)> = reader
+        let superfiles: Vec<(Uuid, SuperfileReader)> = reader
             .manifest()
             .get_all_superfiles()
             .iter()
-            .map(|e| (e.superfile_id, e.id_min, e.id_max))
+            .map(|e| {
+                let bytes =
+                    std::fs::read(dir.path().join(e.uri.storage_path())).expect("superfile bytes");
+                let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+                (e.superfile_id, sf)
+            })
             .collect();
-        let superfile_of = |id: i128| -> Uuid {
-            ranges
-                .iter()
-                .find(|(_, lo, hi)| *lo <= id && id <= *hi)
-                .map(|(sf, _, _)| *sf)
-                .expect("every hit falls in one superfile's id range")
-        };
         for term in ["shared", "alpha", "beta", "s1d00", "s2d04"] {
             let postings = rt
                 .block_on(index.postings(title_id(), term))
@@ -3025,41 +3032,22 @@ mod tests {
                     "{term} in {sf}: bound is a real ceiling, not the +inf placeholder"
                 );
             }
-            let batches = reader
-                .bm25_search(
-                    "title",
-                    term,
-                    DOCS_PER_SEGMENT * SEGMENTS,
-                    Bm25SearchOptions::new().with_stats(Bm25Stats::PerSuperfile),
-                    Some(&["_id", "score"]),
-                )
-                .expect("search");
-            let mut observed_max: HashMap<Uuid, f32> = HashMap::new();
-            for b in &batches {
-                let scores = b
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .expect("score");
-                let ids = b.column(0);
-                for i in 0..b.num_rows() {
-                    let id: i128 = if let Some(a) = ids.as_any().downcast_ref::<Decimal128Array>() {
-                        a.value(i)
-                    } else {
-                        ids.as_any()
-                            .downcast_ref::<Int64Array>()
-                            .expect("_id")
-                            .value(i) as i128
-                    };
-                    let sf = superfile_of(id);
-                    let e = observed_max.entry(sf).or_insert(0.0);
-                    *e = e.max(scores.value(i));
-                }
-            }
-            assert!(!observed_max.is_empty());
-            for (sf, observed) in observed_max {
+            let mut observed_any = false;
+            for (sf, superfile) in &superfiles {
+                let hits = rt
+                    .block_on(superfile.bm25_search_pretokenized(
+                        "title",
+                        &[term],
+                        DOCS_PER_SEGMENT,
+                        BoolMode::Or,
+                    ))
+                    .expect("search");
+                let Some(observed) = hits.iter().map(|(_, s)| *s).reduce(f32::max) else {
+                    continue;
+                };
+                observed_any = true;
                 let bound = bounds
-                    .get(&sf)
+                    .get(sf)
                     .copied()
                     .unwrap_or_else(|| panic!("{term}: a superfile with hits has a posting"));
                 assert!(
@@ -3067,8 +3055,10 @@ mod tests {
                     "{term} in {sf}: observed max {observed} exceeds bound {bound}"
                 );
             }
+            assert!(observed_any, "{term}: the fixture has hits");
         }
     }
+
     /// Like [`fresh_table`] with a ceiling-ordered open window of `window`
     /// superfiles (1 = strictly sequential, so skipping is observable).
     fn fresh_table_with_open_window(
@@ -3129,7 +3119,6 @@ mod tests {
         use crate::{
             Bm25SearchOptions,
             runtime_metrics::op_stats::{self, with_op_stats},
-            superfile::fts::reader::Bm25Stats,
         };
 
         let (_dir, _storage, st) = fresh_table_with_open_window(1);
@@ -3154,11 +3143,13 @@ mod tests {
                         "title",
                         "alpha",
                         k,
-                        Bm25SearchOptions::new().with_stats(Bm25Stats::PerSuperfile),
+                        Bm25SearchOptions::new(),
                         Some(&["_id", "score"]),
                     )
                     .expect("search");
-                let opened = op_stats::current().expect("metered").superfiles_opened();
+                let opened = op_stats::current()
+                    .expect("metered")
+                    .score_pruning_survived();
                 (hits_of(&batches), opened)
             })
             .0
@@ -3218,7 +3209,7 @@ mod tests {
                 locs.iter().all(|(t, _, _)| t != "absent"),
                 "an absent term has no location"
             );
-            let pairs: Vec<(&str, u64, FstValue)> = locs
+            let pairs: Vec<(&str, u64, DictEntry)> = locs
                 .iter()
                 .filter_map(|(t, df, l)| l.to_dict_value().map(|v| (t.as_str(), *df, v)))
                 .collect();
@@ -3242,22 +3233,22 @@ mod tests {
                 match (slot, fact.entry) {
                     (
                         FetchedTermSlot::Inline { doc_id, tf },
-                        FstValue::Inline { doc_id: d, tf: t },
+                        DictEntry::Inline { doc_id: d, tf: t },
                     ) => {
                         assert_eq!((doc_id, tf), (d, t));
                     }
                     (
                         FetchedTermSlot::Pfor { bytes, short, .. },
-                        FstValue::Pfor {
-                            postings_length_hint,
+                        DictEntry::Pfor {
+                            postings_length,
                             short: s,
                             ..
                         },
                     ) => {
                         assert_eq!(short, s);
                         assert_eq!(
-                            Some(bytes.len() as u32),
-                            postings_length_hint,
+                            bytes.len() as u32,
+                            postings_length,
                             "{name}: fetched exactly the postings range"
                         );
                     }
@@ -3365,7 +3356,7 @@ mod tests {
     /// The old format keeps working under the new reader, and mixes with
     /// the new format without changing an answer. The fixture is a table
     /// written by the engine before the term index existed: blooms in its
-    /// parts, bloom unions in its list, a term-stats sidecar, no index.
+    /// parts, bloom unions in its list, no index.
     ///
     /// Four states of the same rows must answer every query identically:
     /// the fixture as written (blooms route); the fixture after the current
@@ -3408,7 +3399,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         copy_dir_recursive(&fixture, dir.path());
         let (storage, st) = open_old_format(dir.path(), |o| o);
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
 
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
@@ -3551,7 +3542,7 @@ mod tests {
             root_after.superfiles.iter().copied().collect();
         assert_eq!(covered, live_before);
 
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let reader = st.reader().expect("reader");
         assert!(
             reader.manifest().term_index_complete(),
@@ -3566,7 +3557,7 @@ mod tests {
     fn old_format_tables_read_and_mix_with_the_new_format() {
         use std::path::Path;
 
-        use crate::{Bm25SearchOptions, superfile::fts::reader::Bm25Stats, supertable::Supertable};
+        use crate::{Bm25SearchOptions, supertable::Supertable};
 
         fn open(dir: &Path) -> (Arc<dyn StorageProvider>, Supertable) {
             open_old_format(dir, |o| o)
@@ -3611,9 +3602,7 @@ mod tests {
                             "title",
                             q,
                             DOCS_PER_SEGMENT * (SEGMENTS + 1),
-                            Bm25SearchOptions::new()
-                                .with_mode(*mode)
-                                .with_stats(Bm25Stats::Global),
+                            Bm25SearchOptions::new().with_mode(*mode),
                             Some(&["title", "score"]),
                         )
                         .expect("search");
@@ -3637,10 +3626,6 @@ mod tests {
             assert!(
                 manifest.term_index_ref().is_none(),
                 "the fixture predates the index"
-            );
-            assert!(
-                manifest.term_stats_blob().is_some(),
-                "the fixture carries the term-stats sidecar"
             );
             for e in manifest.get_all_superfiles() {
                 assert!(
@@ -3686,7 +3671,7 @@ mod tests {
         let mixed_answers = answers(&st);
 
         // Cell 3: a maintenance rebuild covers everything and flips the flag.
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         {
             let manifest = st.reader().expect("reader").manifest().clone();
             assert!(

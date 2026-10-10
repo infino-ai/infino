@@ -2,11 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! Short-form posting body for terms whose whole list fits one block
-//! (`df <= BLOCK_LEN`) — the `VERSION_V7` layout for the rare-term tail.
+//! (`df <= BLOCK_LEN`) — the layout for the rare-term tail.
 //!
 //! The long form charges a single-block term its metadata header, a
-//! skip entry, a position sub-index row, a coarse slot and a block
-//! header before the first posting, and the block codec then pads the
+//! skip entry, a coarse slot and a block header before the first
+//! posting, and the block codec then pads the
 //! partial block to `BLOCK_LEN` lanes at the block's bit width — on a
 //! Zipfian corpus that made the ~97% of terms with `df <= 128` more
 //! than half of the postings region while holding 6% of the postings.

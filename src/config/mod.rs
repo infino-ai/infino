@@ -1014,6 +1014,20 @@ impl GcSettings {
     }
 }
 
+/// Which columns of an edge table carry the graph `optimize()` builds a
+/// resident adjacency index over. A node is a row of some table — its
+/// table's name and its stable `_id` — so an edge is four columns: the
+/// source row's table (a string) and `_id` (the engine's `Decimal128` id
+/// type), and the destination row's.
+#[cfg(feature = "graph-index")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdjacencySpec {
+    pub(crate) src_table: String,
+    pub(crate) src_id: String,
+    pub(crate) dst_table: String,
+    pub(crate) dst_id: String,
+}
+
 /// Options for [`crate::Supertable::optimize`].
 ///
 /// Additional operation kinds (e.g. vector-index maintenance) will be
@@ -1024,6 +1038,11 @@ pub struct OptimizeOptions {
     pub(crate) gc: GcSettings,
     pub(crate) recalibrate: RecalibratePolicy,
     pub(crate) skip_router_cache_warmup: bool,
+    /// The edge columns of a table whose rows are a graph; set, `optimize()`
+    /// builds and publishes the resident adjacency index the graph walks
+    /// read, as it builds the `hnsw` graph over a vector column.
+    #[cfg(feature = "graph-index")]
+    pub(crate) adjacency: Option<AdjacencySpec>,
 }
 
 impl OptimizeOptions {
@@ -1033,6 +1052,37 @@ impl OptimizeOptions {
             compaction: settings,
             ..Self::default()
         }
+    }
+
+    /// Treat the table's rows as a graph's edges between rows — the source
+    /// row's table name and `_id` in `src_table` / `src_id`, the
+    /// destination's in `dst_table` / `dst_id` — and have `optimize()` build
+    /// and publish the resident adjacency index over them, in the lifecycle
+    /// of the `hnsw` graph: one content-addressed blob referenced from the
+    /// manifest, fetched once per generation and decoded into memory, kept
+    /// by GC while referenced, and rebuilt when the rows, the table's
+    /// deletes or these columns change. Edges are directed: a walk follows
+    /// an edge from its source row to its destination row only, so an
+    /// undirected graph is written as two rows per edge. Behind the
+    /// `graph-index` feature, off the curated public surface. The columns
+    /// are checked against the table's schema before `optimize()` changes
+    /// anything; a column that is missing or of the wrong type fails it
+    /// there.
+    #[cfg(feature = "graph-index")]
+    pub fn with_adjacency(
+        mut self,
+        src_table: &str,
+        src_id: &str,
+        dst_table: &str,
+        dst_id: &str,
+    ) -> Self {
+        self.adjacency = Some(AdjacencySpec {
+            src_table: src_table.to_string(),
+            src_id: src_id.to_string(),
+            dst_table: dst_table.to_string(),
+            dst_id: dst_id.to_string(),
+        });
+        self
     }
 
     /// Override the gc settings `optimize()`'s bundled sweep uses.
@@ -1177,25 +1227,6 @@ pub struct ReindexOptions {
     /// tuned it for compaction meant it for this too. A value here
     /// overrides that for one run.
     pub stale_seal_timeout_ms: Option<u64>,
-    /// Credit a superfile that records no analysis revision with the one
-    /// the engine that wrote it emitted, instead of treating it as
-    /// unknown. Defaults to `false`.
-    ///
-    /// Revisions were not recorded before this field existed, so every
-    /// older superfile reads as stale and `Auto` re-analyzes it — correct,
-    /// but it re-tokenizes corpora whose terms are already current.
-    /// Setting this reads the writer's version out of `inf.builder` and
-    /// credits what that version's chains emitted, skipping those files.
-    ///
-    /// **Only sound when the table never held superfiles older than the
-    /// writer's version.** A merge carries postings rather than
-    /// re-analyzing them, and engines that did not record revisions did
-    /// not lower the output to its oldest input either — so a compaction
-    /// run by one of them could have folded much older terms into a file
-    /// stamped with its own version, and nothing in that file says so.
-    /// Crediting it leaves those terms in place and reports the table
-    /// migrated. Leave this off unless the table's whole history is known.
-    pub trust_writer_analysis: bool,
 }
 
 impl ReindexOptions {
@@ -1232,15 +1263,6 @@ impl ReindexOptions {
     /// Override the table's seal-takeover age for this run.
     pub fn with_stale_seal_timeout_ms(mut self, ms: u64) -> Self {
         self.stale_seal_timeout_ms = Some(ms);
-        self
-    }
-
-    /// Credit a superfile recording no analysis revision with the one its
-    /// writer emitted. Read
-    /// [`ReindexOptions::trust_writer_analysis`] before setting this: it
-    /// is unsound on a table whose history is not known.
-    pub fn trusting_writer_analysis(mut self) -> Self {
-        self.trust_writer_analysis = true;
         self
     }
 }

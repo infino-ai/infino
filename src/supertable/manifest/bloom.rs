@@ -4,7 +4,7 @@
 //! FTS term-presence bloom filter.
 //!
 //! One bloom per (superfile, FTS column). Built once at commit time
-//! by feeding the superfile's FST term iterator through a
+//! by feeding the superfile's term-dictionary iterator through a
 //! [`BloomBuilder`]; queried at skip-prune time via
 //! [`Bloom::contains`] to decide whether a superfile could contain
 //! at least one of a query's terms. Returns `false` definitively

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Query-option types for FTS search: the default-operator [`BoolMode`],
-//! the [`Bm25Stats`] idf-source selector, and the [`Bm25SearchOptions`]
-//! builder. Part of the `fts::reader::*` public surface.
+//! Query-option types for FTS search: the default-operator [`BoolMode`]
+//! and the [`Bm25SearchOptions`] builder. Part of the `fts::reader::*`
+//! public surface.
 
 use crate::superfile::fts::bm25::Bm25Params;
 
@@ -23,53 +23,21 @@ pub enum BoolMode {
     Or,
 }
 
-/// Which BM25 collection statistics to score term rarity (idf) with
-/// across the superfiles a query fans out over.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
-pub enum Bm25Stats {
-    /// Score each superfile against its own local document count and
-    /// term document-frequencies. Fast (full fan-out, no extra pass),
-    /// but a term's idf — and therefore a doc's score — depends on
-    /// which superfile it lands in, so scores are only approximately
-    /// comparable across superfiles and ranking drifts as the table
-    /// fragments.
-    PerSuperfile,
-    /// Score every superfile against table-wide idf: the document count
-    /// and per-term document-frequencies aggregated across all
-    /// superfiles in the query's manifest snapshot. A term then has one
-    /// idf for the whole table, so a fragmented table ranks like a
-    /// single unified corpus, at the cost of a document-frequency
-    /// gather before scoring. Length normalization needs no gather:
-    /// every superfile is written at the table-wide average document
-    /// length as of its commit and scored at the average it declares.
-    /// The default: ranking should not depend on how commits happened
-    /// to shard the corpus.
-    #[default]
-    Global,
-}
-
-impl From<&str> for Bm25Stats {
-    fn from(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "global" => Bm25Stats::Global,
-            "per_superfile" => Bm25Stats::PerSuperfile,
-            // Anything else is treated as "unspecified" and takes the
-            // default, so this conversion and the enum default cannot
-            // drift apart.
-            _ => Bm25Stats::default(),
-        }
-    }
-}
-
-/// Options for a BM25 search: the boolean `mode` and the corpus-statistics
-/// `stats`. Set fields with the `with_*` builders; [`Default`] is
-/// [`BoolMode::Or`] with [`Bm25Stats::Global`].
+/// Options for a BM25 search: the boolean `mode` and an optional
+/// similarity override. Set fields with the `with_*` builders;
+/// [`Default`] is [`BoolMode::Or`] with each column's declared parameters.
+///
+/// A term search scores every superfile against the document count and
+/// document frequency aggregated across the superfiles resident in the
+/// query's manifest snapshot, so a fragmented, fully loaded table ranks
+/// like one corpus. Prefix search, and a lazily loaded manifest with no
+/// resident superfiles, score each superfile with its own statistics.
 ///
 /// ```ignore
-/// // OR mode, global stats (the defaults):
+/// // OR mode (the default):
 /// Bm25SearchOptions::new()
-/// // AND mode, per-superfile (segment-local) stats:
-/// Bm25SearchOptions::new().with_mode(BoolMode::And).with_stats(Bm25Stats::PerSuperfile)
+/// // AND mode:
+/// Bm25SearchOptions::new().with_mode(BoolMode::And)
 /// ```
 /// `#[non_exhaustive]`: construct with [`Bm25SearchOptions::new`] and
 /// the `with_*` setters. The attribute is what lets a further search
@@ -85,8 +53,6 @@ impl From<&str> for Bm25Stats {
 pub struct Bm25SearchOptions {
     /// Boolean mode for the query's bare terms (`Or` = should, `And` = must).
     pub mode: BoolMode,
-    /// Which BM25 corpus statistics to score with.
-    pub stats: Bm25Stats,
     /// Similarity parameters to score with, overriding whatever each
     /// column declared. `None` — the default — scores every column with
     /// its own declared pair, which is also the pair its stored bounds
@@ -101,7 +67,7 @@ pub struct Bm25SearchOptions {
 }
 
 impl Bm25SearchOptions {
-    /// Default options: `Or` mode, global statistics.
+    /// Default options: `Or` mode, each column's declared parameters.
     pub fn new() -> Self {
         Self::default()
     }
@@ -109,12 +75,6 @@ impl Bm25SearchOptions {
     /// Set the boolean mode for the query's bare terms.
     pub fn with_mode(mut self, mode: BoolMode) -> Self {
         self.mode = mode;
-        self
-    }
-
-    /// Set which BM25 corpus statistics to score with.
-    pub fn with_stats(mut self, stats: Bm25Stats) -> Self {
-        self.stats = stats;
         self
     }
 

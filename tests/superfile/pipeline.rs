@@ -12,6 +12,7 @@ use arrow_array::{Array, Decimal128Array, Float32Array, LargeStringArray, Record
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    Stemmer,
     superfile::{
         SuperfileReader, VectorSearchOptions,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig},
@@ -586,11 +587,11 @@ fn one_row_superfile_with(cfg: FtsConfig) -> SuperfileReader {
 /// would silently stop matching at query time.
 #[test]
 fn add_batch_from_reader_mergeability_fts_analyzer_mismatch() {
-    let reader = one_row_superfile_with(FtsConfig::new("body").analyzer("standard"));
+    let reader = one_row_superfile_with(FtsConfig::new("body"));
     let opts = BuilderOptions::new(
         pipeline_schema(),
         "doc_id",
-        vec![FtsConfig::new("body").analyzer("ascii_lower")],
+        vec![FtsConfig::new("body").stemmer(Stemmer::English)],
         vec![],
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
@@ -672,11 +673,9 @@ fn add_batch_from_reader_mergeability_fts_presence_mismatch() {
 #[test]
 fn fts_merge_rejects_mixed_analyzers() {
     let a = Arc::new(one_row_superfile_with(
-        FtsConfig::new("body").analyzer("ascii_lower"),
+        FtsConfig::new("body").stemmer(Stemmer::English),
     ));
-    let b = Arc::new(one_row_superfile_with(
-        FtsConfig::new("body").analyzer("standard"),
-    ));
+    let b = Arc::new(one_row_superfile_with(FtsConfig::new("body")));
     let err = SuperfileBuilder::build_from_readers_fts_merge(&[(a, None), (b, None)])
         .expect_err("mixed-analyzer inputs must be refused");
     assert!(

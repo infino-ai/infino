@@ -47,7 +47,6 @@ use crate::{
 };
 
 pub mod term_range;
-pub mod term_stats;
 
 use std::{
     cmp::Ordering,
@@ -553,7 +552,6 @@ impl ManifestSnapshot {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts,
@@ -654,9 +652,8 @@ impl ManifestSnapshot {
 
     /// One FTS column's length statistics over the whole table — the
     /// documents that carry tokens and their token total — folded from
-    /// every superfile's summary. `None` while any superfile's summary
-    /// predates the totals: a partial sum would describe some other
-    /// corpus, so the caller falls back rather than mixing.
+    /// every superfile's summary. `None` when any summary's totals are
+    /// unknown: a partial sum would describe some other corpus.
     pub fn fts_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
         let id = self.field_id(column)?;
         Self::fts_length_stats_over(self.superfiles.iter(), id)
@@ -1515,17 +1512,6 @@ impl ManifestSnapshot {
         ))
     }
 
-    /// Centroid-section sibling of the slow-CAS blob (contiguous fp32 fine
-    /// centroids in `(entry, column, cell)` order) — the stripped-summary
-    /// admit rescore hydrates it once instead of fanning per-cell superfile
-    /// reads. `None` on manifests written before the sibling existed.
-    /// The manifest's global term-stats sidecar reference, when one is
-    /// stamped and still valid for this membership (the carry rule drops
-    /// it on any superfile removal). See `manifest::term_stats`.
-    pub(crate) fn term_stats_blob(&self) -> Option<&RoutingRef> {
-        self.list.as_ref().and_then(|l| l.term_stats.as_ref())
-    }
-
     /// This snapshot with `edit` applied to a copy of its list — a
     /// successor on the next manifest id when `bump_id` (a maintenance
     /// publish), otherwise an overlay on the same id for a commit to
@@ -1556,13 +1542,6 @@ impl ManifestSnapshot {
         }
     }
 
-    /// Successor manifest (bumped id) with the term-stats sidecar
-    /// reference stamped — the maintenance publish, mirroring
-    /// [`Self::with_slow_vector_state`].
-    pub(crate) fn with_term_stats(&self, reference: RoutingRef) -> Self {
-        self.with_list_edited(true, |list| list.term_stats = Some(reference))
-    }
-
     /// The manifest's term-index root reference, when one has been built.
     /// See `manifest::term_index`.
     pub(crate) fn term_index_ref(&self) -> Option<&RoutingRef> {
@@ -1589,8 +1568,8 @@ impl ManifestSnapshot {
     }
 
     /// Successor manifest (bumped id) with the term-index root reference
-    /// stamped — the maintenance publish, mirroring [`Self::with_term_stats`].
-    /// A maintenance build covers the whole membership.
+    /// stamped — the maintenance publish. A maintenance build covers the
+    /// whole membership.
     pub(crate) fn with_term_index(&self, reference: RoutingRef) -> Self {
         self.with_list_edited(true, |list| {
             list.term_index = Some(reference);
@@ -1598,8 +1577,36 @@ impl ManifestSnapshot {
         })
     }
 
+    /// Centroid-section sibling of the slow-CAS blob (contiguous fp32 fine
+    /// centroids in `(entry, column, cell)` order) — the stripped-summary
+    /// admit rescore hydrates it once instead of fanning per-cell superfile
+    /// reads. `None` on manifests written before the sibling existed.
     pub(crate) fn slow_vector_state_centroids_blob(&self) -> Option<&RoutingRef> {
         self.list.as_ref()?.slow_vector_state_centroids.as_ref()
+    }
+
+    /// Successor manifest (bumped id) with the resident-index ref replaced
+    /// by `reference` — the knowledge graph's adjacency, stamped by the
+    /// maintenance publish the way [`Self::with_term_stats`] stamps its
+    /// sidecar. The ref lives in the same list slot as the `hnsw` graph's: a
+    /// table carries one resident index, and an edge table has no vector
+    /// column to carry the other.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn with_adjacency_ref(&self, reference: RoutingRef) -> Self {
+        self.with_list_edited(true, |list| {
+            list.slow_vector_state_graphs = Some(reference);
+        })
+    }
+
+    /// Successor manifest (bumped id) with no resident-index ref: what an
+    /// edge table whose edges are all gone is stamped with, so a walk no
+    /// longer reads the adjacency of edges that no longer exist. The
+    /// superseded blob is then unreferenced, and gc reclaims it.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn without_adjacency_ref(&self) -> Self {
+        self.with_list_edited(true, |list| {
+            list.slow_vector_state_graphs = None;
+        })
     }
 
     /// The graph-sections sibling ref (persisted `hnsw` HNSW graphs),
@@ -2401,18 +2408,6 @@ impl ManifestSnapshot {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
-            // The term-stats sidecar sums gross df over a recorded set of
-            // superfiles. An append leaves that set intact — the new
-            // superfiles are simply uncovered tail the query tops up from
-            // their own dictionaries — so the ref carries forward. A
-            // removal bakes departed superfiles' contributions into a sum
-            // that can no longer be attributed, so the ref drops and only
-            // a fresh maintenance pass republishes it.
-            term_stats: if entries_to_remove.is_empty() {
-                self.list.as_ref().and_then(|l| l.term_stats.clone())
-            } else {
-                None
-            },
             // The term index carries forward on every commit, removals
             // included: its postings are per superfile, so a reader simply
             // ignores those whose superfile is no longer live, and a
@@ -3247,6 +3242,12 @@ pub struct SubsectionOffsets {
 pub struct SuperfileUri(pub Uuid);
 
 impl SuperfileUri {
+    /// The uri of a hit that is not placed yet — one known only by its
+    /// stable `_id`, as a graph walk reaches rows — which placement
+    /// (`user_placement_for_scalar_resolve`) resolves by that id. Never a
+    /// committed superfile's uri: those are v4 uuids.
+    pub(crate) const UNPLACED: Self = Self(Uuid::nil());
+
     /// Generate a fresh URI. Called by the writer at commit time
     /// when assigning a key for a new superfile's bytes.
     pub fn new_v4() -> Self {
@@ -5498,7 +5499,6 @@ mod tests {
                 slow_vector_state_centroids: None,
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
-                term_stats: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: entries,
@@ -6004,7 +6004,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![list::ManifestPartEntry {
@@ -6189,7 +6188,6 @@ mod tests {
                 slow_vector_state_centroids: None,
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
-                term_stats: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: vec![],
@@ -6331,7 +6329,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![part_entry(pa_id), part_entry(pb_id)],
@@ -6411,7 +6408,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: Vec::new(),
@@ -6541,7 +6537,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -6755,7 +6750,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -7019,7 +7013,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -7177,7 +7170,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -7393,7 +7385,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -7501,7 +7492,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -7636,7 +7626,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -7761,7 +7750,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -7902,7 +7890,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -8053,7 +8040,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -8218,7 +8204,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -8445,7 +8430,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -8550,7 +8534,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -8671,7 +8654,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -8815,7 +8797,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -8956,7 +8937,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -9051,7 +9031,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -9165,7 +9144,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -9302,7 +9280,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts,

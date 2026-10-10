@@ -5,7 +5,7 @@
 //!
 //! Compaction is the one phase this module owns outright; it lives in
 //! [`compact`]. Every other phase (the hidden-cell drain, the
-//! centroid-router refresh, the term-stats rebuild, gc) is a maintenance
+//! centroid-router refresh, the term-index rebuild, gc) is a maintenance
 //! operation with callers of its own, sequenced here rather than
 //! implemented here.
 
@@ -46,8 +46,16 @@ impl Supertable {
         // stick for compaction scaling — see DiagnosticsSettings.
         let phase_timers = crate::config::global().diagnostics.optimize_phase_timers;
         let mut __t = Instant::now();
+        // The edge columns are checked against the schema first: a wrong
+        // spec is the caller's error, and it fails here with nothing
+        // committed rather than after the compaction below.
+        #[cfg(feature = "graph-index")]
+        if let Some(spec) = &opts.adjacency {
+            self.check_adjacency_spec(spec)
+                .map_err(OptimizeError::from)?;
+        }
         self.drain_hidden_vector_cells_sync()
-            .map_err(|e| OptimizeError::Build(e.to_string()))?;
+            .map_err(OptimizeError::from)?;
         if phase_timers {
             tracing::info!(secs = __t.elapsed().as_secs_f64(), "[optphase] drain");
             __t = Instant::now();
@@ -74,13 +82,25 @@ impl Supertable {
                 "[optphase] router_cache"
             );
         }
-        // Refresh the term index, and the term-stats sidecar if the index
-        // is incomplete, over the post-merge membership (compaction's
-        // removals dropped any prior sidecar reference — see the manifest
-        // carry rule). Runs before gc so the sweep's live set names the
-        // fresh artifacts.
-        self.refresh_term_stats_sync()
-            .map_err(|e| OptimizeError::Build(e.to_string()))?;
+        // Rebuild the term index over the merged superfiles. Runs before gc
+        // so the sweep keeps the fresh index and removes the one it replaced.
+        self.refresh_term_index_sync()
+            .map_err(OptimizeError::from)?;
+        // The knowledge graph's adjacency over an edge table, rebuilt only
+        // when the rows, the deletes or the edge columns changed; before gc
+        // for the same reason. Best-effort like the hnsw build above: the
+        // compaction is committed by now, and the walks keep serving the
+        // prior generation until a later pass republishes, so a failed
+        // publish is logged rather than failing an optimize that is done.
+        #[cfg(feature = "graph-index")]
+        if let Some(spec) = &opts.adjacency
+            && let Err(e) = self.refresh_adjacency_sync(spec)
+        {
+            tracing::warn!(
+                "adjacency refresh failed: {e}; the walks keep the prior generation until a \
+                 later optimize republishes"
+            );
+        }
         match self.gc(opts.gc.safety_gap) {
             Ok(_) | Err(GcError::NoStorage) => {}
             Err(e) => return Err(OptimizeError::Gc(e)),

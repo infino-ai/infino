@@ -76,7 +76,7 @@ fn part_overlaps_prefix(
         return true;
     };
     let Some((min_term, max_term)) = agg.term_range.as_ref() else {
-        // Every superfile had an empty FST for this column;
+        // Every superfile had an empty dictionary for this column;
         // nothing to match. Skip.
         return false;
     };
@@ -297,7 +297,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: entries,
@@ -326,7 +325,7 @@ mod tests {
     #[test]
     fn aggregates_compute_fts_term_range_union() {
         // Three superfiles with different term ranges; the
-        // empty-FST one contributes nothing to the union.
+        // empty-dictionary one contributes nothing to the union.
         let s_a = seg(0, 10, &["alpha", "bravo", "charlie"], None);
         let s_b = seg(11, 20, &["bravo", "charlie", "delta"], None);
         let id = Uuid::new_v4();
@@ -361,8 +360,8 @@ mod tests {
         let aggs = aggregates::compute(&[s_a, s_b, s_c], None);
         let fts_agg = aggs.fts_summary_agg.get(&fid("title")).expect("title agg");
         let (mn, mx) = fts_agg.term_range.as_ref().expect("range");
-        assert_eq!(mn, b"alpha", "min of mins across non-empty FSTs");
-        assert_eq!(mx, b"delta", "max of maxes across non-empty FSTs");
+        assert_eq!(mn, b"alpha", "min of mins across non-empty dictionaries");
+        assert_eq!(mx, b"delta", "max of maxes across non-empty dictionaries");
     }
 
     #[test]

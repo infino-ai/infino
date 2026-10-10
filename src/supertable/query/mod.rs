@@ -25,6 +25,8 @@ pub mod df_object_store;
 pub mod dispatch;
 pub mod exec;
 pub mod fts;
+#[cfg(feature = "graph-index")]
+pub mod graph;
 pub mod hierarchical_iter;
 pub mod provider;
 pub mod prune;
@@ -34,6 +36,7 @@ pub mod skip;
 pub(crate) mod sorted_root;
 pub mod sql;
 pub mod superfile_reader;
+pub(crate) mod topk_row_filter;
 pub(crate) mod values_subquery;
 pub mod vector;
 
@@ -78,4 +81,19 @@ pub struct SuperfileHit {
     /// other path (FTS, user-table, hits without an inline region); the remap
     /// then falls back to the region/scalar read.
     pub stable_id: Option<i128>,
+}
+
+#[cfg(feature = "graph-index")]
+impl SuperfileHit {
+    /// A hit known by its stable `_id` alone, before placement — what a
+    /// graph walk reaches. `user_placement_for_scalar_resolve` places it
+    /// by the id, like a hidden-index hit.
+    pub(crate) fn by_id(stable_id: i128, score: f32) -> Self {
+        Self {
+            superfile: SuperfileUri::UNPLACED,
+            local_doc_id: 0,
+            score,
+            stable_id: Some(stable_id),
+        }
+    }
 }

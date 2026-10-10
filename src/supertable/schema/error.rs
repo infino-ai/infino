@@ -249,3 +249,225 @@ pub enum SchemaError {
         name: String,
     },
 }
+
+impl SchemaError {
+    /// A stable name for the cause, for a caller that has to tell one refusal
+    /// from another.
+    ///
+    /// The message says what went wrong and names the column, cap or version
+    /// at fault; it is written for a person and may be reworded. This is the
+    /// part a program matches on, so it is the variant's own name and does
+    /// not change once shipped. The language bindings carry it across, since
+    /// a caller there sees one exception class for every schema refusal and
+    /// would otherwise have to match on prose.
+    ///
+    /// Exhaustive on purpose, with no fallback arm: the enum is
+    /// `#[non_exhaustive]` to callers outside the crate, but inside it a new
+    /// variant must name itself here rather than inherit someone else's name
+    /// or a catch-all. A caller matching on these names should still keep a
+    /// default branch, since a newer engine can send one this build has
+    /// never seen.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SchemaError::TypeMismatch { .. } => "TypeMismatch",
+            SchemaError::MissingColumn { .. } => "MissingColumn",
+            SchemaError::NullInNonNullable { .. } => "NullInNonNullable",
+            SchemaError::ValueOutOfRange { .. } => "ValueOutOfRange",
+            SchemaError::IntegerNotExactInFloat { .. } => "IntegerNotExactInFloat",
+            SchemaError::MixedArray { .. } => "MixedArray",
+            SchemaError::FieldCapExceeded { .. } => "FieldCapExceeded",
+            SchemaError::DepthExceeded { .. } => "DepthExceeded",
+            SchemaError::CapExceeded { .. } => "CapExceeded",
+            SchemaError::InvalidType { .. } => "InvalidType",
+            SchemaError::TypeRequired { .. } => "TypeRequired",
+            SchemaError::PathShadowsColumn { .. } => "PathShadowsColumn",
+            SchemaError::UnknownStructField { .. } => "UnknownStructField",
+            SchemaError::NestedArray { .. } => "NestedArray",
+            SchemaError::DuplicateColumn { .. } => "DuplicateColumn",
+            SchemaError::Invalid { .. } => "Invalid",
+            SchemaError::NameTaken { .. } => "NameTaken",
+            SchemaError::UnknownFieldId { .. } => "UnknownFieldId",
+            SchemaError::NotEmpty { .. } => "NotEmpty",
+            SchemaError::IdentityChange { .. } => "IdentityChange",
+            SchemaError::BacksGlobalVectorIndex { .. } => "BacksGlobalVectorIndex",
+            SchemaError::ConversionInProgress { .. } => "ConversionInProgress",
+            SchemaError::SchemaConflict { .. } => "SchemaConflict",
+            SchemaError::InvalidIndex { .. } => "InvalidIndex",
+            SchemaError::InvalidRow { .. } => "InvalidRow",
+            SchemaError::TableExists { .. } => "TableExists",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One of every variant. Kept beside [`every_kind_is_the_variants_own_name`],
+    /// which is what gives it a point: a sample that is wrong in any way the
+    /// name does not depend on costs nothing.
+    fn one_of_every_variant() -> Vec<SchemaError> {
+        let column = || "c".to_string();
+        vec![
+            SchemaError::TypeMismatch {
+                column: column(),
+                frozen: DataType::Int64,
+                offered: DataType::Utf8,
+            },
+            SchemaError::MissingColumn { column: column() },
+            SchemaError::NullInNonNullable { column: column() },
+            SchemaError::ValueOutOfRange {
+                column: column(),
+                value: "1".into(),
+                data_type: "Int8".into(),
+            },
+            SchemaError::IntegerNotExactInFloat {
+                column: column(),
+                value: 1,
+                stored: 1.0,
+            },
+            SchemaError::MixedArray {
+                column: column(),
+                types: vec!["number".into()],
+            },
+            SchemaError::FieldCapExceeded {
+                cap: 1,
+                current: 1,
+                fields: vec![column()],
+            },
+            SchemaError::DepthExceeded {
+                cap: 1,
+                path: "a.b".into(),
+            },
+            SchemaError::CapExceeded {
+                setting: "max_fields".into(),
+                value: 2,
+                cap: 1,
+            },
+            SchemaError::InvalidType {
+                column: column(),
+                reason: "r".into(),
+            },
+            SchemaError::TypeRequired { column: column() },
+            SchemaError::PathShadowsColumn {
+                path: "a.b".into(),
+                column: column(),
+            },
+            SchemaError::UnknownStructField {
+                column: column(),
+                field: "f".into(),
+            },
+            SchemaError::NestedArray { path: "a.b".into() },
+            SchemaError::DuplicateColumn { name: column() },
+            SchemaError::Invalid { reason: "r".into() },
+            SchemaError::NameTaken { name: column() },
+            SchemaError::UnknownFieldId { id: FieldId(1) },
+            SchemaError::NotEmpty { column: column() },
+            SchemaError::IdentityChange {
+                attribute: "id_column".into(),
+            },
+            SchemaError::BacksGlobalVectorIndex { column: column() },
+            SchemaError::ConversionInProgress { column: column() },
+            SchemaError::SchemaConflict {
+                expected: 1,
+                current: 2,
+            },
+            SchemaError::InvalidIndex {
+                column: column(),
+                reason: "r".into(),
+            },
+            SchemaError::InvalidRow {
+                row: 0,
+                reason: "r".into(),
+            },
+            SchemaError::TableExists { name: column() },
+        ]
+    }
+
+    /// Exhaustive on purpose, and the reason [`one_of_every_variant`] can be
+    /// trusted to be every variant: a variant added to the enum does not
+    /// compile until it is listed here, and a reader who comes here to add an
+    /// arm is standing next to the samples.
+    fn _every_variant_has_a_sample(error: &SchemaError) {
+        match error {
+            SchemaError::TypeMismatch { .. }
+            | SchemaError::MissingColumn { .. }
+            | SchemaError::NullInNonNullable { .. }
+            | SchemaError::ValueOutOfRange { .. }
+            | SchemaError::IntegerNotExactInFloat { .. }
+            | SchemaError::MixedArray { .. }
+            | SchemaError::FieldCapExceeded { .. }
+            | SchemaError::DepthExceeded { .. }
+            | SchemaError::CapExceeded { .. }
+            | SchemaError::InvalidType { .. }
+            | SchemaError::TypeRequired { .. }
+            | SchemaError::PathShadowsColumn { .. }
+            | SchemaError::UnknownStructField { .. }
+            | SchemaError::NestedArray { .. }
+            | SchemaError::DuplicateColumn { .. }
+            | SchemaError::Invalid { .. }
+            | SchemaError::NameTaken { .. }
+            | SchemaError::UnknownFieldId { .. }
+            | SchemaError::NotEmpty { .. }
+            | SchemaError::IdentityChange { .. }
+            | SchemaError::BacksGlobalVectorIndex { .. }
+            | SchemaError::ConversionInProgress { .. }
+            | SchemaError::SchemaConflict { .. }
+            | SchemaError::InvalidIndex { .. }
+            | SchemaError::InvalidRow { .. }
+            | SchemaError::TableExists { .. } => {}
+        }
+    }
+
+    /// The variant's own name, taken from the derived `Debug`, which prints
+    /// it ahead of the fields. Read rather than written down, so the check
+    /// below compares `kind()` against the enum itself and not against a
+    /// second list that could carry the same typo.
+    fn variant_name(error: &SchemaError) -> String {
+        let debug = format!("{error:?}");
+        debug
+            .split([' ', '{', '('])
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Every variant's kind is its own name. `kind()` is 26 hand-written
+    /// arms and the contract is that the names never change once shipped, so
+    /// a typo in any one of them would otherwise ship: the arms a reader
+    /// happens to spot-check are the only ones a list of expected strings
+    /// covers.
+    #[test]
+    fn every_kind_is_the_variants_own_name() {
+        let samples = one_of_every_variant();
+        for error in &samples {
+            assert_eq!(
+                error.kind(),
+                variant_name(error),
+                "kind() disagrees with the variant's name"
+            );
+        }
+        // Distinct, or two variants a caller is meant to tell apart answer
+        // the same name.
+        let mut kinds: Vec<&str> = samples.iter().map(SchemaError::kind).collect();
+        kinds.sort_unstable();
+        let total = kinds.len();
+        kinds.dedup();
+        assert_eq!(kinds.len(), total, "two variants share a kind");
+    }
+
+    /// The kind is a name, not the message: it carries no column, cap or
+    /// value, so it stays stable while the prose moves.
+    #[test]
+    fn the_kind_carries_none_of_the_message() {
+        let error = SchemaError::NameTaken {
+            name: "title".into(),
+        };
+        assert_eq!(error.kind(), "NameTaken");
+        assert!(
+            !error.kind().contains("title"),
+            "the kind names the cause, not the instance"
+        );
+        assert!(error.to_string().contains("title"), "the message does");
+    }
+}

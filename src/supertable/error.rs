@@ -21,10 +21,13 @@ use thiserror::Error;
 
 use crate::{
     storage::{StorageError, error_chain, permission_denied_in_chain},
-    superfile::error::{BuildError as SuperfileBuildError, FtsError, ReadError, VectorError},
+    superfile::error::{
+        BuildError as SuperfileBuildError, FtsError, ReadError, VectorError,
+        unreadable_format_in_chain,
+    },
     supertable::{
         ManifestLoadError,
-        manifest::{part, term_stats::TermStatsError},
+        manifest::{part, term_index::TermIndexError},
         schema::error::SchemaError,
     },
 };
@@ -122,12 +125,6 @@ pub enum BuildError {
     #[error("user column name {0:?} starts with reserved prefix 'inf.'")]
     ReservedPrefixInColumnName(String),
 
-    #[error(
-        "FTS column {column:?}: unknown analyzer {analyzer:?} (valid: \
-         \"ascii_lower\", \"standard\")"
-    )]
-    UnknownAnalyzer { column: String, analyzer: String },
-
     #[error("{0}")]
     Schema(#[from] SchemaError),
 
@@ -154,6 +151,13 @@ pub enum BuildError {
 
     #[error("superfile store: {0}")]
     Store(String),
+
+    /// A superfile the build reads is in a format this engine does not read
+    /// (see [`QueryError::Unsupported`]). Carried as its own variant rather
+    /// than folded into [`Self::Store`] so the public mapping reports
+    /// `Unsupported` with the message that says how to fix it.
+    #[error("{0}")]
+    Unsupported(String),
 
     /// The storage backend refused the credentials in use. Carried as its own
     /// variant rather than folded into [`Self::Store`] for the same reason as
@@ -244,13 +248,40 @@ impl BuildError {
     }
 }
 
-impl From<TermStatsError> for BuildError {
-    /// The term-stats pass reaches the build path as `Store` carrying the
-    /// message, except a refused credential under it, which keeps its own
-    /// variant so the caller is told to fix the credentials, not to retry.
-    fn from(e: TermStatsError) -> Self {
+impl From<TermIndexError> for BuildError {
+    /// A term-index build failure reaches the build path as `Store`, except a
+    /// refused credential, which stays `PermissionDenied` so the caller fixes
+    /// the credentials instead of retrying, and a superfile in a format this
+    /// engine does not read, which stays `Unsupported`.
+    fn from(e: TermIndexError) -> Self {
         if e.is_permission_denied() {
             return BuildError::PermissionDenied(e.to_string());
+        }
+        if let TermIndexError::Open(QueryError::Unsupported(m)) = e {
+            return BuildError::Unsupported(m);
+        }
+        BuildError::Store(e.to_string())
+    }
+}
+
+/// A superfile open under a build (a compaction or drain input):
+/// `Unsupported` for a superfile this engine does not read, anything else a
+/// `Store` failure carrying the message.
+impl From<QueryError> for BuildError {
+    fn from(e: QueryError) -> Self {
+        match e {
+            QueryError::Unsupported(m) => BuildError::Unsupported(m),
+            other => BuildError::Store(other.to_string()),
+        }
+    }
+}
+
+/// A superfile a build opened itself: `Unsupported` for a format this engine
+/// does not read, anything else a `Store` failure carrying the message.
+impl From<ReadError> for BuildError {
+    fn from(e: ReadError) -> Self {
+        if e.is_unreadable_format() {
+            return BuildError::Unsupported(e.to_string());
         }
         BuildError::Store(e.to_string())
     }
@@ -502,6 +533,12 @@ pub enum ReindexError {
     /// Reading a superfile to decide whether it is stale failed.
     #[error("failed to assess superfiles: {0}")]
     Assess(String),
+    /// A superfile is in a format this engine does not read, so it can
+    /// neither assess nor rewrite it: a full-text index older than the oldest
+    /// version it reads, or one under a removed analyzer. The message says how
+    /// to bring it forward; retrying cannot help.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
     /// Rewriting one superfile failed. The migration stops here; the
     /// superfiles already rewritten stay rewritten, and re-running picks
     /// up what is left.
@@ -517,6 +554,17 @@ pub enum ReindexError {
         /// What went wrong underneath.
         cause: String,
     },
+}
+
+impl ReindexError {
+    /// An assessment that failed: [`Self::Unsupported`] when a superfile is in
+    /// a format this engine does not read, otherwise [`Self::Assess`].
+    pub(crate) fn assess(e: CompactionError) -> Self {
+        match e {
+            CompactionError::Unsupported(m) => ReindexError::Unsupported(m),
+            other => ReindexError::Assess(other.to_string()),
+        }
+    }
 }
 
 /// Errors raised by [`crate::Supertable::optimize`].
@@ -550,6 +598,12 @@ pub enum OptimizeError {
     /// Building a merged superfile failed.
     #[error("failed to build superfile: {0}")]
     Build(String),
+    /// A superfile to compact is in a format this engine does not read: a
+    /// full-text index older than the oldest version it reads, or one under a
+    /// removed analyzer. The message says how to bring it forward; retrying
+    /// cannot help.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
     /// Committing the compaction to the manifest failed.
     #[error("failed to commit: {0}")]
     Commit(String),
@@ -565,6 +619,14 @@ pub enum OptimizeError {
     /// The post-compaction WAL sweep failed.
     #[error("wal sweep failed during optimize: {0}")]
     WalGc(#[from] crate::supertable::wal::gc::GcError),
+}
+
+/// A build step of optimize that failed, classified as a compaction build
+/// failure is.
+impl From<BuildError> for OptimizeError {
+    fn from(e: BuildError) -> Self {
+        OptimizeError::from(CompactionError::from(e))
+    }
 }
 
 impl From<CompactionError> for OptimizeError {
@@ -588,6 +650,7 @@ impl From<CompactionError> for OptimizeError {
             }
             CompactionError::Seal(s) => OptimizeError::Seal(s),
             CompactionError::Build(s) => OptimizeError::Build(s),
+            CompactionError::Unsupported(s) => OptimizeError::Unsupported(s),
             CompactionError::Commit(s) => OptimizeError::Commit(s),
             CompactionError::Refresh(s) => OptimizeError::Refresh(s),
             CompactionError::AlreadyCompacting => OptimizeError::AlreadyRunning,
@@ -649,6 +712,11 @@ pub(crate) enum CompactionError {
     #[error("failed to build superfile: {0}")]
     Build(String),
 
+    /// An input superfile is in a format this engine does not read (see
+    /// [`QueryError::Unsupported`]); the message says how to fix it.
+    #[error("{0}")]
+    Unsupported(String),
+
     /// Error when committing the compacted superfile. Carries the
     /// rendered cause as a string (see `Build`).
     #[error("failed to commit compaction: {0}")]
@@ -661,6 +729,26 @@ pub(crate) enum CompactionError {
     /// Another compaction is already running on this supertable handle.
     #[error("compaction already in progress on this supertable handle")]
     AlreadyCompacting,
+}
+
+/// A compaction input that failed to build: [`CompactionError::Unsupported`]
+/// for a superfile this engine does not read, otherwise
+/// [`CompactionError::Build`] carrying the message.
+impl From<BuildError> for CompactionError {
+    fn from(e: BuildError) -> Self {
+        match e {
+            BuildError::Unsupported(m) => CompactionError::Unsupported(m),
+            other => CompactionError::Build(other.to_string()),
+        }
+    }
+}
+
+/// A compaction input that failed to open, classified as
+/// `From<BuildError>` classifies it.
+impl From<QueryError> for CompactionError {
+    fn from(e: QueryError) -> Self {
+        CompactionError::from(BuildError::from(e))
+    }
 }
 
 /// Errors raised by [`crate::Supertable::gc`].
@@ -703,6 +791,14 @@ pub enum QueryError {
     #[error("failed to run the query: {0}")]
     Internal(String),
 
+    /// A superfile the query read is in a format this engine does not read:
+    /// a full-text index older than the oldest version it reads, or one
+    /// under a removed analyzer, found however the read was wrapped. Neither
+    /// the query nor a retry can fix it; the message says what does. Maps to
+    /// the public `Unsupported`.
+    #[error("{0}")]
+    Unsupported(String),
+
     /// DataFusion failed to plan or run a query, typed as it returned it, so
     /// the public mapping can tell a bad query from a failed read or an
     /// engine fault (`crate::error::datafusion_error`).
@@ -743,6 +839,7 @@ impl From<QueryError> for DataFusionError {
 /// |---|---|
 /// | over the connection's memory budget | `OverBudget` |
 /// | an FTS query the column cannot answer: a phrase without positions, nothing positive to rank | `InvalidQuery`: the caller's |
+/// | a full-text index older than this engine reads, or one under a removed analyzer, at any depth | `Unsupported` |
 /// | the store refused our credentials | `PermissionDenied` |
 /// | a local doc id past the superfile's end, or a read called on a codec it does not support: our bug, retrying cannot help | `Internal` |
 /// | anything else | `Parquet`: a read failed |
@@ -758,6 +855,9 @@ impl From<ReadError> for QueryError {
             )
         {
             return QueryError::InvalidQuery(e.to_string());
+        }
+        if e.is_unreadable_format() {
+            return QueryError::Unsupported(e.to_string());
         }
         if permission_denied_in_chain(&e) {
             return QueryError::PermissionDenied(e.to_string());
@@ -824,10 +924,14 @@ impl QueryError {
     }
 
     /// Classify a storage-backed query failure whose source is about to be
-    /// stringified: refused credentials get their own variant, everything else
-    /// stays a [`Self::Store`]. `message` is the text the caller would have
-    /// used either way, so no message changes shape.
+    /// stringified: a superfile this engine cannot read and refused
+    /// credentials get their own variants, everything else stays a
+    /// [`Self::Store`]. `message` is the text the caller would have used
+    /// either way, so no message changes shape.
     pub(crate) fn build(message: String, source: &(dyn Error + 'static)) -> Self {
+        if unreadable_format_in_chain(source) {
+            return QueryError::Unsupported(message);
+        }
         if permission_denied_in_chain(source) {
             return QueryError::PermissionDenied(message);
         }
@@ -842,28 +946,34 @@ mod tests {
     use super::*;
     use crate::{superfile::LazyByteSourceError, supertable::reader_cache::disk::DiskCacheError};
 
-    /// The term-stats pass runs during optimize: a refused credential under
+    /// The term-index pass runs during optimize: a refused credential under
     /// any of its failures (a dictionary read, a reader open, the artifact
     /// write) reaches the build path as `PermissionDenied`, so the caller
-    /// fixes the credentials instead of retrying; anything else stays `Store`.
+    /// fixes the credentials instead of retrying; an unreadable superfile
+    /// stays `Unsupported`; anything else is `Store`.
     #[test]
-    fn a_refused_credential_in_the_term_stats_pass_stays_permission_denied() {
+    fn a_term_index_failure_keeps_its_class_on_the_build_path() {
         let refused = || StorageError::PermissionDenied { uri: "u".into() };
-        let read = TermStatsError::Read {
-            what: "dict fetch",
+        let read = TermIndexError::Read {
+            what: "term walk",
             source: FtsError::RangeFetch {
                 what: "fts/dict",
                 source: LazyByteSourceError::Storage(refused()),
             },
         };
-        let open = TermStatsError::Open(QueryError::PermissionDenied("refused".into()));
-        for failure in [read, open, TermStatsError::Storage(refused())] {
+        let open = TermIndexError::Open(QueryError::PermissionDenied("refused".into()));
+        for failure in [read, open, TermIndexError::Storage(refused())] {
             assert!(
                 matches!(BuildError::from(failure), BuildError::PermissionDenied(_)),
                 "a refused credential must stay one"
             );
         }
-        let timeout = TermStatsError::Storage(StorageError::TransientExhausted {
+        let unreadable = TermIndexError::Open(QueryError::Unsupported("format".into()));
+        assert!(matches!(
+            BuildError::from(unreadable),
+            BuildError::Unsupported(_)
+        ));
+        let timeout = TermIndexError::Storage(StorageError::TransientExhausted {
             uri: "u".into(),
             source: "boom".into(),
         });
@@ -938,6 +1048,29 @@ mod tests {
         assert!(matches!(
             QueryError::from(ReadError::Fts(Box::new(FtsError::NegationOnly))),
             QueryError::InvalidQuery(_)
+        ));
+        assert!(matches!(
+            QueryError::from(ReadError::Fts(Box::new(FtsError::IndexTooOld {
+                version: 5
+            }))),
+            QueryError::Unsupported(_)
+        ));
+        assert!(matches!(
+            QueryError::from(ReadError::RemovedAnalyzer {
+                column: "body".into(),
+                analyzer: "ascii_lower".into(),
+            }),
+            QueryError::Unsupported(_)
+        ));
+        // Also when the FTS reader raised it while opening the column.
+        assert!(matches!(
+            QueryError::from(ReadError::Fts(Box::new(FtsError::Read(
+                ReadError::RemovedAnalyzer {
+                    column: "body".into(),
+                    analyzer: "ascii_lower".into(),
+                }
+            )))),
+            QueryError::Unsupported(_)
         ));
         // A local doc id past the end is our bug: retrying the read cannot help.
         assert!(matches!(

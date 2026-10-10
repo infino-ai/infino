@@ -10,7 +10,10 @@
 //! filled with nulls, and anything else is refused as a whole. A type
 //! never changes from a batch; that takes a schema write.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use arrow_array::{ArrayRef, RecordBatch, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
@@ -150,21 +153,20 @@ pub fn union_schema<'a>(
     id_column: &str,
 ) -> Result<Option<TableSchema>, SchemaError> {
     let mut added: Vec<AddColumn> = Vec::new();
+    let mut added_at: HashMap<String, usize> = HashMap::new();
     for batch in batches {
         for field in batch.schema().fields() {
             if field.name() == id_column {
                 continue;
             }
-            let frozen = match current.id_of(field.name()) {
-                Some(id) => current
-                    .fields()
-                    .iter()
-                    .find(|f| f.id == id)
-                    .map(|f| &f.data_type),
-                None => added
-                    .iter()
-                    .find(|a| a.name == *field.name())
-                    .map(|a| &a.data_type),
+            // The table's own lookup by name, which is a hash; `added`
+            // carries the columns this commit is adding, which no schema
+            // knows about yet.
+            let frozen = match current.field_named(field.name()) {
+                Some(f) => Some(&f.data_type),
+                None => added_at
+                    .get(field.name().as_str())
+                    .map(|&i| &added[i].data_type),
             };
             match frozen {
                 Some(frozen) if frozen != field.data_type() => {
@@ -175,12 +177,15 @@ pub fn union_schema<'a>(
                     });
                 }
                 Some(_) => {}
-                None => added.push(AddColumn {
-                    name: field.name().clone(),
-                    data_type: field.data_type().clone(),
-                    index: requested_index(field)?,
-                    metadata: user_metadata(field),
-                }),
+                None => {
+                    added_at.insert(field.name().clone(), added.len());
+                    added.push(AddColumn {
+                        name: field.name().clone(),
+                        data_type: field.data_type().clone(),
+                        index: requested_index(field)?,
+                        metadata: user_metadata(field),
+                    });
+                }
             }
         }
     }

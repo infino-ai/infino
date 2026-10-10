@@ -26,7 +26,6 @@ use crate::{
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
             list::RoutingRef,
             term_index::{self, STORAGE_PREFIX as TERM_INDEX_STORAGE_PREFIX},
-            term_stats::STORAGE_PREFIX as TERM_STATS_STORAGE_PREFIX,
         },
         slow_vector_state::{self, STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX},
         wal::persistence::{SUPERFILES_DIR, WalStore},
@@ -130,7 +129,6 @@ fn list_refs(manifest: &ManifestSnapshot) -> impl Iterator<Item = &str> {
         manifest
             .slow_vector_state_centroid_graph_blob()
             .map(|r| r.uri.as_str()),
-        manifest.term_stats_blob().map(|r| r.uri.as_str()),
         manifest.term_index_ref().map(|r| r.uri.as_str()),
     ]
     .into_iter()
@@ -371,7 +369,6 @@ pub(super) async fn gc_storage_sweep_for_inner(
         MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
-        TERM_STATS_STORAGE_PREFIX,
         TERM_INDEX_STORAGE_PREFIX,
         // Tombstone sidecars under `superfiles/` (live set includes the
         // paths for current superfiles; orphans age out past the safety gap).
@@ -778,7 +775,6 @@ mod tests {
                 slow_vector_state_centroids: None,
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
-                term_stats: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: vec![ManifestPartEntry {
@@ -856,7 +852,6 @@ mod tests {
                 }),
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
-                term_stats: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: Vec::new(),
@@ -926,7 +921,6 @@ mod tests {
                     uri: centroid_graph_uri.clone(),
                     content_hash: centroid_graph_hash,
                 }),
-                term_stats: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: Vec::new(),

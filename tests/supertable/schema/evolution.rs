@@ -803,7 +803,6 @@ fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
                 FieldPatch::named("body")
                     .with_type(DataType::LargeUtf8)
                     .with_index(ColumnIndex::Fts {
-                        analyzer: "standard".into(),
                         stopwords: Stopwords::None,
                         stemmer: Stemmer::None,
                         positions: false,
@@ -834,7 +833,6 @@ fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
                 FieldPatch::named("title")
                     .with_id(id_of(&with_body, "title"))
                     .with_index(ColumnIndex::Fts {
-                        analyzer: "standard".into(),
                         stopwords: Stopwords::None,
                         stemmer: Stemmer::None,
                         positions: false,
@@ -950,5 +948,176 @@ fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
             "second|20|null",
             "third|null|the quick fox"
         ]
+    );
+}
+
+/// A projection that names only columns the hit's file predates resolves to
+/// no stored column in that file, so the read returns no columns at all. It
+/// must still report how many rows it covered, because that count is what
+/// the caller null-fills from: a batch carrying neither columns nor a stated
+/// row count cannot say. Mixed projections never hit this; an all-missing
+/// one failed the whole search.
+#[test]
+fn a_search_projecting_only_a_newer_column_reads_it_as_null() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(vec![Field::new(
+                "body",
+                DataType::LargeUtf8,
+                true,
+            )])),
+            IndexSpec::new().fts("body"),
+        )
+        .expect("create");
+
+    // This file predates `title` entirely.
+    docs.append_rows(&[serde_json::json!({"body": "the quick fox"})])
+        .expect("append");
+
+    db.apply_schema(
+        TABLE,
+        &SchemaPatch::new(vec![
+            FieldPatch::named("title").with_type(DataType::LargeUtf8),
+        ]),
+        None,
+    )
+    .expect("add a column the written file cannot hold");
+
+    let hits = docs
+        .bm25_search("body", "fox", 10, Default::default(), Some(&["title"]))
+        .expect("a projection of only the newer column still reads");
+    assert_eq!(
+        hits.iter().map(|b| b.num_rows()).sum::<usize>(),
+        1,
+        "the hit is returned"
+    );
+    for b in &hits {
+        let column = b.column_by_name("title").expect("the projected column");
+        for row in 0..b.num_rows() {
+            assert!(column.is_null(row), "a column the file predates reads null");
+        }
+    }
+}
+
+/// How many columns the writer adds while the reader runs. Enough that the
+/// reader lands mid-flight many times over, few enough to stay quick.
+const RACE_GENERATIONS: usize = 24;
+
+/// A reader running *while* the schema moves only ever sees a coherent
+/// snapshot: the columns the manifest names and the data behind them land
+/// under one pointer, so a reader selecting exactly what the schema reports
+/// never finds a column with no data or data under a column the schema has
+/// not got.
+///
+/// The other tests here drive the race by hand — two handles appending in
+/// turn — which pins the resolution but never the window. This one has a
+/// second thread reading continuously while the first commits, so the reader
+/// genuinely observes whatever intermediate states exist.
+#[test]
+fn a_reader_running_while_the_schema_grows_sees_only_coherent_snapshots() {
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        thread,
+    };
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().to_str().expect("utf8 path");
+    let db = connect(path).expect("connect");
+    db.create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
+        .expect("create");
+
+    let writing = Arc::new(AtomicBool::new(true));
+    let writer_done = Arc::clone(&writing);
+    let writer_path = path.to_owned();
+    let writer = thread::spawn(move || {
+        let db = connect(&writer_path).expect("connect");
+        let table = db.open_table(TABLE).expect("open");
+        for generation in 0..RACE_GENERATIONS {
+            // Each append adds a column the table has never had, so every
+            // commit publishes a new schema and the rows that introduced it
+            // together.
+            let column = format!("c{generation}");
+            table
+                .append(&batch(vec![
+                    ("title", titles(&["row"])),
+                    (column.as_str(), ints(vec![Some(generation as i64)])),
+                ]))
+                .expect("the writer's append");
+        }
+        writer_done.store(false, Ordering::SeqCst);
+    });
+
+    let mut reads = 0usize;
+    let mut widest = 0usize;
+    let mut rows_seen = 0usize;
+    while writing.load(Ordering::SeqCst) {
+        // A fresh connection each pass, so the reader sees the pointer move
+        // rather than a handle's cached manifest.
+        let reader = connect(path).expect("connect");
+        let document = reader.schema(TABLE).expect("schema");
+        let columns: Vec<&str> = document.fields().iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            columns.first() == Some(&"title"),
+            "the declared column is always there: {columns:?}"
+        );
+
+        // Selecting exactly what the schema reports must work. A torn
+        // snapshot shows up here: a column the manifest names whose data
+        // never landed cannot be read, and a file holding a column the
+        // schema has not got would not be projectable by name.
+        let sql = format!("SELECT {} FROM {TABLE}", columns.join(", "));
+        let out = rows(&reader, &sql);
+
+        // Every row carries one value per column the schema names, so the
+        // manifest and the files agree about the table's width.
+        for row in &out {
+            assert_eq!(
+                row.split('|').count(),
+                columns.len(),
+                "row {row:?} against columns {columns:?}"
+            );
+        }
+
+        // Neither the width nor the row count ever goes backwards: a reader
+        // moves from one committed generation to a later one, never to a
+        // partial one.
+        assert!(
+            columns.len() >= widest,
+            "the schema narrowed from {widest} to {}",
+            columns.len()
+        );
+        assert!(
+            out.len() >= rows_seen,
+            "the table lost rows: {} after {rows_seen}",
+            out.len()
+        );
+        widest = columns.len();
+        rows_seen = out.len();
+        reads += 1;
+    }
+    writer.join().expect("the writer thread");
+
+    assert!(reads > 0, "the reader never got a pass in");
+    // The reader must have actually observed the schema moving, or it proved
+    // nothing about the race.
+    assert!(
+        widest > 1,
+        "the reader only ever saw the table at its declared width"
+    );
+
+    // Everything the writer committed is there at the end.
+    let fresh = connect(path).expect("connect");
+    let document = fresh.schema(TABLE).expect("schema");
+    assert_eq!(
+        document.fields().len(),
+        RACE_GENERATIONS + 1,
+        "title plus one column per generation"
+    );
+    assert_eq!(
+        rows(&fresh, &format!("SELECT title FROM {TABLE}")).len(),
+        RACE_GENERATIONS,
+        "one row per generation"
     );
 }

@@ -525,6 +525,9 @@ impl TableSchema {
             next.apply_one(change)?;
         }
         next.schema_id += 1;
+        // The changes moved `fields`; the index that follows them is rebuilt
+        // once here rather than per change.
+        next.reindex();
         Ok(next)
     }
 
@@ -748,7 +751,65 @@ mod tests {
     use arrow_schema::{Field, Schema, TimeUnit};
 
     use super::*;
-    use crate::superfile::builder::FtsConfig;
+    use crate::superfile::{builder::FtsConfig, fts::analysis::Stopwords};
+
+    /// The name index follows every change that moves a name, or a lookup
+    /// answers for a column that is no longer there. It is derived state,
+    /// so nothing fails loudly when it goes stale: a rename would keep
+    /// answering under the old name, and a drop would keep answering at all.
+    #[test]
+    fn the_name_index_follows_every_change() {
+        let t = table();
+        let before: Vec<String> = t.fields().iter().map(|f| f.name.clone()).collect();
+        for name in &before {
+            assert_eq!(
+                t.field_named(name).map(|f| f.id),
+                t.id_of(name),
+                "{name}: the index and the id agree to begin with"
+            );
+        }
+
+        let added = t
+            .apply(&[SchemaChange::AddColumn {
+                name: "tag".into(),
+                data_type: DataType::LargeUtf8,
+                nullable: true,
+                index: None,
+                metadata: BTreeMap::new(),
+            }])
+            .expect("add");
+        let tag = added.id_of("tag").expect("the added column is findable");
+
+        let renamed = added
+            .apply(&[SchemaChange::RenameColumn {
+                id: tag,
+                to: "label".into(),
+            }])
+            .expect("rename");
+        assert_eq!(renamed.id_of("label"), Some(tag), "the new name finds it");
+        assert_eq!(renamed.id_of("tag"), None, "the old name finds nothing");
+        assert_eq!(
+            renamed.field_named("label").map(|f| f.id),
+            Some(tag),
+            "and the column it finds is the one that moved"
+        );
+
+        let dropped = renamed
+            .apply(&[SchemaChange::DropColumn { id: tag }])
+            .expect("drop");
+        assert_eq!(dropped.id_of("label"), None, "a dropped column is gone");
+        assert!(dropped.field_named("label").is_none());
+
+        // Every live column still answers, and answers for itself.
+        for field in dropped.fields() {
+            assert_eq!(
+                dropped.field_named(&field.name).map(|f| f.id),
+                Some(field.id),
+                "{}: each name finds its own column",
+                field.name
+            );
+        }
+    }
 
     fn table() -> TableSchema {
         TableSchema::from_options(
@@ -914,11 +975,10 @@ mod tests {
             merge(&t, &id_col, ctx(false)),
             Err(SchemaError::NameTaken { .. })
         ));
-        let analyzer = SchemaPatch {
+        let analysis = SchemaPatch {
             fields: vec![FieldPatch {
                 index: Some(ColumnIndex::Fts {
-                    analyzer: "ascii_lower".into(),
-                    stopwords: Default::default(),
+                    stopwords: Stopwords::English,
                     stemmer: Default::default(),
                     positions: false,
                     stored: true,
@@ -930,7 +990,7 @@ mod tests {
             max_depth: None,
         };
         assert!(matches!(
-            merge(&t, &analyzer, ctx(false)),
+            merge(&t, &analysis, ctx(false)),
             Err(SchemaError::IdentityChange { .. })
         ));
         let tighten = SchemaPatch {

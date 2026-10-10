@@ -31,7 +31,8 @@ use std::{
 
 use arrow::compute::{concat_batches, take};
 use arrow_array::{
-    Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchReader, UInt32Array,
+    Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchOptions,
+    RecordBatchReader, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
@@ -40,8 +41,8 @@ use parquet::{
     arrow::{
         ProjectionMask,
         arrow_reader::{
-            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
-            RowSelector,
+            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+            ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
         },
         async_reader::MetadataFetch,
         parquet_to_arrow_schema,
@@ -77,30 +78,13 @@ use crate::{
         },
     },
     supertable::{query::provider::tombstone_access_plan, schema::FieldId},
-    utils::terms::FstValue,
+    utils::terms::DictEntry,
 };
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
 /// row group's column metadata — a few KiB to a few tens of KiB) in
 /// one range GET, so the cold open usually costs a single round-trip.
 const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
-
-/// The `inf.builder` value this superfile records — the engine that
-/// wrote it — or `None` on a file that carries no such key.
-///
-/// Read from the footer's key-value list rather than a parsed map, and so
-/// dependent on a rewrite having stripped the carried file's keys before
-/// appending its own; otherwise the first match would be the previous
-/// writer's.
-pub(crate) fn writer_builder_of(metadata: &ParquetMetaData) -> Option<&str> {
-    metadata
-        .file_metadata()
-        .key_value_metadata()?
-        .iter()
-        .find(|entry| entry.key == kv::BUILDER)?
-        .value
-        .as_deref()
-}
 
 pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorLayout {
     kv_map
@@ -116,7 +100,7 @@ pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorL
 pub struct OpenOptions {
     /// Verify all CRC32C checksums on open: the embedded
     /// vector blob's whole-blob + per-subsection CRCs, and
-    /// the embedded FTS blob's four per-section CRCs (FST,
+    /// the embedded FTS blob's four per-section CRCs (term dictionary,
     /// postings region, doc-lengths directory, per-column
     /// doc-lengths arrays). Defaults to `true`; the
     /// argumentless [`SuperfileReader::open`] uses this
@@ -876,11 +860,32 @@ impl SuperfileReader {
         self.bytes = Some(bytes);
         Ok(())
     }
-    /// Returns a record batch containing all documents with all columns
+    /// Returns a record batch containing all documents with all columns.
+    /// Test-only: joining the batches overflows a `Utf8` column past 2 GiB,
+    /// so production code reads with `record_batches`.
+    #[cfg(test)]
     pub fn get_record_batch(
         &self,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<RecordBatch, ReadError> {
+        let reader = self.record_batches(deleted_docs_bitmap)?;
+        let read_schema = reader.schema();
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        let record_batch = concat_batches(&read_schema, &batches)
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+
+        Ok(record_batch)
+    }
+
+    /// All documents (minus `deleted_docs_bitmap`) with all columns, one
+    /// decoded batch at a time. The batches are never joined, so a string column past 2 GiB, more than
+    /// one `Utf8` array's 32-bit offsets can hold, still reads.
+    pub(crate) fn record_batches(
+        &self,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+    ) -> Result<ParquetRecordBatchReader, ReadError> {
         let bytes = self
             .bytes
             .as_ref()
@@ -910,17 +915,9 @@ impl SuperfileReader {
                 builder = builder.with_row_selection(selection);
             }
         }
-        let reader = builder
+        builder
             .build()
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
-        let read_schema = reader.schema();
-        let batches = reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
-        let record_batch = concat_batches(&read_schema, &batches)
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
-
-        Ok(record_batch)
+            .map_err(|e| ReadError::Columnar(e.to_string()))
     }
 
     /// A [`LazyByteSource`] over the **entire** superfile, regardless of
@@ -1122,7 +1119,17 @@ impl SuperfileReader {
                 .map_err(|e| ReadError::Columnar(e.to_string()))?;
             columns.push(taken);
         }
-        RecordBatch::try_new(out_schema, columns).map_err(|e| ReadError::Columnar(e.to_string()))
+        // The row count is carried explicitly rather than inferred from the
+        // columns: a projection can legitimately resolve to no columns at
+        // all — a caller naming only columns this file predates — and a
+        // batch with neither columns nor a stated row count cannot say how
+        // many rows it has. The caller null-fills from this count.
+        RecordBatch::try_new_with_options(
+            out_schema,
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(local_doc_ids.len())),
+        )
+        .map_err(|e| ReadError::Columnar(e.to_string()))
     }
 
     /// Build the `_id` column for `local_doc_ids` (in caller order) from the
@@ -1320,7 +1327,7 @@ impl SuperfileReader {
         mode: BoolMode,
     ) -> Result<Vec<(RowId, f32)>, ReadError> {
         // Tokenize with the target column's configured tokenizer so query
-        // terms match how the column was indexed (ascii_lower / standard).
+        // terms match how the column was indexed (its analysis chain).
         // A column this superfile has no full-text index for fails here,
         // where the reason is still nameable, rather than after a pass with
         // some other column's analyzer.
@@ -1367,7 +1374,7 @@ impl SuperfileReader {
 
     /// Pre-tokenized variant of [`Self::bm25_hits_async`] — the caller
     /// supplies the already-tokenized term slice and we skip the
-    /// `AsciiLowerTokenizer` pass.
+    /// tokenizer pass.
     ///
     /// Used by the supertable layer's fan-out: the cross-superfile
     /// search tokenizes the query once at the orchestrator (to
@@ -1376,10 +1383,9 @@ impl SuperfileReader {
     /// `(N+1)·T` redundant tokenizations across N superfiles and
     /// a T-token query.
     ///
-    /// Terms must already be tokenized to the column's FST key form —
-    /// e.g. `AsciiLowerTokenizer.tokenize(query)` for an `ascii_lower`
-    /// column (already-lowercased ASCII alphanumerics) or
-    /// `StandardTokenizer.tokenize(query)` for a `standard` column.
+    /// Terms must already be tokenized to the column's dictionary key form —
+    /// the column's own tokenizer, e.g. `StandardTokenizer.tokenize(query)`
+    /// for a plain `standard` column.
     pub async fn bm25_search_pretokenized(
         &self,
         column: &str,
@@ -1575,7 +1581,7 @@ impl SuperfileReader {
     /// [`FtsReader::memo_from_dict_values`].
     pub(crate) async fn term_memo_from_dict_values(
         &self,
-        terms: &[(&str, u64, FstValue)],
+        terms: &[(&str, u64, DictEntry)],
     ) -> Result<FetchedTermMemo, ReadError> {
         let fts = self
             .fts()
@@ -1598,10 +1604,10 @@ impl SuperfileReader {
         Ok(fts.term_index_facts(column, tokens).await?)
     }
 
-    /// Document frequency of each of `tokens` in `column`, in input order
-    /// (0 for any absent token). Batched sibling of [`Self::term_df`]:
-    /// resolves the whole set with one FST parse and one coalesced header
-    /// fetch. Delegates to [`FtsReader::term_dfs`].
+    /// Document frequency of each of `tokens` in `column`, in input order (0
+    /// for any absent token). Batched sibling of [`Self::term_df`]: resolves
+    /// the whole set with one dictionary parse and one coalesced header fetch.
+    /// Delegates to [`FtsReader::term_dfs`].
     pub async fn term_dfs(
         &self,
         column: &str,
@@ -1781,10 +1787,9 @@ impl SuperfileReader {
     ///
     /// Expands `prefix` to the lex-ordered list of indexed terms
     /// in `column` whose tokenized form begins with `prefix`,
-    /// then runs `BoolMode::Or` BM25 over that term set. Matches
-    /// the v1 tokenizer convention: the FST stores
-    /// AsciiLowerTokenizer-tokenized terms, so the prefix is
-    /// ASCII-lowercased before expansion. Whitespace inside
+    /// then runs `BoolMode::Or` BM25 over that term set. The term dictionary
+    /// stores lowercased terms, so the prefix is ASCII-lowercased
+    /// before expansion. Whitespace inside
     /// `prefix` is **not** split — prefix search is a single
     /// term-level prefix, not a query parser.
     ///
@@ -1808,16 +1813,16 @@ impl SuperfileReader {
         }
         let lowered = prefix.to_ascii_lowercase();
         // The dictionary walk is CPU work and runs on the reader pool; the
-        // FST fetch it needs stays on this runtime.
+        // dictionary fetch it needs stays on this runtime.
         let term_bytes = fts
             .terms_with_prefix(column, lowered.as_bytes(), pool)
             .await?;
         if term_bytes.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
-        // FST keys are valid UTF-8 by construction (AsciiLower
-        // tokenizer only emits ASCII bytes); the from_utf8 below
-        // is a typed pass-through, not a re-validation cost.
+        // Dictionary keys are valid UTF-8 by construction (a tokenizer
+        // emits `&str` terms); the from_utf8 below is a typed
+        // pass-through, not a re-validation cost.
         let term_strings: Vec<&str> = term_bytes
             .iter()
             .filter_map(|b| str::from_utf8(b).ok())
@@ -1907,7 +1912,7 @@ impl SuperfileReader {
             .await?)
     }
 
-    /// Expand `prefix` via the FST and build its OR cursor set, for
+    /// Expand `prefix` via the term dictionary and build its OR cursor set, for
     /// reuse across this superfile's doc-id sub-ranges via
     /// [`Self::bm25_search_or_range_prebuilt`].
     pub(crate) async fn bm25_prefix_cursor_set(
@@ -1923,9 +1928,9 @@ impl SuperfileReader {
         let term_bytes = fts
             .terms_with_prefix(column, lowered.as_bytes(), pool)
             .await?;
-        // FST keys are valid UTF-8 by construction (AsciiLower
-        // tokenizer only emits ASCII bytes); the from_utf8 below
-        // is a typed pass-through, not a re-validation cost.
+        // FST keys are valid UTF-8 by construction (a tokenizer
+        // emits `&str` terms); the from_utf8 below is a typed
+        // pass-through, not a re-validation cost.
         let term_strings: Vec<&str> = term_bytes
             .iter()
             .filter_map(|b| str::from_utf8(b).ok())
@@ -1954,7 +1959,7 @@ impl SuperfileReader {
     /// Prefix-expanded BM25 search restricted to a doc_id sub-range.
     ///
     /// Same expansion logic as [`Self::bm25_search_prefix`] —
-    /// AsciiLower the prefix, walk the FST for matching terms, run
+    /// lowercase the prefix, walk the term dictionary for matching terms, run
     /// BM25 OR over the term set — but only docs in
     /// `[doc_id_start, doc_id_end)` are eligible. A single-call wrapper
     /// around [`Self::bm25_prefix_cursor_set`] +
@@ -3740,9 +3745,8 @@ mod tests {
     async fn exact_match_on_a_column_without_a_full_text_index_errors() {
         // `exact_match` prunes through the column's own term dictionary,
         // so a column with no full-text index — here the Decimal128
-        // `doc_id` — is rejected by name. It used to tokenize the value
-        // with a fallback analyzer and fail later on the text downcast,
-        // which said nothing about the real problem.
+        // `doc_id` — is rejected by name rather than failing later on a
+        // text downcast that says nothing about the real problem.
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
         let err = r

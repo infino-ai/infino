@@ -202,6 +202,14 @@ impl<'a> Column<'a> {
     }
 }
 
+/// Whether `path` names a live column the table stores as a struct, which is
+/// what stops [`flatten`] descending into the object that fills it.
+fn is_struct_column(schema: &TableSchema, path: &str) -> bool {
+    schema
+        .field_named(path)
+        .is_some_and(|f| matches!(f.data_type, DataType::Struct(_)))
+}
+
 /// The live column a flattened `path` nests under, if any: `a.b.c` checks
 /// `a` and `a.b`. Documents flatten, so such a path cannot fill the column
 /// it nests under.
@@ -229,14 +237,6 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
     // more distinct keys than the table admits is refused before its
     // columns exist, not after they have been allocated.
     let live_fields = schema.fields().len() as u32;
-    // Whether `path` names a live column stored as a struct, which is what
-    // stops `flatten` descending into the object that fills it.
-    let is_struct_column = |path: &str| {
-        schema
-            .id_of(path)
-            .and_then(|id| schema.fields().iter().find(|f| f.id == id))
-            .is_some_and(|f| matches!(f.data_type, DataType::Struct(_)))
-    };
     let mut new_paths: Vec<String> = Vec::new();
     for (row, value) in rows.iter().enumerate() {
         let object = value.as_object().ok_or_else(|| SchemaError::InvalidRow {
@@ -244,14 +244,7 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
             reason: "a row is a JSON object".to_owned(),
         })?;
         let mut leaves = Vec::new();
-        flatten(
-            object,
-            "",
-            1,
-            schema.max_depth(),
-            &mut leaves,
-            &is_struct_column,
-        )?;
+        flatten(object, "", schema, &mut leaves)?;
         for (path, leaf) in leaves {
             let index = match by_path.get(&path) {
                 Some(&i) => i,
@@ -311,13 +304,9 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
         let metadata = HashMap::new();
         // A path the table already has is written in that column's type; a
         // path it does not is inferred from the values.
-        let target = schema.id_of(&column.path).and_then(|id| {
-            schema
-                .fields()
-                .iter()
-                .find(|f| f.id == id)
-                .map(|f| f.data_type.clone())
-        });
+        let target = schema
+            .field_named(&column.path)
+            .map(|f| f.data_type.clone());
         if column.kinds.is_empty() {
             // Only empty arrays. On a list column the table already has,
             // that is a row of empty lists and the column's own type says
@@ -425,22 +414,41 @@ fn json_kind_name(value: &Value) -> &'static str {
     }
 }
 
-/// Flatten `object` to dot paths under `prefix`. `depth` is the object's
-/// nesting level, `1` for a document itself.
+/// Flatten `object` to dot paths under `prefix`.
 fn flatten<'a>(
     object: &'a Map<String, Value>,
     prefix: &str,
-    depth: u32,
-    max_depth: u32,
+    schema: &TableSchema,
     out: &mut Vec<(String, Leaf<'a>)>,
-    structs: &dyn Fn(&str) -> bool,
 ) -> Result<(), SchemaError> {
+    let max_depth = schema.max_depth();
+    let max_fields = schema.max_fields();
     for (key, value) in object {
         let path = if prefix.is_empty() {
             key.clone()
         } else {
             format!("{prefix}.{key}")
         };
+        // The one depth check, on the path rather than on the nesting that
+        // produced it. `{"a.b": 1}` and `{"a": {"b": 1}}` reach the same
+        // column, so the cap counts the dots in the path and neither
+        // spelling buys depth the other is refused. The path already carries
+        // every level the recursion has descended, so there is nothing a
+        // separate nesting counter could add.
+        //
+        // Skipped for a path the table has. The cap bounds how deep a
+        // document may *grow* the schema, not how deep a column's name may
+        // be: only `schema_ipc` or a patch can declare a column called
+        // `a.b.c`, both of which need `manage`, and a write into it adds
+        // nothing to bound.
+        if schema.id_of(&path).is_none()
+            && path.chars().filter(|c| *c == '.').count() as u32 + 1 > max_depth
+        {
+            return Err(SchemaError::DepthExceeded {
+                cap: max_depth,
+                path,
+            });
+        }
         match value {
             Value::Null => {}
             Value::Object(inner) => {
@@ -448,17 +456,11 @@ fn flatten<'a>(
                 // whole. Flattening past it would make `image.url` a second
                 // column beside `image` and leave the declared one null,
                 // which is what `live_prefix_of` refuses.
-                if structs(&path) {
+                if is_struct_column(schema, &path) {
                     out.push((path, Leaf::Object(value)));
                     continue;
                 }
-                if depth + 1 > max_depth {
-                    return Err(SchemaError::DepthExceeded {
-                        cap: max_depth,
-                        path,
-                    });
-                }
-                flatten(inner, &path, depth + 1, max_depth, out, structs)?;
+                flatten(inner, &path, schema, out)?;
             }
             Value::Array(items) => {
                 if items.is_empty() {
@@ -478,17 +480,23 @@ fn flatten<'a>(
                     // the array; packing the values instead would make the
                     // lists disagree about what a position means as soon as
                     // two elements carried different keys.
+                    // Indexed by path, not scanned: one element carrying P
+                    // keys used to cost P comparisons per leaf, so an element
+                    // with many keys spent P^2 before the field cap could
+                    // refuse it. The cap is checked as paths appear, below,
+                    // for the same reason — a body is bounded while it is
+                    // read, not after it has been read.
                     let mut per_path: Vec<(String, Vec<Option<&'a Value>>)> = Vec::new();
+                    // Leaves of this array the table does not have, which are
+                    // the columns it would add.
+                    let mut added = 0u32;
+                    // Keyed by an owned path: a borrow into `per_path` would
+                    // dangle the moment a push reallocates it.
+                    let mut at_path: HashMap<String, usize> = HashMap::new();
                     for (element, item) in items.iter().enumerate() {
                         let mut leaves = Vec::new();
                         let inner = item.as_object().expect("every item is an object");
-                        if depth + 1 > max_depth {
-                            return Err(SchemaError::DepthExceeded {
-                                cap: max_depth,
-                                path,
-                            });
-                        }
-                        flatten(inner, &path, depth + 1, max_depth, &mut leaves, structs)?;
+                        flatten(inner, &path, schema, &mut leaves)?;
                         let before: Vec<usize> = per_path.iter().map(|(_, v)| v.len()).collect();
                         for (leaf_path, leaf) in leaves {
                             let values = match leaf {
@@ -506,13 +514,38 @@ fn flatten<'a>(
                                     return Err(SchemaError::NestedArray { path: leaf_path });
                                 }
                             };
-                            match per_path.iter_mut().find(|(p, _)| *p == leaf_path) {
-                                Some((_, all)) => all.extend(values),
+                            match at_path.get(leaf_path.as_str()) {
+                                Some(&index) => per_path[index].1.extend(values),
                                 None => {
+                                    // A leaf the table does not have is a
+                                    // column the resolver would add, and the
+                                    // cap bounds those here rather than after
+                                    // the whole document is flattened: the
+                                    // null-fill below costs one slot per
+                                    // element already seen, so an array of
+                                    // distinct keys is quadratic long before
+                                    // the check after `flatten` is reached.
+                                    //
+                                    // Counted against the table's live
+                                    // fields, not against this array's leaf
+                                    // count: a row whose leaves all exist
+                                    // adds nothing, whatever the cap is now.
+                                    if schema.id_of(&leaf_path).is_none() {
+                                        added += 1;
+                                        let live = schema.fields().len() as u32;
+                                        if live + added > max_fields {
+                                            return Err(SchemaError::FieldCapExceeded {
+                                                cap: max_fields,
+                                                current: live,
+                                                fields: vec![leaf_path],
+                                            });
+                                        }
+                                    }
                                     // A path first seen on a later element
                                     // is null in the elements before it.
                                     let mut all = vec![None; element];
                                     all.extend(values);
+                                    at_path.insert(leaf_path.clone(), per_path.len());
                                     per_path.push((leaf_path, all));
                                 }
                             }
@@ -1343,7 +1376,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::supertable::schema::resolve::resolve_batch;
+    use crate::supertable::schema::{change::SchemaChange, resolve::resolve_batch};
 
     fn table(fields: Vec<(&str, DataType)>) -> TableSchema {
         TableSchema::from_user_schema(&Schema::new(
@@ -1595,7 +1628,9 @@ mod tests {
     fn depth_is_capped_and_an_empty_document_adds_nothing() {
         let t = table(vec![]);
         let deep = json!({"a": {"b": {"c": {"d": 1}}}});
-        // Depth counts objects: the document is 1, `a` 2, `b` 3, `c` 4.
+        // Depth counts the path's segments: `a.b.c.d` is four, however the
+        // document spelled it. The refusal names the path that is too deep,
+        // not the one it nests under.
         let mut doc = t.to_json();
         doc["max_depth"] = json!(4);
         let four = TableSchema::from_json(&doc).expect("schema");
@@ -1604,7 +1639,7 @@ mod tests {
         let three = TableSchema::from_json(&doc).expect("schema");
         assert!(matches!(
             rows_to_batch(&[deep], &three),
-            Err(SchemaError::DepthExceeded { cap: 3, path }) if path == "a.b.c"
+            Err(SchemaError::DepthExceeded { cap: 3, path }) if path == "a.b.c.d"
         ));
         let empty = rows_to_batch(&[json!({}), json!({"z": null, "e": []})], &t).expect("map");
         assert_eq!(empty.num_columns(), 0);
@@ -2567,5 +2602,184 @@ mod tests {
         rows_to_batch(&[json!({"d": "1.5"})], &wide).expect("Decimal256 reads");
         let whole = table(vec![("d", DataType::Decimal128(10, 0))]);
         rows_to_batch(&[json!({"d": 12})], &whole).expect("scale 0 reads");
+    }
+
+    /// The cap bounds how deep a document may *grow* the schema, so it does
+    /// not apply to a column the table already has. A column called `a.b.c`
+    /// can only be declared through `schema_ipc` or a patch, both of which
+    /// need `manage`; a write into it adds nothing to bound, and refusing it
+    /// would break a producer that wrote dotted keys before the cap counted
+    /// them.
+    #[test]
+    fn the_depth_cap_does_not_apply_to_a_column_the_table_has() {
+        let declared = TableSchema::from_user_schema(&Schema::new(vec![Field::new(
+            "a.b.c",
+            DataType::Int64,
+            true,
+        )]))
+        .apply(&[SchemaChange::SetMaxDepth(2)])
+        .expect("set the cap");
+
+        // Either spelling, since both reach the same column.
+        for row in [json!({"a.b.c": 1}), json!({"a": {"b": {"c": 1}}})] {
+            let batch = rows_to_batch(std::slice::from_ref(&row), &declared)
+                .unwrap_or_else(|e| panic!("{row}: a write into a declared column: {e}"));
+            assert_eq!(types(&batch)["a.b.c"], DataType::Int64, "{row}");
+        }
+
+        // A path the table does not have is still bounded, which is what the
+        // cap is for.
+        let err = rows_to_batch(&[json!({"x.y.z": 1})], &declared)
+            .expect_err("a new path past the cap is refused");
+        assert_eq!(err.kind(), "DepthExceeded");
+    }
+
+    /// Nesting that reaches no key past the cap adds no path, so there is
+    /// nothing to bound. The checks on the nesting that used to sit beside
+    /// the one on the path refused these before any key was looked at.
+    ///
+    /// A key *is* a path, so `{"a": {"b": {}}}` is still refused at `a.b`
+    /// under a cap of one: the document named that path, whatever its value
+    /// turned out to yield.
+    #[test]
+    fn nesting_that_reaches_no_key_is_not_capped() {
+        let shallow = TableSchema::from_user_schema(&Schema::new(Vec::<Field>::new()))
+            .apply(&[SchemaChange::SetMaxDepth(1)])
+            .expect("set the cap");
+        for row in [json!({"a": {}}), json!({"x": [{}]})] {
+            let batch = rows_to_batch(std::slice::from_ref(&row), &shallow)
+                .unwrap_or_else(|e| panic!("{row}: {e}"));
+            assert_eq!(batch.num_columns(), 0, "{row}: no column was added");
+        }
+    }
+
+    /// A dotted key is nesting the caller spelled out, and reaches the same
+    /// column as the nested form. The depth cap counts the path, so neither
+    /// spelling buys depth the other is refused.
+    #[test]
+    fn a_dotted_key_counts_toward_the_depth_cap() {
+        let mut shallow = TableSchema::from_user_schema(&Schema::new(Vec::<Field>::new()));
+        shallow = shallow
+            .apply(&[SchemaChange::SetMaxDepth(2)])
+            .expect("set the cap");
+
+        // Two levels is the cap, spelled either way.
+        rows_to_batch(&[json!({"a": {"b": 1}})], &shallow).expect("nested, at the cap");
+        rows_to_batch(&[json!({"a.b": 1})], &shallow).expect("dotted, at the cap");
+
+        // Three is past it, spelled either way, and the refusal names the
+        // same path both times — one check, on the path.
+        for row in [json!({"a": {"b": {"c": 1}}}), json!({"a.b.c": 1})] {
+            let err = rows_to_batch(std::slice::from_ref(&row), &shallow)
+                .expect_err("three levels is past the cap");
+            assert!(
+                matches!(&err, SchemaError::DepthExceeded { cap, path }
+                    if *cap == 2 && path == "a.b.c"),
+                "{row}: {err:?}"
+            );
+        }
+    }
+
+    /// Two spellings of one path in one document are two values for one
+    /// column, so the document is refused. Across rows they are one value
+    /// each and both land in the column they name.
+    #[test]
+    fn one_path_spelled_twice_is_refused_within_a_row_and_fine_across_rows() {
+        let t = table(Vec::new());
+        let err = rows_to_batch(&[json!({"a.b": 1, "a": {"b": 2}})], &t)
+            .expect_err("one document cannot carry two values for `a.b`");
+        assert_eq!(err.kind(), "InvalidRow");
+
+        let batch = rows_to_batch(&[json!({"a.b": 1}), json!({"a": {"b": 2}})], &t)
+            .expect("each row carries one value for `a.b`");
+        assert_eq!(batch.num_columns(), 1, "one column, not two");
+        assert_eq!(types(&batch)["a.b"], DataType::Int64);
+    }
+
+    /// The field cap bounds an array of objects while it is read. A single
+    /// element carrying more distinct keys than the table admits used to be
+    /// flattened whole first, and the lookup was a scan per leaf, so the
+    /// work before the refusal grew with the square of the keys.
+    #[test]
+    fn an_array_of_objects_is_bounded_by_the_field_cap_as_it_is_read() {
+        let mut capped = TableSchema::from_user_schema(&Schema::new(Vec::<Field>::new()));
+        capped = capped
+            .apply(&[SchemaChange::SetMaxFields(4)])
+            .expect("set the cap");
+        let wide: Map<String, Value> = (0..50).map(|i| (format!("k{i}"), json!(i))).collect();
+        let err = rows_to_batch(&[json!({"xs": [wide]})], &capped)
+            .expect_err("the element carries more leaves than the table admits");
+        assert_eq!(err.kind(), "FieldCapExceeded");
+    }
+
+    /// The bound is what keeps the null-fill from running away. Each new
+    /// leaf of an array of objects is filled with one null per element
+    /// already seen, so an array of distinct keys costs the square of its
+    /// length — and the check after `flatten` only runs once the whole
+    /// document has been flattened, which is too late. With the cap applied
+    /// as the leaves appear, the work stops at the cap however long the
+    /// array is.
+    #[test]
+    fn an_array_of_distinct_keys_stops_at_the_cap_however_long_it_is() {
+        const CAP: u32 = 64;
+        let capped = table(Vec::new())
+            .apply(&[SchemaChange::SetMaxFields(CAP)])
+            .expect("set the cap");
+        for length in [CAP as usize * 4, CAP as usize * 64] {
+            let items: Vec<Value> = (0..length).map(|i| json!({ format!("k{i}"): 0 })).collect();
+            let err = rows_to_batch(&[json!({"xs": items})], &capped)
+                .expect_err("an array of distinct keys is bounded by the cap");
+            assert!(
+                matches!(&err, SchemaError::FieldCapExceeded { cap, fields, .. }
+                    if *cap == CAP && fields == &[format!("xs.k{CAP}")]),
+                "length {length}: the refusal fires at the cap: {err:?}"
+            );
+        }
+    }
+
+    /// The cap counts columns the document would add, not the leaves the
+    /// array happens to carry. A row whose leaves the table already has adds
+    /// nothing, so it lands whatever the cap has since been lowered to —
+    /// counting the array's own leaves refused it, and reported the leaf
+    /// count as the table's width.
+    #[test]
+    fn an_array_whose_leaves_the_table_has_adds_nothing_to_count() {
+        let fields: Vec<(&str, DataType)> = vec![
+            ("xs.a", DataType::Int64),
+            ("xs.b", DataType::Int64),
+            ("xs.c", DataType::Int64),
+        ];
+        let narrowed = table(fields)
+            .apply(&[SchemaChange::SetMaxFields(2)])
+            .expect("a cap below the table's own width");
+        let batch = rows_to_batch(&[json!({"xs": [{"a": 1, "b": 2, "c": 3}]})], &narrowed)
+            .expect("every leaf exists, so the row adds no column");
+        assert_eq!(batch.num_columns(), 3);
+
+        // One leaf the table does not have is one column, and it is counted
+        // against the table's live width rather than the array's.
+        let err = rows_to_batch(&[json!({"xs": [{"a": 1, "d": 4}]})], &narrowed)
+            .expect_err("`xs.d` would be a fourth column under a cap of two");
+        assert!(
+            matches!(&err, SchemaError::FieldCapExceeded { cap, current, fields }
+                if *cap == 2 && *current == 3 && fields == &["xs.d".to_string()]),
+            "the refusal reports the table's width, not the array's: {err:?}"
+        );
+    }
+
+    /// Each refusal names its cause, so a caller can tell one from another
+    /// without reading the message. These are the ones a document can reach.
+    #[test]
+    fn every_refusal_a_document_reaches_names_its_kind() {
+        let t = table(vec![("n", DataType::Int64)]);
+        for (row, kind) in [
+            (json!({"xs": [1, "a"]}), "MixedArray"),
+            (json!({"n": {"deep": 1}}), "PathShadowsColumn"),
+            (json!({"a.b": 1, "a": {"b": 2}}), "InvalidRow"),
+        ] {
+            let err =
+                rows_to_batch(std::slice::from_ref(&row), &t).expect_err("the document is refused");
+            assert_eq!(err.kind(), kind, "{row}");
+        }
     }
 }

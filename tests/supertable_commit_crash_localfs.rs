@@ -79,7 +79,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use infino::{
-    CompactionSettings, GcSettings, VectorSearchOptions,
+    Bm25SearchOptions, CompactionSettings, GcSettings, VectorSearchOptions,
     config::{DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
     superfile::{
         builder::{FtsConfig, VectorConfig},
@@ -102,6 +102,11 @@ const KP_LIST_FIRST: &str = "list-1";
 const KP_SEG_SECOND: &str = "seg-2";
 const KP_LIST_SECOND: &str = "list-2";
 const KP_POINTER_SECOND: &str = "pointer-2";
+/// A commit that adds a column: crash on its superfile PUT, before the
+/// list and pointer that would publish the schema naming it.
+const KP_SCHEMA_SEG: &str = "schema-seg";
+/// The same commit, crashing after its pointer lands: both halves durable.
+const KP_SCHEMA_POINTER: &str = "schema-pointer";
 
 /// Hidden vector-index kill points: crash inside the batched cell-split's
 /// window (child superfile upload → hidden list PUT → hidden pointer CAS).
@@ -654,6 +659,9 @@ fn dispatch_child_if_set() -> Option<()> {
         if kp == KP_COMPACT_BATCH_SUPERFILE {
             run_compact_batch_crash_child(PathBuf::from(dir));
         }
+        if kp == KP_SCHEMA_SEG || kp == KP_SCHEMA_POINTER {
+            run_schema_commit_crash_child(PathBuf::from(dir), &kp);
+        }
         run_crash_child(PathBuf::from(dir), &kp);
     }
     None
@@ -1194,4 +1202,166 @@ fn crash_mid_compaction_batch_recovers_and_reclaims_the_orphans() {
         after,
         "every object the crashed batch staged must have been reclaimed"
     );
+}
+
+/// A commit that adds a column publishes the new schema and the rows that
+/// introduced it in one manifest list, so a crash leaves both or neither.
+///
+/// The second commit below carries a `score` the table has never had:
+/// `union_schema` adds it, and the superfile holding its values and the
+/// schema naming it land under one pointer. The two outcomes a reader may
+/// see are "no `score` column and no row carrying one" and "both"; a schema
+/// that names a column no file holds, or a file holding values under a
+/// column the schema has retired, is the state this pins against.
+fn run_schema_commit_crash_child(dir: PathBuf, kill_point: &str) -> ! {
+    let (prefix, nth, _) = schema_kill_point_config(kill_point);
+    let local = LocalFsStorageProvider::new(&dir).expect("local fs provider");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(CrashStorage::new(local, prefix, nth, kill_point));
+
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+
+    // Commit one: titles only, so the schema stays where `create` left it.
+    // Scoped, because the table takes one writer at a time and a shadowed
+    // binding lives to the end of the function.
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["first commit alpha"]))
+            .expect("append");
+        w.commit().expect("the first commit lands");
+    }
+
+    // Commit two: a column the table has never seen, so this one commit
+    // carries both the rows and the schema that names them.
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&title_and_score_batch(
+            "second commit beta",
+            SCHEMA_CRASH_SCORE,
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+    }
+
+    eprintln!(
+        "CRASH-CHILD: the schema commit completed without aborting \
+         (kill_point={kill_point}) — test configuration is wrong"
+    );
+    std::process::exit(MISCONFIGURED_KILL_POINT_EXIT_CODE);
+}
+
+/// The value the crashing commit writes into the column it adds, so the
+/// parent can tell the row apart from the first commit's.
+const SCHEMA_CRASH_SCORE: i64 = 42;
+
+/// `(trigger_prefix, nth_match)` for the schema-commit kill points. The
+/// counts follow [`kill_point_config`]: `create` writes the first
+/// `manifest/` and `_supertable/current` objects and no `data/` object, and
+/// the first commit writes one of each.
+fn schema_kill_point_config(kp: &str) -> (&'static str, usize, usize) {
+    match kp {
+        KP_SCHEMA_SEG => ("data/", 2, 2),
+        KP_SCHEMA_POINTER => ("_supertable/current", 3, 2),
+        other => panic!("unknown schema kill point {other}"),
+    }
+}
+
+/// A batch carrying `title` and a `score` the fixture schema does not have.
+fn title_and_score_batch(title: &str, score: i64) -> arrow_array::RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("score", DataType::Int64, true),
+    ]));
+    arrow_array::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow_array::LargeStringArray::from(vec![title])),
+            Arc::new(arrow_array::Int64Array::from(vec![score])),
+        ],
+    )
+    .expect("batch shape matches its schema")
+}
+
+/// Reopen after a schema-commit crash and assert the one invariant: the
+/// column and the row that introduced it are both there or both absent.
+fn verify_schema_commit_crash(dir: &PathBuf, expect_landed: bool) {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir).expect("provider"));
+    let recovered = Supertable::open(default_supertable_options().with_storage(storage))
+        .expect("open recovers the table");
+
+    let has_column = recovered
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| f.name() == "score");
+    assert_eq!(
+        has_column,
+        expect_landed,
+        "the schema names `score` only when the commit that added it landed \
+         (manifest_id={}, fields={:?})",
+        recovered.manifest_id(),
+        recovered
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>()
+    );
+
+    // The first commit is durable either way: a crash in the second must
+    // not cost rows the first already published.
+    let reader = recovered.reader().expect("reader");
+    let rows_of = |term: &str| -> Vec<arrow_array::RecordBatch> {
+        reader
+            .bm25_search(
+                "title",
+                term,
+                SCHEMA_CRASH_TOP_K,
+                Bm25SearchOptions::new(),
+                None,
+            )
+            .expect("fts")
+    };
+    let count = |batches: &[arrow_array::RecordBatch]| -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    };
+    assert_eq!(
+        count(&rows_of("alpha")),
+        1,
+        "the first commit survives the second's crash"
+    );
+    assert_eq!(
+        count(&rows_of("beta")),
+        usize::from(expect_landed),
+        "the row carrying `score` is visible exactly when the column is"
+    );
+}
+
+/// Enough to retrieve either planted row; the fixture holds two.
+const SCHEMA_CRASH_TOP_K: usize = 10;
+
+#[test]
+fn crash_before_the_schema_commits_leaves_neither_column_nor_row() {
+    if dispatch_child_if_set().is_some() {
+        return;
+    }
+    let dir = spawn_crash_child(
+        "crash_before_the_schema_commits_leaves_neither_column_nor_row",
+        KP_SCHEMA_SEG,
+    );
+    verify_schema_commit_crash(&dir, false);
+}
+
+#[test]
+fn crash_after_the_schema_commits_leaves_both_column_and_row() {
+    if dispatch_child_if_set().is_some() {
+        return;
+    }
+    let dir = spawn_crash_child(
+        "crash_after_the_schema_commits_leaves_both_column_and_row",
+        KP_SCHEMA_POINTER,
+    );
+    verify_schema_commit_crash(&dir, true);
 }

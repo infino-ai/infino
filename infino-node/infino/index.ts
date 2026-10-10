@@ -15,6 +15,25 @@ export const BUILDER_ID: string = builderId();
 
 const STREAM = "stream";
 
+// Options the engine no longer takes, with what replaces each. The addon
+// drops unknown keys, so these throw rather than be silently ignored.
+const REMOVED_SEARCH_OPTIONS: Record<string, string> = {
+  stats: "term search scores with table-wide statistics; prefix search and lazily loaded tables score each segment with its own",
+};
+const REMOVED_REINDEX_OPTIONS: Record<string, string> = {
+  trustWriterAnalysis: "every superfile records its analysis revision",
+};
+
+/** Throws a `TypeError` naming the first removed option `opts` carries. */
+function rejectRemovedOptions(call: string, opts: object | null | undefined, removed: Record<string, string>): void {
+  if (opts == null) return;
+  for (const key of Object.keys(opts)) {
+    if (Object.hasOwn(removed, key)) {
+      throw new TypeError(`${call}: option \`${key}\` is not supported: ${removed[key]}`);
+    }
+  }
+}
+
 // --- public types ---
 
 /** Vector distance metric. `l2` and `dot` are accepted spellings of `l2sq`
@@ -22,9 +41,6 @@ const STREAM = "stream";
 export type Metric = "cosine" | "l2sq" | "l2" | "negdot" | "dot";
 /** Boolean mode for multi-term FTS queries. */
 export type BoolMode = "or" | "and";
-/** BM25 statistics scope: corpus-wide `"global"` IDF across superfiles
- * (the default) or `"per_superfile"` segment-local IDF. */
-export type Bm25Stats = "per_superfile" | "global";
 /** A row from a query/search when not materializing to Arrow. */
 export type RowRecord = Record<string, unknown>;
 /** A plain `{ column: type }` schema descriptor for `createTable`. */
@@ -172,15 +188,6 @@ export interface ReindexOptions {
   /** How old a sealed tombstone sidecar has to be, in milliseconds, before a
    * rewrite takes it over. Omit to use the table's compaction setting. */
   staleSealTimeoutMs?: number;
-  /**
-   * Credit a superfile that records no analysis revision with the one its
-   * writer emitted (default `false`). **Only sound when the table never held
-   * superfiles older than that writer**: an older compaction can have folded
-   * stale terms into a newer-stamped file, and crediting it reports the table
-   * migrated with those terms still in place. Leave unset unless the table's
-   * whole history is known.
-   */
-  trustWriterAnalysis?: boolean;
 }
 
 /** What a `reindex` did. */
@@ -234,8 +241,6 @@ export interface PlannedRepair {
 
 export interface Bm25SearchOptions {
   mode?: BoolMode;
-  /** BM25 statistics scope: `"global"` (default) or `"per_superfile"`. */
-  stats?: Bm25Stats;
   /** Columns to return, e.g. `["_id", "score"]`; omit for full rows. */
   projection?: string[];
   /** BM25 `k1` for this search only, overriding the column's declared value.
@@ -562,8 +567,9 @@ export class Table {
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions & { arrow: true }): arrow.Table;
   bm25Search(column: string, query: string, k: number, opts?: Bm25SearchOptions): RowRecord[];
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions = {}): RowRecord[] | arrow.Table {
+    rejectRemovedOptions("bm25Search", opts, REMOVED_SEARCH_OPTIONS);
     const buf = guard(this.remote, () =>
-      this.inner.bm25Search(column, query, k, opts.mode, opts.stats, opts.projection, opts.k1, opts.b),
+      this.inner.bm25Search(column, query, k, opts.mode, opts.projection, opts.k1, opts.b),
     );
     return decode(buf, opts.arrow);
   }
@@ -663,18 +669,21 @@ export class Table {
    * and `reindexPlan` / `indexStaleness` — throws with `code` `"InvalidArg"`.
    */
   reindex(options?: ReindexOptions): ReindexReport {
+    rejectRemovedOptions("reindex", options, REMOVED_REINDEX_OPTIONS);
     return guard(this.remote, () => this.inner.reindex(options));
   }
 
   /** The superfiles {@link Table.reindex} would repair under `options`, and
    * the repair each gets — without repairing anything. Writes nothing. */
   reindexPlan(options?: ReindexOptions): PlannedRepair[] {
+    rejectRemovedOptions("reindexPlan", options, REMOVED_REINDEX_OPTIONS);
     return guard(this.remote, () => this.inner.reindexPlan(options));
   }
 
   /** What is behind and what repairing it would cost. Writes nothing, so it is
    * safe against a live table. */
   indexStaleness(options?: ReindexOptions): StalenessReport {
+    rejectRemovedOptions("indexStaleness", options, REMOVED_REINDEX_OPTIONS);
     return guard(this.remote, () => this.inner.indexStaleness(options));
   }
 }

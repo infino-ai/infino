@@ -21,6 +21,12 @@ the scoring math and the parameter type.
   score(t, d)        = idf(t) * tf / ( tf + k1 * norm(dl, avgdl) )
 ```
 
+`N` and `df` are table-wide for a term search on a fully loaded manifest:
+each superfile scores against the document count and document frequencies
+summed across the whole table, so a fragmented table ranks like one corpus.
+Prefix search, and a table opened with a lazily loaded manifest, score each
+superfile with its own `N` and `df`.
+
 A document's score for a query is the sum over its matching terms. Higher
 is better (the opposite direction from `vector_search`, which returns a
 distance).
@@ -279,16 +285,14 @@ token, because stopword lists are written in surface forms (`are`,
 
 ### Base tokenizer
 
-Two ship today, named by `FtsField::analyzer` (the option is spelled
-"analyzer" but the value names a tokenizer; the chain is the analyzer).
-See [`src/superfile/fts/tokenize.rs`](../src/superfile/fts/tokenize.rs).
+Every column is tokenized by `standard`; there is no other base to
+choose. See [`src/superfile/fts/tokenize.rs`](../src/superfile/fts/tokenize.rs).
 
-| | `standard` (default) | `ascii_lower` |
-| --- | --- | --- |
-| Splitting | Unicode UAX #29 word boundaries; segments containing an alphanumeric are kept | Runs of `[A-Za-z0-9]`; every other ASCII byte separates |
-| Case | Full Unicode case folding | ASCII `A-Z` to `a-z` |
-| Non-ASCII | Preserved, so accented and non-Latin scripts stay searchable | Any token containing a non-ASCII byte is dropped silently |
-| Use it for | Natural language, anything multilingual, anything user-written | ASCII-only identifiers, codes, SKUs, log lines |
+| | `standard` |
+| --- | --- |
+| Splitting | Unicode UAX #29 word boundaries; segments containing an alphanumeric or an emoji are kept |
+| Case | Full Unicode lowercasing |
+| Non-ASCII | Preserved, so accented and non-Latin scripts stay searchable |
 
 Two details that surprise people:
 
@@ -387,7 +391,7 @@ from the relevance side:
   image of the text. With a stemmer it is not: `LIKE '%runni%'` matches
   the text `running`, whose indexed term is `run`. So a column carrying
   a chain keeps every superfile for such a predicate
-  ([`Analyzer::of` in `src/supertable/query/candidate.rs`](../src/supertable/query/candidate.rs)).
+  ([`is_plain_standard` in `src/supertable/query/candidate.rs`](../src/supertable/query/candidate.rs)).
   Results stay correct; the skip is what is lost.
 - **Analysis is part of the table's identity.** A merge refuses inputs
   whose per-column analysis differs, because a merged file records one
@@ -409,14 +413,14 @@ guess.
 
 ### Picking a chain
 
-| Column | Tokenizer | Stopwords | Stemmer | Typical `k1` / `b` |
-| --- | --- | --- | --- | --- |
-| Titles, product names | `standard` | off | off | 1.0 to 1.2 / 0.0 to 0.4 |
-| Long English prose | `standard` | `english` | `english` | 1.2 to 1.6 / 0.75 |
-| Multilingual or mixed-script text | `standard` | off | off | 1.2 / 0.75 |
-| Identifiers, SKUs, codes | `ascii_lower` | off | off | 1.2 / 0.0 |
-| Log lines, machine output | `ascii_lower` | off | off | 0.4 to 0.9 / 0.3 |
-| Code or symbol-heavy text | `ascii_lower` | off | off | 1.2 / 0.3 to 0.5 |
+| Column | Stopwords | Stemmer | Typical `k1` / `b` |
+| --- | --- | --- | --- |
+| Titles, product names | off | off | 1.0 to 1.2 / 0.0 to 0.4 |
+| Long English prose | `english` | `english` | 1.2 to 1.6 / 0.75 |
+| Multilingual or mixed-script text | off | off | 1.2 / 0.75 |
+| Identifiers, SKUs, codes | off | off | 1.2 / 0.0 |
+| Log lines, machine output | off | off | 0.4 to 0.9 / 0.3 |
+| Code or symbol-heavy text | off | off | 1.2 / 0.3 to 0.5 |
 
 Declaring a chain in each language:
 
@@ -463,8 +467,6 @@ text.
 
 | Lever | Where | Changeable later | What it does |
 | --- | --- | --- | --- |
-| Corpus statistics scope (`Bm25Stats`) | Per search | Yes | `Global` (the default) scores every superfile against table-wide document counts and document frequencies, so a fragmented table ranks like one corpus. `PerSuperfile` uses each file's own statistics: faster, but a term's IDF depends on which file a document landed in. On a fragmented table this is usually the single biggest ranking lever. See [`src/superfile/fts/reader/options.rs`](../src/superfile/fts/reader/options.rs). |
-| Base tokenizer | `FtsField::analyzer` | No | `standard` or `ascii_lower`. See [Tokenizer, stopwords, and stemming](#tokenizer-stopwords-and-stemming). |
 | Stopwords | `FtsField::stopwords` | No | Drops very common words from index and query. See [Stopwords](#stopwords). |
 | Stemmer | `FtsField::stemmer` | No | Folds inflections onto one term, so one form finds the others. See [Stemming](#stemming). |
 | Positions | `FtsField::positions` | No | Required for exact phrase queries. Roughly doubles the column's index footprint. A phrase against a positionless column is a typed error, never a silent bag-of-words fallback. |
@@ -526,7 +528,7 @@ Two debugging helpers repay the time they take:
   lengths a chain produces. Its siblings
   [`standard_tokenizer.rs`](../tests/superfile/fts/standard_tokenizer.rs) and
   [`token_cap.rs`](../tests/superfile/fts/token_cap.rs) cover the base
-  tokenizers.
+  tokenizer.
 - Run the benches from the section above before and after any change that
   touches scoring, and report the comparison. A relevance win that costs
   latency is a trade to state explicitly, not to discover later.
@@ -537,7 +539,6 @@ Two debugging helpers repay the time they take:
 | --- | --- |
 | Scores are smaller than another engine reports | The missing `(k1 + 1)` numerator. Ranking is unaffected; multiply by `k1 + 1` to compare numbers. |
 | Scores differ slightly from a hand-written BM25 | One-byte length quantization and the thousandths-resolution `avgdl`. Feed `stored_len` and `stored_avgdl` into the reference formula. |
-| Ranking shifts as the table is written to | Per-superfile corpus statistics. Use the default `Bm25Stats::Global`. |
 | A tuned pair works in Rust or a binding but not in SQL | SQL and `hybrid_search` have no override. Declare the pair on the column. |
 | `create_table` rejects the pair | `k1` must be finite and greater than 0, `b` finite and in `[0, 1]`. The error names the column ([`src/supertable/error.rs`](../src/supertable/error.rs)). |
 | A query-time override made things slower | Expected: looser bounds prune fewer blocks. Bake the pair once you have settled on it. |
@@ -552,18 +553,18 @@ Two debugging helpers repay the time they take:
 | Area | Path |
 | --- | --- |
 | Scoring math, `Bm25Params`, length quantization | [`src/superfile/fts/bm25.rs`](../src/superfile/fts/bm25.rs) |
-| Base tokenizers and query parsing | [`src/superfile/fts/tokenize.rs`](../src/superfile/fts/tokenize.rs) |
+| Base tokenizer and query parsing | [`src/superfile/fts/tokenize.rs`](../src/superfile/fts/tokenize.rs) |
 | Analysis chain (stopwords, stemmer, position holes) | [`src/superfile/fts/analysis.rs`](../src/superfile/fts/analysis.rs) |
 | Analysis compatibility on merge | [`src/superfile/builder.rs`](../src/superfile/builder.rs) |
-| `LIKE` lowering and analyzer recognition | [`src/supertable/query/candidate.rs`](../src/supertable/query/candidate.rs) |
-| Per-search options (`Bm25SearchOptions`, `BoolMode`, `Bm25Stats`) | [`src/superfile/fts/reader/options.rs`](../src/superfile/fts/reader/options.rs) |
+| `LIKE` lowering and plain-`standard` recognition | [`src/supertable/query/candidate.rs`](../src/supertable/query/candidate.rs) |
+| Per-search options (`Bm25SearchOptions`, `BoolMode`) | [`src/superfile/fts/reader/options.rs`](../src/superfile/fts/reader/options.rs) |
 | Column declaration (`FtsField`, `IndexSpec`) | [`src/catalog/index_spec.rs`](../src/catalog/index_spec.rs) |
 | Declared pair recorded in the catalog | [`src/catalog/manifest.rs`](../src/catalog/manifest.rs), [`src/catalog/mod.rs`](../src/catalog/mod.rs) |
 | Bound baking at build time | [`src/superfile/fts/builder.rs`](../src/superfile/fts/builder.rs) |
 | Override view and bound correction | [`src/superfile/fts/reader/core.rs`](../src/superfile/fts/reader/core.rs), [`src/superfile/fts/reader/metadata.rs`](../src/superfile/fts/reader/metadata.rs) |
 | Bound decoding for the ranked kernels | [`src/superfile/fts/reader/bounds.rs`](../src/superfile/fts/reader/bounds.rs) |
 | Per-superfile derived-view memo | [`src/superfile/reader.rs`](../src/superfile/reader.rs) |
-| Query fan-out, statistics scope, query syntax | [`src/supertable/query/fts.rs`](../src/supertable/query/fts.rs) |
+| Query fan-out, table-wide statistics, query syntax | [`src/supertable/query/fts.rs`](../src/supertable/query/fts.rs) |
 | SQL search table functions | [`src/supertable/query/exec/fts_exec.rs`](../src/supertable/query/exec/fts_exec.rs), [`src/catalog/search_tvf.rs`](../src/catalog/search_tvf.rs) |
 | Public search surface | [`src/catalog/table.rs`](../src/catalog/table.rs) |
 

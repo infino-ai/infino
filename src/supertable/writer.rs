@@ -118,7 +118,7 @@ use crate::{
         format::{
             CRC_BYTES,
             footer::read_kv_metadata,
-            fts::{HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, U64_BYTES, hdr},
+            fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr},
             kv,
             vec::{
                 CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE,
@@ -126,6 +126,7 @@ use crate::{
                 sub_hdr,
             },
         },
+        fts::builder::DOC_LENGTHS_ENTRY_SIZE,
         reader::vector_layout_from_kv,
         vector::{
             builder::{
@@ -169,10 +170,9 @@ use crate::{
                 PartitionStrategy, WIDTH_LAW_KS,
             },
             listed_once, options_hash,
-            part::{self as part_mod, ContentHash, PartId},
+            part::{self as part_mod, PartId},
             superfile_stem,
             term_index::{self, Contribution as TermContribution, TermIndexError},
-            term_stats,
         },
         mutations::{
             CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -373,8 +373,8 @@ const BUILD_SCALAR_NUM: usize = 5;
 // f32 vector payload, rebuilt as quantized + rerank codecs alongside the raw input: ~6.5x.
 const BUILD_VECTOR_NUM: usize = 13;
 
-// FTS text, ~1.5x for the FST + postings structures. Added on top of the scalar factor, not
-// instead of it: the same text bytes are held as a column and drive the index build at once.
+// FTS text, ~1.5x for the term dictionary + postings structures. Added on top of the scalar factor,
+// not instead of it: the same text bytes are held as a column and drive the index build at once.
 const BUILD_FTS_NUM: usize = 3;
 
 /// Single-writer append + commit handle.
@@ -2338,15 +2338,15 @@ impl SupertableWriter {
         }
 
         // The commit's payload, read off the taken buffer before either
-        // shard-count helper is consulted, so both arms price the same
-        // number. Deliberately not the sealed output: every shard carries
-        // its own dictionary, FST and index headers, so sealed bytes scale
-        // with the shard split — and the split follows the writer pool's
-        // width. On a shared-vocabulary corpus the same input seals to
-        // roughly four times more bytes at width 16 than at width 1, so
-        // pricing off sealed bytes makes an identical append plan more
-        // requests on a wider host, which is precisely what the write-side
-        // determinism contract forbids.
+        // shard-count helper is consulted, so both arms price the same number.
+        // Deliberately not the sealed output: every shard carries its own
+        // Parquet dictionaries, term dictionary and index headers, so sealed
+        // bytes scale with the shard split — and the split follows the writer
+        // pool's width. On a shared-vocabulary corpus the same input seals to
+        // roughly four times more bytes at width 16 than at width 1, so pricing
+        // off sealed bytes makes an identical append plan more requests on a
+        // wider host, which is precisely what the write-side determinism
+        // contract forbids.
         let payload_bytes = buffered_payload_bytes(buffer);
 
         let list_metadata = CommitListMetadata {
@@ -3187,11 +3187,6 @@ fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>>
     if blob.len() < FTS_HEADER_SIZE {
         return None;
     }
-    let version = read_u32_le(blob.get(hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES)?);
-    let header_size = match version == crate::superfile::format::fts::VERSION_V1_LEGACY {
-        true => FTS_HEADER_SIZE,
-        false => crate::superfile::format::fts::HEADER_SIZE_V2,
-    };
     let n_columns =
         read_u32_le(blob.get(hdr::N_COLUMNS_OFF..hdr::N_COLUMNS_OFF + U32_BYTES)?) as usize;
     let doc_lengths_offset =
@@ -3199,13 +3194,13 @@ fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>>
             as usize;
     // Entries plus the directory's CRC.
     let dir_len = n_columns
-        .checked_mul(crate::superfile::fts::builder::DOC_LENGTHS_ENTRY_SIZE)?
+        .checked_mul(DOC_LENGTHS_ENTRY_SIZE)?
         .checked_add(4)?;
-    if header_size > blob.len() || doc_lengths_offset.checked_add(dir_len)? > blob.len() {
+    if doc_lengths_offset.checked_add(dir_len)? > blob.len() {
         return None;
     }
     Some(merge_ranges(vec![
-        (off, header_size as u64),
+        (off, FTS_HEADER_SIZE as u64),
         (off + doc_lengths_offset as u64, dir_len as u64),
     ]))
 }
@@ -3432,22 +3427,28 @@ async fn write_superfile_terms(
         })
         .collect();
     columns.sort();
-    let fst_bytes = fts
+    let dict_bytes = fts
         .dict_bytes_async()
         .await
-        .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
+        .map_err(|source| TermIndexError::Read {
+            what: "term walk",
+            source,
+        })?;
     for (_, column, column_id) in &columns {
         let mut after: Option<Vec<u8>> = None;
         loop {
             let chunk = fts
                 .term_index_facts_after(
-                    &fst_bytes,
+                    &dict_bytes,
                     column,
                     after.as_deref(),
                     TERM_INDEX_BATCH_TERMS,
                 )
                 .await
-                .map_err(|e| TermIndexError::Build(format!("term facts: {e}")))?;
+                .map_err(|source| TermIndexError::Read {
+                    what: "term facts",
+                    source,
+                })?;
             for (term, fact) in &chunk {
                 let term =
                     from_utf8(term).map_err(|_| TermIndexError::Build("non-utf8 term".into()))?;
@@ -4539,16 +4540,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 remote_state.checkpoint.shard_count
             )));
         }
-        // Same acceptance rule as reopening the table: a checkpoint
-        // written before the engine's current options encoding still
-        // identifies this table, so a drain that spans an upgrade
-        // resumes instead of wedging on a re-encoded digest.
-        let checkpoint_hash = ContentHash::from_hex(&remote_state.checkpoint.options_hash);
-        let recognized = checkpoint_hash.is_some_and(|stored| {
-            options_hash::verify_options_hash(user_inner.options.as_ref(), &user_strategy, stored)
-                .is_ok()
-        });
-        if !recognized {
+        if remote_state.checkpoint.options_hash != current_options_hash {
             return Err(BuildError::Store(format!(
                 "drain checkpoint options hash {} != current {}",
                 remote_state.checkpoint.options_hash, current_options_hash
@@ -4897,10 +4889,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 .get(&entry.storage_path())
                                 .await
                                 .map_err(|e| BuildError::Store(e.to_string()))?;
-                            Arc::new(
-                                SuperfileReader::open(bytes)
-                                    .map_err(|e| BuildError::Store(e.to_string()))?,
-                            )
+                            Arc::new(SuperfileReader::open(bytes).map_err(BuildError::from)?)
                         }
                     };
                     // Write-path materialization: no per-query collector.
@@ -5975,7 +5964,7 @@ async fn open_ivf_reader_with_tombstones(
         ReadIntent::Warm,
     )
     .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
+    .map_err(BuildError::from)?;
     Ok((reader, bitmap))
 }
 
@@ -6099,7 +6088,7 @@ async fn cell_doc_counts_via_reader(
         ReadIntent::Warm,
     )
     .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
+    .map_err(BuildError::from)?;
     let v = reader
         .vec()
         .ok_or_else(|| BuildError::Store("IVF entry missing vector index".into()))?;
@@ -9445,7 +9434,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             )
             .instrument(open_span.clone())
             .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+            .map_err(BuildError::from)?;
             let mut bases = HashMap::new();
             if let Some(vr) = reader.vec() {
                 if let Some(cluster_vecs) = vr.resident_fine_cluster_vectors(column.as_str()) {
@@ -9671,7 +9660,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             entry,
         )
         .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+        .map_err(BuildError::from)?;
         // `None` here is a legacy single-cell layout — skip its depth
         // observation; the finish fallback keeps the previous depth law
         // rather than shallowing it on partial evidence.
@@ -10078,7 +10067,7 @@ async fn previous_centroid_section(
 /// deletes. A hash collision only ever costs a spurious reuse/rebuild, not
 /// correctness — the copy-flip and query-time doc-id dedup are the
 /// correctness guards.
-fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
+pub(in crate::supertable) fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
     let entries = manifest.get_all_superfiles();
     let count: u64 = entries.iter().map(|e| e.n_docs).sum();
     let min_id = entries.iter().map(|e| e.id_min).min().unwrap_or(0);
@@ -10108,7 +10097,7 @@ fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
 /// a flat publish logging as a graph publish is the same class of confusion
 /// the reasoned declines exist to remove — the log saying the mode you did not
 /// ask for.
-async fn publish_resident_index(
+pub(in crate::supertable) async fn publish_resident_index(
     storage: &dyn StorageProvider,
     population_key: u64,
     high_water: i128,
@@ -10272,6 +10261,8 @@ async fn build_hnsw_graph_ref(
         && let Some(prior_data) = sections.data.and_then(|kind| match kind {
             slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
             slow_vector_state::ResidentIndexKind::Flat(_) => None,
+            #[cfg(feature = "graph-index")]
+            slow_vector_state::ResidentIndexKind::Adjacency(_) => None,
         })
     {
         let prior_count = prior_data.doc_ids.len();
@@ -10348,7 +10339,7 @@ async fn build_hnsw_graph_ref(
 /// (`None` when nothing needs publishing), then CAS it in. A lost race
 /// derives the next attempt past any crash-orphaned list and retries
 /// with backoff; `what` names the artifact in the terminal error.
-async fn stamp_with_retries<F, Fut>(
+pub(in crate::supertable) async fn stamp_with_retries<F, Fut>(
     inner: &SupertableInner,
     storage: &Arc<dyn StorageProvider>,
     what: &str,
@@ -10376,10 +10367,22 @@ where
             return Ok(());
         };
         let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = get_current_manifest_etag(storage, Arc::clone(&old))
-            .await
-            .inspect_err(|e| inner.note_commit_error(e))
-            .map_err(BuildError::from)?;
+        let prev_etag = match get_current_manifest_etag(storage, Arc::clone(&old)).await {
+            Ok(etag) => etag,
+            // Another commit landed while the successor was built: a lost
+            // race like the one the write reports, so reload and retry.
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                refresh_inner_state_async(inner, storage)
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                sleep(backoff_delay(attempt)).await;
+                continue;
+            }
+            Err(e) => {
+                inner.note_commit_error(&e);
+                return Err(BuildError::from(e));
+            }
+        };
         match new_manifest
             .write(storage.as_ref(), prev_etag.as_deref(), &[])
             .await
@@ -10403,85 +10406,6 @@ where
     Err(BuildError::Store(format!(
         "{what} publish lost every commit race"
     )))
-}
-
-/// Build and publish the term-stats sidecar over the CURRENT
-/// membership, stamping its reference on a successor manifest (see
-/// `manifest::term_stats` for artifact semantics and the carry rule).
-/// Maintenance-only: optimize calls it after compaction settles, so the
-/// artifact always describes the post-merge superfile set. Safe to lose
-/// to contention — queries fall back to the fused query-time gather
-/// until the next maintenance pass republishes.
-pub(in crate::supertable) async fn stamp_term_stats(
-    inner: &SupertableInner,
-) -> Result<(), BuildError> {
-    let Some(storage) = inner.options.storage.clone() else {
-        return Ok(());
-    };
-    if inner.manifest.load().fts_configs().is_empty() {
-        return Ok(());
-    }
-    stamp_with_retries(inner, &storage, "term-stats", |old| {
-        let storage = Arc::clone(&storage);
-        async move {
-            // Every live superfile, parts included: a lazily loaded
-            // manifest's flat view holds only what has been loaded.
-            let entries = old
-                .get_all_superfiles_loaded()
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
-            // One superfile is its own global statistics: a query gathers
-            // df from that superfile's dictionary — the same numbers, one
-            // probe — so publishing an artifact would only duplicate the
-            // dictionary on disk. Nothing to drop either: a commit that
-            // removed the other superfiles already dropped the reference
-            // (the carry rule), and the next multi-superfile maintenance
-            // pass republishes.
-            if entries.len() <= 1 {
-                return Ok(None);
-            }
-            let store = Arc::clone(&old.options.store);
-            let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
-            let opt_storage = old.options.storage.as_ref().map(Arc::clone);
-            // Readers are opened by `build`, one at a time, and dropped
-            // before the next: each pins its superfile's term dictionary
-            // for its lifetime, so materializing them all here made the
-            // pass scale with table size rather than with the work it does.
-            //
-            // No background fills: this pass reads dictionaries and df
-            // headers only, and a fill here copies EVERY superfile —
-            // including compaction's fresh multi-GiB outputs — into the
-            // disk cache. On real object storage those fills outlive the
-            // optimize call and their reads bleed into whatever runs next
-            // (they surfaced as phantom user-data GETs in cold measurements
-            // that began while a fill was still draining).
-            let legacy = old.options.legacy_names();
-            let bytes = term_stats::build(&entries, &legacy, |entry| {
-                let store = Arc::clone(&store);
-                let disk_cache = disk_cache.clone();
-                let opt_storage = opt_storage.clone();
-                let entry = Arc::clone(entry);
-                async move {
-                    open_reader(
-                        &store,
-                        disk_cache.as_ref(),
-                        opt_storage.as_ref(),
-                        &entry,
-                        ReadIntent::Stream,
-                    )
-                    .await
-                    .map_err(term_stats::TermStatsError::Open)
-                }
-            })
-            .await?;
-            let reference = term_stats::write(storage.as_ref(), bytes).await?;
-            if old.term_stats_blob() == Some(&reference) {
-                return Ok(None);
-            }
-            Ok(Some(old.with_term_stats(reference)))
-        }
-    })
-    .await
 }
 
 /// Build and publish the table-level term index over the CURRENT
@@ -10523,11 +10447,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                 &entries,
                 &old.options.legacy_names(),
             )
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-            let reference = term_index::write_built(storage.as_ref(), built)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+            .await?;
+            let reference = term_index::write_built(storage.as_ref(), built).await?;
             // The root is content-addressed, so an unchanged reference can
             // still sit beside a stale "incomplete" mark; this build covers
             // the whole membership, so publish whenever that mark is wrong.
@@ -10557,7 +10478,7 @@ async fn collect_and_build_term_index(
     for entry in entries {
         let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)
             .await
-            .map_err(|e| TermIndexError::Build(e.to_string()))?;
+            .map_err(TermIndexError::Open)?;
         // The walk reads most of the FTS section, whose reads skip the block
         // cache, so each would be its own GET. Fetch the section in bulk first.
         // On failure the walk still works, read by read.
@@ -11874,9 +11795,8 @@ pub(in crate::supertable) async fn put_bytes_multipart_or_atomic(
 
 /// Objects at or above this size go through the multipart upload path.
 /// Azure and S3 cap a single PUT at ~5 GiB, and the artifacts written by
-/// content hash — slow-vector state, term statistics, term-index slices
-/// and roots — can grow past that at scale; the figure matches the
-/// superfile default.
+/// content hash — slow-vector state, term-index slices and roots — can
+/// grow past that at scale; the figure matches the superfile default.
 pub(in crate::supertable) const CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES: u64 =
     100 * 1024 * 1024;
 
@@ -12102,7 +12022,10 @@ mod tests {
     }
 
     use std::{
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -12125,7 +12048,7 @@ mod tests {
         config::Config,
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
+            fts::reader::{Bm25SearchOptions, BoolMode},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -12201,6 +12124,65 @@ mod tests {
                     if column == REQUIRED_COLUMN
             ),
             "{err}"
+        );
+    }
+
+    /// A commit that lands while a stamp builds its successor moves the
+    /// pointer past the stamp's snapshot. The stamp reloads and retries
+    /// instead of failing on that first lost race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stamp_retries_when_a_commit_lands_during_its_build() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let options = || default_supertable_options().with_storage(Arc::clone(&storage));
+        let table = Supertable::create(options()).expect("create");
+        {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_title_batch(&["alpha"]))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        // Another process committing to the same table.
+        let other = Supertable::open(options()).expect("open");
+
+        let attempts = AtomicUsize::new(0);
+        stamp_with_retries(table.inner(), &storage, "test", |old| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let other = &other;
+            async move {
+                if attempt == 0 {
+                    let mut writer = other.writer().expect("writer");
+                    writer
+                        .append(&build_title_batch(&["beta"]))
+                        .expect("append");
+                    writer.commit().expect("commit");
+                }
+                let reference = old
+                    .term_index_ref()
+                    .cloned()
+                    .expect("the commits publish a term index");
+                Ok(Some(old.with_term_index(reference)))
+            }
+        })
+        .await
+        .expect("the stamp retries past the concurrent commit");
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "one lost race, then a win"
+        );
+        assert_eq!(
+            table
+                .inner()
+                .manifest
+                .load_full()
+                .get_all_superfiles()
+                .len(),
+            2,
+            "the retry built on the other commit"
         );
     }
 
@@ -12347,6 +12329,8 @@ mod tests {
         .and_then(|kind| match kind {
             slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
             slow_vector_state::ResidentIndexKind::Flat(_) => None,
+            #[cfg(feature = "graph-index")]
+            slow_vector_state::ResidentIndexKind::Adjacency(_) => None,
         })
         .expect("data graph present after full build");
         assert!(
@@ -12444,6 +12428,8 @@ mod tests {
         .and_then(|kind| match kind {
             slow_vector_state::ResidentIndexKind::Flat(f) => Some(f),
             slow_vector_state::ResidentIndexKind::Graph(_) => None,
+            #[cfg(feature = "graph-index")]
+            slow_vector_state::ResidentIndexKind::Adjacency(_) => None,
         })
         .expect("the envelope must state Flat, and the payload decode as one");
 
@@ -12781,9 +12767,7 @@ mod tests {
                 "title",
                 "alpha",
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 over one-piece commit");
@@ -14214,8 +14198,8 @@ mod tests {
             .expect("title FTS summary present");
 
         // Each doc's title is "doc <i> alpha"; tokenized with
-        // ASCII-lower, distinct terms include "doc", "alpha",
-        // and digits 0-3. The FST will dedupe; n_terms_distinct
+        // `standard`, distinct terms include "doc", "alpha",
+        // and digits 0-3. The term dictionary will dedupe; n_terms_distinct
         // is at least 3 (doc, alpha, plus some digit tokens).
         assert!(
             fts.n_terms_distinct >= 3,
@@ -14226,7 +14210,10 @@ mod tests {
         assert!(fts.may_contain(b"alpha"));
         assert!(fts.may_contain(b"doc"));
         // Lex range should be present and consistent.
-        let (min_term, max_term) = fts.term_range.as_ref().expect("non-empty FST has a range");
+        let (min_term, max_term) = fts
+            .term_range
+            .as_ref()
+            .expect("non-empty dictionary has a range");
         assert!(!min_term.is_empty());
         assert!(!max_term.is_empty());
         assert!(min_term <= max_term, "min_term <= max_term invariant");

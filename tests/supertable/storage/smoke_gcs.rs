@@ -31,7 +31,7 @@ use infino::{
     Bm25SearchOptions,
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::reader::{Bm25Stats, BoolMode},
+        fts::reader::BoolMode,
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
     supertable::{
@@ -196,9 +196,7 @@ async fn supertable_real_gcs_round_trip() {
             "title",
             "alpha",
             10,
-            Bm25SearchOptions::new()
-                .with_mode(BoolMode::Or)
-                .with_stats(Bm25Stats::Global),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
             None,
         )
         .expect("bm25 over real gcs");

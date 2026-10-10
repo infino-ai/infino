@@ -22,6 +22,8 @@ mod search_tvf;
 mod table;
 mod uri;
 
+#[cfg(feature = "graph-index")]
+use std::sync::Weak;
 use std::{
     collections::{HashMap, HashSet},
     ops::ControlFlow,
@@ -103,8 +105,9 @@ use crate::{
     superfile::{
         builder::FtsConfig,
         fts::{
-            analysis::{Stemmer, Stopwords},
+            analysis::{Stemmer, Stopwords, check_recorded_tokenizer},
             bm25,
+            tokenize::STANDARD_TOKENIZER,
         },
         vector::{builder::VectorConfig, distance::Metric},
     },
@@ -212,6 +215,8 @@ pub fn connect_with(
             connection_memory_budget,
             usage_meter,
             gcs_credential,
+            #[cfg(feature = "graph-index")]
+            graph: Mutex::new(None),
         }),
     })
 }
@@ -244,6 +249,8 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             connection_memory_budget,
             usage_meter: UsageMeter::new(),
             gcs_credential: None,
+            #[cfg(feature = "graph-index")]
+            graph: Mutex::new(None),
         }),
     })
 }
@@ -277,6 +284,14 @@ struct ConnectionInner {
     usage_meter: Arc<UsageMeter>,
     /// Swappable GCS credential shared by every provider on this connection.
     gcs_credential: Option<Arc<SwappableGcpCredential>>,
+    /// A graph attached from another catalog (see [`Connection::attach_graph`]):
+    /// the connection it lives in and its edge table, served to this
+    /// connection's SQL as `graph_walk` / `graph_rank` with no table argument.
+    /// Held weakly: the caller keeps the graph's connection open, and a
+    /// strong handle here would let a connection attached to itself, or two
+    /// attached to each other, keep both alive for good.
+    #[cfg(feature = "graph-index")]
+    graph: Mutex<Option<(Weak<ConnectionInner>, String)>>,
 }
 
 /// Where the `name → table` map lives. Durable backends persist it on the
@@ -323,6 +338,31 @@ enum CatalogStore {
 }
 
 impl Connection {
+    /// Serve `table` of `graph` — an edge table over this connection's
+    /// rows that `graph` has indexed with `OptimizeOptions::with_adjacency`
+    /// — to this connection's [`query_sql`](Self::query_sql) as
+    /// `graph_walk(table, seed_table, seed_ids, hops, k)` and
+    /// `graph_rank(...)`, with no edge-table argument. The edge table
+    /// stays `graph`'s: it is not listed, opened or scanned here, and a
+    /// statement reaches it only through the two functions, which return
+    /// rows of this connection's tables. So a graph can live in a catalog
+    /// of its own and be walked from another. Attaching again replaces the
+    /// earlier graph.
+    ///
+    /// The graph's connection is held weakly: keep `graph` (or a clone)
+    /// open while it is attached. Once every handle to it is dropped, a
+    /// statement that calls the functions fails and says so. Behind the
+    /// `graph-index` feature, off the curated public surface.
+    #[cfg(feature = "graph-index")]
+    pub fn attach_graph(&self, graph: &Connection, table: &str) {
+        *self
+            .inner
+            .graph
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some((Arc::downgrade(&graph.inner), table.to_string()));
+    }
+
     /// Cumulative object-store usage for this connection (read-only snapshot).
     /// Shared by every table provider created through this connection; take
     /// two snapshots and call [`UsageSnapshot::since`] for a window delta.
@@ -395,6 +435,9 @@ impl Connection {
     ) -> Result<Supertable, InfinoError> {
         validate_name(name).map_err(|e| e.with_context("create_table", Some(name)))?;
         validate_schema(&schema).map_err(|e| e.with_context("create_table", Some(name)))?;
+        indexes
+            .check_analyzers()
+            .map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
 
         match &self.inner.store {
@@ -456,7 +499,10 @@ impl Connection {
                     schema_ipc: schema_to_ipc(&schema)
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns(),
-                    fts_analyzers: indexes.fts_analyzers(),
+                    fts_analyzers: vec![
+                        STANDARD_TOKENIZER.to_string();
+                        indexes.fts_columns().len()
+                    ],
                     fts_stopwords: indexes
                         .fts_stopwords()
                         .iter()
@@ -597,33 +643,18 @@ impl Connection {
                 // the defaults it applies (rotation seed, rerank codec) are
                 // identical and the table's options-hash check passes.
                 let mut spec = IndexSpec::new();
-                // The analyzer decides how query text is tokenized, so it
-                // cannot be inferred: a record that does not name one per
-                // full-text column is unusable, and guessing would return
-                // wrong results rather than an error.
-                if entry.fts_analyzers.len() != entry.fts.len() {
-                    return Err(InfinoError::Backend(format!(
-                        "table '{name}' has {} full-text columns but {} analyzer names recorded; \
-                         the table record is incomplete",
-                        entry.fts.len(),
-                        entry.fts_analyzers.len()
-                    ))
-                    .with_context("open_table", Some(name)));
-                }
                 for (i, column) in entry.fts.iter().enumerate() {
-                    let analyzer = entry.fts_analyzers[i].as_str();
-                    // `fts_stored` keeps its back-compat rule: a catalog
-                    // written before index-only columns existed can only
-                    // mean the text is stored.
+                    check_recorded_tokenizer(
+                        column,
+                        entry.fts_analyzers.get(i).map(String::as_str),
+                    )
+                    .map_err(|e| {
+                        InfinoError::Config(e.to_string()).with_context("open_table", Some(name))
+                    })?;
+                    // A missing or short list reads as the default.
                     let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
-                    // Same rule for positions: a catalog written before
-                    // they were declarable describes a table built
-                    // without them, because nothing could have asked
-                    // for them.
                     let positions = entry.fts_positions.get(i).copied().unwrap_or(false);
-                    // Same rule for the analysis filters: a catalog
-                    // written before they existed, or one whose entry
-                    // is empty, describes a column with no filter. A
+                    // A missing or empty filter name means no filter; a
                     // name that does not resolve is different — the
                     // recorded analysis cannot be reproduced, so the
                     // table is unusable rather than usable-with-a-guess.
@@ -647,15 +678,12 @@ impl Connection {
                             .with_context("open_table", Some(name))
                         })?,
                     };
-                    // And again for the BM25 pair: a catalog written before
-                    // it was declarable can only describe a table built with
-                    // the standard values, so the fallback is frozen there
-                    // rather than tracking the crate default.
+                    // The BM25 fallback is the frozen standard pair, not
+                    // the crate default.
                     let k1 = entry.fts_k1.get(i).copied().unwrap_or(bm25::K1);
                     let b = entry.fts_b.get(i).copied().unwrap_or(bm25::B);
                     spec = spec.fts(
                         FtsField::new(column.clone())
-                            .analyzer(analyzer)
                             .stopwords(stopwords)
                             .stemmer(stemmer)
                             .positions(positions)
@@ -1103,6 +1131,33 @@ impl Connection {
         // the catalog at call time (so a table named only inside a TVF —
         // not as a `FROM` relation — still resolves).
         search_tvf::register_search_tvfs(&ctx, self.clone());
+        // The graph functions walk an edge table of this catalog by name, or
+        // the one attached from another catalog with no name.
+        #[cfg(feature = "graph-index")]
+        {
+            let attached = self
+                .inner
+                .graph
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            match attached {
+                Some((graph, table)) => {
+                    let graph = graph
+                        .upgrade()
+                        .map(|inner| Connection { inner })
+                        .ok_or_else(|| {
+                            InfinoError::Query(
+                                "the attached graph's connection was dropped; keep it open while \
+                                 it is attached, or attach it again"
+                                    .to_string(),
+                            )
+                        })?;
+                    search_tvf::register_graph_tvfs(&ctx, graph, self.clone(), Some(table));
+                }
+                None => search_tvf::register_graph_tvfs(&ctx, self.clone(), self.clone(), None),
+            }
+        }
         trace::follow_spans_into_datafusion_tasks();
 
         // Caller-thread pickup, same as reader mint: the drive future may
@@ -1644,7 +1699,6 @@ fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), Infino
         })?;
         match &field.index {
             Some(ColumnIndex::Fts {
-                analyzer,
                 stopwords,
                 stemmer,
                 positions,
@@ -1653,7 +1707,6 @@ fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), Infino
             }) => {
                 indexes = indexes.fts(
                     FtsField::new(field.name.clone())
-                        .analyzer(analyzer.clone())
                         .stopwords(*stopwords)
                         .stemmer(*stemmer)
                         .positions(*positions)
@@ -1790,6 +1843,7 @@ mod tests {
         prelude::{SessionContext, col, lit},
     };
     use proptest::prelude::*;
+    use serde_json::{Map, Value, json};
 
     use super::*;
     use crate::{
@@ -1987,6 +2041,40 @@ mod tests {
             conn.open_table("docs"),
             Err(InfinoError::NotFound(_))
         ));
+    }
+
+    /// `standard` may be named explicitly; any other analyzer is refused
+    /// at create, naming the column.
+    #[test]
+    fn create_table_accepts_only_the_standard_analyzer() {
+        let conn = connect("memory://").expect("connect");
+        conn.create_table(
+            "pinned",
+            schema_id_title(),
+            IndexSpec::new().fts(FtsField::new("title").analyzer("standard")),
+        )
+        .expect("an explicit standard is accepted");
+
+        let err = conn
+            .create_table(
+                "other",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").analyzer("ascii_lower")),
+            )
+            .expect_err("a non-standard analyzer is refused");
+        assert!(matches!(err, InfinoError::Config(_)), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("title") && msg.contains("ascii_lower"),
+            "names the column and analyzer: {msg}"
+        );
+        assert!(
+            !conn
+                .list_tables()
+                .expect("list")
+                .contains(&"other".to_string()),
+            "a refused create registers nothing"
+        );
     }
 
     /// Stemming, end to end: one inflection finds the others because
@@ -2318,105 +2406,28 @@ mod tests {
         }
     }
 
-    /// An unknown tokenizer is refused at create time, naming what the
-    /// caller wrote. The filters are separate options, so a
-    /// chain-shaped string is simply a tokenizer name that does not
-    /// resolve — it must not be quietly interpreted as a chain.
-    #[test]
-    fn an_unknown_analyzer_is_refused_and_a_chain_shaped_name_is_not_interpreted() {
-        let conn = connect("memory://").expect("connect");
-        for name in ["nonesuch", "standard+stop=english"] {
-            let err = conn
-                .create_table(
-                    "bad",
-                    schema_id_title(),
-                    IndexSpec::new().fts(FtsField::new("title").analyzer(name)),
-                )
-                .expect_err("an unresolvable analyzer must be rejected");
-            let msg = err.to_string();
-            assert!(
-                msg.contains(name),
-                "the error must name the analyzer as written, got: {msg}"
-            );
-        }
-    }
-
     #[test]
     fn standard_analyzer_keeps_non_ascii_end_to_end() {
+        // A bare declaration is analyzed by `standard`, which keeps
+        // non-ASCII, so "café" matches through the full create → append →
+        // search path.
         let conn = connect("memory://").expect("connect");
-
-        // Explicit ascii_lower drops non-ASCII, so "café" is unsearchable.
-        let ascii = conn
-            .create_table(
-                "ascii",
-                schema_id_title(),
-                IndexSpec::new().fts(FtsField::new("title").analyzer("ascii_lower")),
-            )
-            .expect("create ascii table");
-        ascii
+        let table = conn
+            .create_table("dflt", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create default table");
+        table
             .append(&build_title_batch(&["café latte"]))
             .expect("append");
-        let ascii_hits = ascii
-            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
-            .map(|h| n_rows(&h))
-            .unwrap_or(0);
-        assert_eq!(ascii_hits, 0, "ascii_lower drops the non-ASCII term");
-
-        // The standard analyzer keeps non-ASCII, so "café" matches — the
-        // full create → append → search path honors the chosen analyzer
-        // at both index and query time.
-        let std_tbl = conn
-            .create_table(
-                "std",
-                schema_id_title(),
-                IndexSpec::new().fts(FtsField::new("title").analyzer("standard")),
-            )
-            .expect("create standard table");
-        std_tbl
-            .append(&build_title_batch(&["café latte"]))
-            .expect("append");
-        let hits = std_tbl
+        let hits = table
             .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search");
         assert_eq!(
             n_rows(&hits),
             1,
-            "standard analyzer matches the non-ASCII term"
-        );
-
-        // A column declared without an analyzer gets `standard`, so it
-        // behaves like the explicit table above rather than the ascii one.
-        let default_tbl = conn
-            .create_table("dflt", schema_id_title(), IndexSpec::new().fts("title"))
-            .expect("create default table");
-        default_tbl
-            .append(&build_title_batch(&["café latte"]))
-            .expect("append");
-        let default_hits = default_tbl
-            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
-            .expect("bm25_search");
-        assert_eq!(
-            n_rows(&default_hits),
-            1,
             "a bare declaration keeps the non-ASCII term"
         );
-
-        // An unknown analyzer is a configuration error at create time.
-        let err = conn
-            .create_table(
-                "bad",
-                schema_id_title(),
-                IndexSpec::new().fts(FtsField::new("title").analyzer("nonesuch")),
-            )
-            .expect_err("unknown analyzer must be rejected");
-        assert!(matches!(err, InfinoError::Config(_)), "got: {err:?}");
     }
 
-    /// Two text columns, different analyzers: `title` = standard,
-    /// `body` = ascii_lower. A non-ASCII term in BOTH columns is
-    /// searchable via `title` but not `body`, and an ASCII term is
-    /// searchable via `body` — proving each column is indexed AND
-    /// queried with its own tokenizer (not column 0's for all).
     fn schema_title_body() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("title", DataType::LargeUtf8, false),
@@ -2435,8 +2446,12 @@ mod tests {
         .expect("batch shape matches schema")
     }
 
+    /// Two text columns, different analysis: `title` plain, `body`
+    /// stemmed. The same text holds `running` in both, so `run` reaches
+    /// it through `body` but not `title` — each column is indexed AND
+    /// queried with its own chain, not column 0's for all.
     #[test]
-    fn mixed_per_column_analyzers_index_and_query_independently() {
+    fn mixed_per_column_analysis_indexes_and_queries_independently() {
         let conn = connect("memory://").expect("connect");
         let schema = schema_title_body();
         let table = conn
@@ -2444,133 +2459,111 @@ mod tests {
                 "docs",
                 schema.clone(),
                 IndexSpec::new()
-                    .fts(FtsField::new("title").analyzer("standard"))
-                    .fts(FtsField::new("body").analyzer("ascii_lower")),
+                    .fts("title")
+                    .fts(FtsField::new("body").stemmer(Stemmer::English)),
             )
             .expect("create_table");
         table
-            .append(&title_body_batch(schema, "café latte", "café latte"))
+            .append(&title_body_batch(schema, "running late", "running late"))
             .expect("append");
 
-        let title_cafe = table
-            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
-            .expect("title search");
-        assert_eq!(
-            n_rows(&title_cafe),
-            1,
-            "standard column matches the non-ASCII term"
-        );
-
-        let body_cafe = table
-            .bm25_search("body", "café", TOP_K, Bm25SearchOptions::new(), None)
-            .map(|h| n_rows(&h))
-            .unwrap_or(0);
-        assert_eq!(body_cafe, 0, "ascii_lower column drops the non-ASCII term");
-
-        // The ascii_lower column is genuinely indexed (not empty): an
-        // ASCII term still matches there.
-        let body_latte = table
-            .bm25_search("body", "latte", TOP_K, Bm25SearchOptions::new(), None)
-            .expect("body search");
-        assert_eq!(n_rows(&body_latte), 1, "ascii_lower column indexes ASCII");
-    }
-
-    #[test]
-    fn mixed_analyzers_survive_reopen_on_storage() {
-        // Storage-backed: a fresh connection reopens the table by
-        // reconstructing the per-column analyzers from the catalog
-        // (TableEntry.fts_analyzers), so query tokenization still honors
-        // each column's tokenizer after reopen.
-        let dir = std::env::temp_dir().join(format!("infino-mixed-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("mkdir");
-        let uri = format!("file://{}", dir.display());
-        let schema = schema_title_body();
-        {
-            let conn = connect(&uri).expect("connect");
-            let table = conn
-                .create_table(
-                    "docs",
-                    schema.clone(),
-                    IndexSpec::new()
-                        .fts(FtsField::new("title").analyzer("standard"))
-                        .fts(FtsField::new("body").analyzer("ascii_lower")),
-                )
-                .expect("create_table");
+        let search = |column: &str, query: &str| {
             table
-                .append(&title_body_batch(
-                    schema.clone(),
-                    "café latte",
-                    "café latte",
-                ))
-                .expect("append");
-        }
-        // Fresh connection → open_table rebuilds the spec from the catalog.
-        let conn2 = connect(&uri).expect("reconnect");
-        let table = conn2.open_table("docs").expect("open_table");
-        let title_cafe = table
-            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
-            .expect("title search");
+                .bm25_search(column, query, TOP_K, Bm25SearchOptions::new(), None)
+                .map(|h| n_rows(&h))
+                .unwrap_or(0)
+        };
         assert_eq!(
-            n_rows(&title_cafe),
+            search("body", "run"),
             1,
-            "standard column still matches non-ASCII after reopen"
+            "the stemmed column folds the inflection"
         );
-        let body_cafe = table
-            .bm25_search("body", "café", TOP_K, Bm25SearchOptions::new(), None)
-            .map(|h| n_rows(&h))
-            .unwrap_or(0);
-        assert_eq!(
-            body_cafe, 0,
-            "ascii_lower column still drops non-ASCII after reopen"
-        );
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(search("title", "run"), 0, "the plain column does not");
+        assert_eq!(search("title", "running"), 1, "the plain column is indexed");
     }
 
-    #[test]
-    fn open_table_rejects_a_record_missing_its_analyzer_names() {
-        // The analyzer names are what let a reopened table tokenize query
-        // text the way its postings were built. A record that has full-text
-        // columns but no name for one of them cannot be reopened
-        // correctly, so `open_table` says so and names the table instead
-        // of picking an analyzer and returning wrong results.
-        let dir = std::env::temp_dir().join(format!("infino-noanalyzer-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("mkdir");
-        let uri = format!("file://{}", dir.display());
-        let schema = schema_title_body();
-        {
-            let conn = connect(&uri).expect("connect");
-            conn.create_table(
-                "docs",
-                schema.clone(),
-                IndexSpec::new().fts("title").fts("body"),
-            )
-            .expect("create_table");
-        }
-        // Strip the analyzer list from the stored record, the shape a
-        // record written before analyzers were recorded per column has.
+    /// Rewrite table `docs`'s catalog record through `edit`.
+    fn edit_catalog_entry(dir: &Path, edit: impl FnOnce(&mut Map<String, Value>)) {
         let catalog_file = dir.join(CATALOG_PATH);
-        let mut body: serde_json::Value =
+        let mut body: Value =
             serde_json::from_slice(&fs::read(&catalog_file).expect("read catalog"))
                 .expect("catalog json");
-        body["tables"]["docs"]
-            .as_object_mut()
-            .expect("table entry")
-            .remove("fts_analyzers");
+        edit(body["tables"]["docs"].as_object_mut().expect("table entry"));
         fs::write(
             &catalog_file,
             serde_json::to_vec(&body).expect("encode catalog"),
         )
         .expect("write catalog");
+    }
 
-        let conn = connect(&uri).expect("reconnect");
-        let err = conn.open_table("docs").expect_err("incomplete record");
-        let rendered = err.to_string();
-        assert!(rendered.contains("docs"), "must name the table: {rendered}");
-        assert!(
-            rendered.contains("analyzer"),
-            "must say what is missing: {rendered}"
+    /// A new record names `standard` per column, and a recorded name is
+    /// checked on open: absent or `standard` opens, any other name refuses
+    /// the table with the re-create instruction rather than querying it
+    /// with `standard`.
+    #[test]
+    fn open_table_checks_a_recorded_analyzer_name() {
+        let (conn, dir) = storage_conn();
+        conn.create_table(
+            "docs",
+            schema_title_body(),
+            IndexSpec::new().fts("title").fts("body"),
+        )
+        .expect("create_table");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let mut written = None;
+        edit_catalog_entry(dir.path(), |entry| {
+            written = entry.get("fts_analyzers").cloned();
+        });
+        assert_eq!(
+            written,
+            Some(json!(["standard", "standard"])),
+            "a new record names `standard` per column"
         );
-        let _ = fs::remove_dir_all(&dir);
+        edit_catalog_entry(dir.path(), |entry| {
+            entry.remove("fts_analyzers");
+        });
+        connect(&uri)
+            .expect("reconnect")
+            .open_table("docs")
+            .expect("an absent analyzer list opens");
+
+        edit_catalog_entry(dir.path(), |entry| {
+            entry.insert("fts_analyzers".into(), json!(["standard", "standard"]));
+        });
+        connect(&uri)
+            .expect("reconnect")
+            .open_table("docs")
+            .expect("a recorded standard opens");
+
+        edit_catalog_entry(dir.path(), |entry| {
+            entry.insert("fts_analyzers".into(), json!(["standard", "ascii_lower"]));
+        });
+        let err = connect(&uri)
+            .expect("reconnect")
+            .open_table("docs")
+            .expect_err("a removed analyzer must be refused");
+        assert!(matches!(err, InfinoError::Config(_)), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("docs")
+                && msg.contains("body")
+                && msg.contains("ascii_lower")
+                && msg.contains("re-create"),
+            "must name the table, column, analyzer and fix: {msg}"
+        );
+
+        // An unrelated catalog commit rewrites every record; the removed
+        // analyzer must survive it, or the refusal silently disappears.
+        connect(&uri)
+            .expect("reconnect")
+            .create_table("other", schema_title_body(), IndexSpec::new().fts("title"))
+            .expect("an unrelated create_table");
+        let err = connect(&uri)
+            .expect("reconnect")
+            .open_table("docs")
+            .expect_err("the refusal survives an unrelated catalog commit");
+        assert!(err.to_string().contains("ascii_lower"), "got: {err}");
     }
 
     /// An index-only column (`FtsField::stored(false)`) survives a

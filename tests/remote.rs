@@ -86,12 +86,12 @@ async fn create_table_posts_expected_shape() {
     Mock::given(method("POST"))
         .and(path("/v1/create_table/mydb"))
         .and(header("authorization", format!("Bearer {KEY}").as_str()))
-        // The client names every column's analyzer rather than sending a
-        // bare column name, so the server builds the index with the
-        // analyzer the client resolved and never with a default of its own.
+        // The client names every column's BM25 pair rather than sending a
+        // bare column name, so the server builds the index with the pair
+        // the client resolved and never with a default of its own.
         .and(body_partial_json(json!({
             "table_name": "posts",
-            "indexes": {"fts": [{"column": "id", "analyzer": "standard"}]},
+            "indexes": {"fts": [{"column": "id", "k1": 1.2, "b": 0.75}]},
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
@@ -176,11 +176,6 @@ async fn bm25_search_sends_json_and_decodes_arrow() {
             "query": "hello",
             "k": 10,
             "mode": "or",
-            // A defaulted request sends the CURRENT default explicitly —
-            // "global" since the stats default flipped — rather than
-            // relying on the server's own default (which stays frozen at
-            // its historical meaning for bare/omitted).
-            "stats": "global",
         })))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(ipc_bytes(&id_batch(vec![1, 2, 3])), ARROW_CT),
@@ -198,6 +193,14 @@ async fn bm25_search_sends_json_and_decodes_arrow() {
     .await;
     let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total, 3, "decoded the canned Arrow response into 3 rows");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("json request body");
+    assert!(body.get("stats").is_none(), "no stats field: {body}");
 }
 
 #[tokio::test]
@@ -581,7 +584,6 @@ fn full_index_spec() -> IndexSpec {
     IndexSpec::new()
         .fts(
             FtsField::new("text")
-                .analyzer("standard")
                 .bm25(1.6, 0.4)
                 .stored(false)
                 .positions(true)

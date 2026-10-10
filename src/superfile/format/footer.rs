@@ -686,7 +686,7 @@ pub(crate) fn resolved_regions(metadata: &ParquetMetaData) -> Option<BlobRegions
 }
 
 /// Test-only: where `bytes`' footer starts, and the footer decoded.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 fn split_footer(bytes: &[u8]) -> (usize, ParquetMetaData) {
     let n = bytes.len();
     let len_bytes: [u8; PARQUET_FOOTER_LEN_FIELD_BYTES] = bytes
@@ -712,23 +712,25 @@ pub(crate) fn with_appended_kv(
     with_kv_list(metadata, kvs)
 }
 
-/// Test-only: `bytes` with `extra` written ahead of its footer's own keys,
-/// verbatim — where a carried rewrite left its stale copies, and the
-/// malformed footers [`splice_carried_body_to`] refuses to write.
-#[cfg(test)]
-pub(crate) fn with_forged_footer_kv(bytes: &[u8], extra: &[(&str, &str)]) -> Bytes {
-    let (start, metadata) = split_footer(bytes);
-    let mut kvs = key_values(extra);
-    kvs.extend(stored_kvs(&metadata));
-    let mut out = bytes[..start].to_vec();
-    ParquetMetaDataWriter::new(&mut out, &with_kv_list(&metadata, kvs))
-        .finish()
-        .expect("write forged footer");
-    Bytes::from(out)
+#[cfg(any(test, feature = "test-helpers"))]
+test_visible! {
+    /// Test-only: `bytes` with `extra` written ahead of its footer's own keys,
+    /// verbatim — where a carried rewrite left its stale copies, and the
+    /// malformed footers [`splice_carried_body_to`] refuses to write.
+    fn with_forged_footer_kv(bytes: &[u8], extra: &[(&str, &str)]) -> Bytes {
+        let (start, metadata) = split_footer(bytes);
+        let mut kvs = key_values(extra);
+        kvs.extend(stored_kvs(&metadata));
+        let mut out = bytes[..start].to_vec();
+        ParquetMetaDataWriter::new(&mut out, &with_kv_list(&metadata, kvs))
+            .finish()
+            .expect("write forged footer");
+        Bytes::from(out)
+    }
 }
 
 /// Test-only: the footer's key-value list as stored.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 fn stored_kvs(metadata: &ParquetMetaData) -> Vec<KeyValue> {
     metadata
         .file_metadata()
@@ -738,7 +740,7 @@ fn stored_kvs(metadata: &ParquetMetaData) -> Vec<KeyValue> {
 }
 
 /// Test-only: `pairs` as footer key-value entries.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 fn key_values(pairs: &[(&str, &str)]) -> Vec<KeyValue> {
     pairs
         .iter()
@@ -747,7 +749,7 @@ fn key_values(pairs: &[(&str, &str)]) -> Vec<KeyValue> {
 }
 
 /// Test-only: `metadata` with its key-value list replaced by `kvs`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 fn with_kv_list(metadata: &ParquetMetaData, kvs: Vec<KeyValue>) -> ParquetMetaData {
     let fm = metadata.file_metadata();
     let fm = FileMetaData::new(

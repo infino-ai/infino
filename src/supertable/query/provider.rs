@@ -24,9 +24,9 @@
 //!      `ParquetSource` via an in-memory object store. DataFusion's
 //!      own filter pushdown hands the `FilterExec` predicate to that
 //!      source, where `PruningPredicate` prunes row groups and pages.
-//!      A predicate the index could not bound is evaluated by
-//!      DataFusion's `FilterExec` above the scan, never as a Parquet
-//!      row filter inside it.
+//!      A predicate the index could not bound runs in DataFusion's
+//!      `FilterExec` above the scan, or as a Parquet row filter under
+//!      `ORDER BY ... LIMIT` (`RowFilterUnderTopK`).
 //!      We deliberately do **not** reimplement this commodity layer.
 //!
 //! Correctness is independent of either tier: every pushed filter
@@ -256,8 +256,8 @@ pub(crate) struct SupertableProvider {
     /// Prepared files populate it once; scans reuse it rather than rebuilding
     /// a path→source map for every SQL statement.
     scan_store: Arc<SuperfileObjectStore>,
-    /// Open-time Parquet metadata shared by every scan and residual provider.
-    scan_metas: Arc<DashMap<ObjPath, Arc<ParquetMetaData>>>,
+    /// Open-time Parquet footers shared by every scan and residual provider.
+    scan_footers: Arc<ScanFooters>,
     /// Exact table-level low-cardinality frequencies, merged lazily per
     /// column from this provider's immutable manifest snapshot.
     scalar_value_counts: Arc<DashMap<String, Option<Arc<ScalarValueCounts>>>>,
@@ -328,7 +328,7 @@ impl SupertableProvider {
             segment_filter: None,
             prepared_scan_files: Arc::new(DashMap::new()),
             scan_store: Arc::new(SuperfileObjectStore::new()),
-            scan_metas: Arc::new(DashMap::new()),
+            scan_footers: Arc::new(DashMap::new()),
             scalar_value_counts: Arc::new(DashMap::new()),
         }
     }
@@ -355,7 +355,7 @@ impl SupertableProvider {
         restricted.segment_filter = Some(segments);
         restricted.prepared_scan_files = Arc::clone(&self.prepared_scan_files);
         restricted.scan_store = Arc::clone(&self.scan_store);
-        restricted.scan_metas = Arc::clone(&self.scan_metas);
+        restricted.scan_footers = Arc::clone(&self.scan_footers);
         restricted.scalar_value_counts = Arc::clone(&self.scalar_value_counts);
         restricted
     }
@@ -588,7 +588,7 @@ impl SupertableProvider {
         let disk_cache = self.disk_cache.clone();
         let storage = self.manifest.options.storage.clone();
         let scan_store = Arc::clone(&self.scan_store);
-        let scan_metas = Arc::clone(&self.scan_metas);
+        let scan_footers = Arc::clone(&self.scan_footers);
         let entry = Arc::clone(entry);
         let prepared = cell
             .get_or_try_init(|| async move {
@@ -623,7 +623,7 @@ impl SupertableProvider {
                     .collect::<Vec<_>>()
                     .into();
                 scan_store.insert_source(path.clone(), source);
-                scan_metas.insert(path.clone(), parquet_meta);
+                scan_footers.insert(path.clone(), Arc::new(ScanFooter::new(parquet_meta)));
                 Ok::<Arc<PreparedScanFile>, DataFusionError>(Arc::new(PreparedScanFile {
                     path,
                     size,
@@ -976,22 +976,51 @@ fn full_walk_pays(terms: u64, bytes: u64) -> bool {
     terms == 0 || bytes / terms >= LIKE_WALK_MIN_BYTES_PER_TERM
 }
 
-/// Stored (uncompressed) bytes of `column`'s data pages across a
-/// superfile's row groups — the volume a scan of that column decodes.
-/// `None` when the footer has no leaf column of that name.
-fn column_stored_bytes(meta: &ParquetMetaData, column: &str) -> Option<u64> {
-    let index = meta
-        .file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .position(|descr| descr.name() == column)?;
-    Some(
-        meta.row_groups()
+/// Footers of the files this table's scans have opened, by path.
+pub(crate) type ScanFooters = DashMap<ObjPath, Arc<ScanFooter>>;
+
+/// A file's Parquet footer, and how many bytes each column takes in it.
+#[derive(Debug)]
+pub(crate) struct ScanFooter {
+    meta: Arc<ParquetMetaData>,
+    /// Bytes per column before compression. Added up once when the file is
+    /// opened, so planning a query doesn't have to.
+    leaf_bytes: Box<[u64]>,
+}
+
+impl ScanFooter {
+    fn new(meta: Arc<ParquetMetaData>) -> Self {
+        let mut leaf_bytes = vec![0; meta.file_metadata().schema_descr().num_columns()];
+        for row_group in meta.row_groups() {
+            for (bytes, chunk) in leaf_bytes.iter_mut().zip(row_group.columns()) {
+                *bytes += chunk.uncompressed_size().max(0) as u64;
+            }
+        }
+        Self {
+            meta,
+            leaf_bytes: leaf_bytes.into(),
+        }
+    }
+
+    /// `(column name, bytes)` for each column in the file. A list or struct
+    /// column is stored in parts, and each part comes back under its name.
+    pub(crate) fn columns(&self) -> impl Iterator<Item = (&str, u64)> {
+        let leaves = self.meta.file_metadata().schema_descr().columns();
+        leaves
             .iter()
-            .map(|rg| rg.column(index).uncompressed_size().max(0) as u64)
-            .sum(),
-    )
+            .zip(&self.leaf_bytes)
+            .filter_map(|(leaf, &bytes)| Some((leaf.path().parts().first()?.as_str(), bytes)))
+    }
+
+    /// Bytes of `column` in this file, or `None` if the file doesn't have it.
+    fn column_bytes(&self, column: &str) -> Option<u64> {
+        let mut leaves = self
+            .columns()
+            .filter(|(name, _)| *name == column)
+            .peekable();
+        leaves.peek()?;
+        Some(leaves.map(|(_, bytes)| bytes).sum())
+    }
 }
 
 /// Extract a UTF-8 string literal from a scalar value, if it is one.
@@ -1237,19 +1266,19 @@ impl TableProvider for SupertableProvider {
                             // vocabulary; judged per column from the manifest's
                             // term count and the Parquet footer's column size,
                             // neither of which costs a read.
-                            let meta = self
-                                .scan_metas
+                            let footer = self
+                                .scan_footers
                                 .get(&prepared.path)
-                                .map(|m| Arc::clone(m.value()));
+                                .map(|f| Arc::clone(f.value()));
                             let full_walk_pays = |column: &str| {
                                 let terms = self
                                     .manifest
                                     .field_id(column)
                                     .and_then(|id| entry.fts_summary.get(&id))
                                     .map_or(0, |summary| summary.n_terms_distinct);
-                                let bytes = meta
+                                let bytes = footer
                                     .as_ref()
-                                    .and_then(|m| column_stored_bytes(m, column))
+                                    .and_then(|f| f.column_bytes(column))
                                     .unwrap_or(0);
                                 full_walk_pays(terms, bytes)
                             };
@@ -1417,11 +1446,8 @@ impl TableProvider for SupertableProvider {
         //               (exact ones are not checked again)
         //
         // No predicate is attached to the source. DataFusion hands it the
-        // `FilterExec` predicate for statistics pruning only; it never runs as
-        // a Parquet row filter (`pushdown_filters` is pinned off on the SQL
-        // session). A row filter pays only when a predicate keeps a handful
-        // of rows. On one that keeps a few percent of rows spread over every
-        // row group it skips no page and costs a multiple of the plain scan.
+        // `FilterExec` predicate for statistics pruning, and as a row filter
+        // only under `ORDER BY ... LIMIT` (see `RowFilterUnderTopK`).
         let mut source = ParquetSource::new(Arc::clone(&self.schema));
         // Serve DataFusion's opener the index-complete footers the
         // readers already parsed — without this the opener re-reads +
@@ -1431,7 +1457,7 @@ impl TableProvider for SupertableProvider {
         // lazily-opened readers (a cache-state-dependent priced counter).
         source = source.with_parquet_file_reader_factory(Arc::new(CachedMetadataReaderFactory {
             store: Arc::clone(&store),
-            metas: Arc::clone(&self.scan_metas),
+            footers: Arc::clone(&self.scan_footers),
         }));
 
         // ManifestSnapshot-derived statistics for the scan node. Exact only
@@ -1477,9 +1503,12 @@ impl TableProvider for SupertableProvider {
         let scan = DataSourceExec::from_data_source(config);
         let op_stats = self.scan_store.op_stats();
         Ok(if filters.is_empty() {
-            Arc::new(MeteredExec::new(scan, op_stats))
+            Arc::new(MeteredExec::new(scan, op_stats).with_footers(Arc::clone(&self.scan_footers)))
         } else {
-            Arc::new(MeteredExec::without_limit_pushdown(scan, op_stats))
+            Arc::new(
+                MeteredExec::without_limit_pushdown(scan, op_stats)
+                    .with_footers(Arc::clone(&self.scan_footers)),
+            )
         })
     }
 }
@@ -1601,13 +1630,13 @@ fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
 /// [`SuperfileReader`]: crate::superfile::SuperfileReader
 struct CachedMetadataReaderFactory {
     store: Arc<dyn OsObjectStore>,
-    metas: Arc<DashMap<ObjPath, Arc<ParquetMetaData>>>,
+    footers: Arc<ScanFooters>,
 }
 
 impl fmt::Debug for CachedMetadataReaderFactory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CachedMetadataReaderFactory")
-            .field("superfiles", &self.metas.len())
+            .field("superfiles", &self.footers.len())
             .finish()
     }
 }
@@ -1661,9 +1690,9 @@ impl ParquetFileReaderFactory for CachedMetadataReaderFactory {
         }
         Ok(Box::new(CachedMetadataReader {
             meta: self
-                .metas
+                .footers
                 .get(location)
-                .map(|meta| Arc::clone(meta.value())),
+                .map(|footer| Arc::clone(&footer.meta)),
             inner,
         }))
     }
@@ -2127,7 +2156,10 @@ mod tests {
     use crate::{
         superfile::{
             builder::FtsConfig,
-            fts::tokenize::{AsciiLowerTokenizer, StandardTokenizer},
+            fts::{
+                analysis::{Stemmer, Stopwords, chain_tokenizer},
+                tokenize::StandardTokenizer,
+            },
             vector::layout::VectorLayout,
         },
         supertable::{
@@ -2138,8 +2170,8 @@ mod tests {
     };
 
     /// Per-column tokenizer resolver for the pruning-walker tests: every
-    /// column resolves to the default ASCII-lower analyzer.
-    fn ascii_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
+    /// column resolves to the default `standard` analyzer.
+    fn standard_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
         Some(default_tokenizer())
     }
 
@@ -2402,7 +2434,7 @@ mod tests {
     /// extraction without matching on the full enum.
     fn value_set_leaves(filters: &[Expr], schema: &SchemaRef) -> Vec<(String, usize)> {
         // No FTS columns / tokenizer → only the scalar min/max leaf.
-        exprs_to_value_set_leaves(filters, schema, &HashSet::new(), &ascii_resolver)
+        exprs_to_value_set_leaves(filters, schema, &HashSet::new(), &standard_resolver)
             .into_iter()
             .map(|l| match l {
                 PruneLeaf::ScalarValueSet { column, values } => (column, values.len()),
@@ -2482,7 +2514,7 @@ mod tests {
         let s = schema_xy();
         let expr = col("x").eq(lit(1_i64)).or(col("y").eq(lit(2_i64)));
         assert!(
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
         );
     }
 
@@ -2493,7 +2525,7 @@ mod tests {
         let s = schema_xy();
         let expr = col("x").eq(lit(1_i64)).or(col("x").gt(lit(5_i64)));
         assert!(
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
         );
     }
 
@@ -2507,7 +2539,7 @@ mod tests {
                 .eq(lit(1_i32))
                 .or(cast(col("x"), DataType::Int32).eq(lit(2_i32)));
         assert!(
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
         );
     }
 
@@ -2519,7 +2551,7 @@ mod tests {
         let expr = col("title")
             .eq(lit("Foo Bar"))
             .or(col("title").eq(lit("Bar Baz")));
-        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &ascii_resolver);
+        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &standard_resolver);
 
         assert!(
             leaves
@@ -2546,7 +2578,7 @@ mod tests {
         let s = schema_xy();
         let expr = col("x").in_list(vec![lit(1_i64)], true);
         assert!(
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
         );
     }
 
@@ -2600,7 +2632,7 @@ mod tests {
         // `x IN (1, y)` — `y` is a column, not a literal; can't bound min/max.
         let expr = col("x").in_list(vec![lit(1_i64), col("y")], false);
         assert!(
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
         );
     }
 
@@ -2609,7 +2641,7 @@ mod tests {
         let s = schema_xy();
         let expr = col("z").in_list(vec![lit(1_i64)], false);
         assert!(
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
         );
     }
 
@@ -2620,7 +2652,7 @@ mod tests {
         // 'Foo Bar' → [foo, bar]; 'Bar Baz' → [bar, baz]. The shared `bar`
         // is deduped, and the terms come out sorted-unique.
         let expr = col("title").in_list(vec![lit("Foo Bar"), lit("Bar Baz")], false);
-        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &ascii_resolver);
+        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &standard_resolver);
 
         assert!(
             leaves
@@ -2650,10 +2682,9 @@ mod tests {
 
     #[test]
     fn value_set_bloom_uses_the_per_column_tokenizer() {
-        // `title` is analyzed with the Unicode-aware standard tokenizer
-        // (keeps non-ASCII); `body` with ascii_lower (drops it). Bloom
-        // pruning must probe each column with its own tokenizer, else a
-        // standard-analyzed column is pruned against ascii_lower tokens.
+        // `title` is plain `standard`; `body` stems. Bloom pruning must
+        // probe each column with its own tokenizer, else a stemmed column
+        // is pruned against unstemmed tokens.
         let s = Arc::new(Schema::new(vec![
             Field::new("title", DataType::Utf8, true),
             Field::new("body", DataType::Utf8, true),
@@ -2663,40 +2694,33 @@ mod tests {
             if c == "title" {
                 Some(Arc::new(StandardTokenizer))
             } else {
-                Some(Arc::new(AsciiLowerTokenizer))
+                Some(chain_tokenizer(Stopwords::None, Stemmer::English))
             }
         };
-
-        // Standard column: the non-ASCII term survives tokenization, so a
-        // TermPresence bloom leaf is emitted carrying the folded token.
-        let title_leaves = exprs_to_value_set_leaves(
-            &[col("title").in_list(vec![lit("Süd")], false)],
-            &s,
-            &fts,
-            &resolve,
+        let terms_for = |column: &str| {
+            exprs_to_value_set_leaves(
+                &[col(column).in_list(vec![lit("Running")], false)],
+                &s,
+                &fts,
+                &resolve,
+            )
+            .into_iter()
+            .find_map(|l| match l {
+                PruneLeaf::TermPresence {
+                    column: c, terms, ..
+                } if c == column => Some(terms),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            terms_for("title"),
+            Some(vec!["running".to_string()]),
+            "the plain column probes the unstemmed token"
         );
-        assert!(
-            title_leaves.iter().any(|l| matches!(
-                l,
-                PruneLeaf::TermPresence { column, terms, .. }
-                    if column == "title" && terms == &vec!["süd".to_string()]
-            )),
-            "standard-analyzed column keeps the non-ASCII token"
-        );
-
-        // ascii_lower column: the same literal drops to zero tokens, so no
-        // TermPresence leaf is emitted — only the scalar value-set leaf.
-        let body_leaves = exprs_to_value_set_leaves(
-            &[col("body").in_list(vec![lit("Süd")], false)],
-            &s,
-            &fts,
-            &resolve,
-        );
-        assert!(
-            !body_leaves
-                .iter()
-                .any(|l| matches!(l, PruneLeaf::TermPresence { .. })),
-            "ascii_lower column drops the non-ASCII token — no bloom leaf"
+        assert_eq!(
+            terms_for("body"),
+            Some(vec!["run".to_string()]),
+            "the stemmed column probes the stem"
         );
     }
 
@@ -2705,7 +2729,7 @@ mod tests {
         let s = schema_xy();
         let fts = HashSet::from(["title"]); // "x" not in the set
         let expr = col("x").in_list(vec![lit(1_i64), lit(2_i64), lit(3_i64), lit(4_i64)], false);
-        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &ascii_resolver);
+        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &standard_resolver);
         assert_eq!(leaves.len(), 1);
         assert!(matches!(leaves[0], PruneLeaf::ScalarValueSet { .. }));
     }
@@ -3203,7 +3227,7 @@ mod tests {
         let store: Arc<dyn OsObjectStore> = Arc::new(InMemory::new());
         let factory = CachedMetadataReaderFactory {
             store,
-            metas: Arc::new(DashMap::new()),
+            footers: Arc::new(DashMap::new()),
         };
         let dbg = format!("{factory:?}");
         assert!(

@@ -2,13 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! Term dictionary of the FTS blob: `(column, term)` keys to the term's
-//! posting metadata, in two layouts chosen by the blob version.
+//! posting metadata.
 //!
 //! Every key is `<column_name>\x1F<term>` (ASCII Unit Separator, below
 //! every printable byte), so the terms of one column are exactly the keys
 //! with the `<column>\x1F` prefix, in sorted order.
 //!
-//! # Term blocks (`V7`+)
+//! # Term blocks
 //!
 //! Keys are sorted and cut into blocks of [`TERM_BLOCK_SIZE`]. Inside a
 //! block every entry is **front-coded** against the entry before it: a
@@ -25,20 +25,11 @@
 //! footer, however many terms it holds — for the last first-key `<=`
 //! the probe, and that one block is decoded sequentially; a prefix scan
 //! starts the same way and walks blocks until the prefix stops matching.
-//! This
-//! is a third smaller than the FST for the same keys: an FST spends
+//! This is a third smaller than an FST over the same keys: an FST spends
 //! bytes on transitions and on the value at every leaf, front-coding
 //! spends them only on each key's unshared tail.
-//!
-//! # FST (`V1`–`V6`)
-//!
-//! One `fst::Map` over the same keys, values packed as `fst_value`
-//! describes. Still written for the term-stats sidecar ([`DictBuilder`])
-//! and read for legacy blobs; [`TermDict`] hides which layout a blob uses.
 
 use std::{cmp::Ordering, collections::BTreeMap, io::Write, mem::take, ops::Range};
-
-use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 
 use crate::utils::{
     bytes::{u32_le_at, u64_le_at},
@@ -46,180 +37,48 @@ use crate::utils::{
 };
 
 pub(crate) mod value;
-pub(crate) use value::{FstValue, INLINE_TF_MAX, PFOR_LENGTH_UNKNOWN};
+pub(crate) use value::{DictEntry, INLINE_TF_MAX};
 
 /// Reserved separator byte inside dictionary keys (`<column>\x1F<term>`).
 /// User column names must not contain this byte. ASCII Unit Separator
 /// (U+001F) is below every printable ASCII char, so prefix iteration over a
 /// column's terms works via a plain range scan.
-pub const FST_SEPARATOR: u8 = 0x1F;
+pub const KEY_SEPARATOR: u8 = 0x1F;
 
-/// How a term dictionary lays its terms out — by blob version for a
-/// superfile, by choice for any other caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DictLayout {
-    /// One FST keyed `column <SEP> term`, values packed as [`value`]
-    /// describes. Superfile blobs `V1`–`V6`.
-    Fst,
-    /// Front-coded term blocks behind a fixed-width first-key table (the
-    /// block layout in this module). Superfile blobs `V7`+.
-    Blocks,
-}
-
-/// Build a canonical FST key from `(column_name, term)`.
+/// Build a canonical dictionary key from `(column_name, term)`.
 ///
 /// Encoding: `<column_name_utf8> | 0x1F | <term_utf8>`. The separator
-/// byte ([`FST_SEPARATOR`], ASCII Unit Separator) is below every printable
+/// byte ([`KEY_SEPARATOR`], ASCII Unit Separator) is below every printable
 /// ASCII byte, so prefix iteration `column_name\x1F` cleanly captures
 /// every term in that column.
 ///
 /// Callers must ensure `column_name` does not itself contain the
 /// separator byte — see [`validate_column_name`]. `term` may be any
 /// bytes a tokenizer produced; the separator `0x1F` is a C0 control
-/// byte, which no shipped tokenizer emits inside a token
-/// (`AsciiLowerTokenizer` keeps only `[a-z0-9]+`; `StandardTokenizer`
-/// emits UAX #29 word segments, which never contain a control byte),
-/// so the separator can never appear in a term.
+/// byte, which the shipped tokenizer never emits inside a token
+/// (`StandardTokenizer` emits UAX #29 word segments, which never
+/// contain a control byte), so the separator can never appear in a term.
 pub fn make_key(column_name: &str, term: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(column_name.len() + 1 + term.len());
     k.extend_from_slice(column_name.as_bytes());
-    k.push(FST_SEPARATOR);
+    k.push(KEY_SEPARATOR);
     k.extend_from_slice(term.as_bytes());
     k
 }
 
 /// Returns `true` if `column_name` is safe to use as the column part of
-/// an FST key: it must not contain the FST separator byte (otherwise
+/// a dictionary key: it must not contain the separator byte (otherwise
 /// prefix iteration could return cross-column matches).
 ///
 /// All other bytes are allowed; format-level naming rules (no `inf.`
 /// prefix, etc.) are enforced elsewhere.
 #[inline]
 pub fn validate_column_name(column_name: &str) -> bool {
-    !column_name.as_bytes().contains(&FST_SEPARATOR)
-}
-
-/// Stages keys for FST construction.
-///
-/// `fst::MapBuilder` requires keys to be inserted in sorted order;
-/// `BTreeMap` absorbs that constraint while also deduplicating on
-/// repeated key inserts (last write wins, matching the FST invariant
-/// of one value per key).
-#[derive(Debug, Default)]
-pub struct DictBuilder {
-    sorted_buffer: BTreeMap<Vec<u8>, u64>,
-}
-
-impl DictBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Stage a `(key, value)` pair. Inserts can arrive in any order;
-    /// repeated inserts of the same key keep the most-recent value.
-    pub fn insert(&mut self, key: &[u8], value: u64) {
-        self.sorted_buffer.insert(key.to_vec(), value);
-    }
-
-    /// Number of distinct keys staged so far.
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.sorted_buffer.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.sorted_buffer.is_empty()
-    }
-
-    /// Finalize the FST and return its serialized bytes.
-    ///
-    /// Panics on internal FST errors — these can only occur if the
-    /// `BTreeMap` invariant (sorted, unique keys) is broken, which is
-    /// impossible without `unsafe`.
-    pub fn finish(self) -> Vec<u8> {
-        let mut builder = MapBuilder::memory();
-        for (k, v) in self.sorted_buffer {
-            builder
-                .insert(&k, v)
-                .expect("BTreeMap guarantees sorted, unique keys");
-        }
-        builder
-            .into_inner()
-            .expect("in-memory FST writer cannot fail at finalize")
-    }
-}
-
-/// Reads a serialized `u64`-valued FST — the shape [`DictBuilder`]
-/// writes (the term-stats sidecar); the FTS blob's own dictionary is
-/// read through [`TermDict`]. Test-only: the sidecar has its own reader.
-#[cfg(test)]
-pub struct DictReader<'a> {
-    fst: Map<&'a [u8]>,
-}
-
-#[cfg(test)]
-impl<'a> DictReader<'a> {
-    /// Open from already-serialized FST bytes (the output of
-    /// `DictBuilder::finish`).
-    pub fn open(bytes: &'a [u8]) -> Result<Self, fst::Error> {
-        Ok(Self {
-            fst: Map::new(bytes)?,
-        })
-    }
-
-    /// Exact lookup. Returns `None` if `key` is not in the FST.
-    #[inline]
-    pub fn lookup(&self, key: &[u8]) -> Option<u64> {
-        self.fst.get(key)
-    }
-
-    /// Number of `(key, value)` pairs in the FST.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.fst.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.fst.is_empty()
-    }
-
-    /// Collect every `(key, value)` pair whose key starts with `prefix`,
-    /// in lexicographic order. Returns owned data so the caller doesn't
-    /// have to manage stream lifetimes.
-    ///
-    /// Uses an FST range scan that starts at `prefix` and stops as soon
-    /// as a key without `prefix` appears — O(matching keys), not O(N).
-    /// Suitable for "list every term in column X" diagnostics; for hot
-    /// query paths use [`Self::lookup`].
-    pub fn iter_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, u64)> {
-        let mut out = Vec::new();
-        self.for_each_prefix(prefix, |key, value| {
-            out.push((key.to_vec(), value));
-            true
-        });
-        out
-    }
-
-    /// Visit every `(key, value)` pair whose key starts with `prefix`, in
-    /// lexicographic order, until `visit` returns `false`. The same range
-    /// scan as [`Self::iter_prefix`] without materializing the keys, for a
-    /// caller that keeps only a filtered subset or stops early — a `LIKE`
-    /// expansion walks a column's whole vocabulary this way and gives up
-    /// once too many terms qualify.
-    pub fn for_each_prefix(&self, prefix: &[u8], mut visit: impl FnMut(&[u8], u64) -> bool) {
-        let mut stream = self.fst.range().ge(prefix).into_stream();
-        while let Some((key, value)) = stream.next() {
-            if !key.starts_with(prefix) || !visit(key, value) {
-                break;
-            }
-        }
-    }
+    !column_name.as_bytes().contains(&KEY_SEPARATOR)
 }
 
 // ---------------------------------------------------------------------------
-// Term-block dictionary (blob V7): front-coded blocks instead of an FST.
+// Term-block dictionary: front-coded blocks behind a first-key index.
 // ---------------------------------------------------------------------------
 
 /// Terms per block. Small enough that a lookup's scan after the index
@@ -294,7 +153,7 @@ impl<W: Write> TermBlockWriter<W> {
     }
 
     /// Append one term. Keys must arrive strictly ascending.
-    pub(crate) fn insert_sorted(&mut self, key: &[u8], entry: FstValue) -> std::io::Result<()> {
+    pub(crate) fn insert_sorted(&mut self, key: &[u8], entry: DictEntry) -> std::io::Result<()> {
         debug_assert!(
             self.in_block == 0 || self.prev_key.as_slice() < key,
             "term-block dictionary keys must be strictly ascending"
@@ -317,14 +176,14 @@ impl<W: Write> TermBlockWriter<W> {
         push_varint(&mut self.block, (key.len() - lcp) as u32);
         self.block.extend_from_slice(&key[lcp..]);
         match entry {
-            FstValue::Inline { doc_id, tf } => {
+            DictEntry::Inline { doc_id, tf } => {
                 self.block.push(FORM_INLINE);
                 push_varint(&mut self.block, doc_id);
                 push_varint(&mut self.block, tf);
             }
-            FstValue::Pfor {
+            DictEntry::Pfor {
                 metadata_offset,
-                postings_length_hint,
+                postings_length,
                 short,
             } => {
                 self.block.push(if short { FORM_SHORT } else { FORM_LONG });
@@ -332,10 +191,7 @@ impl<W: Write> TermBlockWriter<W> {
                     &mut self.block,
                     metadata_offset.wrapping_sub(self.prev_offset),
                 );
-                push_varint(
-                    &mut self.block,
-                    postings_length_hint.expect("a term-block entry always carries its length"),
-                );
+                push_varint(&mut self.block, postings_length);
                 self.prev_offset = metadata_offset;
             }
         }
@@ -492,7 +348,7 @@ impl<'a> TermBlocks<'a> {
     }
 
     /// Exact lookup.
-    pub(crate) fn lookup(&self, key: &[u8]) -> Option<FstValue> {
+    pub(crate) fn lookup(&self, key: &[u8]) -> Option<DictEntry> {
         let b = self.block_for(key)?;
         let mut cur = BlockCursor::new(&self.bytes[self.block_range(b)?]);
         while let Some(entry) = cur.next() {
@@ -505,14 +361,34 @@ impl<'a> TermBlocks<'a> {
         None
     }
 
+    /// Every `(key, entry)` whose key starts with `prefix`, in order.
+    pub(crate) fn iter_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, DictEntry)> {
+        let mut out = Vec::new();
+        self.for_each_prefix(prefix, |key, value| {
+            out.push((key.to_vec(), value));
+            true
+        });
+        out
+    }
+
+    /// Visit every `(key, entry)` whose key starts with `prefix`, in
+    /// order, until `visit` returns `false`.
+    pub(crate) fn for_each_prefix(
+        &self,
+        prefix: &[u8],
+        visit: impl FnMut(&[u8], DictEntry) -> bool,
+    ) {
+        self.for_each_from(prefix, prefix, visit);
+    }
+
     /// Visit every `(key, entry)` whose key starts with `prefix` and is
-    /// `>= from`, in order, until `visit` returns `false`. `from` must be
-    /// `>= prefix`.
+    /// `>= from`, in order, until `visit` returns `false`, so a walk can
+    /// resume where an earlier one stopped. `from` must be `>= prefix`.
     pub(crate) fn for_each_from(
         &self,
         prefix: &[u8],
         from: &[u8],
-        mut visit: impl FnMut(&[u8], FstValue) -> bool,
+        mut visit: impl FnMut(&[u8], DictEntry) -> bool,
     ) {
         let mut b = self.block_for(from).unwrap_or(0);
         while b < self.n_blocks {
@@ -555,7 +431,7 @@ impl<'a> BlockCursor<'a> {
     /// Decode the next entry into `self.key` and return its value;
     /// `None` at the block's end. A malformed block ends the walk early
     /// (the region is CRC-checked at open, so this is defensive).
-    fn next(&mut self) -> Option<FstValue> {
+    fn next(&mut self) -> Option<DictEntry> {
         if self.at >= self.bytes.len() {
             return None;
         }
@@ -574,16 +450,16 @@ impl<'a> BlockCursor<'a> {
             FORM_INLINE => {
                 let doc_id = read_varint(self.bytes, &mut self.at)?;
                 let tf = read_varint(self.bytes, &mut self.at)?;
-                Some(FstValue::Inline { doc_id, tf })
+                Some(DictEntry::Inline { doc_id, tf })
             }
             FORM_SHORT | FORM_LONG => {
                 let delta = read_u64_varint(self.bytes, &mut self.at)?;
                 let length = read_varint(self.bytes, &mut self.at)?;
                 let offset = self.prev_offset.wrapping_add(delta);
                 self.prev_offset = offset;
-                Some(FstValue::Pfor {
+                Some(DictEntry::Pfor {
                     metadata_offset: offset,
-                    postings_length_hint: Some(length),
+                    postings_length: length,
                     short: form == FORM_SHORT,
                 })
             }
@@ -592,154 +468,28 @@ impl<'a> BlockCursor<'a> {
     }
 }
 
-/// Builds the term dictionary of an FTS blob in either layout: staged
-/// in a `BTreeMap` (any insertion order) and finished to bytes.
+/// Builds the term dictionary of an FTS blob: staged in a `BTreeMap`
+/// (any insertion order) and finished to bytes.
+#[derive(Default)]
 pub(crate) struct TermDictBuilder {
-    layout: DictLayout,
-    sorted: BTreeMap<Vec<u8>, FstValue>,
+    sorted: BTreeMap<Vec<u8>, DictEntry>,
 }
 
 impl TermDictBuilder {
-    pub(crate) fn new(layout: DictLayout) -> Self {
-        Self {
-            layout,
-            sorted: BTreeMap::new(),
-        }
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 
-    pub(crate) fn insert(&mut self, key: &[u8], entry: FstValue) {
+    pub(crate) fn insert(&mut self, key: &[u8], entry: DictEntry) {
         self.sorted.insert(key.to_vec(), entry);
     }
 
     pub(crate) fn finish(self) -> Vec<u8> {
-        match self.layout {
-            DictLayout::Fst => {
-                let mut builder = DictBuilder::new();
-                for (k, v) in self.sorted {
-                    builder.insert(&k, pack_value(v));
-                }
-                builder.finish()
-            }
-            DictLayout::Blocks => {
-                let mut w = TermBlockWriter::new(Vec::new());
-                for (k, v) in self.sorted {
-                    w.insert_sorted(&k, v).expect("Vec sink cannot fail");
-                }
-                w.finish().expect("Vec sink cannot fail")
-            }
+        let mut w = TermBlockWriter::new(Vec::new());
+        for (k, v) in self.sorted {
+            w.insert_sorted(&k, v).expect("Vec sink cannot fail");
         }
-    }
-}
-
-/// Streaming counterpart of [`TermDictBuilder`] for a producer that
-/// already emits keys in order (the spilled build's k-way merge).
-pub(crate) enum StreamingTermDictBuilder<W: Write> {
-    Fst(MapBuilder<W>),
-    Blocks(TermBlockWriter<W>),
-}
-
-impl<W: Write> StreamingTermDictBuilder<W> {
-    pub(crate) fn new(layout: DictLayout, w: W) -> Result<Self, fst::Error> {
-        Ok(match layout {
-            DictLayout::Fst => Self::Fst(MapBuilder::new(w)?),
-            DictLayout::Blocks => Self::Blocks(TermBlockWriter::new(w)),
-        })
-    }
-
-    pub(crate) fn insert_sorted(&mut self, key: &[u8], entry: FstValue) -> Result<(), fst::Error> {
-        match self {
-            Self::Fst(inner) => inner.insert(key, pack_value(entry)),
-            Self::Blocks(w) => w.insert_sorted(key, entry).map_err(fst::Error::Io),
-        }
-    }
-
-    pub(crate) fn finish(self) -> Result<W, fst::Error> {
-        match self {
-            Self::Fst(inner) => inner.into_inner(),
-            Self::Blocks(w) => w.finish().map_err(fst::Error::Io),
-        }
-    }
-}
-
-/// An FST dictionary holds long-form terms only; the short form exists
-/// from `V7`, whose dictionary is term blocks.
-fn pack_value(entry: FstValue) -> u64 {
-    match entry {
-        FstValue::Inline { doc_id, tf } => FstValue::pack_inline(doc_id, tf),
-        FstValue::Pfor {
-            metadata_offset,
-            postings_length_hint,
-            short,
-        } => {
-            assert!(!short, "an FST dictionary has no short-form terms");
-            FstValue::pack_pfor(
-                metadata_offset,
-                postings_length_hint.unwrap_or(PFOR_LENGTH_UNKNOWN),
-            )
-        }
-    }
-}
-
-/// The term dictionary of an FTS blob, whichever layout the blob's
-/// version uses: decoded entries out, so no caller unpacks a value.
-pub(crate) enum TermDict<'a> {
-    Fst(Map<&'a [u8]>),
-    Blocks(TermBlocks<'a>),
-}
-
-impl<'a> TermDict<'a> {
-    pub(crate) fn open(bytes: &'a [u8], layout: DictLayout) -> Result<Self, String> {
-        Ok(match layout {
-            DictLayout::Fst => Self::Fst(Map::new(bytes).map_err(|e| e.to_string())?),
-            DictLayout::Blocks => Self::Blocks(TermBlocks::open(bytes)?),
-        })
-    }
-
-    #[inline]
-    pub(crate) fn lookup(&self, key: &[u8]) -> Option<FstValue> {
-        match self {
-            Self::Fst(map) => map.get(key).map(FstValue::unpack),
-            Self::Blocks(b) => b.lookup(key),
-        }
-    }
-
-    pub(crate) fn iter_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, FstValue)> {
-        let mut out = Vec::new();
-        self.for_each_prefix(prefix, |key, value| {
-            out.push((key.to_vec(), value));
-            true
-        });
-        out
-    }
-
-    pub(crate) fn for_each_prefix(
-        &self,
-        prefix: &[u8],
-        visit: impl FnMut(&[u8], FstValue) -> bool,
-    ) {
-        self.for_each_from(prefix, prefix, visit);
-    }
-
-    /// [`Self::for_each_prefix`] starting at the first key `>= from`, so a
-    /// walk can resume where an earlier one stopped. `from` must be
-    /// `>= prefix`.
-    pub(crate) fn for_each_from(
-        &self,
-        prefix: &[u8],
-        from: &[u8],
-        mut visit: impl FnMut(&[u8], FstValue) -> bool,
-    ) {
-        match self {
-            Self::Fst(map) => {
-                let mut stream = map.range().ge(from).into_stream();
-                while let Some((key, packed)) = stream.next() {
-                    if !key.starts_with(prefix) || !visit(key, FstValue::unpack(packed)) {
-                        break;
-                    }
-                }
-            }
-            Self::Blocks(b) => b.for_each_from(prefix, from, visit),
-        }
+        w.finish().expect("Vec sink cannot fail")
     }
 }
 
@@ -747,25 +497,25 @@ impl<'a> TermDict<'a> {
 mod tests {
     use super::*;
 
-    fn entries(n: u32) -> Vec<(Vec<u8>, FstValue)> {
+    fn entries(n: u32) -> Vec<(Vec<u8>, DictEntry)> {
         // Sorted keys with realistic shapes: shared prefixes, a block
         // boundary in the middle of a run, inline and both postings forms.
-        let mut v: Vec<(Vec<u8>, FstValue)> = (0..n)
+        let mut v: Vec<(Vec<u8>, DictEntry)> = (0..n)
             .map(|i| {
                 let key = make_key("body", &format!("term{i:05}x{}", i % 7));
                 let value = match i % 3 {
-                    0 => FstValue::Inline {
+                    0 => DictEntry::Inline {
                         doc_id: i * 7,
                         tf: 1 + i % 4,
                     },
-                    1 => FstValue::Pfor {
+                    1 => DictEntry::Pfor {
                         metadata_offset: u64::from(i) * 13,
-                        postings_length_hint: Some(9 + i % 5),
+                        postings_length: 9 + i % 5,
                         short: true,
                     },
-                    _ => FstValue::Pfor {
+                    _ => DictEntry::Pfor {
                         metadata_offset: u64::from(i) * 13 + 4,
-                        postings_length_hint: Some(1000 + i),
+                        postings_length: 1000 + i,
                         short: false,
                     },
                 };
@@ -807,10 +557,12 @@ mod tests {
                 "other column"
             );
             // Prefix walks: whole column, a prefix spanning blocks, none.
-            let all: Vec<_> = TermDict::Blocks(TermBlocks::open(&bytes).expect("opens"))
+            let all: Vec<_> = TermBlocks::open(&bytes)
+                .expect("opens")
                 .iter_prefix(&make_key("body", ""));
             assert_eq!(all, items);
-            let some: Vec<_> = TermDict::Blocks(TermBlocks::open(&bytes).expect("opens"))
+            let some: Vec<_> = TermBlocks::open(&bytes)
+                .expect("opens")
                 .iter_prefix(&make_key("body", "term0003"));
             let want: Vec<_> = items
                 .iter()
@@ -819,7 +571,8 @@ mod tests {
                 .collect();
             assert_eq!(some, want);
             assert!(
-                TermDict::Blocks(TermBlocks::open(&bytes).expect("opens"))
+                TermBlocks::open(&bytes)
+                    .expect("opens")
                     .iter_prefix(&make_key("body", "zzz"))
                     .is_empty()
             );
@@ -853,81 +606,13 @@ mod tests {
     }
 
     #[test]
-    fn term_blocks_are_smaller_than_the_fst_for_the_same_terms() {
-        let items = entries(20_000);
-        // The FST arm has no short form; compare against long-form entries.
-        let mut fst = TermDictBuilder::new(DictLayout::Fst);
-        let items: Vec<(Vec<u8>, FstValue)> = items
-            .into_iter()
-            .map(|(k, v)| match v {
-                FstValue::Pfor {
-                    metadata_offset,
-                    postings_length_hint,
-                    ..
-                } => (
-                    k,
-                    FstValue::Pfor {
-                        metadata_offset,
-                        postings_length_hint,
-                        short: false,
-                    },
-                ),
-                inline => (k, inline),
-            })
-            .collect();
-        let mut w = TermBlockWriter::new(Vec::new());
-        for (k, v) in &items {
-            w.insert_sorted(k, *v).expect("vec sink");
-        }
-        let blocks = w.finish().expect("vec sink");
-        for (k, v) in &items {
-            fst.insert(k, *v);
-        }
-        let fst = fst.finish();
-        assert!(
-            blocks.len() < fst.len(),
-            "blocks {} vs fst {}",
-            blocks.len(),
-            fst.len()
-        );
-        // Both layouts answer identically through the unified reader.
-        let a = TermDict::open(&blocks, DictLayout::Blocks).expect("blocks");
-        let b = TermDict::open(&fst, DictLayout::Fst).expect("fst");
-        for (k, v) in items.iter().step_by(97) {
-            assert_eq!(a.lookup(k), Some(*v));
-            assert_eq!(b.lookup(k), Some(*v));
-        }
-    }
-
-    #[test]
-    fn for_each_from_resumes_at_a_key_in_both_layouts() {
-        // The FST arm has no short form, so use long-form entries only.
-        let items: Vec<(Vec<u8>, FstValue)> = entries(5_000)
-            .into_iter()
-            .map(|(k, v)| match v {
-                FstValue::Pfor {
-                    metadata_offset,
-                    postings_length_hint,
-                    ..
-                } => (
-                    k,
-                    FstValue::Pfor {
-                        metadata_offset,
-                        postings_length_hint,
-                        short: false,
-                    },
-                ),
-                inline => (k, inline),
-            })
-            .collect();
+    fn for_each_from_resumes_at_a_key() {
+        let items = entries(5_000);
         let mut blocks = TermBlockWriter::new(Vec::new());
-        let mut fst = TermDictBuilder::new(DictLayout::Fst);
         for (k, v) in &items {
             blocks.insert_sorted(k, *v).expect("vec sink");
-            fst.insert(k, *v);
         }
         let blocks = blocks.finish().expect("vec sink");
-        let fst = fst.finish();
         let prefix = make_key("body", "");
         // Column start, keys on and between block edges, and past the end.
         let froms = [
@@ -938,17 +623,15 @@ mod tests {
             items[items.len() - 1].0.clone(),
             make_key("body", "zzz"),
         ];
-        for (bytes, layout) in [(&blocks, DictLayout::Blocks), (&fst, DictLayout::Fst)] {
-            let d = TermDict::open(bytes, layout).expect("opens");
-            for from in &froms {
-                let mut got = Vec::new();
-                d.for_each_from(&prefix, from, |k, v| {
-                    got.push((k.to_vec(), v));
-                    true
-                });
-                let want: Vec<_> = items.iter().filter(|(k, _)| k >= from).cloned().collect();
-                assert_eq!(got, want, "{layout:?} from {from:?}");
-            }
+        let d = TermBlocks::open(&blocks).expect("opens");
+        for from in &froms {
+            let mut got = Vec::new();
+            d.for_each_from(&prefix, from, |k, v| {
+                got.push((k.to_vec(), v));
+                true
+            });
+            let want: Vec<_> = items.iter().filter(|(k, _)| k >= from).cloned().collect();
+            assert_eq!(got, want, "from {from:?}");
         }
     }
 
@@ -976,7 +659,8 @@ mod tests {
         let (k, _) = items.last().expect("items");
         assert_eq!(d.lookup(k), None);
         assert!(
-            TermDict::Blocks(TermBlocks::open(&bad).expect("footer intact"))
+            TermBlocks::open(&bad)
+                .expect("footer intact")
                 .iter_prefix(k)
                 .is_empty()
         );
@@ -1008,12 +692,11 @@ mod tests {
 
     #[test]
     fn make_key_preserves_term_bytes() {
-        // AsciiLowerTokenizer drops non-ASCII tokens, but make_key itself
-        // is byte-transparent: multi-byte UTF-8 in a term (e.g. from the
-        // standard tokenizer) comes through exactly.
+        // make_key is byte-transparent: multi-byte UTF-8 in a term
+        // comes through exactly.
         let key = make_key("body", "café");
         assert_eq!(&key[0..4], b"body");
-        assert_eq!(key[4], FST_SEPARATOR);
+        assert_eq!(key[4], KEY_SEPARATOR);
         assert_eq!(&key[5..], "café".as_bytes());
     }
 
@@ -1068,310 +751,5 @@ mod tests {
         // restrictions if needed; the dict layer is byte-transparent.
         assert!(validate_column_name("café"));
         assert!(validate_column_name("日本語"));
-    }
-
-    // --- DictBuilder + DictReader roundtrip -----------------------------
-
-    #[test]
-    fn lookup_roundtrip_basic() {
-        let mut b = DictBuilder::new();
-        b.insert(&make_key("title", "rust"), 100);
-        b.insert(&make_key("title", "async"), 200);
-        b.insert(&make_key("body", "tokio"), 300);
-        let bytes = b.finish();
-
-        let r = DictReader::open(&bytes).expect("open DictReader");
-        assert_eq!(r.lookup(&make_key("title", "rust")), Some(100));
-        assert_eq!(r.lookup(&make_key("title", "async")), Some(200));
-        assert_eq!(r.lookup(&make_key("body", "tokio")), Some(300));
-        assert_eq!(r.len(), 3);
-    }
-
-    #[test]
-    fn lookup_missing_returns_none() {
-        let mut b = DictBuilder::new();
-        b.insert(&make_key("title", "rust"), 1);
-        let bytes = b.finish();
-        let r = DictReader::open(&bytes).expect("open DictReader");
-
-        assert_eq!(r.lookup(&make_key("title", "java")), None);
-        assert_eq!(r.lookup(&make_key("body", "rust")), None);
-        assert_eq!(r.lookup(b""), None);
-    }
-
-    #[test]
-    fn out_of_order_inserts_work() {
-        // Direct fst::MapBuilder rejects out-of-order keys; our
-        // DictBuilder absorbs the sort via BTreeMap.
-        let mut b = DictBuilder::new();
-        let keys = ["z", "a", "m", "b", "y", "c"];
-        for (i, k) in keys.iter().enumerate() {
-            b.insert(&make_key("col", k), i as u64);
-        }
-        let bytes = b.finish();
-        let r = DictReader::open(&bytes).expect("open DictReader");
-
-        for (i, k) in keys.iter().enumerate() {
-            assert_eq!(r.lookup(&make_key("col", k)), Some(i as u64));
-        }
-    }
-
-    #[test]
-    fn duplicate_inserts_keep_last_value() {
-        // BTreeMap dedups; the FST gets the latest value. Documents
-        // the "last write wins" semantic for DictBuilder::insert.
-        let mut b = DictBuilder::new();
-        b.insert(&make_key("col", "key"), 1);
-        b.insert(&make_key("col", "key"), 2);
-        b.insert(&make_key("col", "key"), 999);
-        let bytes = b.finish();
-        let r = DictReader::open(&bytes).expect("open DictReader");
-
-        assert_eq!(r.lookup(&make_key("col", "key")), Some(999));
-        assert_eq!(r.len(), 1);
-    }
-
-    // --- Prefix iteration ----------------------------------------------
-
-    #[test]
-    fn iter_prefix_returns_matching_keys_only() {
-        let mut b = DictBuilder::new();
-        // Three columns, distinct vocabularies.
-        b.insert(&make_key("title", "alpha"), 1);
-        b.insert(&make_key("title", "beta"), 2);
-        b.insert(&make_key("title", "gamma"), 3);
-        b.insert(&make_key("body", "alpha"), 10);
-        b.insert(&make_key("body", "delta"), 20);
-        b.insert(&make_key("tag", "epsilon"), 100);
-        let bytes = b.finish();
-        let r = DictReader::open(&bytes).expect("open DictReader");
-
-        // Listing all terms in `title`.
-        let title_terms = r.iter_prefix(b"title\x1F");
-        let title_only: Vec<&[u8]> = title_terms.iter().map(|(k, _)| k.as_slice()).collect();
-        assert_eq!(
-            title_only,
-            vec![
-                b"title\x1Falpha".as_slice(),
-                b"title\x1Fbeta".as_slice(),
-                b"title\x1Fgamma".as_slice(),
-            ],
-            "iter_prefix on title\\x1F returns only title-prefixed keys"
-        );
-        assert_eq!(
-            title_terms.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-
-        // body has different vocabulary.
-        let body_terms = r.iter_prefix(b"body\x1F");
-        assert_eq!(body_terms.len(), 2);
-
-        // tag has just one.
-        let tag_terms = r.iter_prefix(b"tag\x1F");
-        assert_eq!(tag_terms.len(), 1);
-    }
-
-    #[test]
-    fn iter_prefix_lexicographic_order() {
-        // Insert in arbitrary order, expect lex order out.
-        let mut b = DictBuilder::new();
-        let terms = ["zebra", "ant", "monkey", "apple", "banana", "aardvark"];
-        for (i, t) in terms.iter().enumerate() {
-            b.insert(&make_key("col", t), i as u64);
-        }
-        let bytes = b.finish();
-        let r = DictReader::open(&bytes).expect("open DictReader");
-
-        let listed: Vec<Vec<u8>> = r
-            .iter_prefix(b"col\x1F")
-            .into_iter()
-            .map(|(k, _)| k[4..].to_vec()) // strip "col\x1F"
-            .collect();
-        let mut expected: Vec<&str> = terms.to_vec();
-        expected.sort();
-        let expected: Vec<Vec<u8>> = expected.iter().map(|s| s.as_bytes().to_vec()).collect();
-        assert_eq!(listed, expected);
-    }
-
-    #[test]
-    fn iter_prefix_no_match_returns_empty() {
-        let mut b = DictBuilder::new();
-        b.insert(&make_key("title", "rust"), 1);
-        let bytes = b.finish();
-        let r = DictReader::open(&bytes).expect("open DictReader");
-
-        // Column that doesn't exist in the FST.
-        assert_eq!(r.iter_prefix(b"missing\x1F"), Vec::new());
-        // Empty prefix on non-empty FST returns everything (defining
-        // behavior — useful for a "dump dict" diagnostic).
-        assert_eq!(r.iter_prefix(b"").len(), 1);
-    }
-
-    #[test]
-    fn iter_prefix_stops_at_first_non_match() {
-        // Implementation correctness: iter_prefix must stop scanning
-        // as soon as a non-matching key appears. We can't observe the
-        // stopping directly, but we can confirm the result is correct
-        // when many post-prefix keys exist.
-        let mut b = DictBuilder::new();
-        // Lots of `body\x1F*` keys after the (alphabetically earlier)
-        // `title\x1F*` block.
-        for i in 0..1000 {
-            b.insert(&make_key("body", &format!("term{i:04}")), i as u64);
-        }
-        b.insert(&make_key("title", "rust"), 9999);
-        let bytes = b.finish();
-        let r = DictReader::open(&bytes).expect("open DictReader");
-
-        // Title scan must yield exactly one entry, regardless of how
-        // many body entries follow (`body` < `title` alphabetically,
-        // so by the time the scan reaches `title\x1F` it has already
-        // skipped past every `body\x1F*` key).
-        let title = r.iter_prefix(b"title\x1F");
-        assert_eq!(title.len(), 1);
-        assert_eq!(title[0].1, 9999);
-    }
-
-    // --- Empty-FST handling --------------------------------------------
-
-    #[test]
-    fn empty_builder_produces_valid_empty_fst() {
-        let bytes = DictBuilder::new().finish();
-        let r = DictReader::open(&bytes).expect("open DictReader");
-        assert!(r.is_empty());
-        assert_eq!(r.len(), 0);
-        assert_eq!(r.lookup(b"anything"), None);
-        assert_eq!(r.iter_prefix(b""), Vec::new());
-        assert_eq!(r.iter_prefix(b"prefix"), Vec::new());
-    }
-
-    // --- Stress / scale -------------------------------------------------
-
-    #[test]
-    fn handles_thousand_keys_roundtrip() {
-        let mut b = DictBuilder::new();
-        for i in 0..1000 {
-            b.insert(&make_key("body", &format!("term{i:04}")), i as u64);
-        }
-        let bytes = b.finish();
-        let r = DictReader::open(&bytes).expect("open DictReader");
-        assert_eq!(r.len(), 1000);
-
-        for i in 0..1000 {
-            let k = make_key("body", &format!("term{i:04}"));
-            assert_eq!(r.lookup(&k), Some(i as u64));
-        }
-
-        // Prefix iter returns all 1000 in lex order.
-        let listed = r.iter_prefix(b"body\x1F");
-        assert_eq!(listed.len(), 1000);
-        for w in listed.windows(2) {
-            assert!(w[0].0 < w[1].0, "prefix iter not in lex order");
-        }
-    }
-
-    #[test]
-    fn serialization_is_deterministic() {
-        // Same inputs (regardless of insertion order) produce
-        // byte-identical FST output. Important for reproducible builds
-        // and for content-addressed superfile hashing.
-        let mut b1 = DictBuilder::new();
-        b1.insert(&make_key("a", "x"), 1);
-        b1.insert(&make_key("b", "y"), 2);
-        b1.insert(&make_key("c", "z"), 3);
-        let bytes1 = b1.finish();
-
-        let mut b2 = DictBuilder::new();
-        b2.insert(&make_key("c", "z"), 3);
-        b2.insert(&make_key("a", "x"), 1);
-        b2.insert(&make_key("b", "y"), 2);
-        let bytes2 = b2.finish();
-
-        assert_eq!(bytes1, bytes2);
-    }
-
-    #[test]
-    fn keys_with_same_prefix_share_state() {
-        // FST tail-merging makes shared prefixes effectively free.
-        // We don't probe FST internals; just verify lookups are still
-        // correct when many keys share a long common prefix.
-        let mut b = DictBuilder::new();
-        for i in 0..100 {
-            b.insert(
-                &make_key("very_long_column_name", &format!("term{i}")),
-                i as u64,
-            );
-        }
-        let bytes = b.finish();
-        let r = DictReader::open(&bytes).expect("open DictReader");
-        assert_eq!(r.len(), 100);
-        for i in 0..100 {
-            let k = make_key("very_long_column_name", &format!("term{i}"));
-            assert_eq!(r.lookup(&k), Some(i as u64));
-        }
-    }
-
-    #[test]
-    fn lookup_distinguishes_columns_with_same_term() {
-        // The whole point of `<col>\x1F<term>` keying: same term in
-        // different columns must look up to different values.
-        let mut b = DictBuilder::new();
-        b.insert(&make_key("title", "rust"), 1);
-        b.insert(&make_key("body", "rust"), 2);
-        b.insert(&make_key("tag", "rust"), 3);
-        let bytes = b.finish();
-        let r = DictReader::open(&bytes).expect("open DictReader");
-
-        assert_eq!(r.lookup(&make_key("title", "rust")), Some(1));
-        assert_eq!(r.lookup(&make_key("body", "rust")), Some(2));
-        assert_eq!(r.lookup(&make_key("tag", "rust")), Some(3));
-    }
-
-    /// `DictBuilder` tracks key counts + emptiness, which round-trip
-    /// through `DictReader::{len, is_empty}`; the streaming builder
-    /// tracks `n_keys` as sorted keys arrive.
-    #[test]
-    fn builder_and_reader_track_key_counts() {
-        let mut b = DictBuilder::new();
-        assert!(b.is_empty(), "fresh builder is empty");
-        assert_eq!(b.len(), 0);
-        b.insert(b"alpha", 1);
-        b.insert(b"beta", 2);
-        assert!(!b.is_empty());
-        assert_eq!(b.len(), 2);
-        let bytes = b.finish();
-        let r = DictReader::open(&bytes).expect("open dict");
-        assert_eq!(r.len(), 2);
-        assert!(!r.is_empty());
-
-        // The streaming term dictionary accepts keys fed in strictly
-        // sorted order and produces bytes the unified reader opens, in
-        // both layouts.
-        for layout in [DictLayout::Fst, DictLayout::Blocks] {
-            let mut sb = StreamingTermDictBuilder::new(layout, Vec::new()).expect("streaming");
-            sb.insert_sorted(b"a", FstValue::Inline { doc_id: 1, tf: 1 })
-                .expect("sorted insert");
-            sb.insert_sorted(
-                b"b",
-                FstValue::Pfor {
-                    metadata_offset: 40,
-                    postings_length_hint: Some(9),
-                    short: false,
-                },
-            )
-            .expect("sorted insert");
-            let bytes = sb.finish().expect("finish streaming builder");
-            let d = TermDict::open(&bytes, layout).expect("opens");
-            assert_eq!(d.lookup(b"a"), Some(FstValue::Inline { doc_id: 1, tf: 1 }));
-            assert_eq!(
-                d.lookup(b"b"),
-                Some(FstValue::Pfor {
-                    metadata_offset: 40,
-                    postings_length_hint: Some(9),
-                    short: false,
-                })
-            );
-        }
     }
 }

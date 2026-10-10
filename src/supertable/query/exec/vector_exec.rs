@@ -608,7 +608,6 @@ mod tests {
     use crate::{
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -630,12 +629,6 @@ mod tests {
     }
 
     fn options_one_superfile_per_commit(dim: usize) -> SupertableOptions {
-        options_one_superfile_per_commit_with(dim, ASCII_LOWER_TOKENIZER)
-    }
-
-    /// [`options_one_superfile_per_commit`] with `title` analyzed by the
-    /// named analyzer.
-    fn options_one_superfile_per_commit_with(dim: usize, analyzer: &str) -> SupertableOptions {
         let pool = Arc::new(
             ThreadPoolBuilder::new()
                 .num_threads(1)
@@ -648,7 +641,7 @@ mod tests {
         ]));
         SupertableOptions::new(
             schema,
-            vec![FtsConfig::new("title").analyzer(analyzer)],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -705,17 +698,15 @@ mod tests {
         let titles: Vec<String> = (0..n)
             .map(|i| if i < n_common { "common" } else { "rare" }.to_owned())
             .collect();
-        supertable_ranked_by_index(dim, &titles, ASCII_LOWER_TOKENIZER)
+        supertable_ranked_by_index(dim, &titles)
     }
 
     /// Single-superfile table where doc `i` carries `titles[i]` and the
     /// vector `[1, i, 0, …]`, so distance to the query `[1, 0, …]` ranks by
-    /// index (see [`supertable_for_pushdown`]). `title` is analyzed with
-    /// `tokenizer`. Requires `dim >= 2`.
-    fn supertable_ranked_by_index(dim: usize, titles: &[String], analyzer: &str) -> Supertable {
+    /// index (see [`supertable_for_pushdown`]). Requires `dim >= 2`.
+    fn supertable_ranked_by_index(dim: usize, titles: &[String]) -> Supertable {
         let n = titles.len();
-        let st = Supertable::create(options_one_superfile_per_commit_with(dim, analyzer))
-            .expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         let titles = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
@@ -1064,7 +1055,7 @@ mod tests {
         .iter()
         .map(|t| (*t).to_owned())
         .collect();
-        let st = supertable_ranked_by_index(dim, &titles, STANDARD_TOKENIZER);
+        let st = supertable_ranked_by_index(dim, &titles);
         let q = csv_one_hot(dim, 0);
         let filtered = st
             .reader()
@@ -1090,7 +1081,7 @@ mod tests {
         let dim = 16;
         let k = 3;
         let titles: Vec<String> = (0..LIKE_MAX_TERMS + 8).map(|i| format!("w{i}zz")).collect();
-        let st = supertable_ranked_by_index(dim, &titles, STANDARD_TOKENIZER);
+        let st = supertable_ranked_by_index(dim, &titles);
         let q = csv_one_hot(dim, 0);
         // Contains: no manifest gate at all.
         let contains = st

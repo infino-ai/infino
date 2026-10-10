@@ -140,17 +140,37 @@ pub struct OpStats {
     /// counting them would break the warm/cold invariance);
     /// [`Self::rows_materialized`] is that leg's invariant signal.
     pub planned_read_ranges: u64,
-    /// Superfiles this query entered — opened for reading — across every
-    /// fan-out. Read against [`Self::superfiles_considered`] it says how much
-    /// of the table the query actually touched.
-    pub superfiles_opened: u64,
-    /// Superfiles the prune was asked about: the table's live set, before the
-    /// manifest summaries and the term index had their say.
+    /// Superfiles a query is narrowed through, as a funnel of **survivors**:
+    ///
+    /// ```text
+    /// superfiles_considered           the table's live set
+    ///   └─ presence_pruning_survived  after routing: does this superfile hold the terms?
+    ///        └─ score_pruning_survived  after score ceilings: can it still reach the top k?
+    /// ```
+    ///
+    /// All three count survivors, so they are directly comparable and only
+    /// ever decrease. A stage whose count equals the stage above it did no
+    /// work: `considered == presence_pruning_survived` means routing excluded
+    /// nothing, which is a different problem from a slow scan.
+    ///
+    /// The table's live set, before the manifest summaries and the term index
+    /// had their say.
     pub superfiles_considered: u64,
-    /// Superfiles the prune excluded. `considered - pruned` is what the fan-out
-    /// was handed, so a zero here on a selective predicate means routing found
-    /// nothing to skip — which is a different problem from a slow scan.
-    pub superfiles_pruned: u64,
+    /// Superfiles still standing after presence routing — the manifest
+    /// summaries, the FTS blooms and the term index agreeing the superfile may
+    /// hold the query's terms. This is what the ranked path then orders by
+    /// score ceiling.
+    pub presence_pruning_survived: u64,
+    /// Superfiles actually entered — opened for reading — after score-ceiling
+    /// skipping had its say. A superfile whose ceiling cannot reach the
+    /// running k-th score is never opened, so this is at most
+    /// [`Self::presence_pruning_survived`] and is the number that decides how
+    /// much of the table a query really reads.
+    ///
+    /// Counted per fan-out **work unit**, and a ranged union splits one
+    /// superfile into several units, so this can exceed the superfile count on
+    /// those shapes.
+    pub score_pruning_survived: u64,
     /// Parquet **data-page** bytes SQL scans requested through the
     /// DataFusion store, independent of whether they were served from
     /// resident bytes or fetched. Footer and page-index reads never
@@ -235,12 +255,12 @@ pub struct OpStats {
     /// The object term is derived from the buffered input rather than the
     /// sealed output, and that distinction is load-bearing rather than
     /// cosmetic. Per-superfile overhead is not a fixed footer: every shard
-    /// carries its own dictionary, FST and index headers, so on a corpus
-    /// whose vocabulary is shared across rows the same input seals to
-    /// roughly four times more bytes at pool width 16 than at width 1.
-    /// Dividing that by the target would make an identical append plan
-    /// more requests on a wider host — the exact width-dependence this
-    /// counter exists to avoid.
+    /// carries its own Parquet dictionaries, term dictionary and index headers,
+    /// so on a corpus whose vocabulary is shared across rows the same input
+    /// seals to roughly four times more bytes at pool width 16 than at width 1.
+    /// Dividing that by the target would make an identical append plan more
+    /// requests on a wider host — the exact width-dependence this counter
+    /// exists to avoid.
     ///
     /// Requests are a real and material share of write cost — a PUT is
     /// 12.5x a GET in the bench cost model, and unlike a warm read's
@@ -265,10 +285,10 @@ pub(crate) struct OpStatsCollector {
     planned_read_ranges: AtomicU64,
     /// Superfiles a query entered — opened for reading — across every
     /// fan-out. What bound-ordered opening is meant to shrink.
-    superfiles_opened: AtomicU64,
+    score_pruning_survived: AtomicU64,
     /// Superfiles the prune was asked about, and how many it excluded.
     superfiles_considered: AtomicU64,
-    superfiles_pruned: AtomicU64,
+    presence_pruning_survived: AtomicU64,
     sql_page_bytes: AtomicU64,
     rows_materialized: AtomicU64,
     kernel_cpu_ns: AtomicU64,
@@ -303,8 +323,8 @@ impl OpStatsCollector {
     }
 
     /// Count superfiles a fan-out opened for this operation.
-    pub(crate) fn add_superfiles_opened(&self, n: u64) {
-        self.superfiles_opened.fetch_add(n, Ordering::Relaxed);
+    pub(crate) fn add_score_pruning_survived(&self, n: u64) {
+        self.score_pruning_survived.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Count superfiles the prune was asked about.
@@ -313,14 +333,15 @@ impl OpStatsCollector {
     }
 
     /// Count superfiles the prune excluded.
-    pub(crate) fn add_superfiles_pruned(&self, n: u64) {
-        self.superfiles_pruned.fetch_add(n, Ordering::Relaxed);
+    pub(crate) fn add_presence_pruning_survived(&self, n: u64) {
+        self.presence_pruning_survived
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     /// Superfiles opened so far by this operation.
     #[cfg(test)]
-    pub(crate) fn superfiles_opened(&self) -> u64 {
-        self.superfiles_opened.load(Ordering::Relaxed)
+    pub(crate) fn score_pruning_survived(&self) -> u64 {
+        self.score_pruning_survived.load(Ordering::Relaxed)
     }
 
     /// Flush a kernel's planned byte-source range count.
@@ -410,9 +431,9 @@ impl OpStatsCollector {
             vector_candidates_scanned: self.vector_candidates_scanned.load(Ordering::Relaxed),
             vector_rows_reranked: self.vector_rows_reranked.load(Ordering::Relaxed),
             planned_read_ranges: self.planned_read_ranges.load(Ordering::Relaxed),
-            superfiles_opened: self.superfiles_opened.load(Ordering::Relaxed),
             superfiles_considered: self.superfiles_considered.load(Ordering::Relaxed),
-            superfiles_pruned: self.superfiles_pruned.load(Ordering::Relaxed),
+            presence_pruning_survived: self.presence_pruning_survived.load(Ordering::Relaxed),
+            score_pruning_survived: self.score_pruning_survived.load(Ordering::Relaxed),
             sql_page_bytes: self.sql_page_bytes.load(Ordering::Relaxed),
             rows_materialized: self.rows_materialized.load(Ordering::Relaxed),
             kernel_cpu_ns: self.kernel_cpu_ns.load(Ordering::Relaxed),

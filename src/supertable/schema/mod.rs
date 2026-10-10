@@ -43,10 +43,11 @@ use crate::{
     catalog::DEFAULT_ROT_SEED,
     superfile::{
         builder::FtsConfig,
+        format::fts::REPAIR_RELEASE,
         fts::{
-            analysis::{Base, Stemmer, Stopwords, chain_tokenizer},
+            analysis::{Stemmer, Stopwords, chain_tokenizer},
             bm25::Bm25Params,
-            tokenize::Tokenizer,
+            tokenize::{STANDARD_TOKENIZER, Tokenizer},
         },
         vector::{builder::VectorConfig, distance::Metric, rerank_codec::RerankCodec},
     },
@@ -105,11 +106,10 @@ impl FieldId {
     /// birth-version range of its superfiles. Not a column.
     pub const BIRTH_VERSION: FieldId = FieldId(u32::MAX);
 
-    /// The key a table-level term artifact (the term index, the term-stats
-    /// sidecar) files `term` of this column under: the id in decimal, then
-    /// the same separator and term bytes as a superfile's own dictionary
-    /// key, so one encoding serves both tiers and a rename changes nothing
-    /// at the table level.
+    /// The key the table-level term index files `term` of this column under:
+    /// the id in decimal, then the same separator and term bytes as a
+    /// superfile's own dictionary key, so one encoding serves both tiers and
+    /// a rename changes nothing at the table level.
     pub(crate) fn term_key(self, term: &str) -> Vec<u8> {
         make_key(&self.to_string(), term)
     }
@@ -131,8 +131,6 @@ impl fmt::Display for FieldId {
 pub enum ColumnIndex {
     /// A full-text index over a string column.
     Fts {
-        /// The base tokenizer's name.
-        analyzer: String,
         /// The stopword filter applied after tokenizing.
         stopwords: Stopwords,
         /// The stemmer applied after tokenizing.
@@ -206,6 +204,17 @@ pub(crate) fn user_metadata(field: &Field) -> BTreeMap<String, String> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableSchema {
     fields: Vec<FieldDef>,
+    /// Where each live column's name sits in `fields`.
+    ///
+    /// Derived from `fields` and kept beside them so a lookup by name is one
+    /// hash rather than a scan. Every path that reads a document does that
+    /// lookup per key per row — the depth cap, the struct check, the target
+    /// type, the shadow check — so without it a wide table makes a write
+    /// quadratic in its own width.
+    ///
+    /// Rebuilt by [`TableSchema::reindex`] whenever `fields` moves, which is
+    /// only ever at the end of a construction or an `apply`.
+    by_name: HashMap<String, usize>,
     /// Ids retired by a drop. Never reused.
     tombstoned: Vec<FieldId>,
     /// The highest id ever minted, live or tombstoned.
@@ -219,6 +228,21 @@ pub struct TableSchema {
 }
 
 impl TableSchema {
+    /// Rebuild [`TableSchema::by_name`] from `fields`.
+    pub(crate) fn reindex(&mut self) {
+        self.by_name = self
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(at, f)| (f.name.clone(), at))
+            .collect();
+    }
+
+    /// The live column called `name`, in one lookup.
+    pub(crate) fn field_named(&self, name: &str) -> Option<&FieldDef> {
+        self.by_name.get(name).map(|&at| &self.fields[at])
+    }
+
     /// The schema of a table created from `user`: ids `1..=n` in declared
     /// order, `schema_id` 1, no indexes.
     pub(crate) fn from_user_schema(user: &Schema) -> Self {
@@ -245,14 +269,17 @@ impl TableSchema {
             })
             .collect();
         let last_field_id = fields.len() as u32;
-        Self {
+        let mut schema = Self {
             fields,
+            by_name: HashMap::new(),
             tombstoned: Vec::new(),
             last_field_id,
             schema_id: 1,
             max_fields: DEFAULT_MAX_FIELDS,
             max_depth: DEFAULT_MAX_DEPTH,
-        }
+        };
+        schema.reindex();
+        schema
     }
 
     /// The user schema: every live column in declared order, unstamped.
@@ -325,7 +352,6 @@ impl TableSchema {
             .iter()
             .filter_map(|f| match &f.index {
                 Some(ColumnIndex::Fts {
-                    analyzer,
                     stopwords,
                     stemmer,
                     positions,
@@ -333,7 +359,6 @@ impl TableSchema {
                     bm25,
                 }) => Some(FtsConfig {
                     column: f.name.clone(),
-                    analyzer: analyzer.clone(),
                     stopwords: *stopwords,
                     stemmer: *stemmer,
                     positions: *positions,
@@ -378,15 +403,8 @@ impl TableSchema {
         let field = self.fields.iter().find(|f| f.name == column)?;
         match &field.index {
             Some(ColumnIndex::Fts {
-                analyzer,
-                stopwords,
-                stemmer,
-                ..
-            }) => Some(chain_tokenizer(
-                Base::from_name(analyzer)?,
-                *stopwords,
-                *stemmer,
-            )),
+                stopwords, stemmer, ..
+            }) => Some(chain_tokenizer(*stopwords, *stemmer)),
             _ => None,
         }
     }
@@ -490,14 +508,17 @@ impl TableSchema {
             })
             .transpose()?
             .unwrap_or_default();
-        Ok(Self {
+        let mut schema = Self {
             fields,
+            by_name: HashMap::new(),
             tombstoned,
             last_field_id,
             schema_id,
             max_fields,
             max_depth,
-        })
+        };
+        schema.reindex();
+        Ok(schema)
     }
 
     /// Live columns in declared order.
@@ -523,7 +544,7 @@ impl TableSchema {
 
     /// The id of the live column named `name`.
     pub fn id_of(&self, name: &str) -> Option<FieldId> {
-        self.fields.iter().find(|f| f.name == name).map(|f| f.id)
+        self.field_named(name).map(|f| f.id)
     }
 
     /// The current name of the live column with id `id`.
@@ -562,7 +583,6 @@ impl TableSchema {
 fn column_index(name: &str, fts: &[FtsConfig], vectors: &[VectorConfig]) -> Option<ColumnIndex> {
     if let Some(fc) = fts.iter().find(|fc| fc.column == name) {
         return Some(ColumnIndex::Fts {
-            analyzer: fc.analyzer.clone(),
             stopwords: fc.stopwords,
             stemmer: fc.stemmer,
             positions: fc.positions,
@@ -584,7 +604,6 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
     let mut out = Map::new();
     match index {
         ColumnIndex::Fts {
-            analyzer,
             stopwords,
             stemmer,
             positions,
@@ -592,7 +611,8 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
             bm25,
         } => {
             out.insert("kind".into(), Value::from("fts"));
-            out.insert("analyzer".into(), Value::from(analyzer.as_str()));
+            // Recorded so a future tokenizer needs no format change.
+            out.insert("analyzer".into(), Value::from(STANDARD_TOKENIZER));
             if let Some(name) = stopwords.as_str() {
                 out.insert("stopwords".into(), Value::from(name));
             }
@@ -660,10 +680,18 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
     match str_of("kind")? {
         "fts" => {
             let defaults = FtsConfig::new("");
+            // Only `standard` is reproducible; a list naming another base
+            // refuses rather than query an index split another way.
+            if let Some(name) = obj.get("analyzer").and_then(Value::as_str)
+                && name != STANDARD_TOKENIZER
+            {
+                return Err(format!(
+                    "index uses the removed analyzer '{name}'; copy the table's rows out \
+                     with infino {REPAIR_RELEASE} before upgrading, then re-create it \
+                     under \"standard\""
+                ));
+            }
             Ok(ColumnIndex::Fts {
-                analyzer: str_of("analyzer")
-                    .map(str::to_owned)
-                    .unwrap_or(defaults.analyzer),
                 stopwords: named(obj, "stopwords", Stopwords::from_name)?
                     .unwrap_or(defaults.stopwords),
                 stemmer: named(obj, "stemmer", Stemmer::from_name)?.unwrap_or(defaults.stemmer),
@@ -884,7 +912,6 @@ mod tests {
             Field::new("score", DataType::Int64, true),
         ]);
         let mut fts = FtsConfig::new("title")
-            .analyzer("ascii_lower")
             .stopwords(Stopwords::English)
             .stemmer(Stemmer::English);
         fts.positions = true;
@@ -915,7 +942,6 @@ mod tests {
         assert_eq!(
             (
                 d.column.as_str(),
-                d.analyzer.as_str(),
                 d.stopwords,
                 d.stemmer,
                 d.positions,
@@ -924,7 +950,6 @@ mod tests {
             ),
             (
                 "title",
-                "ascii_lower",
                 Stopwords::English,
                 Stemmer::English,
                 true,
@@ -1213,11 +1238,18 @@ impl PhysicalSchema {
 ///   file's column to the new id, so the dropped column's values read as
 ///   the new column's.
 ///
-/// Both clear once compaction has rewritten every file that predates ids,
-/// since a rewritten file carries ids and is resolved by id. Closing them
-/// outright needs a retired name to carry the id it belonged to, so a
-/// stored name resolves to the column that wrote it rather than to
-/// whatever holds the name today.
+/// A rewritten file carries ids and is resolved by id, so both go away for
+/// any file compaction happens to rewrite. **Nothing makes that rewrite
+/// happen on account of a rename or a drop**: compaction forces a rewrite
+/// for a file whose columns are mid-type-conversion, and a rename is not a
+/// type change, so a small pre-id file under the size thresholds can sit
+/// unrewritten indefinitely and keep reading null under the new name.
+///
+/// Closing this needs one of two changes, neither of them here: force a
+/// rewrite of every pre-id file once the schema retires or renames a name it
+/// could hold, or have a retired name carry the id it belonged to, so a
+/// stored name resolves to the column that wrote it rather than to whatever
+/// holds the name today.
 #[derive(Debug, Clone)]
 pub struct LegacyNames {
     schema: Arc<TableSchema>,

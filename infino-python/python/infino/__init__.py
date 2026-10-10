@@ -11,6 +11,7 @@ from importlib.metadata import PackageNotFoundError, version
 from infino._infino import (
     AlreadyRunningError,
     ConflictError,
+    SchemaError,
     Connection,
     ConnectionMemoryBudgetError,
     GcReport,
@@ -37,6 +38,7 @@ __all__ = [
     "InfinoError",
     "ConnectionMemoryBudgetError",
     "ConflictError",
+    "SchemaError",
     "AlreadyRunningError",
     "Table",
     "IndexSpec",

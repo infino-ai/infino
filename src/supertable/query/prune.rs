@@ -410,7 +410,7 @@ pub(crate) async fn select_superfiles(
     // genuinely be in every superfile.
     if let Some(stats) = op_stats::current() {
         stats.add_superfiles_considered(considered);
-        stats.add_superfiles_pruned(considered - kept.len() as u64);
+        stats.add_presence_pruning_survived(kept.len() as u64);
     }
     Ok(kept)
 }
@@ -538,7 +538,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts,

@@ -169,11 +169,11 @@ pub(crate) fn verify_superfile_vector_codecs(
 ///
 /// Compaction's Sq8 IVF merge reads each input's centroid/code subsection via
 /// `VectorReader::try_get_range_sync` and its id column via
-/// `SuperfileReader::get_record_batch` — both resolve straight off
+/// `SuperfileReader::record_batches` — both resolve straight off
 /// locally-present bytes, never async I/O. The lazy query reader returned by
 /// [`open_reader`] only exposes its bytes synchronously after a *background*
 /// mmap promotion, so a compaction that races that promotion sees a reader
-/// with no resident bytes (`get_record_batch` → `LazyReaderUnsupported`, and
+/// with no resident bytes (`record_batches` → `LazyReaderUnsupported`, and
 /// `try_get_range_sync` → `None`) and fails. Force the disk cache to
 /// mmap-promote the input first via [`DiskCacheStore::reader_synchronous_with_storage`]:
 /// the bytes are NVMe-backed and OS-paged — bounded by the cache budget and the
@@ -494,7 +494,7 @@ async fn stable_ids_for_tagged_hits(
 /// Record one superfile open on the operation's stats, when metered.
 fn note_superfile_opened(op_stats: Option<&Arc<OpStatsCollector>>) {
     if let Some(stats) = op_stats {
-        stats.add_superfiles_opened(1);
+        stats.add_score_pruning_survived(1);
     }
 }
 

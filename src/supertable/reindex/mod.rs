@@ -30,11 +30,8 @@ use crate::{
     runtime_bridge::bridge_on_runtime,
     superfile::{
         format::footer::{BlobRegion, has_duplicated_region_key, resolved_regions},
-        fts::{
-            analysis::{UNKNOWN_ANALYSIS_REVISION, analysis_revision_written_by},
-            reader::{FtsStaleness, StaleColumn},
-        },
-        reader::{SuperfileReader, writer_builder_of},
+        fts::reader::{FtsStaleness, StaleColumn},
+        reader::SuperfileReader,
     },
     supertable::{
         Supertable,
@@ -45,15 +42,12 @@ use crate::{
     },
 };
 
-/// Rewrites between refreshes of the global term-statistics sidecar.
+/// Rewrites between term-index rebuilds.
 ///
-/// The manifest drops its reference to that sidecar on **any** superfile
-/// removal, and every rewrite is a removal — so without this a migration
-/// would run its whole length with no sidecar, and every scored query
-/// would fall back to a gather wave. Refreshing after each rewrite would
-/// be correct and wasteful; refreshing never would be cheap and slow. This
-/// bounds the window to a handful of rewrites.
-const REWRITES_PER_TERM_STATS_REFRESH: usize = 16;
+/// Every rewrite adds a superfile, and with it a delta segment the index
+/// lookups must also search. Rebuilding every few rewrites folds those deltas
+/// into one segment; rebuilding after each would repeat the work for little gain.
+const REWRITES_PER_TERM_INDEX_REFRESH: usize = 16;
 
 /// Superfiles opened at once while deciding which are stale.
 ///
@@ -119,19 +113,8 @@ impl StaleSuperfile {
         live_bytes: u64,
         reader: &SuperfileReader,
         has_duplicated_region_keys: bool,
-        trust_writer_analysis: bool,
     ) -> Self {
-        // A file recording no revision is an unknown unless the caller has
-        // taken responsibility for reading it as its writer's.
-        let assumed = match trust_writer_analysis {
-            true => writer_builder_of(reader.parquet_metadata())
-                .map_or(UNKNOWN_ANALYSIS_REVISION, analysis_revision_written_by),
-            false => UNKNOWN_ANALYSIS_REVISION,
-        };
-        let fts = reader
-            .fts()
-            .map(|f| f.staleness(assumed))
-            .unwrap_or_default();
+        let fts = reader.fts().map(|f| f.staleness()).unwrap_or_default();
         Self {
             superfile_id,
             partition_key,
@@ -438,12 +421,10 @@ impl Supertable {
     /// before taking the next. Peak memory is then a function of that
     /// constant rather than of how large the table is. Readers that the
     /// cache already holds cost nothing extra.
+    ///
     /// Returns what it found against one snapshot, so a caller reports
     /// every count against the same point in time.
-    pub(crate) async fn stale_superfiles(
-        &self,
-        trust_writer_analysis: bool,
-    ) -> Result<Assessment, CompactionError> {
+    pub(crate) async fn stale_superfiles(&self) -> Result<Assessment, CompactionError> {
         let manifest = self.inner().manifest.load_full();
         let store = manifest.options.store.clone();
         let disk_cache = manifest.options.disk_cache.clone();
@@ -469,7 +450,7 @@ impl Supertable {
                 }
             });
             for (entry, reader) in join_all(opens).await {
-                let reader = reader.map_err(|e| CompactionError::Build(e.to_string()))?;
+                let reader = reader.map_err(CompactionError::from)?;
                 let offsets = entry.subsection_offsets.as_ref();
                 let has_duplicated_region_keys = match footer_state(&reader, offsets) {
                     FooterState::Sound => false,
@@ -487,7 +468,6 @@ impl Supertable {
                     offsets.map_or(0, |o| o.total_size),
                     &reader,
                     has_duplicated_region_keys,
-                    trust_writer_analysis,
                 );
                 if !assessed.is_current() {
                     stale.push(assessed);
@@ -506,18 +486,6 @@ impl Supertable {
 }
 
 impl Supertable {
-    /// What a reindex would do, without doing it.
-    ///
-    /// Reads every superfile's index metadata and reports what is behind
-    /// and what repairing it would cost. Writes nothing and takes no
-    /// writer slot, so it is safe to run against a live table and safe to
-    /// run while a reindex or a compaction is in flight — the numbers are
-    /// then a snapshot that run is already changing.
-    ///
-    /// # Errors
-    ///
-    /// [`ReindexError::NoStorage`] without a durable backend, and
-    /// [`ReindexError::Assess`] if a superfile cannot be opened.
     /// The superfiles [`Supertable::reindex`] would repair under `opts`,
     /// and the repair each one gets — without repairing anything.
     ///
@@ -542,9 +510,9 @@ impl Supertable {
             return Err(ReindexError::NoStorage);
         }
         let assessment = self
-            .stale_superfiles(opts.trust_writer_analysis)
+            .stale_superfiles()
             .await
-            .map_err(|e| ReindexError::Assess(e.to_string()))?;
+            .map_err(ReindexError::assess)?;
         // The same planner the run drives, so the two cannot disagree.
         Ok(plan_jobs(&assessment.stale, opts.mode)
             .into_iter()
@@ -559,6 +527,18 @@ impl Supertable {
             .collect())
     }
 
+    /// What a reindex would do, without doing it.
+    ///
+    /// Reads every superfile's index metadata and reports what is behind
+    /// and what repairing it would cost. Writes nothing and takes no
+    /// writer slot, so it is safe to run against a live table and safe to
+    /// run while a reindex or a compaction is in flight — the numbers are
+    /// then a snapshot that run is already changing.
+    ///
+    /// # Errors
+    ///
+    /// [`ReindexError::NoStorage`] without a durable backend, and
+    /// [`ReindexError::Assess`] if a superfile cannot be opened.
     pub fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError> {
         bridge_on_runtime(
             self.index_staleness_async(opts),
@@ -585,9 +565,9 @@ impl Supertable {
             inconsistent_footers,
             superfiles,
         } = self
-            .stale_superfiles(opts.trust_writer_analysis)
+            .stale_superfiles()
             .await
-            .map_err(|e| ReindexError::Assess(e.to_string()))?;
+            .map_err(ReindexError::assess)?;
 
         let mut report = StalenessReport {
             superfiles,
@@ -620,8 +600,8 @@ impl Supertable {
     /// - **Never opened** — the hidden vector index.
     /// - **Written to publish the result, not migrated** — one manifest
     ///   commit per superfile, each output's tombstone sidecar, and the
-    ///   table's term-statistics sidecar. These follow from replacing a
-    ///   file; their own formats are untouched.
+    ///   table's term index. These follow from replacing a file; their own
+    ///   formats are untouched.
     ///
     /// Superfiles are brought to the index layout this engine writes. One
     /// already at or above it is left alone, because a newer release may
@@ -677,9 +657,9 @@ impl Supertable {
             inconsistent_footers,
             superfiles: total,
         } = self
-            .stale_superfiles(opts.trust_writer_analysis)
+            .stale_superfiles()
             .await
-            .map_err(|e| ReindexError::Assess(e.to_string()))?;
+            .map_err(ReindexError::assess)?;
         if !inconsistent_footers.is_empty() {
             warn!(
                 "[supertable reindex] {} superfile(s) have a footer that places a \
@@ -752,6 +732,7 @@ impl Supertable {
                 // and the job. Its staleness went with it, so there is
                 // nothing here to repair and nothing to report.
                 Err(CompactionError::SuperfileNotFound(_)) => continue,
+                Err(CompactionError::Unsupported(m)) => return Err(ReindexError::Unsupported(m)),
                 Err(e) => {
                     return Err(ReindexError::Rewrite {
                         superfile_id,
@@ -767,27 +748,23 @@ impl Supertable {
                 report.rewritten += 1;
             }
 
-            // Bound how long the table runs without its term-statistics
-            // sidecar; see REWRITES_PER_TERM_STATS_REFRESH.
-            if (done + 1) % REWRITES_PER_TERM_STATS_REFRESH == 0 {
-                self.refresh_term_stats_best_effort();
+            // See REWRITES_PER_TERM_INDEX_REFRESH.
+            if (done + 1) % REWRITES_PER_TERM_INDEX_REFRESH == 0 {
+                self.refresh_term_index_best_effort();
             }
         }
         if report.rewritten > 0 {
-            self.refresh_term_stats_best_effort();
+            self.refresh_term_index_best_effort();
         }
         Ok(report)
     }
 
-    /// Rebuild the global term-statistics sidecar, logging rather than
-    /// failing.
-    ///
-    /// A missing sidecar costs latency, never correctness — queries fall
-    /// back to gathering the statistics live — so a refresh that fails is
-    /// not a reason to abandon a migration that is otherwise succeeding.
-    fn refresh_term_stats_best_effort(&self) {
-        if let Err(e) = self.refresh_term_stats_sync() {
-            warn!("[supertable reindex] term-stats refresh failed, queries gather live: {e}");
+    /// Rebuild the term index, logging rather than failing: queries stay
+    /// correct on an index that is behind, so a failed rebuild must not abort
+    /// a migration.
+    fn refresh_term_index_best_effort(&self) {
+        if let Err(e) = self.refresh_term_index_sync() {
+            warn!("[supertable reindex] term-index refresh failed: {e}");
         }
     }
 }
@@ -825,8 +802,8 @@ mod tests {
             .sum()
     }
 
-    /// A migration of a one-superfile table written before the term index
-    /// existed leaves an index that lists that superfile, and marks it so.
+    /// A migration of a one-superfile table whose term index is absent
+    /// leaves an index that lists that superfile, and marks it so.
     ///
     /// The rewrite publishes the table's first index, from this commit's
     /// postings alone, which is exactly what a full rebuild over the new
@@ -1047,40 +1024,20 @@ mod tests {
         );
     }
 
-    /// The committed fixture was written by `infino/0.8.6`, which records
-    /// no analysis revision. That is an unknown, so by default its columns
-    /// read as stale and a reindex re-analyzes them.
-    ///
-    /// Told to trust the writer, the same files read as current: 0.8.6
-    /// shipped the chains this engine still has. The two answers are the
-    /// trade the option exists for, so both are pinned here.
+    /// The committed fixture records no analysis revision, so every
+    /// superfile in it reads as awaiting re-analysis.
     #[test]
-    fn an_unrecorded_revision_is_stale_until_the_writer_is_trusted() {
+    fn an_unrecorded_revision_is_stale() {
         let dir = TempDir::new().expect("tempdir");
         copy_dir_recursive(&old_format_fts_fixture(), dir.path());
         let (_storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
 
-        let conservative = table
+        let report = table
             .index_staleness(&ReindexOptions::default())
             .expect("staleness");
         assert_eq!(
-            conservative.awaiting_reanalysis, conservative.superfiles,
-            "recording no revision, every superfile is an unknown: {conservative:?}"
-        );
-
-        let trusting = table
-            .index_staleness(&ReindexOptions {
-                trust_writer_analysis: true,
-                ..ReindexOptions::default()
-            })
-            .expect("staleness");
-        assert_eq!(
-            trusting.awaiting_reanalysis, 0,
-            "0.8.6 shipped the current chains, so nothing needs re-analysis: {trusting:?}"
-        );
-        assert!(
-            trusting.unrepairable_columns.is_empty(),
-            "and no column is reported unrepairable: {trusting:?}"
+            report.awaiting_reanalysis, report.superfiles,
+            "recording no revision, every superfile is stale: {report:?}"
         );
     }
 

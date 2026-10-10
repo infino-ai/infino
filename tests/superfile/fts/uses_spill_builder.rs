@@ -69,7 +69,7 @@ fn build_test_superfile() -> Bytes {
         Vec::new(),
     );
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-    // Force the spill + streaming-FST finish path. 1024 docs at
+    // Force the spill + streaming-dictionary finish path. 1024 docs at
     // ~50 bytes/doc/column never crosses the default 256 MiB
     // threshold, so without this override the test name
     // ("uses_spill_builder") would be misleading — every column
@@ -149,7 +149,7 @@ async fn superfile_build_routes_through_spill_backed_fts_builder() {
     );
 
     // Negative: a body-only term must not appear in a title search,
-    // and vice versa. Production path keeps per-column FST keys
+    // and vice versa. Production path keeps per-column dictionary keys
     // (`<col>\x1F<term>`) so this scopes correctly.
     let payload_in_title = r
         .bm25_hits_async("title", "payload0500", SPILL_TEST_BM25_K, BoolMode::Or)

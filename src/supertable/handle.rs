@@ -18,7 +18,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     future::Future,
-    sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock, Weak, atomic::AtomicBool},
+    sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -36,7 +36,6 @@ use super::{
     manifest::{
         ManifestSnapshot,
         list::{CellRoutingParams, PartitionStrategy},
-        term_stats::{self, TermStatsSidecar},
     },
     options::SupertableOptions,
 };
@@ -92,30 +91,6 @@ use crate::{
 #[derive(Clone)]
 pub struct Supertable {
     inner: Arc<SupertableInner>,
-}
-
-/// The parsed global term-stats artifact plus the verdict of checking
-/// its coverage, so neither cost is repaid per query.
-///
-/// Two things are memoized here because each is invariant over a
-/// different key. The parsed FST is keyed by the artifact's
-/// content-addressed `uri`: an append carries the same reference
-/// forward, so successive generations reuse it and only a maintenance
-/// republish refetches. The coverage verdict is keyed by manifest
-/// generation, because a manifest pins both its superfile list and its
-/// artifact reference — so `usable` is a pure function of
-/// `checked_generation`, and one check per generation serves every
-/// query on that snapshot.
-pub(super) struct CachedTermStats {
-    /// The artifact's content-addressed storage uri.
-    pub(super) uri: String,
-    /// Manifest generation `usable` was evaluated against.
-    pub(super) checked_generation: u64,
-    /// Whether every superfile the artifact covers was still listed by
-    /// that generation's manifest. `false` means callers must read df
-    /// from the superfile dictionaries instead.
-    pub(super) usable: bool,
-    pub(super) sidecar: Arc<TermStatsSidecar>,
 }
 
 /// Internal shared state. Every `Supertable` clone holds one Arc
@@ -189,13 +164,9 @@ pub(super) struct SupertableInner {
     pub(super) decoded_scalar_cache: DecodedScalarCache,
     /// Per-generation cache of global BM25 idf per (column, term),
     /// shared by every reader minted from this handle so repeat
-    /// queries under `Bm25Stats::Global` skip the dictionary gather
+    /// queries skip the dictionary gather
     /// fan — see [`GlobalIdfCache`].
     pub(super) global_idf_cache: GlobalIdfCache,
-    /// Lazily loaded + verified global term-stats sidecar. `None` until
-    /// first use or when the manifest carries no ref — see
-    /// [`CachedTermStats`] for what the entry holds and why.
-    pub(super) term_stats_cache: StdRwLock<Option<CachedTermStats>>,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -946,25 +917,36 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
-    /// Rebuild the table-level term index over the current membership
-    /// (see `manifest::term_index`), and the global term-stats sidecar only
-    /// if the index still does not cover every superfile. Not part of the
-    /// public API — [`Supertable::optimize`] calls this after compaction so
-    /// the artifacts describe the post-merge superfile set.
-    ///
-    /// A complete index already holds every term's df in every superfile,
-    /// and queries sum global df from it without opening the sidecar, so
-    /// building the sidecar then is a full pass over every dictionary for
-    /// nothing. It stays the fallback for an index that is incomplete.
+    /// Rebuild the table-level term index over the current superfiles (see
+    /// `manifest::term_index`), so it covers every superfile in one segment.
+    /// [`Supertable::optimize`] calls this after compaction.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
-    pub(crate) fn refresh_term_stats_sync(&self) -> Result<(), BuildError> {
-        self.block_on_query(async {
-            super::writer::stamp_term_index(&self.inner).await?;
-            if self.inner.manifest.load().term_index_complete() {
-                return Ok(());
-            }
-            super::writer::stamp_term_stats(&self.inner).await
-        })
+    pub(crate) fn refresh_term_index_sync(&self) -> Result<(), BuildError> {
+        self.block_on_query(super::writer::stamp_term_index(&self.inner))
+    }
+
+    /// Whether `spec` names four columns of this table of the right types
+    /// (see `graph_index::check_spec`). [`Supertable::optimize`] runs this
+    /// before it changes anything, so a wrong spec fails it with nothing
+    /// committed.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn check_adjacency_spec(
+        &self,
+        spec: &config::AdjacencySpec,
+    ) -> Result<(), BuildError> {
+        super::graph_index::check_spec(&self.inner.manifest.load(), spec)
+    }
+
+    /// Build and publish the adjacency index over this edge table's rows
+    /// (see `graph_index::stamp_adjacency`). Not part of the public API —
+    /// [`Supertable::optimize`] calls this after compaction when its options
+    /// name the edge columns.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn refresh_adjacency_sync(
+        &self,
+        spec: &config::AdjacencySpec,
+    ) -> Result<(), BuildError> {
+        self.block_on_query(super::graph_index::stamp_adjacency(self, spec))
     }
 
     /// Route undrained user superfiles into the hidden per-cell index. Not part
@@ -1849,7 +1831,6 @@ async fn build_handle(
         sql_logical_plan_cache: Mutex::new(None),
         decoded_scalar_cache: DecodedScalarCache::default(),
         global_idf_cache: GlobalIdfCache::default(),
-        term_stats_cache: StdRwLock::new(None),
         tombstone_cache,
         handle_id,
         vector_index_table,
@@ -2216,98 +2197,6 @@ impl SupertableReader {
     /// minted from this supertable — see [`GlobalIdfCache`].
     pub(crate) fn global_idf_cache(&self) -> &GlobalIdfCache {
         &self.inner.global_idf_cache
-    }
-
-    /// The manifest-referenced global term-stats sidecar, loaded (and
-    /// hash-verified) once per artifact and cached on the handle by its
-    /// content-addressed URI. Returns `None` when the manifest carries
-    /// no reference, when no storage is attached, or when the load
-    /// fails — global-stats queries then fall back to the query-time
-    /// gather wave, trading latency for availability.
-    pub(crate) async fn term_stats_sidecar(&self) -> Option<Arc<TermStatsSidecar>> {
-        let reference = self.manifest.term_stats_blob()?.clone();
-        let generation = self.manifest.get_manifest_id();
-        // Already parsed AND already checked against this generation's
-        // superfiles: the whole call is one cache read.
-        {
-            let cached = self
-                .inner
-                .term_stats_cache
-                .read()
-                .expect("term stats cache lock");
-            if let Some(entry) = cached.as_ref()
-                && entry.uri == reference.uri
-                && entry.checked_generation == generation
-            {
-                return entry.usable.then(|| Arc::clone(&entry.sidecar));
-            }
-        }
-        // Same artifact, new generation (an append carries the
-        // reference forward): keep the parsed FST and re-check its
-        // coverage rather than refetching.
-        let parsed = {
-            let cached = self
-                .inner
-                .term_stats_cache
-                .read()
-                .expect("term stats cache lock");
-            cached
-                .as_ref()
-                .filter(|entry| entry.uri == reference.uri)
-                .map(|entry| Arc::clone(&entry.sidecar))
-        };
-        let sidecar = match parsed {
-            Some(sidecar) => sidecar,
-            None => {
-                let storage = self.manifest.options.storage.as_ref()?;
-                match term_stats::load(storage.as_ref(), &reference).await {
-                    Ok(sidecar) => Arc::new(sidecar),
-                    Err(e) => {
-                        warn!(error = %e, uri = %reference.uri, "term-stats sidecar load failed; falling back to the query-time df gather");
-                        return None;
-                    }
-                }
-            }
-        };
-        // Coverage check, once per (artifact, generation). The artifact's
-        // sums are aggregates over the superfiles it names, so a
-        // superfile that has since left the manifest cannot be
-        // subtracted back out — serving df from it would over-count and
-        // depress idf for the affected terms. The manifest carry rule
-        // drops the reference on any commit that removes superfiles,
-        // which is what makes a stale artifact unreachable; this is the
-        // belt to those braces, and it runs in every build because the
-        // failure mode is silently wrong ranking rather than an error.
-        // Rejecting an artifact costs latency, never correctness: with
-        // no artifact, callers read df from every superfile's own
-        // dictionary.
-        let current: HashSet<Uuid> = self
-            .manifest
-            .superfiles
-            .iter()
-            .map(|entry| entry.superfile_id)
-            .collect();
-        let usable = sidecar.covered().iter().all(|id| current.contains(id));
-        if !usable {
-            warn!(
-                uri = %reference.uri,
-                generation,
-                "term-stats sidecar covers a superfile this manifest no longer lists; \
-                 ignoring it and reading document frequency from the superfile \
-                 dictionaries instead"
-            );
-        }
-        *self
-            .inner
-            .term_stats_cache
-            .write()
-            .expect("term stats cache lock") = Some(CachedTermStats {
-            uri: reference.uri.clone(),
-            checked_generation: generation,
-            usable,
-            sidecar: Arc::clone(&sidecar),
-        });
-        usable.then_some(sidecar)
     }
 
     /// The shared `Arc<SupertableInner>` backing this reader. Used to
@@ -4565,15 +4454,13 @@ mod tests {
 
         // Exercise the lazy FTS path before optimize (mirrors the SQL bench's
         // pre-compact warm/cold queries against a disk-cache consumer).
-        use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
+        use crate::superfile::fts::reader::BoolMode;
         let hits = consumer
             .bm25_search(
                 "title",
                 "doc",
                 5,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 pre-optimize");
@@ -4588,9 +4475,7 @@ mod tests {
                 "title",
                 "doc",
                 5,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 post-optimize");
@@ -8934,15 +8819,13 @@ mod tests {
     }
 
     fn bm25_title_hits(table: &Supertable, query: &str) -> usize {
-        use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
+        use crate::superfile::fts::reader::BoolMode;
         table
             .bm25_search(
                 "title",
                 query,
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 search")

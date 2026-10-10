@@ -15,6 +15,7 @@
 //! `test-helpers`), so it is also a public-surface consumer test.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,16 +28,18 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::create_exception;
+use pyo3::sync::PyOnceLock;
 use pyo3::exceptions::{
     PyException, PyKeyError, PyNotImplementedError, PyRuntimeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyModule};
 
 use infino::{
-    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
-    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
-    ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions, SchemaPatch, Stemmer,
+    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, GcError,
+    InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
+    ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions,
+    SchemaError as SchemaCause, SchemaPatch, Stemmer,
     Stopwords, VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
@@ -87,6 +90,22 @@ create_exception!(
      again once the other run has finished."
 );
 
+create_exception!(
+    infino,
+    SchemaError,
+    PyValueError,
+    "Raised when the schema refuses a write: a batch whose types disagree \
+     with the table, a row document the mapper cannot map, or a schema \
+     change the table will not take. `kind` names the cause (`TypeMismatch`, \
+     `FieldCapExceeded`, `SchemaConflict`, …) for code that has to tell one \
+     from another; `str(e)` is the message, which names the column, cap or \
+     version at fault and is written to be read rather than matched on. \
+     \
+     Based on `ValueError`, which is what every schema refusal raised before \
+     it had a class of its own, so existing `except ValueError` keeps \
+     working."
+);
+
 /// Map a core engine error to the Python exception the caller sees.
 fn py_err(e: CoreError) -> PyErr {
     match e {
@@ -95,9 +114,11 @@ fn py_err(e: CoreError) -> PyErr {
         | CoreError::Cardinality(m)
         | CoreError::Config(m)
         | CoreError::Query(m) => PyValueError::new_err(m),
-        // The schema cause is typed on the Rust side; Python gets its
-        // message, which names the column, cap or version at fault.
-        CoreError::Schema(e) => PyValueError::new_err(e.to_string()),
+        // The schema cause is typed on the Rust side, so it is typed here
+        // too: one class for "the schema refused this", with the variant on
+        // `kind` so a caller can tell a cap breach from a type mismatch
+        // without reading the prose.
+        CoreError::Schema(e) => schema_err(&e),
         CoreError::Io(m) | CoreError::Backend(m) => PyRuntimeError::new_err(m),
         // A connection-memory-budget refusal: recoverable, so raise the typed
         // ConnectionMemoryBudgetError the caller can catch and back off on.
@@ -112,8 +133,26 @@ fn py_err(e: CoreError) -> PyErr {
     }
 }
 
+/// A schema refusal as [`SchemaError`], carrying its variant on `kind`.
+///
+/// Setting the attribute needs the GIL, which every caller of this already
+/// holds — it is reached from a `#[pymethods]` body. If attaching it ever
+/// fails, the exception is still raised with its message: a missing `kind`
+/// is worth less than the error, and losing the error to report a failure to
+/// decorate it would be the wrong trade.
+fn schema_err(e: &SchemaCause) -> PyErr {
+    let err = SchemaError::new_err(e.to_string());
+    Python::attach(|py| {
+        let _ = err.value(py).setattr("kind", e.kind());
+    });
+    err
+}
+
 fn optimize_err(e: OptimizeError) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
+    match e {
+        OptimizeError::Unsupported(m) => PyNotImplementedError::new_err(m),
+        other => PyRuntimeError::new_err(other.to_string()),
+    }
 }
 
 fn gc_err(e: GcError) -> PyErr {
@@ -133,6 +172,8 @@ fn reindex_err(e: ReindexError) -> PyErr {
         ReindexError::AlreadyRunning => {
             AlreadyRunningError::new_err(ReindexError::AlreadyRunning.to_string())
         }
+        // An index this engine cannot read: raised as `InfinoError::Unsupported` is.
+        ReindexError::Unsupported(m) => PyNotImplementedError::new_err(m),
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
@@ -273,8 +314,8 @@ fn connect(
 }
 
 /// One declared FTS column, as its keyword arguments arrived.
-/// `analyzer` / `stopwords` / `stemmer` `None` mean the defaults;
-/// `k1` / `b` `None` mean the column takes the standard BM25 pair.
+/// `analyzer` `None` means `standard`; `stopwords` / `stemmer` `None`
+/// mean no filter; `k1` / `b` `None` mean the standard BM25 pair.
 #[derive(Clone)]
 struct FtsDecl {
     column: String,
@@ -326,11 +367,9 @@ impl IndexSpec {
         Self::default()
     }
 
-    /// Mark `column` (a UTF-8 string column) as full-text indexed.
-    /// `analyzer` selects the tokenizer: `"standard"` (the default —
-    /// the Unicode-aware UAX #29 tokenizer that keeps non-ASCII text)
-    /// or `"ascii_lower"` (ASCII split + lowercase, non-ASCII dropped).
-    /// It is recorded with the table and cannot be changed afterwards.
+    /// Mark `column` (a UTF-8 string column) as full-text indexed,
+    /// tokenized by the Unicode-aware UAX #29 `standard` tokenizer.
+    /// `analyzer` names it; `"standard"`, the default, is the only one.
     /// `stored=False` makes the column index-only: searchable, but the
     /// raw text is never kept in the table, so it cannot be selected,
     /// projected, or filtered on (append/update batches still carry it).
@@ -368,13 +407,9 @@ impl IndexSpec {
     /// may still score with a different pair (see `bm25_search`), which
     /// is the shape to reach for while tuning; declare the pair here
     /// once it is settled.
-    // The three new options are appended **after** `b`, and behind `*`
-    // so they are keyword-only. Inserting them mid-signature would have
-    // silently changed what `fts("body", "standard", False)` means for
-    // every positional caller — every call site in this repo passes
-    // keywords past `column`, so no test here would have caught it.
-    // Keyword-only also means the next option added cannot repeat the
-    // mistake.
+    // `analyzer` keeps its original slot so positional calls still bind.
+    // The analysis options sit behind `*`, keyword-only, so a new option
+    // can never reposition `stored` / `k1` / `b` for a positional caller.
     #[pyo3(signature = (
         column,
         analyzer = None,
@@ -440,8 +475,8 @@ impl IndexSpec {
             let mut field = infino::FtsField::new(column.clone())
                 .positions(*positions)
                 .stored(*stored);
-            if let Some(a) = analyzer {
-                field = field.analyzer(a.clone());
+            if let Some(name) = analyzer {
+                field = field.analyzer(name.clone());
             }
             if let Some(name) = stopwords {
                 field = field.stopwords(stopwords_from_name(name)?);
@@ -681,22 +716,16 @@ impl CompactOptions {
 struct ReindexOptions {
     mode: Option<String>,
     stale_seal_timeout_ms: Option<u64>,
-    trust_writer_analysis: bool,
 }
 
 #[pymethods]
 impl ReindexOptions {
     #[new]
-    #[pyo3(signature = (*, mode=None, stale_seal_timeout_ms=None, trust_writer_analysis=false))]
-    fn new(
-        mode: Option<String>,
-        stale_seal_timeout_ms: Option<u64>,
-        trust_writer_analysis: bool,
-    ) -> Self {
+    #[pyo3(signature = (*, mode=None, stale_seal_timeout_ms=None))]
+    fn new(mode: Option<String>, stale_seal_timeout_ms: Option<u64>) -> Self {
         Self {
             mode,
             stale_seal_timeout_ms,
-            trust_writer_analysis,
         }
     }
 }
@@ -711,9 +740,6 @@ impl ReindexOptions {
         }
         if let Some(ms) = self.stale_seal_timeout_ms {
             out = out.with_stale_seal_timeout_ms(ms);
-        }
-        if self.trust_writer_analysis {
-            out = out.trusting_writer_analysis();
         }
         Ok(out)
     }
@@ -929,15 +955,11 @@ impl Table {
     /// keep belongs on the column (`IndexSpec.fts`), where the bounds
     /// are built with it and the correction disappears.
     ///
-    /// `stats` selects the BM25 corpus statistics: `"global"` (default)
-    /// scores against table-wide statistics gathered across all segments,
-    /// so a fragmented table ranks like a single unified corpus, at the
-    /// cost of a document-frequency gather before scoring.
-    /// `"per_superfile"` scores each segment against its own local
-    /// document count and term frequencies — fastest, and it skips that
-    /// gather, but a term's idf depends on which segment a document
-    /// landed in, so ranking drifts as the table fragments.
-    #[pyo3(signature = (column, query, k, mode=None, projection=None, stats=None, k1=None, b=None))]
+    /// A term search on a fully loaded table scores every segment against
+    /// table-wide statistics, so a fragmented table ranks like one corpus.
+    /// Prefix search, and a table opened with a lazily loaded manifest,
+    /// score each segment with its own statistics.
+    #[pyo3(signature = (column, query, k, mode=None, projection=None, *, k1=None, b=None))]
     #[allow(clippy::too_many_arguments)]
     fn bm25_search<'py>(
         &self,
@@ -947,13 +969,10 @@ impl Table {
         k: usize,
         mode: Option<&str>,
         projection: Option<Vec<String>>,
-        stats: Option<&str>,
         k1: Option<f32>,
         b: Option<f32>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mut opts = Bm25SearchOptions::new()
-            .with_mode(parse_mode(mode)?)
-            .with_stats(parse_stats(stats)?);
+        let mut opts = Bm25SearchOptions::new().with_mode(parse_mode(mode)?);
         // Both or neither: overriding one parameter and silently
         // keeping the engine default for the other is a footgun, since
         // the two interact through the length norm.
@@ -1459,20 +1478,6 @@ fn parse_filter<'a>(
     }
 }
 
-fn parse_stats(stats: Option<&str>) -> PyResult<Bm25Stats> {
-    let Some(stats) = stats else {
-        // Omitted means the engine default.
-        return Ok(Bm25Stats::default());
-    };
-    match stats.to_ascii_lowercase().as_str() {
-        "per_superfile" => Ok(Bm25Stats::PerSuperfile),
-        "global" => Ok(Bm25Stats::Global),
-        other => Err(PyValueError::new_err(format!(
-            "stats must be 'per_superfile' or 'global', got {other:?}"
-        ))),
-    }
-}
-
 /// What an append or update was given.
 enum AppendInput {
     /// Arrow-typed input: a pyarrow `RecordBatch` or `Table`, as one batch.
@@ -1544,19 +1549,111 @@ fn append_input(
     } else {
         data.clone()
     };
-    match py.import("json")?.call_method1("dumps", (&records,)) {
-        Ok(text) => {
-            let text: String = text.extract()?;
-            let rows: Vec<serde_json::Value> = serde_json::from_str(&text)
-                .map_err(|e| PyValueError::new_err(format!("rows: {e}")))?;
-            Ok(if rows.is_empty() {
-                AppendInput::Empty
-            } else {
-                AppendInput::Rows(rows)
-            })
+    // `allow_nan=False` so a non-finite float raises here rather than being
+    // written as a bare `NaN`, which is not JSON and which the parser below
+    // would reject with a message about the text rather than the value. A
+    // raise is also how a value JSON cannot spell at all reaches the typed
+    // path, so the two cases share one route out.
+    let strict = PyDict::new(py);
+    strict.set_item("allow_nan", false)?;
+    // `allow_nan=False` so a non-finite float raises here rather than being
+    // written as a bare `NaN`, which is not JSON and which the parser below
+    // would reject with a message about the text rather than the value. A
+    // raise is also how a value JSON cannot spell at all reaches the typed
+    // path, so the two cases share one route out.
+    let json = py.import("json")?;
+    match json.call_method("dumps", (&records,), Some(&strict)) {
+        Ok(text) => rows_from_json(&text.extract::<String>()?),
+        Err(_) => {
+            // A pandas frame marks a missing value with `NaN`, so one there
+            // means the row carries nothing in that column, the same as a
+            // key a dict leaves out. Writing it as null keeps that meaning
+            // and keeps the document path, which grows the schema where the
+            // typed path only fills columns the table declares.
+            //
+            // Nothing else is rewritten. Node nulls an infinity too, but
+            // that is `JSON.stringify` having nowhere to put it, not a rule
+            // worth copying.
+            match nulled_missing(py, &json, &strict, &records, is_frame) {
+                Ok(text) => rows_from_json(&text),
+                // Not a frame's missing value, then: an infinity, a `NaN` a
+                // caller wrote in a list of dicts, or a value JSON has no
+                // spelling for at all (bytes, Decimal, datetime, a numpy
+                // scalar). The typed path carries each into a declared
+                // column and refuses an undeclared one.
+                Err(_) => typed_batch_input(py, data, schema, is_frame, &table_cls),
+            }
         }
-        Err(_) => typed_batch_input(py, data, schema, is_frame, &table_cls),
     }
+}
+
+/// The rows of a serialized `data` list, or [`AppendInput::Empty`] when it
+/// carries none.
+fn rows_from_json(text: &str) -> PyResult<AppendInput> {
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(text).map_err(|e| PyValueError::new_err(format!("rows: {e}")))?;
+    Ok(if rows.is_empty() {
+        AppendInput::Empty
+    } else {
+        AppendInput::Rows(rows)
+    })
+}
+
+/// The Python function that replaces pandas' missing marker with `None`.
+///
+/// Compiled once for the process rather than per call: the source is
+/// constant, and an append carrying a missing value would otherwise pay a
+/// module compile on top of the walk.
+static NULLED: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+/// `records` serialized with every `NaN` written as `null`, for a frame.
+///
+/// Only a frame, and only `NaN`: that pairing is pandas' own marker for an
+/// absent value, and nothing else here is one. An infinity is a number a
+/// `Float64` column holds, and a `NaN` in a list of dicts is a value the
+/// caller wrote rather than a marker for one they left out; both raise out
+/// of here, and the caller takes the typed path, which carries them into a
+/// declared column and refuses an undeclared one.
+///
+/// Returns the text rather than the cleaned object: proving the result
+/// serializes and producing the bytes to parse are the same `dumps`, and a
+/// frame of any size pays for each one.
+fn nulled_missing(
+    py: Python<'_>,
+    json: &Bound<'_, PyAny>,
+    strict: &Bound<'_, PyDict>,
+    records: &Bound<'_, PyAny>,
+    is_frame: bool,
+) -> PyResult<String> {
+    if !is_frame {
+        return Err(PyValueError::new_err(
+            "only a frame's NaN marks a missing value",
+        ));
+    }
+    const SANITIZE: &str = r#"
+import math
+
+def nulled(value):
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if isinstance(value, dict):
+        return {k: nulled(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [nulled(v) for v in value]
+    return value
+"#;
+    let nulled = NULLED.get_or_try_init::<_, PyErr>(py, || {
+        Ok(PyModule::from_code(
+            py,
+            &CString::new(SANITIZE)?,
+            &CString::new("infino_nan.py")?,
+            &CString::new("infino_nan")?,
+        )?
+        .getattr("nulled")?
+        .unbind())
+    })?;
+    let cleaned = nulled.bind(py).call1((records,))?;
+    json.call_method("dumps", (cleaned,), Some(strict))?.extract()
 }
 
 /// Rows carrying values JSON cannot spell, as one batch typed by the table's
@@ -1667,6 +1764,7 @@ fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<ConnectionMemoryBudgetError>(),
     )?;
     m.add("ConflictError", m.py().get_type::<ConflictError>())?;
+    m.add("SchemaError", m.py().get_type::<SchemaError>())?;
     m.add(
         "AlreadyRunningError",
         m.py().get_type::<AlreadyRunningError>(),
