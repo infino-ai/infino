@@ -102,14 +102,16 @@ const REORDER_MAX_ROUNDS: usize = 20;
 /// which is why these are constants rather than configuration.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BisectParams {
-    /// Stop once a round's realised gain falls below this fraction of that
-    /// split's first round. `0.0` disables the test.
+    /// Stop once a round's realised gain per document falls below this
+    /// fraction of the run's reference gain per document, which [`Bisect`]
+    /// takes from the root split's first round — not from the first round of
+    /// the split being tested. `0.0` disables the test.
     pub(crate) convergence: f32,
     /// Ceiling on a split's move rounds whatever `convergence` says.
     pub(crate) max_rounds: usize,
 }
 
-/// A bisection in progress: the configured limits, plus the reference the
+/// A bisection in progress: the limits in force, plus the reference the
 /// convergence test measures rounds against.
 ///
 /// The reference is the gain per document of the first split's first round —
