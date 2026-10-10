@@ -157,24 +157,22 @@ const REORDER_FORWARD_INDEX_BUDGET_SHARE: u64 = 10;
 
 /// A merge whose memory budget cannot buy this many slots per document keeps
 /// arrival order rather than paying for a pass that cannot pay back.
-///
-/// This floors what the budget *affords*, not what the documents carry.
-/// Documents holding two eligible terms apiece make a narrow forward index,
-/// not a useless one — those two terms are exactly what groups them.
 const REORDER_MIN_AFFORDABLE_TERMS_PER_DOC: usize = 4;
 
 /// Slots per document the bisection is given, or `None` to keep arrival order.
 ///
-/// Two bounds, and whichever is tighter wins. A document cannot contribute
-/// more terms than it has, so a corpus of short or term-poor documents gets
-/// slots sized to what its documents actually carry rather than a count tuned
-/// on somebody else's text. And the forward index has to fit the merge's
-/// memory budget, which is what bounds a corpus whose documents are rich
-/// enough to fill any number of slots.
+/// Sized by the merge's memory budget alone. The index is rectangular, so a
+/// narrower width saves a short document nothing — its unused slots are
+/// allocated either way — and costs a long one the terms past the cut. Sizing
+/// to what the corpus carries on average would therefore buy a fraction of a
+/// budget already set aside for this, and pay for it by truncating every
+/// above-average document back to the average. On a corpus mixing short titles
+/// with long bodies that is most of the signal, and it is the long documents,
+/// which sit in the most posting lists, that lose it.
 ///
 /// The terms kept are the most selective a document has, which is where the
 /// grouping signal is.
-fn reorder_terms_per_doc(n_docs: usize, eligible_postings: u64) -> Option<usize> {
+fn reorder_terms_per_doc(n_docs: usize) -> Option<usize> {
     let budget_bytes = global()
         .compaction
         .max_memory_mb
@@ -186,12 +184,8 @@ fn reorder_terms_per_doc(n_docs: usize, eligible_postings: u64) -> Option<usize>
         return None;
     }
 
-    // What the documents actually carry, rounded up so a corpus averaging a
-    // fraction over a whole number is not truncated down to it.
-    let carried = eligible_postings.div_ceil(n_docs.max(1) as u64) as usize;
-
     // `filled` and `worst` index a document's slots in a `u8`.
-    Some(carried.clamp(1, affordable.min(u8::MAX as usize)))
+    Some(affordable.min(u8::MAX as usize))
 }
 
 /// Bits of bucket space the bisection groups terms in. Terms are hashed
@@ -2529,17 +2523,7 @@ impl SuperfileBuilder {
             d >= 2 && d <= too_common
         };
 
-        // How many terms the corpus actually offers per document, summed over
-        // the buckets rather than over the postings, so this costs a walk of
-        // the degree table and not a third pass over the index.
-        let eligible_postings: u64 = df
-            .iter()
-            .enumerate()
-            .filter(|&(t, _)| eligible(t as u32))
-            .map(|(_, &d)| u64::from(d))
-            .sum();
-        let Some(terms_per_doc) = reorder_terms_per_doc(n_out_docs as usize, eligible_postings)
-        else {
+        let Some(terms_per_doc) = reorder_terms_per_doc(n_out_docs as usize) else {
             // The forward index will not fit the merge's budget at a width
             // worth having; arrival order it is.
             return Ok(None);
@@ -5882,41 +5866,35 @@ mod tests {
         }
     }
 
-    /// The forward index is bounded from two directions, and a merge that
-    /// cannot afford a useful width declines instead of allocating anyway.
-    /// The old fixed sixteen slots asked for `16 * 4 * n_docs` bytes with
-    /// nothing to stop it, which is over a hundred gigabytes at two billion
-    /// documents.
+    /// The forward index is bounded by the merge's memory budget, and a merge
+    /// that cannot afford a useful width declines instead of allocating
+    /// anyway. The old fixed sixteen slots asked for `16 * 4 * n_docs` bytes
+    /// with nothing to stop it, which is over a hundred gigabytes at two
+    /// billion documents.
     #[test]
-    fn terms_per_document_follows_the_corpus_and_the_budget() {
-        // Term-poor documents get what they carry, not a borrowed constant,
-        // and still reorder: the two terms a narrow document has are exactly
-        // the ones that group it.
-        assert_eq!(reorder_terms_per_doc(1_000, 5_000), Some(5));
-        assert_eq!(reorder_terms_per_doc(1_000, 2_000), Some(2));
-        assert_eq!(reorder_terms_per_doc(1_000, 1_000), Some(1));
-
-        // Term-rich documents are held to what the budget affords; at a few
-        // million documents that lands on the width this used to take flat.
-        let rich = reorder_terms_per_doc(5_000_000, 5_000_000 * 200)
+    fn terms_per_document_follows_the_budget() {
+        // At a few million documents this lands on the width the merge used to
+        // take flat, which is the scale that count was chosen at.
+        let mid = reorder_terms_per_doc(5_000_000)
             .expect("a five-million-document merge can afford to reorder");
         assert!(
-            (12..=20).contains(&rich),
-            "budget-bound width drifted far from the historical sixteen: {rich}"
+            (12..=20).contains(&mid),
+            "budget-bound width drifted far from the historical sixteen: {mid}"
         );
+
+        // A merge gets the whole width its budget buys, whatever its documents
+        // happen to average: the index is rectangular, so trimming to the mean
+        // would only cost the longest documents their least common terms.
+        let small = reorder_terms_per_doc(1_000).expect("a thousand documents can reorder");
+        assert!(small > mid, "a smaller merge affords a wider index");
 
         // A document's slots are indexed by a u8.
-        let dense = reorder_terms_per_doc(1_000, 1_000 * 10_000)
-            .expect("a thousand term-rich documents can afford to reorder");
-        assert!(dense <= u8::MAX as usize);
+        assert!(small <= u8::MAX as usize);
 
-        // Only the budget declines: at two billion documents the forward
-        // index cannot be afforded at any width worth having, so the merge
-        // keeps arrival order rather than pay for a pass that cannot pay back.
-        assert_eq!(
-            reorder_terms_per_doc(2_000_000_000, 2_000_000_000 * 50),
-            None
-        );
+        // Only the budget declines: at two billion documents the forward index
+        // cannot be afforded at any width worth having, so the merge keeps
+        // arrival order rather than pay for a pass that cannot pay back.
+        assert_eq!(reorder_terms_per_doc(2_000_000_000), None);
     }
 
     /// One document of the reordering corpus: drawn from a few
