@@ -1033,6 +1033,9 @@ mod tests {
                 .expect("a Stream entry is Paged"),
         );
         source.range(0, 64).await.expect("range read fills a block");
+
+        store.block_writes_settled().await;
+
         drop(source);
         assert!(
             store.stats().current_bytes > 0,

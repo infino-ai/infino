@@ -21,13 +21,23 @@ use crate::supertable::{
     reader_cache::{config::EvictionCandidate, disk::*},
 };
 
+/// Most bytes of fetched runs a store holds in memory before they are written to block files. Past
+/// this, reads still get their bytes but don't cache them, so a slow disk costs refetches later,
+/// not memory or query time.
+const WRITE_BEHIND_CAP_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Whether dropping this entry would actually release memory: it must be a
 /// lazy entry (no mmap — its cost is anonymous heap that `madvise` cannot
 /// reclaim) and the cache must be its last holder (a reader a query still
 /// has in hand keeps the heap alive regardless, and re-opening costs that
-/// query a round trip).
+/// query a round trip). An entry whose block source still has a run waiting to
+/// be written is kept too, since that run's bytes are not counted yet.
 fn reclaimable_lazy_entry(entry: &CachedEntry) -> bool {
-    entry.mmap().is_none() && Arc::strong_count(&entry.reader) <= 1
+    entry.mmap().is_none()
+        && Arc::strong_count(&entry.reader) <= 1
+        && entry
+            .block_source()
+            .is_none_or(|source| !source.has_pending_writes())
 }
 
 impl DiskCacheStore {
@@ -340,6 +350,23 @@ impl DiskCacheStore {
         self.current_bytes.fetch_sub(bytes, Ordering::Release);
     }
 
+    /// Takes `bytes` of the cap on unwritten runs, or `false` if that would go over
+    /// [`WRITE_BEHIND_CAP_BYTES`]. A run bigger than the whole cap is still let in when nothing else
+    /// is waiting, so a big read can be cached at all.
+    pub(crate) fn try_admit_write_behind(&self, bytes: u64) -> bool {
+        self.write_behind_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                let next = cur.checked_add(bytes)?;
+                (cur == 0 || next <= WRITE_BEHIND_CAP_BYTES).then_some(next)
+            })
+            .is_ok()
+    }
+
+    /// Gives back what [`Self::try_admit_write_behind`] took, once the run is written or dropped.
+    pub(crate) fn release_write_behind(&self, bytes: u64) {
+        self.write_behind_bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
     /// True when `token` still identifies the live block source for `uri`.
     pub(crate) fn lazy_block_entry_is_current(&self, uri: &SuperfileUri, token: &Arc<()>) -> bool {
         self.cached
@@ -484,6 +511,35 @@ impl DiskCacheStore {
 
     // Test helpers. Compiled only for tests, never into the shipped library.
 
+    /// Counts a queued block-file write until the returned ticket drops; see
+    /// [`Self::block_writes_settled`].
+    #[cfg(test)]
+    pub(crate) fn block_write_started(self: &Arc<Self>) -> BlockWriteTicket {
+        self.block_writes.fetch_add(1, Ordering::AcqRel);
+        BlockWriteTicket(Arc::clone(self))
+    }
+
+    /// Bytes of fetched runs not written yet.
+    #[cfg(test)]
+    pub(crate) fn write_behind_in_use(&self) -> u64 {
+        self.write_behind_bytes.load(Ordering::Acquire)
+    }
+
+    /// Waits until every queued block-file write, and the index write after it, is done, so a
+    /// test can check the result.
+    #[cfg(test)]
+    pub(crate) async fn block_writes_settled(&self) {
+        loop {
+            let idle = self.block_writes_idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.block_writes.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+
     /// The budget ledger at rest: every charged byte is backed by a live entry, a scanned cache
     /// file or a scanned block file, and nothing else. Holds only with no fetch or fill in flight.
     #[cfg(test)]
@@ -525,6 +581,20 @@ impl DiskCacheStore {
     #[cfg(test)]
     pub(crate) fn remove_block_entry_for_test(&self, uri: &SuperfileUri) {
         let _ = self.cached.remove(uri);
+    }
+}
+
+/// One queued block-file write, counted by [`DiskCacheStore::block_writes_settled`] until it
+/// drops.
+#[cfg(test)]
+pub(crate) struct BlockWriteTicket(Arc<DiskCacheStore>);
+
+#[cfg(test)]
+impl Drop for BlockWriteTicket {
+    fn drop(&mut self) {
+        if self.0.block_writes.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.block_writes_idle.notify_waiters();
+        }
     }
 }
 
@@ -652,18 +722,79 @@ mod tests {
         );
     }
 
-    /// Opens `uri` lazily for streaming and reads its first byte, so one block is filled.
-    async fn open_and_fill_a_block(store: &Arc<DiskCacheStore>, uri: &SuperfileUri) {
+    /// Opens `uri` lazily for streaming and returns its block source.
+    async fn open_lazily(
+        store: &Arc<DiskCacheStore>,
+        uri: &SuperfileUri,
+    ) -> Arc<BlockCachedSource> {
         store
             .open_for_query(uri, &uri.storage_path(), None, None, ReadIntent::Stream)
             .await
             .expect("stream lazy open");
-        let source = store
+        store
             .cached
             .get(uri)
             .and_then(|entry| entry.block_source().map(Arc::clone))
-            .expect("a lazy entry");
+            .expect("a lazy entry")
+    }
+
+    /// Opens `uri` lazily for streaming and reads its first byte, so one block is filled.
+    async fn open_and_fill_a_block(store: &Arc<DiskCacheStore>, uri: &SuperfileUri) {
+        let source = open_lazily(store, uri).await;
         source.range(0, 1).await.expect("block read");
+        store.block_writes_settled().await;
+    }
+
+    /// A lazy entry with a block write still queued.
+    ///  - the sweep keeps it: its block file would be counted before the write's bytes are.
+    ///  - once the write is done, the sweep drops it and counts the whole file.
+    #[tokio::test]
+    async fn idle_sweep_waits_for_a_queued_block_write() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.mmap_cold_threshold_secs = 0;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        let source = open_lazily(&store, &uri).await;
+        let stall = source.stall_writes();
+        source.range(0, 1).await.expect("block read");
+
+        store.sweep_once();
+        assert!(store.is_cached(&uri), "the entry waits for its write");
+
+        drop(stall);
+        store.block_writes_settled().await;
+        let filled = source.filled_bytes_handle().load(Ordering::Acquire);
+        assert!(filled > 0, "the write landed");
+        drop(source);
+        store.sweep_once();
+        assert!(!store.is_cached(&uri), "then the idle entry is dropped");
+        store.assert_budget_consistent();
+        assert_eq!(
+            store.stats().current_bytes,
+            filled,
+            "and its file is charged"
+        );
+    }
+
+    /// A run bigger than the whole cap is let in when nothing else is waiting; anything more then
+    /// waits for room.
+    #[tokio::test]
+    async fn an_oversized_run_is_admitted_alone() {
+        let (_dir, store) = test_store_with(|_| {});
+        assert!(store.try_admit_write_behind(WRITE_BEHIND_CAP_BYTES + 1));
+        assert!(
+            !store.try_admit_write_behind(1),
+            "nothing more fits beside it"
+        );
+        store.release_write_behind(WRITE_BEHIND_CAP_BYTES + 1);
+        assert!(store.try_admit_write_behind(1));
+        assert!(
+            !store.try_admit_write_behind(WRITE_BEHIND_CAP_BYTES),
+            "with another run waiting, the cap holds"
+        );
     }
 
     /// A lazy entry the sweep drops leaves its `.blocks` file on disk for a later open to adopt.

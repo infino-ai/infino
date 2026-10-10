@@ -2230,6 +2230,7 @@ mod tests {
             .range(vec_off, vec_len)
             .await
             .expect("a query touches the vector blocks");
+        store.block_writes_settled().await;
         let blocks = source.filled_bytes_handle().load(Ordering::Acquire);
         drop(source);
         drop(reader);
@@ -2807,6 +2808,7 @@ mod tests {
                 .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
                 .await
                 .expect("promote");
+            store.block_writes_settled().await;
             assert!(
                 store.hole_path(&uri).exists() && !store.cache_path(&uri).exists(),
                 "a copy missing its vector blob is kept under its own name"
