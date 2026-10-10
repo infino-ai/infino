@@ -142,8 +142,15 @@ impl Bisect<'_> {
             && gain / (len.max(1) as f64) < f64::from(self.params.convergence) * reference
     }
 
-    /// Offer a first round's result as the reference. The first to arrive wins
-    /// and later splits leave it alone.
+    /// Offer the root's first round as the reference for the whole run.
+    ///
+    /// Only the split at depth zero may offer. Any split can be first to
+    /// finish a first round, but below the root several run at once, so
+    /// letting them offer would hand the bar to whichever the thread pool
+    /// happened to finish first and make the output depend on scheduling. The
+    /// root runs alone, so taking the bar from it alone is what keeps a merge
+    /// reproducible. A root that moves nothing offers nothing, and the run
+    /// then has no bar and keeps every round.
     fn offer_reference(&self, gain: f64, len: usize) {
         let per_doc = gain / (len.max(1) as f64);
         if per_doc > 0.0 {
@@ -300,7 +307,7 @@ fn split_parallel(
         return;
     }
     let mid = order.len() / 2;
-    pool.with_state(|state| state.refine(fwd, order, mid, true, run));
+    pool.with_state(|state| state.refine(fwd, order, mid, depth, true, run));
     let (left, right) = order.split_at_mut(mid);
     join(
         || split_parallel(fwd, left, depth + 1, pool, run),
@@ -475,7 +482,7 @@ impl BisectState {
     /// twice to reach the answer it already has.
     fn split_halves(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, run: Bisect<'_>) {
         let mid = order.len() / 2;
-        self.refine(fwd, order, mid, false, run);
+        self.refine(fwd, order, mid, depth, false, run);
         let (left, right) = order.split_at_mut(mid);
         self.split(fwd, left, depth + 1, run);
         self.split(fwd, right, depth + 1, run);
@@ -489,6 +496,7 @@ impl BisectState {
         fwd: &ForwardIndex,
         order: &mut [u32],
         mid: usize,
+        depth: u32,
         parallel: bool,
         run: Bisect<'_>,
     ) {
@@ -569,7 +577,9 @@ impl BisectState {
                 break;
             }
             if round == 0 {
-                run.offer_reference(round_gain, order.len());
+                if depth == 0 {
+                    run.offer_reference(round_gain, order.len());
+                }
             } else if run.converged(round_gain, order.len()) {
                 // This round bought less per document than the corpus showed
                 // was available, so the rounds still to come are not worth
@@ -916,6 +926,67 @@ mod tests {
         assert_eq!(
             bisect_order(&fwd, exhaustive()),
             bisect_order(&fwd, exhaustive())
+        );
+
+        // Again with the parameters a real merge runs with, on a corpus large
+        // enough to reach the parallel arm. A thousand documents under the
+        // exhaustive parameters exercise neither: the convergence test is off,
+        // and the splitting never leaves one thread.
+        let (fwd, _) = clustered(2 * PARALLEL_MIN_PARTITION, 9, 11);
+        let first = bisect_order(&fwd, BisectParams::default());
+        for run in 1..8 {
+            assert_eq!(
+                first,
+                bisect_order(&fwd, BisectParams::default()),
+                "run {run} of the parallel arm produced a different order"
+            );
+        }
+    }
+
+    /// Same inputs, same bytes — under the parameters a real merge runs with,
+    /// on a corpus big enough to reach the parallel arm, and with a root that
+    /// has nothing to move.
+    ///
+    /// The convergence test measures rounds against a reference taken from the
+    /// data. Two halves sharing no terms are already apart, so the root's first
+    /// round swaps nothing and offers no reference, which leaves its two
+    /// children to run concurrently — the point where a reference offered by
+    /// whichever finished first would make the whole run depend on a race.
+    #[test]
+    fn the_order_is_deterministic_when_the_root_has_nothing_to_move() {
+        let half = 2 * PARALLEL_MIN_PARTITION;
+        let mut docs: Vec<Vec<u32>> = Vec::with_capacity(2 * half);
+        let mut rng = StdRng::seed_from_u64(29);
+        for d in 0..2 * half {
+            // Disjoint vocabularies, so no swap across the root's split can
+            // lower the cost and the first round moves nothing. The halves are
+            // deliberately unalike -- one densely shared, one nearly all
+            // singletons -- so a first round of one is worth far more per
+            // document than a first round of the other, and which of them sets
+            // the bar decides what the rest of the run does.
+            let terms: Vec<u32> = match d < half {
+                true => (0..12).map(|_| rng.random_range(0..400u32)).collect(),
+                false => (0..12)
+                    .map(|_| 10_000 + rng.random_range(0..60_000u32))
+                    .collect(),
+            };
+            docs.push(terms);
+        }
+        let fwd = ForwardIndex::from_docs(&docs);
+
+        // A root that moves nothing offers no reference, so there is no bar to
+        // measure against and convergence is off for the whole run. The result
+        // must therefore be exactly what disabling the test outright gives.
+        // When a child could offer the reference instead, this held or not
+        // depending on which child the thread pool happened to finish first.
+        let disabled = BisectParams {
+            convergence: 0.0,
+            ..BisectParams::default()
+        };
+        assert_eq!(
+            bisect_order(&fwd, BisectParams::default()),
+            bisect_order(&fwd, disabled),
+            "a split below the root set the convergence bar"
         );
     }
 
