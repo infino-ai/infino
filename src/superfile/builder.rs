@@ -86,7 +86,7 @@ use tempfile::NamedTempFile;
 
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::{
-    config::scratch_root,
+    config::{global, scratch_root},
     superfile::{
         BuildError, FtsError, ReadError, SuperfileReader,
         format::{
@@ -105,7 +105,7 @@ use crate::{
             bm25,
             builder::FtsBuilder,
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
-            reorder::{ForwardIndex, bisect_order},
+            reorder::{BisectParams, ForwardIndex, bisect_order},
             sorted_merge::SortedInput,
             tokenize::STANDARD_TOKENIZER,
         },
@@ -140,16 +140,95 @@ use crate::{
 /// corpus this small has short gaps already and nothing to regroup.
 const REORDER_MIN_DOCS: usize = 4_096;
 
-/// Terms per document the bisection is given. Bounding the forward
-/// index by documents rather than by postings is what keeps the pass a
-/// fixed size whatever the corpus holds: at four bytes a slot this is
-/// about 64 MiB per million documents, and it does not grow with how
-/// much text a document carries.
+/// Bytes in a mebibyte, for the merge memory budget the config states in MiB.
+const BYTES_PER_MIB: u64 = 1 << 20;
+
+/// Share of a merge's memory budget the bisection's forward index may take.
 ///
-/// The terms kept are the most selective a document has, which is where
-/// the grouping signal is. A document with fewer eligible terms
-/// contributes what it has.
+/// Sized so a few-million-document merge lands near the sixteen slots a
+/// document used to get unconditionally, while a merge large enough to exceed
+/// the budget now takes fewer slots, or declines to reorder, instead of
+/// demanding memory without limit. The old fixed count asked for four bytes a
+/// slot times sixteen times the document count with nothing to stop it — about
+/// 134 GiB at two billion documents.
+const REORDER_FORWARD_INDEX_BUDGET_SHARE: u64 = 10;
+
+/// Slots per document the bisection is given.
+///
+/// A fixed width, because it is the width every measurement of this
+/// reordering has been taken at, and nothing shows a wider one paying for
+/// itself. Letting the budget set it instead makes the width grow as the
+/// merge shrinks -- a hundred thousand documents would take 255 slots where
+/// five million take 16 -- so the smallest and most frequent merges would do
+/// the most work per document, which is backwards.
+///
+/// The budget still bounds the forward index. It bounds how many documents
+/// are reordered together, which is [`ReorderPlan::chunk_docs`], rather than
+/// how much of each one is read.
 const REORDER_TERMS_PER_DOC: usize = 16;
+
+/// Bytes the bisection's forward index may take.
+///
+/// A merge large enough to chunk at the real budget is far larger than a test
+/// can build, so tests narrow this instead of the corpus.
+fn reorder_budget_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(bytes) = tests::reorder_budget_override() {
+        return bytes;
+    }
+    global()
+        .compaction
+        .max_memory_mb
+        .saturating_mul(BYTES_PER_MIB)
+        / REORDER_FORWARD_INDEX_BUDGET_SHARE
+}
+
+/// How a merge's documents are handed to the bisection.
+struct ReorderPlan {
+    /// Slots per document in the forward index.
+    terms_per_doc: usize,
+    /// Documents reordered together. Fewer than the merge holds means the
+    /// merge is reordered in runs of this many, each independently.
+    chunk_docs: usize,
+}
+
+/// How to reorder this merge, or `None` if there is nothing to group by.
+///
+/// The forward index has to fit the merge's memory budget, and that is a
+/// bound on `documents * width`. Spending it on width makes the width shrink
+/// as the merge grows -- and run out entirely a little past twenty million
+/// documents, which gave up on exactly the merges where reordering pays most,
+/// the long-lived packed bases with the longest posting lists and the most
+/// gaps to shorten.
+///
+/// So the width is fixed and the document count gives way instead: a merge
+/// too large to hold is reordered in runs of as many documents as the budget
+/// does hold. Grouping is then confined to each run, which costs the gaps a
+/// document could have closed against one far away in the merge, and keeps
+/// the ones it closes nearby -- where a posting list's gaps are, and all a
+/// block of postings can express anyway.
+///
+/// Chunking is near enough free to read: an input's rows land in one stretch
+/// of the output, so a run skips the inputs it does not cover and the
+/// postings are still read about once across the whole merge.
+fn reorder_plan(n_docs: usize, eligible_postings: u64) -> Option<ReorderPlan> {
+    // Nothing eligible means nothing to group by, whatever the budget allows.
+    let carried = eligible_postings.div_ceil(n_docs.max(1) as u64) as usize;
+    if carried == 0 {
+        return None;
+    }
+
+    // A corpus holding less than the full width per document is read in full
+    // by a narrower index, and the slots it would not fill are not worth
+    // reserving: leaving them out is what lets such a merge stay in one run.
+    let terms_per_doc = carried.min(REORDER_TERMS_PER_DOC);
+    let budget_slots = reorder_budget_bytes() / size_of::<u32>() as u64;
+    let holds = (budget_slots / terms_per_doc as u64).max(1) as usize;
+    Some(ReorderPlan {
+        terms_per_doc,
+        chunk_docs: holds.min(n_docs),
+    })
+}
 
 /// Bits of bucket space the bisection groups terms in. Terms are hashed
 /// into it rather than interned, so the vocabulary costs nothing to
@@ -1933,7 +2012,7 @@ impl SuperfileBuilder {
             // [optmerge] per-phase split: cells taking the cheap byte-splice
             // (I/O + memcpy) vs the full decode/re-cluster/re-encode rebuild, and
             // the wall in each. Gated, off by default.
-            let __merge_timers = crate::config::global().diagnostics.optimize_phase_timers;
+            let __merge_timers = global().diagnostics.optimize_phase_timers;
             let mut __splice_cells = 0usize;
             let mut __rebuild_cells = 0usize;
             let mut __splice_ns: u128 = 0;
@@ -2503,82 +2582,160 @@ impl SuperfileBuilder {
             d >= 2 && d <= too_common
         };
 
+        // How many terms the corpus offers per document, summed over the
+        // buckets rather than the postings, so this costs a walk of the degree
+        // table and not a third pass over the index.
+        let eligible_postings: u64 = df
+            .iter()
+            .enumerate()
+            .filter(|&(t, _)| eligible(t as u32))
+            .map(|(_, &d)| u64::from(d))
+            .sum();
+        let Some(plan) = reorder_plan(n_out_docs as usize, eligible_postings) else {
+            // No term groups anything; arrival order it is.
+            return Ok(None);
+        };
+        let terms_per_doc = plan.terms_per_doc;
+
+        // The stretch of output rows each input covers, so a run of documents
+        // reads only the inputs it actually holds and the postings are read
+        // about once over the whole merge however many runs there are.
+        let span_of: Vec<Option<(usize, usize)>> = rows_by_blob
+            .iter()
+            .map(|rows| {
+                let mut lo = usize::MAX;
+                let mut hi = 0usize;
+                for row in rows.iter().flatten() {
+                    let row = row.get() as usize;
+                    lo = lo.min(row);
+                    hi = hi.max(row);
+                }
+                (lo <= hi).then_some((lo, hi))
+            })
+            .collect();
+
         // Pass two: keep each document's most selective terms, in a
         // fixed number of slots per document. `worst` tracks the slot
         // holding the least selective term kept so far, so a posting
         // that cannot displace it costs one comparison.
-        // An ineligible term is skipped before its postings are read, and
-        // `displaced` counts the kept terms that later lost their slot.
+        // An ineligible term is skipped before its postings are read.
         let pick_span = detail_span!("merge_order_pick_terms").entered();
         let n = n_out_docs as usize;
-        let mut slots: Vec<u32> = vec![0; n * REORDER_TERMS_PER_DOC];
-        let mut filled: Vec<u8> = vec![0; n];
-        let mut worst: Vec<u8> = vec![0; n];
-        for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
-            let fts = reader.fts().expect("checked above");
-            for column_id in 0..n_fts_columns {
-                let on_term = |term: &[u8]| {
-                    let t = term_bucket(term);
-                    let keep = eligible(t);
-                    keep.then_some(t)
-                };
-                fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
-                    let Some(row) = rows[local_doc as usize] else {
-                        return;
+        let mut order: Vec<u32> = Vec::with_capacity(n);
+        let mut grouped_any = false;
+        let mut first_row = 0usize;
+        while first_row < n {
+            let past_row = first_row.saturating_add(plan.chunk_docs).min(n);
+            let run = past_row - first_row;
+            let mut slots: Vec<u32> = vec![0; run * terms_per_doc];
+            let mut filled: Vec<u8> = vec![0; run];
+            let mut worst: Vec<u8> = vec![0; run];
+            for (((reader, _), rows), span) in
+                readers.iter().zip(rows_by_blob.iter()).zip(span_of.iter())
+            {
+                match *span {
+                    Some((lo, hi)) if lo < past_row && hi >= first_row => {}
+                    _ => continue,
+                }
+                let fts = reader.fts().expect("checked above");
+                for column_id in 0..n_fts_columns {
+                    let on_term = |term: &[u8]| {
+                        let t = term_bucket(term);
+                        let keep = eligible(t);
+                        keep.then_some(t)
                     };
-                    let row = row.get() as usize;
-                    let slot_base = row * REORDER_TERMS_PER_DOC;
-                    let used = filled[row] as usize;
-                    if used < REORDER_TERMS_PER_DOC {
-                        slots[slot_base + used] = t;
-                        if used == 0
-                            || df[t as usize] > df[slots[slot_base + worst[row] as usize] as usize]
-                        {
-                            worst[row] = used as u8;
+                    fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
+                        let Some(row) = rows[local_doc as usize] else {
+                            return;
+                        };
+                        let row = row.get() as usize;
+                        if row < first_row || row >= past_row {
+                            return;
                         }
-                        filled[row] = (used + 1) as u8;
-                        return;
-                    }
-                    let worst_slot = slot_base + worst[row] as usize;
-                    if df[t as usize] >= df[slots[worst_slot] as usize] {
-                        return;
-                    }
-                    slots[worst_slot] = t;
+                        let row = row - first_row;
+                        let slot_base = row * terms_per_doc;
+                        let used = filled[row] as usize;
+                        if used < terms_per_doc {
+                            slots[slot_base + used] = t;
+                            if used == 0
+                                || df[t as usize]
+                                    > df[slots[slot_base + worst[row] as usize] as usize]
+                            {
+                                worst[row] = used as u8;
+                            }
+                            filled[row] = (used + 1) as u8;
+                            return;
+                        }
+                        let worst_slot = slot_base + worst[row] as usize;
+                        if df[t as usize] >= df[slots[worst_slot] as usize] {
+                            return;
+                        }
+                        slots[worst_slot] = t;
 
-                    // The worst moved; find it again over the fixed,
-                    // small slot count.
-                    let mut w = 0usize;
-                    for i in 1..REORDER_TERMS_PER_DOC {
-                        if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize] {
-                            w = i;
+                        // The worst moved; find it again over the fixed,
+                        // small slot count.
+                        let mut w = 0usize;
+                        for i in 1..terms_per_doc {
+                            if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize]
+                            {
+                                w = i;
+                            }
                         }
-                    }
-                    worst[row] = w as u8;
-                })
-                .map_err(|e| {
-                    BuildError::Io(Error::other(format!(
-                        "fts merge: reading terms for the document order failed: {e}"
-                    )))
-                })?;
+                        worst[row] = w as u8;
+                    })
+                    .map_err(|e| {
+                        BuildError::Io(Error::other(format!(
+                            "fts merge: reading terms for the document order failed: {e}"
+                        )))
+                    })?;
+                }
             }
+
+            let docs: Vec<&[u32]> = (0..run)
+                .map(|row| {
+                    let lo = row * terms_per_doc;
+                    &slots[lo..lo + filled[row] as usize]
+                })
+                .collect();
+            match docs.iter().all(|d| d.is_empty()) {
+                // No term in this run groups anything; it keeps arrival order
+                // while the rest of the merge is still reordered.
+                true => order.extend(first_row as u32..past_row as u32),
+                false => {
+                    grouped_any = true;
+                    let fwd = ForwardIndex::from_docs(&docs);
+                    drop(docs);
+                    let _bisect_span = detail_span!("merge_order_bisect", docs = run).entered();
+                    order.extend(
+                        bisect_order(&fwd, BisectParams::default())
+                            .into_iter()
+                            .map(|d| d + first_row as u32),
+                    );
+                }
+            }
+            first_row = past_row;
         }
         drop(df);
         drop(pick_span);
 
-        let docs: Vec<&[u32]> = (0..n)
-            .map(|row| {
-                let lo = row * REORDER_TERMS_PER_DOC;
-                &slots[lo..lo + filled[row] as usize]
-            })
-            .collect();
-        if docs.iter().all(|d| d.is_empty()) {
-            return Ok(None);
+        // Each run contributes its own rows and nothing else, so the runs
+        // together are still a permutation of the merge. Cheap to state and
+        // the one thing a chunking mistake would break.
+        debug_assert_eq!(order.len(), n, "the reordering lost or gained rows");
+        debug_assert!(
+            {
+                let mut seen = order.clone();
+                seen.sort_unstable();
+                seen.dedup();
+                seen.len() == n
+            },
+            "the reordering named a row twice"
+        );
+
+        match grouped_any {
+            true => Ok(Some(order)),
+            false => Ok(None),
         }
-        let fwd = ForwardIndex::from_docs(&docs);
-        drop(docs);
-        drop(slots);
-        let _bisect_span = detail_span!("merge_order_bisect", docs = n).entered();
-        Ok(Some(bisect_order(&fwd)))
     }
 
     test_visible! {
@@ -3913,7 +4070,34 @@ fn escape_json(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, io::empty, iter::once, slice, sync::Arc};
+    use std::{cell::Cell, collections::HashMap, io::empty, iter::once, slice, sync::Arc};
+
+    thread_local! {
+        /// Set by [`with_reorder_budget`] for the thread running a merge.
+        static REORDER_BUDGET: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// The narrowed forward-index budget, if this thread is inside
+    /// [`with_reorder_budget`].
+    pub(super) fn reorder_budget_override() -> Option<u64> {
+        REORDER_BUDGET.with(Cell::get)
+    }
+
+    /// Run `f` with the forward index held to `bytes`, so a merge a test can
+    /// afford to build still reaches the chunked path.
+    fn with_reorder_budget<T>(bytes: u64, f: impl FnOnce() -> T) -> T {
+        /// Clears the override however `f` leaves, so one test cannot narrow
+        /// the budget for the next on the same thread.
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                REORDER_BUDGET.with(|b| b.set(None));
+            }
+        }
+        REORDER_BUDGET.with(|b| b.set(Some(bytes)));
+        let _clear = Clear;
+        f()
+    }
 
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, StringArray, UInt64Array};
     use arrow_schema::Field;
@@ -5913,6 +6097,55 @@ mod tests {
         }
     }
 
+    /// The width is fixed and the budget decides how many documents are
+    /// reordered together, so a merge stays reorderable however large it
+    /// grows and a small one does no more work per document than a large one.
+    #[test]
+    fn a_merge_too_large_to_hold_is_reordered_in_runs() {
+        let rich = 200;
+        let plan = |docs: usize| {
+            reorder_plan(docs, docs as u64 * rich)
+                .unwrap_or_else(|| panic!("{docs} documents still reorder"))
+        };
+        let budget =
+            global().compaction.max_memory_mb * (1 << 20) / REORDER_FORWARD_INDEX_BUDGET_SHARE;
+
+        // Everything a production merge is actually made of reorders whole, at
+        // the one width this has ever been measured at. A merge a twentieth
+        // the size of another reads just as much of each document.
+        for docs in [89_034usize, 185_000, 355_000, 2_170_000, 5_000_000] {
+            let p = plan(docs);
+            assert_eq!(
+                (p.terms_per_doc, p.chunk_docs),
+                (REORDER_TERMS_PER_DOC, docs),
+                "{docs} documents should reorder whole at the fixed width"
+            );
+        }
+
+        // Past what the budget holds, the width stays and the runs get
+        // shorter, where this used to narrow the width until it gave up on
+        // reordering altogether.
+        for docs in [25_160_520usize, 100_000_000, 2_000_000_000] {
+            let p = plan(docs);
+            assert_eq!(
+                p.terms_per_doc, REORDER_TERMS_PER_DOC,
+                "{docs}: a chunked merge keeps the width"
+            );
+            assert!(p.chunk_docs < docs, "{docs}: expected runs");
+            let wants = p.chunk_docs as u64 * p.terms_per_doc as u64 * 4;
+            assert!(wants <= budget, "{docs}: a run wants {wants} of {budget}");
+        }
+
+        // Documents holding less than the width are read in full by a
+        // narrower index, and not reserving the slots they cannot fill is
+        // what keeps such a merge in one run.
+        let poor = reorder_plan(30_000_000, 30_000_000 * 2).expect("two terms apiece still group");
+        assert_eq!((poor.terms_per_doc, poor.chunk_docs), (2, 30_000_000));
+
+        // Nothing eligible is the one case with nothing to group by.
+        assert!(reorder_plan(1_000, 0).is_none());
+    }
+
     /// One document of the reordering corpus: drawn from a few
     /// vocabularies and interleaved, so no input is a single topic and
     /// arrival order groups nothing. The pair "t0 t1" recurs, giving a
@@ -5930,6 +6163,106 @@ mod tests {
         }
         t.push_str("common");
         t
+    }
+
+    /// A merge too large to hold at a usable width is reordered in runs, and
+    /// the runs together still name every row exactly once and answer every
+    /// query the same.
+    ///
+    /// The budget is narrowed rather than the merge enlarged: at the real one
+    /// this path needs more than twenty million documents.
+    #[tokio::test]
+    async fn a_chunked_merge_keeps_every_row_and_every_answer() {
+        const PER_INPUT: u64 = 2_600;
+        /// Too small to hold this merge at any usable width, whatever its
+        /// documents carry, so the merge has to be reordered in runs.
+        const BUDGET_BYTES: u64 = 16 * 1024;
+
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig::new("title").positions(true)],
+            vec![],
+        );
+        let schema = opts.schema.clone();
+        let n = (PER_INPUT * 2) as usize;
+        let r1 = SuperfileReader::open(Bytes::from(reorder_corpus_input(
+            &opts, &schema, 0, PER_INPUT,
+        )))
+        .expect("open 1");
+        let r2 = SuperfileReader::open(Bytes::from(reorder_corpus_input(
+            &opts,
+            &schema,
+            PER_INPUT,
+            PER_INPUT * 2,
+        )))
+        .expect("open 2");
+        let inputs = vec![
+            (Arc::new(r1), tombstones(&[])),
+            (Arc::new(r2), tombstones(&[])),
+        ];
+
+        let (reindex_bytes, _) =
+            SuperfileBuilder::build_from_readers(&inputs).expect("re-index build");
+        let (merge_bytes, _) = with_reorder_budget(BUDGET_BYTES, || {
+            // Term-poor and term-rich alike, this budget leaves no room to
+            // hold the merge whole, so it is reordered in runs of its rows
+            // rather than left in arrival order.
+            for carried in [2u64, 100] {
+                let plan = reorder_plan(n, n as u64 * carried).expect("the merge still reorders");
+                assert!(
+                    plan.chunk_docs < n,
+                    "carrying {carried}: expected runs, got all {n} rows at once"
+                );
+            }
+            SuperfileBuilder::build_from_readers_fts_merge(&inputs).expect("k-way fts merge")
+        });
+
+        let reindex_reader =
+            SuperfileReader::open(Bytes::from(reindex_bytes)).expect("open re-index");
+        let merge_reader = SuperfileReader::open(Bytes::from(merge_bytes)).expect("open merge");
+        let merge_fts = merge_reader.fts().expect("merged fts");
+        let reindex_fts = reindex_reader.fts().expect("re-index fts");
+        assert!(
+            merge_fts.has_doc_map(),
+            "a chunked merge still chooses its own order"
+        );
+
+        // Every row is still there, in its arrival position.
+        assert_eq!(
+            reindex_reader
+                .get_record_batch(None)
+                .expect("re-index rows"),
+            merge_reader.get_record_batch(None).expect("merged rows"),
+            "reordering in runs must not move a Parquet row"
+        );
+
+        // And the postings, which the runs wrote in a different order from
+        // every input and from the re-indexed file, still answer the same.
+        let all_k = n + 1;
+        for terms in [
+            &["t0"][..],
+            &["t41"][..],
+            &["common"][..],
+            &["t0", "t41"][..],
+            &["t5", "t45", "t85"][..],
+        ] {
+            let mut want = reindex_fts
+                .search("title", terms, all_k, BoolMode::Or)
+                .await
+                .expect("re-index search");
+            let mut got = merge_fts
+                .search("title", terms, all_k, BoolMode::Or)
+                .await
+                .expect("merged search");
+            assert_eq!(want.len(), got.len(), "{terms:?}: match count");
+            want.sort_by_key(|&(d, _)| d);
+            got.sort_by_key(|&(d, _)| d);
+            for ((dw, sw), (dg, sg)) in want.iter().zip(got.iter()) {
+                assert_eq!(dw, dg, "{terms:?}: row {dw} missing or extra");
+                assert!((sw - sg).abs() < 1e-5, "{terms:?} row {dw}: {sw} vs {sg}");
+            }
+        }
     }
 
     /// One superfile of that corpus, ids `lo..hi`.
