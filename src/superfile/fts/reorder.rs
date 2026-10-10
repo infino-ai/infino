@@ -294,7 +294,9 @@ fn split_parallel(
         return;
     }
     if order.len() < PARALLEL_MIN_PARTITION {
-        pool.with_state(|state| state.split(fwd, order, depth, run));
+        // Both of `split`'s entry tests have just been made above, against
+        // this same partition.
+        pool.with_state(|state| state.split_halves(fwd, order, depth, run));
         return;
     }
     let mid = order.len() / 2;
@@ -462,6 +464,16 @@ impl BisectState {
             apply_inner_order(order, &inner);
             return;
         }
+        self.split_halves(fwd, order, depth, run);
+    }
+
+    /// [`Self::split`] with the entry tests already made.
+    ///
+    /// Only for a caller that has just run them against this same partition:
+    /// [`localizing_pays`] walks every posting in `order` to decide, so the
+    /// handoff out of the parallel splitter would otherwise pay for that walk
+    /// twice to reach the answer it already has.
+    fn split_halves(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, run: Bisect<'_>) {
         let mid = order.len() / 2;
         self.refine(fwd, order, mid, false, run);
         let (left, right) = order.split_at_mut(mid);
