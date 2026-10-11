@@ -326,22 +326,40 @@ fn damage_block(sidecar: &mut [u8], b: usize) {
     sidecar[block_offset(sidecar, b) + HI_WIDTH_AT] = MAX_WIDTH + 1;
 }
 
+/// Test-only: where `superfile`'s id sidecar sits, read from its footer.
+#[cfg(any(test, feature = "test-helpers"))]
+fn id_sidecar_range(superfile: &[u8]) -> Range<usize> {
+    let kvs = read_kv_metadata(superfile).expect("superfile footer");
+    let at = |key: &str| -> usize {
+        kvs.get(key)
+            .expect("the superfile carries an id sidecar")
+            .parse()
+            .expect("a byte offset")
+    };
+    let off = at(kv::IDS_OFFSET);
+    off..off + at(kv::IDS_LENGTH)
+}
+
 #[cfg(any(test, feature = "test-helpers"))]
 test_visible! {
     /// Test-only: a copy of `superfile` with block `b` of its id sidecar
     /// broken, and every other byte unchanged.
     fn with_damaged_id_block(superfile: &[u8], b: usize) -> Vec<u8> {
-        let kvs = read_kv_metadata(superfile).expect("superfile footer");
-        let at = |key: &str| -> usize {
-            kvs.get(key)
-                .expect("the superfile carries an id sidecar")
-                .parse()
-                .expect("a byte offset")
-        };
-        let (off, len) = (at(kv::IDS_OFFSET), at(kv::IDS_LENGTH));
         let mut out = superfile.to_vec();
-        damage_block(&mut out[off..off + len], b);
+        let range = id_sidecar_range(superfile);
+        damage_block(&mut out[range], b);
         out
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+test_visible! {
+    /// Test-only: checks every block of `superfile`'s packed id sidecar, the
+    /// way a rewrite does before copying it.
+    fn check_id_sidecar(superfile: &[u8]) -> Result<(), String> {
+        let sidecar = &superfile[id_sidecar_range(superfile)];
+        let n_docs = u32_le_at(sidecar, 0).ok_or("packed id sidecar shorter than its header")?;
+        PackedIds::open(sidecar, n_docs as usize)?.check_blocks()
     }
 }
 

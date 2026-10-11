@@ -83,6 +83,7 @@ use arrow_schema::{DataType, Field, Schema};
 use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
+use tracing::warn;
 
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::{
@@ -576,6 +577,21 @@ fn append_stable_id_sidecar(out: &mut Vec<u8>, batch: &RecordBatch, id_column: &
         out.extend_from_slice(&col.value(i).to_le_bytes());
     }
     true
+}
+
+/// A packed id sidecar for `source`, rebuilt from its Parquet `_id` column.
+/// Reads only that column, so a rewrite that carries the rest stays a carry.
+/// Empty, so no sidecar, if the column is not `Decimal128`.
+fn rebuild_id_sidecar(source: &SuperfileReader) -> Result<Vec<u8>, BuildError> {
+    let docs: Vec<u32> = (0..source.n_docs() as u32).collect();
+    let batch = source
+        .take_by_local_doc_ids(&docs, &[source.id_column()])
+        .map_err(Error::other)?;
+    let mut raw = Vec::new();
+    if !append_stable_id_sidecar(&mut raw, &batch, source.id_column()) {
+        return Ok(Vec::new());
+    }
+    Ok(ids::encode_packed(&raw))
 }
 
 /// Materialize the stable-id sidecar from the accumulated batches: one
@@ -3124,17 +3140,20 @@ impl SuperfileBuilder {
         // The ids sidecar is derived from rows this build never decoded, so
         // it is carried too — re-packed when the source predates the packed
         // layout, which is the upgrade a rewrite is expected to perform.
+        // Opening the source checked only a packed sidecar's header, so its
+        // blocks are checked here. One with a bad block is rebuilt from the
+        // `_id` column instead, so a rewrite repairs it rather than failing.
         let raw_ids = region(kv::IDS_OFFSET, kv::IDS_LENGTH)?.map(|r| bytes.slice(r));
         let ids_bytes: Vec<u8> = match (&raw_ids, source.id_sidecar_is_packed()) {
-            // Opening the source checked only the sidecar's header.
-            (Some(ids), true) => {
-                ids::PackedIds::open(ids, source.n_docs() as usize)
-                    .and_then(|packed| packed.check_blocks())
-                    .map_err(|reason| {
-                        BuildError::Io(Error::other(format!("carried footer: {reason}")))
-                    })?;
-                ids.to_vec()
-            }
+            (Some(ids), true) => match ids::PackedIds::open(ids, source.n_docs() as usize)
+                .and_then(|packed| packed.check_blocks())
+            {
+                Ok(()) => ids.to_vec(),
+                Err(reason) => {
+                    warn!(%reason, "rebuilding the id sidecar from the `_id` column");
+                    rebuild_id_sidecar(source)?
+                }
+            },
             (Some(ids), false) => ids::encode_packed(ids),
             (None, _) => Vec::new(),
         };
@@ -7449,23 +7468,28 @@ mod tests {
     }
 
     #[test]
-    fn a_carry_refuses_a_malformed_id_sidecar_block() {
+    fn a_carry_rebuilds_a_malformed_id_sidecar_block() {
         // A superfile with one broken block in its id sidecar, rewritten the way
         // a reindex does.
         //  - `open` takes it, since it checks only the sidecar's header.
-        //  - the rewrite refuses it, with an error naming the broken block.
-        // This test pins that a rewrite checks every block before it copies the
-        // sidecar into a new file.
+        //  - the rewrite succeeds, with a sidecar rebuilt from the `_id` column.
+        //  - every block of the new sidecar is good, and every `_id` matches.
+        // This test pins that a rewrite repairs a bad block instead of failing.
         let (opts, _, bytes) = sidecar_fixture();
         let damaged = Bytes::from(ids::with_damaged_id_block(&bytes, 0));
         let source = SuperfileReader::open(damaged).expect("open checks only the header");
-        let Err(err) = carry_rewrite(opts, &source) else {
-            panic!("a malformed sidecar block is refused");
-        };
-        assert!(
-            err.to_string()
-                .contains("carried footer: packed id sidecar block 0 is malformed"),
-            "got {err}"
+        let out = carry_rewrite(opts, &source).expect("the rewrite repairs the sidecar");
+
+        assert_eq!(ids::check_id_sidecar(&out), Ok(()));
+        let rewrite = SuperfileReader::open(Bytes::from(out)).expect("open the rewrite");
+        let locals: Vec<u32> = (0..SIDECAR_ROWS as u32).collect();
+        assert_eq!(
+            rewrite
+                .take_by_local_doc_ids(&locals, &["doc_id"])
+                .expect("read every _id")
+                .column(0)
+                .as_ref(),
+            &decimal128_ids(0..SIDECAR_ROWS) as &dyn Array,
         );
     }
 

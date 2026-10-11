@@ -2,15 +2,22 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! A table whose superfiles each have a broken block in their id sidecar:
-//! every query still answers, `_id` included, as it would on a good copy.
+//! every query still answers, `_id` included, as it would on a good copy, and
+//! a reindex repairs the sidecar.
 
-use std::path::Path;
+use std::{fs, path::Path, time::Duration};
 
 use arrow_array::{Decimal128Array, Int64Array, RecordBatch};
-use infino::{Bm25SearchOptions, connect, superfile::ids::with_damaged_id_block};
+use infino::{
+    Bm25SearchOptions, connect,
+    superfile::ids::{check_id_sidecar, with_damaged_id_block},
+};
 use tempfile::TempDir;
 
-use crate::reindex_fixture::{N_DOCS, TABLE, edit_superfiles, write_table};
+use crate::reindex_fixture::{
+    N_DOCS, Staleness, TABLE, edit_superfiles, repairing, superfile_paths, write_stale_table,
+    write_table,
+};
 
 /// The sidecar block to break. Each fixture superfile fits in one block, so
 /// this is its only block.
@@ -80,5 +87,35 @@ fn a_broken_id_sidecar_block_still_returns_every_id() {
         .sum();
     assert_eq!(rows, N_DOCS as usize);
 
+    assert_eq!(search_ids(root.path()), want);
+}
+
+#[test]
+fn a_reindex_rebuilds_a_broken_id_sidecar_block() {
+    // The fixture table, stale for a layout rewrite, searched once, then with
+    // every superfile's id sidecar broken, and reindexed.
+    //  - the reindex rewrites every superfile, instead of stopping at the first.
+    //  - every rewritten superfile has a good sidecar again.
+    //  - a search returning `_id` gives the same ids as before the break.
+    // This test pins that a reindex repairs a broken sidecar block.
+    let root = TempDir::new().expect("tempdir");
+    let superfiles = write_stale_table(root.path(), Staleness::DuplicatedFooter);
+    let want = search_ids(root.path());
+    edit_superfiles(root.path(), |bytes| {
+        with_damaged_id_block(bytes, DAMAGED_BLOCK)
+    });
+
+    let db = connect(root.path().to_str().expect("utf-8 path")).expect("connect");
+    let table = db.open_table(TABLE).expect("open the table");
+    let report = table
+        .reindex(&repairing(Staleness::DuplicatedFooter))
+        .expect("reindex the damaged table");
+    assert_eq!(report.rewritten, superfiles, "{report:?}");
+    table.gc(Duration::ZERO).expect("collect superseded bytes");
+
+    for path in superfile_paths(root.path()) {
+        let bytes = fs::read(&path).expect("read superfile");
+        assert_eq!(check_id_sidecar(&bytes), Ok(()), "{}", path.display());
+    }
     assert_eq!(search_ids(root.path()), want);
 }
