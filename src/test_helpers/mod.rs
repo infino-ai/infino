@@ -94,10 +94,16 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+#[cfg(test)]
+use std::{io, sync::Mutex};
 
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use rayon::ThreadPoolBuilder;
+#[cfg(test)]
+use tracing::{Level, subscriber::with_default};
+#[cfg(test)]
+use tracing_subscriber::fmt;
 
 use crate::{
     storage::{LocalFsStorageProvider, StorageProvider},
@@ -357,4 +363,37 @@ pub fn fid(name: &str) -> crate::supertable::schema::FieldId {
     }
     let h = h % (u32::MAX - 2) + 1;
     crate::supertable::schema::FieldId(h)
+}
+
+/// Every line a test's subscriber formats, so an assertion can read what was logged.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Runs `f` and returns its result with every line it logged at `level` and above.
+/// The subscriber is this thread's only, so `f` must log from this thread.
+#[cfg(test)]
+pub(crate) fn capture_logs<R>(level: Level, f: impl FnOnce() -> R) -> (R, String) {
+    let logs = CapturedLogs::default();
+    let writer = logs.clone();
+    let subscriber = fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(level)
+        .finish();
+    let out = with_default(subscriber, f);
+    let text = String::from_utf8_lossy(&logs.0.lock().expect("log buffer")).into_owned();
+    (out, text)
 }

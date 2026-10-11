@@ -26,7 +26,10 @@ use std::{
     fmt, io,
     ops::{Deref, Range},
     str,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use arrow::compute::{concat_batches, take};
@@ -53,6 +56,7 @@ use parquet::{
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
+use tracing::warn;
 
 #[cfg(test)]
 use crate::superfile::fts::reader::TermIndexFact;
@@ -201,6 +205,10 @@ pub struct SuperfileReader {
     /// Whether `id_sidecar` holds the packed layout (`superfile::ids`)
     /// rather than the raw `i128` array.
     id_sidecar_packed: bool,
+    /// Set by the first read that finds a bad block in `id_sidecar`. Later
+    /// reads take `_id` from Parquet, so the sidecar is not retried or warned
+    /// about again.
+    id_sidecar_broken: AtomicBool,
 }
 
 struct LazyMetadataFetch {
@@ -422,6 +430,7 @@ impl SuperfileReader {
             // there goes through the Parquet id column.
             id_sidecar: None,
             id_sidecar_packed: false,
+            id_sidecar_broken: AtomicBool::new(false),
         })
     }
 
@@ -535,6 +544,7 @@ impl SuperfileReader {
         //    local doc id. Record its byte range so `take_by_local_doc_ids`
         //    resolves `_id` from a fixed-width slice instead of the Parquet
         //    id pages. Absent on pre-sidecar superfiles → Parquet fallback.
+        //    Only the packed header is checked here; see `PackedIds::open`.
         let id_sidecar_packed =
             kv_map.get(kv::IDS_LAYOUT).map(String::as_str) == Some(kv::IDS_LAYOUT_PACKED);
         let id_sidecar = if all_present(&kv_map, kv::IDS_KEYS) {
@@ -548,7 +558,7 @@ impl SuperfileReader {
                 })?;
             match id_sidecar_packed {
                 true => {
-                    ids::PackedIds::parse(&bytes[off..end], n_docs as usize)
+                    ids::PackedIds::open(&bytes[off..end], n_docs as usize)
                         .map_err(ReadError::MalformedKv)?;
                 }
                 false => {
@@ -584,6 +594,7 @@ impl SuperfileReader {
             vec,
             id_sidecar,
             id_sidecar_packed,
+            id_sidecar_broken: AtomicBool::new(false),
         })
     }
 
@@ -1029,14 +1040,28 @@ impl SuperfileReader {
         // when the superfile carries one — a direct slice, no Parquet decode.
         // Every other column still comes from the id-selected Parquet read;
         // when `_id` is the only projection, that read is skipped entirely.
-        let use_sidecar_for_id =
-            self.id_sidecar.is_some() && projection.iter().any(|&n| n == self.id_column);
-        let sidecar_id = if use_sidecar_for_id {
-            let range = self.id_sidecar.clone().expect("checked");
-            Some(self.id_array_from_sidecar(&bytes, range, local_doc_ids)?)
-        } else {
-            None
+        // A sidecar that can't be read (a bad block) falls back to the Parquet
+        // `_id` column, which holds the same ids, so the read still answers.
+        // The first failure marks the sidecar broken, so later reads skip it and
+        // it warns once. `Relaxed` is enough: a read that misses the mark only
+        // retries the sidecar and falls back the same way.
+        let sidecar_id = match &self.id_sidecar {
+            Some(range)
+                if projection.iter().any(|&n| n == self.id_column)
+                    && !self.id_sidecar_broken.load(Ordering::Relaxed) =>
+            {
+                match self.id_array_from_sidecar(&bytes, range.clone(), local_doc_ids) {
+                    Ok(ids) => Some(ids),
+                    Err(error) => {
+                        self.id_sidecar_broken.store(true, Ordering::Relaxed);
+                        warn!(%error, "reading _id from Parquet, the id sidecar is unreadable");
+                        None
+                    }
+                }
+            }
+            _ => None,
         };
+        let use_sidecar_for_id = sidecar_id.is_some();
 
         // Columns Parquet must serve: the projection minus the sidecar-served
         // `_id`, deduped in first-seen order for the ProjectionMask. The
@@ -1134,8 +1159,8 @@ impl SuperfileReader {
 
     /// Build the `_id` column for `local_doc_ids` (in caller order) from the
     /// stable-id sidecar `range` within `bytes`: a packed sidecar is opened
-    /// by its header (its blocks were validated at superfile open) and
-    /// indexed per doc; a raw one holds a little-endian `i128` at
+    /// by its header and indexed per doc, checking each block it reads; a
+    /// raw one holds a little-endian `i128` at
     /// `local_doc_id * ENTRY`. Direct indexing, so duplicates and ordering
     /// need no rank-back. Raw bounds are guaranteed by the doc-id
     /// bounds-check in [`take_by_local_doc_ids`] and the sidecar-length
@@ -1163,7 +1188,10 @@ impl SuperfileReader {
             // resolve unpacks each block's two streams once instead of
             // reading two bit fields per doc.
             Some(p) => p.get_many(local_doc_ids, &mut ids).ok_or_else(|| {
-                ReadError::MalformedKv("stable-id sidecar has no entry for a requested doc".into())
+                ReadError::MalformedKv(
+                    "stable-id sidecar has no entry for a requested doc, or its block is malformed"
+                        .into(),
+                )
             })?,
             None => {
                 for &doc_id in local_doc_ids {
@@ -2455,6 +2483,7 @@ mod tests {
 
     use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field};
+    use tracing::Level;
 
     use super::*;
     use crate::{
@@ -2463,7 +2492,7 @@ mod tests {
             format::footer::with_forged_footer_kv,
             vector::distance::normalize,
         },
-        test_helpers::{decimal128_ids, default_vector_config},
+        test_helpers::{capture_logs, decimal128_ids, default_vector_config},
     };
 
     fn schema_with_text() -> Arc<Schema> {
@@ -2820,6 +2849,53 @@ mod tests {
             .downcast_ref::<Decimal128Array>()
             .expect("decimal ids");
         assert_eq!(id_col.value(0), ids[10]);
+    }
+
+    #[test]
+    fn a_bad_id_sidecar_block_opens_and_reads_id_from_parquet() {
+        // A 5,000-row superfile with the last block of its id sidecar broken.
+        //  - `open` succeeds, since it checks only the sidecar's header.
+        //  - `_id` for a doc in a good block comes from the sidecar.
+        //  - `_id` for a doc in the broken block comes from Parquet instead, and
+        //    marks the sidecar broken.
+        //  - Once marked, every read takes `_id` from Parquet, still right, and
+        //    the warning is logged only once.
+        // This test pins that a bad block costs neither the open nor the answer.
+        let (bytes, ids) = build_shuffled_id_superfile();
+        let last_block = SHUFFLED_ID_ROWS.div_ceil(ids::BLOCK_DOCS) - 1;
+        let damaged = ids::with_damaged_id_block(&bytes, last_block);
+        let r = SuperfileReader::open(Bytes::from(damaged)).expect("open reads only the header");
+        let read_ids = |docs: &[u32], projection: &[&str]| -> Vec<i128> {
+            let batch = r.take_by_local_doc_ids(docs, projection).expect("take");
+            let at = projection
+                .iter()
+                .position(|&n| n == "doc_id")
+                .expect("doc_id projected");
+            let col = batch
+                .column(at)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("decimal ids");
+            col.values().to_vec()
+        };
+        let bad = SHUFFLED_ID_ROWS - 1;
+
+        let ((), logs) = capture_logs(Level::WARN, || {
+            assert_eq!(read_ids(&[0], &["doc_id"]), [ids[0]]);
+            assert!(!r.id_sidecar_broken.load(Ordering::Relaxed));
+            assert_eq!(
+                read_ids(&[0, bad as u32], &["title", "doc_id"]),
+                [ids[0], ids[bad]]
+            );
+            assert!(r.id_sidecar_broken.load(Ordering::Relaxed));
+            assert_eq!(read_ids(&[bad as u32], &["doc_id"]), [ids[bad]]);
+            assert_eq!(read_ids(&[0], &["doc_id"]), [ids[0]]);
+        });
+        assert_eq!(
+            logs.matches("the id sidecar is unreadable").count(),
+            1,
+            "{logs}"
+        );
     }
 
     #[test]

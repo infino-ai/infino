@@ -45,6 +45,7 @@
 mod bioasq_admit_diag;
 mod commit;
 mod compact_gc;
+mod damaged_id_sidecar;
 mod disk_cache;
 mod drain_tombstones;
 mod gc_stale_snapshot;

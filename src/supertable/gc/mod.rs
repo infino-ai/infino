@@ -615,6 +615,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use tempfile::tempdir;
+    use tracing::Level;
     use uuid::Uuid;
 
     use super::*;
@@ -631,7 +632,7 @@ mod tests {
             },
             slow_vector_state,
         },
-        test_helpers::default_supertable_options,
+        test_helpers::{capture_logs, default_supertable_options},
     };
 
     /// The hidden vector index sweeps through a `PrefixedStorageProvider`, which
@@ -937,21 +938,6 @@ mod tests {
         );
     }
 
-    /// Every line a test's subscriber formats, so an assertion can read what the sweep logged.
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log buffer").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     /// Runs `hook` on a plain thread the first time the sweep lists `data/` after [`Self::arm`],
     /// before the listing reads anything, and hides `hidden` from every `data/` listing. That puts a
     /// concurrent commit, or a listing that missed an object, exactly where the sweep is most exposed
@@ -1127,23 +1113,14 @@ mod tests {
     /// A multi-thread runtime, so `block_on` drives the sweep on this thread and the thread-local
     /// subscriber sees its events.
     fn sweep_logging(st: &Supertable) -> (GcReport, String) {
-        let logs = CapturedLogs::default();
-        let writer = logs.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        let report = tracing::subscriber::with_default(subscriber, || {
+        capture_logs(Level::INFO, || {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("runtime")
                 .block_on(gc_storage_sweep_for_inner(st.inner(), Duration::ZERO))
                 .expect("sweep")
-        });
-        let text = String::from_utf8_lossy(&logs.0.lock().expect("log buffer")).into_owned();
-        (report, text)
+        })
     }
 
     /// Lines reporting loss, under the stable message operators alert on.
