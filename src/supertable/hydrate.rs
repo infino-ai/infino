@@ -664,8 +664,6 @@ mod tests {
         assert_eq!(none, 0);
     }
 
-    /// Every hydrated superfile carries min/max for `_id` and each column, keyed
-    /// by field id like `append`, so SQL can prune files and answer MIN/MAX from stats.
     /// Distinct values in the low-cardinality columns of the stats test.
     const LOW_CARDINALITY: i64 = 5;
 
@@ -727,16 +725,18 @@ mod tests {
 
         let want = table_stats(&appended);
         assert_eq!(want.len(), 3, "`k`, `n` and `s` all carry stats");
-        assert!(
+        assert_eq!(
             want.values()
                 .filter(|stats| stats.value_counts.is_some())
-                .count()
-                == 2,
+                .count(),
+            2,
             "`k` and `s` carry exact value counts, `n` is past the cap"
         );
         assert_eq!(table_stats(&hydrated), want);
     }
 
+    /// Every hydrated superfile carries min/max for `_id` and each column, keyed
+    /// by field id like `append`, so SQL can prune files and answer MIN/MAX from stats.
     #[test]
     fn hydrate_records_stats_for_every_column() {
         let (_dir, _db, table) = table_with(user_schema());
