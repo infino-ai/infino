@@ -16,12 +16,18 @@
 //! Coverage:
 //!  - Two handles racing on the pointer → OCC retry loop in
 //!    `writer::persist_commit` retries the loser, both end
-//!    up committed at monotonic manifest_ids (1, 2).
+//!    up committed at distinct, increasing manifest_ids.
 //!  - Three handles racing → retry handles cascading
-//!    contention; final manifest_id == 3.
+//!    contention; all three commits land.
 //!  - Loser sees the winner's superfiles after retry
 //!    (the refresh-inside-retry path's
 //!    inherit-via-content-addressed-Arc::clone is exercised).
+//!
+//! Manifest ids are not dense under contention: a retry skips any
+//! id whose list object exists above the pointer (a crash orphan or
+//! a racing writer's unpublished list, possibly its own), so the
+//! final id may exceed the commit count. Tests assert ordering and
+//! superfile counts, never exact ids.
 
 #![deny(clippy::unwrap_used)]
 
@@ -43,8 +49,7 @@ use tempfile::TempDir;
 
 /// Two independent handles racing to commit. The OCC retry
 /// loop must ensure both commits eventually succeed and the
-/// final pointer sits at manifest_id = 2 with both writers'
-/// superfiles visible.
+/// final pointer shows both writers' superfiles.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_handles_concurrent_commits_both_succeed_via_occ_retry() {
     let dir = TempDir::new().expect("tempdir");
@@ -81,20 +86,18 @@ async fn two_handles_concurrent_commits_both_succeed_via_occ_retry() {
     t_a.await.expect("task A");
     t_b.await.expect("task B");
 
-    // The handle that won the first pointer-CAS is at
-    // manifest_id = 1; the loser retried after refreshing and
-    // is at manifest_id = 2. We can't assert which was which
-    // (the race is non-deterministic), but the max must be 2.
+    // The loser retried after refreshing, so it sits past the
+    // winner; which handle won is non-deterministic.
     let final_ids = [st_a.manifest_id(), st_b.manifest_id()];
     let max_id = final_ids.iter().copied().max().expect("non-empty");
     let min_id = final_ids.iter().copied().min().expect("non-empty");
-    assert_eq!(
-        max_id, 2,
-        "one handle must have committed at v2 after retry; got {final_ids:?}"
-    );
-    assert_eq!(
-        min_id, 1,
+    assert!(
+        min_id >= 1,
         "both commits succeeded so both handles advanced past v0; got {final_ids:?}"
+    );
+    assert!(
+        max_id > min_id,
+        "the loser must have committed past the winner; got {final_ids:?}"
     );
 
     // Fresh open against the same storage sees the union.
@@ -103,7 +106,7 @@ async fn two_handles_concurrent_commits_both_succeed_via_occ_retry() {
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
             .expect("open");
-    assert_eq!(consumer.manifest_id(), 2);
+    assert_eq!(consumer.manifest_id(), max_id);
     assert_eq!(
         consumer.reader().expect("reader").n_superfiles(),
         2,
@@ -113,7 +116,7 @@ async fn two_handles_concurrent_commits_both_succeed_via_occ_retry() {
 
 /// Three handles racing — exercises cascading retries (the
 /// second loser may itself lose to the first loser's retry
-/// before winning at manifest_id = 3).
+/// before winning).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_handles_concurrent_commits_all_succeed() {
     let dir = TempDir::new().expect("tempdir");
@@ -162,10 +165,10 @@ async fn three_handles_concurrent_commits_all_succeed() {
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
             .expect("open");
-    assert_eq!(
-        consumer.manifest_id(),
-        3,
-        "three concurrent commits must result in manifest_id = 3"
+    assert!(
+        consumer.manifest_id() >= 3,
+        "three concurrent commits must advance the pointer at least three times; got {}",
+        consumer.manifest_id()
     );
     assert_eq!(consumer.reader().expect("reader").n_superfiles(), 3);
 
@@ -227,28 +230,30 @@ async fn retry_winner_sees_loser_superfiles_in_final_manifest() {
     t_a.await.expect("task A");
     t_b.await.expect("task B");
 
-    // Whichever handle ended at manifest_id = 2 should also
-    // see 2 superfiles — its own plus the winner's. The handle
-    // at manifest_id = 1 only sees its own superfile (pre-retry
-    // state, never refreshed).
-    for st in [&st_a, &st_b] {
-        let r = st.reader().expect("reader");
-        if r.manifest_id() == 2 {
-            assert_eq!(
-                r.n_superfiles(),
-                2,
-                "v2 handle must see both superfiles (its own + winner's)"
-            );
-        } else if r.manifest_id() == 1 {
-            assert_eq!(
-                r.n_superfiles(),
-                1,
-                "v1 handle (winner) sees only its own superfile"
-            );
-        } else {
-            panic!("unexpected manifest_id: {}", r.manifest_id());
-        }
-    }
+    // The handle at the higher manifest_id committed last, so its
+    // in-memory manifest holds both superfiles — its own plus the
+    // winner's. The winner never refreshed, so it holds only its own.
+    // `pinned_reader` skips the freshness check `reader` applies,
+    // which would pull the loser's commit into the winner too.
+    let (loser, winner) = if st_a.manifest_id() > st_b.manifest_id() {
+        (&st_a, &st_b)
+    } else {
+        (&st_b, &st_a)
+    };
+    assert!(
+        loser.manifest_id() > winner.manifest_id(),
+        "the loser must have committed past the winner"
+    );
+    assert_eq!(
+        loser.pinned_reader().n_superfiles(),
+        2,
+        "the loser must see both superfiles (its own + winner's)"
+    );
+    assert_eq!(
+        winner.pinned_reader().n_superfiles(),
+        1,
+        "the winner sees only its own superfile"
+    );
 }
 
 /// Sequential commits across two handles — the second
@@ -318,9 +323,8 @@ async fn max_commit_retries_is_plumbed_through_options() {
     }
 
     // Concurrent commit with raised retries — same outcome
-    // as the default-retries test (both commits succeed,
-    // final manifest_id = 2), proves the knob doesn't
-    // break the path.
+    // as the default-retries test (both commits succeed),
+    // proves the knob doesn't break the path.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -362,5 +366,10 @@ async fn max_commit_retries_is_plumbed_through_options() {
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
             .expect("open");
-    assert_eq!(consumer.manifest_id(), 2);
+    assert!(
+        consumer.manifest_id() >= 2,
+        "both commits must advance the pointer; got {}",
+        consumer.manifest_id()
+    );
+    assert_eq!(consumer.reader().expect("reader").n_superfiles(), 2);
 }
