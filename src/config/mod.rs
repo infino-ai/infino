@@ -35,9 +35,11 @@
 
 use std::{
     collections::HashMap,
-    env, fmt,
+    env, fmt, fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::OnceLock,
+    thread::available_parallelism,
     time::Duration,
 };
 
@@ -51,7 +53,10 @@ use serde::{
     ser::Serializer,
 };
 
-use crate::supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT;
+use crate::{
+    runtime_metrics::rss::available_memory_bytes,
+    supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT,
+};
 
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
@@ -140,7 +145,10 @@ pub struct Config {
 pub struct MemorySettings {
     /// Per-connection memory (heap) budget in bytes. `0` (the default) is
     /// measure-only: usage is tracked but never refused. A positive value
-    /// enforces a ceiling so one connection can't exhaust process memory.
+    /// enforces a ceiling on what this connection's search and ingest work may
+    /// hold. Compaction is not charged to it — see
+    /// [`ConnectOptions::with_connection_memory_budget_bytes`] — so this is not
+    /// a ceiling on the process.
     ///
     /// Applies to connections built from a config file (`apply_config`). Code
     /// that opens a connection programmatically sets the budget on
@@ -148,12 +156,20 @@ pub struct MemorySettings {
     ///
     /// [`ConnectOptions::with_connection_memory_budget_bytes`]: crate::ConnectOptions::with_connection_memory_budget_bytes
     pub connection_budget_bytes: u64,
+    /// Process-wide limit for SQL, in bytes of anonymous resident memory: a
+    /// running statement is refused once the process passes it. Unset (the
+    /// default) takes 90% of the process's cgroup memory limit, the lower of
+    /// `memory.high` and `memory.max` up its cgroup v2 hierarchy, and sets no
+    /// limit where there is none; `0` sets no limit; a positive value is the
+    /// limit. Read once per process.
+    pub process_limit_bytes: Option<u64>,
 }
 
 impl Default for MemorySettings {
     fn default() -> Self {
         Self {
             connection_budget_bytes: DEFAULT_CONNECTION_BUDGET_BYTES,
+            process_limit_bytes: None,
         }
     }
 }
@@ -188,6 +204,15 @@ pub fn global() -> &'static Config {
             Config::default()
         }
     })
+}
+
+/// Resolve the root used for temporary scratch space.
+pub(crate) fn scratch_root() -> PathBuf {
+    global()
+        .storage
+        .scratch_root
+        .clone()
+        .unwrap_or_else(env::temp_dir)
 }
 
 /// Supertable subsection of [`Config`]. Keeps supertable-
@@ -278,8 +303,29 @@ pub struct CompactionSettings {
     /// tables. Values below 2 are raised to 2 — merging fewer than two inputs
     /// is a no-op rewrite.
     pub min_superfiles_for_merge: u64,
-    /// Maximum memory budget for materializing inputs during a single merge, in MiB.
+    /// Ceiling on the raw input bytes one merge may accumulate, in MiB. The
+    /// packer stops adding superfiles to a job once it would cross this.
+    ///
+    /// Independent of `target_superfile_size_mb`: raising the target does not
+    /// raise this. Most jobs never approach it, because the output target
+    /// closes them out first — it is the backstop for a partition of unusually
+    /// large superfiles, not a typical job's size.
+    ///
+    /// It is also NOT a bound on the merge's resident set, which runs several
+    /// times higher once rows are decoded and the output encoded, and it does
+    /// not govern how many merges run at once: the runner admits them against
+    /// the host's free memory.
     pub max_memory_mb: u64,
+    /// How many of a pass's merge jobs may be in flight at once.
+    ///
+    /// `None` (the default) derives the ceiling from the maintenance pool and
+    /// lets the runner admit another merge only while the host reports free
+    /// memory; `Some(n)` forces exactly `n`, and `Some(1)` is strictly serial.
+    ///
+    /// Not a thread count: a job is an async task whose CPU work runs on the
+    /// shared maintenance pool, so this is how many merges may overlap, not
+    /// how many threads they get.
+    pub max_concurrent_jobs: Option<usize>,
     /// How old a sealed tombstone sidecar has to be, in milliseconds,
     /// before it's treated as abandoned
     pub stale_seal_timeout_ms: u64,
@@ -292,6 +338,7 @@ impl Default for CompactionSettings {
             min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
             min_superfiles_for_merge: DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE,
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
+            max_concurrent_jobs: None,
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
         }
     }
@@ -990,6 +1037,20 @@ impl GcSettings {
     }
 }
 
+/// Which columns of an edge table carry the graph `optimize()` builds a
+/// resident adjacency index over. A node is a row of some table — its
+/// table's name and its stable `_id` — so an edge is four columns: the
+/// source row's table (a string) and `_id` (the engine's `Decimal128` id
+/// type), and the destination row's.
+#[cfg(feature = "graph-index")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdjacencySpec {
+    pub(crate) src_table: String,
+    pub(crate) src_id: String,
+    pub(crate) dst_table: String,
+    pub(crate) dst_id: String,
+}
+
 /// Options for [`crate::Supertable::optimize`].
 ///
 /// Additional operation kinds (e.g. vector-index maintenance) will be
@@ -999,6 +1060,12 @@ pub struct OptimizeOptions {
     pub(crate) compaction: CompactionSettings,
     pub(crate) gc: GcSettings,
     pub(crate) recalibrate: RecalibratePolicy,
+    pub(crate) skip_router_cache_warmup: bool,
+    /// The edge columns of a table whose rows are a graph; set, `optimize()`
+    /// builds and publishes the resident adjacency index the graph walks
+    /// read, as it builds the `hnsw` graph over a vector column.
+    #[cfg(feature = "graph-index")]
+    pub(crate) adjacency: Option<AdjacencySpec>,
 }
 
 impl OptimizeOptions {
@@ -1006,9 +1073,39 @@ impl OptimizeOptions {
     pub fn compact(settings: CompactionSettings) -> Self {
         Self {
             compaction: settings,
-            gc: GcSettings::default(),
-            recalibrate: RecalibratePolicy::default(),
+            ..Self::default()
         }
+    }
+
+    /// Treat the table's rows as a graph's edges between rows — the source
+    /// row's table name and `_id` in `src_table` / `src_id`, the
+    /// destination's in `dst_table` / `dst_id` — and have `optimize()` build
+    /// and publish the resident adjacency index over them, in the lifecycle
+    /// of the `hnsw` graph: one content-addressed blob referenced from the
+    /// manifest, fetched once per generation and decoded into memory, kept
+    /// by GC while referenced, and rebuilt when the rows, the table's
+    /// deletes or these columns change. Edges are directed: a walk follows
+    /// an edge from its source row to its destination row only, so an
+    /// undirected graph is written as two rows per edge. Behind the
+    /// `graph-index` feature, off the curated public surface. The columns
+    /// are checked against the table's schema before `optimize()` changes
+    /// anything; a column that is missing or of the wrong type fails it
+    /// there.
+    #[cfg(feature = "graph-index")]
+    pub fn with_adjacency(
+        mut self,
+        src_table: &str,
+        src_id: &str,
+        dst_table: &str,
+        dst_id: &str,
+    ) -> Self {
+        self.adjacency = Some(AdjacencySpec {
+            src_table: src_table.to_string(),
+            src_id: src_id.to_string(),
+            dst_table: dst_table.to_string(),
+            dst_id: dst_id.to_string(),
+        });
+        self
     }
 
     /// Override the gc settings `optimize()`'s bundled sweep uses.
@@ -1021,6 +1118,14 @@ impl OptimizeOptions {
     /// [`RecalibratePolicy::Auto`] when unset — backward compatible).
     pub fn with_recalibrate(mut self, recalibrate: RecalibratePolicy) -> Self {
         self.recalibrate = recalibrate;
+        self
+    }
+
+    /// Skip pre-building the in-process centroid-router cache after
+    /// compaction. For a process that optimizes but serves no queries;
+    /// queries still load or build the router lazily.
+    pub fn with_skip_router_cache_warmup(mut self, skip: bool) -> Self {
+        self.skip_router_cache_warmup = skip;
         self
     }
 }
@@ -1042,6 +1147,147 @@ pub enum RecalibratePolicy {
     /// still run. For a repeated-optimize ingest loop where no query is served
     /// until a later, deliberately recalibrated optimize.
     Skip,
+}
+
+/// What a reindex repairs, per superfile.
+///
+/// Two things go out of date independently — the on-disk layout and the
+/// terms — and repairing the terms costs far more. The mode chooses how
+/// much to repair; [`ReindexMode::Auto`] decides per superfile, so a file
+/// that is only behind on layout never pays for a re-analysis it does not
+/// need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ReindexMode {
+    /// Give each superfile the cheapest repair that makes it current:
+    /// [`ReindexMode::Rewrite`] where only its layout is behind,
+    /// [`ReindexMode::Reanalyze`] where its terms are.
+    ///
+    /// The default, because it is the only mode that leaves no stale
+    /// superfile behind and charges the expensive repair only where it is
+    /// the one that works.
+    #[default]
+    Auto,
+    /// Bring each superfile's index into the current on-disk layout,
+    /// keeping its terms.
+    ///
+    /// Cheap: postings are copied, not rebuilt. Recovers the pruning the
+    /// newer layout allows. Does not fix terms produced by an older
+    /// analyzer — nothing that copies postings can — so superfiles whose
+    /// terms are stale are left alone and reported.
+    Rewrite,
+    /// Rebuild terms by re-analyzing the text each superfile stored, and
+    /// bring the layout current as a side effect.
+    ///
+    /// Expensive: every document is tokenized again and every index
+    /// rebuilt. This is what repairs a table whose terms predate a change
+    /// in how text is analyzed — a query analyzed one way cannot find
+    /// terms written another. Columns whose text was never stored cannot
+    /// be repaired and are reported.
+    ///
+    /// Applies to every stale superfile, including ones whose recorded
+    /// revision says their terms are already current — which is the only
+    /// thing this offers over [`ReindexMode::Auto`], and the reason to
+    /// reach for it is not trusting that record.
+    Reanalyze,
+}
+
+/// What a reindex repairs.
+///
+/// Tiered by where the thing lives, so the two ways this grows are two
+/// different edits: a new *kind* of target — the manifest, the tombstone
+/// sidecars — is a variant here, while a new index inside a superfile is
+/// a variant of [`SuperfileIndex`]. Only superfile indexes have a repair
+/// today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReindexTarget {
+    /// An index held inside each superfile.
+    Superfile(SuperfileIndex),
+}
+
+impl Default for ReindexTarget {
+    fn default() -> Self {
+        Self::Superfile(SuperfileIndex::default())
+    }
+}
+
+/// Which of a superfile's indexes a reindex repairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SuperfileIndex {
+    /// The full-text index. Vectors, the Parquet body and the hidden
+    /// vector index are copied or left untouched.
+    #[default]
+    Fts,
+}
+
+/// Knobs for [`crate::Supertable::reindex`].
+///
+/// No sizing knobs, because a reindex has nothing to decide there: it
+/// rewrites every stale superfile, one in and one out, so there is no
+/// target size to pack toward and no fill threshold to clear. Taking
+/// [`CompactionSettings`] instead would hand a caller three knobs the
+/// operation ignores.
+// Every field's default is its type's, so the derive cannot drift from
+// the enums it defers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ReindexOptions {
+    /// What to repair. Defaults to the superfile full-text index, the
+    /// only one with a repair today; a default naming one index can never
+    /// silently widen to cover another.
+    pub target: ReindexTarget,
+    /// How much to repair. Defaults to [`ReindexMode::Auto`], which gives
+    /// each superfile the cheapest repair that makes it current.
+    pub mode: ReindexMode,
+    /// How old a sealed tombstone sidecar has to be, in milliseconds,
+    /// before a rewrite treats it as abandoned and takes it over.
+    ///
+    /// `None`, the default, uses the table's
+    /// [`CompactionSettings::stale_seal_timeout_ms`]: the seal is the same
+    /// guard and a reindex job takes it the same way, so a table that
+    /// tuned it for compaction meant it for this too. A value here
+    /// overrides that for one run.
+    pub stale_seal_timeout_ms: Option<u64>,
+}
+
+impl ReindexOptions {
+    /// Repair layouts only, leaving superfiles whose terms are stale
+    /// untouched and reported.
+    pub fn rewriting() -> Self {
+        Self {
+            mode: ReindexMode::Rewrite,
+            ..Self::default()
+        }
+    }
+
+    /// Re-analyze every stale superfile, including ones whose recorded
+    /// revision says their terms are current.
+    pub fn reanalyzing() -> Self {
+        Self {
+            mode: ReindexMode::Reanalyze,
+            ..Self::default()
+        }
+    }
+
+    /// Repair `target` instead of the default.
+    pub fn with_target(mut self, target: ReindexTarget) -> Self {
+        self.target = target;
+        self
+    }
+
+    /// Repair to `mode` instead of the default.
+    pub fn with_mode(mut self, mode: ReindexMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Override the table's seal-takeover age for this run.
+    pub fn with_stale_seal_timeout_ms(mut self, ms: u64) -> Self {
+        self.stale_seal_timeout_ms = Some(ms);
+        self
+    }
 }
 
 /// Persistent storage backend selected by [`StorageSettings`].
@@ -1099,6 +1345,8 @@ pub struct StorageSettings {
     pub backend: StorageBackend,
     /// Local filesystem root when `backend: local_fs`.
     pub local_root: Option<PathBuf>,
+    /// Configurable root directory for temporary scratch files.
+    pub scratch_root: Option<PathBuf>,
     /// Object-store bucket name (used by the `s3` backend).
     pub bucket: Option<String>,
     /// Credentials/tuning for the backend, keyed by `object_store`
@@ -1153,6 +1401,7 @@ impl Default for StorageSettings {
         Self {
             backend: StorageBackend::None,
             local_root: None,
+            scratch_root: None,
             bucket: None,
             storage_options: HashMap::new(),
             prefix: String::new(),
@@ -1275,6 +1524,47 @@ impl Serialize for ThreadCount {
 }
 
 impl Config {
+    /// How many compaction merge jobs a pass may run at once.
+    ///
+    /// An explicit setting is honored as written. Unset, the width derives
+    /// from the maintenance pool, because merges run on that pool and more
+    /// concurrent jobs than it has threads is width without throughput.
+    ///
+    /// This is a CPU ceiling only. The memory bound lives in the compaction
+    /// runner, which admits another merge only while the host reports free memory
+    /// — an observation, where this layer could only guess from the
+    /// `max_memory_mb` cap. The one exception is a host with no procfs:
+    /// nothing downstream can bound the merges there, so the derived width is 1.
+    /// `compaction` is the settings the pass actually runs with, not
+    /// necessarily `self.compaction`: the hidden vector index compacts under
+    /// its own derived settings and resolves its own width from them.
+    pub(crate) fn compaction_concurrency(&self, compaction: &CompactionSettings) -> usize {
+        let maintenance = self
+            .vector
+            .maintenance_threads
+            .resolve_or_default(available_parallelism().map(NonZeroUsize::get).unwrap_or(1));
+        let resolved = match available_memory_bytes() {
+            // Memory is observable, so the runner reads what this process may
+            // actually spend — its cgroup ceiling where it has one, the host's
+            // `MemAvailable` otherwise — between admissions, and stops
+            // widening once less than its reserve share is free. That measures
+            // what merges cost on this corpus, where this layer could only
+            // guess from the `max_memory_mb` CAP, which real jobs are
+            // routinely a fraction of. The derived value is then just the CPU
+            // ceiling.
+            Some(_) => maintenance,
+            // No procfs: nothing downstream can bound the merges, so stay serial
+            // rather than invent a width.
+            None => 1,
+        };
+        // No upper clamp. An explicit setting is honored as written, and the
+        // real bounds are structural: the merges in flight never exceed the jobs
+        // the pass actually planned, memory narrows it further wherever the
+        // host reports any, and compaction's input opens ride a process-wide
+        // semaphore that bounds object-store fan-out on its own.
+        compaction.max_concurrent_jobs.unwrap_or(resolved).max(1)
+    }
+
     /// Load from the standard hierarchy. See module docs for the
     /// precedence order.
     pub fn load() -> Result<Self, ConfigError> {
@@ -1388,6 +1678,13 @@ impl Config {
     /// load time so a bad config fails fast with a clear message instead of
     /// panicking or misbehaving at query time.
     fn validate(&self) -> Result<(), ConfigError> {
+        // Create scratch root directory if it doesn't exist
+        if let Some(path) = self.storage.scratch_root.as_deref() {
+            fs::create_dir_all(path).map_err(|e| {
+                ConfigError::Invalid(format!("storage.scratch_root {}: {e}", path.display()))
+            })?;
+        }
+
         let v = &self.vector;
         // The calibrator's ef grid starts at the smallest [`HNSW_EF_CANDIDATES`]
         // entry (128). A ceiling below that filters the grid to empty, so the
@@ -1937,6 +2234,17 @@ storage:
     }
 
     #[test]
+    fn process_limit_defaults_to_unset_and_parses_a_value() {
+        // Unset means "take it from the cgroup", not "no limit".
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.memory.process_limit_bytes, None);
+        let yaml = "memory:\n  process_limit_bytes: 1000\n";
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
+        assert_eq!(cfg.memory.process_limit_bytes, Some(1000));
+    }
+
+    #[test]
     fn thread_count_parses_auto_string() {
         let yaml = r#"
 commit_threshold_size_mb: 1024
@@ -2166,5 +2474,66 @@ vector:
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Fixed(12));
         // Untouched keys fall through to the embedded default.
         assert_eq!(cfg.vector.drain_batch_superfiles, 64);
+    }
+
+    /// An arbitrary per-merge input cap. The figure carries no meaning: the
+    /// test below asserts the derived width is INDEPENDENT of it.
+    const ANY_BUDGET_MB: u64 = 3072;
+
+    /// The derived width is a CPU ceiling, not a memory one.
+    ///
+    /// The memory bound belongs to the compaction runner, which admits merges
+    /// only while the host reports free memory. Deriving it here could only
+    /// divide by `max_memory_mb` — the cap the packer stops at, which real jobs
+    /// rarely approach — so the width caps at the pool and nothing else.
+    #[test]
+    fn the_derived_width_is_the_pool_width_not_a_memory_estimate() {
+        let cfg = Config::default();
+        let derived = cfg.compaction_concurrency(&CompactionSettings {
+            max_memory_mb: ANY_BUDGET_MB,
+            ..CompactionSettings::default()
+        });
+        // Never zero, whatever the host — a zero would stall the merge loop.
+        assert!(derived >= 1, "width must be at least one");
+        // Crucially it does NOT scale with the memory budget: a four-fold
+        // budget is the same width, because memory is judged downstream.
+        let wide_budget = cfg.compaction_concurrency(&CompactionSettings {
+            max_memory_mb: ANY_BUDGET_MB * 4,
+            ..CompactionSettings::default()
+        });
+        assert_eq!(
+            derived, wide_budget,
+            "the config layer must not size width off the budget cap"
+        );
+    }
+
+    /// An explicit setting is honored as written, in both directions.
+    ///
+    /// Deliberately unclamped: the merges in flight never exceed the jobs the
+    /// pass planned, memory narrows it wherever the host reports any, and
+    /// input opens ride a process-wide semaphore. A ceiling here would only
+    /// second-guess an operator who asked for something specific.
+    #[test]
+    fn an_explicit_width_is_honored_as_written() {
+        let cfg = Config::default();
+        let serial = cfg.compaction_concurrency(&CompactionSettings {
+            max_concurrent_jobs: Some(1),
+            ..CompactionSettings::default()
+        });
+        assert_eq!(serial, 1, "an explicit 1 must stay serial");
+        /// Wider than any pool this would run on, to prove nothing trims it.
+        const VERY_WIDE: usize = 4096;
+        let wide = cfg.compaction_concurrency(&CompactionSettings {
+            max_concurrent_jobs: Some(VERY_WIDE),
+            ..CompactionSettings::default()
+        });
+        assert_eq!(wide, VERY_WIDE, "an explicit width must not be trimmed");
+    }
+
+    /// The shipped default derives the width rather than forcing one: a serial
+    /// pass was measured holding a 44-core box at a load average of 1.16.
+    #[test]
+    fn the_default_width_is_derived() {
+        assert_eq!(CompactionSettings::default().max_concurrent_jobs, None);
     }
 }

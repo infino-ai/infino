@@ -36,24 +36,14 @@ pub(super) fn atom_cursor_bytes(atoms: &[AnyCursor]) -> u64 {
 /// term. Inline (df=1) cursors plan no fetch (their `bytes` is empty),
 /// matching the single-term arm's "bytes 0 implies ranges 0".
 pub(super) fn term_cursor_ranges(cursors: &[TermCursor]) -> u64 {
-    cursors
-        .iter()
-        .filter(|c| !c.bytes.is_empty())
-        .map(|c| 1 + u64::from(c.header_probed))
-        .sum()
+    cursors.iter().filter(|c| !c.bytes.is_empty()).count() as u64
 }
 
 /// Byte-source ranges the atoms' builds requested: one per PFOR term's
 /// posting range; a phrase member adds one for its postings and one for
 /// its position runs. Inline legs (empty buffers) plan no fetch.
 pub(super) fn atom_planned_ranges(atoms: &[AnyCursor]) -> u64 {
-    let term_ranges = |c: &TermCursor| {
-        if c.bytes.is_empty() {
-            0
-        } else {
-            1 + u64::from(c.header_probed)
-        }
-    };
+    let term_ranges = |c: &TermCursor| u64::from(!c.bytes.is_empty());
     atoms
         .iter()
         .map(|a| match a {

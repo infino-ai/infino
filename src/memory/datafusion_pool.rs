@@ -18,12 +18,14 @@
 //!   memory by writing its buffered run to disk, then continues. The query still
 //!   succeeds, just slower.
 //! - Otherwise it surfaces as [`InfinoError::OverBudget`], when:
-//!     - the operator can't spill at all:
-//!        - non-spillable (hash-join build side, nested-loop join, window aggregate), or
-//!        - a streaming operator (scan / filter / projection) that buffers nothing, so a single
-//!          allocation already exceeds the budget and there is nothing to write out; or
+//!     - the operator can't spill at all (hash-join build side, nested-loop join), or
 //!     - it is spillable but can't reserve even the minimum it needs to run the
 //!       spill / merge (e.g. the sort's merge reservation).
+//!
+//! Some operators never ask this pool: the streaming ones — scan, filter,
+//! projection, `unnest` — and window functions, which buffer without
+//! reserving. Nothing they allocate is gated, however large; the process
+//! memory limit (see `resident`) is what bounds them.
 //!
 //! Spilling needs a disk manager; we use DataFusion's default (OS temp dir).
 //!
@@ -35,11 +37,19 @@ use datafusion::{
     execution::{
         memory_pool::{MemoryLimit, MemoryPool, MemoryReservation},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
+        session_state::SessionStateBuilder,
     },
+    physical_optimizer::optimizer::PhysicalOptimizer,
     prelude::{SessionConfig, SessionContext},
 };
 
-use crate::memory::ConnectionMemoryBudget;
+use crate::{
+    memory::ConnectionMemoryBudget,
+    supertable::query::{
+        sorted_root::KeepSortedRoot, topk_row_filter::RowFilterUnderTopK,
+        values_subquery::ValuesSubqueryRewrite,
+    },
+};
 
 /// A DataFusion memory pool over a [`ConnectionMemoryBudget`]: measured never
 /// refuses, bounded refuses at the 90% gate (DataFusion then spills, or errors
@@ -140,10 +150,30 @@ pub(crate) fn budgeted_session_context(
         .execution
         .skip_partial_aggregation_probe_ratio_threshold = PARTIAL_AGG_SKIP_PROBE_RATIO;
 
-    Ok(SessionContext::new_with_config_rt(
-        config,
-        budgeted_runtime(budget)?,
-    ))
+    // Predicates run in a `FilterExec` above the scan, not as Parquet row
+    // filters, except under `ORDER BY ... LIMIT` (see `RowFilterUnderTopK`).
+    // Pinned off here because the scan's own flag is ORed with this option.
+    config.options_mut().execution.parquet.pushdown_filters = false;
+
+    // DataFusion's rules, with ours at both ends:
+    //  - `RowFilterUnderTopK` first, so DataFusion's filter pushdown sees the
+    //    marked scans and drops their `FilterExec`.
+    //  - `KeepSortedRoot` last, to remove the round-robin repartition that
+    //    `EnforceDistribution` adds above a sorted result, which would return
+    //    an `ORDER BY` out of order.
+    let mut rules = PhysicalOptimizer::new().rules;
+    rules.insert(0, Arc::new(RowFilterUnderTopK));
+    rules.push(Arc::new(KeepSortedRoot));
+    let mut builder = SessionStateBuilder::new()
+        .with_config(config)
+        .with_runtime_env(budgeted_runtime(budget)?)
+        .with_default_features()
+        // A scalar subquery in a `VALUES` cell would be evaluated while the
+        // list is planned, before the subquery has run; this plans such a
+        // list as one-row projections instead (see the rule's module).
+        .with_optimizer_rule(Arc::new(ValuesSubqueryRewrite));
+    *builder.physical_optimizers() = Some(PhysicalOptimizer::with_rules(rules));
+    Ok(SessionContext::new_with_state(builder.build()))
 }
 
 #[cfg(test)]

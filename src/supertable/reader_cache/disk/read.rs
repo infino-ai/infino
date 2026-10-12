@@ -204,6 +204,19 @@ impl DiskCacheStore {
         entry.has_whole_file().then(|| Arc::clone(&entry))
     }
 
+    /// The whole-file entry's bytes for `uri` (see [`Self::whole_file_in_memory`]), as one source
+    /// over the entire file. A block source the cache entry no longer points at reads through it
+    /// instead of object storage.
+    ///
+    /// Only a fully resident reader counts: every byte in memory, no source behind it. A copy with
+    /// a vector hole serves the hole through a block source, possibly the very one asking, which
+    /// would then ask here again and never return.
+    pub(crate) fn whole_file_source(&self, uri: &SuperfileUri) -> Option<Arc<dyn LazyByteSource>> {
+        self.whole_file_in_memory(uri)
+            .filter(|entry| entry.reader.is_fully_resident())
+            .map(|entry| entry.reader.byte_source())
+    }
+
     /// Tier 3: a cached lazy ([`Residency::Paged`]) entry. A query shares its block cache instead
     /// of opening a second stream.
     fn open_lazy_reader(&self, uri: &SuperfileUri) -> Option<Arc<CachedEntry>> {
@@ -257,9 +270,8 @@ impl DiskCacheStore {
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<(Arc<CachedEntry>, OpenTier), DiskCacheError> {
-        // A fill may have installed the whole file since the memory check. Use its entry, not the
-        // file on disk: a fill that left the vector blob on the block cache wrote a file with a
-        // hole, and only the live entry can serve it.
+        // A fill may have installed the whole file since the memory check. Use its entry rather
+        // than open the file it wrote a second time.
         if let Some(entry) = self.whole_file_in_memory(uri) {
             return Ok((entry, OpenTier::Memory));
         }
@@ -267,7 +279,7 @@ impl DiskCacheStore {
         // Tier 2, disk: the whole file is on local disk (a prior run, or a finished fill). Mmap
         // it, no GETs.
         if let Some(entry) = self
-            .fetch_from_disk_cache(uri, offsets.map(|o| o.total_size))
+            .fetch_from_disk_cache(uri, storage_key, offsets.map(|o| o.total_size), storage)
             .await?
         {
             return Ok((entry, OpenTier::Disk));

@@ -120,7 +120,6 @@ fn build(b: &BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
         schema.clone(),
         vec![
             FtsConfig::new(&b.field)
-                .analyzer("standard")
                 .positions(b.positions)
                 .stored(false),
         ],

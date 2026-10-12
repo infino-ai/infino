@@ -278,6 +278,7 @@ mod tests {
                 outcome: TombstoneOutcome::NotFound,
                 tombstoned_in_superfile: None,
             }],
+            schema_id: None,
         }
     }
 

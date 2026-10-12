@@ -31,6 +31,11 @@ pub mod fts;
 pub mod id_space;
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) mod id_space;
+// `pub` under `test-helpers`, so integration tests can break a sidecar block;
+// `pub(crate)` otherwise.
+#[cfg(feature = "test-helpers")]
+pub mod ids;
+#[cfg(not(feature = "test-helpers"))]
 pub(crate) mod ids;
 pub mod lazy_source;
 pub mod reader;

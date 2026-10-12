@@ -30,9 +30,12 @@ use std::{
 
 use arrow_array::{ArrayRef, UInt64Array};
 
-use crate::supertable::manifest::{
-    SuperfileEntry,
-    list::{BIRTH_VERSION_AGGREGATE_COLUMN, FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg},
+use crate::supertable::{
+    manifest::{
+        SuperfileEntry,
+        list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg},
+    },
+    schema::FieldId,
 };
 
 /// All three aggregate buckets for one [`ManifestPartEntry`].
@@ -40,8 +43,8 @@ use crate::supertable::manifest::{
 #[derive(Debug, Default)]
 pub struct AggregateSet {
     pub id_range: (i128, i128),
-    pub scalar_stats_agg: HashMap<String, ScalarStatsAgg>,
-    pub fts_summary_agg: BTreeMap<String, FtsSummaryAgg>,
+    pub scalar_stats_agg: HashMap<FieldId, ScalarStatsAgg>,
+    pub fts_summary_agg: BTreeMap<FieldId, FtsSummaryAgg>,
 }
 
 /// Build the aggregate set for one manifest part from its
@@ -79,7 +82,7 @@ pub fn compute(
         .max()
         .unwrap_or(0);
     scalar_stats_agg.insert(
-        BIRTH_VERSION_AGGREGATE_COLUMN.into(),
+        FieldId::BIRTH_VERSION,
         ScalarStatsAgg {
             min: Arc::new(UInt64Array::from(vec![birth_min])) as ArrayRef,
             max: Arc::new(UInt64Array::from(vec![birth_max])) as ArrayRef,
@@ -109,14 +112,14 @@ pub fn compute(
 // Scalar stats: per column, fold the superfiles' aggregates.
 // ---------------------------------------------------------
 
-fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<String, ScalarStatsAgg> {
+fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<FieldId, ScalarStatsAgg> {
     // Fold each superfile's per-column aggregate table together. `merge_tables`
     // keeps the min/max extremes (column union) and combines the additive
     // stats (null count / sum / HLL) only when every contributor carries them
     // — the same part-level semantics, sharing one code path with the
     // per-column merge instead of a hand-rolled fold + a duplicate min/max
     // helper.
-    let mut out: HashMap<String, ScalarStatsAgg> = HashMap::new();
+    let mut out: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
     for seg in superfiles {
         ScalarStatsAgg::merge(&mut out, &seg.scalar_stats);
     }
@@ -127,16 +130,16 @@ fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<String, Scala
 // FTS summary aggregate: fold the superfiles' summaries.
 // ---------------------------------------------------------
 
-fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSummaryAgg> {
+fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<FieldId, FtsSummaryAgg> {
     // Fold each superfile's per-column summary together via
     // `FtsSummaryAgg::merge` — bloom bit-OR union (exact for the "any
     // superfile contained this term" semantic, since the block-and-mask
     // scheme is positional) + term-range union — sharing one code path with
     // the per-column merge instead of a hand-rolled fold.
-    let mut out: BTreeMap<String, FtsSummaryAgg> = BTreeMap::new();
+    let mut out: BTreeMap<FieldId, FtsSummaryAgg> = BTreeMap::new();
     for seg in superfiles {
         for (col, summary) in &seg.fts_summary {
-            out.entry(col.clone())
+            out.entry(*col)
                 .and_modify(|acc| acc.merge_with(summary))
                 .or_insert_with(|| summary.clone());
         }
@@ -153,17 +156,21 @@ mod tests {
     use super::*;
     use crate::{
         superfile::vector::layout::VectorLayout,
-        supertable::manifest::{
-            FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
-            part::{ContentHash, PartId},
+        supertable::{
+            manifest::{
+                FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+                part::{ContentHash, PartId},
+            },
+            schema::FieldId,
         },
+        test_helpers::fid,
     };
 
     /// A `ManifestPartEntry` standing in for an existing part, carrying the
     /// given id range + per-column scalar aggregates (empty fts/vector aggs).
     fn base_entry(
         id_range: (i128, i128),
-        scalar_stats_agg: HashMap<String, ScalarStatsAgg>,
+        scalar_stats_agg: HashMap<FieldId, ScalarStatsAgg>,
     ) -> ManifestPartEntry {
         ManifestPartEntry {
             part_id: PartId(uuid::Uuid::from_bytes([0xb; 16])),
@@ -180,11 +187,11 @@ mod tests {
     }
 
     /// A single-column i64 scalar-stats table, for building `base_entry`s.
-    fn scalar_i64(col: &str, vals: Vec<i64>) -> HashMap<String, ScalarStatsAgg> {
+    fn scalar_i64(col: &str, vals: Vec<i64>) -> HashMap<FieldId, ScalarStatsAgg> {
         let arr: ArrayRef = Arc::new(Int64Array::from(vals));
         let mut m = HashMap::new();
         m.insert(
-            col.to_string(),
+            fid(col),
             ScalarStatsAgg::from_column(&arr).expect("i64 is orderable"),
         );
         m
@@ -199,7 +206,7 @@ mod tests {
         let aggregate = compute(&[Arc::new(first), Arc::new(second)], None);
         let birth = aggregate
             .scalar_stats_agg
-            .get(BIRTH_VERSION_AGGREGATE_COLUMN)
+            .get(&FieldId::BIRTH_VERSION)
             .expect("birth aggregate");
         let min = birth
             .min
@@ -227,8 +234,9 @@ mod tests {
             )
         };
         let mut cols = HashMap::new();
-        cols.insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
+        cols.insert(fid(col), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: uuid::Uuid::new_v4(),
@@ -237,7 +245,7 @@ mod tests {
             id_min: 0,
             id_max: 0,
             scalar_stats: cols,
-            fts_summary: HashMap::<String, FtsSummaryAgg>::new(),
+            fts_summary: HashMap::<FieldId, FtsSummaryAgg>::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
@@ -266,7 +274,7 @@ mod tests {
             seg_with_string_minmax("title", "bravo", "echo", false),
         ];
         let aggs = scalar_stats_agg(&segs);
-        let agg = aggs.get("title").expect("title agg present");
+        let agg = aggs.get(&fid("title")).expect("title agg present");
         assert_eq!(string_val(&agg.min), "alpha");
         assert_eq!(string_val(&agg.max), "echo");
     }
@@ -278,7 +286,7 @@ mod tests {
             seg_with_string_minmax("body", "apple", "orange", true),
         ];
         let aggs = scalar_stats_agg(&segs);
-        let agg = aggs.get("body").expect("body agg present");
+        let agg = aggs.get(&fid("body")).expect("body agg present");
         assert_eq!(string_val(&agg.min), "apple");
         assert_eq!(string_val(&agg.max), "papaya");
     }
@@ -289,10 +297,11 @@ mod tests {
         let arr: ArrayRef = Arc::new(Int64Array::from(vals));
         let mut cols = HashMap::new();
         cols.insert(
-            col.to_string(),
+            fid(col),
             ScalarStatsAgg::from_column(&arr).expect("i64 is orderable"),
         );
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: uuid::Uuid::new_v4(),
@@ -301,7 +310,7 @@ mod tests {
             id_min: 0,
             id_max: 0,
             scalar_stats: cols,
-            fts_summary: HashMap::<String, FtsSummaryAgg>::new(),
+            fts_summary: HashMap::<FieldId, FtsSummaryAgg>::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
@@ -326,7 +335,7 @@ mod tests {
             seg_with_i64("n", vec![5, 30]),  // sum 35
         ];
         let aggs = scalar_stats_agg(&segs);
-        let agg = aggs.get("n").expect("n agg present");
+        let agg = aggs.get(&fid("n")).expect("n agg present");
         assert_eq!(i64_val(&agg.min), 5);
         assert_eq!(i64_val(&agg.max), 50);
         assert_eq!(agg.null_count, Some(0)); // no nulls in either
@@ -343,8 +352,9 @@ mod tests {
             let mn: ArrayRef = Arc::new(Int64Array::from(vec![3]));
             let mx: ArrayRef = Arc::new(Int64Array::from(vec![4]));
             let mut cols = HashMap::new();
-            cols.insert("n".to_string(), ScalarStatsAgg::from_min_max(mn, mx));
+            cols.insert(fid("n"), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                physical_schema: None,
                 stem: None,
                 birth_version: 0,
                 superfile_id: uuid::Uuid::new_v4(),
@@ -353,7 +363,7 @@ mod tests {
                 id_min: 0,
                 id_max: 0,
                 scalar_stats: cols,
-                fts_summary: HashMap::<String, FtsSummaryAgg>::new(),
+                fts_summary: HashMap::<FieldId, FtsSummaryAgg>::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
                 partition_hint: None,
@@ -363,7 +373,7 @@ mod tests {
         };
         let segs = vec![seg_with_i64("n", vec![1, 100]), bounds_only];
         let aggs = scalar_stats_agg(&segs);
-        let agg = aggs.get("n").expect("n agg present");
+        let agg = aggs.get(&fid("n")).expect("n agg present");
         // min/max union across both.
         assert_eq!(i64_val(&agg.min), 1);
         assert_eq!(i64_val(&agg.max), 100);
@@ -381,7 +391,10 @@ mod tests {
         let base = base_entry((100, 200), scalar_i64("n", vec![5, 9]));
         let aggs = compute(&[], Some(&base));
         assert_eq!(aggs.id_range, (100, 200));
-        let n = aggs.scalar_stats_agg.get("n").expect("n carried forward");
+        let n = aggs
+            .scalar_stats_agg
+            .get(&fid("n"))
+            .expect("n carried forward");
         assert_eq!(i64_val(&n.min), 5);
         assert_eq!(i64_val(&n.max), 9);
         // fts aggregates are carried over as-is (empty here).
@@ -413,11 +426,11 @@ mod tests {
         // id_range = (min(0, -5), max(0, 200)).
         assert_eq!(aggs.id_range, (-5, 200));
         // "n" merged across new superfiles + base: min(20, 10), max(80, 60).
-        let n = aggs.scalar_stats_agg.get("n").expect("n");
+        let n = aggs.scalar_stats_agg.get(&fid("n")).expect("n");
         assert_eq!(i64_val(&n.min), 10);
         assert_eq!(i64_val(&n.max), 80);
         // "m" exists only in the base part → carried forward by the merge.
-        let m = aggs.scalar_stats_agg.get("m").expect("m from base");
+        let m = aggs.scalar_stats_agg.get(&fid("m")).expect("m from base");
         assert_eq!(i64_val(&m.min), 1);
         assert_eq!(i64_val(&m.max), 2);
     }

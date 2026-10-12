@@ -20,6 +20,10 @@ const DEFAULT_DECODED_SCALAR_CACHE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     uri: SuperfileUri,
+    /// The schema the rows were decoded under. A column's name, type and
+    /// identity all belong to a generation of the schema, so a cached
+    /// batch answers only for the generation that produced it.
+    schema_id: u32,
     columns: Box<[String]>,
     local_doc_ids: Box<[u32]>,
 }
@@ -58,9 +62,10 @@ impl DecodedScalarCache {
         }
     }
 
-    fn key(uri: SuperfileUri, local_doc_ids: &[u32], columns: &[&str]) -> CacheKey {
+    fn key(uri: SuperfileUri, schema_id: u32, local_doc_ids: &[u32], columns: &[&str]) -> CacheKey {
         CacheKey {
             uri,
+            schema_id,
             columns: columns.iter().map(|column| (*column).to_string()).collect(),
             local_doc_ids: local_doc_ids.into(),
         }
@@ -69,10 +74,11 @@ impl DecodedScalarCache {
     pub(crate) fn get(
         &self,
         uri: SuperfileUri,
+        schema_id: u32,
         local_doc_ids: &[u32],
         columns: &[&str],
     ) -> Option<RecordBatch> {
-        let key = Self::key(uri, local_doc_ids, columns);
+        let key = Self::key(uri, schema_id, local_doc_ids, columns);
         let mut state = self.state.lock().expect("decoded scalar cache poisoned");
         state.tick = state.tick.wrapping_add(1);
         let tick = state.tick;
@@ -84,6 +90,7 @@ impl DecodedScalarCache {
     pub(crate) fn insert(
         &self,
         uri: SuperfileUri,
+        schema_id: u32,
         local_doc_ids: &[u32],
         columns: &[&str],
         batch: RecordBatch,
@@ -92,7 +99,7 @@ impl DecodedScalarCache {
         if bytes > self.max_bytes {
             return;
         }
-        let key = Self::key(uri, local_doc_ids, columns);
+        let key = Self::key(uri, schema_id, local_doc_ids, columns);
         let mut state = self.state.lock().expect("decoded scalar cache poisoned");
         state.tick = state.tick.wrapping_add(1);
         let tick = state.tick;
@@ -124,6 +131,10 @@ impl DecodedScalarCache {
 
 #[cfg(test)]
 mod tests {
+    /// The schema generation these tests decode under; the cache keys on
+    /// it, and one generation is enough to exercise everything else.
+    const SCHEMA_ID: u32 = 1;
+
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, Int64Array};
@@ -151,10 +162,12 @@ mod tests {
     fn repeated_key_returns_cached_batch() {
         let cache = DecodedScalarCache::new(TEST_CACHE_BYTES);
         let uri = SuperfileUri::new_v4();
-        cache.insert(uri, &[7, 3], &["value"], batch(&[70, 30]));
-        let cached = cache.get(uri, &[7, 3], &["value"]).expect("cache hit");
+        cache.insert(uri, SCHEMA_ID, &[7, 3], &["value"], batch(&[70, 30]));
+        let cached = cache
+            .get(uri, SCHEMA_ID, &[7, 3], &["value"])
+            .expect("cache hit");
         assert_eq!(cached.num_rows(), 2);
-        assert!(cache.get(uri, &[3, 7], &["value"]).is_none());
+        assert!(cache.get(uri, SCHEMA_ID, &[3, 7], &["value"]).is_none());
     }
 
     #[test]
@@ -164,9 +177,9 @@ mod tests {
         let cache = DecodedScalarCache::new(budget);
         let first = SuperfileUri::new_v4();
         let second = SuperfileUri::new_v4();
-        cache.insert(first, &[0], &["value"], one);
-        cache.insert(second, &[0], &["value"], batch(&[2]));
-        assert!(cache.get(first, &[0], &["value"]).is_none());
-        assert!(cache.get(second, &[0], &["value"]).is_some());
+        cache.insert(first, SCHEMA_ID, &[0], &["value"], one);
+        cache.insert(second, SCHEMA_ID, &[0], &["value"], batch(&[2]));
+        assert!(cache.get(first, SCHEMA_ID, &[0], &["value"]).is_none());
+        assert!(cache.get(second, SCHEMA_ID, &[0], &["value"]).is_some());
     }
 }

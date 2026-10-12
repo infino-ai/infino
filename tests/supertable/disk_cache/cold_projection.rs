@@ -24,10 +24,7 @@ use arrow_schema::{DataType, Field, Schema};
 use infino::{
     Bm25SearchOptions, VectorSearchOptions,
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::{
-        builder::FtsConfig,
-        fts::reader::{Bm25Stats, BoolMode},
-    },
+    superfile::{builder::FtsConfig, fts::reader::BoolMode},
     supertable::{Supertable, SupertableOptions},
     test_helpers::{default_vector_config, lazy_foreground_disk_cache},
 };
@@ -180,9 +177,7 @@ async fn cold_bm25_projection_pairs_each_hit_with_its_own_row() {
             "title",
             "fox",
             TOP_K,
-            Bm25SearchOptions::new()
-                .with_mode(BoolMode::Or)
-                .with_stats(Bm25Stats::Global),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
             Some(&["_id", "title", "rating", "score"]),
         )
         .expect("cold bm25");
@@ -206,9 +201,7 @@ async fn cold_bm25_projection_pairs_each_hit_with_its_own_row() {
             "title",
             "async wolf",
             TOP_K,
-            Bm25SearchOptions::new()
-                .with_mode(BoolMode::Or)
-                .with_stats(Bm25Stats::Global),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
             Some(&["_id", "title", "rating", "score"]),
         )
         .expect("cold bm25 or");

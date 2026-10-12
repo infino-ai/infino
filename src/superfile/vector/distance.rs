@@ -78,6 +78,27 @@ pub enum Metric {
     NegDot,
 }
 
+impl Metric {
+    /// The metric's name as footers and the schema document spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Metric::Cosine => "cosine",
+            Metric::L2Sq => "l2sq",
+            Metric::NegDot => "negdot",
+        }
+    }
+
+    /// The metric a name spells.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "cosine" => Some(Metric::Cosine),
+            "l2sq" => Some(Metric::L2Sq),
+            "negdot" => Some(Metric::NegDot),
+            _ => None,
+        }
+    }
+}
+
 /// Generic distance dispatch. Smaller value = closer match for every metric.
 #[inline]
 pub fn distance(metric: Metric, a: &[f32], b: &[f32]) -> f32 {

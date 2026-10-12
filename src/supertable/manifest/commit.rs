@@ -489,6 +489,7 @@ mod tests {
     use std::sync::Arc;
 
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     use super::*;
     use crate::{
@@ -831,10 +832,9 @@ mod tests {
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
-            schema: Vec::new(),
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: Vec::new(),
-            vector_columns: Vec::new(),
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::TimeRange {
                 column: "_id".into(),
                 granularity_secs: 86_400,
@@ -846,7 +846,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: Vec::new(),

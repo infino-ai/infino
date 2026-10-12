@@ -16,7 +16,7 @@
 //! cargo bench -- supertable vector build cold
 //!
 //! # Diagnostics (standalone programs, same binary):
-//! cargo bench -- diagnostic              # all nine
+//! cargo bench -- diagnostic              # all ten
 //! cargo bench -- diagnostic scale        # a subset, grouped
 //! cargo bench -- tombstone               # bare names also work
 //!
@@ -36,9 +36,9 @@
 //!   `all`       : explicit "every tier × modality × phase" (the default).
 //!                 Matrix only — diagnostics are NEVER implied by `all` or
 //!                 by a bare `cargo bench`.
-//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `object-store` | `concurrent` | `disk-warm` | `write-diag`,
+//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `fts-merge` | `object-store` | `concurrent` | `disk-warm` | `write-diag`,
 //!                 by name, or grouped under the `diagnostic` keyword —
-//!                 `cargo bench -- diagnostic` runs all nine,
+//!                 `cargo bench -- diagnostic` runs all ten,
 //!                 `cargo bench -- diagnostic scale tombstone` a subset.
 //!
 //! The matrix tests run = (selected tiers) × (selected modalities).
@@ -70,6 +70,7 @@ enum Diagnostic {
     Update,
     SqlDiag,
     FtsDiag,
+    FtsMerge,
     ObjectStore,
     Concurrent,
     DiskWarm,
@@ -85,6 +86,7 @@ impl Diagnostic {
             Diagnostic::Update => "update",
             Diagnostic::SqlDiag => "sql-diag",
             Diagnostic::FtsDiag => "fts-diag",
+            Diagnostic::FtsMerge => "fts-merge",
             Diagnostic::ObjectStore => "object-store",
             Diagnostic::Concurrent => "concurrent",
             Diagnostic::DiskWarm => "disk-warm",
@@ -100,6 +102,7 @@ impl Diagnostic {
             Diagnostic::Update => infino_bench_utils::supertable_update::run(),
             Diagnostic::SqlDiag => infino_bench_utils::sql_diag::run(),
             Diagnostic::FtsDiag => infino_bench_utils::fts_diag::run(),
+            Diagnostic::FtsMerge => infino_bench_utils::fts_merge::run(),
             Diagnostic::ObjectStore => infino_bench_utils::unified_object_store::run(),
             Diagnostic::Concurrent => infino_bench_utils::concurrent::run(),
             Diagnostic::DiskWarm => {
@@ -337,7 +340,7 @@ fn print_usage_and_exit(code: i32) -> ! {
          \x20           quality = FTS BM25 parity vs a textbook oracle, the two fts cells only)\n\
          all       : every tier x modality x phase (the default for a bare\n\
          \x20           `cargo bench`); matrix only — never implies diagnostics\n\
-         Diagnostic: scale | tombstone | update | sql-diag | fts-diag | object-store | concurrent | disk-warm | recall_while_ingest,\n\
+         Diagnostic: scale | tombstone | update | sql-diag | fts-diag | fts-merge | object-store | concurrent | disk-warm | recall_while_ingest,\n\
          \x20           or `diagnostic` for the grouped set / `diagnostic <names>` for a subset\n\
          \n\
          corpus=<spec>     : corpus source. Default: `realistic` for the two fts\n\
@@ -451,6 +454,7 @@ fn parse_args() -> Selection {
             "update" | "supertable-update" => diagnostics.push(Diagnostic::Update),
             "sql-diag" | "sql_diag" => diagnostics.push(Diagnostic::SqlDiag),
             "fts-diag" | "fts_diag" => diagnostics.push(Diagnostic::FtsDiag),
+            "fts-merge" | "fts_merge" => diagnostics.push(Diagnostic::FtsMerge),
             "object-store" | "object_store" => diagnostics.push(Diagnostic::ObjectStore),
             "concurrent" => diagnostics.push(Diagnostic::Concurrent),
             "disk-warm" | "disk_warm" => diagnostics.push(Diagnostic::DiskWarm),
@@ -493,6 +497,7 @@ fn parse_args() -> Selection {
             Diagnostic::Update,
             Diagnostic::SqlDiag,
             Diagnostic::FtsDiag,
+            Diagnostic::FtsMerge,
             Diagnostic::ObjectStore,
             Diagnostic::Concurrent,
             Diagnostic::DiskWarm,

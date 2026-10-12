@@ -47,9 +47,9 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
-    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
-    RecalibratePolicy, Stemmer, Stopwords,
+    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError, InfinoError, Metric,
+    OptimizeError, OptimizeOptions as InfinoOptimizeOptions, RecalibratePolicy, ReindexError,
+    ReindexMode, ReindexOptions as InfinoReindexOptions, SchemaPatch, Stemmer, Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -65,6 +65,12 @@ use infino::{
 //
 // TODO: refine into distinct JS `Error` subclasses once the surface settles,
 // matching Python's `InfinoError` base + `ConnectionMemoryBudgetError`.
+/// The rows a JSON array text carries.
+fn parse_rows(rows_json: &str) -> Result<Vec<serde_json::Value>> {
+    serde_json::from_str::<Vec<serde_json::Value>>(rows_json)
+        .map_err(|e| Error::new(Status::InvalidArg, format!("rows: {e}")))
+}
+
 fn map_err(e: InfinoError) -> Error {
     match e {
         InfinoError::NotFound(m) => Error::new(Status::GenericFailure, format!("NotFound: {m}")),
@@ -74,9 +80,11 @@ fn map_err(e: InfinoError) -> Error {
         InfinoError::AlreadyExists(m) => {
             Error::new(Status::InvalidArg, format!("AlreadyExists: {m}"))
         }
-        InfinoError::Schema(m) | InfinoError::Cardinality(m) | InfinoError::Query(m) => {
-            Error::new(Status::InvalidArg, m)
-        }
+        // The schema cause is typed on the Rust side, so the variant leads
+        // the message here as every other typed cause does: a caller telling
+        // a cap breach from a type mismatch reads the name, not the prose.
+        InfinoError::Schema(e) => Error::new(Status::InvalidArg, format!("{}: {e}", e.kind())),
+        InfinoError::Cardinality(m) | InfinoError::Query(m) => Error::new(Status::InvalidArg, m),
         InfinoError::Io(m) | InfinoError::Backend(m) => Error::new(Status::GenericFailure, m),
         // A recoverable connection-memory-budget refusal. Prefixed with the same
         // name Python raises (`ConnectionMemoryBudgetError`) so the concept reads
@@ -90,6 +98,12 @@ fn map_err(e: InfinoError) -> Error {
         // tell it apart and reissue the operation.
         InfinoError::Conflict(m) => {
             Error::new(Status::GenericFailure, format!("ConflictError: {m}"))
+        }
+        // A valid query using something the engine does not support yet.
+        // Prefixed with the variant name, as `NotFound:` is, so a caller can
+        // tell it apart from a malformed query.
+        InfinoError::Unsupported(m) => {
+            Error::new(Status::GenericFailure, format!("Unsupported: {m}"))
         }
         // `InfinoError` is `#[non_exhaustive]`: future variants fall back
         // to a generic runtime error carrying the message.
@@ -107,6 +121,9 @@ fn optimize_err(e: OptimizeError) -> Error {
             Status::InvalidArg,
             "optimize requires durable storage (not memory://)",
         ),
+        OptimizeError::Unsupported(m) => {
+            Error::new(Status::GenericFailure, format!("Unsupported: {m}"))
+        }
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
 }
@@ -119,6 +136,79 @@ fn gc_err(e: GcError) -> Error {
         ),
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
+}
+
+/// A table without its own storage backend — `memory://`, or a hosted table
+/// whose storage the service holds — has nothing a reindex could read or
+/// rewrite, so every reindex call refuses it as a bad target rather than
+/// reporting an empty, misleadingly current, result.
+fn reindex_err(e: ReindexError) -> Error {
+    match e {
+        ReindexError::NoStorage => Error::new(
+            Status::InvalidArg,
+            "reindex requires durable storage (not memory:// or a hosted table)",
+        ),
+        // Another compaction or reindex holds the table's slot. Retryable, and
+        // prefixed with the same name Python raises (`AlreadyRunningError`) so
+        // a caller can tell it apart from a failed repair and try again later.
+        ReindexError::AlreadyRunning => Error::new(
+            Status::GenericFailure,
+            format!("AlreadyRunningError: {}", ReindexError::AlreadyRunning),
+        ),
+        // An index this engine cannot read: the caller's to fix, prefixed as
+        // `InfinoError::Unsupported` is so one check covers every surface.
+        ReindexError::Unsupported(m) => {
+            Error::new(Status::GenericFailure, format!("Unsupported: {m}"))
+        }
+        other => Error::new(Status::GenericFailure, other.to_string()),
+    }
+}
+
+/// Parse a reindex mode name (`"auto"` / `"rewrite"` / `"reanalyze"`).
+fn reindex_mode_from_str(s: &str) -> Result<ReindexMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => Ok(ReindexMode::Auto),
+        "rewrite" => Ok(ReindexMode::Rewrite),
+        "reanalyze" => Ok(ReindexMode::Reanalyze),
+        other => Err(Error::new(
+            Status::InvalidArg,
+            format!("unknown reindex mode {other:?}; use 'auto', 'rewrite', or 'reanalyze'"),
+        )),
+    }
+}
+
+/// The name `reindex_mode_from_str` parses back to the same mode.
+fn reindex_mode_name(mode: ReindexMode) -> String {
+    match mode {
+        ReindexMode::Auto => "auto".into(),
+        ReindexMode::Rewrite => "rewrite".into(),
+        ReindexMode::Reanalyze => "reanalyze".into(),
+        // `ReindexMode` is `#[non_exhaustive]`: a newer mode keeps its own
+        // name rather than masquerading as one of the three above.
+        other => format!("{other:?}").to_ascii_lowercase(),
+    }
+}
+
+/// Lower the binding's reindex options onto the engine's, through its
+/// builder so every field left unset keeps the engine's default.
+fn reindex_options(opts: Option<ReindexOptions>) -> Result<InfinoReindexOptions> {
+    let mut out = InfinoReindexOptions::default();
+    let Some(o) = opts else {
+        return Ok(out);
+    };
+    if let Some(mode) = o.mode.as_deref() {
+        out = out.with_mode(reindex_mode_from_str(mode)?);
+    }
+    if let Some(ms) = o.stale_seal_timeout_ms {
+        let ms = u64::try_from(ms).map_err(|_| {
+            Error::new(
+                Status::InvalidArg,
+                format!("staleSealTimeoutMs must not be negative, got {ms}"),
+            )
+        })?;
+        out = out.with_stale_seal_timeout_ms(ms);
+    }
+    Ok(out)
 }
 
 /// Parse a metric name (`"cosine"` / `"l2sq"` / `"negdot"`).
@@ -427,23 +517,6 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
     }
 }
 
-/// Parse a BM25 statistics-scope string: `"global"` (corpus-wide IDF, the
-/// default when omitted) or `"per_superfile"` (segment-local IDF).
-fn parse_stats(stats: Option<&str>) -> Result<Bm25Stats> {
-    let Some(stats) = stats else {
-        // Omitted means the engine default.
-        return Ok(Bm25Stats::default());
-    };
-    match stats.to_ascii_lowercase().as_str() {
-        "per_superfile" => Ok(Bm25Stats::PerSuperfile),
-        "global" => Ok(Bm25Stats::Global),
-        other => Err(Error::new(
-            Status::InvalidArg,
-            format!("stats must be 'per_superfile' or 'global', got {other:?}"),
-        )),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -543,6 +616,117 @@ impl From<infino::GcReport> for GcReport {
     }
 }
 
+/// Options for `reindex`, `reindexPlan` and `indexStaleness`; all fields
+/// optional (omitted ⇒ engine default). Repairs the full-text index, the only
+/// index with a repair today.
+#[napi(object)]
+pub struct ReindexOptions {
+    /// How much to repair: `"auto"` (default — the cheapest repair that makes
+    /// each superfile current), `"rewrite"` (layout only; superfiles whose
+    /// terms are stale are left and reported), or `"reanalyze"` (re-tokenize
+    /// every stale superfile from its stored text).
+    pub mode: Option<String>,
+    /// How old a sealed tombstone sidecar has to be, in milliseconds, before a
+    /// rewrite takes it over. Omit to use the table's compaction setting.
+    // `i64`, not `u32`: a JS number carries any timeout up to 2^53 ms, and a
+    // `u32` would wrap the ones past ~49 days instead of passing them on.
+    pub stale_seal_timeout_ms: Option<i64>,
+}
+
+/// What a `reindex` did.
+#[napi(object)]
+pub struct ReindexReport {
+    /// Superfiles rewritten into the current format.
+    pub rewritten: i64,
+    /// Superfiles already current when the run planned.
+    pub already_current: i64,
+    /// Superfiles holding terms from an older analysis that this run's mode
+    /// cannot repair (non-zero only under `"rewrite"`).
+    pub awaiting_reanalysis: i64,
+    /// Stale superfiles another run held; run again to finish them.
+    pub held_by_another_run: i64,
+    /// Columns whose text was never stored, so no repair can fix their terms;
+    /// only re-ingesting them from source can.
+    pub unrepairable_columns: Vec<String>,
+    /// Superfiles left untouched because their footer places a blob where
+    /// the file or its manifest entry contradicts; they need inspection.
+    pub inconsistent_footers: Vec<String>,
+}
+
+impl From<infino::ReindexReport> for ReindexReport {
+    fn from(r: infino::ReindexReport) -> Self {
+        Self {
+            rewritten: r.rewritten as i64,
+            already_current: r.already_current as i64,
+            awaiting_reanalysis: r.awaiting_reanalysis as i64,
+            held_by_another_run: r.held_by_another_run as i64,
+            unrepairable_columns: r.unrepairable_columns,
+            inconsistent_footers: ids_to_strings(&r.inconsistent_footers),
+        }
+    }
+}
+
+/// What a `reindex` would do, and what it would cost.
+#[napi(object)]
+pub struct StalenessReport {
+    /// Superfiles in the table, stale or not.
+    pub superfiles: i64,
+    /// Superfiles whose layout is behind — what `"rewrite"` would rewrite.
+    pub needing_rewrite: i64,
+    /// Superfiles holding terms from an older analysis, which only
+    /// re-analysis repairs.
+    pub awaiting_reanalysis: i64,
+    /// Live bytes a `"rewrite"` would read and write again.
+    pub bytes_to_rewrite: i64,
+    /// Columns no repair can fix, because their text was never stored.
+    pub unrepairable_columns: Vec<String>,
+    /// Superfiles whose footer places a blob where the file or its manifest
+    /// entry contradicts. A reindex reports these and never rewrites them.
+    pub inconsistent_footers: Vec<String>,
+    /// Whether a reindex would do nothing at all.
+    pub is_current: bool,
+}
+
+impl From<infino::StalenessReport> for StalenessReport {
+    fn from(r: infino::StalenessReport) -> Self {
+        Self {
+            is_current: r.is_current(),
+            superfiles: r.superfiles as i64,
+            needing_rewrite: r.needing_rewrite as i64,
+            awaiting_reanalysis: r.awaiting_reanalysis as i64,
+            bytes_to_rewrite: r.bytes_to_rewrite as i64,
+            unrepairable_columns: r.unrepairable_columns,
+            inconsistent_footers: ids_to_strings(&r.inconsistent_footers),
+        }
+    }
+}
+
+/// Superfile ids as the strings the binding exposes them as.
+fn ids_to_strings(ids: &[impl ToString]) -> Vec<String> {
+    ids.iter().map(ToString::to_string).collect()
+}
+
+/// One superfile a `reindex` would repair, and how.
+#[napi(object)]
+pub struct PlannedRepair {
+    /// The superfile the run reads and replaces.
+    pub superfile_id: String,
+    /// The repair it gets: `"rewrite"` or `"reanalyze"`, never `"auto"`.
+    pub mode: String,
+    /// Live bytes in the superfile.
+    pub live_bytes: i64,
+}
+
+impl From<infino::PlannedRepair> for PlannedRepair {
+    fn from(p: infino::PlannedRepair) -> Self {
+        Self {
+            superfile_id: p.superfile_id.to_string(),
+            mode: reindex_mode_name(p.mode),
+            live_bytes: p.live_bytes as i64,
+        }
+    }
+}
+
 /// Text-predicate filter for `vectorSearch` — a pushdown pre-filter, not a
 /// post-filter: kNN ranks only among rows whose FTS-indexed `column` matches
 /// `query`. `mode` is `"or"` (default) or `"and"`.
@@ -581,10 +765,7 @@ struct FtsDecl {
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct FtsOptions {
-    /// Tokenizer: `"standard"` (the default — the Unicode-aware UAX #29
-    /// tokenizer that keeps non-ASCII text) or `"ascii_lower"` (ASCII
-    /// split + lowercase, non-ASCII dropped). It is recorded with the
-    /// table and cannot be changed afterwards.
+    /// Base tokenizer: `"standard"`, the default, is the only one.
     pub analyzer: Option<String>,
     /// Remove this column's stopwords — the very common words whose
     /// presence says almost nothing about what a document is about.
@@ -643,8 +824,8 @@ impl IndexSpec {
     }
 
     /// Mark `column` (a UTF-8 string column) as full-text indexed, with
-    /// optional per-column `options` (analyzer, stopwords, stemmer,
-    /// positions, stored, k1/b).
+    /// optional per-column `options` (stopwords, stemmer, positions,
+    /// stored, k1/b).
     #[napi]
     pub fn fts(&self, column: String, options: Option<FtsOptions>) -> Self {
         let mut next = self.clone();
@@ -683,8 +864,8 @@ impl IndexSpec {
             let mut field = infino::FtsField::new(column.clone())
                 .positions(positions.unwrap_or(false))
                 .stored(stored.unwrap_or(true));
-            if let Some(a) = analyzer {
-                field = field.analyzer(a.clone());
+            if let Some(name) = analyzer {
+                field = field.analyzer(name.clone());
             }
             if let Some(name) = stopwords {
                 field = field.stopwords(stopwords_from_name(name)?);
@@ -798,6 +979,34 @@ impl Connection {
         Ok(Table { inner })
     }
 
+    /// The table's schema document as JSON text, or — with `patch_json`, a
+    /// patch in the same shape — the document after merging the patch into
+    /// the schema (creating the table when there is none). The JS wrapper
+    /// parses the result and stringifies the patch; `expected_schema_id` is
+    /// a compare-and-set against the current `schema_id`.
+    #[napi]
+    pub fn schema(
+        &self,
+        name: String,
+        patch_json: Option<String>,
+        expected_schema_id: Option<u32>,
+    ) -> Result<String> {
+        let doc = match patch_json {
+            None => self.inner.schema(&name).map_err(map_err)?,
+            Some(text) => {
+                let invalid =
+                    |e: String| Error::new(Status::InvalidArg, format!("schema patch: {e}"));
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|e| invalid(e.to_string()))?;
+                let patch = SchemaPatch::from_json(&value).map_err(invalid)?;
+                self.inner
+                    .apply_schema(&name, &patch, expected_schema_id)
+                    .map_err(map_err)?
+            }
+        };
+        Ok(doc.to_json().to_string())
+    }
+
     /// Drop a table. `purge` defaults to `true`, which also deletes the
     /// table's storage subtree after the catalog commit, reclaiming the bytes;
     /// pass `false` to only unregister it from the catalog and keep the bytes.
@@ -818,6 +1027,7 @@ impl Connection {
     /// the JS side reads with `tableFromIPC`. Search is available in SQL
     /// via the TVFs, e.g.
     /// `SELECT _id, score FROM bm25_search('docs', 'body', 'q', 10)`.
+    /// Read-only, one statement per call: a write throws `InvalidArg`.
     #[napi]
     pub fn query_sql(&self, sql: String) -> Result<Buffer> {
         let batches = self.inner.query_sql(&sql).map_err(map_err)?;
@@ -844,8 +1054,44 @@ impl Table {
             return Ok(());
         }
         self.inner
-            .append(&self.align_batches(batches)?)
+            .append(&self.merge_batches(batches)?)
             .map_err(map_err)
+    }
+
+    /// Append rows given as a JSON array of objects (the text the JS wrapper
+    /// produces with `JSON.stringify`): nested objects flatten to dot paths,
+    /// arrays become list columns, a key the table has not seen adds a
+    /// column typed from its values, and a value whose type disagrees with
+    /// the column's is refused.
+    #[napi]
+    pub fn append_rows(&self, rows_json: String) -> Result<()> {
+        let rows = parse_rows(&rows_json)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.inner.append_rows(&rows).map_err(map_err)
+    }
+
+    /// `appendRows`, naming the source the rows came from as `appendNamed`
+    /// does.
+    #[napi]
+    pub fn append_rows_named(&self, rows_json: String, source_name: String) -> Result<()> {
+        let rows = parse_rows(&rows_json)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .append_rows_named(&rows, &source_name)
+            .map_err(map_err)
+    }
+
+    /// `update` with the replacement rows as a JSON array of objects, mapped
+    /// as `appendRows` maps them.
+    #[napi]
+    pub fn update_rows(&self, predicate: String, rows_json: String) -> Result<MutationStats> {
+        let expr = self.parse_predicate(&predicate)?;
+        let rows = parse_rows(&rows_json)?;
+        Ok(self.inner.update_rows(expr, &rows).map_err(map_err)?.into())
     }
 
     /// `append`, naming the source the rows came from: the superfiles this
@@ -860,7 +1106,7 @@ impl Table {
             return Ok(());
         }
         self.inner
-            .append_named(&self.align_batches(batches)?, &source_name)
+            .append_named(&self.merge_batches(batches)?, &source_name)
             .map_err(map_err)
     }
 
@@ -886,14 +1132,11 @@ impl Table {
         query: String,
         k: u32,
         mode: Option<String>,
-        stats: Option<String>,
         projection: Option<Vec<String>>,
         k1: Option<f64>,
         b: Option<f64>,
     ) -> Result<Buffer> {
-        let mut opts = Bm25SearchOptions::new()
-            .with_mode(parse_mode(mode.as_deref())?)
-            .with_stats(parse_stats(stats.as_deref())?);
+        let mut opts = Bm25SearchOptions::new().with_mode(parse_mode(mode.as_deref())?);
         opts = match (k1, b) {
             (Some(k1), Some(b)) => opts.with_bm25(k1 as f32, b as f32),
             (None, None) => opts,
@@ -1065,7 +1308,7 @@ impl Table {
         let aligned = if batches.is_empty() {
             RecordBatch::new_empty(self.inner.schema())
         } else {
-            self.align_batches(batches)?
+            self.merge_batches(batches)?
         };
         Ok(self.inner.update(expr, &aligned).map_err(map_err)?.into())
     }
@@ -1116,6 +1359,39 @@ impl Table {
         self.inner.gc(grace).map(GcReport::from).map_err(gc_err)
     }
 
+    /// Repair every superfile whose full-text index is behind what this engine
+    /// writes. Rows, their order and their `_id`s are unchanged. Requires
+    /// durable storage and takes the table's compaction slot.
+    #[napi]
+    pub fn reindex(&self, options: Option<ReindexOptions>) -> Result<ReindexReport> {
+        let opts = reindex_options(options)?;
+        self.inner
+            .reindex(&opts)
+            .map(ReindexReport::from)
+            .map_err(reindex_err)
+    }
+
+    /// The superfiles `reindex` would repair under `options`, and the repair
+    /// each gets — without repairing anything. Writes nothing.
+    #[napi]
+    pub fn reindex_plan(&self, options: Option<ReindexOptions>) -> Result<Vec<PlannedRepair>> {
+        let opts = reindex_options(options)?;
+        self.inner
+            .reindex_plan(&opts)
+            .map(|plan| plan.into_iter().map(PlannedRepair::from).collect())
+            .map_err(reindex_err)
+    }
+
+    /// What is behind and what repairing it would cost. Writes nothing.
+    #[napi]
+    pub fn index_staleness(&self, options: Option<ReindexOptions>) -> Result<StalenessReport> {
+        let opts = reindex_options(options)?;
+        self.inner
+            .index_staleness(&opts)
+            .map(StalenessReport::from)
+            .map_err(reindex_err)
+    }
+
     /// The user-facing Arrow schema, as an Arrow IPC `Buffer` (an empty
     /// table carrying the schema; read with `tableFromIPC`).
     #[napi]
@@ -1126,19 +1402,16 @@ impl Table {
 }
 
 impl Table {
-    /// Merge IPC batches into one and re-wrap under the table's declared
-    /// schema, so the exact-schema check accepts otherwise-nullable inputs (a
-    /// genuine type mismatch still errors). Caller guarantees `batches` is
-    /// non-empty. Shared by `append` and `update`.
-    fn align_batches(&self, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
-        let declared = self.inner.schema();
-        let merged = if batches.len() == 1 {
-            batches.into_iter().next().expect("len == 1")
-        } else {
-            let schema = batches[0].schema();
-            concat_batches(&schema, &batches).map_err(arrow_err)?
-        };
-        RecordBatch::try_new(declared, merged.columns().to_vec()).map_err(arrow_err)
+    /// Merge IPC batches into one. The engine brings the result to the
+    /// table's shape (a column it does not have joins the schema, an absent
+    /// nullable one is null-filled), so nothing is re-wrapped here. Caller
+    /// guarantees `batches` is non-empty. Shared by `append` and `update`.
+    fn merge_batches(&self, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+        if batches.len() == 1 {
+            return Ok(batches.into_iter().next().expect("len == 1"));
+        }
+        let schema = batches[0].schema();
+        concat_batches(&schema, &batches).map_err(arrow_err)
     }
 
     /// Parse a SQL predicate string into a DataFusion `Expr`, resolved against

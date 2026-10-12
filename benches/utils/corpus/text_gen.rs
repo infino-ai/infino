@@ -26,7 +26,7 @@
 //!   repeated tokens), and a sprinkle of surface variation — capitalized
 //!   tokens, punctuation glued to a token, year-like digit tokens — so
 //!   the analyzer is on the measured path. Everything stays ASCII, so the
-//!   `ascii_lower` rule is the only tokenization rule in play.
+//!   `standard` analyzer tokenizes it on its ASCII fast path.
 //!
 //! Both flavours are seeded per scheduling chunk with [`chunk_seed`] so a
 //! parallel writer and a sequential stream produce identical bytes; the
@@ -93,7 +93,7 @@ const REPEAT_PROB: f64 = 0.4;
 /// `[0, YEAR)` emits a year-like digit token instead of the term,
 /// `[YEAR, CAP)` capitalizes the term, `[CAP, COMMA)` glues a trailing
 /// comma, `[COMMA, PERIOD)` a trailing period, the rest is the bare term.
-/// Every variant tokenizes back to the same term under `ascii_lower`
+/// Every variant tokenizes back to the same term under `standard`
 /// (case folds, punctuation splits), so df/tf are unchanged while the
 /// analyzer does real work.
 const YEAR_TOKEN_CUTOFF: f64 = 0.01;

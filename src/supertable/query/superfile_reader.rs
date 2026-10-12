@@ -34,7 +34,16 @@
 //! bridge, no throwaway `current_thread` runtime, and
 //! object-store retries fire correctly.
 
-use std::{io, sync::Arc};
+use std::{
+    error::Error,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use tracing::Span;
 
 use crate::{
     storage::StorageProvider,
@@ -129,9 +138,7 @@ pub async fn superfile_reader_tiered(
                 .get(storage_key)
                 .await
                 .map_err(|e| ReaderCacheError::OpenFailed {
-                    source: ReadError::Io(io::Error::other(format!(
-                        "storage fetch {storage_key}: {e}"
-                    ))),
+                    source: fetch_failed(format!("storage fetch {storage_key}"), e),
                 })?;
         let reader = SuperfileReader::open(bytes)
             .map_err(|source| ReaderCacheError::OpenFailed { source })?;
@@ -141,10 +148,105 @@ pub async fn superfile_reader_tiered(
     Err(ReaderCacheError::NotFound { uri: *uri })
 }
 
+/// How many of a read's opens each cache tier served. One line of counts on the
+/// span that opened them instead of a span per file: enough for a trace to say
+/// whether a slow read was a cold one, at a cost that does not grow with the
+/// table. Counted with relaxed atomics, so the concurrent opens of a fan-out
+/// can share one tally.
+///
+/// A fan-out counts one open per work unit, and a ranged search can split one
+/// superfile into several units, so the counts add up to the phase's `units`,
+/// not its superfiles. The repeats show as `memory` or `coalesced`.
+#[derive(Debug, Default)]
+pub(crate) struct OpenTierCounts {
+    memory: AtomicU64,
+    disk: AtomicU64,
+    lazy: AtomicU64,
+    source: AtomicU64,
+    coalesced: AtomicU64,
+    streamed: AtomicU64,
+}
+
+impl OpenTierCounts {
+    /// A tally for the opens `span` will report, or `None` when there is
+    /// nowhere to put them: tracing is off, the span is disabled, or it does
+    /// not declare the tier fields (made by `tiered_span!`).
+    pub(crate) fn for_span(span: &Span) -> Option<Arc<Self>> {
+        if !cfg!(feature = "detailed-tracing") {
+            return None;
+        }
+        span.metadata()
+            .is_some_and(|meta| meta.fields().field("memory").is_some())
+            .then(Arc::default)
+    }
+
+    /// [`Self::for_span`] on the current span, looked up only with
+    /// `detailed-tracing`.
+    pub(crate) fn for_current_span() -> Option<Arc<Self>> {
+        if !cfg!(feature = "detailed-tracing") {
+            return None;
+        }
+        Self::for_span(&Span::current())
+    }
+
+    pub(crate) fn add(&self, tier: OpenTier) {
+        let slot = match tier {
+            OpenTier::Memory => &self.memory,
+            OpenTier::Disk => &self.disk,
+            OpenTier::Lazy => &self.lazy,
+            OpenTier::Source => &self.source,
+            OpenTier::Coalesced => &self.coalesced,
+            OpenTier::Streamed => &self.streamed,
+        };
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The counts in `[memory, disk, lazy, source, coalesced, streamed]` order.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> [u64; 6] {
+        [
+            self.memory.load(Ordering::Relaxed),
+            self.disk.load(Ordering::Relaxed),
+            self.lazy.load(Ordering::Relaxed),
+            self.source.load(Ordering::Relaxed),
+            self.coalesced.load(Ordering::Relaxed),
+            self.streamed.load(Ordering::Relaxed),
+        ]
+    }
+
+    /// Record the counts on `span`, into the `memory`, `disk`, `lazy`,
+    /// `source`, `coalesced` and `streamed` fields it declares.
+    pub(crate) fn record_on(&self, span: &Span) {
+        span.record("memory", self.memory.load(Ordering::Relaxed));
+        span.record("disk", self.disk.load(Ordering::Relaxed));
+        span.record("lazy", self.lazy.load(Ordering::Relaxed));
+        span.record("source", self.source.load(Ordering::Relaxed));
+        span.record("coalesced", self.coalesced.load(Ordering::Relaxed));
+        span.record("streamed", self.streamed.load(Ordering::Relaxed));
+    }
+}
+
 fn cache_open_failed(e: DiskCacheError) -> ReaderCacheError {
     ReaderCacheError::OpenFailed {
-        source: ReadError::Io(io::Error::other(format!("disk cache fetch: {e}"))),
+        source: fetch_failed("disk cache fetch".to_string(), e),
     }
+}
+
+/// A fetch of a superfile's bytes that failed, read as `{label}: {source}`.
+/// The store's error stays typed underneath, so a refused credential is still
+/// found under the read error rather than lost in its text.
+#[derive(Debug, thiserror::Error)]
+#[error("{label}: {source}")]
+struct FetchFailed {
+    label: String,
+    source: Box<dyn Error + Send + Sync>,
+}
+
+fn fetch_failed(label: String, source: impl Error + Send + Sync + 'static) -> ReadError {
+    ReadError::Io(io::Error::other(FetchFailed {
+        label,
+        source: Box::new(source),
+    }))
 }
 
 #[cfg(test)]
@@ -156,12 +258,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        storage::LocalFsStorageProvider,
+        storage::{LocalFsStorageProvider, StorageError},
         superfile::{
-            ReadError,
+            FtsError, ReadError,
             builder::{BuilderOptions, SuperfileBuilder},
         },
-        supertable::reader_cache::{InMemoryReaderCache, config::DiskCacheConfig},
+        supertable::{
+            QueryError,
+            reader_cache::{InMemoryReaderCache, config::DiskCacheConfig},
+        },
         test_helpers::{decimal128_id_field, decimal128_ids},
     };
 
@@ -501,6 +606,37 @@ mod tests {
                 );
             }
             other => panic!("expected OpenFailed, got {other:?}"),
+        }
+    }
+
+    /// A cold fetch the disk cache could not make keeps the store's error
+    /// typed under the read error, so a refused credential is still one; the
+    /// message reads as it always has.
+    #[test]
+    fn a_failed_cold_fetch_keeps_the_stores_error_under_its_label() {
+        let refused = cache_open_failed(DiskCacheError::Storage(StorageError::PermissionDenied {
+            uri: "u".into(),
+        }));
+        assert_eq!(
+            refused.to_string(),
+            "failed to open superfile bytes: io error during read: disk cache fetch: storage error during cold fetch"
+        );
+        assert!(matches!(
+            QueryError::store(refused),
+            QueryError::PermissionDenied(_)
+        ));
+    }
+
+    /// A superfile the disk cache could not open because its index is too
+    /// old to read stays `Unsupported` under the cache's own wrapping, with
+    /// the message that says to reindex.
+    #[test]
+    fn an_index_too_old_under_the_disk_cache_stays_unsupported() {
+        let too_old = ReadError::Fts(Box::new(FtsError::IndexTooOld { version: 6 }));
+        let wrapped = cache_open_failed(DiskCacheError::SuperfileOpenRead(too_old));
+        match QueryError::store(wrapped) {
+            QueryError::Unsupported(m) => assert!(m.contains("reindex"), "{m}"),
+            other => panic!("expected Unsupported, got {other:?}"),
         }
     }
 }

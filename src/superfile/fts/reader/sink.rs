@@ -282,24 +282,6 @@ impl AndSink for CollectSink {
     }
 }
 
-/// Unranked counting sink: tally the intersection size without
-/// materializing the ids. Drives the count path through the same
-/// flat-merge as [`CollectSink`] but skips the `Vec<u32>` — for a
-/// high-cardinality count that allocation (4 bytes/doc) is pure waste.
-pub(super) struct CountSink {
-    pub(super) n: u64,
-}
-
-impl AndSink for CountSink {
-    fn needs_score(&self) -> bool {
-        false
-    }
-
-    fn emit(&mut self, _doc: u32, _score: f32) {
-        self.n += 1;
-    }
-}
-
 /// Push `(score, doc_id)` into the top-k AND heap with the same
 /// tie-break (asc doc_id) the OR paths use, so AND and OR rankings
 /// agree on score-tied docs.

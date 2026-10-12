@@ -18,11 +18,11 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     future::Future,
-    sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock, Weak, atomic::AtomicBool},
+    sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
@@ -36,7 +36,6 @@ use super::{
     manifest::{
         ManifestSnapshot,
         list::{CellRoutingParams, PartitionStrategy},
-        term_stats::{self, TermStatsSidecar},
     },
     options::SupertableOptions,
 };
@@ -53,6 +52,7 @@ use crate::{
     },
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
+        gc::superseded::Superseded,
         manifest::commit::{PointerProbe, probe_pointer, read_pointer},
         options::Consistency,
         query::{
@@ -72,8 +72,9 @@ use crate::{
             lease::DEFAULT_LEASE_DURATION,
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
         },
+        writer::builder_options_of,
     },
-    utils::trace::{TableRole, record},
+    utils::trace::{CloseOut, TableRole, record},
 };
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::{
@@ -90,30 +91,6 @@ use crate::{
 #[derive(Clone)]
 pub struct Supertable {
     inner: Arc<SupertableInner>,
-}
-
-/// The parsed global term-stats artifact plus the verdict of checking
-/// its coverage, so neither cost is repaid per query.
-///
-/// Two things are memoized here because each is invariant over a
-/// different key. The parsed FST is keyed by the artifact's
-/// content-addressed `uri`: an append carries the same reference
-/// forward, so successive generations reuse it and only a maintenance
-/// republish refetches. The coverage verdict is keyed by manifest
-/// generation, because a manifest pins both its superfile list and its
-/// artifact reference — so `usable` is a pure function of
-/// `checked_generation`, and one check per generation serves every
-/// query on that snapshot.
-pub(super) struct CachedTermStats {
-    /// The artifact's content-addressed storage uri.
-    pub(super) uri: String,
-    /// Manifest generation `usable` was evaluated against.
-    pub(super) checked_generation: u64,
-    /// Whether every superfile the artifact covers was still listed by
-    /// that generation's manifest. `false` means callers must read df
-    /// from the superfile dictionaries instead.
-    pub(super) usable: bool,
-    pub(super) sidecar: Arc<TermStatsSidecar>,
 }
 
 /// Internal shared state. Every `Supertable` clone holds one Arc
@@ -187,13 +164,9 @@ pub(super) struct SupertableInner {
     pub(super) decoded_scalar_cache: DecodedScalarCache,
     /// Per-generation cache of global BM25 idf per (column, term),
     /// shared by every reader minted from this handle so repeat
-    /// queries under `Bm25Stats::Global` skip the dictionary gather
+    /// queries skip the dictionary gather
     /// fan — see [`GlobalIdfCache`].
     pub(super) global_idf_cache: GlobalIdfCache,
-    /// Lazily loaded + verified global term-stats sidecar. `None` until
-    /// first use or when the manifest carries no ref — see
-    /// [`CachedTermStats`] for what the entry holds and why.
-    pub(super) term_stats_cache: StdRwLock<Option<CachedTermStats>>,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -235,14 +208,18 @@ pub(super) struct SupertableInner {
     /// (which rewrite the pointer without capturing its new etag) —
     /// the next probe then takes the full-read path and re-seeds it.
     pub(super) last_pointer_etag: Mutex<Option<String>>,
+    /// Keys this handle's commits dropped since its last deferred sweep was scheduled. Every
+    /// pointer-swapping commit adds to it (`note_superseded`); scheduling a sweep takes it all.
+    pub(super) superseded: Mutex<Superseded>,
     /// Set once this handle's pointer is seen deleted — its table was dropped
     /// and purged elsewhere. Latched: the handle can only be discarded, and
     /// `Connection::open_table` checks this before serving it from cache.
     pub(super) pointer_vanished: OnceLock<()>,
-    /// Cached SQL schemas, built once from the immutable `options` (lock-free
-    /// lazy init). A pure function of the schema, so no snapshot invalidation
-    /// (unlike `sql_session_cache`). See [`SqlSchemas`].
-    pub(super) sql_schemas: OnceLock<Arc<SqlSchemas>>,
+    /// Cached SQL schemas, keyed by the `schema_id` they were built from:
+    /// a pure function of the table's schema, rebuilt when it changes and
+    /// otherwise shared (unlike `sql_session_cache`, which follows the
+    /// snapshot). See [`SqlSchemas`].
+    pub(super) sql_schemas: ArcSwapOption<(u32, Arc<SqlSchemas>)>,
     /// Decoded hidden deleted-`_id` set, cached per hidden manifest version.
     /// The set is a deliberate duplicate of the user-table tombstones, carried
     /// INLINE in the hidden manifest so hidden vector search drops deleted rows
@@ -259,9 +236,7 @@ impl SupertableInner {
     /// of the current manifest, so the new file bakes — and is scored at
     /// — the corpus average rather than its own.
     pub(super) fn builder_options(&self) -> BuilderOptions {
-        self.options
-            .builder_options()
-            .with_fts_corpus_stats(self.manifest.load().fts_corpus_stats(&HashSet::new()))
+        builder_options_of(&self.manifest.load())
     }
 
     /// Runtime driving the sync API's async kernels when the caller
@@ -291,10 +266,17 @@ impl SupertableInner {
     /// The table's cached SQL schemas, built once from the immutable options.
     /// Cheap `Arc` clone on every call after the first.
     pub(super) fn sql_schemas(&self) -> Arc<SqlSchemas> {
-        Arc::clone(
-            self.sql_schemas
-                .get_or_init(|| Arc::new(build_sql_schemas(&self.options))),
-        )
+        let manifest = self.manifest.load();
+        let schema_id = manifest.table_schema().schema_id();
+        if let Some(cached) = self.sql_schemas.load().as_ref()
+            && cached.0 == schema_id
+        {
+            return Arc::clone(&cached.1);
+        }
+        let built = Arc::new(build_sql_schemas(&manifest));
+        self.sql_schemas
+            .store(Some(Arc::new((schema_id, Arc::clone(&built)))));
+        built
     }
 
     /// Push the current manifest's tombstone-seq view into the
@@ -749,6 +731,16 @@ impl Supertable {
         self.inner.role
     }
 
+    /// Begin the [`CloseOut`] a search's root span records when it is done:
+    /// the caller's op-stats collector and the storage's request ledger.
+    /// Taken before the reader is minted, so the manifest check that minting
+    /// may do is in the store numbers.
+    pub(crate) fn close_out(&self) -> CloseOut {
+        CloseOut::begin(op_stats::current, || {
+            self.inner.options.storage.as_ref().map(|s| s.usage_meter())
+        })
+    }
+
     test_visible! {
     fn vector_index_table(&self) -> Option<&Arc<Supertable>> {
         self.inner.vector_index_table.as_ref()
@@ -905,7 +897,7 @@ impl Supertable {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn schema(&self) -> SchemaRef {
-        self.inner.options.user_schema()
+        self.inner.manifest.load().user_schema()
     }
 
     /// Cached per-table SQL schemas (scan view + scalar schema).
@@ -925,16 +917,36 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
-    /// Build and publish the global term-stats sidecar over the current
-    /// membership (see `manifest::term_stats`). Not part of the public
-    /// API — [`Supertable::optimize`] calls this after compaction so the
-    /// artifact describes the post-merge superfile set.
+    /// Rebuild the table-level term index over the current superfiles (see
+    /// `manifest::term_index`), so it covers every superfile in one segment.
+    /// [`Supertable::optimize`] calls this after compaction.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
-    pub(crate) fn refresh_term_stats_sync(&self) -> Result<(), BuildError> {
-        self.block_on_query(async {
-            super::writer::stamp_term_stats(&self.inner).await?;
-            super::writer::stamp_term_index(&self.inner).await
-        })
+    pub(crate) fn refresh_term_index_sync(&self) -> Result<(), BuildError> {
+        self.block_on_query(super::writer::stamp_term_index(&self.inner))
+    }
+
+    /// Whether `spec` names four columns of this table of the right types
+    /// (see `graph_index::check_spec`). [`Supertable::optimize`] runs this
+    /// before it changes anything, so a wrong spec fails it with nothing
+    /// committed.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn check_adjacency_spec(
+        &self,
+        spec: &config::AdjacencySpec,
+    ) -> Result<(), BuildError> {
+        super::graph_index::check_spec(&self.inner.manifest.load(), spec)
+    }
+
+    /// Build and publish the adjacency index over this edge table's rows
+    /// (see `graph_index::stamp_adjacency`). Not part of the public API —
+    /// [`Supertable::optimize`] calls this after compaction when its options
+    /// name the edge columns.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn refresh_adjacency_sync(
+        &self,
+        spec: &config::AdjacencySpec,
+    ) -> Result<(), BuildError> {
+        self.block_on_query(super::graph_index::stamp_adjacency(self, spec))
     }
 
     /// Route undrained user superfiles into the hidden per-cell index. Not part
@@ -976,7 +988,7 @@ impl Supertable {
         let Some(column) = crate::supertable::query::vector::select_eager_router_column(
             vcfg.search_mode,
             vcfg.ivf_router,
-            &self.inner.options.vector_columns,
+            &self.inner.manifest.load().vector_configs(),
         ) else {
             return;
         };
@@ -1077,6 +1089,7 @@ impl Supertable {
     /// budgets; an explicit budget is never changed, but gets a one-shot
     /// warning when the footprint exceeds it (steady-state reads would
     /// churn the cache).
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn reconcile_cache_budget(&self) {
         let Some(cache) = self.inner.options.disk_cache.as_ref() else {
             return;
@@ -1601,7 +1614,9 @@ const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 /// Aggressive compaction profile for the hidden vector-index table: keep
 /// ~one compact packed shard object per partition key instead of many
 /// small delta files.
-pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
+pub(crate) fn hidden_vector_index_compaction_settings(
+    max_concurrent_jobs: Option<usize>,
+) -> crate::config::CompactionSettings {
     let cfg = crate::config::global();
     let vector = &cfg.vector;
     crate::config::CompactionSettings {
@@ -1613,6 +1628,19 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
         min_fill_percent: cfg.compaction.min_fill_percent,
         min_superfiles_for_merge: vector.compaction_min_superfiles_for_merge,
         max_memory_mb: vector.compaction_max_memory_mb,
+        // The width the user table's pass runs at, so an operator who asked for
+        // one merge at a time gets one here too: this pass runs on the same
+        // machine, out of the same pools, and a setting that only made half the
+        // work serial would not be the setting they asked for. Unset derives it,
+        // as the user table does.
+        //
+        // Running them at all is safe for the same reason as the user table's: a
+        // pass's jobs never share an input. The hidden table partitions by vector
+        // cell, so its jobs are per-cell and disjoint by construction, and the
+        // over-cap cell split is a separate phase that completes before merge
+        // selection begins — no merge can race a split that would remove a
+        // superfile it planned to use.
+        max_concurrent_jobs,
         ..Default::default()
     }
 }
@@ -1621,15 +1649,15 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
 /// existing user-table IVF summary. Hidden commits use
 /// [`super::opann`] MVCC maintenance — never call this per commit.
 pub(crate) fn train_global_centroids(
-    user_opts: &SupertableOptions,
     manifest: &super::manifest::ManifestSnapshot,
     n_cells: usize,
 ) -> Option<super::manifest::ClusterCentroids> {
-    let vc = user_opts.vector_columns.first()?;
+    let vc = manifest.vector_configs().into_iter().next()?;
+    let vc_id = manifest.field_id(&vc.column)?;
     let mut all_centroids = Vec::new();
     let mut dim = 0usize;
     for entry in manifest.superfiles.iter() {
-        let Some(vs) = entry.vector_summary.get(&vc.column) else {
+        let Some(vs) = entry.vector_summary.get(&vc_id) else {
             continue;
         };
         for cell in &vs.cells {
@@ -1761,7 +1789,7 @@ fn build_vector_index_options(
     }
     if let Some(manifest) = user_manifest
         && let Some(clusters) =
-            train_global_centroids(user_opts, manifest, hidden_vector_cell_count(user_opts))
+            train_global_centroids(manifest, hidden_vector_cell_count(user_opts))
     {
         hidden_opts = hidden_opts.with_partition_strategy(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {
@@ -1802,16 +1830,16 @@ async fn build_handle(
         sql_logical_plan_cache: Mutex::new(None),
         decoded_scalar_cache: DecodedScalarCache::default(),
         global_idf_cache: GlobalIdfCache::default(),
-        term_stats_cache: StdRwLock::new(None),
         tombstone_cache,
         handle_id,
         vector_index_table,
         hidden_index_open_error: std::sync::OnceLock::new(),
         last_pointer_check: Mutex::new(None),
         last_pointer_etag: Mutex::new(None),
+        superseded: Mutex::default(),
         pointer_vanished: OnceLock::new(),
         hidden_deleted_cache: Mutex::new(None),
-        sql_schemas: OnceLock::new(),
+        sql_schemas: ArcSwapOption::empty(),
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };
@@ -2170,98 +2198,6 @@ impl SupertableReader {
         &self.inner.global_idf_cache
     }
 
-    /// The manifest-referenced global term-stats sidecar, loaded (and
-    /// hash-verified) once per artifact and cached on the handle by its
-    /// content-addressed URI. Returns `None` when the manifest carries
-    /// no reference, when no storage is attached, or when the load
-    /// fails — global-stats queries then fall back to the query-time
-    /// gather wave, trading latency for availability.
-    pub(crate) async fn term_stats_sidecar(&self) -> Option<Arc<TermStatsSidecar>> {
-        let reference = self.manifest.term_stats_blob()?.clone();
-        let generation = self.manifest.get_manifest_id();
-        // Already parsed AND already checked against this generation's
-        // superfiles: the whole call is one cache read.
-        {
-            let cached = self
-                .inner
-                .term_stats_cache
-                .read()
-                .expect("term stats cache lock");
-            if let Some(entry) = cached.as_ref()
-                && entry.uri == reference.uri
-                && entry.checked_generation == generation
-            {
-                return entry.usable.then(|| Arc::clone(&entry.sidecar));
-            }
-        }
-        // Same artifact, new generation (an append carries the
-        // reference forward): keep the parsed FST and re-check its
-        // coverage rather than refetching.
-        let parsed = {
-            let cached = self
-                .inner
-                .term_stats_cache
-                .read()
-                .expect("term stats cache lock");
-            cached
-                .as_ref()
-                .filter(|entry| entry.uri == reference.uri)
-                .map(|entry| Arc::clone(&entry.sidecar))
-        };
-        let sidecar = match parsed {
-            Some(sidecar) => sidecar,
-            None => {
-                let storage = self.manifest.options.storage.as_ref()?;
-                match term_stats::load(storage.as_ref(), &reference).await {
-                    Ok(sidecar) => Arc::new(sidecar),
-                    Err(e) => {
-                        warn!(error = %e, uri = %reference.uri, "term-stats sidecar load failed; falling back to the query-time df gather");
-                        return None;
-                    }
-                }
-            }
-        };
-        // Coverage check, once per (artifact, generation). The artifact's
-        // sums are aggregates over the superfiles it names, so a
-        // superfile that has since left the manifest cannot be
-        // subtracted back out — serving df from it would over-count and
-        // depress idf for the affected terms. The manifest carry rule
-        // drops the reference on any commit that removes superfiles,
-        // which is what makes a stale artifact unreachable; this is the
-        // belt to those braces, and it runs in every build because the
-        // failure mode is silently wrong ranking rather than an error.
-        // Rejecting an artifact costs latency, never correctness: with
-        // no artifact, callers read df from every superfile's own
-        // dictionary.
-        let current: HashSet<Uuid> = self
-            .manifest
-            .superfiles
-            .iter()
-            .map(|entry| entry.superfile_id)
-            .collect();
-        let usable = sidecar.covered().iter().all(|id| current.contains(id));
-        if !usable {
-            warn!(
-                uri = %reference.uri,
-                generation,
-                "term-stats sidecar covers a superfile this manifest no longer lists; \
-                 ignoring it and reading document frequency from the superfile \
-                 dictionaries instead"
-            );
-        }
-        *self
-            .inner
-            .term_stats_cache
-            .write()
-            .expect("term stats cache lock") = Some(CachedTermStats {
-            uri: reference.uri.clone(),
-            checked_generation: generation,
-            usable,
-            sidecar: Arc::clone(&sidecar),
-        });
-        usable.then_some(sidecar)
-    }
-
     /// The shared `Arc<SupertableInner>` backing this reader. Used to
     /// build a [`WeakReader`] that retains the snapshot without an
     /// owning cycle through a cached `SessionContext`. Module-private:
@@ -2295,6 +2231,18 @@ impl SupertableReader {
     /// Per-supertable configuration for this reader's snapshot.
     pub(crate) fn options(&self) -> &Arc<SupertableOptions> {
         &self.inner.options
+    }
+
+    /// Whether a search on this reader splits its root span into phase spans
+    /// (superfile selection, term lookup, the fan-out, the vector legs).
+    ///
+    /// Only on a table of more than one superfile. Each exported span costs
+    /// the query a few microseconds, and on a single superfile the phases
+    /// are one file each, so the root's totals already say where the time
+    /// went; with more files the phase spans replace a span per file and
+    /// cost less than before.
+    pub(crate) fn phase_spans(&self) -> bool {
+        cfg!(feature = "detailed-tracing") && self.manifest.superfiles.len() > 1
     }
 
     /// Cached per-table SQL schemas (scan view + scalar schema).
@@ -2408,6 +2356,7 @@ mod tests {
             opann::MODALITY_MIN_CELL_DOCS,
             options::Consistency,
             query::dispatch::open_reader,
+            schema::LegacyNames,
         },
         test_helpers::default_tokenizer,
     };
@@ -2458,6 +2407,7 @@ mod tests {
     fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -2484,6 +2434,29 @@ mod tests {
         let old = st.inner.manifest.load();
         let new = old.with_appended(entries);
         st.inner.manifest.store(Arc::new(new));
+    }
+
+    /// The hidden vector index runs at the width the pass was asked for.
+    ///
+    /// An operator who sets `max_concurrent_jobs` is sizing one machine, and
+    /// the hidden pass runs on it out of the same pools. Deriving its own width
+    /// there would leave `Some(1)` meaning "serial, except for half the work".
+    #[test]
+    fn the_hidden_index_follows_the_width_it_was_given() {
+        assert_eq!(
+            hidden_vector_index_compaction_settings(Some(1)).max_concurrent_jobs,
+            Some(1),
+            "a serial pass must be serial on both tables"
+        );
+        assert_eq!(
+            hidden_vector_index_compaction_settings(Some(4)).max_concurrent_jobs,
+            Some(4)
+        );
+        assert_eq!(
+            hidden_vector_index_compaction_settings(None).max_concurrent_jobs,
+            None,
+            "unset still derives, as the user table does"
+        );
     }
 
     #[test]
@@ -4280,6 +4253,7 @@ mod tests {
             min_fill_percent: 1,
             min_superfiles_for_merge: 2,
             max_memory_mb: 64,
+            max_concurrent_jobs: Some(1),
             stale_seal_timeout_ms: crate::config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         };
 
@@ -4479,15 +4453,13 @@ mod tests {
 
         // Exercise the lazy FTS path before optimize (mirrors the SQL bench's
         // pre-compact warm/cold queries against a disk-cache consumer).
-        use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
+        use crate::superfile::fts::reader::BoolMode;
         let hits = consumer
             .bm25_search(
                 "title",
                 "doc",
                 5,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 pre-optimize");
@@ -4502,9 +4474,7 @@ mod tests {
                 "title",
                 "doc",
                 5,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 post-optimize");
@@ -5249,6 +5219,7 @@ mod tests {
                 hidden_storage.as_ref(),
                 uri,
                 &hash,
+                &LegacyNames::none(),
             ))
             .expect("slow state loads");
         assert!(
@@ -5310,6 +5281,22 @@ mod tests {
                 });
             }
             self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_overwrite(
+            &self,
+            uri: &str,
+            bytes: bytes::Bytes,
+        ) -> Result<(), crate::storage::StorageError> {
+            if self
+                .fail_data_puts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && uri.contains("data/")
+            {
+                return Err(crate::storage::StorageError::NotFound {
+                    uri: format!("injected data PUT failure: {uri}"),
+                });
+            }
+            self.inner.put_overwrite(uri, bytes).await
         }
         async fn put_if_match(
             &self,
@@ -5477,6 +5464,7 @@ mod tests {
                 hidden_storage.as_ref(),
                 uri,
                 &hash,
+                &LegacyNames::none(),
             ))
             .expect("slow state loads");
         assert!(
@@ -6182,6 +6170,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let no_removals = Vec::new();
         // The hidden table's own scoped provider — its pointer file, not the
@@ -6204,7 +6194,7 @@ mod tests {
                 Vec::new(),
             ))
             .expect("plant stale law");
-        hidden.inner().manifest.store(Arc::new(planted_manifest));
+        hidden.inner().manifest.store(planted_manifest);
 
         // (2) Recalibration re-measures both laws over the post-split grid
         // from stored bytes and stamps the difference.
@@ -6383,6 +6373,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden
@@ -6403,7 +6395,7 @@ mod tests {
                 Vec::new(),
             ))
             .expect("plant stale law");
-        hidden.inner().manifest.store(Arc::new(planted_manifest));
+        hidden.inner().manifest.store(planted_manifest);
 
         // (1) Heavily tombstoned recalibration measures from the live rows.
         let stamped = hidden
@@ -6461,6 +6453,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let zero_manifest = hidden
             .block_on_query(persist_commit_async(
@@ -6479,7 +6473,7 @@ mod tests {
                 Vec::new(),
             ))
             .expect("plant zero law");
-        hidden.inner().manifest.store(Arc::new(zero_manifest));
+        hidden.inner().manifest.store(zero_manifest);
         let stamped = hidden
             .block_on_query(recalibrate_probe_laws(hidden.inner()))
             .expect("recalibrate on an uncalibrated grid is a clean no-op");
@@ -6664,6 +6658,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden
@@ -6684,7 +6680,7 @@ mod tests {
                 Vec::new(),
             ))
             .expect("plant cleared law");
-        hidden.inner().manifest.store(Arc::new(planted_manifest));
+        hidden.inner().manifest.store(planted_manifest);
         let achievable = |hidden: &Supertable| {
             let strategy = hidden
                 .reader()
@@ -6846,6 +6842,8 @@ mod tests {
             superseded_cells_additions: None,
             split_checks_additions: None,
             graph_ref: None,
+            schema: None,
+            expected_schema_id: None,
         };
         let hidden_storage = hidden
             .inner()
@@ -6865,7 +6863,7 @@ mod tests {
                 Vec::new(),
             ))
             .expect("plant cleared law");
-        hidden.inner().manifest.store(Arc::new(planted_manifest));
+        hidden.inner().manifest.store(planted_manifest);
         let achievable = |hidden: &Supertable| {
             let PartitionStrategy::VectorCell { clusters, .. } = hidden
                 .reader()
@@ -7055,7 +7053,7 @@ mod tests {
         // Merge the hidden index: the superseded parent blocks are dropped and
         // the parent superfile is reclaimed.
         hidden
-            .compact(&hidden_vector_index_compaction_settings())
+            .compact(&hidden_vector_index_compaction_settings(None))
             .expect("hidden merge");
 
         let reader = hidden.reader().expect("reader");
@@ -7588,7 +7586,7 @@ mod tests {
             assert!(
                 !entry
                     .vector_summary
-                    .get("emb")
+                    .get(&manifest.field_id("emb").expect("emb id"))
                     .map(|v| v.cells.iter().all(|cell| cell.clusters.is_empty()))
                     .unwrap_or(true),
                 "packed shard missing cluster summary"
@@ -7828,7 +7826,7 @@ mod tests {
             .flat_map(|entry| {
                 entry
                     .vector_summary
-                    .get("emb")
+                    .get(&manifest.field_id("emb").expect("emb id"))
                     .into_iter()
                     .flat_map(|summary| summary.cells.iter())
             })
@@ -8195,7 +8193,8 @@ mod tests {
         let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
         assert!(!manifest.superfiles.is_empty(), "drain built cell files");
         for entry in manifest.superfiles.iter() {
-            let vs = entry.vector_summary.get("emb").unwrap_or_else(|| {
+            let emb = manifest.field_id("emb").expect("emb id");
+            let vs = entry.vector_summary.get(&emb).unwrap_or_else(|| {
                 panic!(
                     "drain-built hidden superfile {} has NO vector_summary",
                     entry.superfile_id
@@ -8780,6 +8779,10 @@ mod tests {
             self.inner.put_atomic(uri, bytes).await
         }
 
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+
         async fn put_if_match(
             &self,
             uri: &str,
@@ -8815,15 +8818,13 @@ mod tests {
     }
 
     fn bm25_title_hits(table: &Supertable, query: &str) -> usize {
-        use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
+        use crate::superfile::fts::reader::BoolMode;
         table
             .bm25_search(
                 "title",
                 query,
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25 search")
@@ -8955,6 +8956,10 @@ mod tests {
             bytes: Bytes,
         ) -> Result<Option<String>, StorageError> {
             self.inner.put_atomic(uri, bytes).await
+        }
+
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
         }
         async fn put_if_match(
             &self,

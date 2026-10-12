@@ -8,12 +8,9 @@
 //! correctness pattern used across the integration tests.
 
 use bytes::Bytes;
-use infino::{
-    superfile::fts::{
-        builder::FtsBuilder,
-        reader::{BoolMode, FtsReader},
-    },
-    test_helpers::default_tokenizer,
+use infino::superfile::fts::{
+    builder::FtsBuilder,
+    reader::{BoolMode, FtsReader},
 };
 
 /// Document count for the two-column FTS pipeline fixture.
@@ -46,8 +43,7 @@ const BMW_MULTISPAN_HIGH_TF_DOCS: u32 = 32;
 const BMW_MULTISPAN_HIGH_TF: usize = 40;
 
 fn build_with_two_columns() -> (Bytes, String) {
-    let tok = default_tokenizer();
-    let mut b = FtsBuilder::new(tok);
+    let mut b = FtsBuilder::new();
     let _ = b
         .register_column("title".into(), false)
         .expect("register column");
@@ -69,8 +65,7 @@ fn build_with_two_columns() -> (Bytes, String) {
     b.add_doc(1, 3, "filler only here").expect("add doc");
 
     let bytes = b.finish().expect("finish fts");
-    let json =
-        r#"[{"name":"title","tokenizer":"ascii_lower"},{"name":"body","tokenizer":"ascii_lower"}]"#;
+    let json = r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75},{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     (Bytes::from(bytes), json.to_string())
 }
 
@@ -246,7 +241,7 @@ fn end_to_end_n_terms_and_columns_reported_correctly() {
 async fn bmw_single_term_matches_brute_force() {
     use infino::superfile::fts::reader::BoolMode;
 
-    let mut b = FtsBuilder::new(default_tokenizer());
+    let mut b = FtsBuilder::new();
     b.register_column("body".into(), false)
         .expect("register column");
 
@@ -266,7 +261,7 @@ async fn bmw_single_term_matches_brute_force() {
         b.add_doc(0, i, &text).expect("add doc");
     }
     let bytes = b.finish().expect("finish fts");
-    let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     let r = FtsReader::open(Bytes::from(bytes), json).expect("open FtsReader");
 
     // Single term → BMW path.
@@ -313,7 +308,7 @@ async fn bmw_single_term_matches_brute_force() {
 async fn bmw_single_term_multispan_matches_brute_force() {
     use infino::superfile::fts::reader::BoolMode;
 
-    let mut b = FtsBuilder::new(default_tokenizer());
+    let mut b = FtsBuilder::new();
     b.register_column("body".into(), false)
         .expect("register column");
 
@@ -350,7 +345,7 @@ async fn bmw_single_term_multispan_matches_brute_force() {
         b.add_doc(0, i, &toks.join(" ")).expect("add doc");
     }
     let bytes = b.finish().expect("finish fts");
-    let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     let r = FtsReader::open(Bytes::from(bytes), json).expect("open FtsReader");
 
     // Single term → coarse-skip BMW path.

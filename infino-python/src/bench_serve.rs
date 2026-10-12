@@ -459,7 +459,8 @@ fn do_search(stream: &mut TcpStream, srv: &ServeState) -> std::io::Result<()> {
         // Pass the per-query beam via the test-and-bench options path (off the
         // public API); ef=0 leaves the engine's stamped curve in charge.
         let opts = VectorSearchOptions::new().with_ef(ef);
-        let batches = match table.vector_search_with_options(&srv.col, &query, k, opts, None, None) {
+        let batches = match table.vector_search_with_options(&srv.col, &query, k, opts, None, None)
+        {
             Ok(b) => b,
             Err(e) => {
                 // A transient engine error fails this one query rather than

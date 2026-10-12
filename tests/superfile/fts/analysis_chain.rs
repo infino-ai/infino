@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! BM25 correctness oracle for a column carrying an **analysis chain**
-//! — a stopword set, a stemmer, or both, on top of a base tokenizer.
+//! — a stopword set, a stemmer, or both, on top of `standard`.
 //!
 //! Same discipline as `brute_force_oracle`: the optimized walks are
 //! graded against the textbook scorer in
@@ -74,13 +74,11 @@ fn corpus() -> Vec<(u64, &'static str)> {
 fn build(
     stopwords: Stopwords,
     stemmer: Stemmer,
-    tokenizer: &str,
 ) -> (SuperfileReader, BruteForceBm25, Arc<dyn Tokenizer>) {
     let corp = corpus();
     let reader = build_infino_superfile_with_fts(
         &corp,
         FtsConfig::new("title")
-            .analyzer(tokenizer)
             .stopwords(stopwords)
             .stemmer(stemmer)
             .positions(true),
@@ -103,32 +101,11 @@ fn build(
 }
 
 /// The chains under test, with the label used in assertion messages.
-fn chains() -> Vec<(&'static str, Stopwords, Stemmer, &'static str)> {
+fn chains() -> Vec<(&'static str, Stopwords, Stemmer)> {
     vec![
-        (
-            "standard+stop",
-            Stopwords::English,
-            Stemmer::None,
-            "standard",
-        ),
-        (
-            "standard+stem",
-            Stopwords::None,
-            Stemmer::English,
-            "standard",
-        ),
-        (
-            "standard+stop+stem",
-            Stopwords::English,
-            Stemmer::English,
-            "standard",
-        ),
-        (
-            "ascii_lower+stop+stem",
-            Stopwords::English,
-            Stemmer::English,
-            "ascii_lower",
-        ),
+        ("standard+stop", Stopwords::English, Stemmer::None),
+        ("standard+stem", Stopwords::None, Stemmer::English),
+        ("standard+stop+stem", Stopwords::English, Stemmer::English),
     ]
 }
 
@@ -204,8 +181,8 @@ async fn chained_columns_match_the_textbook_scorer() {
         // disagreement.
         "the and of",
     ];
-    for (label, stopwords, stemmer, base) in chains() {
-        let (reader, oracle, tok) = build(stopwords, stemmer, base);
+    for (label, stopwords, stemmer) in chains() {
+        let (reader, oracle, tok) = build(stopwords, stemmer);
         assert_eq!(
             tok.name(),
             reader
@@ -233,7 +210,7 @@ async fn chained_columns_match_the_textbook_scorer() {
 /// implementations the same way still fails here.
 #[tokio::test]
 async fn phrase_holes_separate_documents_that_differ_only_by_a_stopword() {
-    let (reader, _, _) = build(Stopwords::English, Stemmer::None, "standard");
+    let (reader, _, _) = build(Stopwords::English, Stemmer::None);
     // Doc 2 is "new york city", doc 3 is "new the york city". Only the
     // first has the two words adjacent.
     assert_eq!(matching(&reader, "\"new york\"").await, HashSet::from([2]));
@@ -258,7 +235,7 @@ async fn phrase_holes_separate_documents_that_differ_only_by_a_stopword() {
 /// other spelling of it.
 #[tokio::test]
 async fn stemming_is_symmetric_across_inflections() {
-    let (reader, _, _) = build(Stopwords::None, Stemmer::English, "standard");
+    let (reader, _, _) = build(Stopwords::None, Stemmer::English);
     // "walking walked walks walk" (doc 10) is reachable by all four.
     for spelling in ["walking", "walked", "walks", "walk"] {
         let hits = matching(&reader, spelling).await;

@@ -133,6 +133,7 @@ impl DiskCacheStore {
                 .remove_if(&uri, |_, entry| reclaimable_lazy_entry(entry))
             {
                 self.release_entry_accounting(&removed);
+                self.retain_block_file(&uri, &removed, now_us);
             }
         }
     }
@@ -258,7 +259,7 @@ impl DiskCacheStore {
             // cannot double-count.
             if self.unindexed.remove(&uri).is_some() {
                 tracing::info!(target: "infino::cache", uri = %uri.0, size, "evict: whole .sf.parquet (budget)");
-                let _ = fs::remove_file(self.cache_path(&uri));
+                self.remove_local_copy(&uri);
                 self.drop_block_file(&uri);
                 self.current_bytes.fetch_sub(size, Ordering::Release);
                 self.n_evictions.fetch_add(1, Ordering::AcqRel);
@@ -321,11 +322,6 @@ impl DiskCacheStore {
             let needed = (cur + bytes).saturating_sub(budget);
             self.evict_at_least(needed).await?;
         }
-    }
-
-    /// Reserve bytes for block-cache growth.
-    pub(crate) async fn reserve_block_bytes(&self, bytes: u64) -> Result<(), DiskCacheError> {
-        self.reserve_manual(bytes).await
     }
 
     /// Reserve `bytes` only if the budget has room now, never evicting. For a caller that cannot
@@ -407,6 +403,16 @@ impl DiskCacheStore {
         })
     }
 
+    /// Like [`Self::reserve`], but only from free space: `None` instead of evicting.
+    pub(crate) fn try_reserve(&self, bytes: u64) -> Option<Reservation<'_>> {
+        self.try_reserve_without_evicting(bytes)
+            .then(|| Reservation {
+                store: self,
+                bytes,
+                committed: false,
+            })
+    }
+
     /// Drive the eviction policy until either `bytes_needed`
     /// is freed or no eligible victims remain (→
     /// `BudgetExceeded`).
@@ -466,8 +472,7 @@ impl DiskCacheStore {
                 // A leftover coordinator would keep the evicted entry, and its budget, alive.
                 self.coordinators.remove(&uri);
 
-                let path = self.cache_path(&uri);
-                let _ = fs::remove_file(&path);
+                self.remove_local_copy(&uri);
                 let _ = fs::remove_file(self.blocks_path(&uri));
                 let _ = fs::remove_file(self.blocks_idx_path(&uri));
                 self.release_entry_accounting(&entry);
@@ -552,12 +557,15 @@ impl<'a> Drop for Reservation<'a> {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use crate::supertable::{
-        manifest::SuperfileUri,
-        reader_cache::{
-            block_source::CACHE_BLOCK_BYTES,
-            config::ColdFetchMode,
-            disk::{budget::*, test_support::*},
+    use crate::{
+        superfile::LazyByteSource,
+        supertable::{
+            manifest::SuperfileUri,
+            reader_cache::{
+                block_source::CACHE_BLOCK_BYTES,
+                config::ColdFetchMode,
+                disk::{budget::*, test_support::*},
+            },
         },
     };
 
@@ -642,6 +650,59 @@ mod tests {
             0,
             "nothing is charged once both entries are gone"
         );
+    }
+
+    /// Opens `uri` lazily for streaming and reads its first byte, so one block is filled.
+    async fn open_and_fill_a_block(store: &Arc<DiskCacheStore>, uri: &SuperfileUri) {
+        store
+            .open_for_query(uri, &uri.storage_path(), None, None, ReadIntent::Stream)
+            .await
+            .expect("stream lazy open");
+        let source = store
+            .cached
+            .get(uri)
+            .and_then(|entry| entry.block_source().map(Arc::clone))
+            .expect("a lazy entry");
+        source.range(0, 1).await.expect("block read");
+    }
+
+    /// A lazy entry the sweep drops leaves its `.blocks` file on disk for a later open to adopt.
+    /// The file must stay charged, or the disk holds bytes the budget cannot see or evict.
+    #[tokio::test]
+    async fn idle_sweep_keeps_charging_the_block_file_it_leaves() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.mmap_cold_threshold_secs = 0;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        open_and_fill_a_block(&store, &uri).await;
+        let filled = store.stats().current_bytes;
+        assert!(filled > 0, "the read filled a block");
+
+        store.sweep_once();
+        assert!(!store.is_cached(&uri), "the idle entry is dropped");
+        assert!(
+            store.blocks_path(&uri).exists(),
+            "its file stays for adoption"
+        );
+        store.assert_budget_consistent();
+        assert_eq!(store.stats().current_bytes, filled, "and stays charged");
+
+        // A reopen adopts the file without charging it twice.
+        open_and_fill_a_block(&store, &uri).await;
+        store.assert_budget_consistent();
+        assert_eq!(store.stats().current_bytes, filled);
+
+        store.sweep_once();
+        store.evict_at_least(filled).await.expect("evict");
+        assert!(
+            !store.blocks_path(&uri).exists(),
+            "eviction reclaims the file"
+        );
+        store.assert_budget_consistent();
+        assert_eq!(store.stats().current_bytes, 0);
     }
 
     #[tokio::test]

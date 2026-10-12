@@ -46,11 +46,14 @@ use thiserror::Error;
 
 use crate::{
     superfile::{fts::reader::ColumnLengthStats, vector::distance::decode_f32_le_vec},
-    supertable::manifest::{
-        ADMIT_CODE_WORD_BITS, CellVectorSummary, ClusterCentroids, FtsSummaryAgg, RabitqAdmitCodes,
-        VectorSummary,
-        bloom::Bloom,
-        list::{ScalarStatsAgg, ScalarValueCounts},
+    supertable::{
+        manifest::{
+            ADMIT_CODE_WORD_BITS, CellVectorSummary, ClusterCentroids, FtsSummaryAgg,
+            RabitqAdmitCodes, VectorSummary,
+            bloom::Bloom,
+            list::{ScalarStatsAgg, ScalarValueCounts},
+        },
+        schema::{FieldId, LegacyNames, parse_wire_key, wire_key},
     },
 };
 
@@ -62,6 +65,10 @@ const CLUSTER_CENTROIDS_WIRE_FP32: u32 = 0x3233_4643;
 /// decodes into the stripped in-memory shape (`vectors_resident()` =
 /// false), so exact scans read the superfile centroid regions.
 const CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY: u32 = 0x3052_4643;
+
+/// What to do about an FTS summary written before it carried length totals.
+const FTS_SUMMARY_TOO_OLD_MSG: &str = "manifest FTS summary has no length totals, so infino < 0.8.3 \
+     wrote it; reindex the table with infino 0.10.0 before upgrading";
 
 /// Which form of each summary cell's cluster block goes on the wire.
 ///
@@ -108,6 +115,11 @@ pub enum DecodeError {
     /// would break prefix-overlap pruning.
     #[error("invalid term range: min_term > max_term (inverted range)")]
     InvalidTermRange,
+
+    /// An FTS summary ends before its length totals, the shape an older
+    /// engine wrote; only a reindex by an engine that reads it repairs it.
+    #[error("{FTS_SUMMARY_TOO_OLD_MSG}")]
+    FtsSummaryTooOld,
 
     /// Arrow IPC parse failed.
     #[error("arrow ipc parse failed: {0}")]
@@ -161,7 +173,7 @@ const VALUE_COUNTS_SUFFIX: &str = "__value_counts";
 const VALUE_COUNTS_VALUE_FIELD: &str = "value";
 const VALUE_COUNTS_COUNT_FIELD: &str = "count";
 
-pub fn encode_scalar_stats(stats: &HashMap<String, ScalarStatsAgg>) -> Vec<u8> {
+pub fn encode_scalar_stats(stats: &HashMap<FieldId, ScalarStatsAgg>) -> Vec<u8> {
     if stats.is_empty() {
         // Empty table → emit a sentinel zero-length blob.
         // Decode treats that as an empty map.
@@ -170,13 +182,14 @@ pub fn encode_scalar_stats(stats: &HashMap<String, ScalarStatsAgg>) -> Vec<u8> {
     // Sort columns for deterministic output. The order
     // doesn't matter for correctness but makes diffs +
     // content-addressing stable.
-    let mut keys: Vec<&String> = stats.keys().collect();
-    keys.sort();
+    let mut ids: Vec<FieldId> = stats.keys().copied().collect();
+    ids.sort();
 
     let mut fields: Vec<Field> = Vec::new();
     let mut arrays: Vec<ArrayRef> = Vec::new();
-    for key in keys {
-        let agg = &stats[key];
+    for id in ids {
+        let agg = &stats[&id];
+        let key = wire_key(id);
         fields.push(Field::new(
             format!("{key}{MIN_SUFFIX}"),
             agg.min.data_type().clone(),
@@ -237,7 +250,10 @@ pub fn encode_scalar_stats(stats: &HashMap<String, ScalarStatsAgg>) -> Vec<u8> {
     out
 }
 
-pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAgg>, DecodeError> {
+pub fn decode_scalar_stats(
+    bytes: &[u8],
+    legacy: Option<&LegacyNames>,
+) -> Result<HashMap<FieldId, ScalarStatsAgg>, DecodeError> {
     if bytes.is_empty() {
         return Ok(HashMap::new());
     }
@@ -313,7 +329,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
             maxes.len()
         )));
     }
-    let mut stats: HashMap<String, ScalarStatsAgg> = HashMap::new();
+    let mut stats: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
     for (base, min) in mins {
         let max = maxes.remove(&base).ok_or_else(|| {
             DecodeError::ArrowIpc(format!("column {base} has __min but no __max"))
@@ -322,17 +338,21 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
         let sum = sums.remove(&base);
         let hll = hlls.remove(&base);
         let value_counts = value_counts.remove(&base);
-        stats.insert(
-            base,
-            ScalarStatsAgg {
-                min,
-                max,
-                null_count,
-                sum,
-                hll,
-                value_counts,
-            },
-        );
+        // A key the table cannot resolve (an older artifact's name for a
+        // column that no longer exists) carries stats nothing will look up.
+        if let Some(id) = parse_wire_key(&base, legacy) {
+            stats.insert(
+                id,
+                ScalarStatsAgg {
+                    min,
+                    max,
+                    null_count,
+                    sum,
+                    hll,
+                    value_counts,
+                },
+            );
+        }
     }
     // Each matched base was `remove`d from the optional maps above, so a
     // leftover entry is a `__nulls` / `__sum` / `__hll` field whose base
@@ -512,18 +532,15 @@ pub(crate) fn decode_length1_array(bytes: &[u8]) -> Result<ArrayRef, DecodeError
 //   [min_term bytes]
 //   u32 max_term_len
 //   [max_term bytes]               (empty min+max ⇒ no range, i.e. None)
-//   u64 total_tokens               ┐ optional tail: present together or
-//   u64 n_scored_docs              ┘ not at all (⇒ length_stats None)
+//   u64 total_tokens
+//   u64 n_scored_docs
 //
-// The trailing pair is a compatible extension in both directions, and
-// both directions are exercised by the round-trip tests. A summary
-// written before it existed simply ends after `max_term`, and the
-// decoder reads the absent tail as "no totals recorded"; a decoder that
-// predates it stops after `max_term` and ignores what follows, because
-// each summary is a length-delimited blob inside the manifest's binary
-// column rather than a stream this shares with anything else. That
-// second property is what makes appending safe here, so it is load
-// bearing: do not add a trailing-bytes rejection to this decoder.
+// A payload that ends after `max_term` is an older engine's, which
+// carried no totals, and is refused with the fix; one ending inside
+// them is truncated. Each summary is a length-delimited blob inside
+// the manifest's binary column, so a field appended after the totals
+// is invisible to a decoder that stops reading here — which is what
+// makes appending safe, so do not add a trailing-bytes rejection.
 //
 // ---------------------------------------------------------
 
@@ -587,17 +604,13 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
     } else {
         return Err(DecodeError::InvalidTermRange);
     };
-    // The totals are optional and go together: a summary that predates
-    // them ends here. Read both or neither — a tail carrying only one is
-    // a truncated write, not an older writer, so it is rejected rather
-    // than half-believed.
-    let length_stats = match c.get_ref().len() - c.position() as usize {
-        0 => None,
-        _ => Some(ColumnLengthStats {
-            total_tokens: read_u64(&mut c, "total_tokens")?,
-            n_scored_docs: read_u64(&mut c, "n_scored_docs")?,
-        }),
-    };
+    if c.position() as usize == c.get_ref().len() {
+        return Err(DecodeError::FtsSummaryTooOld);
+    }
+    let length_stats = Some(ColumnLengthStats {
+        total_tokens: read_u64(&mut c, "total_tokens")?,
+        n_scored_docs: read_u64(&mut c, "n_scored_docs")?,
+    });
     Ok(FtsSummaryAgg {
         term_bloom,
         n_terms_distinct,
@@ -827,14 +840,15 @@ pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError>
 //     [value_len bytes]  (encode_<inner>)
 // ---------------------------------------------------------
 
-pub fn encode_fts_summary_map(map: &HashMap<String, FtsSummaryAgg>) -> Vec<u8> {
-    let mut keys: Vec<&String> = map.keys().collect();
-    keys.sort();
+pub fn encode_fts_summary_map(map: &HashMap<FieldId, FtsSummaryAgg>) -> Vec<u8> {
+    let mut ids: Vec<FieldId> = map.keys().copied().collect();
+    ids.sort();
     let mut out = Vec::new();
-    out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
-    for k in keys {
-        let key_bytes = k.as_bytes();
-        let value_bytes = encode_fts_summary(&map[k]);
+    out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    for id in ids {
+        let key = wire_key(id);
+        let key_bytes = key.as_bytes();
+        let value_bytes = encode_fts_summary(&map[&id]);
         out.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(key_bytes);
         out.extend_from_slice(&(value_bytes.len() as u32).to_le_bytes());
@@ -843,7 +857,10 @@ pub fn encode_fts_summary_map(map: &HashMap<String, FtsSummaryAgg>) -> Vec<u8> {
     out
 }
 
-pub fn decode_fts_summary_map(bytes: &[u8]) -> Result<HashMap<String, FtsSummaryAgg>, DecodeError> {
+pub fn decode_fts_summary_map(
+    bytes: &[u8],
+    legacy: Option<&LegacyNames>,
+) -> Result<HashMap<FieldId, FtsSummaryAgg>, DecodeError> {
     let mut c = Cursor::new(bytes);
     let n = read_u32(&mut c, "fts_map_n")? as usize;
     let mut out = HashMap::with_capacity(n);
@@ -854,22 +871,25 @@ pub fn decode_fts_summary_map(bytes: &[u8]) -> Result<HashMap<String, FtsSummary
             .map_err(|e| DecodeError::ArrowIpc(format!("fts key utf-8: {e}")))?;
         let vl = read_u32(&mut c, "fts_value_len")? as usize;
         let v = view_n(&mut c, vl, "fts_value")?;
-        out.insert(key, decode_fts_summary(v)?);
+        if let Some(id) = parse_wire_key(&key, legacy) {
+            out.insert(id, decode_fts_summary(v)?);
+        }
     }
     Ok(out)
 }
 
 pub fn encode_vector_summary_map(
-    map: &HashMap<String, VectorSummary>,
+    map: &HashMap<FieldId, VectorSummary>,
     mode: SummaryWireMode,
 ) -> Vec<u8> {
-    let mut keys: Vec<&String> = map.keys().collect();
-    keys.sort();
+    let mut ids: Vec<FieldId> = map.keys().copied().collect();
+    ids.sort();
     let mut out = Vec::new();
-    out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
-    for k in keys {
-        let key_bytes = k.as_bytes();
-        let value_bytes = encode_vector_summary(&map[k], mode);
+    out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    for id in ids {
+        let key = wire_key(id);
+        let key_bytes = key.as_bytes();
+        let value_bytes = encode_vector_summary(&map[&id], mode);
         out.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(key_bytes);
         out.extend_from_slice(&(value_bytes.len() as u32).to_le_bytes());
@@ -880,7 +900,8 @@ pub fn encode_vector_summary_map(
 
 pub fn decode_vector_summary_map(
     bytes: &[u8],
-) -> Result<HashMap<String, VectorSummary>, DecodeError> {
+    legacy: Option<&LegacyNames>,
+) -> Result<HashMap<FieldId, VectorSummary>, DecodeError> {
     let mut c = Cursor::new(bytes);
     let n = read_u32(&mut c, "vec_map_n")? as usize;
     let mut out = HashMap::with_capacity(n);
@@ -891,7 +912,9 @@ pub fn decode_vector_summary_map(
             .map_err(|e| DecodeError::ArrowIpc(format!("vec key utf-8: {e}")))?;
         let vl = read_u32(&mut c, "vec_value_len")? as usize;
         let v = view_n(&mut c, vl, "vec_value")?;
-        out.insert(key, decode_vector_summary(v)?);
+        if let Some(id) = parse_wire_key(&key, legacy) {
+            out.insert(id, decode_vector_summary(v)?);
+        }
     }
     Ok(out)
 }
@@ -954,17 +977,37 @@ mod decode_error_tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        DecodeError, ScalarStatsAgg, ScalarValue, ScalarValueCounts, decode_fts_summary,
-        decode_fts_summary_map, decode_length1_array, decode_scalar_stats, decode_value_counts,
-        decode_vector_summary, decode_vector_summary_map, encode_fts_summary, encode_length1_array,
-        encode_scalar_stats, read_n, read_u32,
+        DecodeError, FTS_SUMMARY_TOO_OLD_MSG, ScalarStatsAgg, ScalarValue, ScalarValueCounts,
+        decode_fts_summary, decode_fts_summary_map, decode_length1_array, decode_scalar_stats,
+        decode_value_counts, decode_vector_summary, decode_vector_summary_map, encode_fts_summary,
+        encode_length1_array, encode_scalar_stats, read_n, read_u32,
     };
-    use crate::{superfile::fts::reader::ColumnLengthStats, supertable::manifest::FtsSummaryAgg};
+    use crate::{
+        superfile::fts::reader::ColumnLengthStats,
+        supertable::{
+            manifest::FtsSummaryAgg,
+            schema::{FieldId, wire_key},
+        },
+        test_helpers::fid,
+    };
 
     /// Hand-build a `decode_fts_summary` payload: no bloom, a given
-    /// distinct count, then the `(min_term, max_term)` pair verbatim.
-    /// Lets a test plant a half-empty range the encoder would never emit.
+    /// distinct count, the `(min_term, max_term)` pair verbatim, then the
+    /// totals. Lets a test plant a half-empty range the encoder would
+    /// never emit.
     fn fts_summary_bytes(n_terms_distinct: u32, min_term: &[u8], max_term: &[u8]) -> Vec<u8> {
+        let mut out = fts_summary_bytes_without_totals(n_terms_distinct, min_term, max_term);
+        out.extend_from_slice(&TEST_TOTAL_TOKENS.to_le_bytes());
+        out.extend_from_slice(&TEST_SCORED_DOCS.to_le_bytes());
+        out
+    }
+
+    /// [`fts_summary_bytes`] ending after `max_term`, with no totals.
+    fn fts_summary_bytes_without_totals(
+        n_terms_distinct: u32,
+        min_term: &[u8],
+        max_term: &[u8],
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&0u32.to_le_bytes()); // bloom_len = 0 ⇒ no bloom
         out.extend_from_slice(&n_terms_distinct.to_le_bytes());
@@ -975,23 +1018,38 @@ mod decode_error_tests {
         out
     }
 
-    // ---- FtsSummaryAgg length totals: an optional wire tail ----
+    // ---- FtsSummaryAgg length totals: the wire tail ----
 
     /// Totals a test can recognise on the way back out.
     const TEST_TOTAL_TOKENS: u64 = 4_242;
     const TEST_SCORED_DOCS: u64 = 707;
 
     #[test]
-    fn fts_summary_without_totals_decodes_as_absent() {
-        // Exactly what a writer that predates the totals emits: the
-        // payload ends after `max_term`. It must decode cleanly, with
-        // the totals reported as unknown rather than as zero — zero
-        // would claim a column with no documents and silently shrink
-        // the table-wide average and collection size.
-        let bytes = fts_summary_bytes(3, b"a", b"z");
-        let got = decode_fts_summary(&bytes).expect("legacy payload decodes");
-        assert_eq!(got.length_stats, None);
-        assert_eq!(got.n_terms_distinct, 3);
+    fn fts_summary_without_totals_is_rejected() {
+        // Reading a missing tail as zero would claim a column with no
+        // documents and silently shrink the table-wide average and
+        // collection size.
+        let bytes = fts_summary_bytes_without_totals(3, b"a", b"z");
+        let err = decode_fts_summary(&bytes).expect_err("a payload without totals must not decode");
+        assert!(matches!(err, DecodeError::FtsSummaryTooOld), "{err:?}");
+        assert_eq!(err.to_string(), FTS_SUMMARY_TOO_OLD_MSG);
+    }
+
+    #[test]
+    fn fts_summary_map_without_totals_names_the_fix() {
+        // The map decoder is the manifest part's entry point; the fix must survive it.
+        let value = fts_summary_bytes_without_totals(3, b"a", b"z");
+        let key = wire_key(fid("body"));
+        let key = key.as_bytes();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&value);
+        let err =
+            decode_fts_summary_map(&bytes, None).expect_err("an old summary map must not decode");
+        assert!(matches!(err, DecodeError::FtsSummaryTooOld), "{err:?}");
     }
 
     #[test]
@@ -1010,44 +1068,8 @@ mod decode_error_tests {
     }
 
     #[test]
-    fn a_decoder_without_the_tail_still_reads_a_payload_carrying_one() {
-        // Forward compatibility, and the reason appending is safe here:
-        // each summary is a length-delimited blob, and a decoder that
-        // stops after `max_term` simply never looks at what follows.
-        // Modelled by decoding a payload with the tail using the
-        // field-by-field reads an older decoder performed.
-        let agg = FtsSummaryAgg {
-            term_bloom: None,
-            n_terms_distinct: 5,
-            term_range: Some((b"aa".to_vec(), b"zz".to_vec())),
-            length_stats: Some(ColumnLengthStats {
-                total_tokens: TEST_TOTAL_TOKENS,
-                n_scored_docs: TEST_SCORED_DOCS,
-            }),
-        };
-        let bytes = encode_fts_summary(&agg);
-        let mut c = Cursor::new(bytes.as_slice());
-        let bloom_len = read_u32(&mut c, "bloom_len").expect("bloom_len") as usize;
-        assert_eq!(bloom_len, 0);
-        assert_eq!(read_u32(&mut c, "n_terms").expect("n_terms"), 5);
-        let min_len = read_u32(&mut c, "min_len").expect("min_len") as usize;
-        assert_eq!(read_n(&mut c, min_len, "min").expect("min"), b"aa");
-        let max_len = read_u32(&mut c, "max_len").expect("max_len") as usize;
-        assert_eq!(read_n(&mut c, max_len, "max").expect("max"), b"zz");
-        // An older decoder returns here; the trailing bytes are simply
-        // the ones it never consumed.
-        assert_eq!(
-            bytes.len() - c.position() as usize,
-            2 * size_of::<u64>(),
-            "the tail must be exactly the two totals"
-        );
-    }
-
-    #[test]
     fn fts_summary_truncated_tail_is_rejected() {
-        // Half a tail is a truncated write, not an older writer. Reading
-        // it as "no totals" would let corruption pass as a legacy
-        // payload.
+        // Half a tail is a truncated write.
         let agg = FtsSummaryAgg {
             term_bloom: None,
             n_terms_distinct: 1,
@@ -1059,7 +1081,8 @@ mod decode_error_tests {
         };
         let bytes = encode_fts_summary(&agg);
         let truncated = &bytes[..bytes.len() - size_of::<u64>()];
-        decode_fts_summary(truncated).expect_err("half a tail must not decode");
+        let err = decode_fts_summary(truncated).expect_err("half a tail must not decode");
+        assert!(matches!(err, DecodeError::Truncated { .. }), "{err:?}");
     }
 
     /// One length-1 arrow-IPC RecordBatch with the given fields/columns,
@@ -1160,7 +1183,7 @@ mod decode_error_tests {
     /// `encode_scalar_stats` emits for an empty input).
     #[test]
     fn decode_scalar_stats_empty_is_empty_table() {
-        let table = decode_scalar_stats(&[]).expect("empty");
+        let table = decode_scalar_stats(&[], None).expect("empty");
         assert!(table.is_empty());
         // The empty table round-trips back to a zero-length blob.
         assert!(encode_scalar_stats(&HashMap::new()).is_empty());
@@ -1176,10 +1199,10 @@ mod decode_error_tests {
         let i64_arr = |v: i64| Arc::new(Int64Array::from(vec![v])) as ArrayRef;
         let str_arr = |v: &str| Arc::new(StringArray::from(vec![v])) as ArrayRef;
 
-        let mut table: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        let mut table: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
         // Every stat present.
         table.insert(
-            "full".into(),
+            fid("full"),
             ScalarStatsAgg {
                 min: i64_arr(1),
                 max: i64_arr(100),
@@ -1194,12 +1217,12 @@ mod decode_error_tests {
         );
         // Min/max only (the `from_min_max` shape).
         table.insert(
-            "bounds_only".into(),
+            fid("bounds_only"),
             ScalarStatsAgg::from_min_max(str_arr("alpha"), str_arr("omega")),
         );
         // Nulls but no sum/hll (e.g. a non-summable type that still counts nulls).
         table.insert(
-            "nulls_no_sum".into(),
+            fid("nulls_no_sum"),
             ScalarStatsAgg {
                 min: i64_arr(-3),
                 max: i64_arr(9),
@@ -1210,14 +1233,14 @@ mod decode_error_tests {
             },
         );
 
-        let decoded = decode_scalar_stats(&encode_scalar_stats(&table)).expect("round-trip");
+        let decoded = decode_scalar_stats(&encode_scalar_stats(&table), None).expect("round-trip");
         assert_eq!(decoded, table);
     }
 
     /// Garbage (non-arrow-IPC) bytes surface an `ArrowIpc` decode error.
     #[test]
     fn decode_scalar_stats_garbage_is_arrow_ipc_error() {
-        let err = decode_scalar_stats(b"definitely not arrow ipc").expect_err("garbage");
+        let err = decode_scalar_stats(b"definitely not arrow ipc", None).expect_err("garbage");
         assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
     }
 
@@ -1228,7 +1251,7 @@ mod decode_error_tests {
             vec![Field::new("c__nulls", DataType::Int64, true)],
             vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
         );
-        let err = decode_scalar_stats(&bytes).expect_err("bad nulls type");
+        let err = decode_scalar_stats(&bytes, None).expect_err("bad nulls type");
         assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
     }
 
@@ -1239,7 +1262,7 @@ mod decode_error_tests {
             vec![Field::new("c__bogus", DataType::Int64, true)],
             vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
         );
-        let err = decode_scalar_stats(&bytes).expect_err("bad suffix");
+        let err = decode_scalar_stats(&bytes, None).expect_err("bad suffix");
         assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
     }
 
@@ -1347,7 +1370,7 @@ mod decode_error_tests {
             vec![Field::new("c__min", DataType::Utf8, true)],
             vec![Arc::new(StringArray::from(vec!["a"])) as ArrayRef],
         );
-        let err = decode_scalar_stats(&bytes).expect_err("unpaired min");
+        let err = decode_scalar_stats(&bytes, None).expect_err("unpaired min");
         assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
     }
 
@@ -1370,12 +1393,12 @@ mod decode_error_tests {
         bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.push(0xff);
-        let fts_err = decode_fts_summary_map(&bytes).expect_err("bad fts key");
+        let fts_err = decode_fts_summary_map(&bytes, None).expect_err("bad fts key");
         assert!(
             matches!(fts_err, DecodeError::ArrowIpc(_)),
             "got {fts_err:?}"
         );
-        let vec_err = decode_vector_summary_map(&bytes).expect_err("bad vec key");
+        let vec_err = decode_vector_summary_map(&bytes, None).expect_err("bad vec key");
         assert!(
             matches!(vec_err, DecodeError::ArrowIpc(_)),
             "got {vec_err:?}"
@@ -1417,9 +1440,9 @@ mod decode_error_tests {
     #[test]
     fn decode_summary_maps_empty() {
         let zero = 0u32.to_le_bytes().to_vec();
-        let fts: HashMap<_, _> = decode_fts_summary_map(&zero).expect("empty fts");
+        let fts: HashMap<_, _> = decode_fts_summary_map(&zero, None).expect("empty fts");
         assert!(fts.is_empty());
-        let vec: HashMap<_, _> = decode_vector_summary_map(&zero).expect("empty vec");
+        let vec: HashMap<_, _> = decode_vector_summary_map(&zero, None).expect("empty vec");
         assert!(vec.is_empty());
     }
 
@@ -1470,7 +1493,7 @@ mod decode_error_tests {
             w.write(&batch).expect("write 2");
             w.finish().expect("finish");
         }
-        let err = decode_scalar_stats(&out).expect_err("two batches");
+        let err = decode_scalar_stats(&out, None).expect_err("two batches");
         assert!(
             matches!(err, DecodeError::UnexpectedBatchCount(2)),
             "got {err:?}"
@@ -1485,7 +1508,7 @@ mod decode_error_tests {
             vec![Field::new("c__hll", DataType::Int64, true)],
             vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
         );
-        let err = decode_scalar_stats(&bytes).expect_err("bad hll type");
+        let err = decode_scalar_stats(&bytes, None).expect_err("bad hll type");
         assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
     }
 
@@ -1507,7 +1530,7 @@ mod decode_error_tests {
                 Arc::new(Int64Array::from(vec![3])) as ArrayRef,
             ],
         );
-        let err = decode_scalar_stats(&bytes).expect_err("orphan __sum");
+        let err = decode_scalar_stats(&bytes, None).expect_err("orphan __sum");
         assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
     }
 
@@ -1526,7 +1549,7 @@ mod decode_error_tests {
                 Arc::new(Int64Array::from(vec![2])) as ArrayRef,
             ],
         );
-        let err = decode_scalar_stats(&bytes).expect_err("mismatched bases");
+        let err = decode_scalar_stats(&bytes, None).expect_err("mismatched bases");
         assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
     }
 }

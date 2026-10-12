@@ -1809,23 +1809,21 @@ pub mod fts {
             emit_ingest(&mut report, n_docs, metrics);
         }
 
-        // Maintenance parity for the global-stats default: publish the
-        // term-stats sidecar over the fresh fragmented layout via a
-        // stats-only optimize (both merge triggers disabled, so the
-        // superfile layout is untouched). The read phases then measure
-        // the maintained shape a production table sits in. On an engine
-        // without the sidecar this is a no-op maintenance pass.
+        // Fold the term index over the fresh fragmented layout with a
+        // maintenance-only optimize (both merge triggers disabled, so the
+        // superfile layout is untouched). The read phases then measure the
+        // maintained shape a production table sits in.
         if corpus.is_some() && phases.reads() {
             let (cache_dir, admin) = open_consumer(Modality::Fts, &built);
-            let stats_only = OptimizeOptions::compact(CompactionSettings {
+            let maintenance_only = OptimizeOptions::compact(CompactionSettings {
                 min_fill_percent: 100,
                 min_superfiles_for_merge: u64::MAX,
                 ..CompactionSettings::default()
             });
-            let (result, wall, _cpu) = cpu::timed(|| admin.optimize(&stats_only));
-            result.expect("stats-only optimize");
+            let (result, wall, _cpu) = cpu::timed(|| admin.optimize(&maintenance_only));
+            result.expect("maintenance-only optimize");
             eprintln!(
-                "[supertable_fts] term-stats maintenance (stats-only optimize): {:.1}s, {} superfiles",
+                "[supertable_fts] term-index maintenance: {:.1}s, {} superfiles",
                 wall.as_secs_f64(),
                 admin.reader().expect("reader").n_superfiles()
             );

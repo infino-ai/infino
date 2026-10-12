@@ -59,17 +59,19 @@ use futures::stream;
 use crate::{
     superfile::reader::VectorSearchOptions,
     supertable::{
+        error::QueryError,
         handle::{SupertableReader, WeakReader},
         query::{
             candidate::CandidatePlan,
             exec::common::{
                 PushedPredicate, SCORE_COLUMN, arg_to_string, arg_to_usize,
-                candidate_plan_for_filters, fill_top_k, output_schema_with_score, resolve_hits,
-                search_query_df_error,
+                candidate_plan_for_filters, fill_top_k, live_reader, output_schema_with_score,
+                resolve_hits, scope_to_call, traced_tvf,
             },
             vector::{free_column_slot, hits_id_score_batch, user_placement_for_scalar_resolve},
         },
     },
+    utils::trace::detail_span,
 };
 
 /// SQL name the TVF is registered under.
@@ -126,20 +128,19 @@ impl TableFunctionImpl for VectorSearchFunc {
         let column = arg_to_string(&args[0], "column")?;
         let query = arg_to_query_vector(&args[1])?;
         let k = arg_to_usize(&args[2], "k")?;
-        let reader = self.reader.upgrade().ok_or_else(|| {
-            DataFusionError::Execution(
-                "vector_search: supertable consumer dropped before execution".into(),
-            )
-        })?;
-        Ok(Arc::new(VectorSearchTable {
-            reader,
-            column,
-            query,
-            k,
-            options: VectorSearchOptions::new(),
-            scalar_schema: Arc::clone(&self.scalar_schema),
-            output_schema: Arc::clone(&self.output_schema),
-        }))
+        let reader = live_reader(&self.reader, "vector_search")?;
+        scope_to_call(
+            VECTOR_SEARCH_UDTF,
+            Arc::new(VectorSearchTable {
+                reader,
+                column,
+                query,
+                k,
+                options: VectorSearchOptions::new(),
+                scalar_schema: Arc::clone(&self.scalar_schema),
+                output_schema: Arc::clone(&self.output_schema),
+            }),
+        )
     }
 }
 
@@ -269,7 +270,7 @@ impl VectorSearchExec {
             Some(indices) => Arc::new(
                 output_schema
                     .project(indices)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+                    .map_err(QueryError::internal)?,
             ),
             None => Arc::clone(&output_schema),
         };
@@ -428,7 +429,7 @@ impl ExecutionPlan for VectorSearchExec {
                                 .await?
                         }
                     };
-                    Ok(hits)
+                    Ok::<_, QueryError>(hits)
                 }
             };
             // Same stamp guard as the hybrid exec path: unstamped hits fall
@@ -438,16 +439,13 @@ impl ExecutionPlan for VectorSearchExec {
             if filters.is_empty()
                 && let Some(indices) = id_score_projection
             {
-                let hits = search(k).await.map_err(search_query_df_error)?;
+                let hits = search(k).await?;
                 if hits.iter().all(|hit| hit.stable_id.is_some()) {
-                    return hits_id_score_batch(&reader, &hits)
-                        .map_err(|e| DataFusionError::Execution(e.to_string()))?
+                    return hits_id_score_batch(&reader, &hits)?
                         .project(&indices)
-                        .map_err(|e| DataFusionError::Execution(e.to_string()));
+                        .map_err(|e| QueryError::internal(e).into());
                 }
-                let hits = user_placement_for_scalar_resolve(&reader, &hits)
-                    .await
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                let hits = user_placement_for_scalar_resolve(&reader, &hits).await?;
                 return resolve_hits(
                     &reader,
                     &hits,
@@ -478,6 +476,12 @@ impl ExecutionPlan for VectorSearchExec {
             .await
         };
 
+        let span = detail_span!(
+            "tvf.vector_search",
+            k = self.k,
+            rows_out = tracing::field::Empty
+        );
+        let fut = traced_tvf(span, fut);
         let stream = stream::once(fut);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,
@@ -604,7 +608,6 @@ mod tests {
     use crate::{
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -626,12 +629,6 @@ mod tests {
     }
 
     fn options_one_superfile_per_commit(dim: usize) -> SupertableOptions {
-        options_one_superfile_per_commit_with(dim, ASCII_LOWER_TOKENIZER)
-    }
-
-    /// [`options_one_superfile_per_commit`] with `title` analyzed by the
-    /// named analyzer.
-    fn options_one_superfile_per_commit_with(dim: usize, analyzer: &str) -> SupertableOptions {
         let pool = Arc::new(
             ThreadPoolBuilder::new()
                 .num_threads(1)
@@ -644,7 +641,7 @@ mod tests {
         ]));
         SupertableOptions::new(
             schema,
-            vec![FtsConfig::new("title").analyzer(analyzer)],
+            vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
@@ -701,17 +698,15 @@ mod tests {
         let titles: Vec<String> = (0..n)
             .map(|i| if i < n_common { "common" } else { "rare" }.to_owned())
             .collect();
-        supertable_ranked_by_index(dim, &titles, ASCII_LOWER_TOKENIZER)
+        supertable_ranked_by_index(dim, &titles)
     }
 
     /// Single-superfile table where doc `i` carries `titles[i]` and the
     /// vector `[1, i, 0, …]`, so distance to the query `[1, 0, …]` ranks by
-    /// index (see [`supertable_for_pushdown`]). `title` is analyzed with
-    /// `tokenizer`. Requires `dim >= 2`.
-    fn supertable_ranked_by_index(dim: usize, titles: &[String], analyzer: &str) -> Supertable {
+    /// index (see [`supertable_for_pushdown`]). Requires `dim >= 2`.
+    fn supertable_ranked_by_index(dim: usize, titles: &[String]) -> Supertable {
         let n = titles.len();
-        let st = Supertable::create(options_one_superfile_per_commit_with(dim, analyzer))
-            .expect("create");
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         let titles = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
@@ -1060,7 +1055,7 @@ mod tests {
         .iter()
         .map(|t| (*t).to_owned())
         .collect();
-        let st = supertable_ranked_by_index(dim, &titles, STANDARD_TOKENIZER);
+        let st = supertable_ranked_by_index(dim, &titles);
         let q = csv_one_hot(dim, 0);
         let filtered = st
             .reader()
@@ -1086,7 +1081,7 @@ mod tests {
         let dim = 16;
         let k = 3;
         let titles: Vec<String> = (0..LIKE_MAX_TERMS + 8).map(|i| format!("w{i}zz")).collect();
-        let st = supertable_ranked_by_index(dim, &titles, STANDARD_TOKENIZER);
+        let st = supertable_ranked_by_index(dim, &titles);
         let q = csv_one_hot(dim, 0);
         // Contains: no manifest gate at all.
         let contains = st
@@ -1339,8 +1334,8 @@ mod tests {
         let dim = 16;
         let st = supertable_one_superfile(dim, 8);
         let reader = Arc::new(st.reader().expect("reader"));
-        let scalar_schema = reader.options().scalar_schema();
-        use crate::supertable::query::exec::common::test_support::call_tvf;
+        let scalar_schema = reader.manifest().scalar_schema();
+        use crate::supertable::query::exec::common::test_support::{call_tvf, scoped_inner};
         let func = VectorSearchFunc::new(reader, scalar_schema);
         let table = call_tvf(&func, &[lit("emb"), lit(csv_one_hot(dim, 0)), lit(5_i64)])
             .expect("vector table");
@@ -1348,7 +1343,9 @@ mod tests {
         let dbg = format!("{table:?}");
         assert!(dbg.contains("VectorSearchTable"), "Debug missing: {dbg}");
         assert!(
-            table.downcast_ref::<VectorSearchTable>().is_some(),
+            scoped_inner(&table)
+                .downcast_ref::<VectorSearchTable>()
+                .is_some(),
             "as_any downcasts to VectorSearchTable"
         );
         assert_eq!(table.table_type(), TableType::Base);

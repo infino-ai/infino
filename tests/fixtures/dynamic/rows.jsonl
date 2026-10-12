@@ -1,0 +1,4 @@
+{"title": "first post", "views": 10, "score": 4.5, "published": true, "tags": ["a", "b"], "author": {"name": "ann", "age": 31}}
+{"title": "second post", "views": 25, "tags": ["b"], "author": {"name": "bob"}, "meta": {"source": "import", "attempt": 2}}
+{"title": "third", "score": 3, "published": false, "author": {"name": "cy", "handles": ["@cy", "cy2"]}, "ratings": [4, 4.5, 5], "notes": null, "empty": []}
+{"title": "fourth", "views": 7, "comments": [{"user": "ann", "stars": 5}, {"user": "bob", "stars": 3}]}

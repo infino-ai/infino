@@ -5,19 +5,19 @@
 //! search path.
 //!
 //! The supertable shards the corpus across N superfiles. Each
-//! superfile runs its own BM25 with its own per-superfile IDF +
-//! avgdl, and the supertable merges the per-superfile top-k into a
-//! global top-k. This oracle mirrors that shape with a per-superfile
-//! brute-force BM25 and a global merge, then asserts the
-//! supertable's hits match.
+//! superfile scores with table-wide IDF and the average document length
+//! it declares (the table-wide average as of its commit), and the
+//! supertable merges the per-superfile top-k into a global top-k. This
+//! oracle mirrors that shape: one brute-force BM25 per superfile, each
+//! indexed over the whole corpus and re-pointed at that file's declared
+//! average, restricted to the file's rows and merged globally.
 //!
 //! ## What this oracle catches
 //!
-//! Per-superfile brute-force catches per-superfile scoring bugs (same
-//! as the single-superfile oracle in
-//! `tests/superfile/fts/brute_force_oracle.rs`). The cross-superfile
-//! merge catches a separate class of bugs that the single-superfile
-//! oracle can't see: wrong superfile partitioning, wrong tagging of
+//! Scoring bugs (same as the single-superfile oracle in
+//! `tests/superfile/fts/brute_force_oracle.rs`), wrong table-wide
+//! statistics, and the cross-superfile bugs the single-superfile oracle
+//! can't see: wrong superfile partitioning, wrong tagging of
 //! per-superfile hits with their superfile URI, wrong score-direction
 //! in the top-k merge.
 //!
@@ -44,7 +44,7 @@ use infino::{
         builder::FtsConfig,
         fts::{
             bm25::stored_avgdl,
-            reader::{Bm25Stats, BoolMode, ColumnLengthStats},
+            reader::{BoolMode, ColumnLengthStats},
             tokenize::Phrase,
         },
     },
@@ -230,29 +230,10 @@ fn supertable_to_global_ids(
 }
 
 fn supertable_search_global(st: &Supertable, query: &str, k: usize, chunk_size: usize) -> Vec<u64> {
-    supertable_search_stats(st, query, k, chunk_size, Bm25Stats::PerSuperfile)
-}
-
-/// OR-mode supertable search under an explicit statistics scope. The
-/// per-superfile oracles below model local-idf scoring, so tests
-/// comparing against them pin `PerSuperfile`; the whole-corpus oracle
-/// arm compares against `Global`.
-fn supertable_search_stats(
-    st: &Supertable,
-    query: &str,
-    k: usize,
-    chunk_size: usize,
-    stats: Bm25Stats,
-) -> Vec<u64> {
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_hits(
-            "title",
-            query,
-            k,
-            Bm25SearchOptions::new().with_stats(stats),
-        )
+        .bm25_hits("title", query, k, Bm25SearchOptions::new())
         .expect("supertable bm25");
     supertable_to_global_ids(st, hits, chunk_size)
 }
@@ -270,9 +251,7 @@ fn supertable_search_and_global(
             "title",
             query,
             k,
-            Bm25SearchOptions::new()
-                .with_mode(BoolMode::And)
-                .with_stats(Bm25Stats::PerSuperfile),
+            Bm25SearchOptions::new().with_mode(BoolMode::And),
         )
         .expect("supertable bm25 AND");
     supertable_to_global_ids(st, hits, chunk_size)
@@ -294,32 +273,67 @@ fn supertable_prefix_global(
 
 // ---- Brute-force oracle (per-superfile + global merge) ---------------
 
-/// Build a per-superfile BruteForceBm25 oracle list. Index i scores
-/// superfile i with that superfile's own IDF/avgdl, mirroring the
-/// supertable's per-superfile scoring shape.
-/// Per-superfile oracles that score with `params` rather than the
-/// standard pair — the reference side of a declared-parameter fixture.
+/// One superfile's reference scorer: indexed over the whole corpus (so
+/// idf is table-wide), normalizing lengths at the average the file
+/// declares, and answering only for the rows the file holds.
+struct FileOracle {
+    scorer: BruteForceBm25,
+    rows: Range<u64>,
+}
+
+impl FileOracle {
+    /// This file's rows out of a whole-corpus ranking.
+    fn own(&self, hits: Vec<(u64, f32)>) -> impl Iterator<Item = (u64, f32)> + '_ {
+        hits.into_iter().filter(|(d, _)| self.rows.contains(d))
+    }
+}
+
+/// File oracles that score with `params` rather than the standard
+/// pair — the reference side of a declared-parameter fixture.
 fn build_oracles_with_params(
     corpus: &[(u64, String)],
     n_superfiles: usize,
     params: OracleBm25Params,
-) -> Vec<BruteForceBm25> {
+) -> Vec<FileOracle> {
     build_oracles(corpus, n_superfiles)
         .into_iter()
-        .map(|o| o.with_params(params))
+        .map(|o| FileOracle {
+            scorer: o.scorer.with_params(params),
+            rows: o.rows,
+        })
         .collect()
 }
 
-fn build_oracles(corpus: &[(u64, String)], n_superfiles: usize) -> Vec<BruteForceBm25> {
+/// One [`FileOracle`] per superfile [`build_supertable`] writes. Each
+/// commit holds one chunk, so a file declares the average over every
+/// row up to and including its own chunk, rounded as the writer stores
+/// it.
+fn build_oracles(corpus: &[(u64, String)], n_superfiles: usize) -> Vec<FileOracle> {
     let tok = default_tokenizer();
+    let view: Vec<(u64, &str)> = corpus.iter().map(|(i, t)| (*i, t.as_str())).collect();
+    let lengths: Vec<u32> = corpus
+        .iter()
+        .map(|(_, t)| {
+            let mut n = 0u32;
+            tok.tokenize_each(t, &mut |_| n += 1);
+            n
+        })
+        .collect();
     let chunk_size = corpus.len().div_ceil(n_superfiles);
+    let mut committed_rows = 0usize;
     corpus
         .chunks(chunk_size)
         .map(|chunk| {
-            // The chunk lives in &str-as-&'a String land; BruteForceBm25
-            // wants `&[(u64, &str)]`, so adapt the borrow once.
-            let view: Vec<(u64, &str)> = chunk.iter().map(|(i, t)| (*i, t.as_str())).collect();
-            BruteForceBm25::index(&view, tok.as_ref())
+            committed_rows += chunk.len();
+            let committed =
+                ColumnLengthStats::from_lengths(lengths[..committed_rows].iter().copied());
+            let first = chunk.first().expect("non-empty chunk").0;
+            let last = chunk.last().expect("non-empty chunk").0;
+            FileOracle {
+                scorer: BruteForceBm25::index(&view, tok.as_ref())
+                    .with_avgdl(stored_avgdl(committed.avgdl())),
+                rows: first..last + 1,
+            }
         })
         .collect()
 }
@@ -342,11 +356,11 @@ fn merge_global_top_k(mut all: Vec<(u64, f32)>, k: usize) -> Vec<u64> {
 }
 
 /// Run per-superfile brute-force BM25 and merge into a global top-k.
-fn brute_force_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u64> {
+fn brute_force_top_k(oracles: &[FileOracle], query: &str, k: usize) -> Vec<u64> {
     let tok = default_tokenizer();
     let all = oracles
         .iter()
-        .flat_map(|o| o.top_k(query, k, tok.as_ref()))
+        .flat_map(|o| o.own(o.scorer.top_k(query, usize::MAX, tok.as_ref())))
         .collect();
     merge_global_top_k(all, k)
 }
@@ -355,23 +369,23 @@ fn brute_force_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u
 /// AND query. Each superfile scores its AND intersection
 /// independently; the global merge keeps the highest-scoring docs
 /// across superfiles. Mirrors the supertable's AND fan-out shape.
-fn brute_force_and_top_k(oracles: &[BruteForceBm25], query: &str, k: usize) -> Vec<u64> {
+fn brute_force_and_top_k(oracles: &[FileOracle], query: &str, k: usize) -> Vec<u64> {
     let tok = default_tokenizer();
     let mut terms: Vec<String> = Vec::new();
     tok.tokenize_each(query, &mut |t| terms.push(t.to_owned()));
     let all = oracles
         .iter()
-        .flat_map(|o| o.top_k_terms_and(&terms, k))
+        .flat_map(|o| o.own(o.scorer.top_k_terms_and(&terms, usize::MAX)))
         .collect();
     merge_global_top_k(all, k)
 }
 
 /// Same as [`brute_force_top_k`] but for a multi-term explicit
 /// OR query (used to mirror the supertable's prefix expansion).
-fn brute_force_terms_top_k(oracles: &[BruteForceBm25], terms: &[String], k: usize) -> Vec<u64> {
+fn brute_force_terms_top_k(oracles: &[FileOracle], terms: &[String], k: usize) -> Vec<u64> {
     let all = oracles
         .iter()
-        .flat_map(|o| o.top_k_terms(terms, k))
+        .flat_map(|o| o.own(o.scorer.top_k_terms(terms, usize::MAX)))
         .collect();
     merge_global_top_k(all, k)
 }
@@ -389,7 +403,7 @@ fn assert_top_k_sets_match(label: &str, supertable: Vec<u64>, oracle: Vec<u64>, 
 
 struct StandardFixture {
     infino: Supertable,
-    oracles: Vec<BruteForceBm25>,
+    oracles: Vec<FileOracle>,
 }
 
 static STANDARD_FIXTURE: LazyLock<StandardFixture> = LazyLock::new(|| {
@@ -449,14 +463,19 @@ impl QueryShape {
     }
 
     /// The reference top-k for the same shape.
-    fn oracle_top_k(&self, oracles: &[BruteForceBm25], k: usize) -> Vec<u64> {
+    fn oracle_top_k(&self, oracles: &[FileOracle], k: usize) -> Vec<u64> {
         match self {
             Self::Or(q) => brute_force_top_k(oracles, q, k),
             Self::AllOf(terms) => {
                 let musts: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
                 let all = oracles
                     .iter()
-                    .flat_map(|o| o.top_k_atoms(&musts, &[], &[], &[], &[], &[], k))
+                    .flat_map(|o| {
+                        o.own(
+                            o.scorer
+                                .top_k_atoms(&musts, &[], &[], &[], &[], &[], usize::MAX),
+                        )
+                    })
                     .collect();
                 merge_global_top_k(all, k)
             }
@@ -469,7 +488,17 @@ impl QueryShape {
                     Phrase::adjacent(terms.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>());
                 let all = oracles
                     .iter()
-                    .flat_map(|o| o.top_k_atoms(&[], &[], &[], from_ref(&phrase), &[], &[], k))
+                    .flat_map(|o| {
+                        o.own(o.scorer.top_k_atoms(
+                            &[],
+                            &[],
+                            &[],
+                            from_ref(&phrase),
+                            &[],
+                            &[],
+                            usize::MAX,
+                        ))
+                    })
                     .collect();
                 merge_global_top_k(all, k)
             }
@@ -558,9 +587,7 @@ fn oracle_query_time_override_matches_the_reference_at_that_pair() {
                     "title",
                     &query,
                     k,
-                    Bm25SearchOptions::new()
-                        .with_stats(Bm25Stats::PerSuperfile)
-                        .with_bm25(params.k1, params.b),
+                    Bm25SearchOptions::new().with_bm25(params.k1, params.b),
                 )
                 .expect("bm25 with override");
             let inf_hits = supertable_to_global_ids(&f.infino, hits, CHUNK_SIZE);
@@ -834,19 +861,14 @@ fn zipfian_corpus(n_docs: usize, seed: u64) -> Vec<(u64, String)> {
 
 #[test]
 fn oracle_zipfian_corpus_query_shapes_match() {
-    // 5K docs × 4 superfiles = 1250 docs/superfile. Brute-force across
-    // superfiles is the exact same scoring path the supertable runs
-    // (per-superfile IDF + global top-k merge with identical
-    // tie-breaker), so set overlap on the top-k is expected to be
-    // tight; we keep the 60 % threshold loose to absorb any future
-    // BM25 dl-norm refinements without test churn.
+    // 5K docs × 4 superfiles = 1250 docs/superfile. The file oracles
+    // model the engine's scoring exactly (table-wide idf, each file's
+    // declared average); only the one-byte doc-length quantization and
+    // tie order remain, which the 90 % overlap threshold absorbs.
     let n_docs = 5_000;
     let corp = zipfian_corpus(n_docs, 42);
     let infino = build_supertable(&corp, SUPERFILES);
     let oracles = build_oracles(&corp, SUPERFILES);
-    // One oracle over the WHOLE corpus = textbook BM25 with global idf —
-    // the ground truth for the `Global` (default) statistics scope.
-    let global_oracle = build_oracles(&corp, 1);
     let k = ZIPFIAN_TOP_K;
 
     let queries = [
@@ -861,43 +883,17 @@ fn oracle_zipfian_corpus_query_shapes_match() {
     ];
 
     for (label, q) in queries {
-        // Per-superfile arm: local-idf scoring parity against the
-        // per-shard oracles that model it.
-        let inf =
-            supertable_search_stats(&infino, q, k, n_docs / SUPERFILES, Bm25Stats::PerSuperfile);
+        let inf = supertable_search_global(&infino, q, k, n_docs / SUPERFILES);
         let ora = brute_force_top_k(&oracles, q, k);
         let inf_set: HashSet<u64> = inf.iter().copied().collect();
         let ora_set: HashSet<u64> = ora.iter().copied().collect();
         let common = inf_set.intersection(&ora_set).count();
         let target = inf_set.len().min(ora_set.len());
-        // ≥ 60 % overlap threshold. Brute-force shares infino's
-        // tie-breaker so in practice the overlap is much higher, but
-        // we keep the threshold loose so BM25 dl-norm refinements
-        // aren't artificially bound by the test.
-        let threshold = (target * 6) / 10;
+        let threshold = (target * 9) / 10;
         assert!(
             common >= threshold,
-            "{label}: top-{k} overlap {common}/{target} below 60% threshold; \
+            "{label}: top-{k} overlap {common}/{target} below 90% threshold; \
              supertable={inf:?} oracle={ora:?}",
-        );
-
-        // Global arm (the default): table-wide idf against the
-        // whole-corpus textbook oracle. Tighter threshold than the
-        // per-superfile arm — global idf matches the oracle exactly and
-        // this corpus has fixed-length docs, so per-superfile avgdl
-        // equals corpus avgdl; only the one-byte doc-length
-        // quantization and tie order remain.
-        let inf_g = supertable_search_stats(&infino, q, k, n_docs / SUPERFILES, Bm25Stats::Global);
-        let ora_g = brute_force_top_k(&global_oracle, q, k);
-        let inf_g_set: HashSet<u64> = inf_g.iter().copied().collect();
-        let ora_g_set: HashSet<u64> = ora_g.iter().copied().collect();
-        let common_g = inf_g_set.intersection(&ora_g_set).count();
-        let target_g = inf_g_set.len().min(ora_g_set.len());
-        let threshold_g = (target_g * 9) / 10;
-        assert!(
-            common_g >= threshold_g,
-            "{label} (global): top-{k} overlap {common_g}/{target_g} below 90% threshold; \
-             supertable={inf_g:?} oracle={ora_g:?}",
         );
     }
 }
@@ -1014,9 +1010,7 @@ fn skip_path_hits(st: &Supertable, k: usize, chunk_size: usize) -> Vec<(u64, f32
             "title",
             "common",
             k,
-            Bm25SearchOptions::new()
-                .with_mode(BoolMode::Or)
-                .with_stats(Bm25Stats::Global),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
         )
         .expect("single-term global search");
     let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
@@ -1081,24 +1075,6 @@ fn single_term_global_idf_skip_matches_a_single_superfile() {
             fragmented_top
         );
     }
-
-    // The fixture genuinely distinguishes the two statistics scopes: per
-    // superfile, `common` is in every row of the first superfile, so its
-    // local idf collapses to near zero there and that superfile's rows
-    // rank differently. Were this equal, the comparison above would pass
-    // no matter what the rescale did.
-    let per_superfile = st_hits_per_superfile(&fragmented, SKIP_TOP_K, SKIP_DOCS_PER_SUPERFILE);
-    assert_ne!(
-        per_superfile,
-        fragmented_top.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        "fixture does not distinguish global from per-superfile statistics, so it cannot \
-         be exercising the global-idf override"
-    );
-}
-
-/// Ids from a per-superfile-statistics search, for the contrast check.
-fn st_hits_per_superfile(st: &Supertable, k: usize, chunk_size: usize) -> Vec<u64> {
-    supertable_search_stats(st, "common", k, chunk_size, Bm25Stats::PerSuperfile)
 }
 
 // ---- the running table-wide average, one declared value per file ------
@@ -1361,14 +1337,7 @@ fn running_engine_hits(
 ) -> Vec<(u64, f32)> {
     st.reader()
         .expect("reader")
-        .bm25_hits(
-            "title",
-            query,
-            k,
-            Bm25SearchOptions::new()
-                .with_mode(mode)
-                .with_stats(Bm25Stats::Global),
-        )
+        .bm25_hits("title", query, k, Bm25SearchOptions::new().with_mode(mode))
         .expect("bm25 search")
         .into_iter()
         .map(|h| {

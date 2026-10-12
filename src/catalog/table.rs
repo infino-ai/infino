@@ -14,14 +14,21 @@
 use std::any::Any;
 use std::{fmt, sync::Arc, time::Duration};
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
 use datafusion::prelude::Expr;
+use serde_json::Value;
 
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, VectorFilter, catalog::ensure_expr_within_connective_cap,
-    superfile::VectorSearchOptions, supertable::Supertable as SupertableHandle,
+    OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
+    catalog::ensure_expr_within_connective_cap,
+    superfile::VectorSearchOptions,
+    supertable::{
+        Supertable as SupertableHandle,
+        hydrate::hydrate_from_reader,
+        reindex::{PlannedRepair, ReindexReport, StalenessReport},
+    },
 };
 
 /// The operation surface shared by every table implementation (local or
@@ -32,7 +39,10 @@ pub(crate) trait Table: Send + Sync {
     fn schema(&self) -> SchemaRef;
     fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError>;
     fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError>;
+    fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError>;
+    fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError>;
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError>;
+    fn update_rows(&self, predicate: Expr, rows: &[Value]) -> Result<MutationStats, InfinoError>;
     fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError>;
     fn bm25_search(
         &self,
@@ -79,6 +89,14 @@ pub(crate) trait Table: Send + Sync {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError>;
+    fn hydrate(
+        &self,
+        batches: &mut dyn RecordBatchReader,
+        target_rows: usize,
+    ) -> Result<usize, InfinoError>;
+    fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError>;
+    fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError>;
+    fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError>;
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError>;
 
     /// Test-only: expose the concrete handle behind the trait object so tests
@@ -102,8 +120,17 @@ impl Table for SupertableHandle {
     fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
         SupertableHandle::append_named(self, batch, source_name)
     }
+    fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
+        SupertableHandle::append_rows(self, rows)
+    }
+    fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
+        SupertableHandle::append_rows_named(self, rows, source_name)
+    }
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError> {
         SupertableHandle::update(self, predicate, batch)
+    }
+    fn update_rows(&self, predicate: Expr, rows: &[Value]) -> Result<MutationStats, InfinoError> {
+        SupertableHandle::update_rows(self, predicate, rows)
     }
     fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
         SupertableHandle::delete(self, predicate)
@@ -178,6 +205,22 @@ impl Table for SupertableHandle {
     fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
         SupertableHandle::optimize(self, opts)
     }
+    fn hydrate(
+        &self,
+        batches: &mut dyn RecordBatchReader,
+        target_rows: usize,
+    ) -> Result<usize, InfinoError> {
+        Ok(hydrate_from_reader(self, batches, target_rows)?)
+    }
+    fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
+        SupertableHandle::reindex(self, opts)
+    }
+    fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError> {
+        SupertableHandle::index_staleness(self, opts)
+    }
+    fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError> {
+        SupertableHandle::reindex_plan(self, opts)
+    }
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         SupertableHandle::gc(self, safety_gap)
     }
@@ -246,6 +289,23 @@ impl Supertable {
         self.inner.append_named(batch, source_name)
     }
 
+    /// Append rows given as JSON documents. Each document is flattened to
+    /// dot paths and typed from its values: a path the table does not have
+    /// joins the schema, a nullable column a document omits is null, and a
+    /// value whose type disagrees with the column's is refused with the
+    /// same error an Arrow batch would get. Numbers are never parsed from
+    /// strings or truncated: an integral literal fits an integer or a
+    /// `Float64` column, a literal with a fraction fits only a float column.
+    pub fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
+        self.inner.append_rows(rows)
+    }
+
+    /// [`Self::append_rows`], naming the source the rows came from as
+    /// [`Self::append_named`] does.
+    pub fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
+        self.inner.append_rows_named(rows, source_name)
+    }
+
     /// Update rows matching `predicate` with values from `batch`.
     pub fn update(
         &self,
@@ -256,6 +316,17 @@ impl Supertable {
         self.inner.update(predicate, batch)
     }
 
+    /// [`Self::update`] with the replacement rows given as JSON documents,
+    /// mapped as [`Self::append_rows`] maps them.
+    pub fn update_rows(
+        &self,
+        predicate: Expr,
+        rows: &[Value],
+    ) -> Result<MutationStats, InfinoError> {
+        ensure_expr_within_connective_cap(&predicate)?;
+        self.inner.update_rows(predicate, rows)
+    }
+
     /// Delete rows matching `predicate`.
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
         ensure_expr_within_connective_cap(&predicate)?;
@@ -264,12 +335,12 @@ impl Supertable {
 
     /// Ranked BM25 full-text search over one FTS column.
     ///
-    /// `opts` ([`Bm25SearchOptions`]) carries the boolean `mode` and the
-    /// corpus-statistics selector: [`Bm25Stats::Global`](crate::Bm25Stats::Global)
-    /// (the default, each segment scored against its own local statistics) or
-    /// [`Bm25Stats::Global`](crate::Bm25Stats::Global) (one table-wide idf
-    /// across all segments, so a fragmented table ranks like a single unified
-    /// corpus). `Bm25SearchOptions::new()` is `Or` mode + per-superfile stats.
+    /// `opts` ([`Bm25SearchOptions`]) carries the boolean `mode` and an
+    /// optional similarity override; `Bm25SearchOptions::new()` is `Or` mode
+    /// with each column's declared parameters. On a fully loaded manifest
+    /// every segment scores against one table-wide idf, so a fragmented
+    /// table ranks like a single unified corpus; a lazily loaded manifest
+    /// scores each segment with its own statistics.
     pub fn bm25_search(
         &self,
         column: &str,
@@ -318,31 +389,31 @@ impl Supertable {
     /// asks the index how it reads them rather than comparing spellings: a
     /// slash, an underscore or a case difference is not a token, and its own
     /// copy of the rule drifts from the index the moment a column is declared
-    /// with another analyzer. `column` must carry a full-text index; the
+    /// with another filter. `column` must carry a full-text index; the
     /// error for one that does not names the columns that do.
     ///
     /// ```
     /// # use std::sync::Arc;
     /// # use infino::arrow_schema::{DataType, Field, Schema};
-    /// # use infino::{connect, FtsField, IndexSpec};
+    /// # use infino::{connect, FtsField, IndexSpec, Stemmer};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![
     /// #     Field::new("body", DataType::LargeUtf8, false),
-    /// #     Field::new("code", DataType::LargeUtf8, false),
+    /// #     Field::new("notes", DataType::LargeUtf8, false),
     /// # ]));
     /// # let posts = db.create_table(
     /// #     "posts",
     /// #     schema,
     /// #     IndexSpec::new()
     /// #         .fts("body")
-    /// #         .fts(FtsField::new("code").analyzer("ascii_lower")),
+    /// #         .fts(FtsField::new("notes").stemmer(Stemmer::English)),
     /// # )?;
-    /// // The standard analyzer keeps a word whatever its script; the ASCII
-    /// // analyzer splits on every other byte and drops the accented word.
+    /// // The standard analyzer keeps a word whatever its script; a stemmed
+    /// // column also folds each word onto its stem.
     /// assert_eq!(posts.tokenize("body", "Hello, World! Café")?, ["hello", "world", "café"]);
     /// assert_eq!(
-    ///     posts.tokenize("code", "left/failed write_pointer Café")?,
-    ///     ["left", "failed", "write", "pointer"]
+    ///     posts.tokenize("notes", "Running studies")?,
+    ///     ["run", "studi"]
     /// );
     /// assert!(posts.tokenize("nope", "anything").is_err());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -452,6 +523,78 @@ impl Supertable {
     /// Optimize (compact) the table.
     pub fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
         self.inner.optimize(opts)
+    }
+
+    /// Bulk-load `batches` into this table as a few big superfiles, for data
+    /// already in columnar form that is queried with SQL only. Returns the rows
+    /// committed. **Experimental:** the signature may change.
+    ///
+    /// Batches are packed into superfiles of about `target_rows` rows each (at
+    /// least 1), with no per-append superfiles and no `optimize` pass. A Parquet
+    /// reader can be passed straight in: batches are read as needed, and a read
+    /// error comes back as [`InfinoError::Io`].
+    ///
+    /// - SQL-only: the table must have no full-text or vector index, else
+    ///   [`InfinoError::Schema`]. Hydrated rows are never found by BM25 or
+    ///   vector search.
+    /// - Columns are matched by name, like `append`. Unlike `append`, a column the
+    ///   table doesn't have is refused: hydrate doesn't grow the schema.
+    /// - Takes the table's writer slot for the whole load; a concurrent writer
+    ///   gets [`InfinoError::Conflict`].
+    /// - Not atomic: superfiles commit in waves to bound memory, so an error part
+    ///   way leaves the waves already committed. Don't retry on the same table
+    ///   (that adds those rows again); drop it and hydrate again.
+    /// - Memory is bounded by the connection memory budget and the memory free to
+    ///   the process. A table with no storage backend keeps all its data in
+    ///   memory anyway.
+    /// - Hosted (remote) tables return [`InfinoError::Unsupported`].
+    pub fn hydrate(
+        &self,
+        mut batches: impl RecordBatchReader,
+        target_rows: usize,
+    ) -> Result<usize, InfinoError> {
+        self.inner.hydrate(&mut batches, target_rows)
+    }
+
+    /// Rewrite every superfile whose full-text index is behind the format
+    /// this engine writes, leaving rows, ids and ranking unchanged.
+    ///
+    /// Each superfile is rewritten and committed on its own, so a query
+    /// sees either the old file or its replacement. Interrupting a run
+    /// keeps the rewrites it finished; running again resumes, because what
+    /// is left is read from the files rather than tracked in a journal.
+    /// Idempotent — a second run over a migrated table does nothing.
+    ///
+    /// A run killed mid-rewrite leaves its tombstone-sidecar seal behind
+    /// on the one superfile it held. The next run honours that seal rather
+    /// than assuming the owner is dead — it cannot tell a crashed writer
+    /// from a slow one — so it migrates everything else and counts that
+    /// file in [`ReindexReport::held_by_another_run`]. The seal is taken
+    /// over once it is older than
+    /// [`ReindexOptions::stale_seal_timeout_ms`], which is the knob to
+    /// lower when a crash is known rather than suspected.
+    pub fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
+        self.inner.reindex(opts)
+    }
+
+    /// What a [`Self::reindex`] would do, without doing it.
+    ///
+    /// The migration is on demand by design, which leaves an operator
+    /// needing an answer to "is anything behind, and what would repairing
+    /// it cost" before they rewrite committed data. This reads that answer
+    /// off the files and writes nothing.
+    ///
+    /// Takes no writer slot, so it is safe against a live table and safe
+    /// while a reindex or compaction is running — the numbers are then a
+    /// snapshot of something already in motion.
+    pub fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError> {
+        self.inner.index_staleness(opts)
+    }
+
+    /// The superfiles [`Self::reindex`] would repair under `opts`, and the
+    /// repair each gets, without repairing anything.
+    pub fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError> {
+        self.inner.reindex_plan(opts)
     }
 
     /// Garbage-collect orphaned superfiles older than `safety_gap`.

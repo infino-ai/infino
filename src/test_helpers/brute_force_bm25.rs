@@ -18,7 +18,7 @@
 //! ```
 //!
 //! Tokenization runs through whatever `Tokenizer` the caller
-//! supplies — pass [`crate::superfile::fts::tokenize::AsciiLowerTokenizer`]
+//! supplies — pass [`crate::superfile::fts::tokenize::StandardTokenizer`]
 //! to match the production pipeline.
 //!
 //! Result invariants match the optimized search path:

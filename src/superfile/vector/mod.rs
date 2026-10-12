@@ -11,6 +11,8 @@
 //! See `docs/architecture/superfile.md` for the per-column
 //! subsection layout and the IVF + RaBitQ + rerank query pipeline.
 
+#[cfg(feature = "graph-index")]
+pub(crate) mod adjacency;
 pub mod builder;
 pub mod cell_posting;
 pub mod distance;

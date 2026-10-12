@@ -10,16 +10,12 @@
 //!
 //! ## What gets validated at split time
 //!
-//! Schema-static checks live in `SupertableOptions::new` — types,
-//! dims, name uniqueness, etc. The runtime checks here are the ones
-//! that depend on the data of a specific `RecordBatch`:
-//!
-//! 1. Input batch's schema field-by-field equals the supertable's
-//!    declared schema (every append must match what
-//!    `Supertable::create` declared).
-//! 2. Each vector column's underlying `FixedSizeListArray` has no
-//!    null entries — null vectors aren't permitted, since the IVF
-//!    index has no notion of "skip this row's vector".
+//! The batch has already been brought to the table's shape by the
+//! schema resolver; the checks here are the ones that depend on the
+//! vector data of a specific `RecordBatch`: every declared vector
+//! column is present as a `FixedSizeList<Float32>` of the declared
+//! dimension, and has no null entries — null vectors aren't permitted,
+//! since the IVF index has no notion of "skip this row's vector".
 //!
 //! ## Zero-copy
 //!
@@ -32,38 +28,28 @@
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 
-use crate::{
-    supertable::{error::BuildError, options::SupertableOptions},
-    utils::schema,
-};
+use crate::supertable::{error::BuildError, manifest::ManifestSnapshot};
 
 /// Maximum number of null row offsets collected into a
 /// `VectorColumnHasNulls` error. Bounds the error payload so a batch
 /// that is null-heavy doesn't produce an unbounded diagnostic list.
 const MAX_NULL_OFFSETS_IN_ERROR: usize = 5;
 
-/// Split vector columns out of `batch`. Returns a `RecordBatch` of
-/// scalar-only columns (matching `options.scalar_schema()`) plus a
-/// `Vec<&[f32]>` parallel to `options.vector_columns` — one slice
-/// per declared vector column, in declaration order.
+/// Split vector columns out of `batch`. Returns a `RecordBatch` of the
+/// non-vector columns in the batch's order plus a `Vec<&[f32]>` parallel
+/// to the table's vector columns — one slice per declared vector column,
+/// in declaration order.
 ///
 /// See module docs for what's validated here vs at options time.
 pub(crate) fn split_vectors<'a>(
     batch: &'a RecordBatch,
-    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
 ) -> Result<(RecordBatch, Vec<&'a [f32]>), BuildError> {
-    // 1. The input batch's schema must match the supertable's
-    //    declared schema. We don't allow per-batch schema drift
-    //    (per non-goal "Schema evolution"). Equality is by
-    //    structural comparison.
-    if !schema::compare_schema(&batch.schema(), &options.schema) {
-        return Err(BuildError::BatchSchemaMismatch);
-    }
-
-    // 2. Pull each vector column out, validate FixedSizeList shape +
+    // 1. Pull each vector column out, validate FixedSizeList shape +
     //    no-nulls, view the inner Float32Array as &[f32].
-    let mut vectors: Vec<&'a [f32]> = Vec::with_capacity(options.vector_columns.len());
-    for vc in &options.vector_columns {
+    let configs = manifest.vector_configs();
+    let mut vectors: Vec<&'a [f32]> = Vec::with_capacity(configs.len());
+    for vc in &configs {
         let idx =
             batch
                 .schema()
@@ -133,34 +119,19 @@ pub(crate) fn split_vectors<'a>(
         vectors.push(inner.values());
     }
 
-    // 3. Project scalar-only RecordBatch by dropping vector columns.
-    //    project_by_name preserves field order from the projection
-    //    list, so collect the kept names in their original schema
-    //    order.
-    let scalar_field_names: Vec<&str> = options
-        .schema
+    // 2. The scalar batch: every column that is not a vector column, in
+    //    the batch's order.
+    let scalar_indices: Vec<usize> = batch
+        .schema()
         .fields()
         .iter()
-        .filter(|f| {
-            !options
-                .vector_columns
-                .iter()
-                .any(|vc| vc.column == *f.name())
-        })
-        .map(|f| f.name().as_str())
+        .enumerate()
+        .filter(|(_, f)| !configs.iter().any(|vc| vc.column == *f.name()))
+        .map(|(i, _)| i)
         .collect();
     let scalar_batch = batch
-        .project(
-            &scalar_field_names
-                .iter()
-                .map(|n| {
-                    batch.schema().index_of(n).expect(
-                        "invariant: name from options.schema is in batch.schema (checked above)",
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|_| BuildError::BatchSchemaMismatch)?;
+        .project(&scalar_indices)
+        .expect("indices were enumerated from this batch's schema");
 
     Ok((scalar_batch, vectors))
 }
@@ -199,9 +170,12 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
-    use crate::superfile::{
-        builder::{FtsConfig, VectorConfig},
-        vector::{distance::Metric, rerank_codec::RerankCodec},
+    use crate::{
+        superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        },
+        supertable::options::SupertableOptions,
     };
 
     fn fixed_list_f32(dim: usize) -> DataType {
@@ -209,6 +183,10 @@ mod tests {
             Arc::new(Field::new("item", DataType::Float32, true)),
             dim as i32,
         )
+    }
+
+    fn snapshot(options: SupertableOptions) -> ManifestSnapshot {
+        ManifestSnapshot::empty(Arc::new(options))
     }
 
     fn schema_id_title_emb(dim: usize) -> Arc<Schema> {
@@ -263,7 +241,8 @@ mod tests {
             .expect("valid options");
 
         let batch = build_batch(schema, 4, dim);
-        let (scalar, vectors) = split_vectors(&batch, &opts).expect("split should succeed");
+        let (scalar, vectors) =
+            split_vectors(&batch, &snapshot(opts)).expect("split should succeed");
 
         // Scalar batch keeps only title in schema order
         // (vector columns dropped; the supertable's writer
@@ -287,24 +266,25 @@ mod tests {
     }
 
     #[test]
-    fn split_rejects_batch_with_wrong_schema() {
+    fn split_rejects_batch_without_the_vector_column() {
         let dim = 16;
         let schema = schema_id_title_emb(dim);
         let opts = SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
             .expect("valid options");
 
-        // Build a batch with a different schema (no `title` column).
         let other_schema = Arc::new(Schema::new(vec![Field::new(
-            "emb",
-            fixed_list_f32(dim),
+            "title",
+            DataType::LargeUtf8,
             false,
         )]));
-        let fsl = build_fsl(vec![0.0; 2 * dim], dim);
-        let other_batch =
-            RecordBatch::try_new(other_schema, vec![Arc::new(fsl)]).expect("build batch");
+        let other_batch = RecordBatch::try_new(
+            other_schema,
+            vec![Arc::new(LargeStringArray::from(vec!["a", "b"]))],
+        )
+        .expect("build batch");
 
-        let err = split_vectors(&other_batch, &opts).expect_err("expected error");
-        assert!(matches!(err, BuildError::BatchSchemaMismatch));
+        let err = split_vectors(&other_batch, &snapshot(opts)).expect_err("expected error");
+        assert!(matches!(err, BuildError::VectorColumnMissing { column } if column == "emb"));
     }
 
     #[test]
@@ -334,7 +314,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(fsl)])
             .expect("build batch");
 
-        let err = split_vectors(&batch, &opts).expect_err("expected error");
+        let err = split_vectors(&batch, &snapshot(opts)).expect_err("expected error");
         match err {
             BuildError::VectorColumnHasNulls {
                 column,
@@ -360,7 +340,8 @@ mod tests {
         let titles = LargeStringArray::from(vec!["x", "y"]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(titles)]).expect("build batch");
 
-        let (scalar, vectors) = split_vectors(&batch, &opts).expect("split should succeed");
+        let (scalar, vectors) =
+            split_vectors(&batch, &snapshot(opts)).expect("split should succeed");
         assert_eq!(scalar.num_rows(), 2);
         assert_eq!(scalar.num_columns(), 1);
         assert_eq!(vectors.len(), 0);
@@ -400,7 +381,8 @@ mod tests {
         )
         .expect("build batch");
 
-        let (scalar, vectors) = split_vectors(&batch, &opts).expect("split should succeed");
+        let (scalar, vectors) =
+            split_vectors(&batch, &snapshot(opts)).expect("split should succeed");
         let names: Vec<_> = scalar
             .schema()
             .fields()
@@ -448,7 +430,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(fsl)])
             .expect("build batch");
 
-        let err = split_vectors(&batch, &opts).expect_err("expected error");
+        let err = split_vectors(&batch, &snapshot(opts)).expect_err("expected error");
         match err {
             BuildError::VectorColumnHasNulls {
                 column,
@@ -463,72 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn split_rejects_missing_vector_column() {
-        // Drive the `VectorColumnMissing` defensive branch: build valid
-        // options, then point the declared vector column at a name that
-        // is not in the (otherwise schema-matching) batch.
-        let dim = 16;
-        let schema = schema_id_title_emb(dim);
-        let mut opts =
-            SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
-                .expect("valid options");
-        opts.vector_columns[0].column = "not_a_column".into();
-
-        let batch = build_batch(schema, 2, dim);
-        let err = split_vectors(&batch, &opts).expect_err("expected error");
-        assert!(matches!(
-            err,
-            BuildError::VectorColumnMissing { column } if column == "not_a_column"
-        ));
-    }
-
-    #[test]
-    fn split_rejects_non_fixed_size_list_column() {
-        // Drive the `VectorColumnNotFixedSizeList` branch: declare the
-        // scalar `title` column as the vector column. At split time the
-        // downcast to FixedSizeListArray fails.
-        let dim = 16;
-        let schema = schema_id_title_emb(dim);
-        let mut opts =
-            SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
-                .expect("valid options");
-        opts.vector_columns[0].column = "title".into();
-
-        let batch = build_batch(schema, 2, dim);
-        let err = split_vectors(&batch, &opts).expect_err("expected error");
-        assert!(matches!(
-            err,
-            BuildError::VectorColumnNotFixedSizeList { column, .. } if column == "title"
-        ));
-    }
-
-    #[test]
-    fn split_rejects_dim_mismatch() {
-        // Drive the `VectorColumnDimMismatch` branch: the FSL on disk is
-        // sized `dim`, but the declared config asks for a different dim.
-        let dim = 16;
-        // A different, still-valid declared dim so the only mismatch is
-        // against the batch's FSL list_size.
-        const WRONG_DIM: usize = 32;
-        let schema = schema_id_title_emb(dim);
-        let mut opts =
-            SupertableOptions::new(schema.clone(), vec![fc("title")], vec![vc("emb", dim)])
-                .expect("valid options");
-        opts.vector_columns[0].dim = WRONG_DIM;
-
-        let batch = build_batch(schema, 2, dim);
-        let err = split_vectors(&batch, &opts).expect_err("expected error");
-        assert!(matches!(
-            err,
-            BuildError::VectorColumnDimMismatch {
-                expected: WRONG_DIM,
-                actual,
-                column,
-            } if actual == dim && column == "emb"
-        ));
-    }
-
-    #[test]
     fn split_returns_zero_copy_view_into_batch() {
         let dim = 16;
         let schema = schema_id_title_emb(dim);
@@ -536,7 +452,8 @@ mod tests {
             .expect("valid options");
         let batch = build_batch(schema, 4, dim);
 
-        let (_scalar, vectors) = split_vectors(&batch, &opts).expect("split should succeed");
+        let (_scalar, vectors) =
+            split_vectors(&batch, &snapshot(opts)).expect("split should succeed");
         // Compare the slice's pointer to the underlying Float32Array's
         // values pointer in the original batch — they must be the
         // same memory (zero-copy contract).

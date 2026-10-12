@@ -463,6 +463,7 @@ fn budget_only_config(connection_budget_bytes: u64) -> Config {
         },
         memory: MemorySettings {
             connection_budget_bytes,
+            ..MemorySettings::default()
         },
         ..Config::default()
     }

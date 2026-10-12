@@ -1,6 +1,6 @@
 # Infino
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/infino-ai/infino)
+[![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-blue)](https://deepwiki.com/infino-ai/infino)
 [![Crates.io](https://img.shields.io/crates/v/infino.svg)](https://crates.io/crates/infino)
 [![docs.rs](https://img.shields.io/docsrs/infino)](https://docs.rs/infino)
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
@@ -17,13 +17,13 @@ cargo add infino                # Rust
 or in Cargo.toml:
 
 [dependencies]
-infino = "0.8"
+infino = "0.11"
 ```
 
 Note: infino installs the [mimalloc](https://github.com/microsoft/mimalloc)
 global allocator by default. If you embed infino in a process that already
 sets a global allocator, turn it off to avoid a second one:
-`infino = { version = "0.8", default-features = false }`.
+`infino = { version = "0.11", default-features = false }`.
 
 ## Quickstart
 
@@ -469,6 +469,11 @@ The same pages are available as Markdown source on GitHub:
 [Parquet interop](https://github.com/infino-ai/docs/blob/main/guides/parquet-interop.mdx),
 [embeddings](https://github.com/infino-ai/docs/blob/main/guides/embeddings.mdx),
 [storage](https://github.com/infino-ai/docs/blob/main/guides/storage.mdx).
+
+In this repo:
+
+- [FAQ](docs/faq.md) — short answers to common questions
+- [How Infino compares](docs/comparisons.md) — how it relates to vector databases, search engines, and query engines
 
 Design references (in this repo):
 

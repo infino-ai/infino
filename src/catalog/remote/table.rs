@@ -12,16 +12,22 @@
 use std::any::Any;
 use std::{sync::Arc, time::Duration};
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
 use datafusion::{prelude::Expr, sql::unparser::expr_to_sql};
 use serde_json::{Value, json};
 
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
-    Bm25SearchOptions, Bm25Stats, BoolMode, GcError, GcReport, InfinoError, MutationStats,
-    OptimizeError, OptimizeOptions, VectorFilter, catalog::table::Table,
+    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
+    OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
+    catalog::table::Table,
+    dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
+    supertable::{
+        reindex::{PlannedRepair, ReindexReport, StalenessReport},
+        schema::TableSchema,
+    },
 };
 
 /// A hosted table handle. Holds its `RemoteCatalog`, the table name, and the
@@ -48,15 +54,6 @@ fn mode_str(mode: BoolMode) -> &'static str {
     match mode {
         BoolMode::And => "and",
         BoolMode::Or => "or",
-    }
-}
-
-/// Wire spelling for the BM25 statistics mode
-/// (`"per_superfile"` / `"global"`).
-fn stats_str(stats: Bm25Stats) -> &'static str {
-    match stats {
-        Bm25Stats::PerSuperfile => "per_superfile",
-        Bm25Stats::Global => "global",
     }
 }
 
@@ -128,6 +125,27 @@ impl Table for RemoteTable {
         )))
     }
 
+    /// Rows are mapped here against the Arrow schema the table was opened
+    /// with, and travel as a batch; the hosted side applies its own rules
+    /// to the batch.
+    fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
+        let batch = rows_to_batch(rows, &TableSchema::from_user_schema(&self.schema))
+            .map_err(|e| InfinoError::Schema(e).with_context("append_rows", None))?;
+        self.append(&batch)
+    }
+
+    fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
+        let batch = rows_to_batch(rows, &TableSchema::from_user_schema(&self.schema))
+            .map_err(|e| InfinoError::Schema(e).with_context("append_rows_named", None))?;
+        self.append_named(&batch, source_name)
+    }
+
+    fn update_rows(&self, predicate: Expr, rows: &[Value]) -> Result<MutationStats, InfinoError> {
+        let batch = rows_to_batch(rows, &TableSchema::from_user_schema(&self.schema))
+            .map_err(|e| InfinoError::Schema(e).with_context("update_rows", None))?;
+        self.update(predicate, &batch)
+    }
+
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError> {
         let predicate = predicate_to_sql(&predicate)?;
         let body = wire::batches_to_ipc(std::slice::from_ref(batch))?;
@@ -169,7 +187,6 @@ impl Table for RemoteTable {
             "query": query,
             "k": k,
             "mode": mode_str(opts.mode),
-            "stats": stats_str(opts.stats),
             "projection": projection,
         });
         let response = self.catalog.post_json("bm25_search", body)?;
@@ -302,6 +319,39 @@ impl Table for RemoteTable {
         Err(OptimizeError::NoStorage)
     }
 
+    fn hydrate(
+        &self,
+        _batches: &mut dyn RecordBatchReader,
+        _target_rows: usize,
+    ) -> Result<usize, InfinoError> {
+        // Hydrate writes superfiles and commits the manifest directly, which
+        // needs the storage backend and writer slot the hosted side owns.
+        Err(InfinoError::Unsupported(
+            "hydrate is not supported over the remote transport".to_string(),
+        ))
+    }
+
+    fn reindex(&self, _opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
+        // A reindex rewrites committed superfiles in place, which is the
+        // hosted side's job for the same reason compaction is: it needs the
+        // storage backend and the writer slot, neither of which a client
+        // holds. Deliberately not exposed over the remote transport.
+        Err(ReindexError::NoStorage)
+    }
+
+    fn reindex_plan(&self, _opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError> {
+        // Planning reads every superfile's index metadata, same as the
+        // staleness report below and for the same reason.
+        Err(ReindexError::NoStorage)
+    }
+
+    fn index_staleness(&self, _opts: &ReindexOptions) -> Result<StalenessReport, ReindexError> {
+        // Reads every superfile's index metadata off the storage backend a
+        // client does not hold. Server-side for the same reason the
+        // reindex it describes is.
+        Err(ReindexError::NoStorage)
+    }
+
     fn gc(&self, _safety_gap: Duration) -> Result<GcReport, GcError> {
         // Retention/GC on a hosted table is server-side; not a client operation.
         Err(GcError::NoStorage)
@@ -310,5 +360,38 @@ impl Table for RemoteTable {
     #[cfg(any(test, feature = "test-helpers"))]
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{RecordBatch, RecordBatchIterator};
+    use arrow_schema::{ArrowError, DataType, Field, Schema};
+
+    use crate::{
+        InfinoError,
+        catalog::{
+            remote::{RemoteCatalog, table::RemoteTable},
+            table::Table,
+        },
+    };
+
+    /// Hydrate over the remote transport is refused as unsupported, before any
+    /// request is sent.
+    #[test]
+    fn hydrate_is_unsupported_over_remote() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let catalog =
+            RemoteCatalog::new("http://127.0.0.1:1".into(), "db".into(), Some("key".into()))
+                .expect("catalog");
+        let table = RemoteTable::new(Arc::new(catalog), "t".into(), Arc::clone(&schema));
+        let mut empty =
+            RecordBatchIterator::new(Vec::<Result<RecordBatch, ArrowError>>::new(), schema);
+        let err = table
+            .hydrate(&mut empty, 1_000)
+            .expect_err("remote hydrate must be refused");
+        assert!(matches!(err, InfinoError::Unsupported(_)), "got {err:?}");
     }
 }

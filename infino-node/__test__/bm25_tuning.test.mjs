@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 //
-// Per-search BM25 tuning through the public wrapper. The addon has taken
-// `k1` / `b` since the pair became overridable per search, but the wrapper
-// forwarded only mode / stats / projection, so the options were silently
-// dropped at the boundary: a caller passing them got the column's declared
-// pair and no error. These tests hold the wrapper to the addon's contract.
+// Per-search BM25 tuning through the public wrapper: `k1` / `b` must reach
+// the addon rather than be dropped at the boundary, so a caller passing them
+// scores with that pair, not the column's declared one. These tests hold the
+// wrapper to the addon's contract.
 
 import test from "node:test";
 import assert from "node:assert/strict";

@@ -50,7 +50,7 @@ use infino::{
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
-        fts::reader::{Bm25Stats, BoolMode},
+        fts::reader::BoolMode,
     },
     supertable::{
         Supertable, SupertableOptions,
@@ -393,9 +393,7 @@ fn fanout_floor_decomposition() {
                     "title",
                     term,
                     K,
-                    Bm25SearchOptions::new()
-                        .with_mode(BoolMode::Or)
-                        .with_stats(Bm25Stats::Global),
+                    Bm25SearchOptions::new().with_mode(BoolMode::Or),
                     None,
                 )
                 .expect("bm25_search");
@@ -410,9 +408,7 @@ fn fanout_floor_decomposition() {
                     "title",
                     term,
                     K,
-                    Bm25SearchOptions::new()
-                        .with_mode(BoolMode::Or)
-                        .with_stats(Bm25Stats::Global),
+                    Bm25SearchOptions::new().with_mode(BoolMode::Or),
                     Some(&["_id", "title", "score"]),
                 )
                 .expect("bm25_search");

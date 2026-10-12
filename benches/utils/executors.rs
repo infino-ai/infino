@@ -288,7 +288,7 @@ pub mod fts {
             SuperfileReader,
             fts::{
                 reader::BoolMode as InfinoBoolMode,
-                tokenize::{AsciiLowerTokenizer, Phrase, Tokenizer},
+                tokenize::{Phrase, StandardTokenizer, Tokenizer},
             },
         },
         supertable::SupertableReader,
@@ -740,7 +740,7 @@ pub mod fts {
                 // never change which docs count); otherwise the bare
                 // terms match under `mode`. Phrase atoms take the
                 // phrase-aware walk.
-                let clauses = AsciiLowerTokenizer.parse(query).into_clauses(mode);
+                let clauses = StandardTokenizer.parse(query).into_clauses(mode);
                 let has_musts = !clauses.musts.is_empty() || !clauses.must_phrases.is_empty();
                 let (terms, phrases, eff_mode) = if has_musts {
                     (clauses.musts, clauses.must_phrases, InfinoBoolMode::And)
@@ -2662,6 +2662,37 @@ pub mod sql {
     /// carried forward.
     pub const LIKE_SUBSTRING: &str = "WHERE title LIKE '%term…%' (substring, open-edged token)";
 
+    /// The needles of the `title ILIKE '%needle%'` shapes. Each is one whole
+    /// `standard` token, so the engine answers it from the term dictionary
+    /// rather than by reading `title`. Rare is the FTS battery's
+    /// `single_rare` term and mid the first of its mid-rank lists; every
+    /// corpus term is `term0…` (ranks below 10,000), so the broad needle
+    /// matches every row.
+    const ILIKE_RARE: &str = "term09999";
+    const ILIKE_MID: &str = "term00050";
+    const ILIKE_BROAD: &str = "term0";
+    /// The first rank of the `ILIKE` OR chains, which run up the mid ranks.
+    const ILIKE_OR_FIRST_RANK: usize = 50;
+    /// The short and the long `ILIKE` OR chain's lengths.
+    const ILIKE_OR_SHORT: usize = 10;
+    const ILIKE_OR_LONG: usize = 50;
+    /// Rows the `ILIKE ... LIMIT` shapes ask for: what the first batch
+    /// has to carry.
+    const ILIKE_LIMIT: usize = 10;
+
+    /// `title ILIKE '%needle%'`.
+    fn ilike(needle: &str) -> String {
+        format!("title ILIKE '%{needle}%'")
+    }
+
+    /// An `OR` of `len` `ILIKE` leaves on consecutive mid-rank terms.
+    fn ilike_or_chain(len: usize) -> String {
+        (ILIKE_OR_FIRST_RANK..ILIKE_OR_FIRST_RANK + len)
+            .map(|rank| ilike(&format!("term{rank:05}")))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+
     /// The one classification of a bulk / scan-priced shape by name. Both
     /// the warm/cold query table (this module) and the serving-cost family
     /// split (`supertable.rs`) call this rather than each re-deriving the
@@ -2764,6 +2795,44 @@ pub mod sql {
                 "SUM(rating) bucket IN all (whole-table scan)",
                 format!("SELECT SUM(rating) AS a FROM supertable WHERE bucket IN {BUCKET_IN_ALL}"),
             ),
+            // Counts over an `ILIKE '%needle%'` the dictionary answers
+            // exactly: no text is read, and the selection is the needle's
+            // rows however many there are.
+            (
+                "COUNT(*)            ILIKE '%rare%' (exact)",
+                format!(
+                    "SELECT COUNT(*) AS a FROM supertable WHERE {}",
+                    ilike(ILIKE_RARE)
+                ),
+            ),
+            (
+                "COUNT(*)            ILIKE '%mid%' (exact)",
+                format!(
+                    "SELECT COUNT(*) AS a FROM supertable WHERE {}",
+                    ilike(ILIKE_MID)
+                ),
+            ),
+            (
+                "COUNT(*)            ILIKE '%broad%' (exact, every row)",
+                format!(
+                    "SELECT COUNT(*) AS a FROM supertable WHERE {}",
+                    ilike(ILIKE_BROAD)
+                ),
+            ),
+            (
+                "COUNT(*)            10 ILIKEs OR'd (exact, one column)",
+                format!(
+                    "SELECT COUNT(*) AS a FROM supertable WHERE {}",
+                    ilike_or_chain(ILIKE_OR_SHORT)
+                ),
+            ),
+            (
+                "COUNT(*)            50 ILIKEs OR'd (exact, one column)",
+                format!(
+                    "SELECT COUNT(*) AS a FROM supertable WHERE {}",
+                    ilike_or_chain(ILIKE_OR_LONG)
+                ),
+            ),
         ]
     }
 
@@ -2854,6 +2923,53 @@ pub mod sql {
                 // column's analyzer and on stored text against vocabulary.
                 LIKE_SUBSTRING,
                 "SELECT key, rating FROM supertable WHERE title LIKE '%term09999%'".to_string(),
+            ),
+            // Row-returning shapes over an `ILIKE '%needle%'` the dictionary
+            // answers exactly, appended so the by-key lookup stays first.
+            // The broad needle matches every row, so it is measured only
+            // under a `LIMIT` and beside a point lookup: returning every row
+            // would be a bulk row set, which `BULK_RANGE_SCAN` already prices.
+            (
+                "WHERE title ILIKE '%rare%' (exact)",
+                format!(
+                    "SELECT key, rating FROM supertable WHERE {}",
+                    ilike(ILIKE_RARE)
+                ),
+            ),
+            (
+                "WHERE title ILIKE '%mid%' (exact)",
+                format!(
+                    "SELECT key, rating FROM supertable WHERE {}",
+                    ilike(ILIKE_MID)
+                ),
+            ),
+            (
+                "WHERE title ILIKE '%rare%' LIMIT n (exact)",
+                format!(
+                    "SELECT key, rating FROM supertable WHERE {} LIMIT {ILIKE_LIMIT}",
+                    ilike(ILIKE_RARE)
+                ),
+            ),
+            (
+                "WHERE title ILIKE '%mid%' LIMIT n (exact)",
+                format!(
+                    "SELECT key, rating FROM supertable WHERE {} LIMIT {ILIKE_LIMIT}",
+                    ilike(ILIKE_MID)
+                ),
+            ),
+            (
+                "WHERE title ILIKE '%broad%' LIMIT n (exact, every row)",
+                format!(
+                    "SELECT key, rating FROM supertable WHERE {} LIMIT {ILIKE_LIMIT}",
+                    ilike(ILIKE_BROAD)
+                ),
+            ),
+            (
+                "WHERE key = ? AND title ILIKE '%broad%' (point + every row)",
+                format!(
+                    "SELECT key, rating FROM supertable WHERE key = '{k}' AND {}",
+                    ilike(ILIKE_BROAD)
+                ),
             ),
         ]
     }
@@ -3267,6 +3383,61 @@ pub mod sql {
             out.insert(*name, cold.finish());
         }
         out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::collections::HashSet;
+
+        use super::*;
+
+        /// Corpus rows for the battery's literals; any count works.
+        const TEST_DOCS: usize = 1000;
+
+        #[test]
+        fn every_battery_shape_has_its_own_name() {
+            // Names key the A/B rows, so two shapes sharing one would be
+            // diffed as one.
+            let inputs = QueryInputs {
+                qv: "0".into(),
+                sample_title: "doc0000000 term00001".into(),
+                sample_key: "key0".into(),
+                n_docs: TEST_DOCS,
+            };
+            let battery = full_battery(&inputs);
+            let names: HashSet<&str> = battery.iter().map(|(name, _)| *name).collect();
+            assert_eq!(names.len(), battery.len());
+        }
+
+        #[test]
+        fn every_ilike_needle_is_a_plain_word() {
+            // `ilike` writes its needle into the pattern as is: a quote,
+            // `%`, `_` or `\` in it would break the SQL or widen the
+            // match. Escaping would change the measured SQL instead, so
+            // the needles are held to letters and digits.
+            let chain = ilike_or_chain(ILIKE_OR_LONG);
+            let chain_needles = chain.split(" OR ").map(|leaf| {
+                leaf.trim_start_matches("title ILIKE '%")
+                    .trim_end_matches("%'")
+            });
+            for needle in [ILIKE_RARE, ILIKE_MID, ILIKE_BROAD]
+                .into_iter()
+                .chain(chain_needles)
+            {
+                assert!(
+                    !needle.is_empty() && needle.bytes().all(|b| b.is_ascii_alphanumeric()),
+                    "{needle:?} needs escaping"
+                );
+            }
+        }
+
+        #[test]
+        fn an_ilike_or_chain_has_one_distinct_leaf_per_rank() {
+            let chain = ilike_or_chain(ILIKE_OR_SHORT);
+            let leaves: HashSet<&str> = chain.split(" OR ").collect();
+            assert_eq!(leaves.len(), ILIKE_OR_SHORT);
+            assert!(leaves.contains("title ILIKE '%term00050%'"), "{chain}");
+        }
     }
 }
 

@@ -36,6 +36,8 @@
 
 use std::ops::Range;
 
+#[cfg(any(test, feature = "test-helpers"))]
+use crate::superfile::format::{footer::read_kv_metadata, kv};
 use crate::superfile::{
     bits::{MAX_WIDTH, for_each_lane, get_bits, payload_bytes, put_bits, width_of},
     format::{ID_SIDECAR_ENTRY_BYTES, u32_le_at, u64_le_at},
@@ -53,6 +55,13 @@ const HEADER_BYTES: usize = 16;
 const BLOCK_HEADER_BYTES: usize = 24;
 /// Directory entry size: one `u64` block offset.
 const DIR_ENTRY_BYTES: usize = 8;
+/// Where a block header keeps the bit width of its ids' high halves.
+const HI_WIDTH_AT: usize = 16;
+/// Where a block header keeps the bit width of its ids' low halves.
+const LO_WIDTH_AT: usize = 17;
+/// Where a block header keeps how many docs the block holds.
+const N_IN_BLOCK_AT: usize = 18;
+
 /// Encode a raw sidecar (`n_docs` little-endian `i128`s, local doc order)
 /// into the packed layout. An empty input yields an empty output, the
 /// "no sidecar" shape both ends already understand.
@@ -120,7 +129,7 @@ pub(crate) fn encode_packed(raw: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A validated packed sidecar over borrowed bytes.
+/// A packed id sidecar over borrowed bytes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PackedIds<'a> {
     bytes: &'a [u8],
@@ -129,45 +138,9 @@ pub(crate) struct PackedIds<'a> {
 }
 
 impl<'a> PackedIds<'a> {
-    /// Parse and validate every header, directory entry and block bound
-    /// against `bytes` and the expected `n_docs`. A mismatch is an `Err`
-    /// with the reason; nothing panics on a malformed sidecar. This is
-    /// the superfile-open check; the per-query path takes [`Self::open`].
-    pub(crate) fn parse(bytes: &'a [u8], n_docs: usize) -> Result<Self, String> {
-        let ids = Self::open(bytes, n_docs)?;
-        for b in 0..ids.n_blocks {
-            let off = u64_le_at(bytes, HEADER_BYTES + b * DIR_ENTRY_BYTES)
-                .ok_or("packed id sidecar directory truncated")? as usize;
-            let n_in_block = match b + 1 == ids.n_blocks {
-                true => n_docs - b * BLOCK_DOCS,
-                false => BLOCK_DOCS,
-            };
-            let header = bytes
-                .get(off..off + BLOCK_HEADER_BYTES)
-                .ok_or("packed id sidecar block header truncated")?;
-            let hi_width = header[16];
-            let lo_width = header[17];
-            let n_declared = u16::from_le_bytes([header[18], header[19]]) as usize;
-            if hi_width > MAX_WIDTH || lo_width > MAX_WIDTH || n_declared != n_in_block {
-                return Err(format!("packed id sidecar block {b} header is malformed"));
-            }
-            let end = off
-                + BLOCK_HEADER_BYTES
-                + payload_bytes(n_in_block, hi_width)
-                + payload_bytes(n_in_block, lo_width);
-            if end > bytes.len() {
-                return Err(format!("packed id sidecar block {b} runs past the sidecar"));
-            }
-        }
-        Ok(ids)
-    }
-
-    /// Open a sidecar by its header alone — no walk of the block
-    /// directory — for the per-query id resolve of a superfile whose
-    /// sidecar [`Self::parse`] validated at open. The walk is a few
-    /// thousand blocks on a large superfile, and it was being repeated
-    /// on every query. [`Self::get`] bounds-checks each read it makes,
-    /// so bytes this is misapplied to answer `None` rather than panic.
+    /// Opens a sidecar by checking only its header. Checking every block here
+    /// would read the whole sidecar from disk on a cold open, even for a query
+    /// that never asks for an `_id`. A bad block shows up as `None` on read.
     pub(crate) fn open(bytes: &'a [u8], n_docs: usize) -> Result<Self, String> {
         let declared =
             u32_le_at(bytes, 0).ok_or("packed id sidecar shorter than its header")? as usize;
@@ -193,18 +166,36 @@ impl<'a> PackedIds<'a> {
         })
     }
 
-    /// Block `b`'s header and stream ranges, `None` if the bytes cannot
-    /// hold it.
+    /// Checks every block and names the first bad one. A rewrite calls this
+    /// before copying the sidecar, so a bad block is not copied into a new file.
+    pub(crate) fn check_blocks(&self) -> Result<(), String> {
+        (0..self.n_blocks).try_for_each(|b| match self.block(b) {
+            Some(_) => Ok(()),
+            None => Err(format!("packed id sidecar block {b} is malformed")),
+        })
+    }
+
+    /// Block `b`'s header and where its ids sit, or `None` if the header is
+    /// bad or the block runs past the sidecar.
     #[inline]
     fn block(&self, b: usize) -> Option<IdBlock> {
         let off = u64_le_at(self.bytes, HEADER_BYTES + b * DIR_ENTRY_BYTES)? as usize;
         let header = self.bytes.get(off..off + BLOCK_HEADER_BYTES)?;
-        let hi_width = header[16];
-        let lo_width = header[17];
-        let n_in_block = u16::from_le_bytes([header[18], header[19]]) as usize;
-        if hi_width > MAX_WIDTH || lo_width > MAX_WIDTH {
+        let hi_width = header[HI_WIDTH_AT];
+        let lo_width = header[LO_WIDTH_AT];
+        let n_in_block =
+            u16::from_le_bytes([header[N_IN_BLOCK_AT], header[N_IN_BLOCK_AT + 1]]) as usize;
+
+        // Every block holds BLOCK_DOCS docs but the last, which holds the rest.
+        let expected = match b + 1 == self.n_blocks {
+            true => self.n_docs - b * BLOCK_DOCS,
+            false => BLOCK_DOCS,
+        };
+
+        if hi_width > MAX_WIDTH || lo_width > MAX_WIDTH || n_in_block != expected {
             return None;
         }
+
         let hi_start = off + BLOCK_HEADER_BYTES;
         let lo_start = hi_start + payload_bytes(n_in_block, hi_width);
         let lo_end = lo_start + payload_bytes(n_in_block, lo_width);
@@ -322,6 +313,56 @@ impl IdBlock {
     }
 }
 
+/// Test-only: where block `b`'s header starts in a packed sidecar.
+#[cfg(any(test, feature = "test-helpers"))]
+fn block_offset(sidecar: &[u8], b: usize) -> usize {
+    u64_le_at(sidecar, HEADER_BYTES + b * DIR_ENTRY_BYTES).expect("directory entry") as usize
+}
+
+/// Test-only: break block `b`'s header (a bit width past 64), so a test has
+/// one bad block among good ones.
+#[cfg(any(test, feature = "test-helpers"))]
+fn damage_block(sidecar: &mut [u8], b: usize) {
+    sidecar[block_offset(sidecar, b) + HI_WIDTH_AT] = MAX_WIDTH + 1;
+}
+
+/// Test-only: where `superfile`'s id sidecar sits, read from its footer.
+#[cfg(any(test, feature = "test-helpers"))]
+fn id_sidecar_range(superfile: &[u8]) -> Range<usize> {
+    let kvs = read_kv_metadata(superfile).expect("superfile footer");
+    let at = |key: &str| -> usize {
+        kvs.get(key)
+            .expect("the superfile carries an id sidecar")
+            .parse()
+            .expect("a byte offset")
+    };
+    let off = at(kv::IDS_OFFSET);
+    off..off + at(kv::IDS_LENGTH)
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+test_visible! {
+    /// Test-only: a copy of `superfile` with block `b` of its id sidecar
+    /// broken, and every other byte unchanged.
+    fn with_damaged_id_block(superfile: &[u8], b: usize) -> Vec<u8> {
+        let mut out = superfile.to_vec();
+        let range = id_sidecar_range(superfile);
+        damage_block(&mut out[range], b);
+        out
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+test_visible! {
+    /// Test-only: checks every block of `superfile`'s packed id sidecar, the
+    /// way a rewrite does before copying it.
+    fn check_id_sidecar(superfile: &[u8]) -> Result<(), String> {
+        let sidecar = &superfile[id_sidecar_range(superfile)];
+        let n_docs = u32_le_at(sidecar, 0).ok_or("packed id sidecar shorter than its header")?;
+        PackedIds::open(sidecar, n_docs as usize)?.check_blocks()
+    }
+}
+
 /// A block is unpacked whole for a bulk resolve when at least one doc in
 /// this many of its docs is asked for; below that, per-doc reads win.
 const BULK_DENSITY: usize = 4;
@@ -336,7 +377,7 @@ mod tests {
 
     fn round_trip(ids: &[i128]) -> Vec<u8> {
         let packed = encode_packed(&raw(ids));
-        let p = PackedIds::parse(&packed, ids.len()).expect("valid");
+        let p = PackedIds::open(&packed, ids.len()).expect("valid");
         for (d, &id) in ids.iter().enumerate() {
             assert_eq!(p.get(d as u32), Some(id), "doc {d}");
         }
@@ -391,7 +432,7 @@ mod tests {
             .map(|i| (i * 7919) ^ (i << 40))
             .collect();
         let packed = round_trip(&ids);
-        let p = PackedIds::parse(&packed, ids.len()).expect("parses");
+        let p = PackedIds::open(&packed, ids.len()).expect("opens");
         let n = ids.len() as u32;
         let cases: Vec<Vec<u32>> = vec![
             (0..n).collect(),               // every doc, ascending
@@ -425,51 +466,73 @@ mod tests {
     }
 
     #[test]
-    fn header_only_open_answers_none_on_a_block_it_cannot_hold() {
+    fn a_malformed_header_is_refused_and_a_malformed_block_answers_none() {
+        // A sidecar of 2,053 docs in three blocks, broken one way at a time.
+        //  - a wrong doc count, or the header cut short: `open` refuses it.
+        //  - the last block broken (cut short, its start past the end, a bit
+        //    width past 64, or the wrong doc count): `open` still takes it,
+        //    reads in that block return `None`, and `check_blocks` names it.
+        //  - docs in the other blocks still return their ids.
+        // This test pins that `open` checks only the header, and each read
+        // still checks its block.
         let ids: Vec<i128> = (0..BLOCK_DOCS as i128 * 2 + 5)
             .map(|i| i * 11 + 3)
             .collect();
-        let mut packed = round_trip(&ids);
-        // Point the last block's directory entry past the sidecar.
-        let dir = HEADER_BYTES + 2 * DIR_ENTRY_BYTES;
-        let past_end = packed.len() as u64;
-        packed[dir..dir + 8].copy_from_slice(&past_end.to_le_bytes());
-        assert!(
-            PackedIds::parse(&packed, ids.len()).is_err(),
-            "open-time parse refuses it"
-        );
-        let p = PackedIds::open(&packed, ids.len()).expect("header is intact");
-        assert_eq!(p.get(0), Some(ids[0]));
-        assert_eq!(
-            p.get(2 * BLOCK_DOCS as u32 - 1),
-            Some(ids[2 * BLOCK_DOCS - 1])
-        );
-        assert_eq!(p.get(2 * BLOCK_DOCS as u32), None, "corrupt block");
-        assert_eq!(p.get(ids.len() as u32), None, "past n_docs");
-        assert!(PackedIds::open(&packed[..HEADER_BYTES + 8], ids.len()).is_err());
-    }
-
-    #[test]
-    fn malformed_sidecars_are_refused() {
-        let ids: Vec<i128> = (0..1_500).map(|i| i as i128).collect();
         let packed = encode_packed(&raw(&ids));
-        assert!(PackedIds::parse(&packed, 1_499).is_err(), "n_docs mismatch");
-        for cut in [0usize, 8, HEADER_BYTES + 3, packed.len() - 1] {
-            assert!(
-                PackedIds::parse(&packed[..cut], ids.len()).is_err(),
-                "cut {cut}"
-            );
-        }
-        let mut bad_width = packed.clone();
-        let block0 = u64::from_le_bytes(
-            packed[HEADER_BYTES..HEADER_BYTES + 8]
-                .try_into()
-                .expect("8 bytes"),
-        ) as usize;
-        bad_width[block0 + 16] = 65;
-        assert!(
-            PackedIds::parse(&bad_width, ids.len()).is_err(),
-            "width past 64"
+        let n = ids.len();
+        let last_block = n.div_ceil(BLOCK_DOCS) - 1;
+        let (bad_doc, good_docs) = (
+            (last_block * BLOCK_DOCS) as u32,
+            [0, (last_block * BLOCK_DOCS - 1) as u32],
         );
+
+        assert!(PackedIds::open(&packed, n - 1).is_err(), "n_docs mismatch");
+        for cut in [0, 8, HEADER_BYTES + 3, HEADER_BYTES + DIR_ENTRY_BYTES] {
+            assert!(PackedIds::open(&packed[..cut], n).is_err(), "cut {cut}");
+        }
+        assert_eq!(
+            PackedIds::open(&packed, n).expect("intact").check_blocks(),
+            Ok(()),
+            "an intact sidecar passes the full check"
+        );
+
+        let at = block_offset(&packed, last_block);
+        let damage = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut bytes = packed.clone();
+            edit(&mut bytes);
+            bytes
+        };
+        let cases: [(&str, Vec<u8>); 4] = [
+            ("block cut short", packed[..packed.len() - 1].to_vec()),
+            (
+                "directory entry past the sidecar",
+                damage(&|b| {
+                    let dir = HEADER_BYTES + last_block * DIR_ENTRY_BYTES;
+                    let past_end = b.len() as u64;
+                    b[dir..dir + 8].copy_from_slice(&past_end.to_le_bytes());
+                }),
+            ),
+            ("width past 64", damage(&|b| damage_block(b, last_block))),
+            (
+                "doc count",
+                damage(&|b| {
+                    let count_at = at + N_IN_BLOCK_AT;
+                    let wrong = (n - last_block * BLOCK_DOCS - 1) as u16;
+                    b[count_at..count_at + 2].copy_from_slice(&wrong.to_le_bytes());
+                }),
+            ),
+        ];
+        for (what, bytes) in &cases {
+            let p = PackedIds::open(bytes, n).expect("header intact");
+            assert_eq!(p.get(bad_doc), None, "{what}");
+            assert_eq!(
+                p.check_blocks(),
+                Err(format!("packed id sidecar block {last_block} is malformed")),
+                "{what}: the full check names the block"
+            );
+            for good in good_docs {
+                assert_eq!(p.get(good), Some(ids[good as usize]), "{what}: doc {good}");
+            }
+        }
     }
 }

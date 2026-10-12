@@ -59,7 +59,6 @@ use infino::{
             rerank_codec::RerankCodec,
         },
     },
-    test_helpers::default_tokenizer,
 };
 use memmap2::Mmap;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -132,7 +131,7 @@ pub const TOKENS_PER_DOC: usize = 200;
 /// Vocabulary size — controls term-frequency distribution. Small
 /// enough that common terms appear in many docs (exercising long
 /// posting lists); large enough that rare terms exist (exercising the
-/// FST + skip-table cold path).
+/// term dictionary + skip-table cold path).
 pub const VOCAB_SIZE: usize = 10_000;
 
 // ─── Parallel corpus-generation constants ─────────────────────────────
@@ -2571,7 +2570,7 @@ pub fn calibrate_superfile(
 /// Build a stand-alone FTS index from a token corpus. Wrapper exists so
 /// both bench harnesses construct the index identically.
 pub fn build_fts_index(docs: &[String]) -> FtsBuilder {
-    let mut b = FtsBuilder::new(default_tokenizer());
+    let mut b = FtsBuilder::new();
     b.register_column("title".to_string(), true)
         .expect("register column");
     for (i, text) in docs.iter().enumerate() {
