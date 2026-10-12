@@ -29,6 +29,8 @@
 //!                                     │
 //!                                     ├─► pending: later reads get them from memory
 //!                                     ▼
+//!          wait for a block writer (a task, no thread)
+//!                                     ▼
 //!          blocking thread: write ─► mark filled ─► out of pending ─► fsync + index
 //! ```
 //!
@@ -36,8 +38,15 @@
 //!   neither is fetched.
 //! - The index on disk lists only blocks that were fsynced, so a crash loses at
 //!   most the blocks not synced yet, and later reads fetch them again.
-//! - Each store holds at most 256 MiB of fetched runs not written yet. Past
-//!   that, a read still gets its bytes, but they are not cached.
+//! - Each store runs at most [`BLOCK_WRITERS`] writes at once, so a slow disk
+//!   can't take the blocking threads a query needs.
+//! - Each store holds up to [`WRITE_BEHIND_CAP_BYTES`] of fetched runs not
+//!   written yet. Past that, a read still gets its bytes, but they are not
+//!   cached. A run bigger than the cap is still let in when nothing else is
+//!   waiting, and a prefetch, which waits for its own write, is never refused.
+//!
+//! [`BLOCK_WRITERS`]: super::disk::BLOCK_WRITERS
+//! [`WRITE_BEHIND_CAP_BYTES`]: super::disk::WRITE_BEHIND_CAP_BYTES
 //!
 //! Budget integration: each newly filled run reserves its bytes against the
 //! owning [`DiskCacheStore`]'s budget (with LRU eviction pressure) *before*
@@ -69,7 +78,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, stream};
 use memmap2::Mmap;
 use roaring::RoaringBitmap;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, spawn_blocking};
 
 #[cfg(test)]
 use super::disk::BlockWriteTicket;
@@ -147,14 +156,18 @@ pub(crate) struct BlockCachedSource {
     flushing: AtomicBool,
     /// Tests set this to hold block-file writes; see [`Self::stall_writes`].
     #[cfg(test)]
-    write_stall: (Mutex<bool>, Condvar),
+    write_stall: (Mutex<WriteStallState>, Condvar),
 }
 
-/// Runs a block-file write or fsync on the shared I/O runtime's blocking
-/// threads. Never on the caller's runtime: a sync read from a rayon thread runs
-/// on a throwaway runtime, and dropping it would wait for the write or cancel it.
-fn spawn_disk_io<R: Send + 'static>(io: impl FnOnce() -> R + Send + 'static) -> JoinHandle<R> {
-    shared_io_runtime().spawn_blocking(io)
+/// How a missing run is fetched and cached.
+#[derive(Clone, Copy)]
+enum Fill {
+    /// For a read: may evict colder entries to make room, is not cached once
+    /// the cap on unwritten runs is full, and doesn't wait for its write.
+    Read,
+    /// Ahead of reads: uses only free budget and waits for its own write, so
+    /// the cap never refuses it; it holds the bytes until then either way.
+    Prefetch,
 }
 
 /// A fetched run of blocks waiting to be written to the block file, made by
@@ -163,7 +176,7 @@ fn spawn_disk_io<R: Send + 'static>(io: impl FnOnce() -> R + Send + 'static) -> 
 /// - its share of the store's cap on unwritten runs,
 /// - its entry in `pending`, so reads get the bytes from memory.
 ///
-/// [`Self::land`] writes it. Dropping it gives back whatever it still holds,
+/// [`Self::spawn_write`] writes it. Dropping it gives back whatever it still holds,
 /// whether the write worked, failed or never ran, and writes the index if the
 /// blocks were written.
 struct FetchedRun {
@@ -183,8 +196,24 @@ struct FetchedRun {
 }
 
 impl FetchedRun {
+    /// Writes the run once one of the store's block writers is free; `false` if
+    /// the write failed. It runs on the shared I/O runtime, never the caller's: a
+    /// sync read from a rayon thread runs on a throwaway runtime, and dropping it
+    /// would wait for the write or cancel it.
+    fn spawn_write(self) -> JoinHandle<bool> {
+        shared_io_runtime().spawn(async move {
+            let writer = self.store.block_writer().await;
+            spawn_blocking(move || {
+                let _writer = writer;
+                self.land()
+            })
+            .await
+            .unwrap_or(false)
+        })
+    }
+
     /// Writes the run to the block file and marks its blocks filled; `false` if
-    /// the write failed. Blocking: run it with [`spawn_disk_io`].
+    /// the write failed. Blocking.
     fn land(mut self) -> bool {
         #[cfg(test)]
         self.source.wait_while_stalled();
@@ -316,7 +345,7 @@ impl BlockCachedSource {
             dirty: AtomicBool::new(false),
             flushing: AtomicBool::new(false),
             #[cfg(test)]
-            write_stall: (Mutex::new(false), Condvar::new()),
+            write_stall: (Mutex::new(WriteStallState::default()), Condvar::new()),
         })
     }
 
@@ -606,7 +635,7 @@ impl BlockCachedSource {
     }
 
     /// Fsyncs the block file, then writes the index of the blocks marked filled.
-    /// Blocking: run it with [`spawn_disk_io`] or outside async code.
+    /// Blocking: runs at the end of a block write, or in `Drop`.
     /// - One flush runs per source. A call that finds one running returns at
     ///   once; the running one covers its blocks.
     /// - If blocks were marked during the fsync, the running flush goes again,
@@ -767,19 +796,13 @@ impl BlockCachedSource {
                 continue;
             };
 
-            let Some(store) = self.store_if_current() else {
+            let Some((bytes, run)) = self.fetch_missing(bf, first, last, Fill::Read).await? else {
                 return Ok(None);
             };
 
-            let Some((bytes, reservation)) =
-                self.fetch_run(&store, bf.size, first, last, true).await?
-            else {
-                return Ok(None);
-            };
-
-            if let Some(run) = self.admit_run(&store, first, last, &bytes, reservation) {
+            if let Some(run) = run {
                 // Don't wait for the write: the query already has its bytes.
-                drop(spawn_disk_io(move || run.land()));
+                drop(run.spawn_write());
             }
 
             *segment = Segment::Pending {
@@ -793,45 +816,53 @@ impl BlockCachedSource {
         Ok(self.assemble(bf, start, len, &segments))
     }
 
-    /// Reserves budget for blocks `[first, last]` and fetches them with one GET.
-    /// `None` if they can't be cached:
-    /// - no budget left (`may_evict` lets the reservation evict colder entries),
-    /// - the GET returned another length, so the object is not the one this
-    ///   reader opened.
+    /// Fetches blocks `[first, last]` with one GET, reserving their budget
+    /// first, and queues them for writing. Returns:
+    /// - `None` when the read has to go elsewhere: the store is gone or this
+    ///   source is no longer the live entry, no budget is left, or the GET
+    ///   returned another length (the object is not the one this reader opened);
+    /// - the bytes and no run when they are fetched but not queued: the cap on
+    ///   unwritten runs is full, or a run starting at the same block is queued.
+    ///
     /// If the caller is dropped mid-GET, the reservation gives its bytes back.
-    async fn fetch_run<'s>(
+    async fn fetch_missing(
         &self,
-        store: &'s DiskCacheStore,
-        size: u64,
+        bf: &BlockFile,
         first: u32,
         last: u32,
-        may_evict: bool,
-    ) -> Result<Option<(Bytes, Option<Reservation<'s>>)>, LazyByteSourceError> {
-        let (run_start, run_len) = Self::run_bytes(size, first, last);
+        fill: Fill,
+    ) -> Result<Option<(Bytes, Option<FetchedRun>)>, LazyByteSourceError> {
+        let Some(store) = self.store_if_current() else {
+            return Ok(None);
+        };
+        let (run_start, run_len) = Self::run_bytes(bf.size, first, last);
 
-        let reservation = if !self.owns_accounting {
-            None
-        } else if may_evict {
-            let Ok(reserved) = store.reserve(run_len).await else {
+        let reservation = if self.owns_accounting {
+            let reserved = match fill {
+                Fill::Read => store.reserve(run_len).await.ok(),
+                Fill::Prefetch => store.try_reserve(run_len),
+            };
+            let Some(reserved) = reserved else {
                 return Ok(None);
             };
             Some(reserved)
         } else {
-            let Some(reserved) = store.try_reserve(run_len) else {
-                return Ok(None);
-            };
-            Some(reserved)
+            None
         };
 
         let bytes = self.inner.range(run_start, run_len).await?;
+        if bytes.len() as u64 != run_len {
+            return Ok(None);
+        }
 
-        Ok((bytes.len() as u64 == run_len).then_some((bytes, reservation)))
+        let run = self.admit_run(&store, first, last, &bytes, reservation, fill);
+        Ok(Some((bytes, run)))
     }
 
     /// Queues fetched run `[first, last]` for writing: takes its share of the
     /// store's cap on unwritten runs, puts it in `pending`, and hands it the
-    /// reserved budget. `None` (the reservation is given back) if the cap is
-    /// full or a run starting at the same block is already waiting.
+    /// reserved budget. `None` (the reservation is given back) if a read finds
+    /// the cap full, or a run starting at the same block is already waiting.
     fn admit_run(
         &self,
         store: &Arc<DiskCacheStore>,
@@ -839,12 +870,18 @@ impl BlockCachedSource {
         last: u32,
         bytes: &Bytes,
         reservation: Option<Reservation<'_>>,
+        fill: Fill,
     ) -> Option<FetchedRun> {
         let source = self.me.upgrade()?;
 
         let run_len = bytes.len() as u64;
-        if !store.try_admit_write_behind(run_len) {
-            return None;
+        match fill {
+            Fill::Read => {
+                if !store.try_admit_write_behind(run_len) {
+                    return None;
+                }
+            }
+            Fill::Prefetch => store.admit_write_behind(run_len),
         }
 
         match self
@@ -890,17 +927,29 @@ impl BlockCachedSource {
     /// if an assert fails, so a failing test can't hang.
     #[cfg(test)]
     pub(crate) fn stall_writes(&self) -> WriteStall<'_> {
-        *self.write_stall.0.lock().expect("write stall poisoned") = true;
+        self.write_stall.0.lock().expect("write stall poisoned").on = true;
         WriteStall(self)
+    }
+
+    /// How many block writes are held by [`Self::stall_writes`] right now.
+    #[cfg(test)]
+    fn stalled_writes(&self) -> usize {
+        self.write_stall
+            .0
+            .lock()
+            .expect("write stall poisoned")
+            .waiting
     }
 
     #[cfg(test)]
     fn wait_while_stalled(&self) {
-        let (stalled, resume) = &self.write_stall;
-        let mut stalled = stalled.lock().expect("write stall poisoned");
-        while *stalled {
-            stalled = resume.wait(stalled).expect("write stall poisoned");
+        let (state, resume) = &self.write_stall;
+        let mut state = state.lock().expect("write stall poisoned");
+        state.waiting += 1;
+        while state.on {
+            state = resume.wait(state).expect("write stall poisoned");
         }
+        state.waiting -= 1;
     }
 
     /// Serve `[start, start+len)` from the sparse file. `None` on a read
@@ -938,9 +987,9 @@ impl BlockCachedSource {
 
     /// One chunk of [`Self::prefetch`]: fetches every block of `[b0, b1]` that is
     /// neither filled nor pending, and waits for it to be written. It reserves
-    /// only free budget, so a prefetch never evicts what queries use. `false`
-    /// stops the prefetch, when:
-    /// - the budget or the cap on unwritten runs is full,
+    /// only free budget, so a prefetch never evicts what queries use. A run
+    /// another fill queued first is left to it. `false` stops the prefetch, when:
+    /// - the budget is full,
     /// - this source is no longer the live entry, or the store is gone,
     /// - the GET came back short, or the write failed.
     async fn prefetch_chunk(
@@ -954,27 +1003,28 @@ impl BlockCachedSource {
                 continue;
             };
 
-            let Some(store) = self.store_if_current() else {
+            let Some((_, run)) = self.fetch_missing(bf, first, last, Fill::Prefetch).await? else {
                 return Ok(false);
             };
 
-            let Some((bytes, reservation)) =
-                self.fetch_run(&store, bf.size, first, last, false).await?
-            else {
-                return Ok(false);
-            };
-
-            let Some(run) = self.admit_run(&store, first, last, &bytes, reservation) else {
-                return Ok(false);
-            };
-
-            if !spawn_disk_io(move || run.land()).await.unwrap_or(false) {
+            if let Some(run) = run
+                && !run.spawn_write().await.unwrap_or(false)
+            {
                 return Ok(false);
             }
         }
 
         Ok(true)
     }
+}
+
+/// What [`BlockCachedSource::stall_writes`] holds: whether writes wait, and how
+/// many are waiting.
+#[cfg(test)]
+#[derive(Default)]
+struct WriteStallState {
+    on: bool,
+    waiting: usize,
 }
 
 /// Holds a source's block-file writes; see [`BlockCachedSource::stall_writes`].
@@ -984,8 +1034,8 @@ pub(crate) struct WriteStall<'a>(&'a BlockCachedSource);
 #[cfg(test)]
 impl Drop for WriteStall<'_> {
     fn drop(&mut self) {
-        let (stalled, resume) = &self.0.write_stall;
-        *stalled.lock().expect("write stall poisoned") = false;
+        let (state, resume) = &self.0.write_stall;
+        state.lock().expect("write stall poisoned").on = false;
         resume.notify_all();
     }
 }
@@ -1103,17 +1153,39 @@ mod tests {
 
     use futures::FutureExt;
     use tempfile::tempdir;
-    use tokio::sync::Barrier;
+    use tokio::{
+        sync::{Barrier, Notify},
+        time::{sleep, timeout},
+    };
 
     use super::*;
     use crate::{
         runtime_bridge::bridge_sync_to_async_send,
-        supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, LruPolicy},
+        supertable::reader_cache::{
+            ColdFetchMode, DiskCacheConfig, LruPolicy, disk::BLOCK_WRITERS,
+        },
     };
 
     /// How long a test waits for something that should happen right away, before
     /// failing instead of hanging.
     const NO_WAIT_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// How often [`wait_until`] checks its condition.
+    const POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+    /// How long a test waits to see that something does not happen.
+    const STAYS_PUT: Duration = Duration::from_millis(50);
+
+    /// Waits until `cond` holds, failing with `what` after [`NO_WAIT_DEADLINE`].
+    async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+        timeout(NO_WAIT_DEADLINE, async {
+            while !cond() {
+                sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+    }
 
     /// In-memory fake source that counts `range` calls.
     struct CountingSource {
@@ -1573,7 +1645,7 @@ mod tests {
         store.install_block_entry_for_test(uri, Arc::clone(&b));
         let tail = 3 * CACHE_BLOCK_BYTES + 10;
         let _ = b.range(tail, 50).await.expect("B fill disjoint block");
-        wait_for_file(&idx_path).await;
+        wait_until(|| idx_path.exists(), "B writes its index").await;
 
         // A's write runs now and writes its {0} bitmap. WITHOUT the inode fence
         // this renames {0} onto `.blocks.idx`, which now names Y (block 0 = hole).
@@ -1597,17 +1669,6 @@ mod tests {
             "D must serve real bytes, not zeros from a successor inode's hole \
              claimed by a dropped generation's stale bitmap"
         );
-    }
-
-    /// Waits for `path` to appear, written by another source's flush.
-    async fn wait_for_file(path: &Path) {
-        tokio::time::timeout(NO_WAIT_DEADLINE, async {
-            while !path.exists() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("the file is written in time");
     }
 
     /// Two disjoint missing runs in one request → one GET per run.
@@ -1933,7 +1994,7 @@ mod tests {
         let start = 100u64;
         let len = 2 * b;
         let want = inner.blob.slice(start as usize..(start + len) as usize);
-        let first = tokio::time::timeout(NO_WAIT_DEADLINE, src.range(start, len))
+        let first = timeout(NO_WAIT_DEADLINE, src.range(start, len))
             .await
             .expect("the read does not wait for its write");
         assert_eq!(first.expect("first read"), want);
@@ -1979,16 +2040,14 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
         let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
-        let size = src.block_file().expect("block file").size;
+        let bf = src.block_file().expect("block file");
 
-        let (bytes, reservation) = src
-            .fetch_run(&store, size, 0, 0, true)
+        let (_, run) = src
+            .fetch_missing(bf, 0, 0, Fill::Read)
             .await
             .expect("GET")
             .expect("fetched");
-        let run = src
-            .admit_run(&store, 0, 0, &bytes, reservation)
-            .expect("admitted");
+        let run = run.expect("queued");
         assert_eq!(store.stats().current_bytes, b, "the run holds its charge");
         assert!(src.has_pending_writes());
 
@@ -2028,7 +2087,11 @@ mod tests {
         store.block_writes_settled().await;
         assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), b);
         assert_eq!(store.stats().current_bytes, b);
-        assert_eq!(store.write_behind_in_use(), 0, "the allowance came back");
+        assert_eq!(
+            store.write_behind_in_use(),
+            0,
+            "its share of the cap came back"
+        );
         store.remove_block_entry_for_test(&uri);
     }
 
@@ -2103,15 +2166,23 @@ mod tests {
             Arc::clone(&inner) as Arc<dyn LazyByteSource>,
         );
 
+        let stall = src.stall_writes();
         let (one, two) = tokio::join!(src.range(0, 64), src.range(10, 64));
         assert_eq!(one.expect("first read"), inner.inner.blob.slice(0..64));
         assert_eq!(two.expect("second read"), inner.inner.blob.slice(10..74));
         assert_eq!(inner.inner.calls(), 2, "both missed, so both fetched");
+        assert_eq!(store.write_behind_in_use(), b, "only one run is queued");
+        assert_eq!(store.stats().current_bytes, b, "only one is charged");
 
+        drop(stall);
         store.block_writes_settled().await;
         assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), b);
         assert_eq!(store.stats().current_bytes, b, "charged once");
-        assert_eq!(store.write_behind_in_use(), 0, "the allowance came back");
+        assert_eq!(
+            store.write_behind_in_use(),
+            0,
+            "its share of the cap came back"
+        );
         store.remove_block_entry_for_test(&uri);
     }
 
@@ -2158,13 +2229,7 @@ mod tests {
         // pending runs would fetch block 0 again. Its own writes are held too,
         // so let them go once blocks 1 and 2 are fetched.
         let release = async {
-            tokio::time::timeout(NO_WAIT_DEADLINE, async {
-                while inner.calls() < 3 {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
-            .await
-            .expect("the prefetch fetches blocks 1 and 2");
+            wait_until(|| inner.calls() >= 3, "the prefetch fetches blocks 1 and 2").await;
             drop(stall);
         };
         let (prefetched, ()) = tokio::join!(src.prefetch(0, 3 * b, b, 3), release);
@@ -2180,7 +2245,7 @@ mod tests {
     /// With the store's cap on unwritten runs full, a miss still gets its bytes
     /// but is not cached, and its reserved budget is given back.
     #[tokio::test]
-    async fn a_full_write_behind_allowance_serves_uncached() {
+    async fn a_full_write_behind_cap_serves_uncached() {
         let b = CACHE_BLOCK_BYTES;
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
@@ -2208,6 +2273,107 @@ mod tests {
         store.remove_block_entry_for_test(&uri);
     }
 
+    /// However many runs wait, at most `BLOCK_WRITERS` writes run at once, so a
+    /// slow disk can't take every blocking thread. The rest wait as tasks.
+    #[tokio::test]
+    async fn block_writes_run_at_most_block_writers_at_once() {
+        let b = CACHE_BLOCK_BYTES;
+        let runs = BLOCK_WRITERS + 2;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = counting_source(dir.path(), &store, runs * b as usize);
+
+        let stall = src.stall_writes();
+        for run in 0..runs as u64 {
+            let _ = src.range(run * b, 10).await.expect("pend one block");
+        }
+        assert_eq!(inner.calls(), runs);
+        wait_until(
+            || src.stalled_writes() == BLOCK_WRITERS,
+            "every block writer is busy",
+        )
+        .await;
+        sleep(STAYS_PUT).await;
+        assert_eq!(src.stalled_writes(), BLOCK_WRITERS, "the others wait");
+        assert_eq!(store.write_behind_in_use(), runs as u64 * b);
+
+        drop(stall);
+        store.block_writes_settled().await;
+        assert_eq!(
+            src.filled_bytes_handle().load(Ordering::Acquire),
+            runs as u64 * b
+        );
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A full cap on unwritten runs doesn't stop a prefetch: it waits for its own
+    /// writes, so every chunk is still filled.
+    #[tokio::test]
+    async fn prefetch_fills_every_chunk_with_the_cap_full() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = counting_source(dir.path(), &store, 3 * b as usize);
+        let mut taken = 0;
+        while store.try_admit_write_behind(b) {
+            taken += b;
+        }
+
+        src.prefetch(0, 3 * b, b, 1).await.expect("prefetch");
+        assert_eq!(inner.calls(), 3);
+        assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 3 * b);
+        assert_eq!(store.write_behind_in_use(), taken, "its share came back");
+
+        store.release_write_behind(taken);
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A prefetch that finds its run queued by a read while its own GET was in
+    /// flight leaves the run to that read and goes on.
+    #[tokio::test]
+    async fn prefetch_goes_on_past_a_run_queued_meanwhile() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = Arc::new(HeldSource {
+            inner: CountingSource::new(2 * b as usize),
+            first: AtomicBool::new(true),
+            held: AtomicBool::new(false),
+            release: Notify::new(),
+        });
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+        let bf = src.block_file().expect("block file");
+
+        let stall = src.stall_writes();
+        let read_meanwhile = async {
+            wait_until(|| inner.held.load(Ordering::Acquire), "the prefetch GETs").await;
+            let _ = src.range(0, 10).await.expect("the read queues block 0");
+            inner.release.notify_one();
+        };
+        let (chunk, ()) = timeout(NO_WAIT_DEADLINE, async {
+            tokio::join!(src.prefetch_chunk(bf, 0, 0), read_meanwhile)
+        })
+        .await
+        .expect("the prefetch doesn't wait for the read's write");
+        assert!(chunk.expect("prefetch chunk"), "the prefetch goes on");
+        assert_eq!(
+            store.write_behind_in_use(),
+            b,
+            "only the read's run is queued"
+        );
+
+        drop(stall);
+        store.block_writes_settled().await;
+        assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), b);
+        assert_eq!(store.stats().current_bytes, b, "charged once");
+        store.remove_block_entry_for_test(&uri);
+    }
+
     /// Holds every `range` until two are in flight, so two reads both miss.
     struct GatedSource {
         inner: CountingSource,
@@ -2221,7 +2387,35 @@ mod tests {
         }
 
         async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
-            self.gate.wait().await;
+            timeout(NO_WAIT_DEADLINE, self.gate.wait())
+                .await
+                .expect("both reads reach the GET");
+            self.inner.range(start, len).await
+        }
+    }
+
+    /// Holds the first `range` until `release`, so another fill can queue the
+    /// same run meanwhile. `held` is set while it waits.
+    struct HeldSource {
+        inner: CountingSource,
+        first: AtomicBool,
+        held: AtomicBool,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for HeldSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            if self.first.swap(false, Ordering::AcqRel) {
+                self.held.store(true, Ordering::Release);
+                timeout(NO_WAIT_DEADLINE, self.release.notified())
+                    .await
+                    .expect("the held GET is let go");
+            }
             self.inner.range(start, len).await
         }
     }

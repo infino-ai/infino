@@ -4,6 +4,8 @@
 //! Disk-budget accounting: reserve space before a fetch, evict cold entries to
 //! make room, and the idle-page sweeps that trim resident memory.
 
+#[cfg(test)]
+use std::time::Duration;
 use std::{
     fs, mem,
     sync::{Arc, atomic::Ordering},
@@ -11,6 +13,9 @@ use std::{
 
 use dashmap::mapref::entry::Entry;
 use memmap2::{Mmap, UncheckedAdvice};
+use tokio::sync::OwnedSemaphorePermit;
+#[cfg(test)]
+use tokio::time::timeout;
 
 #[cfg(test)]
 use crate::supertable::reader_cache::{
@@ -21,10 +26,9 @@ use crate::supertable::{
     reader_cache::{config::EvictionCandidate, disk::*},
 };
 
-/// Most bytes of fetched runs a store holds in memory before they are written to block files. Past
-/// this, reads still get their bytes but don't cache them, so a slow disk costs refetches later,
-/// not memory or query time.
-const WRITE_BEHIND_CAP_BYTES: u64 = 256 * 1024 * 1024;
+/// How long a test waits for queued block writes to finish, before failing instead of hanging.
+#[cfg(test)]
+const BLOCK_WRITES_SETTLE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Whether dropping this entry would actually release memory: it must be a
 /// lazy entry (no mmap — its cost is anonymous heap that `madvise` cannot
@@ -362,7 +366,21 @@ impl DiskCacheStore {
             .is_ok()
     }
 
-    /// Gives back what [`Self::try_admit_write_behind`] took, once the run is written or dropped.
+    /// Takes `bytes` of the cap even past it, for a run whose caller waits for the write: the caller
+    /// holds those bytes until then either way.
+    pub(crate) fn admit_write_behind(&self, bytes: u64) {
+        self.write_behind_bytes.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    /// Waits for one of the store's [`BLOCK_WRITERS`] slots. Waiting holds no thread.
+    pub(crate) async fn block_writer(&self) -> OwnedSemaphorePermit {
+        Arc::clone(&self.block_writers)
+            .acquire_owned()
+            .await
+            .expect("invariant: the block-writer semaphore is never closed")
+    }
+
+    /// Gives back what admitting a run took, once the run is written or dropped.
     pub(crate) fn release_write_behind(&self, bytes: u64) {
         self.write_behind_bytes.fetch_sub(bytes, Ordering::AcqRel);
     }
@@ -529,15 +547,20 @@ impl DiskCacheStore {
     /// test can check the result.
     #[cfg(test)]
     pub(crate) async fn block_writes_settled(&self) {
-        loop {
-            let idle = self.block_writes_idle.notified();
-            tokio::pin!(idle);
-            idle.as_mut().enable();
-            if self.block_writes.load(Ordering::Acquire) == 0 {
-                return;
+        let settled = async {
+            loop {
+                let idle = self.block_writes_idle.notified();
+                tokio::pin!(idle);
+                idle.as_mut().enable();
+                if self.block_writes.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                idle.await;
             }
-            idle.await;
-        }
+        };
+        timeout(BLOCK_WRITES_SETTLE_DEADLINE, settled)
+            .await
+            .expect("queued block writes finish in time");
     }
 
     /// The budget ledger at rest: every charged byte is backed by a live entry, a scanned cache

@@ -60,6 +60,16 @@ const MMAP_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Yield cadence while a background fill waits for its foreground reader.
 const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Most bytes of fetched runs a store holds in memory before they are written to block files. Past
+/// this, reads still get their bytes but don't cache them, so a slow disk costs refetches later,
+/// not memory or query time.
+pub(super) const WRITE_BEHIND_CAP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Block-file writes a store runs at once. Each one holds a thread of the blocking pool, which a
+/// query also needs to hand off its worker in `block_in_place`; more writers would not write faster
+/// anyway, since they wait on the same disk.
+pub(super) const BLOCK_WRITERS: usize = 4;
+
 /// Filename suffix for per-superfile sparse block-cache files.
 const BLOCKS_FILE_SUFFIX: &str = ".blocks";
 
@@ -339,9 +349,12 @@ pub struct DiskCacheStore {
     unindexed: DashMap<SuperfileUri, UnindexedFile>,
     block_files: DashMap<SuperfileUri, UnindexedFile>,
     current_bytes: AtomicU64,
-    /// Bytes of fetched runs handed to the block-file writer and not written yet. Capped by
-    /// [`Self::try_admit_write_behind`], so a slow disk limits memory, not queries.
+    /// Bytes of fetched runs handed to the block-file writers and not written yet. Past
+    /// [`WRITE_BEHIND_CAP_BYTES`] a read's run is not cached, so a slow disk limits memory, not
+    /// queries.
     write_behind_bytes: AtomicU64,
+    /// [`BLOCK_WRITERS`] slots; a fetched run waits for one before its write takes a thread.
+    block_writers: Arc<Semaphore>,
     /// Queued block-file writes not finished yet (index write included), and a wake-up when it
     /// reaches zero; see [`Self::block_writes_settled`].
     #[cfg(test)]
@@ -450,6 +463,7 @@ impl DiskCacheStore {
             block_files: DashMap::new(),
             current_bytes: AtomicU64::new(0),
             write_behind_bytes: AtomicU64::new(0),
+            block_writers: Arc::new(Semaphore::new(BLOCK_WRITERS)),
             #[cfg(test)]
             block_writes: AtomicUsize::new(0),
             #[cfg(test)]
