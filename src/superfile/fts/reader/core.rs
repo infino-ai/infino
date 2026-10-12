@@ -64,6 +64,17 @@ const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
 /// Maximum total gap bytes tolerated in one coalesced postings request.
 const TERM_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
 
+/// What a query scores a superfile at in place of what its columns
+/// declare. The default changes nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ScoringView<'a> {
+    /// The BM25 parameters for every column.
+    pub params: Option<bm25::Bm25Params>,
+    /// The average document length for the one column named, as this file
+    /// labels it.
+    pub avgdl: Option<(&'a str, f32)>,
+}
+
 /// Per-term table-wide BM25 idf, keyed by term.
 pub(crate) type GlobalTermIdf = std::collections::HashMap<String, f32>;
 
@@ -544,34 +555,57 @@ pub struct FtsReader {
 }
 
 impl FtsReader {
-    /// A view of this reader that scores every column with `params`
-    /// instead of the pair that column declared.
+    /// A view of this reader that scores at `scoring` instead of what its
+    /// columns declare, or `None` when that changes no column.
     ///
     /// Two things change per column, and nothing else: the norm decode
-    /// table is re-derived at `params` (the per-doc length buckets are
-    /// shared, not copied — they carry no parameters), and
+    /// table is re-derived at the new parameters and average length (the
+    /// per-doc length buckets are shared, not copied), and
     /// [`ColumnMeta::bound_scale`] picks up the factor that keeps the
-    /// *stored* bounds — which belong to the declared pair — upper
-    /// bounds under the new one. Results stay exact; only pruning power
-    /// is traded, which is why this is an opt-in per query and never the
-    /// default path.
-    ///
-    /// A column whose declared pair already equals `params` is left
-    /// untouched, so a query that "overrides" with what the column
-    /// already uses costs nothing.
-    pub(crate) fn with_bm25_override(&self, params: bm25::Bm25Params) -> Self {
+    /// *stored* bounds, which belong to what the file declares, upper bounds
+    /// under the new values. Results stay exact; only pruning power is
+    /// traded.
+    pub(crate) fn with_scoring(&self, scoring: &ScoringView<'_>) -> Option<Self> {
+        let target = |col: &ColumnMeta| {
+            let params = scoring.params.unwrap_or(col.params);
+            let avgdl = match scoring.avgdl {
+                Some((column, avgdl)) if column == col.name => avgdl,
+                _ => col.score_avgdl,
+            };
+            (params, avgdl)
+        };
+        if self
+            .columns
+            .iter()
+            .all(|col| target(col) == (col.params, col.score_avgdl))
+        {
+            return None;
+        }
         let mut view = self.clone();
         for col in &mut view.columns {
-            if col.params == params {
+            let (params, avgdl) = target(col);
+            if (params, avgdl) == (col.params, col.score_avgdl) {
                 continue;
             }
-            // The view scores at `params`; its norms are derived from the
-            // declared-parameter norms on first use (`ColumnMeta::norms`),
-            // composing the bound factor rather than replacing it.
+            // The view's norms are derived from the declared ones on first
+            // use (`ColumnMeta::norms`), composing the bound factor rather
+            // than replacing it.
             col.params = params;
+            col.score_avgdl = avgdl;
             col.view_norms = Arc::new(OnceLock::new());
         }
-        view
+        Some(view)
+    }
+
+    /// [`Self::with_scoring`] at `params` alone, unchanged when no column
+    /// moves.
+    #[cfg(test)]
+    pub(crate) fn with_bm25_override(&self, params: bm25::Bm25Params) -> Self {
+        let scoring = ScoringView {
+            params: Some(params),
+            avgdl: None,
+        };
+        self.with_scoring(&scoring).unwrap_or_else(|| self.clone())
     }
 
     /// Open with default options (CRC verification on).
@@ -918,6 +952,7 @@ impl FtsReader {
                 source: source.clone(),
                 n_docs,
                 baked_avgdl,
+                score_avgdl: baked_avgdl,
                 declared_params: params,
                 verify_crc: opts.verify_crc,
                 base_norms: Arc::new(OnceLock::new()),
@@ -1030,6 +1065,13 @@ impl FtsReader {
     /// fan-out that reopens every superfile, so an array that cannot be read
     /// is an error, not a column with no tokens: a zero recorded there would
     /// skew every query's statistics for as long as the superfile lives.
+    /// The average document length `column` was built at, which its stored
+    /// bounds assume; `None` when the index has no such column.
+    pub(crate) fn column_baked_avgdl(&self, column: &str) -> Option<f32> {
+        let id = self.resolve_column_id(column).ok()?;
+        Some(self.columns[id as usize].baked_avgdl)
+    }
+
     pub fn column_length_stats(&self, column: &str) -> Result<Option<ColumnLengthStats>, FtsError> {
         let Ok(id) = self.resolve_column_id(column) else {
             return Ok(None);

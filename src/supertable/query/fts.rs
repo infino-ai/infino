@@ -120,6 +120,7 @@ use crate::{
             reader::{
                 Bm25SearchOptions, ClauseLists, ColumnLengthStats, FetchedTermMemo, GlobalTermIdf,
                 LiveFloor, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryIdf,
+                ScoringView,
             },
             tokenize::Phrase,
         },
@@ -140,6 +141,7 @@ use crate::{
             prune::{PruneLeaf, select_superfiles},
         },
         reader_cache::{ReadIntent, disk::ForegroundQueryGuard},
+        schema::FieldId,
         tombstones::SidecarCache,
     },
     utils::{
@@ -547,6 +549,47 @@ pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
     ceiling.partial_cmp(&floor) != Some(std::cmp::Ordering::Less)
 }
 
+/// What a superfile scores a query at: the query's BM25 parameters, and
+/// the table's average length `table_avgdl` for `column`, as the file labels
+/// it.
+fn table_scoring(column: &str, params: Option<Bm25Params>, table_avgdl: f32) -> ScoringView<'_> {
+    ScoringView {
+        params,
+        avgdl: Some((column, table_avgdl)),
+    }
+}
+
+/// Scales each superfile's score ceiling, stored at the average length it
+/// was built at, so it stays an upper bound at the table's average
+/// `table_avgdl`. A file built at a smaller average scores at most
+/// `table_avgdl / baked` higher there: the length norm
+/// `1 - b + b·dl/avgdl` falls by at most that ratio, and `tf / (tf + k1·norm)`
+/// rises by no more than the norm falls. A file that records no average has
+/// no bound, so it is opened and never skipped.
+fn ceilings_at_table_avgdl(
+    ceilings: &mut HashMap<Uuid, f32>,
+    kept: &[Arc<SuperfileEntry>],
+    column: FieldId,
+    table_avgdl: f32,
+) {
+    for entry in kept {
+        let Some(ceiling) = ceilings.get_mut(&entry.superfile_id) else {
+            continue;
+        };
+        let baked = entry
+            .fts_summary
+            .get(&column)
+            .and_then(|summary| summary.baked_avgdl);
+        *ceiling = match baked {
+            Some(baked) if baked >= table_avgdl => *ceiling,
+            // Rounded up so the division's rounding never leaves the
+            // ceiling below a score it has to cap.
+            Some(baked) if baked > 0.0 => (*ceiling * (table_avgdl / baked)).next_up(),
+            _ => f32::INFINITY,
+        };
+    }
+}
+
 /// A ranked query's clauses, owned and resolved to terms: what the scoring
 /// core takes, whether they came from parsing a query or expanding a
 /// prefix.
@@ -771,6 +814,10 @@ impl SupertableReader {
         if corpus.n_scored_docs == 0 {
             return Ok(Vec::new());
         }
+        // Every superfile scores at the table's average length, in the
+        // fixed point a file stores it in, so a file built at exactly this
+        // average takes the declared path.
+        let table_avgdl = bm25::stored_avgdl(corpus.avgdl());
 
         let phases = self.phase_spans();
         let select_span = trace::phase(phases, || {
@@ -893,6 +940,10 @@ impl SupertableReader {
                         .instrument(term_span.clone())
                         .await
                         .ok()
+                        .map(|mut ceilings| {
+                            ceilings_at_table_avgdl(&mut ceilings, &kept, column_id, table_avgdl);
+                            ceilings
+                        })
                 }
                 _ => None,
             };
@@ -1022,6 +1073,7 @@ impl SupertableReader {
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
                 let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+                let scoring = table_scoring(&column_arc, bm25_params, table_avgdl);
 
                 // This superfile's open-wave fetches (global stats): the
                 // cursor builds below serve the scored terms from the memo
@@ -1083,6 +1135,7 @@ impl SupertableReader {
                                         &should_refs,
                                         QueryIdf::Table(&global_idf),
                                         memo.as_deref(),
+                                        &scoring,
                                     )
                                     .await?;
                                 // Flushed inside the OnceCell init so slices
@@ -1102,6 +1155,7 @@ impl SupertableReader {
                             let kernel_reader = Arc::clone(&r);
                             let kernel_set = Arc::clone(set);
                             let kernel_stats = op_stats.clone();
+                            let kernel_column = column_arc.clone();
                             run_on_pool(
                                 Some(&reader_pool),
                                 "ranged fts kernel: reader pool dropped result",
@@ -1113,7 +1167,11 @@ impl SupertableReader {
                                             start,
                                             end,
                                             floor,
-                                            bm25_params,
+                                            &table_scoring(
+                                                &kernel_column,
+                                                bm25_params,
+                                                table_avgdl,
+                                            ),
                                         )
                                     })
                                 },
@@ -1122,14 +1180,7 @@ impl SupertableReader {
                             .map_err(|e| QueryError::Internal(e.to_string()))??
                         } else {
                             op_stats::timed_kernel(&op_stats, || {
-                                r.bm25_search_or_range_prebuilt(
-                                    set,
-                                    k,
-                                    start,
-                                    end,
-                                    floor,
-                                    bm25_params,
-                                )
+                                r.bm25_search_or_range_prebuilt(set, k, start, end, floor, &scoring)
                             })?
                         }
                     }
@@ -1155,7 +1206,7 @@ impl SupertableReader {
                                 },
                                 k,
                                 floor,
-                                bm25_params,
+                                &scoring,
                             )
                             .await?;
                         if let Some(stats) = &op_stats {
@@ -1178,7 +1229,7 @@ impl SupertableReader {
                             // ids, and everything downstream reads them
                             // as rows.
                             prep @ PreparedClauses::Done { .. } => {
-                                r.run_prepared(prep, bm25_params)?
+                                r.run_prepared(prep, &scoring)?
                             }
                             // Gate on posting mass, not term count: this
                             // scan isn't sliced, so a rare-term query
@@ -1187,12 +1238,20 @@ impl SupertableReader {
                             prep if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS => {
                                 let kernel_reader = Arc::clone(&r);
                                 let kernel_stats = op_stats.clone();
+                                let kernel_column = column_arc.clone();
                                 run_on_pool(
                                     Some(&reader_pool),
                                     "un-ranged fts kernel: reader pool dropped result",
                                     move || {
                                         op_stats::timed_kernel(&kernel_stats, || {
-                                            kernel_reader.run_prepared(prep, bm25_params)
+                                            kernel_reader.run_prepared(
+                                                prep,
+                                                &table_scoring(
+                                                    &kernel_column,
+                                                    bm25_params,
+                                                    table_avgdl,
+                                                ),
+                                            )
                                         })
                                     },
                                 )
@@ -1200,7 +1259,7 @@ impl SupertableReader {
                                 .map_err(|e| QueryError::Internal(e.to_string()))??
                             }
                             prep => op_stats::timed_kernel(&op_stats, || {
-                                r.run_prepared(prep, bm25_params)
+                                r.run_prepared(prep, &scoring)
                             })?,
                         }
                     }
@@ -3141,17 +3200,19 @@ mod tests {
         );
     }
 
+    /// Relative score gap two tables may differ by and still count as
+    /// scoring alike: f32 rounding, never a different statistic.
+    const SCORE_REL_TOLERANCE: f32 = 1e-5;
+
     /// Oracle for table-wide statistics: a table split across many
     /// commits, against the same docs in a single superfile (whose
     /// local statistics already are table-wide). Lengths fall with doc id, so each commit's own
     /// average differs from the table's.
     ///
-    /// idf is globalized at query time, so it matches everywhere. The
-    /// average document length is baked at write time as the running
-    /// table-wide value: the last commit's covers the whole table and
-    /// its docs score exactly as in the single superfile; each earlier
-    /// commit sits as close to the table's average as the data committed
-    /// by then allowed, and no further.
+    /// Both statistics are table-wide at query time: idf, and the average
+    /// document length every superfile is scored at, whatever average it
+    /// was built with. Every commit's documents score as they do in the
+    /// single superfile.
     #[test]
     fn global_stats_multi_superfile_converges_to_single_superfile() {
         // 24 docs of *varying* length. The first three tokens carry the
@@ -3224,14 +3285,6 @@ mod tests {
             hits.into_iter().collect()
         };
 
-        let chunk_of = |title: &str| -> usize {
-            let i: usize = title
-                .split(' ')
-                .find_map(|w| w.strip_prefix('d'))
-                .and_then(|d| d.parse().ok())
-                .expect("titles carry a d{i:02} tag");
-            i / 6
-        };
         let rel = |a: f32, b: f32| (a - b).abs() / a.abs().max(1.0);
 
         for q in ["alpha shared", "beta red", "gamma green d05", "shared red"] {
@@ -3243,30 +3296,13 @@ mod tests {
                 multi_global.len(),
                 "hit count mismatch for {q:?}"
             );
-            // Per commit: the mean relative gap to the single-superfile
-            // score. The last commit is exact; earlier ones converge.
-            let mut gap = [(0.0f32, 0usize); 4];
             for (title, s_score) in &single_ref {
                 let g_score = multi_global
                     .get(title)
                     .unwrap_or_else(|| panic!("global result missing {title:?} for {q:?}"));
-                let chunk = chunk_of(title);
-                gap[chunk].0 += rel(*s_score, *g_score);
-                gap[chunk].1 += 1;
-                if chunk == 3 {
-                    assert!(
-                        rel(*s_score, *g_score) <= 1e-5,
-                        "last commit: global score {g_score} != single score {s_score} \
-                         for {title:?} / {q:?}"
-                    );
-                }
-            }
-            if q == "alpha shared" {
-                let means: Vec<f32> = gap.iter().map(|&(sum, n)| sum / n as f32).collect();
                 assert!(
-                    means.windows(2).all(|w| w[0] >= w[1]) && means[0] > means[3],
-                    "each commit must sit closer to the table's average than the one \
-                     before it, got per-commit gaps {means:?} for {q:?}"
+                    rel(*s_score, *g_score) <= SCORE_REL_TOLERANCE,
+                    "global score {g_score} != single score {s_score} for {title:?} / {q:?}"
                 );
             }
         }
@@ -3383,6 +3419,13 @@ mod tests {
     /// target each falls far below, and a fill floor each clears.
     const COMPACT_TARGET_MB: u64 = 1;
     const COMPACT_MIN_FILL_PERCENT: u8 = 1;
+
+    /// An ordered-open window of one: superfiles open strictly in turn.
+    const SEQUENTIAL_OPENS: usize = 1;
+
+    /// Tokens in a long fixture document: enough to pull the table's average
+    /// far above a two-token document's.
+    const LONG_DOC_TOKENS: usize = 40;
 
     /// A `k` above every fixture's match count, so no hit is cut off.
     const K_EVERY_MATCH: usize = 100;
@@ -3588,6 +3631,35 @@ mod tests {
         let stranger: HashSet<Uuid> = [Uuid::new_v4()].into();
         let live = block_on(manifest.live_among(&index, &stranger)).expect("live");
         assert!(live.is_empty(), "a superfile the table does not hold");
+    }
+
+    /// Term-index ceilings are stored at the average each file was built at.
+    /// The first commit here is short documents, so its stored ceiling for
+    /// `zeta` is far below what its short match scores once the long second
+    /// commit lifts the table's average; the second commit's weaker match
+    /// opens first. Unscaled, the first commit's ceiling would fall under
+    /// that floor and its better hit would be skipped.
+    #[test]
+    fn a_file_built_at_a_shorter_average_is_not_skipped() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let filler = |n: usize| vec!["f"; n].join(" ");
+        let weaker = format!("zeta zeta {}", filler(LONG_DOC_TOKENS / 2 - 2));
+        let long = filler(LONG_DOC_TOKENS);
+        commit_each(&storage, &[&["zeta a", "b c"], &[&weaker, &long, &long]]);
+        // One open at a time, so the second commit's floor is set before the
+        // first commit's ceiling is checked.
+        let st = Supertable::open(
+            eager_options(&storage).with_bound_ordered_open_window(SEQUENTIAL_OPENS),
+        )
+        .expect("open");
+        let every = all_scored(&st, "zeta");
+        assert_eq!(
+            every[0].0, "zeta a",
+            "the short match ranks first: {every:?}"
+        );
+        assert_eq!(top_k_scored(&st, "zeta", 1), every[..1]);
     }
 
     /// A list whose part entries carry no length totals, as one written

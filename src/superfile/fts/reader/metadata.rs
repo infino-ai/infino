@@ -362,11 +362,12 @@ pub(super) fn unscored_norm_table() -> &'static NormTable {
 }
 
 impl ColumnNorms {
-    /// These norms re-derived at `params`, for a view that scores with
-    /// parameters other than `declared` — the ones the stored bounds were
-    /// baked at. The per-doc length buckets are shared, not copied.
-    fn rescored(&self, declared: bm25::Bm25Params, params: bm25::Bm25Params) -> Self {
-        let dl_norm_k1 = self.dl_norm_k1.rescored(self.dl_norm_k1.avgdl(), params);
+    /// These norms re-derived at `params` and `avgdl`, for a view that
+    /// scores with other parameters than `declared` (the ones the stored
+    /// bounds were baked at) or another average length. The per-doc length
+    /// buckets are shared, not copied.
+    fn rescored(&self, declared: bm25::Bm25Params, params: bm25::Bm25Params, avgdl: f32) -> Self {
+        let dl_norm_k1 = self.dl_norm_k1.rescored(avgdl, params);
         Self {
             bound_scale: self.bound_scale
                 * self.dl_norm_k1.bound_scale(&dl_norm_k1, declared, params),
@@ -411,6 +412,9 @@ pub struct ColumnMeta {
     pub(super) source: Source,
     pub(super) n_docs: u32,
     pub(super) baked_avgdl: f32,
+    /// The average length this column is scored at: the baked one, or a
+    /// scoring view's (see `FtsReader::with_scoring`).
+    pub(super) score_avgdl: f32,
     /// The pair the stored bounds were baked at.
     pub(super) declared_params: bm25::Bm25Params,
     /// Whether the length array's CRC is checked when it is read.
@@ -553,14 +557,20 @@ impl ColumnMeta {
     /// for, and its empty table is one `get` must never see.
     pub(super) fn norms(&self) -> &ColumnNorms {
         let base = self.base_norms();
-        if self.params == self.declared_params {
+        if self.scores_as_declared() {
             return base;
         }
         let Some(base) = self.base_norms.get() else {
             return base;
         };
         self.view_norms
-            .get_or_init(|| base.rescored(self.declared_params, self.params))
+            .get_or_init(|| base.rescored(self.declared_params, self.params, self.score_avgdl))
+    }
+
+    /// Whether this column scores at what its file declares, so the stored
+    /// bounds hold as they are.
+    fn scores_as_declared(&self) -> bool {
+        self.params == self.declared_params && self.score_avgdl == self.baked_avgdl
     }
 
     /// Whether the declared-parameter norms have been built.
@@ -590,7 +600,7 @@ impl ColumnMeta {
     /// the parameters it is scored at. Exactly `1.0` when scored at the
     /// declared parameters, known without reading anything.
     pub fn bound_scale(&self) -> f32 {
-        if self.params == self.declared_params {
+        if self.scores_as_declared() {
             return 1.0;
         }
         self.norms().bound_scale

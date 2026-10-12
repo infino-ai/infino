@@ -1174,6 +1174,7 @@ mod tests {
             n_terms,
             range,
             ColumnLengthStats::default(),
+            None,
         )
     }
 

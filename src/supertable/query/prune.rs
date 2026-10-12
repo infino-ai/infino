@@ -715,6 +715,7 @@ mod tests {
                 titles.len() as u32,
                 (mn.as_bytes().to_vec(), mx.as_bytes().to_vec()),
                 ColumnLengthStats::default(),
+                None,
             ),
         );
 
@@ -831,6 +832,7 @@ mod tests {
                 bloom_tokens.len() as u32,
                 term_range,
                 ColumnLengthStats::default(),
+                None,
             ),
         );
         let id = Uuid::new_v4();

@@ -274,8 +274,9 @@ fn supertable_prefix_global(
 // ---- Brute-force oracle (per-superfile + global merge) ---------------
 
 /// One superfile's reference scorer: indexed over the whole corpus (so
-/// idf is table-wide), normalizing lengths at the average the file
-/// declares, and answering only for the rows the file holds.
+/// idf is table-wide), normalizing lengths at the table's average
+/// whatever average the file was built at, and answering only for the rows
+/// the file holds.
 struct FileOracle {
     scorer: BruteForceBm25,
     rows: Range<u64>,
@@ -304,38 +305,36 @@ fn build_oracles_with_params(
         .collect()
 }
 
-/// One [`FileOracle`] per superfile [`build_supertable`] writes. Each
-/// commit holds one chunk, so a file declares the average over every
-/// row up to and including its own chunk, rounded as the writer stores
-/// it.
+/// One [`FileOracle`] per superfile [`build_supertable`] writes, each
+/// scoring at the whole corpus's average, rounded as a file stores it.
 fn build_oracles(corpus: &[(u64, String)], n_superfiles: usize) -> Vec<FileOracle> {
     let tok = default_tokenizer();
     let view: Vec<(u64, &str)> = corpus.iter().map(|(i, t)| (*i, t.as_str())).collect();
-    let lengths: Vec<u32> = corpus
-        .iter()
-        .map(|(_, t)| {
-            let mut n = 0u32;
-            tok.tokenize_each(t, &mut |_| n += 1);
-            n
-        })
-        .collect();
+    let table_avgdl = corpus_avgdl(corpus);
     let chunk_size = corpus.len().div_ceil(n_superfiles);
-    let mut committed_rows = 0usize;
     corpus
         .chunks(chunk_size)
         .map(|chunk| {
-            committed_rows += chunk.len();
-            let committed =
-                ColumnLengthStats::from_lengths(lengths[..committed_rows].iter().copied());
             let first = chunk.first().expect("non-empty chunk").0;
             let last = chunk.last().expect("non-empty chunk").0;
             FileOracle {
-                scorer: BruteForceBm25::index(&view, tok.as_ref())
-                    .with_avgdl(stored_avgdl(committed.avgdl())),
+                scorer: BruteForceBm25::index(&view, tok.as_ref()).with_avgdl(table_avgdl),
                 rows: first..last + 1,
             }
         })
         .collect()
+}
+
+/// The average document length over all of `corpus`, rounded as a file
+/// stores it: what the engine scores every superfile at.
+fn corpus_avgdl(corpus: &[(u64, String)]) -> f32 {
+    let tok = default_tokenizer();
+    let stats = ColumnLengthStats::from_lengths(corpus.iter().map(|(_, t)| {
+        let mut n = 0u32;
+        tok.tokenize_each(t, &mut |_| n += 1);
+        n
+    }));
+    stored_avgdl(stats.avgdl())
 }
 
 /// Merge per-superfile brute-force hits into a global top-k, in the
@@ -1296,27 +1295,20 @@ fn running_spans(st: &Supertable, corpus: &[(u64, String)]) -> Vec<RunningSpan> 
     spans
 }
 
-/// The reference for `query`: every file's rows scored with table-wide
-/// idf at that file's declared average, merged by score then id.
+/// The reference for `query`: every row scored with table-wide idf at the
+/// table's average, whatever average its file declares, merged by score
+/// then id.
 fn running_expected(
     corpus: &[(u64, String)],
-    spans: &[RunningSpan],
     query: &str,
     mode: BoolMode,
     k: usize,
 ) -> Vec<(u64, f32)> {
     let refs: Vec<(u64, &str)> = corpus.iter().map(|(i, t)| (*i, t.as_str())).collect();
     let tok = default_tokenizer();
-    let mut all: Vec<(u64, f32)> = Vec::new();
-    for span in spans {
-        let oracle = BruteForceBm25::index(&refs, tok.as_ref()).with_avgdl(span.declared_avgdl);
-        all.extend(
-            oracle
-                .top_k_query(query, mode, tok.as_ref(), usize::MAX)
-                .into_iter()
-                .filter(|(d, _)| span.rows.contains(d)),
-        );
-    }
+    let mut all = BruteForceBm25::index(&refs, tok.as_ref())
+        .with_avgdl(corpus_avgdl(corpus))
+        .top_k_query(query, mode, tok.as_ref(), usize::MAX);
     all.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(Ordering::Equal)
@@ -1361,7 +1353,7 @@ fn assert_running_shape(
     mode: BoolMode,
     k: usize,
 ) {
-    let want = running_expected(corpus, spans, query, mode, k);
+    let want = running_expected(corpus, query, mode, k);
     let got = running_engine_hits(st, spans, query, mode, k);
     assert_eq!(
         got.len(),
@@ -1414,29 +1406,21 @@ fn run_running_average_arm(files_per_commit: usize) {
         assert_running_shape(&st, &corpus, &spans, q, BoolMode::And, RUNNING_TOP_K);
     }
 
-    // The fixture distinguishes the declared averages from one
-    // table-wide average: scoring every row at the corpus average
-    // disagrees with the engine on at least one row by more than the
-    // tolerance, so the agreement above is not a coincidence of the
-    // corpus.
-    let refs: Vec<(u64, &str)> = corpus.iter().map(|(i, t)| (*i, t.as_str())).collect();
-    let tok = default_tokenizer();
-    let single: HashMap<u64, f32> = BruteForceBm25::index(&refs, tok.as_ref())
-        .top_k_query("alpha", BoolMode::Or, tok.as_ref(), usize::MAX)
-        .into_iter()
-        .collect();
-    let engine = running_engine_hits(&st, &spans, "alpha", BoolMode::Or, corpus.len());
+    // The fixture's files declare averages other than the table's, so the
+    // agreement above shows every file scored at the table's average and
+    // not at what it declares.
+    let table = corpus_avgdl(&corpus);
     assert!(
-        engine
+        spans
             .iter()
-            .any(|(d, s)| (s - single[d]).abs() > RUNNING_SCORE_TOLERANCE),
-        "a single-average reference agrees with every score; the fixture's commits do not \
-         differ enough in length to exercise the declared averages"
+            .any(|s| (s.declared_avgdl - table).abs() > RUNNING_AVGDL_TOLERANCE * table),
+        "every file declares the table's average; the fixture's commits do not differ \
+         enough in length to tell the two apart"
     );
 }
 
 /// One file per commit: each file declares the running table-wide
-/// average as of its commit, and the engine scores it there.
+/// average as of its commit, and the engine scores it at the table's.
 #[test]
 fn running_average_with_one_file_per_commit_matches_the_reference() {
     run_running_average_arm(1);
@@ -1444,10 +1428,10 @@ fn running_average_with_one_file_per_commit_matches_the_reference() {
 
 /// Two files per commit: the second file of a commit declares the
 /// average *without* the first file's rows — the manifest the writer
-/// reads has not been advanced yet — and both are scored at what they
-/// declare. A writer that folded the earlier flush in, or a reader that
-/// scored every file of a commit at one value, fails the declared-average
-/// check or the score comparison.
+/// reads has not been advanced yet — and both are scored at the table's
+/// average. A writer that folded the earlier flush in fails the
+/// declared-average check; a reader that scored a file at what it declares
+/// fails the score comparison.
 #[test]
 fn running_average_with_two_files_per_commit_matches_the_reference() {
     run_running_average_arm(2);

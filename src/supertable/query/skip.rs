@@ -734,6 +734,7 @@ mod tests {
             terms.len() as u32,
             term_range,
             ColumnLengthStats::default(),
+            None,
         );
         (fid(column), summary)
     }

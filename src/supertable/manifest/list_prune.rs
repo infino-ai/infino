@@ -225,6 +225,7 @@ mod tests {
                     title_terms.len() as u32,
                     term_range,
                     ColumnLengthStats::default(),
+                    None,
                 ),
             );
         }
@@ -338,6 +339,7 @@ mod tests {
                 0,
                 (Vec::new(), Vec::new()),
                 ColumnLengthStats::default(),
+                None,
             ),
         );
         let s_c = Arc::new(SuperfileEntry {
@@ -376,6 +378,7 @@ mod tests {
                 0,
                 (Vec::new(), Vec::new()),
                 ColumnLengthStats::default(),
+                None,
             ),
         );
         let s = Arc::new(SuperfileEntry {

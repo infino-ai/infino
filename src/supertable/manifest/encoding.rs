@@ -573,6 +573,10 @@ pub fn encode_fts_summary(s: &FtsSummaryAgg) -> Vec<u8> {
     if let Some(stats) = s.length_stats {
         out.extend_from_slice(&stats.total_tokens.to_le_bytes());
         out.extend_from_slice(&stats.n_scored_docs.to_le_bytes());
+        // Follows the totals, so it is only ever written after them.
+        if let Some(avgdl) = s.baked_avgdl {
+            out.extend_from_slice(&avgdl.to_bits().to_le_bytes());
+        }
     }
     out
 }
@@ -611,11 +615,17 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
         total_tokens: read_u64(&mut c, "total_tokens")?,
         n_scored_docs: read_u64(&mut c, "n_scored_docs")?,
     });
+    // Absent on a summary written before it was recorded.
+    let baked_avgdl = match c.position() as usize == c.get_ref().len() {
+        true => None,
+        false => Some(f32::from_bits(read_u32(&mut c, "baked_avgdl")?)),
+    };
     Ok(FtsSummaryAgg {
         term_bloom,
         n_terms_distinct,
         term_range,
         length_stats,
+        baked_avgdl,
     })
 }
 
@@ -1023,6 +1033,8 @@ mod decode_error_tests {
     /// Totals a test can recognise on the way back out.
     const TEST_TOTAL_TOKENS: u64 = 4_242;
     const TEST_SCORED_DOCS: u64 = 707;
+    /// A build-time average length, as a stored fixed-point value.
+    const TEST_BAKED_AVGDL: f32 = 5.999;
 
     #[test]
     fn fts_summary_without_totals_is_rejected() {
@@ -1054,17 +1066,20 @@ mod decode_error_tests {
 
     #[test]
     fn fts_summary_totals_round_trip() {
-        let agg = FtsSummaryAgg {
-            term_bloom: None,
-            n_terms_distinct: 9,
-            term_range: Some((b"a".to_vec(), b"z".to_vec())),
-            length_stats: Some(ColumnLengthStats {
-                total_tokens: TEST_TOTAL_TOKENS,
-                n_scored_docs: TEST_SCORED_DOCS,
-            }),
-        };
-        let got = decode_fts_summary(&encode_fts_summary(&agg)).expect("decode");
-        assert_eq!(got, agg);
+        for baked_avgdl in [Some(TEST_BAKED_AVGDL), None] {
+            let agg = FtsSummaryAgg {
+                term_bloom: None,
+                n_terms_distinct: 9,
+                term_range: Some((b"a".to_vec(), b"z".to_vec())),
+                length_stats: Some(ColumnLengthStats {
+                    total_tokens: TEST_TOTAL_TOKENS,
+                    n_scored_docs: TEST_SCORED_DOCS,
+                }),
+                baked_avgdl,
+            };
+            let got = decode_fts_summary(&encode_fts_summary(&agg)).expect("decode");
+            assert_eq!(got, agg);
+        }
     }
 
     #[test]
@@ -1078,6 +1093,7 @@ mod decode_error_tests {
                 total_tokens: TEST_TOTAL_TOKENS,
                 n_scored_docs: TEST_SCORED_DOCS,
             }),
+            baked_avgdl: None,
         };
         let bytes = encode_fts_summary(&agg);
         let truncated = &bytes[..bytes.len() - size_of::<u64>()];

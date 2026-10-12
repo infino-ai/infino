@@ -70,7 +70,7 @@ use crate::{
             bm25::Bm25Params,
             reader::{
                 self as fts_reader, BoolMode, ClauseLists, ContainsRows, FetchedTermMemo,
-                FtsReader, MatchWork, OrCursorSet, PreparedClauses, TermPattern,
+                FtsReader, MatchWork, OrCursorSet, PreparedClauses, ScoringView, TermPattern,
             },
             tokenize::{Phrase, Tokenizer},
         },
@@ -118,6 +118,34 @@ pub struct OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self { verify_crc: true }
+    }
+}
+
+/// A [`ScoringView`] owned, as the scored-view memo keys on it.
+#[derive(Debug)]
+struct ScoringKey {
+    params: Option<Bm25Params>,
+    avgdl: Option<(String, f32)>,
+}
+
+impl ScoringKey {
+    /// Whether this key is `scoring`'s, compared without allocating.
+    fn matches(&self, scoring: &ScoringView<'_>) -> bool {
+        self.params == scoring.params
+            && self
+                .avgdl
+                .as_ref()
+                .map(|(column, avgdl)| (column.as_str(), *avgdl))
+                == scoring.avgdl
+    }
+
+    fn of(scoring: &ScoringView<'_>) -> Self {
+        Self {
+            params: scoring.params,
+            avgdl: scoring
+                .avgdl
+                .map(|(column, avgdl)| (column.to_owned(), avgdl)),
+        }
     }
 }
 
@@ -192,7 +220,7 @@ pub struct SuperfileReader {
     /// query on a column asks for the same override, so a single entry
     /// hits on all but the first. A table alternating between two FTS
     /// columns thrashes it and simply pays what it paid before.
-    scored_fts: RwLock<Option<(Bm25Params, Arc<FtsReader>)>>,
+    scored_fts: RwLock<Option<(ScoringKey, Arc<FtsReader>)>>,
     vec: Option<VectorReader>,
     /// Byte range of the stable-id sidecar within `bytes` (a packed
     /// little-endian `i128` per local doc id), when the superfile carries
@@ -1759,9 +1787,9 @@ impl SuperfileReader {
         lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
-        bm25: Option<Bm25Params>,
+        scoring: &ScoringView<'_>,
     ) -> Result<PreparedClauses, ReadError> {
-        let fts = self.fts_scored(bm25)?;
+        let fts = self.fts_scored(scoring)?;
         Ok(fts.prepare_clauses(column, lists, k, floor).await?)
     }
 
@@ -1776,9 +1804,9 @@ impl SuperfileReader {
     pub(crate) fn run_prepared(
         &self,
         prep: PreparedClauses,
-        bm25: Option<Bm25Params>,
+        scoring: &ScoringView<'_>,
     ) -> Result<Vec<(RowId, f32)>, ReadError> {
-        let fts = self.fts_scored(bm25)?;
+        let fts = self.fts_scored(scoring)?;
         Ok(fts.run_prepared(prep)?)
     }
 
@@ -1791,23 +1819,24 @@ impl SuperfileReader {
     /// for the blob plus one 1 KiB decode table per column that
     /// actually moves — and records the factor that keeps each column's
     /// stored bounds upper bounds under what is being scored.
-    fn fts_scored(&self, bm25: Option<Bm25Params>) -> Result<ScoredFts<'_>, ReadError> {
+    fn fts_scored(&self, scoring: &ScoringView<'_>) -> Result<ScoredFts<'_>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        let Some(params) = bm25 else {
-            return Ok(ScoredFts::Baked(fts));
-        };
         if let Some((cached, view)) = self.scored_fts.read().expect("scored fts memo").as_ref()
-            && *cached == params
+            && cached.matches(scoring)
         {
             return Ok(ScoredFts::Derived(Arc::clone(view)));
         }
-        let view = Arc::new(fts.with_bm25_override(params));
+        let Some(view) = fts.with_scoring(scoring) else {
+            return Ok(ScoredFts::Baked(fts));
+        };
+        let view = Arc::new(view);
         // Last writer wins. Two queries racing here derive the same view
-        // from the same inputs — `with_bm25_override` is deterministic —
-        // so which one lands is immaterial.
-        *self.scored_fts.write().expect("scored fts memo") = Some((params, Arc::clone(&view)));
+        // from the same inputs — `with_scoring` is deterministic — so which
+        // one lands is immaterial.
+        *self.scored_fts.write().expect("scored fts memo") =
+            Some((ScoringKey::of(scoring), Arc::clone(&view)));
         Ok(ScoredFts::Derived(view))
     }
 
@@ -1931,10 +1960,11 @@ impl SuperfileReader {
         terms: &[&str],
         idf: fts_reader::QueryIdf<'_>,
         prefetched: Option<&fts_reader::FetchedTermMemo>,
+        scoring: &ScoringView<'_>,
     ) -> Result<OrCursorSet, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        // Built through the same view the set is scored through, so its
+        // stored bounds carry that view's scale.
+        let fts = self.fts_scored(scoring)?;
         Ok(fts
             .build_or_cursor_set(column, terms, idf, prefetched)
             .await?)
@@ -1950,9 +1980,9 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
-        bm25: Option<Bm25Params>,
+        scoring: &ScoringView<'_>,
     ) -> Result<Vec<(RowId, f32)>, ReadError> {
-        let fts = self.fts_scored(bm25)?;
+        let fts = self.fts_scored(scoring)?;
         Ok(fts.search_or_range_prebuilt(set, k, doc_id_start, doc_id_end, floor)?)
     }
 
@@ -3138,16 +3168,20 @@ mod tests {
         // and never keeps a stale pair.
         let r = SuperfileReader::open(build_simple_fts_only_superfile()).expect("open");
         assert!(matches!(
-            r.fts_scored(None).expect("baked"),
+            r.fts_scored(&ScoringView::default()).expect("baked"),
             ScoredFts::Baked(_)
         ));
         let a = Bm25Params::new(1.4, 0.6);
         let b = Bm25Params::new(0.9, 0.4);
-        let first = match r.fts_scored(Some(a)).expect("derive") {
+        let at = |params| ScoringView {
+            params: Some(params),
+            avgdl: None,
+        };
+        let first = match r.fts_scored(&at(a)).expect("derive") {
             ScoredFts::Derived(v) => v,
             ScoredFts::Baked(_) => panic!("an override must derive a view"),
         };
-        let again = match r.fts_scored(Some(a)).expect("reuse") {
+        let again = match r.fts_scored(&at(a)).expect("reuse") {
             ScoredFts::Derived(v) => v,
             ScoredFts::Baked(_) => panic!("an override must derive a view"),
         };
@@ -3155,7 +3189,7 @@ mod tests {
             Arc::ptr_eq(&first, &again),
             "same pair: the memoized view is reused"
         );
-        let other = match r.fts_scored(Some(b)).expect("derive another") {
+        let other = match r.fts_scored(&at(b)).expect("derive another") {
             ScoredFts::Derived(v) => v,
             ScoredFts::Baked(_) => panic!("an override must derive a view"),
         };
@@ -3165,9 +3199,39 @@ mod tests {
         );
         assert_eq!(other.fts_columns_config().next().expect("column").params, b);
         assert!(matches!(
-            r.fts_scored(None).expect("baked"),
+            r.fts_scored(&ScoringView::default()).expect("baked"),
             ScoredFts::Baked(_)
         ));
+    }
+
+    /// A view at the average a column was built at changes nothing, so the
+    /// baked reader serves it; another average derives a view that rescores
+    /// that column alone and widens its stored bounds.
+    #[test]
+    fn a_scored_view_moves_only_the_named_column_average() {
+        let r = SuperfileReader::open(build_simple_fts_only_superfile()).expect("open");
+        let fts = r.fts().expect("fts");
+        let column = fts.fts_columns_config().next().expect("column");
+        let (name, baked) = (column.name.clone(), column.avgdl());
+        let at = |avgdl| ScoringView {
+            params: None,
+            avgdl: Some((name.as_str(), avgdl)),
+        };
+        assert!(matches!(
+            r.fts_scored(&at(baked)).expect("baked"),
+            ScoredFts::Baked(_)
+        ));
+        let wider = 2.0 * baked;
+        let view = match r.fts_scored(&at(wider)).expect("derive") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("another average must derive a view"),
+        };
+        let col = view
+            .fts_columns_config()
+            .find(|c| c.name == name)
+            .expect("column");
+        assert_eq!(col.avgdl(), wider);
+        assert!(col.bound_scale() > 1.0, "a longer average raises scores");
     }
 
     #[test]
