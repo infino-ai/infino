@@ -145,29 +145,6 @@ fn part_matches_terms(
     }
 }
 
-/// Filter the list's parts to those whose `id_range`
-/// overlaps the inclusive range `[query_min, query_max]`.
-///
-/// The id column is `Decimal128(38, 0)` (the supertable-
-/// injected `_id` column), so this is the type-specialized
-/// hot path for `WHERE _id BETWEEN ? AND ?`. For other
-/// scalar columns, use [`prune_parts_for_scalar_min_max_bytes`].
-pub fn prune_parts_for_id_range(list: &Manifest, query_min: i128, query_max: i128) -> Vec<PartId> {
-    list.parts
-        .iter()
-        .filter_map(|entry| {
-            let (lo, hi) = entry.id_range;
-            // `(query_min, query_max)` overlaps `(lo, hi)` iff
-            // query_min <= hi && query_max >= lo.
-            if query_min <= hi && query_max >= lo {
-                Some(entry.part_id)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
@@ -492,21 +469,6 @@ mod tests {
     }
 
     // ---- list_prune — query-shape correctness.
-
-    #[test]
-    fn prune_parts_for_id_range_filters_non_overlapping_parts() {
-        let part0 = entry_from_superfiles(&[seg(0, 99, &[], None)], 0);
-        let part1 = entry_from_superfiles(&[seg(100, 199, &[], None)], 1);
-        let part2 = entry_from_superfiles(&[seg(200, 299, &[], None)], 2);
-        let part3 = entry_from_superfiles(&[seg(300, 399, &[], None)], 3);
-        let list = list_with(vec![part0, part1.clone(), part2.clone(), part3]);
-
-        let survivors = prune_parts_for_id_range(&list, 150, 250);
-        let ids: Vec<_> = survivors.into_iter().collect();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&part1.part_id));
-        assert!(ids.contains(&part2.part_id));
-    }
 
     #[test]
     fn prune_parts_for_fts_prefix_filters_disjoint_term_ranges() {
