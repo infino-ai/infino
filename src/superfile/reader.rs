@@ -1389,7 +1389,7 @@ impl SuperfileReader {
                 must_phrases: &must_phrases,
                 should_phrases: &should_phrases,
                 negative_phrases: &negative_phrases,
-                global_idf: None,
+                idf: fts_reader::QueryIdf::ThisFile,
                 prefetched: None,
                 live_floor: None,
                 allow: None,
@@ -1889,14 +1889,14 @@ impl SuperfileReader {
             doc_id_start,
             doc_id_end,
             f32::NEG_INFINITY,
-            None,
+            fts_reader::QueryIdf::ThisFile,
         )
         .await
     }
 
     /// [`Self::bm25_search_or_range_pretokenized`] with a score floor —
     /// same contract as [`Self::bm25_search_pretokenized_with_floor`].
-    pub async fn bm25_search_or_range_pretokenized_with_floor(
+    pub(crate) async fn bm25_search_or_range_pretokenized_with_floor(
         &self,
         column: &str,
         terms: &[&str],
@@ -1904,7 +1904,7 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
-        global_idf: Option<&fts_reader::GlobalTermIdf>,
+        idf: fts_reader::QueryIdf<'_>,
     ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self
             .fts()
@@ -1917,7 +1917,7 @@ impl SuperfileReader {
                 doc_id_start,
                 doc_id_end,
                 floor,
-                global_idf,
+                idf,
             )
             .await?)
     }
@@ -1929,14 +1929,14 @@ impl SuperfileReader {
         &self,
         column: &str,
         terms: &[&str],
-        global_idf: Option<&fts_reader::GlobalTermIdf>,
+        idf: fts_reader::QueryIdf<'_>,
         prefetched: Option<&fts_reader::FetchedTermMemo>,
     ) -> Result<OrCursorSet, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .build_or_cursor_set(column, terms, global_idf, prefetched)
+            .build_or_cursor_set(column, terms, idf, prefetched)
             .await?)
     }
 
@@ -3403,7 +3403,7 @@ mod tests {
                 0,
                 4,
                 1e9,
-                None,
+                fts_reader::QueryIdf::ThisFile,
             )
             .await
             .expect("floored ranged search");

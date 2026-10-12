@@ -684,7 +684,7 @@ impl FtsReader {
                             bytes,
                             short,
                             &col,
-                            None,
+                            TermIdf::Absent,
                             UNWEIGHTED,
                             CursorUse::Count,
                         )?;

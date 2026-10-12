@@ -119,7 +119,7 @@ use crate::{
             bm25::Bm25Params,
             reader::{
                 Bm25SearchOptions, ClauseLists, ColumnLengthStats, FetchedTermMemo, GlobalTermIdf,
-                LiveFloor, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses,
+                LiveFloor, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryIdf,
             },
             tokenize::Phrase,
         },
@@ -766,6 +766,11 @@ impl SupertableReader {
         let corpus = manifest
             .fts_length_stats(column)
             .ok_or_else(|| QueryError::Unsupported(FTS_SUMMARY_TOO_OLD_MSG.to_owned()))?;
+        // No document in the table has a token in this column, so nothing
+        // can match and no term has an idf to score with.
+        if corpus.n_scored_docs == 0 {
+            return Ok(Vec::new());
+        }
 
         let phases = self.phase_spans();
         let select_span = trace::phase(phases, || {
@@ -827,19 +832,13 @@ impl SupertableReader {
                 .cloned()
                 .collect()
         };
-        let (global_idf, prefetch_memos): (Option<Arc<GlobalTermIdf>>, PrefetchMemos) =
-            match scored.is_empty() {
-                true => (None, None),
-                false => {
-                    let (map, memos) = self
-                        .global_idf_open_wave(manifest.as_ref(), column, &scored, &kept, corpus)
-                        .instrument(trace::phase(phases, || {
-                            tiered_span!("fts.global_idf", terms = scored.len())
-                        }))
-                        .await?;
-                    (Some(Arc::new(map)), memos)
-                }
-            };
+        let (global_idf, prefetch_memos) = self
+            .global_idf_open_wave(manifest.as_ref(), column, &scored, &kept, corpus)
+            .instrument(trace::phase(phases, || {
+                tiered_span!("fts.global_idf", terms = scored.len())
+            }))
+            .await?;
+        let global_idf = Arc::new(global_idf);
 
         // Build the work-unit list. When the reader pool has more
         // threads than there are kept superfiles AND we're on the
@@ -887,11 +886,8 @@ impl SupertableReader {
                         .map(|p| p.iter().map(String::as_str).collect())
                         .collect();
                     let gidf = global_idf.clone();
-                    let idf_used = move |term: &str, local: f32| {
-                        gidf.as_ref()
-                            .and_then(|m| m.get(term).copied())
-                            .unwrap_or(local)
-                    };
+                    let idf_used =
+                        move |term: &str, local: f32| gidf.get(term).copied().unwrap_or(local);
                     index
                         .query_ceilings(column_id, &terms, &phrases, &kept, &idf_used)
                         .instrument(term_span.clone())
@@ -1085,7 +1081,7 @@ impl SupertableReader {
                                     .bm25_or_cursor_set(
                                         &column_arc,
                                         &should_refs,
-                                        global_idf.as_deref(),
+                                        QueryIdf::Table(&global_idf),
                                         memo.as_deref(),
                                     )
                                     .await?;
@@ -1152,7 +1148,7 @@ impl SupertableReader {
                                     must_phrases: &must_ph_arc,
                                     should_phrases: &should_ph_arc,
                                     negative_phrases: &neg_ph_arc,
-                                    global_idf: global_idf.as_deref(),
+                                    idf: QueryIdf::Table(&global_idf),
                                     prefetched: memo.as_deref(),
                                     live_floor,
                                     allow,

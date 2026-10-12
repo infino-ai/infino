@@ -2537,7 +2537,10 @@ mod tests {
     /// with no memo and to a run whose memo covers every term.
     #[test]
     fn a_partial_memo_falls_back_to_the_dictionary_for_the_terms_it_lacks() {
-        use crate::superfile::{SuperfileReader, fts::reader::ClauseLists};
+        use crate::superfile::{
+            SuperfileReader,
+            fts::reader::{ClauseLists, QueryIdf},
+        };
 
         let (dir, storage, st) = fresh_table();
         commit_segment(&st, 0);
@@ -2576,7 +2579,7 @@ mod tests {
                         must_phrases: &[],
                         should_phrases: &[],
                         negative_phrases: &[],
-                        global_idf: None,
+                        idf: QueryIdf::ThisFile,
                         prefetched: memo,
                         live_floor: None,
                         allow: None,

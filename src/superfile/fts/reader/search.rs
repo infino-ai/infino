@@ -425,6 +425,7 @@ impl FtsReader {
                 ClauseLists {
                     musts,
                     shoulds,
+                    idf: QueryIdf::ThisFile,
                     ..ClauseLists::default()
                 },
                 k,
@@ -457,6 +458,7 @@ impl FtsReader {
                 ClauseLists {
                     musts,
                     shoulds,
+                    idf: QueryIdf::ThisFile,
                     ..ClauseLists::default()
                 },
                 k,
@@ -565,7 +567,7 @@ impl FtsReader {
                     column_id,
                     lists.musts,
                     lists.must_phrases,
-                    lists.global_idf,
+                    lists.idf,
                     lists.prefetched,
                     CursorUse::Score,
                 )
@@ -587,7 +589,7 @@ impl FtsReader {
                     column_id,
                     lists.shoulds,
                     lists.should_phrases,
-                    lists.global_idf,
+                    lists.idf,
                     lists.prefetched,
                     CursorUse::Score,
                 )
@@ -600,7 +602,7 @@ impl FtsReader {
                     column_id,
                     lists.negatives,
                     lists.negative_phrases,
-                    None,
+                    QueryIdf::ThisFile,
                     None,
                     CursorUse::Match,
                 )
@@ -652,8 +654,15 @@ impl FtsReader {
         let neg_cursors = match lists.negatives {
             [] => Vec::new(),
             negatives => {
-                self.build_term_cursors(column_id, negatives, None, CursorUse::Count, None, None)
-                    .await?
+                self.build_term_cursors(
+                    column_id,
+                    negatives,
+                    QueryIdf::ThisFile,
+                    CursorUse::Count,
+                    None,
+                    None,
+                )
+                .await?
             }
         };
         // term-dictionary ranges the builds below request — one per
@@ -684,10 +693,10 @@ impl FtsReader {
         // Single-atom fast path: BlockMaxWAND-driven block skipping.
         // One term scores identically whichever clause list it sits
         // in (a lone must and a lone should both rank that term's
-        // postings), so both shapes take it. A global-idf override rides
-        // along: the walk scores with it and rescales its stored bounds
-        // by the exact linear ratio, so the skip decisions stay as tight
-        // as the per-superfile path's.
+        // postings), so both shapes take it. The walk scores with the
+        // query's idf and rescales its stored bounds by the exact linear
+        // ratio to it, so the skip decisions stay as tight as they would
+        // be at the idf the bounds were stored at.
         if lists.musts.len() + lists.shoulds.len() == 1 {
             let term = lists
                 .musts
@@ -695,7 +704,7 @@ impl FtsReader {
                 .chain(lists.shoulds)
                 .next()
                 .expect("one atom");
-            let gidf = lists.global_idf.and_then(|m| m.get(*term).copied());
+            let gidf = lists.idf.term(term);
             let mut filter = neg_filter;
             let filter_postings_bytes = filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
             let filter_ranges = filter.as_ref().map_or(0, ExcludeFilter::planned_ranges);
@@ -727,7 +736,7 @@ impl FtsReader {
                 .build_term_cursors(
                     column_id,
                     &shoulds,
-                    lists.global_idf,
+                    lists.idf,
                     CursorUse::Score,
                     Some(&should_qtf),
                     lists.prefetched,
@@ -760,7 +769,7 @@ impl FtsReader {
             .build_term_cursors(
                 column_id,
                 &musts,
-                lists.global_idf,
+                lists.idf,
                 CursorUse::Score,
                 Some(&must_qtf),
                 lists.prefetched,
@@ -796,7 +805,7 @@ impl FtsReader {
             .build_term_cursors(
                 column_id,
                 &shoulds,
-                lists.global_idf,
+                lists.idf,
                 CursorUse::Score,
                 Some(&should_qtf),
                 lists.prefetched,
@@ -950,14 +959,14 @@ impl FtsReader {
             doc_id_start,
             doc_id_end,
             f32::NEG_INFINITY,
-            None,
+            QueryIdf::ThisFile,
         )
         .await
     }
 
     /// [`Self::search_or_range_pretokenized`] with a score floor — see
     /// [`Self::search_with_floor`] for the floor contract.
-    pub async fn search_or_range_pretokenized_with_floor(
+    pub(crate) async fn search_or_range_pretokenized_with_floor(
         &self,
         column: &str,
         terms: &[&str],
@@ -965,11 +974,9 @@ impl FtsReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
-        global_idf: Option<&GlobalTermIdf>,
+        idf: QueryIdf<'_>,
     ) -> Result<Vec<(RowId, f32)>, FtsError> {
-        let set = self
-            .build_or_cursor_set(column, terms, global_idf, None)
-            .await?;
+        let set = self.build_or_cursor_set(column, terms, idf, None).await?;
         self.search_or_range_prebuilt(&set, k, doc_id_start, doc_id_end, floor)
     }
 
@@ -981,29 +988,22 @@ impl FtsReader {
     /// cold bytes when slicing widened); clones of these cursors share
     /// `bytes` and the `Arc` skip table instead.
     ///
-    /// `global_idf` is baked into the cursors here (see
+    /// `idf` is baked into the cursors here (see
     /// [`Self::build_term_cursors`]), so every sub-range sharing a set
     /// must want the same override — it does: one gather per query.
     pub(crate) async fn build_or_cursor_set(
         &self,
         column: &str,
         terms: &[&str],
-        global_idf: Option<&GlobalTermIdf>,
+        idf: QueryIdf<'_>,
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<OrCursorSet, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         let cursors = if terms.is_empty() {
             Vec::new()
         } else {
-            self.build_term_cursors(
-                column_id,
-                terms,
-                global_idf,
-                CursorUse::Score,
-                None,
-                prefetched,
-            )
-            .await?
+            self.build_term_cursors(column_id, terms, idf, CursorUse::Score, None, prefetched)
+                .await?
         };
         Ok(OrCursorSet { column_id, cursors })
     }
@@ -1103,7 +1103,7 @@ impl FtsReader {
         k: usize,
         mut filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
-        global_idf: Option<f32>,
+        idf: TermIdf,
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<(Vec<(FtsDocId, f32)>, MatchWork, u64), FtsError> {
         let col_meta = &self.columns[column_id as usize];
@@ -1186,7 +1186,7 @@ impl FtsReader {
                     true => 1,
                     false => tf,
                 };
-                let idf_t = global_idf.unwrap_or_else(|| bm25::idf(col_meta.scored_doc_count(), 1));
+                let idf_t = idf.resolve(col_meta, 1)?;
                 let idf_weight = idf_t;
                 // Drop the lone match if a negated term excludes it.
                 // The inline slot read no postings-region bytes; the
@@ -1220,8 +1220,7 @@ impl FtsReader {
                                 "short-form term body does not decode".into(),
                             ))
                         })?;
-                let idf_weight = global_idf
-                    .unwrap_or_else(|| bm25::idf(col_meta.scored_doc_count(), decoded.n as u64));
+                let idf_weight = idf.resolve(col_meta, decoded.n as u64)?;
                 let dl_norm_k1 = col_meta.dl_norm_k1();
                 let mut heap: BinaryHeap<TopKEntry> =
                     BinaryHeap::with_capacity(k.min(decoded.n).max(1));
@@ -1271,7 +1270,7 @@ impl FtsReader {
         let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions)?;
 
         let local_idf = bm25::idf(col_meta.scored_doc_count(), term_meta.df);
-        let idf_t = global_idf.unwrap_or(local_idf);
+        let idf_t = idf.resolve(col_meta, term_meta.df)?;
         let idf_weight = idf_t;
         // Every stored bound — per block and per span — is decoded at the
         // same idf and statistics the scores below use, so the skip tests
@@ -1510,13 +1509,13 @@ impl FtsReader {
         &self,
         column_id: u32,
         terms: &[&str],
-        global_idf: Option<&GlobalTermIdf>,
+        idf: QueryIdf<'_>,
         purpose: CursorUse,
         qtf: Option<&[u32]>,
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<Vec<TermCursor>, FtsError> {
         Ok(self
-            .build_term_cursors_opt(column_id, terms, global_idf, purpose, qtf, prefetched, None)
+            .build_term_cursors_opt(column_id, terms, idf, purpose, qtf, prefetched, None)
             .await?
             .into_iter()
             .flatten()
@@ -1617,7 +1616,7 @@ impl FtsReader {
         &self,
         column_id: u32,
         terms: &[&str],
-        global_idf: Option<&GlobalTermIdf>,
+        idf: QueryIdf<'_>,
         purpose: CursorUse,
         qtf: Option<&[u32]>,
         prefetched: Option<&FetchedTermMemo>,
@@ -1637,21 +1636,20 @@ impl FtsReader {
         // it — its bytes were fetched when its df was gathered — so the
         // dictionary is opened, and the PFOR fan below issued, only for the
         // terms the memo does not cover (all of them on the single-pass
-        // path). Each resolved entry carries its term's global idf (when the
-        // caller supplied one) so the cursor is built with the global value;
-        // `None` per term falls back to this superfile's local idf.
+        // path). Each resolved entry carries its term's idf source, which the
+        // cursor resolves when it scores.
         enum Resolved {
             Memo {
                 slot: FetchedTermSlot,
-                gidf: Option<f32>,
+                gidf: TermIdf,
             },
             Inline {
                 doc_id: u32,
                 tf: u32,
-                gidf: Option<f32>,
+                gidf: TermIdf,
             },
             Pfor {
-                gidf: Option<f32>,
+                gidf: TermIdf,
                 short: bool,
             },
         }
@@ -1668,7 +1666,7 @@ impl FtsReader {
         let mut resolved: Vec<Option<Resolved>> = Vec::with_capacity(terms.len());
         let mut pfor_offsets: Vec<(usize, usize)> = Vec::new();
         for term in terms {
-            let gidf = global_idf.and_then(|m| m.get(*term).copied());
+            let gidf = idf.term(term);
             if let Some(entry) = prefetched.and_then(|m| m.lookup(term)) {
                 resolved.push(entry.map(|slot| Resolved::Memo { slot, gidf }));
                 continue;
@@ -1717,7 +1715,7 @@ impl FtsReader {
                     let tf = col_meta.inline_tf(tf);
                     cursors.push(Some(TermCursor::new_inline(
                         doc_id, tf, col_meta, gidf, weight, purpose,
-                    )));
+                    )?));
                 }
                 Some(Resolved::Memo {
                     slot: FetchedTermSlot::Pfor { bytes, short, .. },
@@ -1733,7 +1731,7 @@ impl FtsReader {
                     // dictionary lookup — see `build_atom_cursors`.)
                     let tf = col_meta.inline_tf(tf);
                     let cursor =
-                        TermCursor::new_inline(doc_id, tf, col_meta, gidf, weight, purpose);
+                        TermCursor::new_inline(doc_id, tf, col_meta, gidf, weight, purpose)?;
                     cursors.push(Some(cursor));
                 }
                 Some(Resolved::Pfor { gidf, short }) => {
@@ -1757,6 +1755,65 @@ mod tests {
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{builder::FtsBuilder, tokenize::Phrase};
+
+    /// A `k` above the fixture's match count.
+    const TABLE_IDF_K: usize = 10;
+    /// An arbitrary table-wide idf to score with.
+    const TABLE_IDF: f32 = 1.5;
+
+    /// A table-wide search scores with its map's idf alone: a scored term
+    /// the map leaves out is an error, never this superfile's own idf.
+    #[tokio::test]
+    async fn a_scored_term_missing_from_the_table_idf_is_an_error() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let table = GlobalTermIdf::new();
+        let clauses = ClauseLists {
+            musts: &["rust"],
+            idf: QueryIdf::Table(&table),
+            ..ClauseLists::default()
+        };
+        let err = r
+            .search_excluding("body", clauses, TABLE_IDF_K, f32::NEG_INFINITY)
+            .await
+            .expect_err("no idf for `rust`");
+        assert!(matches!(err, FtsError::MissingIdf), "{err:?}");
+    }
+
+    /// The table's idf is the one scored with: doubling it doubles every
+    /// score, which a fallback to this superfile's own idf would not do.
+    #[tokio::test]
+    async fn the_table_idf_is_what_scores() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let scores = |idf: f32| {
+            let table = GlobalTermIdf::from([("rust".to_owned(), idf)]);
+            let r = &r;
+            async move {
+                let clauses = ClauseLists {
+                    musts: &["rust"],
+                    idf: QueryIdf::Table(&table),
+                    ..ClauseLists::default()
+                };
+                let mut hits = r
+                    .search_excluding("body", clauses, TABLE_IDF_K, f32::NEG_INFINITY)
+                    .await
+                    .expect("search");
+                hits.sort_by_key(|(d, _)| d.get());
+                hits
+            }
+        };
+        let once = scores(TABLE_IDF).await;
+        let twice = scores(2.0 * TABLE_IDF).await;
+        assert!(!once.is_empty());
+        for ((d1, s1), (d2, s2)) in once.iter().zip(&twice) {
+            assert_eq!(d1, d2);
+            assert!(
+                (s2 - 2.0 * s1).abs() <= f32::EPSILON * s2.abs(),
+                "{s1} {s2}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn search_returns_exact_doc_ids_for_known_term() {
@@ -2306,7 +2363,7 @@ mod tests {
 
         let terms: &[&str] = &["alpha", "beta", "gamma", "delta"];
         let set = r
-            .build_or_cursor_set("body", terms, None, None)
+            .build_or_cursor_set("body", terms, QueryIdf::ThisFile, None)
             .await
             .expect("set");
         let windows = [
@@ -2375,7 +2432,7 @@ mod tests {
                 0,
                 8,
                 1e9,
-                None,
+                QueryIdf::ThisFile,
             )
             .await
             .expect("floored ranged search");

@@ -164,7 +164,14 @@ impl FtsReader {
         // Unranked: built to match, so no global idf and no norms; the
         // column's length array is never read.
         let (built, dict_ranges) = self
-            .build_atom_cursors(column_id, terms, phrases, None, None, CursorUse::Match)
+            .build_atom_cursors(
+                column_id,
+                terms,
+                phrases,
+                QueryIdf::ThisFile,
+                None,
+                CursorUse::Match,
+            )
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
         let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
@@ -199,7 +206,14 @@ impl FtsReader {
         // Unranked: built to match, so no global idf and no norms; the
         // column's length array is never read.
         let (built, dict_ranges) = self
-            .build_atom_cursors(column_id, terms, phrases, None, None, CursorUse::Match)
+            .build_atom_cursors(
+                column_id,
+                terms,
+                phrases,
+                QueryIdf::ThisFile,
+                None,
+                CursorUse::Match,
+            )
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
         let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
@@ -220,7 +234,7 @@ impl FtsReader {
                     column_id,
                     neg_terms,
                     neg_phrases,
-                    None,
+                    QueryIdf::ThisFile,
                     None,
                     CursorUse::Match,
                 )
@@ -296,7 +310,14 @@ impl FtsReader {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, CursorUse::Count, None, prefetched)
+            .build_term_cursors(
+                column_id,
+                tokens,
+                QueryIdf::ThisFile,
+                CursorUse::Count,
+                None,
+                prefetched,
+            )
             .await?;
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
@@ -352,7 +373,14 @@ impl FtsReader {
             return Ok((0, MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, CursorUse::Count, None, prefetched)
+            .build_term_cursors(
+                column_id,
+                tokens,
+                QueryIdf::ThisFile,
+                CursorUse::Count,
+                None,
+                prefetched,
+            )
             .await?;
         let mut work = MatchWork::for_cursors(&cursors);
         work.planned_ranges += dictionary_fetches(tokens, prefetched);
@@ -419,7 +447,7 @@ impl FtsReader {
             .build_term_cursors_opt(
                 column_id,
                 tokens,
-                None,
+                QueryIdf::ThisFile,
                 CursorUse::Score,
                 None,
                 None,
@@ -699,7 +727,7 @@ impl FtsReader {
             }));
         }
         let meta = TermMeta::parse(bytes.as_ref(), 0, col_meta.positions)?;
-        let cursor = TermCursor::new(bytes, col_meta, None, 1, CursorUse::Count)?;
+        let cursor = TermCursor::new(bytes, col_meta, TermIdf::Absent, 1, CursorUse::Count)?;
         let mut layout = TermLayout {
             df: meta.df,
             num_blocks: meta.num_blocks,
@@ -1011,7 +1039,14 @@ mod tests {
         // Prove `mix` really has both encodings — else the test silently checks
         // nothing about the transition.
         let cursors = r
-            .build_term_cursors(0, &["mix"], None, CursorUse::Count, None, None)
+            .build_term_cursors(
+                0,
+                &["mix"],
+                QueryIdf::ThisFile,
+                CursorUse::Count,
+                None,
+                None,
+            )
             .await
             .expect("build cursors");
         let mix = &cursors[0];

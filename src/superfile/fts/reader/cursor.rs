@@ -12,7 +12,7 @@ use bytes::Bytes;
 
 use super::{
     bounds::BoundDecoder,
-    core::{read_u32_le, read_u64_le},
+    core::{TermIdf, read_u32_le, read_u64_le},
     metadata::ColumnMeta,
 };
 use crate::superfile::{
@@ -464,7 +464,7 @@ impl TermCursor {
     pub(super) fn new(
         term_bytes: Bytes,
         col: &ColumnMeta,
-        global_idf: Option<f32>,
+        idf: TermIdf,
         weight: u32,
         purpose: CursorUse,
     ) -> Result<Self, FtsError> {
@@ -475,14 +475,14 @@ impl TermCursor {
         // An unscored cursor (`Match` or `Count`) needs neither the idf nor
         // the bounds, both of which read the norms the length array holds.
         // Otherwise the effective idf folds in the query-term-frequency
-        // `weight` (> 1 only for a deduplicated repeated term) on top of any
-        // global-idf override, and every stored bound is decoded at it, so the
-        // bounds stay consistent with the scores computed from it.
+        // `weight` (> 1 only for a deduplicated repeated term) on top of the
+        // query's idf, and every stored bound is decoded at it, so the bounds
+        // stay consistent with the scores computed from it.
         let (idf, bounds) = match purpose.scores() {
             false => (0.0, BoundDecoder::unscored()),
             true => {
                 let local_idf = bm25::idf(col.scored_doc_count(), term_meta.df);
-                let idf = global_idf.unwrap_or(local_idf) * weight as f32;
+                let idf = idf.resolve(col, term_meta.df)? * weight as f32;
                 (idf, BoundDecoder::new(col, idf, local_idf))
             }
         };
@@ -548,13 +548,13 @@ impl TermCursor {
         bytes: Bytes,
         short: bool,
         col: &ColumnMeta,
-        global_idf: Option<f32>,
+        idf: TermIdf,
         weight: u32,
         purpose: CursorUse,
     ) -> Result<Self, FtsError> {
         match short {
-            true => Self::new_short(bytes, col, global_idf, weight, purpose),
-            false => Self::new(bytes, col, global_idf, weight, purpose),
+            true => Self::new_short(bytes, col, idf, weight, purpose),
+            false => Self::new(bytes, col, idf, weight, purpose),
         }
     }
 
@@ -568,7 +568,7 @@ impl TermCursor {
     pub(super) fn new_short(
         body: Bytes,
         col: &ColumnMeta,
-        global_idf: Option<f32>,
+        idf: TermIdf,
         weight: u32,
         purpose: CursorUse,
     ) -> Result<Self, FtsError> {
@@ -591,8 +591,7 @@ impl TermCursor {
         let (idf_weight, block_max_bm25) = match purpose.scores() {
             false => (0.0, 0.0),
             true => {
-                let local_idf = bm25::idf(col.scored_doc_count(), n as u64);
-                let idf_weight = global_idf.unwrap_or(local_idf) * weight as f32;
+                let idf_weight = idf.resolve(col, n as u64)? * weight as f32;
                 let block_max_bm25 = block_doc_ids[..n]
                     .iter()
                     .zip(&block_tfs[..n])
@@ -644,10 +643,10 @@ impl TermCursor {
         doc_id: u32,
         tf: u32,
         col: &ColumnMeta,
-        global_idf: Option<f32>,
+        idf: TermIdf,
         weight: u32,
         purpose: CursorUse,
-    ) -> Self {
+    ) -> Result<Self, FtsError> {
         // An unscored cursor (`Match` or `Count`): no idf, no block maximum,
         // and no read of the length array to compute either. Otherwise the
         // qtf `weight` folds into the effective idf, so the single-doc
@@ -655,8 +654,7 @@ impl TermCursor {
         let (idf_weight, block_max_bm25) = match purpose.scores() {
             false => (0.0, 0.0),
             true => {
-                let local_idf = bm25::idf(col.scored_doc_count(), 1);
-                let idf_weight = global_idf.unwrap_or(local_idf) * weight as f32;
+                let idf_weight = idf.resolve(col, 1)? * weight as f32;
                 let dl_norm_k1 = col.dl_norm_k1().get(doc_id);
                 (
                     idf_weight,
@@ -680,7 +678,7 @@ impl TermCursor {
         block_doc_ids[0] = doc_id;
         block_tfs[0] = tf;
 
-        Self {
+        Ok(Self {
             idf_weight,
             term_max_bm25: block_max_bm25,
             df: 1,
@@ -704,7 +702,7 @@ impl TermCursor {
             lazy_steps: 0,
             dense_streak: 0,
             eager_blocks: 0,
-        }
+        })
     }
 
     /// Block `b`'s parsed header. A packed or patched block derives its
@@ -1547,7 +1545,7 @@ mod tests {
         bm25,
         builder::FtsBuilder,
         posting::{ENCODING_PACKED, ENCODING_PATCHED},
-        reader::FtsReader,
+        reader::{FtsReader, QueryIdf},
     };
 
     /// The per-block BM25 upper bound stored in the skip table must be a
@@ -1638,7 +1636,14 @@ mod tests {
         let json = r#"[{"name":"flat","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let cursors = view
-            .build_term_cursors(0, &["common"], None, CursorUse::Score, None, None)
+            .build_term_cursors(
+                0,
+                &["common"],
+                QueryIdf::ThisFile,
+                CursorUse::Score,
+                None,
+                None,
+            )
             .await
             .expect("cursors");
         let tf_of = |doc: u32| 1 + doc % 5;
@@ -1692,7 +1697,14 @@ mod tests {
         let json = r#"[{"name":"flat","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let cursors = view
-            .build_term_cursors(0, &["sparse"], None, CursorUse::Score, None, None)
+            .build_term_cursors(
+                0,
+                &["sparse"],
+                QueryIdf::ThisFile,
+                CursorUse::Score,
+                None,
+                None,
+            )
             .await
             .expect("cursors");
         let mut c = cursors[0].clone();
@@ -1722,7 +1734,14 @@ mod tests {
     async fn lazy_block_expands_for_materialize_contains_and_walk() {
         let view = two_column_reader();
         let cursors = view
-            .build_term_cursors(1, &["common"], None, CursorUse::Score, None, None)
+            .build_term_cursors(
+                1,
+                &["common"],
+                QueryIdf::ThisFile,
+                CursorUse::Score,
+                None,
+                None,
+            )
             .await
             .expect("cursors");
         let mut reference = cursors[0].clone();
@@ -1768,7 +1787,14 @@ mod tests {
         let view = two_column_reader();
         for purpose in [CursorUse::Score, CursorUse::Count] {
             let cursors = view
-                .build_term_cursors(1, &["common"], None, CursorUse::Score, None, None)
+                .build_term_cursors(
+                    1,
+                    &["common"],
+                    QueryIdf::ThisFile,
+                    CursorUse::Score,
+                    None,
+                    None,
+                )
                 .await
                 .expect("cursors");
             let mut reference = cursors[0].clone();
@@ -1812,7 +1838,14 @@ mod tests {
         let view = two_column_reader();
         for purpose in [CursorUse::Score, CursorUse::Count] {
             let cursors = view
-                .build_term_cursors(1, &["common"], None, CursorUse::Score, None, None)
+                .build_term_cursors(
+                    1,
+                    &["common"],
+                    QueryIdf::ThisFile,
+                    CursorUse::Score,
+                    None,
+                    None,
+                )
                 .await
                 .expect("cursors");
             let mut reference = cursors[0].clone();
@@ -1874,7 +1907,14 @@ mod tests {
         let view = two_column_reader();
         for (col, positional) in [(0u32, true), (1u32, false)] {
             let cursors = view
-                .build_term_cursors(col, &["common"], None, CursorUse::Score, None, None)
+                .build_term_cursors(
+                    col,
+                    &["common"],
+                    QueryIdf::ThisFile,
+                    CursorUse::Score,
+                    None,
+                    None,
+                )
                 .await
                 .expect("cursors");
             let cursor = &cursors[0];
@@ -1941,7 +1981,14 @@ mod tests {
     async fn block_bounds_and_maxima(view: &FtsReader) -> Vec<(f32, f32)> {
         let col = &view.columns[0];
         let mut cursors = view
-            .build_term_cursors(0, &["common"], None, CursorUse::Score, None, None)
+            .build_term_cursors(
+                0,
+                &["common"],
+                QueryIdf::ThisFile,
+                CursorUse::Score,
+                None,
+                None,
+            )
             .await
             .expect("cursors");
         let cursor = cursors.first_mut().expect("term present");
@@ -2079,7 +2126,14 @@ mod tests {
         let reader = FtsReader::open(bytes, json).expect("open FtsReader");
 
         let mut cursors = reader
-            .build_term_cursors(0, &["common"], None, CursorUse::Score, None, None)
+            .build_term_cursors(
+                0,
+                &["common"],
+                QueryIdf::ThisFile,
+                CursorUse::Score,
+                None,
+                None,
+            )
             .await
             .expect("build term cursors");
         let cursor = cursors.first_mut().expect("`common` present in dictionary");
@@ -2298,7 +2352,14 @@ mod tests {
         let n_docs = d + 1;
         let view = planted_reader(&[list.clone()], n_docs);
         let cursors = view
-            .build_term_cursors(0, &SEEK_TERMS[..1], None, CursorUse::Score, None, None)
+            .build_term_cursors(
+                0,
+                &SEEK_TERMS[..1],
+                QueryIdf::ThisFile,
+                CursorUse::Score,
+                None,
+                None,
+            )
             .await
             .expect("cursors");
         let c = &cursors[0];
@@ -2429,7 +2490,7 @@ mod tests {
                             .block_on(view.build_term_cursors(
                                 0,
                                 &SEEK_TERMS[t..=t],
-                                None,
+                                QueryIdf::ThisFile,
                                 CursorUse::Score,
                                 None,
                                 None,
@@ -2464,7 +2525,14 @@ mod tests {
     async fn eager_mode_retries_a_lazy_probe_every_few_blocks() {
         let view = two_column_reader();
         let cursors = view
-            .build_term_cursors(1, &["common"], None, CursorUse::Score, None, None)
+            .build_term_cursors(
+                1,
+                &["common"],
+                QueryIdf::ThisFile,
+                CursorUse::Score,
+                None,
+                None,
+            )
             .await
             .expect("cursors");
         let walked = walk_all(&cursors[0]);

@@ -64,9 +64,56 @@ const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
 /// Maximum total gap bytes tolerated in one coalesced postings request.
 const TERM_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
 
-/// Per-term table-wide BM25 idf, keyed by term. A term absent from the
-/// map falls back to that superfile's local idf.
+/// Per-term table-wide BM25 idf, keyed by term.
 pub(crate) type GlobalTermIdf = std::collections::HashMap<String, f32>;
+
+/// The corpus a query's terms are weighted against.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum QueryIdf<'a> {
+    /// The whole table's: the map holds every scored term.
+    Table(&'a GlobalTermIdf),
+    /// This superfile's own statistics, for a superfile searched by itself,
+    /// which is then the whole corpus.
+    #[default]
+    ThisFile,
+}
+
+impl QueryIdf<'_> {
+    /// The idf source for one `term`.
+    pub(crate) fn term(self, term: &str) -> TermIdf {
+        match self {
+            QueryIdf::Table(map) => map
+                .get(term)
+                .copied()
+                .map_or(TermIdf::Absent, TermIdf::Table),
+            QueryIdf::ThisFile => TermIdf::ThisFile,
+        }
+    }
+}
+
+/// The idf one term is weighted with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TermIdf {
+    /// The table-wide value.
+    Table(f32),
+    /// This superfile's own, from its document frequency here.
+    ThisFile,
+    /// None was supplied: fine for a cursor that never scores, an error for
+    /// one that does.
+    Absent,
+}
+
+impl TermIdf {
+    /// The idf to score with, given the term's document frequency `df` in
+    /// this superfile's column `col`.
+    pub(super) fn resolve(self, col: &ColumnMeta, df: u64) -> Result<f32, FtsError> {
+        match self {
+            TermIdf::Table(idf) => Ok(idf),
+            TermIdf::ThisFile => Ok(bm25::idf(col.scored_doc_count(), df)),
+            TermIdf::Absent => Err(FtsError::MissingIdf),
+        }
+    }
+}
 
 /// A query's parsed clause lists, borrowed for one search call —
 /// terms and phrases per polarity, with the default operator already
@@ -80,9 +127,8 @@ pub(crate) struct ClauseLists<'a> {
     pub must_phrases: &'a [Phrase<String>],
     pub should_phrases: &'a [Phrase<String>],
     pub negative_phrases: &'a [Phrase<String>],
-    /// Per-term table-wide idf; `None` scores with this superfile's local
-    /// statistics, which is what a single-superfile read wants.
-    pub global_idf: Option<&'a GlobalTermIdf>,
+    /// The corpus the scored terms are weighted against.
+    pub idf: QueryIdf<'a>,
     /// Open-wave fetches for the scored terms (global stats): the
     /// cursor builds serve these terms from the memo instead of
     /// re-reading the dictionary and postings ranges the df gather
@@ -1191,7 +1237,7 @@ impl FtsReader {
         column_id: u32,
         terms: &[&str],
         phrases: &[Phrase<String>],
-        global_idf: Option<&GlobalTermIdf>,
+        idf: QueryIdf<'_>,
         prefetched: Option<&FetchedTermMemo>,
         purpose: CursorUse,
     ) -> Result<(Vec<Option<AnyCursor>>, u64), FtsError> {
@@ -1215,9 +1261,7 @@ impl FtsReader {
         // dictionary range for the whole batch.
         if !terms.is_empty() {
             let term_cursors = self
-                .build_term_cursors_opt(
-                    column_id, terms, global_idf, purpose, None, prefetched, None,
-                )
+                .build_term_cursors_opt(column_id, terms, idf, purpose, None, prefetched, None)
                 .await?;
             dict_ranges += 1;
             for cursor in term_cursors {
@@ -1229,16 +1273,9 @@ impl FtsReader {
             // A phrase's score is Σ member idf (see `PhraseCursor::new`), so
             // globalizing the members' idf globalizes the phrase — the
             // per-member rescale ratio cancels out of the phrase's tf/length
-            // bound. Build members with the same `global_idf` as bare terms.
+            // bound. Build members with the same `idf` as bare terms.
             let cursors = self
-                .build_term_cursors(
-                    column_id,
-                    &member_refs,
-                    global_idf,
-                    purpose,
-                    None,
-                    prefetched,
-                )
+                .build_term_cursors(column_id, &member_refs, idf, purpose, None, prefetched)
                 .await?;
             dict_ranges += 1;
             if cursors.len() != member_refs.len() {
@@ -1511,8 +1548,13 @@ impl FtsReader {
                     // This walk carries postings across into a merge; it
                     // reads doc ids, tfs and positions and never consults
                     // a score bound.
-                    let mut cursor =
-                        TermCursor::new(term_bytes, col_meta, None, 1, CursorUse::Match)?;
+                    let mut cursor = TermCursor::new(
+                        term_bytes,
+                        col_meta,
+                        TermIdf::Absent,
+                        1,
+                        CursorUse::Match,
+                    )?;
                     // Each block's runs are one group, decoded whole at the
                     // block's start and sliced per pair.
                     let mut group = GroupIndex::default();
@@ -1618,8 +1660,13 @@ impl FtsReader {
                         // A `Count` cursor decodes a block's doc ids and
                         // skips its tfs.
                         false => {
-                            let mut cursor =
-                                TermCursor::new(term_bytes, col_meta, None, 1, CursorUse::Count)?;
+                            let mut cursor = TermCursor::new(
+                                term_bytes,
+                                col_meta,
+                                TermIdf::Absent,
+                                1,
+                                CursorUse::Count,
+                            )?;
                             while !cursor.is_exhausted() {
                                 for &doc in &cursor.block_doc_ids[cursor.pos..cursor.block_n] {
                                     on_doc(&carry, doc);

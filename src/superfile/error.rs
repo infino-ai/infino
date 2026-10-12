@@ -207,7 +207,11 @@ impl ReadError {
         match self {
             ReadError::DocIdOutOfRange { .. } | ReadError::WrongCodecPath(_) => true,
             ReadError::Vector(v) => matches!(v.as_ref(), VectorError::Read(r) if r.is_internal()),
-            ReadError::Fts(f) => matches!(f.as_ref(), FtsError::Read(r) if r.is_internal()),
+            ReadError::Fts(f) => match f.as_ref() {
+                FtsError::Read(r) => r.is_internal(),
+                FtsError::MissingIdf => true,
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -265,6 +269,9 @@ pub enum FtsError {
 
     #[error("unknown FTS column {0:?}")]
     UnknownColumn(String),
+    /// A table-wide search scored a term its idf map left out.
+    #[error("a table-wide search has no idf for one of its scored terms")]
+    MissingIdf,
 
     /// The query has only negated (`-term`) clauses — nothing to rank.
     /// Reject this case.

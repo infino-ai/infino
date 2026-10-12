@@ -672,7 +672,7 @@ mod tests {
     use crate::superfile::{
         fts::{
             builder::FtsBuilder,
-            reader::{FtsReader, core::ClauseLists, cursor::CursorUse},
+            reader::{FtsReader, QueryIdf, core::ClauseLists, cursor::CursorUse},
             tokenize::Phrase,
         },
         id_space::FtsDocId,
@@ -904,7 +904,7 @@ mod tests {
         let phrases = phrase(&["the", "mid", "rare"]);
         let build = || async {
             let (mut atoms, _) = r
-                .build_atom_cursors(0, &[], &phrases, None, None, CursorUse::Score)
+                .build_atom_cursors(0, &[], &phrases, QueryIdf::ThisFile, None, CursorUse::Score)
                 .await
                 .expect("atoms");
             match atoms.remove(0).expect("phrase present") {
@@ -1226,7 +1226,7 @@ mod tests {
     /// `purpose`.
     async fn phrase_cursor(r: &FtsReader, terms: &[&str], purpose: CursorUse) -> PhraseCursor {
         let (atoms, _) = r
-            .build_atom_cursors(0, &[], &phrase(terms), None, None, purpose)
+            .build_atom_cursors(0, &[], &phrase(terms), QueryIdf::ThisFile, None, purpose)
             .await
             .expect("build atoms");
         match atoms.into_iter().next().flatten() {
