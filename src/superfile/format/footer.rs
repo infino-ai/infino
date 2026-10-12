@@ -1022,7 +1022,7 @@ mod tests {
 
     use arrow_array::{Float64Array, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field};
-    use parquet::basic::ZstdLevel;
+    use parquet::{arrow::arrow_reader::ParquetRecordBatchReaderBuilder, basic::ZstdLevel};
 
     use super::*;
 
@@ -1673,6 +1673,30 @@ mod tests {
             planned.body_len,
             default.body_len
         );
+    }
+
+    /// A body that dropped some dictionaries is ordinary Parquet: a standard
+    /// reader returns exactly the rows written, whichever way each column
+    /// was encoded.
+    #[test]
+    fn a_body_without_some_dictionaries_reads_back_as_written() {
+        let (schema, batch) = unique_and_status(2 * TEST_GROUP_ROWS);
+        let body = encode_parquet_body_planned(&schema, slice::from_ref(&batch), plan(&schema))
+            .expect("planned body");
+        assert!(
+            dictionaries(&body).iter().flatten().any(|(_, has)| !has),
+            "the fixture must drop a dictionary"
+        );
+        let parts = splice_index_blobs(body, &[], &[], &[], &[]).expect("splice");
+        let read: Vec<RecordBatch> =
+            ParquetRecordBatchReaderBuilder::try_new(Bytes::from(parts.bytes))
+                .expect("open")
+                .build()
+                .expect("reader")
+                .collect::<Result<_, _>>()
+                .expect("read");
+        let read = concat_batches(&schema, &read).expect("concat");
+        assert_eq!(read.columns(), batch.columns());
     }
 
     /// With no candidates the plan changes nothing: the body is the one the
