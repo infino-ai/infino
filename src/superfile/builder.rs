@@ -146,12 +146,11 @@ const BYTES_PER_MIB: u64 = 1 << 20;
 
 /// Share of a merge's memory budget the bisection's forward index may take.
 ///
-/// Sized so a few-million-document merge lands near the sixteen slots a
-/// document used to get unconditionally, while a merge large enough to exceed
-/// the budget now takes fewer slots, or declines to reorder, instead of
-/// demanding memory without limit. The old fixed count asked for four bytes a
-/// slot times sixteen times the document count with nothing to stop it — about
-/// 134 GiB at two billion documents.
+/// Sized so a few-million-document merge holds all of itself at the width
+/// below. A merge larger than that is reordered in runs the budget does hold,
+/// rather than demanding memory without limit: the old fixed count asked for
+/// four bytes a slot times sixteen times the document count with nothing to
+/// stop it — about 134 GiB at two billion documents.
 const REORDER_FORWARD_INDEX_BUDGET_SHARE: u64 = 10;
 
 /// Slots per document the bisection is given.
@@ -170,16 +169,19 @@ const REORDER_TERMS_PER_DOC: usize = 16;
 
 /// Bytes the bisection's forward index may take.
 ///
-/// A merge large enough to chunk at the real budget is far larger than a test
-/// can build, so tests narrow this instead of the corpus.
-fn reorder_budget_bytes() -> u64 {
+/// `merge_memory_mb` is what the compaction run was configured with, which is
+/// what a per-deployment override sets; the global configuration is the
+/// fallback for a merge with no run behind it.
+///
+/// A merge large enough to be split at the real budget is far larger than a
+/// test can build, so tests narrow this instead of the corpus.
+fn reorder_budget_bytes(merge_memory_mb: Option<u64>) -> u64 {
     #[cfg(test)]
     if let Some(bytes) = tests::reorder_budget_override() {
         return bytes;
     }
-    global()
-        .compaction
-        .max_memory_mb
+    merge_memory_mb
+        .unwrap_or(global().compaction.max_memory_mb)
         .saturating_mul(BYTES_PER_MIB)
         / REORDER_FORWARD_INDEX_BUDGET_SHARE
 }
@@ -209,25 +211,48 @@ struct ReorderPlan {
 /// the ones it closes nearby -- where a posting list's gaps are, and all a
 /// block of postings can express anyway.
 ///
-/// Chunking is near enough free to read: an input's rows land in one stretch
-/// of the output, so a run skips the inputs it does not cover and the
-/// postings are still read about once across the whole merge.
-fn reorder_plan(n_docs: usize, eligible_postings: u64) -> Option<ReorderPlan> {
+/// What a run costs to read depends on how the merge's inputs are shaped. An
+/// input's rows land in one stretch of the output, so a run skips every input
+/// it does not cover: a merge of many inputs each smaller than a run reads
+/// its postings about once over all the runs. An input larger than a run is
+/// read once per run it spans, so a merge of one large previous output and
+/// many small files -- the shape a packed base is re-merged in -- reads that
+/// output as many times as it spans runs. Ending runs on input boundaries
+/// would avoid that; it is not done here, and the cost has not been measured
+/// on that shape.
+fn reorder_plan(
+    n_docs: usize,
+    eligible_postings: u64,
+    budget_bytes: Option<u64>,
+) -> Option<ReorderPlan> {
     // Nothing eligible means nothing to group by, whatever the budget allows.
     let carried = eligible_postings.div_ceil(n_docs.max(1) as u64) as usize;
     if carried == 0 {
         return None;
     }
 
-    // A corpus holding less than the full width per document is read in full
-    // by a narrower index, and the slots it would not fill are not worth
-    // reserving: leaving them out is what lets such a merge stay in one run.
-    let terms_per_doc = carried.min(REORDER_TERMS_PER_DOC);
-    let budget_slots = reorder_budget_bytes() / size_of::<u32>() as u64;
-    let holds = (budget_slots / terms_per_doc as u64).max(1) as usize;
+    let budget_slots = reorder_budget_bytes(budget_bytes) / size_of::<u32>() as u64;
+    let holds = |width: usize| (budget_slots / width as u64).max(1) as usize;
+
+    // The full width, unless reserving slots the documents cannot fill is
+    // what splits the merge. A narrower index reads a long document short,
+    // and the mean is no guide to how long the longest are, so it is worth
+    // that only when it buys something: keeping the whole merge in one run.
+    let narrow = carried.min(REORDER_TERMS_PER_DOC);
+    let terms_per_doc = match holds(REORDER_TERMS_PER_DOC) >= n_docs {
+        true => REORDER_TERMS_PER_DOC,
+        false if holds(narrow) >= n_docs => narrow,
+        false => REORDER_TERMS_PER_DOC,
+    };
+
+    // Runs of an even size rather than full ones and a remainder. A merge a
+    // few documents past what the budget holds would otherwise get a second
+    // run of those few, and a run of 32 or fewer is below the size the
+    // bisection splits at, so it would come back in arrival order.
+    let runs = n_docs.div_ceil(holds(terms_per_doc));
     Some(ReorderPlan {
         terms_per_doc,
-        chunk_docs: holds.min(n_docs),
+        chunk_docs: n_docs.div_ceil(runs.max(1)),
     })
 }
 
@@ -624,6 +649,14 @@ pub struct BuilderOptions {
     /// footer records their ids from here, so every column of a written
     /// file is identified the same way.
     pub(crate) field_ids_outside_schema: HashMap<String, FieldId>,
+    /// Memory this merge may use, in MiB, taken from the compaction settings
+    /// the run was given rather than from the global configuration. The
+    /// reordering sizes its forward index from a share of it, so a deployment
+    /// that raises the merge budget reorders more documents together.
+    ///
+    /// `None` outside compaction, where there is no run to honour and the
+    /// configured value is the only one there is.
+    pub(crate) merge_memory_mb: Option<u64>,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -731,7 +764,15 @@ impl BuilderOptions {
             fts_corpus_stats: HashMap::new(),
             schema_id: 1,
             field_ids_outside_schema: HashMap::new(),
+            merge_memory_mb: None,
         }
+    }
+
+    /// Give the merge the memory budget its compaction run was configured
+    /// with (see [`BuilderOptions::merge_memory_mb`]).
+    pub(crate) fn with_merge_memory_mb(mut self, mb: u64) -> Self {
+        self.merge_memory_mb = Some(mb);
+        self
     }
 
     /// Record the field id of each column the schema does not carry (see
@@ -2550,6 +2591,7 @@ impl SuperfileBuilder {
         n_fts_columns: u32,
         n_out_docs: u32,
         rows_of: &[Vec<Option<RowId>>],
+        merge_memory_mb: Option<u64>,
     ) -> Result<Option<Vec<u32>>, BuildError> {
         if (n_out_docs as usize) <= REORDER_MIN_DOCS {
             return Ok(None);
@@ -2607,7 +2649,8 @@ impl SuperfileBuilder {
             .filter(|&(t, _)| eligible(t as u32))
             .map(|(_, &d)| u64::from(d))
             .sum();
-        let Some(plan) = reorder_plan(n_out_docs as usize, eligible_postings) else {
+        let Some(plan) = reorder_plan(n_out_docs as usize, eligible_postings, merge_memory_mb)
+        else {
             // No term groups anything; arrival order it is.
             return Ok(None);
         };
@@ -2823,7 +2866,13 @@ impl SuperfileBuilder {
                     .iter()
                     .map(|input| (Arc::clone(&input.reader), input.deleted.clone()))
                     .collect();
-                Self::merge_doc_order(&readers, n_fts_columns, n_out_docs, &rows_of)?
+                Self::merge_doc_order(
+                    &readers,
+                    n_fts_columns,
+                    n_out_docs,
+                    &rows_of,
+                    superfile_builder.opts.merge_memory_mb,
+                )?
             }
             false => None,
         };
@@ -6131,11 +6180,10 @@ mod tests {
     fn a_merge_too_large_to_hold_is_reordered_in_runs() {
         let rich = 200;
         let plan = |docs: usize| {
-            reorder_plan(docs, docs as u64 * rich)
+            reorder_plan(docs, docs as u64 * rich, None)
                 .unwrap_or_else(|| panic!("{docs} documents still reorder"))
         };
-        let budget =
-            global().compaction.max_memory_mb * (1 << 20) / REORDER_FORWARD_INDEX_BUDGET_SHARE;
+        let budget = reorder_budget_bytes(None);
 
         // Everything a production merge is actually made of reorders whole, at
         // the one width this has ever been measured at. A merge a twentieth
@@ -6159,18 +6207,58 @@ mod tests {
                 "{docs}: a chunked merge keeps the width"
             );
             assert!(p.chunk_docs < docs, "{docs}: expected runs");
-            let wants = p.chunk_docs as u64 * p.terms_per_doc as u64 * 4;
+            let wants = p.chunk_docs as u64 * p.terms_per_doc as u64 * size_of::<u32>() as u64;
             assert!(wants <= budget, "{docs}: a run wants {wants} of {budget}");
         }
 
-        // Documents holding less than the width are read in full by a
-        // narrower index, and not reserving the slots they cannot fill is
-        // what keeps such a merge in one run.
-        let poor = reorder_plan(30_000_000, 30_000_000 * 2).expect("two terms apiece still group");
+        // Narrowing is worth it only when it is what keeps the merge whole.
+        // Thirty million documents carrying two eligible terms fit in one run
+        // at that width and would not at sixteen.
+        let poor =
+            reorder_plan(30_000_000, 30_000_000 * 2, None).expect("two terms apiece still group");
         assert_eq!((poor.terms_per_doc, poor.chunk_docs), (2, 30_000_000));
 
+        // A merge that gets split either way keeps the full width rather than
+        // reading its long documents short for nothing.
+        let wide = reorder_plan(400_000_000, 400_000_000 * 2, None).expect("still reorders");
+        assert_eq!(wide.terms_per_doc, REORDER_TERMS_PER_DOC);
+
+        // A merge that fits at the full width is never narrowed.
+        let fits = reorder_plan(1_000_000, 1_000_000 * 2, None).expect("still reorders");
+        assert_eq!(
+            (fits.terms_per_doc, fits.chunk_docs),
+            (REORDER_TERMS_PER_DOC, 1_000_000)
+        );
+
+        // Runs divide evenly, so a merge a hair past what the budget holds
+        // does not get a second run of a handful of documents -- a run of 32
+        // or fewer is below the size the bisection splits at.
+        let holds = (reorder_budget_bytes(None)
+            / size_of::<u32>() as u64
+            / REORDER_TERMS_PER_DOC as u64) as usize;
+        let over = plan(holds + 10);
+        assert_eq!(
+            over.chunk_docs,
+            (holds + 10).div_ceil(2),
+            "runs should halve"
+        );
+        let last = (holds + 10) - over.chunk_docs;
+        assert!(
+            over.chunk_docs - last <= 1,
+            "the runs should come out even, got {} and {last}",
+            over.chunk_docs
+        );
+
+        // The budget comes from the run's own settings, not the global ones.
+        let roomy = reorder_plan(20_000_000, 20_000_000 * 200, Some(32_768))
+            .expect("a larger budget still reorders");
+        assert_eq!(
+            roomy.chunk_docs, 20_000_000,
+            "a run given more memory holds more documents"
+        );
+
         // Nothing eligible is the one case with nothing to group by.
-        assert!(reorder_plan(1_000, 0).is_none());
+        assert!(reorder_plan(1_000, 0, None).is_none());
     }
 
     /// One document of the reordering corpus: drawn from a few
@@ -6236,7 +6324,8 @@ mod tests {
             // hold the merge whole, so it is reordered in runs of its rows
             // rather than left in arrival order.
             for carried in [2u64, 100] {
-                let plan = reorder_plan(n, n as u64 * carried).expect("the merge still reorders");
+                let plan =
+                    reorder_plan(n, n as u64 * carried, None).expect("the merge still reorders");
                 assert!(
                     plan.chunk_docs < n,
                     "carrying {carried}: expected runs, got all {n} rows at once"

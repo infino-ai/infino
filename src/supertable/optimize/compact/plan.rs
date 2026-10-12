@@ -91,6 +91,14 @@ pub struct CompactionJob {
     pub inputs: Vec<Uuid>,
     /// Estimated size of the merged superfile.
     pub estimated_output_bytes: u64,
+    /// Memory this job may use, in MiB, from the settings the run was given.
+    /// Carried on the job because the planner is where those settings are in
+    /// scope; the merge reads it rather than the global configuration, so a
+    /// caller that raises the budget reorders more documents together.
+    ///
+    /// `None` for a job no compaction run planned, which takes the
+    /// configured value because there is no other.
+    pub merge_memory_mb: Option<u64>,
 }
 
 /// Plan compaction: pack each partition's small superfiles into
@@ -163,14 +171,29 @@ fn pack_partition(
             .then(a.superfile_id.cmp(&b.superfile_id))
     });
 
+    // The same setting the packing limit was built from, back in the unit
+    // the merge states it in.
+    let merge_memory_mb = Some(max_memory_bytes / MIB);
     let mut pending = PendingJob::default();
     for s in candidates {
         if !pending.fits(s, target_bytes, max_memory_bytes) {
-            pending.emit(key, min_output_bytes, min_superfiles_for_merge, jobs);
+            pending.emit(
+                key,
+                min_output_bytes,
+                min_superfiles_for_merge,
+                merge_memory_mb,
+                jobs,
+            );
         }
         pending.push(s);
     }
-    pending.emit(key, min_output_bytes, min_superfiles_for_merge, jobs);
+    pending.emit(
+        key,
+        min_output_bytes,
+        min_superfiles_for_merge,
+        merge_memory_mb,
+        jobs,
+    );
 }
 
 #[derive(Default)]
@@ -206,6 +229,7 @@ impl PendingJob {
         key: &[u8],
         min_output_bytes: u64,
         min_superfiles_for_merge: usize,
+        merge_memory_mb: Option<u64>,
         jobs: &mut Vec<CompactionJob>,
     ) {
         let size_ready = self.inputs.len() >= 2 && self.live_bytes >= min_output_bytes;
@@ -216,6 +240,7 @@ impl PendingJob {
                 partition_key: key.to_vec(),
                 inputs: mem::take(&mut self.inputs),
                 estimated_output_bytes: self.live_bytes,
+                merge_memory_mb,
             });
         }
         *self = PendingJob::default();
@@ -581,7 +606,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
         let mut jobs = Vec::new();
         let mut p = PendingJob::default();
         p.push(&seg(1, 200, 1000, 0));
-        p.emit(&[], 0, 2, &mut jobs);
+        p.emit(&[], 0, 2, None, &mut jobs);
         assert!(jobs.is_empty(), "single-input job must not emit");
         // Reset to default after emit attempt.
         assert_eq!(p.inputs.len(), 0);
