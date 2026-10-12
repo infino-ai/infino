@@ -2994,16 +2994,18 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
     use datafusion::prelude::{col, lit};
+    use tempfile::TempDir;
     use tokio::runtime::Builder;
     use uuid::Uuid;
 
-    use super::{BoolMode, FanOut, build_work_units, fanout_for};
+    use super::{BoolMode, FanOut, SuperfileHit, SupertableReader, build_work_units, fanout_for};
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
             fts::{
+                bm25,
                 posting::BLOCK_LEN,
                 reader::{Bm25SearchOptions, top_k_initial_capacity},
             },
@@ -3380,14 +3382,7 @@ mod tests {
         superfiles.sort_by_key(|sf| sf.id_min);
         let declared: Vec<f32> = superfiles
             .iter()
-            .map(|sf| {
-                let reader = manifest.options.store.reader(&sf.uri).expect("reader");
-                let fts = reader.fts().expect("fts index");
-                fts.fts_columns_config()
-                    .next()
-                    .expect("title column")
-                    .avgdl()
-            })
+            .map(|sf| declared_title_avgdl(&reader, sf))
             .collect();
         assert_eq!(declared, vec![5.0, 14.0 / 4.0, 16.0 / 5.0]);
         assert_eq!(
@@ -3414,6 +3409,180 @@ mod tests {
                 n_scored_docs: 1,
             })
         );
+    }
+
+    /// A part size every commit exceeds, so each commit writes its own
+    /// manifest part instead of growing the previous one.
+    const PART_PER_COMMIT_BYTES: u64 = 1;
+
+    /// Parts loaded when a table opens: none, so every part is fetched on
+    /// demand.
+    const LAZY_OPEN_PARTS: u32 = 0;
+
+    /// A `k` above every fixture's match count, so no hit is cut off.
+    const K_EVERY_MATCH: usize = 100;
+
+    /// Two commits whose term frequencies and lengths differ, so any
+    /// statistic taken from one superfile instead of the table moves a
+    /// score: `alpha` is in half of the first commit's long documents and
+    /// a quarter of the second's short ones, and `zebra` and `zest` share
+    /// the prefix `ze` but only `zebra` is in both commits.
+    const SKEWED_COMMITS: [&[&str]; 2] = [
+        &[
+            "alpha zebra one two three four five six",
+            "beta one two three four five six seven",
+        ],
+        &["alpha zebra x", "gamma zest y", "delta z", "epsilon w"],
+    ];
+
+    /// The `title` average length superfile `sf` declares in its footer.
+    fn declared_title_avgdl(reader: &SupertableReader, sf: &SuperfileEntry) -> f32 {
+        let superfile = reader.open_superfile(sf).expect("open superfile");
+        let fts = superfile.fts().expect("fts index");
+        fts.fts_columns_config()
+            .next()
+            .expect("title column")
+            .avgdl()
+    }
+
+    /// Storage-backed [`options_one_superfile_per_commit`] where every
+    /// commit writes its own manifest part, and opening loads no part.
+    fn lazy_options(storage: &Arc<dyn StorageProvider>) -> SupertableOptions {
+        options_one_superfile_per_commit()
+            .with_storage(Arc::clone(storage))
+            .with_part_size_threshold_bytes(PART_PER_COMMIT_BYTES)
+            .with_eager_load_threshold(LAZY_OPEN_PARTS)
+    }
+
+    /// [`lazy_options`] opened with every part loaded.
+    fn eager_options(storage: &Arc<dyn StorageProvider>) -> SupertableOptions {
+        lazy_options(storage).with_eager_load_threshold(u32::MAX)
+    }
+
+    /// Commits `commits` one at a time to the table behind `storage`.
+    fn commit_each(storage: &Arc<dyn StorageProvider>, commits: &[&[&str]]) {
+        let st = Supertable::create(eager_options(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        for titles in commits {
+            w.append(&build_batch(0, titles)).expect("append");
+            w.commit().expect("commit");
+        }
+    }
+
+    /// An in-process table holding [`SKEWED_COMMITS`], one superfile each.
+    fn skewed_in_memory_table() -> Supertable {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        for titles in SKEWED_COMMITS {
+            w.append(&build_batch(0, titles)).expect("append");
+            w.commit().expect("commit");
+        }
+        st
+    }
+
+    /// Hits keyed by where they live, so two runs over one table compare
+    /// without depending on how score ties were ordered.
+    fn by_location(mut hits: Vec<SuperfileHit>) -> Vec<(Uuid, u32, f32)> {
+        hits.sort_by_key(|h| (h.superfile.0, h.local_doc_id));
+        hits.into_iter()
+            .map(|h| (h.superfile.0, h.local_doc_id, h.score))
+            .collect()
+    }
+
+    /// A handle that loads no manifest part at open scores exactly like
+    /// one that loads them all.
+    #[test]
+    #[ignore = "lazily loaded manifests score with per-superfile idf (#931)"]
+    fn lazy_handle_scores_like_eager() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        commit_each(&storage, &SKEWED_COMMITS);
+
+        let eager = Supertable::open(eager_options(&storage)).expect("open eager");
+        let lazy = Supertable::open(lazy_options(&storage)).expect("open lazy");
+        for q in ["alpha", "alpha beta", "zebra gamma", "one x"] {
+            assert_eq!(all_scored(&lazy, q), all_scored(&eager, q), "{q:?}");
+        }
+    }
+
+    /// A commit through a handle that loaded no part still declares the
+    /// table-wide average length, not its own.
+    #[test]
+    #[ignore = "lazily loaded manifests hand the builder no corpus totals (#931)"]
+    fn lazy_writer_bakes_table_avgdl() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        commit_each(&storage, &SKEWED_COMMITS);
+        let before: HashSet<Uuid> = Supertable::open(eager_options(&storage))
+            .expect("open eager")
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|sf| sf.superfile_id)
+            .collect();
+
+        let lazy = Supertable::open(lazy_options(&storage)).expect("open lazy");
+        let mut w = lazy.writer().expect("writer");
+        w.append(&build_batch(0, &["omega", "omega psi"]))
+            .expect("append");
+        w.commit().expect("commit");
+
+        let after = Supertable::open(eager_options(&storage)).expect("reopen eager");
+        let reader = after.reader().expect("reader");
+        let manifest = reader.manifest();
+        let added: Vec<&Arc<SuperfileEntry>> = manifest
+            .get_all_superfiles()
+            .iter()
+            .filter(|sf| !before.contains(&sf.superfile_id))
+            .collect();
+        let [added] = added.as_slice() else {
+            panic!("one commit adds one superfile, got {}", added.len());
+        };
+        let table = manifest.fts_length_stats("title").expect("table totals");
+        assert_eq!(
+            declared_title_avgdl(&reader, added),
+            bm25::stored_avgdl(table.avgdl())
+        );
+    }
+
+    /// A prefix that expands to a single term in every superfile scores
+    /// exactly like that term.
+    #[test]
+    #[ignore = "prefix search scores with per-superfile idf (#931)"]
+    fn prefix_with_one_expansion_scores_like_term() {
+        let reader = skewed_in_memory_table().reader().expect("reader");
+        let prefix = reader
+            .bm25_search_prefix("title", "zeb", K_EVERY_MATCH)
+            .expect("prefix search");
+        let term = reader
+            .bm25_hits("title", "zebra", K_EVERY_MATCH, Bm25SearchOptions::new())
+            .expect("term search");
+        assert!(!term.is_empty(), "the fixture matches `zebra`");
+        assert_eq!(by_location(prefix), by_location(term));
+    }
+
+    /// A prefix scores like an `Or` query over every term it expands to
+    /// anywhere in the table, including terms only some superfiles hold.
+    #[test]
+    #[ignore = "prefix search scores with per-superfile idf (#931)"]
+    fn prefix_scores_like_or_over_its_expansion() {
+        let reader = skewed_in_memory_table().reader().expect("reader");
+        let prefix = reader
+            .bm25_search_prefix("title", "ze", K_EVERY_MATCH)
+            .expect("prefix search");
+        let expansion = reader
+            .bm25_hits(
+                "title",
+                "zebra zest",
+                K_EVERY_MATCH,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
+            .expect("or search");
+        assert_eq!(by_location(prefix), by_location(expansion));
     }
 
     /// Like [`options_one_superfile_per_commit`] but with the `title`
