@@ -93,8 +93,9 @@ use crate::{
         format::{
             self,
             footer::{
-                EncodedBody, ParquetBodyEncoder, ParquetLayout, encode_parquet_body,
-                extract_kv_map, splice_carried_body_to, splice_index_streams_to,
+                BodyPlan, EncodedBody, ParquetLayout, PlannedBodyEncoder,
+                encode_parquet_body_planned, extract_kv_map, splice_carried_body_to,
+                splice_index_streams_to,
             },
             kv,
         },
@@ -774,6 +775,27 @@ impl BuilderOptions {
     pub(crate) fn with_merge_memory_mb(mut self, mb: Option<u64>) -> Self {
         self.merge_memory_mb = mb;
         self
+    }
+
+    /// How the Parquet body of a superfile whose body has `schema` is
+    /// written: this builder's codec, row-group size and id page limit, with
+    /// every flat column a candidate to drop its dictionary. The encoder
+    /// settles which do from the first row group.
+    pub(crate) fn body_plan(&self, schema: &Schema) -> BodyPlan {
+        // A nested column's leaves sit under longer paths, which a
+        // per-column dictionary switch on the top-level name would miss.
+        let dictionary_candidates = schema
+            .fields()
+            .iter()
+            .filter(|f| !f.data_type().is_nested())
+            .map(|f| f.name().clone())
+            .collect();
+        BodyPlan {
+            compression: self.compression,
+            row_group_size: self.row_group_size,
+            dictionary_candidates,
+            column_page_size_limits: vec![(self.id_column.clone(), self.id_page_size_limit)],
+        }
     }
 
     /// Record the field id of each column the schema does not carry (see
@@ -2793,18 +2815,12 @@ impl SuperfileBuilder {
         // finished body in the builder. Ordinary merges read one input at a time;
         // the multi-cell path supplies preordered batches and retains them until
         // they are written.
-        let mut body_encoder = {
-            let id_page_limit = [(
-                superfile_builder.opts.id_column.as_str(),
-                superfile_builder.opts.id_page_size_limit,
-            )];
-            ParquetBodyEncoder::new(
-                &superfile_builder.parquet_schema,
-                superfile_builder.opts.compression,
-                superfile_builder.opts.row_group_size,
-                &id_page_limit,
-            )?
-        };
+        let mut body_encoder = PlannedBodyEncoder::new(
+            &superfile_builder.parquet_schema,
+            superfile_builder
+                .opts
+                .body_plan(&superfile_builder.parquet_schema),
+        );
 
         let (ordered_batches, mut stats_collector) = match ordered {
             Some((batches, stats)) => (Some(batches), stats),
@@ -3088,7 +3104,7 @@ impl SuperfileBuilder {
 
     /// Hydrate: build one no-blob superfile straight from Arrow batches whose
     /// `_id` column is already prepended at index 0. Batches are streamed through
-    /// [`ParquetBodyEncoder`], so the build adds only the running row group and
+    /// [`PlannedBodyEncoder`], so the build adds only the running row group and
     /// the id sidecar (16 B per row) on top of the caller's batches.
     /// [`finish`](Self::finish) instead buffers a second copy of the data.
     ///
@@ -3102,13 +3118,8 @@ impl SuperfileBuilder {
     ) -> Result<ParquetLayout, BuildError> {
         let n_docs: u32 = batches.iter().map(|b| b.num_rows() as u32).sum();
         let mut sb = SuperfileBuilder::new(opts)?;
-        let id_page_limit = [(sb.opts.id_column.as_str(), sb.opts.id_page_size_limit)];
-        let mut encoder = ParquetBodyEncoder::new(
-            &sb.opts.schema,
-            sb.opts.compression,
-            sb.opts.row_group_size,
-            &id_page_limit,
-        )?;
+        let mut encoder =
+            PlannedBodyEncoder::new(&sb.opts.schema, sb.opts.body_plan(&sb.opts.schema));
         for batch in batches {
             encoder.write_batch(batch)?;
         }
@@ -3180,16 +3191,9 @@ impl SuperfileBuilder {
         // absent, the FTS finalizer doesn't saturate the pool, so hide
         // the body encode behind it (body ‖ FTS). The final splice (byte
         // appends + footer rewrite) is cheap and stays serial.
-        let id_page_limit = [(self.opts.id_column.as_str(), self.opts.id_page_size_limit)];
-        let encode_body = || {
-            encode_parquet_body(
-                &self.parquet_schema,
-                &self.batches,
-                self.opts.compression,
-                self.opts.row_group_size,
-                &id_page_limit,
-            )
-        };
+        let plan = self.opts.body_plan(&self.parquet_schema);
+        let encode_body =
+            || encode_parquet_body_planned(&self.parquet_schema, &self.batches, plan.clone());
         let has_vector = vec_builder.is_some()
             || cell_posting_builder.is_some()
             || prebuilt_multi_cell.is_some();
@@ -3225,7 +3229,7 @@ impl SuperfileBuilder {
 
     /// Finish the build with a Parquet body the caller **already encoded** —
     /// e.g. the FTS merge, which streams each input's row groups into a
-    /// [`ParquetBodyEncoder`] and drops them, so the corpus body is never held
+    /// [`PlannedBodyEncoder`] and drops them, so the corpus body is never held
     /// whole. Finalizes the FTS/vector blobs and splices them onto `body`,
     /// exactly as [`finish_to`](Self::finish_to) does after its own body encode.
     ///
@@ -3460,13 +3464,10 @@ impl SuperfileBuilder {
             .map(MultiCellSubsectionSource::cell_id)
             .collect();
         let kvs = superfile_kvs(&self.opts, n_docs, Some(&cell_ids))?;
-        let id_page_limit = [(self.opts.id_column.as_str(), self.opts.id_page_size_limit)];
-        let body = encode_parquet_body(
+        let body = encode_parquet_body_planned(
             &self.parquet_schema,
             &self.batches,
-            self.opts.compression,
-            self.opts.row_group_size,
-            &id_page_limit,
+            self.opts.body_plan(&self.parquet_schema),
         )?;
         let scratch_root = scratch_root();
         let mut vector_file = tempfile::tempfile_in(&scratch_root).map_err(BuildError::Io)?;
@@ -9527,5 +9528,20 @@ mod tests {
                 "survivor payload changed"
             );
         }
+    }
+
+    #[test]
+    fn every_flat_column_but_no_nested_one_may_drop_its_dictionary() {
+        let item = Arc::new(Field::new("item", DataType::Float32, false));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Decimal128(38, 0), false),
+            Field::new("note", DataType::Utf8, false),
+            Field::new("qty", DataType::Int64, false),
+            Field::new("embedding", DataType::FixedSizeList(item, 4), false),
+        ]));
+        let opts = BuilderOptions::new(schema.clone(), "_id", vec![], vec![]);
+        let plan = opts.body_plan(&schema);
+        assert_eq!(plan.dictionary_candidates, vec!["_id", "note", "qty"]);
+        assert_eq!(plan.row_group_size, opts.row_group_size);
     }
 }
