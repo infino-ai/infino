@@ -232,6 +232,19 @@ impl Manifest {
         self.manifest_id = manifest_id;
         self.commit_token = Uuid::new_v4();
     }
+
+    /// Clear every part's union term bloom, leaving the rest of each FTS
+    /// aggregate. An absent bloom keeps the part, so this only ever widens
+    /// what term pruning keeps.
+    pub(crate) fn drop_term_blooms(&mut self) {
+        for agg in self
+            .parts
+            .iter_mut()
+            .flat_map(|p| p.fts_summary_agg.values_mut())
+        {
+            agg.term_bloom = None;
+        }
+    }
 }
 
 /// A cached split-check result for one cell. `fingerprint` identifies the
@@ -2847,6 +2860,43 @@ mod tests {
         };
         list.parts = (0..n_parts).map(rich_entry).collect();
         list
+    }
+
+    /// Dropping the stored term blooms clears every part's union bloom and
+    /// leaves the rest of each FTS aggregate — the term range drives prefix
+    /// pruning, the length totals drive scoring.
+    #[test]
+    fn drop_term_blooms_clears_every_part_union_and_keeps_the_rest() {
+        let mut list = rich_list(3);
+        let before: Vec<_> = list
+            .parts
+            .iter()
+            .map(|p| p.fts_summary_agg.clone())
+            .collect();
+        assert!(
+            before
+                .iter()
+                .flat_map(BTreeMap::values)
+                .any(|agg| agg.term_bloom.is_some()),
+            "the fixture carries union blooms"
+        );
+
+        list.drop_term_blooms();
+
+        for (part, before) in list.parts.iter().zip(&before) {
+            for (id, agg) in &part.fts_summary_agg {
+                assert!(agg.term_bloom.is_none(), "{id:?} keeps a union bloom");
+                let FtsSummaryAgg {
+                    n_terms_distinct,
+                    term_range,
+                    length_stats,
+                    ..
+                } = &before[id];
+                assert_eq!(agg.n_terms_distinct, *n_terms_distinct);
+                assert_eq!(&agg.term_range, term_range);
+                assert_eq!(&agg.length_stats, length_stats);
+            }
+        }
     }
 
     fn assert_entries_equal(a: &ManifestPartEntry, b: &ManifestPartEntry) {

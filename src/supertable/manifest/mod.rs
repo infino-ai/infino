@@ -927,8 +927,12 @@ impl ManifestSnapshot {
                 actual: "None options".to_string(),
             });
         };
-        let list = list::decode(&list_bytes, &options.legacy_names())
+        let mut list = list::decode(&list_bytes, &options.legacy_names())
             .map_err(ManifestLoadError::ListParse)?;
+        // The per-part union blooms go for the reason the entry blooms do
+        // (see `decode_stored_part`); the next commit writes the list
+        // without them.
+        list.drop_term_blooms();
 
         // Verify the caller's options match the
         // manifest's stamped digest. The all-zero stored
@@ -1304,7 +1308,8 @@ impl ManifestSnapshot {
                 if self.superfile_list.superfiles.len() as u64 == expected {
                     return Ok(self.superfile_list.superfiles.clone());
                 }
-                // Incomplete view (legacy lazy manifests): prune at part
+                // Incomplete view (more parts than the eager-load
+                // threshold, so parts load on demand): prune at part
                 // granularity and load only the survivors.
                 // Intersect each constraining leaf's kept-part set. A leaf
                 // with no part pruner (`None`) imposes no constraint.
@@ -2901,6 +2906,26 @@ impl UserCentroidCache {
     }
 }
 
+/// Decode a part read from storage, without its stored term blooms.
+///
+/// A storage-backed table routes term and prefix leaves through its term
+/// index, and its writer stores no bloom. Entries written before the index
+/// existed still carry one (a fixed 64 KiB per column on the oldest
+/// writers), consulted only for a superfile the index does not list, where
+/// an absent bloom keeps the superfile: correct, only less selective, and
+/// only until maintenance completes the index. Dropping them here stops
+/// every process from holding them resident, and a part a commit re-encodes
+/// from these entries is written without them.
+fn decode_stored_part(
+    bytes: &[u8],
+    budget: &OpenBlobBudget,
+    legacy: &LegacyNames,
+) -> Result<ManifestPart, part::PartParseError> {
+    let mut part = part::decode_with_blob_budget(bytes, budget, legacy)?;
+    part.drop_term_blooms();
+    Ok(part)
+}
+
 /// Decode part bytes off the async runtime. Part decode is a CPU wave
 /// (multi-MiB Avro payloads carrying centroid summaries and open blobs);
 /// running it inline used to serialize every part behind one polling
@@ -2917,7 +2942,7 @@ async fn decode_part_off_thread(
     legacy: Arc<LegacyNames>,
 ) -> Result<ManifestPart, ManifestLoadError> {
     match spawn_blocking(carry_span(move || {
-        part::decode_with_blob_budget(&bytes, &budget, &legacy)
+        decode_stored_part(&bytes, &budget, &legacy)
     }))
     .await
     {
@@ -2953,7 +2978,7 @@ async fn verify_and_decode_part_off_thread(
                 actual: actual_hash.to_hex(),
             });
         }
-        part::decode_with_blob_budget(&bytes, &budget, &legacy).map_err(ManifestLoadError::from)
+        decode_stored_part(&bytes, &budget, &legacy).map_err(ManifestLoadError::from)
     };
     match spawn_blocking(carry_span(verify_then_decode)).await {
         Ok(result) => result,
@@ -3074,12 +3099,12 @@ pub struct SuperfileEntry {
     /// keyed by column name, for skip pruning of SQL filters. An absent
     /// column means "no usable stats" (the pruner keeps the superfile).
     pub scalar_stats: HashMap<FieldId, ScalarStatsAgg>,
-    /// Per-FTS-column term-presence bloom + lex range. The bloom
-    /// drives exact-term skip; the term-range drives prefix-query
-    /// skip via `[prefix, prefix_upper_bound)` overlap. Keyed by
-    /// FTS column name. Same per-column [`FtsSummaryAgg`] shape the
-    /// list-level aggregate uses; built per superfile via
-    /// [`FtsSummaryAgg::from_superfile`].
+    /// Per-FTS-column lex term range, length totals and, on a table with
+    /// no term index, a term-presence bloom. The bloom drives exact-term
+    /// skip; the term range drives prefix-query skip via
+    /// `[prefix, prefix_upper_bound)` overlap. Keyed by FTS column id. Same
+    /// per-column [`FtsSummaryAgg`] shape the list-level aggregate uses;
+    /// built per superfile via [`FtsSummaryAgg::new_with_params`].
     pub fts_summary: HashMap<FieldId, FtsSummaryAgg>,
     /// Per-vector-column summary centroid + per-cluster IVF centroids,
     /// driving global cluster selection at query time. Keyed by vector
@@ -4508,6 +4533,7 @@ mod tests {
         superfile::{builder::FtsConfig, vector::distance::distance},
         supertable::{
             manifest::{
+                bloom::BloomBuilder,
                 commit::{PartWriteResult, write_manifest_part},
                 list::{Manifest, PartitionStrategy},
             },
@@ -4515,6 +4541,9 @@ mod tests {
         },
         test_helpers::{default_tokenizer, fid},
     };
+
+    /// Block count for the hand-built blooms in these tests; any size works.
+    const BLOOM_TEST_BLOCKS: usize = 16;
 
     /// Deterministic synthetic fp32 centroids for cluster-scoring tests.
     fn synth_clusters(n_cent: u32, dim: u32, seed: u64) -> (ClusterCentroids, Vec<f32>) {
@@ -9431,5 +9460,65 @@ mod tests {
             matches!(err, ManifestLoadError::Parse(_)),
             "expected a parse error, got {err:?}"
         );
+    }
+
+    /// A part read from storage arrives without the term blooms an older
+    /// writer stored in it — on both the disk-cache and the storage-GET
+    /// decode — and keeps the rest of the FTS summary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stored_part_decodes_without_term_blooms() {
+        let id = Uuid::new_v4();
+        let mut bloom = BloomBuilder::with_n_blocks(BLOOM_TEST_BLOCKS);
+        bloom.insert(b"alpha");
+        let summary = FtsSummaryAgg::new_with_params(
+            Some(bloom.finish()),
+            1,
+            (b"alpha".to_vec(), b"alpha".to_vec()),
+            ColumnLengthStats::default(),
+        );
+        let part = ManifestPart {
+            format_version: part::FORMAT_VERSION.into(),
+            part_id: PartId::new_v4(),
+            superfiles: vec![Arc::new(SuperfileEntry {
+                physical_schema: None,
+                stem: None,
+                birth_version: 0,
+                superfile_id: id,
+                uri: SuperfileUri(id),
+                n_docs: 1,
+                id_min: 0,
+                id_max: 0,
+                scalar_stats: HashMap::new(),
+                fts_summary: HashMap::from([(fid("title"), summary)]),
+                vector_summary: HashMap::new(),
+                partition_key: Vec::new(),
+                partition_hint: None,
+                vector_layout: VectorLayout::Ivf,
+                subsection_offsets: None,
+            })],
+        };
+        let bytes = Bytes::from(part::encode(&part));
+        let budget = || Arc::new(OpenBlobBudget::unlimited());
+        let legacy = || Arc::new(LegacyNames::none());
+
+        let cached = decode_part_off_thread(bytes.clone(), budget(), legacy())
+            .await
+            .expect("decode");
+        let fetched = verify_and_decode_part_off_thread(
+            bytes.clone(),
+            ContentHash::of(&bytes),
+            budget(),
+            legacy(),
+        )
+        .await
+        .expect("verify and decode");
+        for decoded in [cached, fetched] {
+            let summary = &decoded.superfiles[0].fts_summary[&fid("title")];
+            assert!(summary.term_bloom.is_none(), "the stored bloom is dropped");
+            assert_eq!(
+                summary.term_range,
+                Some((b"alpha".to_vec(), b"alpha".to_vec()))
+            );
+        }
     }
 }

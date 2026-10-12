@@ -230,6 +230,22 @@ pub struct ManifestPart {
     pub superfiles: Vec<Arc<SuperfileEntry>>,
 }
 
+impl ManifestPart {
+    /// Clear every entry's term bloom, leaving the rest of each FTS summary.
+    /// An absent bloom keeps the superfile, so this only ever widens what
+    /// term pruning keeps. An entry without a bloom is left untouched, so it
+    /// is never copied out of a shared `Arc`.
+    pub(crate) fn drop_term_blooms(&mut self) {
+        for entry in &mut self.superfiles {
+            if entry.fts_summary.values().any(|s| s.term_bloom.is_some()) {
+                for summary in Arc::make_mut(entry).fts_summary.values_mut() {
+                    summary.term_bloom = None;
+                }
+            }
+        }
+    }
+}
+
 /// Errors from the Avro+zstd decode path.
 #[derive(Debug, Error)]
 pub enum PartParseError {
@@ -1355,6 +1371,37 @@ mod tests {
                 "entry {i} must keep its blob when no ceiling is set"
             );
         }
+    }
+
+    /// Dropping the stored term blooms clears every entry's bloom and leaves
+    /// the rest of each FTS summary, including on an entry with no FTS
+    /// columns at all.
+    #[test]
+    fn drop_term_blooms_clears_every_entry_bloom_and_keeps_the_rest() {
+        let mut part = fresh_part(vec![make_rich_superfile(), fresh_superfile(3)]);
+        let before = part.superfiles[0].fts_summary.clone();
+        assert!(
+            before.values().any(|s| s.term_bloom.is_some()),
+            "the fixture carries blooms"
+        );
+
+        part.drop_term_blooms();
+
+        let after = &part.superfiles[0].fts_summary;
+        assert_eq!(after.len(), before.len());
+        for (id, summary) in after {
+            assert!(summary.term_bloom.is_none(), "{id:?} keeps a bloom");
+            let FtsSummaryAgg {
+                n_terms_distinct,
+                term_range,
+                length_stats,
+                ..
+            } = &before[id];
+            assert_eq!(summary.n_terms_distinct, *n_terms_distinct);
+            assert_eq!(&summary.term_range, term_range);
+            assert_eq!(&summary.length_stats, length_stats);
+        }
+        assert!(part.superfiles[1].fts_summary.is_empty());
     }
 
     fn assert_superfiles_equal(a: &SuperfileEntry, b: &SuperfileEntry) {

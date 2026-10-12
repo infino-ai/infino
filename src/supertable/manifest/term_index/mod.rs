@@ -3919,7 +3919,9 @@ mod tests {
         let work = TempDir::new().expect("tempdir");
         copy_dir_recursive(&fixture, work.path());
 
-        // Cell 1: the old table as written. Blooms present, no index.
+        // Cell 1: the old table as written: no index. Its entries were
+        // stored with blooms; the load drops them, so every superfile is
+        // kept for a term leaf and the answers below are unchanged.
         let (_storage, st) = open(work.path());
         {
             let reader = st.reader().expect("reader");
@@ -3933,8 +3935,8 @@ mod tests {
                 assert!(
                     e.fts_summary[&manifest.field_id("title").expect("title id")]
                         .term_bloom
-                        .is_some(),
-                    "old entries carry blooms"
+                        .is_none(),
+                    "stored blooms are dropped at load"
                 );
             }
         }
@@ -3947,7 +3949,7 @@ mod tests {
 
         // Cell 2: the current writer appends a segment. An index appears,
         // covering only the new superfile; the list marks it incomplete;
-        // the old superfiles keep routing by their blooms.
+        // the old superfiles, unlisted and without blooms, are kept.
         commit_segment(&st, SEGMENTS);
         {
             let reader = st.reader().expect("reader");
