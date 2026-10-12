@@ -485,6 +485,11 @@ required-features = ["test-helpers"]
 name = "index_size_report"
 required-features = ["test-helpers"]
 
+# `manifest_bloom_report` decodes manifest lists and parts as stored.
+[[example]]
+name = "manifest_bloom_report"
+required-features = ["test-helpers"]
+
 # `locomo-recall` uses only the public `infino::*` surface (connect, create_table,
 # the search methods, query_sql), so no `test-helpers`. Multi-file example:
 # examples/locomo-recall/{main.rs, embed.mjs, fixture.json, README.md}.
