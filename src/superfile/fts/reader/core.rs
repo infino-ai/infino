@@ -1737,13 +1737,6 @@ pub(crate) struct OrCursorSet {
 }
 
 impl OrCursorSet {
-    /// Number of expanded terms this set was built from — used to gate
-    /// ranged-kernel pool dispatch by scan cost, the same signal the
-    /// plain multi-should path gates on.
-    pub(crate) fn len(&self) -> usize {
-        self.cursors.len()
-    }
-
     /// Posting-list bytes this set's cursors index into — see
     /// [`PreparedClauses::postings_bytes`]. Counted once per superfile
     /// even when ranged slices share the set.

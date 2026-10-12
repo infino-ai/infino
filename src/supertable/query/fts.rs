@@ -73,7 +73,7 @@
 use std::{
     borrow::Cow,
     cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
     slice,
     sync::{Arc, Mutex, RwLock},
     time::Instant,
@@ -547,6 +547,19 @@ pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
     ceiling.partial_cmp(&floor) != Some(std::cmp::Ordering::Less)
 }
 
+/// A ranked query's clauses, owned and resolved to terms: what the scoring
+/// core takes, whether they came from parsing a query or expanding a
+/// prefix.
+#[derive(Default)]
+struct ScoredClauses {
+    musts: Vec<String>,
+    shoulds: Vec<String>,
+    negatives: Vec<String>,
+    must_phrases: Vec<Phrase<String>>,
+    should_phrases: Vec<Phrase<String>>,
+    negative_phrases: Vec<Phrase<String>>,
+}
+
 impl SupertableReader {
     /// [`plan_locations_for`] on this reader's manifest.
     pub(crate) async fn plan_locations(
@@ -643,7 +656,6 @@ impl SupertableReader {
             Self::validate_bm25_params(p)?;
         }
         let manifest = self.manifest();
-        let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
 
         // Resolve the query tokenizer, which doubles as the column's
@@ -658,14 +670,6 @@ impl SupertableReader {
                 &manifest.fts_configs(),
             )));
         };
-        // Idf is computed against the table-wide totals. The average
-        // document length needs no such fold: every superfile was baked at
-        // the table-wide average as of its commit and is scored at what it
-        // declares.
-        let corpus = manifest
-            .fts_length_stats(column)
-            .ok_or_else(|| QueryError::Unsupported(FTS_SUMMARY_TOO_OLD_MSG.to_owned()))?;
-
         // Parse the query once here, not per superfile, resolving the
         // bare tokens' polarity from the default operator (`And` ⇒
         // must, `Or` ⇒ should). The fan-out closures below need owned
@@ -686,8 +690,6 @@ impl SupertableReader {
         let should_phrases = own_phrases(clauses.should_phrases);
         let negative_phrases = own_phrases(clauses.negative_phrases);
         let has_musts = !musts.is_empty() || !must_phrases.is_empty();
-        let has_phrases =
-            !must_phrases.is_empty() || !should_phrases.is_empty() || !negative_phrases.is_empty();
 
         if !has_musts && shoulds.is_empty() && should_phrases.is_empty() {
             // No scorable clause at all. Empty / punctuation-only
@@ -715,6 +717,56 @@ impl SupertableReader {
             true => presence_leaf(&column_owned, &musts, &must_phrases, BoolMode::And),
             false => presence_leaf(&column_owned, &shoulds, &should_phrases, mode),
         };
+        self.bm25_search_clauses(
+            column,
+            ScoredClauses {
+                musts,
+                shoulds,
+                negatives,
+                must_phrases,
+                should_phrases,
+                negative_phrases,
+            },
+            prune_leaf,
+            k,
+            bm25_params,
+            scope,
+        )
+        .await
+    }
+
+    /// Ranks `clauses` over the superfiles `prune_leaf` keeps, with idf
+    /// from the whole table: the shared core of term and prefix search.
+    async fn bm25_search_clauses(
+        &self,
+        column: &str,
+        clauses: ScoredClauses,
+        prune_leaf: PruneLeaf,
+        k: usize,
+        bm25_params: Option<Bm25Params>,
+        scope: Option<&CandidateScope>,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let ScoredClauses {
+            musts,
+            shoulds,
+            negatives,
+            must_phrases,
+            should_phrases,
+            negative_phrases,
+        } = clauses;
+        let has_phrases =
+            !must_phrases.is_empty() || !should_phrases.is_empty() || !negative_phrases.is_empty();
+        let manifest = self.manifest();
+        let pool_threads = manifest.options.reader_pool.current_num_threads();
+        let column_owned = column.to_owned();
+        // Idf is computed against the table-wide totals. The average
+        // document length needs no such fold: every superfile was baked at
+        // the table-wide average as of its commit and is scored at what it
+        // declares.
+        let corpus = manifest
+            .fts_length_stats(column)
+            .ok_or_else(|| QueryError::Unsupported(FTS_SUMMARY_TOO_OLD_MSG.to_owned()))?;
+
         let phases = self.phase_spans();
         let select_span = trace::phase(phases, || {
             detail_span!(
@@ -760,20 +812,21 @@ impl SupertableReader {
         // each member of a scored (must/should) phrase — a phrase's score
         // is Σ member idf. Negated terms/phrases are pure exclusions, so
         // their idf never matters and they stay out of the wave.
-        let mut scored: Vec<String> = Vec::new();
-        let mut add = |t: &String| {
-            if !scored.contains(t) {
-                scored.push(t.clone());
-            }
+        let scored: Vec<String> = {
+            let mut seen: HashSet<&str> = HashSet::new();
+            musts
+                .iter()
+                .chain(shoulds.iter())
+                .chain(
+                    must_phrases
+                        .iter()
+                        .chain(should_phrases.iter())
+                        .flat_map(|phrase| phrase.iter()),
+                )
+                .filter(|t| seen.insert(t.as_str()))
+                .cloned()
+                .collect()
         };
-        for t in musts.iter().chain(shoulds.iter()) {
-            add(t);
-        }
-        for phrase in must_phrases.iter().chain(should_phrases.iter()) {
-            for member in phrase.iter() {
-                add(member);
-            }
-        }
         let (global_idf, prefetch_memos): (Option<Arc<GlobalTermIdf>>, PrefetchMemos) =
             match scored.is_empty() {
                 true => (None, None),
@@ -1391,15 +1444,14 @@ impl SupertableReader {
     }
 
     /// Prefix-expanded BM25 search across the pinned manifest's
-    /// superfiles. The prefix is ASCII-lowercased before expansion
-    /// and expanded per-superfile to the
-    /// concrete term list before `BoolMode::Or` BM25 scoring.
+    /// superfiles. The prefix is ASCII-lowercased, expanded to every
+    /// indexed term in the table that starts with it, and the expansion is
+    /// ranked as a `BoolMode::Or` query, so each term carries table-wide
+    /// idf exactly as it would if searched on its own.
     ///
-    /// Returns up to `k` highest-scoring hits, sorted descending
-    /// by score.
-    ///
-    /// Empty supertable (no superfiles) and `k == 0` short-circuit
-    /// to an empty `Vec`.
+    /// Returns up to `k` highest-scoring hits, sorted descending by score.
+    /// Empty supertable (no superfiles) and `k == 0` short-circuit to an
+    /// empty `Vec`.
     ///
     /// `pub(crate)` async kernel — the public surface is the sync
     /// [`SupertableReader::bm25_search_prefix`].
@@ -1416,174 +1468,82 @@ impl SupertableReader {
         // As in `bm25_search_async`: a prefix query over a column with no
         // full-text index would otherwise fail deep in the scan with an opaque
         // missing-metadata error. Reject up front, naming the searchable set.
-        // Prefix expansion lowercases the prefix bytes directly rather than
-        // tokenizing, so there is no tokenizer lookup to fold this into — but
-        // it is the same single pass over `fts_columns`, once per query.
         if manifest.try_fts_tokenizer_for(column).is_none() {
             return Err(QueryError::InvalidQuery(no_fts_index_message(
                 column,
                 &manifest.fts_configs(),
             )));
         }
-        let pool_threads = manifest.options.reader_pool.current_num_threads();
-        let column_owned = column.to_owned();
-        let prefix_owned = prefix.to_owned();
-
-        // ManifestSnapshot-level term-range skip uses the same
-        // lowercased prefix bytes the FST-expansion path
-        // uses, so the skip's
-        // lex-range overlap test exactly matches the
-        // tokenizer's interpretation of the prefix.
-        let prefix_lower = prefix_owned.to_ascii_lowercase();
-
-        // Superfile selection via the shared two-tier prune — the
-        // single-`Prefix`-leaf case (part-level term-range skip →
-        // lazy-load surviving parts → per-superfile term-range skip).
-        let kept = select_fts_superfiles(
-            manifest.as_ref(),
-            &[PruneLeaf::Prefix {
-                column: column_owned.clone(),
-                prefix: prefix_lower.as_bytes().to_vec(),
-            }],
-            &column_owned,
-        )
-        .await?;
-        if kept.is_empty() {
+        // Expansion matches the dictionary's lowercased bytes, and the
+        // term-range prune compares the same bytes, so both see one prefix.
+        let prune_leaf = PruneLeaf::Prefix {
+            column: column.to_owned(),
+            prefix: prefix.to_ascii_lowercase().into_bytes(),
+        };
+        let kept =
+            select_fts_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf), column).await?;
+        let shoulds = self.expand_prefix(column, &prune_leaf, kept).await?;
+        if shoulds.is_empty() {
             return Ok(Vec::new());
         }
-
-        let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
-        // Prefix expansion is always multi-term OR with no negation, so
-        // it is directly sub-range eligible.
-        let work_units = build_work_units(&kept_refs, FanOut::SubRanges, pool_threads);
-        let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, Uuid))> = work_units
-            .into_iter()
-            .map(|u| {
-                let suid = u.entry.superfile_id;
-                (u.entry, (u.range, suid))
-            })
-            .collect();
-
-        let column_field_id = self.manifest().field_id(column);
-
-        let column_arc = Arc::new(column_owned);
-        let prefix_arc = Arc::new(prefix_owned);
-        // No scope here: prefix search takes no pushed-down `WHERE` (the
-        // `bm25_search_prefix` table function fills its k by over-fetching
-        // under the exact predicate instead), so its units stay the plain
-        // `(range, superfile id)` pair.
-        let reader_pool = Arc::clone(&manifest.options.reader_pool);
-
-        // Share one FST expansion + cursor build per superfile across its
-        // slices, keyed by superfile id.
-        type SharedCursorCell = Arc<OnceCell<Arc<OrCursorSet>>>;
-        let cursor_sets: Arc<Mutex<HashMap<Uuid, SharedCursorCell>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-
-        // Shared fan-out — see `bm25_search` for the rationale; the
-        // kernel differs only in calling the prefix search variants.
-        let op_stats = self.op_stats.clone();
-        let kernel = move |r: Arc<SuperfileReader>, (range, suid): (Option<(u32, u32)>, Uuid)| {
-            let column_arc = Arc::clone(&column_arc);
-            let prefix_arc = Arc::clone(&prefix_arc);
-            let cursor_sets = Arc::clone(&cursor_sets);
-            let reader_pool = Arc::clone(&reader_pool);
-            let op_stats = op_stats.clone();
-            async move {
-                // A file written before a rename labels the column as it was
-                // then, and its dictionary is keyed by that label; the id is
-                // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
-
-                match range {
-                    Some((start, end)) => {
-                        let cell = {
-                            let mut sets =
-                                cursor_sets.lock().expect("cursor-set map lock poisoned");
-                            Arc::clone(sets.entry(suid).or_default())
-                        };
-                        let set = cell
-                            .get_or_try_init(|| async {
-                                let set = r
-                                    .bm25_prefix_cursor_set(
-                                        &column_arc,
-                                        &prefix_arc,
-                                        Some(&reader_pool),
-                                    )
-                                    .await?;
-                                // Flushed inside the OnceCell init so slices
-                                // sharing this superfile's expansion count
-                                // its posting work exactly once — the same
-                                // contract as the exact-term ranged path.
-                                if let Some(stats) = &op_stats {
-                                    stats.add_fts_postings_bytes(set.postings_bytes());
-                                    stats.add_planned_read_ranges(set.planned_ranges());
-                                }
-                                Ok::<_, QueryError>(Arc::new(set))
-                            })
-                            .await?;
-                        if set.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
-                            let kernel_reader = Arc::clone(&r);
-                            let kernel_set = Arc::clone(set);
-                            let kernel_stats = op_stats.clone();
-                            run_on_pool(
-                                Some(&reader_pool),
-                                "ranged prefix kernel: reader pool dropped result",
-                                move || {
-                                    op_stats::timed_kernel(&kernel_stats, || {
-                                        kernel_reader.bm25_search_or_range_prebuilt(
-                                            &kernel_set,
-                                            k,
-                                            start,
-                                            end,
-                                            f32::NEG_INFINITY,
-                                            // Prefix search takes no
-                                            // search options yet, so
-                                            // there is nothing to
-                                            // override with; columns
-                                            // score with what they
-                                            // baked in.
-                                            None,
-                                        )
-                                    })
-                                },
-                            )
-                            .await
-                            .map_err(|e| QueryError::Internal(e.to_string()))?
-                            .map_err(QueryError::from)
-                            .map(rows_as_local_ids)
-                        } else {
-                            op_stats::timed_kernel(&op_stats, || {
-                                r.bm25_search_or_range_prebuilt(
-                                    set,
-                                    k,
-                                    start,
-                                    end,
-                                    f32::NEG_INFINITY,
-                                    None,
-                                )
-                            })
-                            .map_err(QueryError::from)
-                            .map(rows_as_local_ids)
-                        }
-                    }
-                    None => {
-                        let (hits, work) = r
-                            .bm25_search_prefix(&column_arc, &prefix_arc, k, Some(&reader_pool))
-                            .await?;
-                        if let Some(stats) = &op_stats {
-                            stats.add_fts_postings_bytes(work.postings_bytes);
-                            stats.add_planned_read_ranges(work.planned_ranges);
-                            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                        }
-                        Ok(rows_as_local_ids(hits))
-                    }
-                }
-            }
+        let clauses = ScoredClauses {
+            shoulds,
+            ..ScoredClauses::default()
         };
-        let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
-        let hits = select_top_k_stable(self, per_unit, k).await?;
-        Ok(hits)
+        // Prefix search takes no search options, so columns score with the
+        // parameters they declared.
+        self.bm25_search_clauses(column, clauses, prune_leaf, k, None, None)
+            .await
+    }
+
+    /// Every term in `column` starting with `prefix_leaf`'s prefix, across
+    /// the superfiles in `kept`, deduplicated and in byte order.
+    async fn expand_prefix(
+        &self,
+        column: &str,
+        prefix_leaf: &PruneLeaf,
+        kept: Vec<Arc<SuperfileEntry>>,
+    ) -> Result<Vec<String>, QueryError> {
+        let PruneLeaf::Prefix { prefix, .. } = prefix_leaf else {
+            return Err(QueryError::Internal(
+                "prefix expansion without a prefix".into(),
+            ));
+        };
+        let column_field_id = self.manifest().field_id(column);
+        let column_arc: Arc<str> = Arc::from(column);
+        let prefix_arc: Arc<[u8]> = Arc::from(prefix.as_slice());
+        let pool = Arc::clone(&self.manifest().options.reader_pool);
+        let units = kept.into_iter().map(|entry| (entry, ())).collect();
+        let per_superfile: Vec<Vec<Vec<u8>>> = dispatch::fanout_with(
+            self,
+            units,
+            false,
+            ReadIntent::Warm,
+            move |r, _entry, _sidecars, _now, ()| {
+                let column_arc = Arc::clone(&column_arc);
+                let prefix_arc = Arc::clone(&prefix_arc);
+                let pool = Arc::clone(&pool);
+                async move {
+                    let fts = r
+                        .fts()
+                        .ok_or_else(|| QueryError::Internal("superfile has no FTS index".into()))?;
+                    // A file written before a rename labels the column as it
+                    // was then; the id finds it in either file.
+                    let column = r.column_alias(column_field_id, &column_arc);
+                    Ok(fts
+                        .terms_with_prefix(column, &prefix_arc, Some(&pool))
+                        .await?)
+                }
+            },
+        )
+        .await?;
+        let terms: BTreeSet<Vec<u8>> = per_superfile.into_iter().flatten().collect();
+        // Dictionary keys are valid UTF-8 by construction: a tokenizer emits
+        // `&str` terms.
+        Ok(terms
+            .into_iter()
+            .filter_map(|t| String::from_utf8(t).ok())
+            .collect())
     }
 
     /// Parse `query` into positive and negated tokens, then select the
@@ -3684,7 +3644,6 @@ mod tests {
     /// A prefix that expands to a single term in every superfile scores
     /// exactly like that term.
     #[test]
-    #[ignore = "prefix search scores with per-superfile idf (#931)"]
     fn prefix_with_one_expansion_scores_like_term() {
         let reader = skewed_in_memory_table().reader().expect("reader");
         let prefix = reader
@@ -3700,7 +3659,6 @@ mod tests {
     /// A prefix scores like an `Or` query over every term it expands to
     /// anywhere in the table, including terms only some superfiles hold.
     #[test]
-    #[ignore = "prefix search scores with per-superfile idf (#931)"]
     fn prefix_scores_like_or_over_its_expansion() {
         let reader = skewed_in_memory_table().reader().expect("reader");
         let prefix = reader

@@ -877,6 +877,14 @@ impl From<VectorError> for QueryError {
     }
 }
 
+/// The full-text reader's own error, before it is wrapped in a
+/// [`ReadError`]: classified the same way.
+impl From<FtsError> for QueryError {
+    fn from(e: FtsError) -> Self {
+        QueryError::from(ReadError::Fts(Box::new(e)))
+    }
+}
+
 impl QueryError {
     /// The engine broke its own invariant; `error` says how.
     pub(crate) fn internal(error: impl Display) -> Self {

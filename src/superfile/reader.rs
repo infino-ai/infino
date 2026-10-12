@@ -1940,34 +1940,6 @@ impl SuperfileReader {
             .await?)
     }
 
-    /// Expand `prefix` via the term dictionary and build its OR cursor set, for
-    /// reuse across this superfile's doc-id sub-ranges via
-    /// [`Self::bm25_search_or_range_prebuilt`].
-    pub(crate) async fn bm25_prefix_cursor_set(
-        &self,
-        column: &str,
-        prefix: &str,
-        pool: Option<&ThreadPool>,
-    ) -> Result<OrCursorSet, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts
-            .terms_with_prefix(column, lowered.as_bytes(), pool)
-            .await?;
-        // FST keys are valid UTF-8 by construction (a tokenizer
-        // emits `&str` terms); the from_utf8 below is a typed
-        // pass-through, not a re-validation cost.
-        let term_strings: Vec<&str> = term_bytes
-            .iter()
-            .filter_map(|b| str::from_utf8(b).ok())
-            .collect();
-        Ok(fts
-            .build_or_cursor_set(column, &term_strings, None, None)
-            .await?)
-    }
-
     /// Ranged multi-term OR against prebuilt cursors — see
     /// [`Self::bm25_search_or_range_pretokenized_with_floor`] for the
     /// range and floor contract.
@@ -1982,39 +1954,6 @@ impl SuperfileReader {
     ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self.fts_scored(bm25)?;
         Ok(fts.search_or_range_prebuilt(set, k, doc_id_start, doc_id_end, floor)?)
-    }
-
-    /// Prefix-expanded BM25 search restricted to a doc_id sub-range.
-    ///
-    /// Same expansion logic as [`Self::bm25_search_prefix`] —
-    /// lowercase the prefix, walk the term dictionary for matching terms, run
-    /// BM25 OR over the term set — but only docs in
-    /// `[doc_id_start, doc_id_end)` are eligible. A single-call wrapper
-    /// around [`Self::bm25_prefix_cursor_set`] +
-    /// [`Self::bm25_search_or_range_prebuilt`].
-    pub async fn bm25_search_prefix_range(
-        &self,
-        column: &str,
-        prefix: &str,
-        k: usize,
-        doc_id_start: u32,
-        doc_id_end: u32,
-        pool: Option<&ThreadPool>,
-    ) -> Result<Vec<(RowId, f32)>, ReadError> {
-        if k == 0 || doc_id_start >= doc_id_end {
-            return Ok(Vec::new());
-        }
-        let set = self.bm25_prefix_cursor_set(column, prefix, pool).await?;
-        // Prefix search has no search-options surface, so columns score
-        // with the pair they declared.
-        self.bm25_search_or_range_prebuilt(
-            &set,
-            k,
-            doc_id_start,
-            doc_id_end,
-            f32::NEG_INFINITY,
-            None,
-        )
     }
 
     /// Multi-column BM25 search with per-column weights ("most
@@ -3472,33 +3411,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bm25_search_prefix_range_restricts_window() {
-        let bytes = build_simple_fts_only_superfile();
-        let r = SuperfileReader::open(bytes).expect("open");
-        // "ru" expands to "rust" (docs 0,2); restrict to [0,2) ⇒ doc 0.
-        let hits = r
-            .bm25_search_prefix_range("title", "ru", 10, 0, 2, None)
-            .await
-            .expect("prefix range");
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
-        assert!(ids.contains(&0));
-        assert!(!ids.contains(&2));
-        // Degenerate range / k short-circuits.
-        assert!(
-            r.bm25_search_prefix_range("title", "ru", 0, 0, 2, None)
-                .await
-                .expect("zero k")
-                .is_empty()
-        );
-        assert!(
-            r.bm25_search_prefix_range("title", "ru", 10, 2, 2, None)
-                .await
-                .expect("empty range")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
     async fn vector_search_clusters_probes_explicit_clusters() {
         let bytes = build_vector_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
@@ -3801,19 +3713,6 @@ mod tests {
             .await
             .expect("exact_match")
             .0;
-        assert!(hits.is_empty());
-    }
-
-    #[tokio::test]
-    async fn bm25_search_prefix_range_unmatched_prefix_is_empty() {
-        // A valid (non-degenerate) range with a prefix no term begins
-        // with drives the empty-term-expansion short-circuit.
-        let bytes = build_simple_fts_only_superfile();
-        let r = SuperfileReader::open(bytes).expect("open");
-        let hits = r
-            .bm25_search_prefix_range("title", "zz", 10, 0, 4, None)
-            .await
-            .expect("prefix range");
         assert!(hits.is_empty());
     }
 
