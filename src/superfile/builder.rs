@@ -769,9 +769,10 @@ impl BuilderOptions {
     }
 
     /// Give the merge the memory budget its compaction run was configured
-    /// with (see [`BuilderOptions::merge_memory_mb`]).
-    pub(crate) fn with_merge_memory_mb(mut self, mb: u64) -> Self {
-        self.merge_memory_mb = Some(mb);
+    /// with (see [`BuilderOptions::merge_memory_mb`]). `None` leaves it on
+    /// the configured value.
+    pub(crate) fn with_merge_memory_mb(mut self, mb: Option<u64>) -> Self {
+        self.merge_memory_mb = mb;
         self
     }
 
@@ -6278,6 +6279,39 @@ mod tests {
         }
         t.push_str("common");
         t
+    }
+
+    /// The run's budget survives the reshaping a merge does to its options,
+    /// so the width and run length the plan picks are the ones the caller's
+    /// settings asked for rather than the configured default.
+    #[test]
+    fn a_merge_keeps_the_budget_its_run_was_given() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig::new("title").positions(true)],
+            vec![],
+        );
+        assert_eq!(opts.merge_memory_mb, None, "no run behind a plain build");
+
+        let given = opts.clone().with_merge_memory_mb(Some(16_384));
+        assert_eq!(given.merge_memory_mb, Some(16_384));
+
+        // The merge rebuilds its options from the inputs before it runs, and
+        // that reshaping must not drop the budget on the way.
+        let bytes = reorder_corpus_input(&given, &given.schema.clone(), 0, 64);
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+        let inputs = vec![MergeInput {
+            reader: Arc::new(reader),
+            deleted: None,
+            adapter: None,
+        }];
+        let reshaped = merge_builder_opts(&inputs, given).expect("merge options");
+        assert_eq!(
+            reshaped.merge_memory_mb,
+            Some(16_384),
+            "the budget must reach the builder the merge actually runs with"
+        );
     }
 
     /// A merge too large to hold at a usable width is reordered in runs, and

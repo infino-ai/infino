@@ -279,6 +279,32 @@ pub(in crate::supertable::optimize::compact) mod tests {
         }
     }
 
+    /// Each job carries the memory budget of the run that planned it, so the
+    /// merge sizes its reordering from the settings the caller passed rather
+    /// than from the configured default.
+    #[test]
+    fn a_job_carries_the_budget_of_the_run_that_planned_it() {
+        let stats = vec![seg(1, 1, 1000, 0), seg(2, 1, 1000, 0)];
+        for mb in [512u64, 3072, 16_384] {
+            let cfg = CompactionSettings {
+                max_memory_mb: mb,
+                // Two fragments are enough to plan on, so the job exists to
+                // be inspected whatever the budget is.
+                min_superfiles_for_merge: 2,
+                ..CompactionSettings::default()
+            };
+            let jobs = select(&stats, &cfg);
+            assert!(!jobs.is_empty(), "{mb} MiB should still plan a job");
+            for job in &jobs {
+                assert_eq!(
+                    job.merge_memory_mb,
+                    Some(mb),
+                    "a job planned at {mb} MiB should carry it"
+                );
+            }
+        }
+    }
+
     /// Two mergeable fragments on opposite sides of the drain watermark must
     /// land in different selection groups: a single mixed job would stamp the
     /// merged superfile with the drained input's (older) `birth_version` and

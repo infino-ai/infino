@@ -710,12 +710,10 @@ impl Supertable {
         // its own documents — the same statistic a fresh append bakes, and
         // what lets a compacted table score like an unfragmented one.
         let replaced: HashSet<Uuid> = superfiles.iter().map(|e| e.superfile_id).collect();
-        let mut builder_options = manifest
+        let builder_options = manifest
             .builder_options()
-            .with_fts_corpus_stats(manifest.fts_corpus_stats(&replaced));
-        if let Some(mb) = merge_memory_mb {
-            builder_options = builder_options.with_merge_memory_mb(mb);
-        }
+            .with_fts_corpus_stats(manifest.fts_corpus_stats(&replaced))
+            .with_merge_memory_mb(merge_memory_mb);
         // The build is long, synchronous CPU work, so it runs on the
         // maintenance pool rather than the thread driving this future.
         // `run_on_pool` needs a `'static` closure, so everything it reads —
