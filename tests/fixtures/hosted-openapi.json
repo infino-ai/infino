@@ -18,7 +18,7 @@
           "Rows"
         ],
         "summary": "Append rows",
-        "description": "Append rows to a table. The body is an Arrow IPC stream, or a JSON `{\"data\": [...]}` envelope.",
+        "description": "Append rows to a table. The body is an Arrow IPC stream, or a JSON `{\"data\": [...]}` envelope. A column the table does not have is added, typed from the rows; a value that disagrees with a column it does have is rejected.",
         "operationId": "append",
         "parameters": [
           {
@@ -61,7 +61,7 @@
             "description": "Rows appended. Body is an Arrow IPC row stream (application/vnd.apache.arrow.stream), or a JSON `{\"data\": [...]}` envelope."
           },
           "400": {
-            "description": "Invalid request body."
+            "description": "Invalid request body, or rows the table refuses. A key the table has no column for adds one, typed from the values; a value whose type disagrees with a column the table already has is refused, naming the column, the type it holds and the one offered. Growing past the table's `max_fields` is refused the same way. Not transient: the same body fails identically. Change the value, or change the column with a `schema` patch first."
           },
           "401": {
             "description": "Missing or invalid API key."
@@ -757,8 +757,8 @@
         "tags": [
           "Tables"
         ],
-        "summary": "Describe a table's schema",
-        "description": "Return a table's column schema.",
+        "summary": "Describe or change a table's schema",
+        "description": "With `table_name` alone, return the table's columns. With `patch`, change the schema — adding, retyping, renaming, indexing or retiring a column, or creating the table when there is none — and return the schema document that results. A patch needs the `manage` capability.",
         "operationId": "schema",
         "parameters": [
           {
@@ -783,13 +783,26 @@
         },
         "responses": {
           "200": {
-            "description": "JSON array of column descriptors."
+            "description": "A describe answers the table's columns as the `[{name, type, nullable, …}]` descriptor array by default, the schema document under `encoding: \"document\"`, and an Arrow IPC schema message under `encoding: \"ipc\"`. A write answers the schema document that resulted — the patch applied, or the table created from it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaResponse"
+                }
+              }
+            }
           },
           "400": {
-            "description": "Invalid request body."
+            "description": "Invalid request body, an unknown `encoding`, an `encoding` sent together with `patch` (a write always answers the document), or a patch the schema refuses: a type the frozen column disagrees with, a name a live column holds, an id no live column has, a change that needs an empty table, an index the column cannot carry. The message names the remedy."
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "403": {
+            "description": "Either the body carries `patch` and the key lacks the `manage` capability, or the account is at a storage limit: a patch creates the table when there is none, so it meets the same quota wall a row-adding write does, with the same body naming the limit. A describe is a read and is never refused for either reason."
+          },
+          "409": {
+            "description": "`expected_schema_id` no longer matches: the schema moved. Describe again and resubmit."
           },
           "503": {
             "description": "The database's workers are still activating, or no capacity is free to place them. Transient — retry after the `Retry-After` interval."
@@ -858,7 +871,7 @@
           "Rows"
         ],
         "summary": "Update rows",
-        "description": "Replace rows matching a predicate. `table` and `predicate` are query parameters; the body carries the replacement rows (Arrow IPC or JSON).",
+        "description": "Replace rows matching a predicate. `table` and `predicate` are query parameters; the body carries the replacement rows (Arrow IPC or JSON), which add and are checked against the table's columns exactly as an append's are.",
         "operationId": "update",
         "parameters": [
           {
@@ -908,7 +921,7 @@
             "description": "Row counts as JSON `{matched, n_tombstoned, n_not_found}`. Body is the replacement rows as an Arrow IPC stream."
           },
           "400": {
-            "description": "Invalid request."
+            "description": "Invalid request body, or rows the table refuses. A key the table has no column for adds one, typed from the values; a value whose type disagrees with a column the table already has is refused, naming the column, the type it holds and the one offered. Growing past the table's `max_fields` is refused the same way. Not transient: the same body fails identically. Change the value, or change the column with a `schema` patch first."
           },
           "401": {
             "description": "Missing or invalid API key."
@@ -1036,17 +1049,6 @@
           },
           "query": {
             "type": "string"
-          },
-          "stats": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Stats",
-                "description": "BM25 corpus statistics for idf scoring. Absent ⇒ the deployed\nengine's own default, whatever that is; the engine SDK's remote\ntransport always sends it explicitly."
-              }
-            ]
           },
           "table_name": {
             "type": "string"
@@ -1233,6 +1235,13 @@
                 "type": "string",
                 "description": "The storage account's region."
               },
+              "storage_account": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The storage account holding the container, which is addressed by\nboth."
+              },
               "tenant_id": {
                 "type": "string",
                 "description": "The customer's Entra tenant id."
@@ -1296,6 +1305,17 @@
             ],
             "description": "For AWS bindings: the external id to write into the role's trust\npolicy (`sts:ExternalId` condition). Returned exactly once, here."
           },
+          "ownership": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StorageOwnership",
+                "description": "For a self-serve account's GCS or Azure binding: the ownership token\nand where to write it. Such a binding verifies only once its bucket\nholds it, so `verified` is `false`. Returned exactly once, here."
+              }
+            ]
+          },
           "verified": {
             "type": "boolean",
             "description": "Whether the bind-time probe already passed. GCS and Azure try the\nprobe at create when the grant is already in place. AWS is always\n`false` here: the external id did not exist until this response, so\nthe customer cannot have written the trust policy yet — call\n`POST /v1/databases/{name}/storage/verify` (or the first query, which\nre-probes) once it is."
@@ -1326,6 +1346,110 @@
             "description": "Lifecycle state: `registered` (usable), `purging` (being deleted), or\n`unreachable` (a bound database whose storage grant failed — restore\nthe grant and re-verify to restore service; the data is not lost)."
           }
         }
+      },
+      "DescribedColumn": {
+        "type": "object",
+        "description": "One column as `POST /v1/schema/{database}` describes it by default. `name`, `type` and `nullable` describe a column and a struct's own fields; a map's `key`/`value`, and a list's `item` when the element is itself nested, are types rather than fields and carry `type` and its keys alone. This is the `create_table` descriptor vocabulary widened to every type a table can hold — see `SchemaField` for which of them `create_table` accepts back. A column's stable `id`, its index and its metadata are not in this shape; ask for `encoding: \"document\"` to get those.",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "dim": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Element count of a `vector` or `fixed_size_list`.",
+            "minimum": 0
+          },
+          "fields": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/DescribedColumn"
+            },
+            "description": "A struct's own fields."
+          },
+          "item": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object"
+              }
+            ],
+            "description": "The element's bare scalar spelling, or its own type keys."
+          },
+          "key": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DescribedColumn",
+                "description": "A map's key type."
+              }
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absent when this describes a type rather than a field — a map's\n`key`/`value`, or a nested list `item`."
+          },
+          "nullable": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Absent alongside `name`, for the same reason."
+          },
+          "precision": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Total digits of a decimal.",
+            "minimum": 0
+          },
+          "scale": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Digits after the point of a decimal; may be negative."
+          },
+          "type": {
+            "type": "string",
+            "description": "The type tag: a scalar spelling (`\"i64\"`, `\"large_utf8\"`,\n`\"timestamp_ms\"`, …), or `\"vector\"`, `\"list\"`, `\"large_list\"`,\n`\"fixed_size_list\"`, `\"struct\"`, `\"map\"`, `\"decimal\"`, `\"decimal256\"`.\nA type with no spelling at all falls back to Arrow's own display name."
+          },
+          "tz": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "IANA time zone of a zoned timestamp."
+          },
+          "value": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DescribedColumn",
+                "description": "A map's value type."
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
       },
       "DropTableRequest": {
         "type": "object",
@@ -1399,7 +1523,7 @@
               "string",
               "null"
             ],
-            "description": "Analyzer name (`\"standard\"` or `\"ascii_lower\"`). Omitted means the\nengine default, `standard` — the Unicode-aware UAX #29 tokenizer.\n`ascii_lower` splits on ASCII alphanumerics and drops every\nnon-ASCII token. Recorded with the table; it cannot be changed\nafterwards, so pass it explicitly to pin a column either way."
+            "description": "Analyzer name. `\"standard\"` — the Unicode-aware UAX #29 tokenizer —\nis the only analyzer, and what an omitted field means; any other name\nis refused."
           },
           "b": {
             "type": [
@@ -1577,7 +1701,7 @@
       },
       "RowsEnvelope": {
         "type": "object",
-        "description": "JSON row envelope for `POST /v1/append/{database}` and\n`POST /v1/update/{database}` — the `Content-Type: application/json`\nalternative to an Arrow IPC stream body. Rows are JSON objects keyed by\ncolumn name, converted server-side into one Arrow batch against the\ntable's schema.",
+        "description": "JSON row envelope for `POST /v1/append/{database}` and\n`POST /v1/update/{database}` — the `Content-Type: application/json`\nalternative to an Arrow IPC stream body. Rows are JSON objects keyed by\ncolumn name, converted server-side into one Arrow batch against the\ntable's schema.\n\nA key the table has no column for **adds** one, typed from the values in\nthe request and nullable, so earlier rows read back null for it. That is\nthe table's behaviour and not this encoding's: an Arrow batch carrying a\ncolumn the table lacks adds it on the same terms. What is specific to JSON\nis how a row is read — a nested object flattens to dot-path columns, an\narray becomes a list column, and the column's type is inferred from the\nvalues rather than stated by the caller.\n\nA value whose type disagrees with a column the table already has is a 400,\nnaming the column, the type it holds and the one offered; the write lands\nno rows. Growing past the table's `max_fields` is a 400 too. Neither is\nretryable as sent: change the value, or change the column with a `schema`\npatch first. Appending never creates a table — an unknown table name is a\n404.",
         "required": [
           "data"
         ],
@@ -1592,9 +1716,310 @@
         },
         "additionalProperties": false
       },
+      "SchemaColumnIndex": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A full-text index: what the column was tokenized under, and the BM25\nconstants it is scored with.",
+            "required": [
+              "analyzer",
+              "positions",
+              "stored",
+              "k1",
+              "b",
+              "kind"
+            ],
+            "properties": {
+              "analyzer": {
+                "type": "string"
+              },
+              "b": {
+                "type": "number",
+                "format": "float",
+                "description": "BM25 length normalization."
+              },
+              "k1": {
+                "type": "number",
+                "format": "float",
+                "description": "BM25 term-frequency saturation."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "fts"
+                ]
+              },
+              "positions": {
+                "type": "boolean",
+                "description": "Whether term positions are stored (what a phrase query needs)."
+              },
+              "stemmer": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Absent when the chain does not stem."
+              },
+              "stopwords": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Absent when the chain removes no stopwords."
+              },
+              "stored": {
+                "type": "boolean",
+                "description": "Whether the column's text is stored in the index."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A vector index.",
+            "required": [
+              "metric",
+              "rot_seed",
+              "rerank_codec",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "vector"
+                ]
+              },
+              "metric": {
+                "$ref": "#/components/schemas/Metric"
+              },
+              "rerank_codec": {
+                "type": "string",
+                "description": "The on-disk rerank byte layout. A free-form name, not a closed\nset: the engine adds codecs over time."
+              },
+              "rot_seed": {
+                "type": "string",
+                "description": "The rotation seed, as a decimal **string**: it is a `u64` whose\ndefault sits above the 2^53 a JSON number carries exactly, so a\nclient that reads numbers as doubles would hand back a different\nseed than it was given."
+              }
+            }
+          }
+        ],
+        "description": "The search index on a [`SchemaDocumentField`], discriminated by `kind`."
+      },
+      "SchemaDocument": {
+        "type": "object",
+        "description": "The schema document: the table's definition as the engine holds it. Returned by every schema write, and by a describe that asks for `encoding: \"document\"`. Its `schema_id` is what the next write passes as `expected_schema_id` to make itself a compare-and-set.",
+        "required": [
+          "schema_id",
+          "last_field_id",
+          "max_fields",
+          "max_depth",
+          "fields",
+          "tombstoned"
+        ],
+        "properties": {
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SchemaDocumentField"
+            },
+            "description": "The live columns, in schema order."
+          },
+          "last_field_id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The highest field id ever minted for this table, live or dropped. Ids\nare never reused, so this only grows.",
+            "minimum": 0
+          },
+          "max_depth": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How deep a document may nest before the row mapper refuses it.",
+            "minimum": 0
+          },
+          "max_fields": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The most live fields the table may hold.",
+            "minimum": 0
+          },
+          "schema_id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Bumps on every committed schema change. Pass it back as\n`expected_schema_id` to make the next write a compare-and-set.",
+            "minimum": 0
+          },
+          "tombstoned": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "Ids of columns that were dropped. Their names are free for reuse by a\nnew column, which gets a new id."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchemaDocumentField": {
+        "type": "object",
+        "description": "One column of a schema document, and the nested fields inside it. The document spells types differently from the descriptor array a describe answers by default: a list's `item` is always a field object rather than a bare name, and a map carries Arrow's `entries` struct plus `keys_sorted` rather than a flattened `key`/`value` pair — so a client reading both encodings needs a parser for each. `id`, `index`, `converting_from` and `metadata` belong to a top-level column; a nested field carries `name`, `nullable` and its type keys alone.",
+        "required": [
+          "name",
+          "type",
+          "nullable"
+        ],
+        "properties": {
+          "converting_from": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The type the column is being converted *from*, as type keys. Present\nonly while a committed type change is still being applied to the\ntable's existing files; absent once every file carries the new type."
+          },
+          "dim": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Element count of a `vector` or `fixed_size_list`.",
+            "minimum": 0
+          },
+          "entries": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SchemaDocumentField",
+                "description": "A map's entry field: Arrow's two-field `{key, value}` struct, as Arrow\nstores it."
+              }
+            ]
+          },
+          "fields": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/SchemaDocumentField"
+            },
+            "description": "A struct's own fields."
+          },
+          "id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Stable for the column's whole life, across renames — what a `patch`\nmatches on when it changes an existing column. Every top-level column\ncarries one; a nested field does not.",
+            "minimum": 0
+          },
+          "index": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SchemaColumnIndex",
+                "description": "The column's search index, absent when it carries none."
+              }
+            ]
+          },
+          "ipc": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A base64 Arrow IPC schema message carrying the one type that has no\nspelling. Present only when `type` is `\"arrow\"`."
+          },
+          "item": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SchemaDocumentField",
+                "description": "Element field of a `list`, `large_list` or `fixed_size_list`."
+              }
+            ]
+          },
+          "item_nullable": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Present, and `false`, only when a `vector`'s element is non-nullable —\nthe compact spelling's elements are nullable by default."
+          },
+          "keys_sorted": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether a map's keys are stored sorted."
+          },
+          "metadata": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Free-form column metadata, carried through unchanged. Absent when the\ncolumn has none.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "nullable": {
+            "type": "boolean"
+          },
+          "precision": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Total digits of a decimal.",
+            "minimum": 0
+          },
+          "scale": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Digits after the point of a decimal; may be negative."
+          },
+          "type": {
+            "type": "string",
+            "description": "The type tag: a scalar spelling, `\"vector\"`, `\"list\"`,\n`\"large_list\"`, `\"fixed_size_list\"`, `\"struct\"`, `\"map\"`,\n`\"decimal\"`, `\"decimal256\"`, `\"fixed_size_binary\"`, or `\"arrow\"` for a\ntype with no spelling, whose Arrow form rides in `ipc`."
+          },
+          "tz": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "IANA time zone of a zoned timestamp."
+          },
+          "width": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Byte width of a `fixed_size_binary`.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "SchemaField": {
         "type": "object",
-        "description": "One column in a `create_table` schema. A scalar column is `{name, type}` where `type` is one of `\"utf8\"`, `\"large_utf8\"`, `\"bool\"`, `\"i32\"`, `\"i64\"`, `\"u32\"`, `\"u64\"`, `\"f32\"`, `\"f64\"`, `\"date32\"`, `\"date64\"`, or a timezone-naive timestamp with its unit: `\"timestamp_s\"`, `\"timestamp_ms\"` (also `\"timestamp\"`), `\"timestamp_us\"`, `\"timestamp_ns\"`. A vector column is `{name, type: \"vector\", dim}`; a list column is `{name, type: \"list\", item}`. `dim` is required for `\"vector\"` and `item` for `\"list\"`. The `schema` endpoint returns this shape for every column, including ones this form cannot declare: a zoned timestamp carries `tz`, a decimal is `{type: \"decimal\", precision, scale}`, a struct is `{type: \"struct\", fields}`, a map is `{type: \"map\", key, value}`; declare those with `schema_ipc`.",
+        "description": "One column in a `create_table` schema. A scalar column is `{name, type}` where `type` is one of `\"utf8\"`, `\"large_utf8\"`, `\"bool\"`, `\"i32\"`, `\"i64\"`, `\"u32\"`, `\"u64\"`, `\"f32\"`, `\"f64\"`, `\"date32\"`, `\"date64\"`, or a timezone-naive timestamp with its unit: `\"timestamp_s\"`, `\"timestamp_ms\"` (also `\"timestamp\"`), `\"timestamp_us\"`, `\"timestamp_ns\"`. A vector column is `{name, type: \"vector\", dim}`; a list column is `{name, type: \"list\", item}`. `dim` is required for `\"vector\"` and `item` for `\"list\"`. The `schema` endpoint describes every column in this same vocabulary, but what it returns is a superset of what this form accepts: a zoned timestamp carries `tz`, a decimal is `{type: \"decimal\", precision, scale}`, a struct is `{type: \"struct\", fields}`, a map is `{type: \"map\", key, value}`, and a list whose element is itself nested spells `item` as an object rather than a name. Declare any of those with `schema_ipc`, and do not hand a described column of one of those types back to `create_table` unchanged — the extra keys are rejected.",
         "required": [
           "name",
           "type"
@@ -1636,7 +2061,7 @@
       },
       "SchemaRequest": {
         "type": "object",
-        "description": "`POST /v1/schema/{database}`.",
+        "description": "`POST /v1/schema/{database}`: one op, two shapes. With `table_name` alone\nit describes the table; with `patch` it changes the schema — or creates\nthe table when there is none — and describes the result.\n\nThe two shapes answer differently. A describe answers the\n`[{name, type, nullable, …}]` column-descriptor array, which is what it\nhas always answered; `encoding` asks for the other forms. A write answers\nthe schema document ([`SchemaDocument`]), which is what carries the\n`schema_id` the next compare-and-set needs.",
         "required": [
           "table_name"
         ],
@@ -1646,13 +2071,45 @@
               "string",
               "null"
             ],
-            "description": "Response encoding. Omitted (the default) returns the JSON column\ndescriptors; `\"ipc\"` returns an Arrow IPC schema message, which is the\nonly form that can carry a nested column type."
+            "description": "Response encoding of a describe. Omitted (the default) returns the\n`[{name, type, nullable, …}]` column-descriptor array; `\"document\"`\nreturns the schema document ([`SchemaDocument`]), which adds each\ncolumn's stable `id`, its index and its metadata; `\"ipc\"` returns an\nArrow IPC schema message carrying the Arrow shape of the columns. Any\nother value is a 400.\n\nOnly a describe takes it: sending it together with `patch` is a 400,\nbecause a write always answers the document."
+          },
+          "expected_schema_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Compare-and-set against the document's `schema_id`: the write is\nrefused with 409 when the schema has moved.",
+            "minimum": 0
+          },
+          "patch": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The schema write, in the document's own shape: `fields` to add or\nchange (matched by `id` when given, else by `name`; `dropped: true`\nretires one), `max_fields`, `max_depth`. Nothing is\ndropped by omission, and applying what a describe returned changes\nnothing. Requires the `manage` capability; a `patch` that is present\nand not null counts as a write, whether the body is sent as an object\nor as an array, which serde fills by position."
           },
           "table_name": {
             "type": "string"
           }
         },
         "additionalProperties": false
+      },
+      "SchemaResponse": {
+        "oneOf": [
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DescribedColumn"
+            },
+            "description": "The default answer to a describe: the table's columns in the shape\n`create_table` declares them, widened to the types it cannot declare."
+          },
+          {
+            "$ref": "#/components/schemas/SchemaDocument",
+            "description": "The answer to a schema write, and to a describe that asked for it."
+          }
+        ],
+        "description": "What `POST /v1/schema/{database}` answers with, as JSON: the column\ndescriptors by default, the [`SchemaDocument`] when a write ran or\n`encoding: \"document\"` asked for it. (`encoding: \"ipc\"` answers an Arrow\nIPC schema message, which is not JSON and is not in this union.)\n\nUntagged: the two are told apart by their JSON shape — the descriptors are\nan array, the document an object."
       },
       "SqlQueryRequest": {
         "type": "object",
@@ -1667,13 +2124,23 @@
         },
         "additionalProperties": false
       },
-      "Stats": {
-        "type": "string",
-        "description": "Which BM25 corpus statistics to score term rarity (idf) with. Accepted\ncase-insensitively on the wire (`\"per_superfile\"`, `\"global\"`); serialized\ncanonically. Absent on a request ⇒ whatever the deployed engine defaults\nto, deliberately: an omitted field means \"let the engine choose\", so a\nraw REST caller and an SDK caller who both leave it out score alike, and\nthe engine can improve its default without this contract going stale. Send\nthe field explicitly to pin one mode across engine versions.",
-        "enum": [
-          "per_superfile",
-          "global"
-        ]
+      "StorageOwnership": {
+        "type": "object",
+        "description": "Where a self-serve binding's ownership token goes, returned once by the\ncreate call (`storage.ownership`).",
+        "required": [
+          "object",
+          "token"
+        ],
+        "properties": {
+          "object": {
+            "type": "string",
+            "description": "The full key, inside the bucket (or container), to write the token\nto: `<prefix>/<customer>/<database>/.infino-owner`, no leading slash."
+          },
+          "token": {
+            "type": "string",
+            "description": "The token the object must hold: its whole content, surrounding\nwhitespace aside."
+          }
+        }
       },
       "TokenMatchRequest": {
         "type": "object",
