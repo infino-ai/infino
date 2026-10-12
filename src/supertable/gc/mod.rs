@@ -789,6 +789,7 @@ mod tests {
                     id_range: (0, 0),
                     scalar_stats_agg: HashMap::new(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 }],
             }),
         );

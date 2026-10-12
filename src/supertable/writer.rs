@@ -628,7 +628,7 @@ pub(in crate::supertable) fn with_id_column(
 pub(in crate::supertable) fn builder_options_of(manifest: &ManifestSnapshot) -> BuilderOptions {
     manifest
         .builder_options()
-        .with_fts_corpus_stats(manifest.fts_corpus_stats(&HashSet::new()))
+        .with_fts_corpus_stats(manifest.fts_corpus_stats(&[]))
 }
 
 /// Ingested work accumulated across the buffered appends of one commit.

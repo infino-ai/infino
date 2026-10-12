@@ -511,6 +511,7 @@ mod tests {
             id_range: aggs.id_range,
             scalar_stats_agg: aggs.scalar_stats_agg,
             fts_summary_agg: aggs.fts_summary_agg,
+            fts_length_totals: None,
         }
     }
 

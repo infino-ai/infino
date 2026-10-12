@@ -128,7 +128,10 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri, term_index},
+        manifest::{
+            ManifestSnapshot, SuperfileEntry, SuperfileUri, encoding::FTS_SUMMARY_TOO_OLD_MSG,
+            term_index,
+        },
         query::{
             SuperfileHit,
             candidate::{CandidatePlan, CandidateScope, TermMemos},
@@ -640,11 +643,6 @@ impl SupertableReader {
             Self::validate_bm25_params(p)?;
         }
         let manifest = self.manifest();
-        // The table-wide collection size for idf. The average document
-        // length needs no such fold: every current-version superfile was
-        // baked at the table-wide average as of its commit and is scored
-        // at what it declares.
-        let corpus = manifest.fts_length_stats(column);
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
 
@@ -660,6 +658,13 @@ impl SupertableReader {
                 &manifest.fts_configs(),
             )));
         };
+        // Idf is computed against the table-wide totals. The average
+        // document length needs no such fold: every superfile was baked at
+        // the table-wide average as of its commit and is scored at what it
+        // declares.
+        let corpus = manifest
+            .fts_length_stats(column)
+            .ok_or_else(|| QueryError::Unsupported(FTS_SUMMARY_TOO_OLD_MSG.to_owned()))?;
 
         // Parse the query once here, not per superfile, resolving the
         // bare tokens' polarity from the default operator (`And` ⇒
@@ -1218,7 +1223,7 @@ impl SupertableReader {
         column: &str,
         terms: &[String],
         kept: &[Arc<SuperfileEntry>],
-        corpus: Option<ColumnLengthStats>,
+        corpus: ColumnLengthStats,
     ) -> Result<(GlobalTermIdf, PrefetchMemos), QueryError> {
         let mut map = GlobalTermIdf::with_capacity(terms.len());
         // The collection size idf is computed against: documents that
@@ -1227,9 +1232,8 @@ impl SupertableReader {
         // over, so the two have to come from the same corpus — a row
         // that is null here can never contribute to a `df`, and counting
         // it in `N` would weight the column's common terms too heavily
-        // against its rare ones. Falls back to the row count when the
-        // totals are unknown.
-        let global_n = corpus.map_or_else(|| manifest.n_docs_total(), |c| c.n_scored_docs);
+        // against its rare ones.
+        let global_n = corpus.n_scored_docs;
         if terms.is_empty() || global_n == 0 {
             return Ok((map, None));
         }
@@ -1265,18 +1269,22 @@ impl SupertableReader {
         if manifest.term_index_complete()
             && let Some(index) = manifest.term_index().await
         {
-            let live: HashSet<Uuid> = manifest
-                .get_all_superfiles_loaded()
-                .await
-                .map_err(QueryError::ManifestLoad)?
-                .iter()
-                .map(|e| e.superfile_id)
-                .collect();
             let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(misses.len());
             let asked: Vec<&str> = misses.iter().map(String::as_str).collect();
             let runs = index.postings_many(column_id, &asked).await.map_err(|e| {
                 QueryError::Store(format!("term index unreadable for global stats: {e}"))
             })?;
+            // The index keeps postings for removed superfiles, so only live
+            // ones count; liveness is checked for the terms' holders alone.
+            let holders: HashSet<Uuid> = runs
+                .iter()
+                .flat_map(|run| run.iter())
+                .filter_map(|p| index.superfile_id(p.superfile))
+                .collect();
+            let live = manifest
+                .live_among(&index, &holders)
+                .await
+                .map_err(QueryError::ManifestLoad)?;
             for (t, postings) in misses.iter().zip(runs) {
                 let df: u64 = postings
                     .iter()
@@ -3000,6 +3008,7 @@ mod tests {
 
     use super::{BoolMode, FanOut, SuperfileHit, SupertableReader, build_work_units, fanout_for};
     use crate::{
+        config::{CompactionSettings, OptimizeOptions},
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             SuperfileReader,
@@ -3007,14 +3016,14 @@ mod tests {
             fts::{
                 bm25,
                 posting::BLOCK_LEN,
-                reader::{Bm25SearchOptions, top_k_initial_capacity},
+                reader::{Bm25SearchOptions, ColumnLengthStats, top_k_initial_capacity},
             },
             vector::layout::VectorLayout,
         },
         supertable::{
             Supertable, SupertableOptions,
             error::QueryError,
-            manifest::{SuperfileEntry, SuperfileUri},
+            manifest::{SuperfileEntry, SuperfileUri, commit::read_pointer, list},
             schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         },
     };
@@ -3356,10 +3365,6 @@ mod tests {
     /// documents committed so far — and the manifest fold agrees.
     #[test]
     fn each_commit_bakes_the_running_table_wide_average() {
-        use std::collections::HashSet;
-
-        use crate::superfile::fts::reader::ColumnLengthStats;
-
         let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
         // Token totals per commit: 10 over 2 docs, then 4 over 2, then 2
         // over 1 — the empty title is a row this column has no document
@@ -3393,17 +3398,16 @@ mod tests {
             })
         );
         assert_eq!(
-            manifest
-                .fts_corpus_stats(&HashSet::new())
-                .get("title")
-                .copied(),
+            manifest.fts_corpus_stats(&[]).get("title").copied(),
             manifest.fts_length_stats("title")
         );
         // What a compaction replacing the first two commits hands the
         // merged file: the third commit's totals alone.
-        let replaced: HashSet<_> = superfiles[..2].iter().map(|sf| sf.superfile_id).collect();
         assert_eq!(
-            manifest.fts_corpus_stats(&replaced).get("title").copied(),
+            manifest
+                .fts_corpus_stats(&superfiles[..2])
+                .get("title")
+                .copied(),
             Some(ColumnLengthStats {
                 total_tokens: 2,
                 n_scored_docs: 1,
@@ -3418,6 +3422,11 @@ mod tests {
     /// Parts loaded when a table opens: none, so every part is fetched on
     /// demand.
     const LAZY_OPEN_PARTS: u32 = 0;
+
+    /// Compaction settings that merge the fixture's small superfiles: a 1 MB
+    /// target each falls far below, and a fill floor each clears.
+    const COMPACT_TARGET_MB: u64 = 1;
+    const COMPACT_MIN_FILL_PERCENT: u8 = 1;
 
     /// A `k` above every fixture's match count, so no hit is cut off.
     const K_EVERY_MATCH: usize = 100;
@@ -3492,7 +3501,6 @@ mod tests {
     /// A handle that loads no manifest part at open scores exactly like
     /// one that loads them all.
     #[test]
-    #[ignore = "lazily loaded manifests score with per-superfile idf (#931)"]
     fn lazy_handle_scores_like_eager() {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
@@ -3509,7 +3517,6 @@ mod tests {
     /// A commit through a handle that loaded no part still declares the
     /// table-wide average length, not its own.
     #[test]
-    #[ignore = "lazily loaded manifests hand the builder no corpus totals (#931)"]
     fn lazy_writer_bakes_table_avgdl() {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
@@ -3546,6 +3553,131 @@ mod tests {
         assert_eq!(
             declared_title_avgdl(&reader, added),
             bm25::stored_avgdl(table.avgdl())
+        );
+    }
+
+    /// A compaction rewrites the parts it touches, so their totals cover
+    /// the merged table and a lazy handle still scores like an eager one.
+    #[test]
+    fn lazy_handle_after_compaction_scores_like_eager() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        commit_each(&storage, &SKEWED_COMMITS);
+        let eager = Supertable::open(eager_options(&storage)).expect("open eager");
+        let before = eager
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .len();
+        let merge_all = CompactionSettings {
+            target_superfile_size_mb: COMPACT_TARGET_MB,
+            min_fill_percent: COMPACT_MIN_FILL_PERCENT,
+            min_superfiles_for_merge: SKEWED_COMMITS.len() as u64,
+            ..CompactionSettings::default()
+        };
+        eager
+            .optimize(&OptimizeOptions::compact(merge_all))
+            .expect("optimize");
+        let after = Supertable::open(eager_options(&storage)).expect("reopen eager");
+        assert!(
+            after
+                .reader()
+                .expect("reader")
+                .manifest()
+                .get_all_superfiles()
+                .len()
+                < before,
+            "the fixture compacts"
+        );
+
+        let lazy = Supertable::open(lazy_options(&storage)).expect("open lazy");
+        for q in ["alpha", "zebra gamma", "one x"] {
+            assert_eq!(all_scored(&lazy, q), all_scored(&after, q), "{q:?}");
+        }
+    }
+
+    /// Liveness for the term index's postings loads only the parts whose id
+    /// range covers a candidate, and a superfile the table does not hold is
+    /// not live.
+    #[test]
+    fn live_among_loads_only_the_parts_covering_its_candidates() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        commit_each(&storage, &SKEWED_COMMITS);
+        let all = Supertable::open(eager_options(&storage))
+            .expect("open eager")
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .to_vec();
+        let lazy = Supertable::open(lazy_options(&storage)).expect("open lazy");
+        let reader = lazy.reader().expect("reader");
+        let manifest = reader.manifest();
+        let index = block_on(manifest.term_index()).expect("term index");
+
+        let one: HashSet<Uuid> = [all[0].superfile_id].into();
+        let live = block_on(manifest.live_among(&index, &one)).expect("live");
+        assert_eq!(live, one);
+        let loaded = manifest
+            .get_all_list_entries()
+            .iter()
+            .filter(|e| manifest.get_cached_part_by_id(&e.part_id).is_some())
+            .count();
+        assert_eq!(loaded, 1, "only the covering part loads");
+
+        let stranger: HashSet<Uuid> = [Uuid::new_v4()].into();
+        let live = block_on(manifest.live_among(&index, &stranger)).expect("live");
+        assert!(live.is_empty(), "a superfile the table does not hold");
+    }
+
+    /// A list whose part entries carry no length totals, as one written
+    /// before they existed, gets them filled from the parts when it loads,
+    /// so a lazy handle still scores table-wide; the next commit writes
+    /// them out.
+    #[test]
+    fn part_totals_missing_from_the_list_are_filled_on_load() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        commit_each(&storage, &SKEWED_COMMITS);
+        let eager = Supertable::open(eager_options(&storage)).expect("open eager");
+        let expected = all_scored(&eager, "alpha");
+
+        let legacy = lazy_options(&storage).legacy_names();
+        let read_list = || {
+            let (pointer, _) = block_on(read_pointer(storage.as_ref()))
+                .expect("read pointer")
+                .expect("pointer");
+            let (bytes, _) = block_on(storage.get(&pointer.manifest_uri)).expect("list");
+            (pointer, list::decode(&bytes, &legacy).expect("decode"))
+        };
+        let (pointer, mut stripped) = read_list();
+        for part in &mut stripped.parts {
+            part.fts_length_totals = None;
+        }
+        std::fs::write(
+            dir.path().join(&pointer.manifest_uri),
+            list::encode(&stripped).expect("encode"),
+        )
+        .expect("rewrite list");
+
+        let lazy = Supertable::open(lazy_options(&storage)).expect("open lazy");
+        assert_eq!(all_scored(&lazy, "alpha"), expected);
+
+        let mut w = lazy.writer().expect("writer");
+        w.append(&build_batch(0, &["omega"])).expect("append");
+        w.commit().expect("commit");
+        let (_, persisted) = read_list();
+        assert!(
+            persisted
+                .parts
+                .iter()
+                .all(|part| part.fts_length_totals.is_some()),
+            "the commit persists every part's totals"
         );
     }
 
@@ -5577,12 +5709,12 @@ mod tests {
             }
         }
         assert_eq!(expected_df, [2, 1, 6, 0]);
-        let n = manifest.n_docs_total();
+        let corpus = manifest.fts_length_stats("title").expect("table totals");
 
         let owned: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
         let ((idf, memos), opened) = with_op_stats(|| {
             let (map, memos) = rt
-                .block_on(reader.global_idf_open_wave(manifest, "title", &owned, &entries, None))
+                .block_on(reader.global_idf_open_wave(manifest, "title", &owned, &entries, corpus))
                 .expect("wave");
             let opened = crate::runtime_metrics::op_stats::current()
                 .expect("metered")
@@ -5595,7 +5727,7 @@ mod tests {
         for (i, t) in terms.iter().enumerate() {
             assert_eq!(
                 idf[*t],
-                bm25::idf(n, expected_df[i]),
+                bm25::idf(corpus.n_scored_docs, expected_df[i]),
                 "idf of `{t}` from the index equals the dictionaries' sum"
             );
         }

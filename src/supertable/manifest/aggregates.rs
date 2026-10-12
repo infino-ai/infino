@@ -30,12 +30,15 @@ use std::{
 
 use arrow_array::{ArrayRef, UInt64Array};
 
-use crate::supertable::{
-    manifest::{
-        SuperfileEntry,
-        list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg},
+use crate::{
+    superfile::fts::reader::ColumnLengthStats,
+    supertable::{
+        manifest::{
+            SuperfileEntry,
+            list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg},
+        },
+        schema::FieldId,
     },
-    schema::FieldId,
 };
 
 /// All three aggregate buckets for one [`ManifestPartEntry`].
@@ -106,6 +109,24 @@ pub fn compute(
         scalar_stats_agg,
         fts_summary_agg,
     }
+}
+
+/// Per-FTS-column length totals summed over every superfile of a part,
+/// the exact sums table-wide scoring statistics fold from. `None` when any
+/// superfile's totals are unknown.
+pub fn fts_length_totals(
+    superfiles: &[Arc<SuperfileEntry>],
+) -> Option<BTreeMap<FieldId, ColumnLengthStats>> {
+    let mut totals: BTreeMap<FieldId, ColumnLengthStats> = BTreeMap::new();
+    for sf in superfiles {
+        for (column, summary) in &sf.fts_summary {
+            totals
+                .entry(*column)
+                .or_default()
+                .merge_with(&summary.length_stats?);
+        }
+    }
+    Some(totals)
 }
 
 // ---------------------------------------------------------
@@ -183,6 +204,7 @@ mod tests {
             id_range,
             scalar_stats_agg,
             fts_summary_agg: BTreeMap::new(),
+            fts_length_totals: None,
         }
     }
 

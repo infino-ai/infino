@@ -708,10 +708,9 @@ impl Supertable {
         // average document length over everything else in the table plus
         // its own documents — the same statistic a fresh append bakes, and
         // what lets a compacted table score like an unfragmented one.
-        let replaced: HashSet<Uuid> = superfiles.iter().map(|e| e.superfile_id).collect();
         let builder_options = manifest
             .builder_options()
-            .with_fts_corpus_stats(manifest.fts_corpus_stats(&replaced));
+            .with_fts_corpus_stats(manifest.fts_corpus_stats(superfiles));
         // The build is long, synchronous CPU work, so it runs on the
         // maintenance pool rather than the thread driving this future.
         // `run_on_pool` needs a `'static` closure, so everything it reads —

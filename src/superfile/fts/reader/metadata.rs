@@ -108,6 +108,15 @@ impl ColumnLengthStats {
         self.n_scored_docs = self.n_scored_docs.saturating_add(other.n_scored_docs);
     }
 
+    /// These totals with `part`'s taken out; `None` when `part` holds more
+    /// than these do, so it cannot be a part of them.
+    pub fn without(&self, part: &ColumnLengthStats) -> Option<Self> {
+        Some(Self {
+            total_tokens: self.total_tokens.checked_sub(part.total_tokens)?,
+            n_scored_docs: self.n_scored_docs.checked_sub(part.n_scored_docs)?,
+        })
+    }
+
     /// Count one document of `dl` tokens. A zero-length document — a null
     /// or empty cell indexed to keep the per-doc arrays row-aligned — is
     /// not a document this column has and contributes to neither total.

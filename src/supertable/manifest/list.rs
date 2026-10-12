@@ -682,6 +682,12 @@ pub struct ManifestPartEntry {
     /// Per-FTS-column aggregate bloom-union + range-union.
     /// Empty → always-keep.
     pub fts_summary_agg: BTreeMap<FieldId, FtsSummaryAgg>,
+    /// Per-FTS-column length totals, summed exactly over every superfile in
+    /// this part, so table-wide scoring statistics fold from the list
+    /// without loading a part. A column no superfile here carries is
+    /// absent. `None` on an entry written without them; loading the
+    /// manifest fills it in from the part.
+    pub fts_length_totals: Option<BTreeMap<FieldId, ColumnLengthStats>>,
 }
 
 impl ManifestPartEntry {
@@ -1534,6 +1540,8 @@ struct ManifestPartEntryDto {
     id_range: (String, String),
     scalar_stats_agg: BTreeMap<String, ScalarStatsAggDto>,
     fts_summary_agg: BTreeMap<String, FtsSummaryAggDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fts_length_totals: Option<BTreeMap<String, ColumnLengthStatsDto>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1692,6 +1700,20 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
                 )
             })
             .collect(),
+        fts_length_totals: e.fts_length_totals.as_ref().map(|totals| {
+            totals
+                .iter()
+                .map(|(k, ls)| {
+                    (
+                        wire_key(*k),
+                        ColumnLengthStatsDto {
+                            total_tokens: ls.total_tokens,
+                            n_scored_docs: ls.n_scored_docs,
+                        },
+                    )
+                })
+                .collect()
+        }),
     })
 }
 
@@ -1823,6 +1845,20 @@ fn entry_from_dto(
         },
         scalar_stats_agg,
         fts_summary_agg,
+        fts_length_totals: d.fts_length_totals.map(|totals| {
+            totals
+                .into_iter()
+                .filter_map(|(k, ls)| {
+                    Some((
+                        parse_wire_key(&k, legacy)?,
+                        ColumnLengthStats {
+                            total_tokens: ls.total_tokens,
+                            n_scored_docs: ls.n_scored_docs,
+                        },
+                    ))
+                })
+                .collect()
+        }),
     })
 }
 
@@ -2829,6 +2865,7 @@ mod tests {
             id_range: (0, 245_678_901),
             scalar_stats_agg: scalar,
             fts_summary_agg: fts,
+            fts_length_totals: None,
         }
     }
 
