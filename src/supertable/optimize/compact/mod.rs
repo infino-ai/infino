@@ -4127,6 +4127,7 @@ mod tests {
                 .map(|e| e.superfile_id)
                 .collect(),
             estimated_output_bytes: 0,
+            merge_memory_mb: None,
         };
         faults.fail_with(
             FaultKind::Precondition,
