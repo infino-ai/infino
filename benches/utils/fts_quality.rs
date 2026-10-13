@@ -21,18 +21,16 @@
 //!   (`stored_len`): exact below 16 tokens, truncated downward by up to
 //!   one bucket above. On a corpus with realistic length variation this
 //!   reorders near-ties.
-//! * **Average length.** idf is table-wide, but each superfile
-//!   normalizes lengths with the average it *declares*: the table-wide
-//!   average as of its commit (every superfile already committed plus its
-//!   own documents), rounded to the fixed point the file stores. A file
-//!   from the first commit therefore scores at its own average; a file
-//!   from the last at nearly the corpus-wide one.
+//! * **Average length.** idf and the average length are both table-wide:
+//!   every superfile is scored at the table's average over the lengths the
+//!   files store, rounded to the fixed point a file stores. Each file also
+//!   declares the average it was built at (the table-wide average as of
+//!   its commit), which only rescales its stored bounds.
 //!
 //! So the oracle scores every matching document twice from the same
 //! statistics: **T**, textbook BM25 with the exact length and the
 //! corpus-wide average, and **Q**, the BM25 the engine is specified to
-//! compute, with the stored length and the declared average of the
-//! superfile that holds the document. The table then reports, per query
+//! compute, with the stored length and the table's stored average. The table then reports, per query
 //! and `k`:
 //!
 //! | column | definition |
@@ -51,9 +49,9 @@
 //! verified on each run rather than inferred from Zipf ranks.
 //!
 //! Q is exact, so its gates are tight. Making it exact needs the row-to-
-//! superfile mapping and each superfile's declared average: [`Layout`]
-//! recovers both from the table itself and verifies the mapping against
-//! the stored document lengths (§ [`Layout::recover`]).
+//! superfile mapping and the table's stored average: [`Layout`] recovers
+//! both from the table itself and verifies the mapping against the stored
+//! document lengths (§ [`Layout::recover`]).
 //!
 //! Recall is **tie-aware**: a returned document counts as a hit when its
 //! oracle score is at least the oracle's k-th score (within a rounding
@@ -132,7 +130,7 @@ const MIN_ENGINE_MODEL_RECALL: f64 = 1.0;
 
 /// Gate: the largest relative gap between an engine score and Q over the
 /// returned documents. Q reproduces every input the engine
-/// scores with (table-wide idf, the stored length, the declared average),
+/// scores with (table-wide idf, the stored length, the table's average),
 /// so what remains is f32 arithmetic: idf and the length normalizer held
 /// as `f32`, the per-term sum accumulated in `f32`. Those are parts per
 /// million; the ceiling leaves three orders of magnitude of headroom and
@@ -141,8 +139,8 @@ const MAX_SCORE_DELTA: f64 = 1e-3;
 
 /// Floor on `recall vs BM25` (the textbook column) at
 /// `k >= TEXTBOOK_FLOOR_MIN_K`. This column measures a design cost, not a
-/// bug: the stored one-byte length and each file scoring at the average it
-/// declares reorder near-ties against textbook BM25. The floor is a
+/// bug: the stored one-byte length and the average taken over stored
+/// lengths reorder near-ties against textbook BM25. The floor is a
 /// regression tripwire on that cost, set below the values recorded on the
 /// realistic corpus with margin. At smaller `k` one boundary tie moves
 /// recall by a tenth or more, so those rows report only.
@@ -373,24 +371,23 @@ struct ResolvedQuery {
     b: f64,
 }
 
-/// One superfile's slice of the corpus and the average length it scores at.
+/// One superfile's slice of the corpus.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SuperfileSpan {
     /// First corpus row this superfile holds; its rows are contiguous.
     pub first_row: u32,
     pub n_docs: u32,
-    /// The average document length the superfile declares, which is what
-    /// its norm table decodes with.
-    pub avgdl: f64,
 }
 
-/// The row-to-superfile mapping of the graded table, with each
-/// superfile's declared average length — the one input to Q that varies
-/// by superfile.
+/// The row-to-superfile mapping of the graded table, and the average
+/// length every superfile scores at.
 #[derive(Clone)]
 pub struct Layout {
     /// Ascending by `first_row`, covering `0..n_docs` without gaps.
     spans: Vec<SuperfileSpan>,
+    /// The table's average over the lengths its files store, rounded as a
+    /// file stores it: what Q normalizes every row with.
+    avgdl: f64,
     /// How many commits the superfiles fell into (see [`Self::recover`]).
     n_commits: usize,
     /// The graded files' readers, in span order — the coverage table reads
@@ -407,8 +404,8 @@ impl Layout {
             spans: vec![SuperfileSpan {
                 first_row: 0,
                 n_docs: u32::try_from(n_docs).expect("row count fits u32"),
-                avgdl,
             }],
+            avgdl,
             n_commits: 1,
             readers: Vec::new(),
         }
@@ -502,13 +499,15 @@ impl Layout {
             spans.push(SuperfileSpan {
                 first_row: u32::try_from(first_row).expect("row fits u32"),
                 n_docs: u32::try_from(n_docs).expect("row count fits u32"),
-                avgdl: declared,
             });
             readers.push(Arc::clone(&superfile));
             first_row += n_docs;
         }
+        let mut table = committed;
+        table.merge_with(&commit);
         Self {
             spans,
+            avgdl: declared_under(&table, &ColumnLengthStats::default()),
             n_commits,
             readers,
         }
@@ -525,13 +524,6 @@ impl Layout {
     /// The graded files' readers, in span order.
     pub fn readers(&self) -> &[Arc<SuperfileReader>] {
         &self.readers
-    }
-
-    /// The declared average of the superfile holding `row`.
-    fn avgdl_of(&self, row: u32) -> f64 {
-        let i = self.spans.partition_point(|s| s.first_row <= row);
-        debug_assert!(i > 0, "row {row} precedes the first span");
-        self.spans[i - 1].avgdl
     }
 }
 
@@ -627,8 +619,8 @@ pub struct Oracle {
     df: Vec<u32>,
     /// Corpus-wide average length: T normalizes with it.
     avgdl: f64,
-    /// Where each row lives and the average its superfile scores at: Q
-    /// normalizes with it. One span at the corpus average until
+    /// Where each row lives and the table's stored average, which Q
+    /// normalizes with. One span at the corpus average until
     /// [`Self::set_layout`].
     layout: Layout,
 }
@@ -871,8 +863,8 @@ impl Oracle {
 
     /// Score one row's cells under both references, or `None` when the row
     /// does not match the query. T normalizes with the corpus average and
-    /// the exact length; Q with the declared average of the row's
-    /// superfile and the length as the file stores it.
+    /// the exact length; Q with the table's stored average and the length
+    /// as the file stores it.
     fn score_cells(&self, cells: &[Entry], row: u32, q: &ResolvedQuery) -> Option<(f64, f64)> {
         let tf_of = |atom: Atom| -> Option<u32> {
             cells
@@ -885,7 +877,7 @@ impl Oracle {
         }
         let dl = self.dl[row as usize];
         let dl_q = stored_len(dl.min(DOC_LENGTH_STORED_MAX));
-        let avgdl_q = self.layout.avgdl_of(row);
+        let avgdl_q = self.layout.avgdl;
         let mut textbook = 0.0f64;
         let mut engine_model = 0.0f64;
         let mut add = |atom: Atom, tf: u32| {
@@ -1509,8 +1501,8 @@ pub fn run(
             fmt_count(n_docs),
             flavor.label()
         ),
-        "each superfile's declared average, both read back from the table and verified against \
-         the oracle's own tokenization",
+        "the table's average over the lengths its files store, read back from the table and \
+         verified against the oracle's own tokenization",
         &rows,
     );
     assert_gates(&rows, log_prefix);
@@ -1636,8 +1628,8 @@ fn emit(report: &mut Report, anchor: &str, title: String, engine_avgdl: &str, ro
             "Engine top-k graded against a streaming BM25 oracle over the whole corpus, \
              tie-aware (a hit is any returned doc scoring at least the oracle's k-th score). \
              `recall vs BM25` = textbook BM25 with exact doc lengths and the corpus-wide average \
-             length — the user-facing quality, which pays for the one-byte length quantization \
-             and for each file normalizing with the average it declares; a tripwire floor of \
+             length — the user-facing quality, which pays for the one-byte length quantization; \
+             a tripwire floor of \
              {textbook_floor:.2} applies from k = {floor_k}. \
              `recall vs engine BM25` = BM25 with the engine's stored (quantized) lengths and \
              {engine_avgdl} — gated at {floor:.1}: a miss is a document the kernels' own formula \
@@ -1891,9 +1883,8 @@ mod tests {
     /// it (verified against the stored lengths), derives the commit
     /// grouping from the declared averages, and with that layout Q is
     /// exact: every battery shape reaches full recall against it and the
-    /// engine's scores match it to f32 noise. The corpus-wide average
-    /// would not: on a three-commit table the first commit's files score
-    /// at a third of the corpus, and the gap shows in the score deltas.
+    /// engine's scores match it to f32 noise, every file scored at the
+    /// table's stored average.
     #[test]
     fn recovered_layout_makes_the_engine_model_exact() {
         let tokenizer = default_tokenizer();
@@ -1905,21 +1896,6 @@ mod tests {
             TextFlavor::Realistic,
             tokenizer.as_ref(),
             QUALITY_BATTERY,
-        );
-
-        // The corpus-wide average is measurably wrong for this table.
-        let single = grade(
-            &oracle,
-            &reader,
-            "title",
-            tokenizer.as_ref(),
-            QUALITY_BATTERY,
-            "test",
-        );
-        let worst_single = single.iter().map(|r| r.max_delta).fold(0.0, f64::max);
-        assert!(
-            worst_single > MAX_SCORE_DELTA,
-            "a fragmented table must expose the corpus-wide average as inexact (worst Δ {worst_single})"
         );
 
         let layout = Layout::recover(&reader, "title", oracle.doc_lengths());
@@ -1995,36 +1971,6 @@ mod tests {
         let absent = by_term("term200009");
         assert_eq!(absent.files, 0);
         assert_eq!(coverage.len(), oracle.terms().len());
-    }
-
-    #[test]
-    fn layout_lookup_maps_rows_to_their_span() {
-        let layout = Layout {
-            spans: vec![
-                SuperfileSpan {
-                    first_row: 0,
-                    n_docs: 3,
-                    avgdl: 10.0,
-                },
-                SuperfileSpan {
-                    first_row: 3,
-                    n_docs: 2,
-                    avgdl: 20.0,
-                },
-                SuperfileSpan {
-                    first_row: 5,
-                    n_docs: 1,
-                    avgdl: 30.0,
-                },
-            ],
-            n_commits: 2,
-            readers: Vec::new(),
-        };
-        assert_eq!(layout.avgdl_of(0), 10.0);
-        assert_eq!(layout.avgdl_of(2), 10.0);
-        assert_eq!(layout.avgdl_of(3), 20.0);
-        assert_eq!(layout.avgdl_of(4), 20.0);
-        assert_eq!(layout.avgdl_of(5), 30.0);
     }
 
     #[test]
