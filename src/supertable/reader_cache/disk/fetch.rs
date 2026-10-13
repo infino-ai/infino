@@ -2182,6 +2182,9 @@ mod tests {
                 0,
                 "{reopen:?}: no stray tempfiles"
             );
+            // The reopened query's block write may still be queued: its run is charged
+            // before it lands.
+            store.block_writes_settled().await;
             store.assert_budget_consistent();
 
             let fetches = store.stats().n_cold_fetches;
