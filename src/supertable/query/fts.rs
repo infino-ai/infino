@@ -918,7 +918,11 @@ impl SupertableReader {
         all_terms.dedup();
         let ceilings: Option<HashMap<Uuid, f32>> =
             match (&term_index, bm25_params, manifest.field_id(column)) {
-                (Some(index), None, Some(column_id)) => {
+                // Ceilings rescale by each term's table idf, so they order and
+                // skip only when the map holds every scored term.
+                (Some(index), None, Some(column_id))
+                    if all_terms.iter().all(|t| global_idf.contains_key(*t)) =>
+                {
                     let terms: Vec<&str> = musts
                         .iter()
                         .chain(shoulds.iter())
@@ -930,8 +934,11 @@ impl SupertableReader {
                         .map(|p| p.iter().map(String::as_str).collect())
                         .collect();
                     let gidf = global_idf.clone();
-                    let idf_used =
-                        move |term: &str, local: f32| gidf.get(term).copied().unwrap_or(local);
+                    // Every term is in the map (the guard above); the fallback
+                    // only satisfies the type.
+                    let idf_used = move |term: &str, _local: f32| {
+                        gidf.get(term).copied().unwrap_or(f32::INFINITY)
+                    };
                     index
                         .query_ceilings(column_id, &terms, &phrases, &kept, &idf_used)
                         .instrument(term_span.clone())
