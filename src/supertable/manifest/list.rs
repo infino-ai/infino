@@ -694,8 +694,9 @@ pub struct ManifestPartEntry {
     /// Per-FTS-column length totals, summed exactly over every superfile in
     /// this part, so table-wide scoring statistics fold from the list
     /// without loading a part. A column no superfile here carries is
-    /// absent. `None` on an entry written without them; loading the
-    /// manifest fills it in from the part.
+    /// absent. `None` on an entry written without them; the first FTS
+    /// query or commit derives them from the part, and that commit
+    /// persists them.
     pub fts_length_totals: Option<BTreeMap<FieldId, ColumnLengthStats>>,
 }
 

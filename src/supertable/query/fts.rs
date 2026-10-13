@@ -849,6 +849,10 @@ impl SupertableReader {
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
         // Idf is computed against the table-wide totals.
+        manifest
+            .derive_length_totals()
+            .await
+            .map_err(QueryError::ManifestLoad)?;
         let corpus = manifest
             .fts_length_stats(column)
             .ok_or_else(|| QueryError::Unsupported(FTS_SUMMARY_TOO_OLD_MSG.to_owned()))?;
@@ -2937,7 +2941,11 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         future::Future,
-        sync::Arc,
+        ops::Range,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     /// A phrase's members are conjunctive, so a quoted phrase on its own
@@ -3041,16 +3049,21 @@ mod tests {
 
     use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
     use bytes::Bytes;
     use datafusion::prelude::{col, lit};
+    use object_store::MultipartUpload;
     use tempfile::TempDir;
     use tokio::runtime::Builder;
     use uuid::Uuid;
 
-    use super::{BoolMode, FanOut, SuperfileHit, SupertableReader, build_work_units, fanout_for};
+    use super::{
+        BoolMode, FanOut, SuperfileHit, SupertableReader, build_work_units,
+        ceilings_at_table_avgdl, fanout_for,
+    };
     use crate::{
         config::{CompactionSettings, OptimizeOptions},
-        storage::{LocalFsStorageProvider, StorageProvider},
+        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
             SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
@@ -3064,7 +3077,11 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             error::QueryError,
-            manifest::{FtsSummaryAgg, SuperfileEntry, SuperfileUri, commit::read_pointer, list},
+            manifest::{
+                FtsSummaryAgg, SuperfileEntry, SuperfileUri,
+                commit::{MANIFEST_PARTS_DIR, read_pointer},
+                list,
+            },
             schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
         },
     };
@@ -3441,6 +3458,10 @@ mod tests {
     /// demand.
     const LAZY_OPEN_PARTS: u32 = 0;
 
+    /// How many times a part-load test opens the table, so a cost paid on
+    /// every open shows.
+    const REOPENS: usize = 3;
+
     /// Compaction settings that merge the fixture's small superfiles: a 1 MB
     /// target each falls far below, and a fill floor each clears.
     const COMPACT_TARGET_MB: u64 = 1;
@@ -3507,7 +3528,7 @@ mod tests {
             .iter()
             .map(|e| (e.superfile_id, STORED_CEILING))
             .collect();
-        super::ceilings_at_table_avgdl(&mut ceilings, &kept, column, TABLE_AVG);
+        ceilings_at_table_avgdl(&mut ceilings, &kept, column, TABLE_AVG);
         let ceiling = |i: usize| ceilings[&kept[i].superfile_id];
         assert!(ceiling(0) >= STORED_CEILING * TABLE_AVG / SHORTER_AVG);
         assert_eq!(ceiling(1), STORED_CEILING);
@@ -3733,36 +3754,111 @@ mod tests {
         assert_eq!(top_k_scored(&st, "zeta", 1), every[..1]);
     }
 
+    /// Counts the manifest parts read through it; everything else passes
+    /// straight to `inner`.
+    #[derive(Debug)]
+    struct PartReadCounter {
+        inner: Arc<dyn StorageProvider>,
+        part_reads: AtomicUsize,
+    }
+
+    impl PartReadCounter {
+        fn part_reads(&self) -> usize {
+            self.part_reads.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for PartReadCounter {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            if uri.starts_with(MANIFEST_PARTS_DIR) {
+                self.part_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get(uri).await
+        }
+        async fn get_if_none_match(
+            &self,
+            uri: &str,
+            etag: &str,
+        ) -> Result<Option<(Bytes, ObjectMeta)>, StorageError> {
+            self.inner.get_if_none_match(uri, etag).await
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+        async fn list_with_prefix_metadata(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+            self.inner.list_with_prefix_metadata(prefix).await
+        }
+    }
+
     /// A list whose part entries carry no length totals, as one written
-    /// before they existed, gets them filled from the parts when it loads,
-    /// so a lazy handle still scores table-wide; the next commit writes
-    /// them out.
+    /// before they existed, opens without reading a part. The first FTS
+    /// query derives the totals, so a lazy handle still scores table-wide,
+    /// and the next commit writes them out.
     #[test]
-    fn part_totals_missing_from_the_list_are_filled_on_load() {
+    fn part_totals_missing_from_the_list_are_derived_on_first_query() {
         let dir = TempDir::new().expect("tempdir");
-        let storage: Arc<dyn StorageProvider> =
+        let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        commit_each(&storage, &SKEWED_COMMITS);
-        let eager = Supertable::open(eager_options(&storage)).expect("open eager");
+        commit_each(&local, &SKEWED_COMMITS);
+        let eager = Supertable::open(eager_options(&local)).expect("open eager");
         let expected = all_scored(&eager, "alpha");
 
-        let legacy = lazy_options(&storage).legacy_names();
+        let legacy = lazy_options(&local).legacy_names();
         let read_list = || {
-            let (pointer, _) = block_on(read_pointer(storage.as_ref()))
+            let (pointer, _) = block_on(read_pointer(local.as_ref()))
                 .expect("read pointer")
                 .expect("pointer");
-            let (bytes, _) = block_on(storage.get(&pointer.manifest_uri)).expect("list");
+            let (bytes, _) = block_on(local.get(&pointer.manifest_uri)).expect("list");
             (pointer, list::decode(&bytes, &legacy).expect("decode"))
         };
         let (pointer, mut stripped) = read_list();
         for part in &mut stripped.parts {
             part.fts_length_totals = None;
         }
-        std::fs::write(
-            dir.path().join(&pointer.manifest_uri),
-            list::encode(&stripped).expect("encode"),
-        )
-        .expect("rewrite list");
+        let encoded = list::encode(&stripped).expect("encode");
+        block_on(local.put_overwrite(&pointer.manifest_uri, Bytes::from(encoded)))
+            .expect("rewrite list");
+
+        let counter = Arc::new(PartReadCounter {
+            inner: Arc::clone(&local),
+            part_reads: AtomicUsize::new(0),
+        });
+        let storage: Arc<dyn StorageProvider> = Arc::clone(&counter) as _;
+        for _ in 0..REOPENS {
+            drop(Supertable::open(lazy_options(&storage)).expect("open lazy"));
+        }
+        assert_eq!(counter.part_reads(), 0, "opening reads no part");
 
         let lazy = Supertable::open(lazy_options(&storage)).expect("open lazy");
         assert_eq!(all_scored(&lazy, "alpha"), expected);
