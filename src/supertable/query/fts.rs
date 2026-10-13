@@ -527,8 +527,9 @@ pub(crate) async fn memo_from_locations(
         .filter_map(|(t, df, loc)| loc.to_dict_value().map(|v| (t.as_str(), *df, v)))
         .collect();
     let mut memo = r.term_memo_from_dict_values(&pairs).await.ok()?;
+    let present: HashSet<&str> = located.iter().map(|(t, _, _)| t.as_str()).collect();
     for term in &locations.terms {
-        if !located.iter().any(|(t, _, _)| t == term) {
+        if !present.contains(term.as_str()) {
             memo.note_absent(term);
         }
     }
