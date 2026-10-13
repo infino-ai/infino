@@ -27,7 +27,7 @@ use super::{
 use crate::{
     runtime_metrics::{
         cpu::{thread_cpu_delta_ns, thread_cpu_ns},
-        op_stats::{metering_active, timed_section},
+        op_stats::metering_active,
     },
     superfile::{
         ReadError,
@@ -433,52 +433,6 @@ impl FtsReader {
             )
             .await?;
         self.run_prepared(prep)
-    }
-
-    /// [`Self::search`] that also returns the walk's work — posting
-    /// bytes, planned ranges, and the bracketed kernel on-CPU ns
-    /// (`prepare_clauses`' inline walks plus the `run_prepared`
-    /// section), all carried on the one [`MatchWork`]. Prefix search
-    /// reports through this so an expansion to thousands of terms
-    /// carries its cost like any other query shape.
-    pub(crate) async fn search_with_work(
-        &self,
-        column: &str,
-        terms: &[&str],
-        k: usize,
-        mode: BoolMode,
-    ) -> Result<(Vec<(RowId, f32)>, MatchWork), FtsError> {
-        let (musts, shoulds): (&[&str], &[&str]) = match mode {
-            BoolMode::And => (terms, &[]),
-            BoolMode::Or => (&[], terms),
-        };
-        let prep = self
-            .prepare_clauses(
-                column,
-                ClauseLists {
-                    musts,
-                    shoulds,
-                    idf: QueryIdf::ThisFile,
-                    ..ClauseLists::default()
-                },
-                k,
-                f32::NEG_INFINITY,
-            )
-            .await?;
-        let mut work = MatchWork {
-            postings_bytes: prep.postings_bytes(),
-            planned_ranges: prep.planned_ranges(),
-            kernel_cpu_ns: prep.inline_kernel_cpu_ns(),
-        };
-        let hits = match prep {
-            PreparedClauses::Done { hits, .. } => hits,
-            prep => {
-                let (hits, run_ns) = timed_section(|| self.run_prepared_in_blob_ids(prep));
-                work.kernel_cpu_ns += run_ns;
-                hits?
-            }
-        };
-        Ok((self.hits_to_rows(hits), work))
     }
 
     /// BM25 search over explicit clause lists, with negated terms

@@ -12,7 +12,7 @@ pub mod must_should;
 pub mod negation;
 pub mod phrase;
 pub mod pipeline;
-pub mod prefix_and_floor;
+pub mod score_floor;
 pub mod standard_tokenizer;
 pub mod stored_fields;
 mod token_cap;

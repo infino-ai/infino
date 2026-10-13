@@ -1840,55 +1840,6 @@ impl SuperfileReader {
         Ok(ScoredFts::Derived(view))
     }
 
-    /// Prefix-expanded BM25 search.
-    ///
-    /// Expands `prefix` to the lex-ordered list of indexed terms
-    /// in `column` whose tokenized form begins with `prefix`,
-    /// then runs `BoolMode::Or` BM25 over that term set. The term dictionary
-    /// stores lowercased terms, so the prefix is ASCII-lowercased
-    /// before expansion. Whitespace inside
-    /// `prefix` is **not** split — prefix search is a single
-    /// term-level prefix, not a query parser.
-    ///
-    /// Returns an empty `Vec` if no indexed term begins with
-    /// `prefix` or if `k == 0`.
-    /// Returns the hits plus the expansion's posting + kernel work, so
-    /// a prefix expanding to thousands of terms carries its cost like
-    /// any other query shape.
-    pub async fn bm25_search_prefix(
-        &self,
-        column: &str,
-        prefix: &str,
-        k: usize,
-        pool: Option<&ThreadPool>,
-    ) -> Result<(Vec<(RowId, f32)>, MatchWork), ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        if k == 0 {
-            return Ok((Vec::new(), MatchWork::default()));
-        }
-        let lowered = prefix.to_ascii_lowercase();
-        // The dictionary walk is CPU work and runs on the reader pool; the
-        // dictionary fetch it needs stays on this runtime.
-        let term_bytes = fts
-            .terms_with_prefix(column, lowered.as_bytes(), pool)
-            .await?;
-        if term_bytes.is_empty() {
-            return Ok((Vec::new(), MatchWork::default()));
-        }
-        // Dictionary keys are valid UTF-8 by construction (a tokenizer
-        // emits `&str` terms); the from_utf8 below is a typed
-        // pass-through, not a re-validation cost.
-        let term_strings: Vec<&str> = term_bytes
-            .iter()
-            .filter_map(|b| str::from_utf8(b).ok())
-            .collect();
-        Ok(fts
-            .search_with_work(column, &term_strings, k, BoolMode::Or)
-            .await?)
-    }
-
     /// Multi-term OR BM25 search restricted to a doc_id sub-range.
     ///
     /// Mirrors [`Self::bm25_search_pretokenized`] in `BoolMode::Or`
@@ -3405,40 +3356,6 @@ mod tests {
         // No row stores just "rust", so the exact comparison yields none.
         let none = r.exact_match("title", "rust").await.expect("exact_match").0;
         assert!(none.is_empty());
-    }
-
-    #[tokio::test]
-    async fn bm25_search_prefix_expands_terms() {
-        let bytes = build_simple_fts_only_superfile();
-        let r = SuperfileReader::open(bytes).expect("open");
-        // "rust" is a prefix of "rust" (docs 0,2); "ru" expands to it too.
-        let (hits, work) = r
-            .bm25_search_prefix("title", "ru", 5, None)
-            .await
-            .expect("prefix search");
-        assert!(
-            work.postings_bytes > 0 && work.planned_ranges > 0,
-            "a matching prefix expansion reports its posting work"
-        );
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
-        assert!(ids.contains(&0));
-        assert!(ids.contains(&2));
-        // No indexed term begins with "zz".
-        assert!(
-            r.bm25_search_prefix("title", "zz", 5, None)
-                .await
-                .expect("prefix")
-                .0
-                .is_empty()
-        );
-        // k == 0 short-circuits.
-        assert!(
-            r.bm25_search_prefix("title", "ru", 0, None)
-                .await
-                .expect("zero k")
-                .0
-                .is_empty()
-        );
     }
 
     #[tokio::test]

@@ -4353,9 +4353,16 @@ mod tests {
         }
 
         let oracle = build_oracle_superfile(&titles);
-        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5, None))
-            .expect("oracle")
-            .0;
+        // The oracle is one superfile, so its own expansion is the table's.
+        let fts = oracle.fts().expect("oracle fts");
+        let expansion = block_on(fts.terms_with_prefix("title", b"rust", None)).expect("expand");
+        let terms: Vec<&str> = expansion
+            .iter()
+            .map(|t| std::str::from_utf8(t).expect("utf8 term"))
+            .collect();
+        let oracle_hits =
+            block_on(oracle.bm25_search_pretokenized("title", &terms, 5, BoolMode::Or))
+                .expect("oracle");
         let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| d.get()).collect();
 
         let st_reader = st.reader().expect("reader");
