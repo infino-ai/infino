@@ -3754,6 +3754,57 @@ mod tests {
         assert_eq!(top_k_scored(&st, "zeta", 1), every[..1]);
     }
 
+    /// Docs in the large superfile of the ranged-`Or` test: enough that
+    /// the fan-out splits it into doc-id sub-ranges.
+    const RANGED_FILE_DOCS: usize = 120_000;
+    /// Every this-many docs of the large file holds the query term.
+    const RANGED_MATCH_EVERY: usize = 10;
+    /// Long docs committed beside the large file, so the table's average
+    /// length moves well away from the large file's own.
+    const RANGED_LONG_DOCS: usize = 1_000;
+    /// Tokens in each long doc.
+    const RANGED_LONG_DOC_TOKENS: usize = 300;
+    /// Reader threads: more than one, so the fan-out uses sub-ranges.
+    const RANGED_READER_THREADS: usize = 4;
+
+    /// A superfile split into doc-id sub-ranges builds its shared `Or`
+    /// cursors at the table's average length, the same view its ranges
+    /// score through. Built at the file's own average instead, the stored
+    /// block bounds no longer cap the rescored scores, and once the `x f`
+    /// docs set the floor, the pruning skips the block holding the best
+    /// doc, so it sits last in the file.
+    #[test]
+    fn ranged_or_builds_its_cursors_at_the_table_average() {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(RANGED_READER_THREADS)
+                .build()
+                .expect("pool"),
+        );
+        let st = Supertable::create(options_one_superfile_per_commit().with_reader_pool(pool))
+            .expect("create");
+        let short: Vec<&str> = (0..RANGED_FILE_DOCS)
+            .map(|i| match i {
+                _ if i == RANGED_FILE_DOCS - 1 => "x",
+                _ if i % RANGED_MATCH_EVERY == 0 => "x f",
+                _ => "f",
+            })
+            .collect();
+        let long_doc = vec!["w"; RANGED_LONG_DOC_TOKENS].join(" ");
+        let long = vec![long_doc.as_str(); RANGED_LONG_DOCS];
+        let mut w = st.writer().expect("writer");
+        for titles in [&short, &long] {
+            w.append(&build_batch(0, titles)).expect("append");
+            w.commit().expect("commit");
+        }
+        let top = top_k_scored(&st, "x zzz", 1);
+        assert_eq!(
+            top.first().map(|(title, _)| title.as_str()),
+            Some("x"),
+            "{top:?}"
+        );
+    }
+
     /// Counts the manifest parts read through it; everything else passes
     /// straight to `inner`.
     #[derive(Debug)]
