@@ -760,6 +760,7 @@ impl SupertableReader {
             true => presence_leaf(&column_owned, &musts, &must_phrases, BoolMode::And),
             false => presence_leaf(&column_owned, &shoulds, &should_phrases, mode),
         };
+        let kept = self.select_scored(column, &prune_leaf, scope).await?;
         self.bm25_search_clauses(
             column,
             ScoredClauses {
@@ -770,7 +771,7 @@ impl SupertableReader {
                 should_phrases,
                 negative_phrases,
             },
-            prune_leaf,
+            kept,
             k,
             bm25_params,
             scope,
@@ -778,13 +779,48 @@ impl SupertableReader {
         .await
     }
 
-    /// Ranks `clauses` over the superfiles `prune_leaf` keeps, with idf
-    /// from the whole table: the shared core of term and prefix search.
+    /// The superfiles `leaf` keeps for `column`. A pushed-down `WHERE`
+    /// narrows them to the superfiles its `scope` admits, the statistics
+    /// survivors that still hold a candidate row. The global-idf gather
+    /// still probes every superfile the terms may live in, so idf stays
+    /// table-wide and a scoped query ranks on the same scale as an
+    /// unscoped one.
+    async fn select_scored(
+        &self,
+        column: &str,
+        leaf: &PruneLeaf,
+        scope: Option<&CandidateScope>,
+    ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
+        let manifest = self.manifest();
+        let select_span = trace::phase(self.phase_spans(), || {
+            detail_span!(
+                "fts.select_superfiles",
+                manifest_superfiles = manifest.superfiles.len(),
+                survivors = tracing::field::Empty,
+            )
+        });
+        let mut kept = select_fts_superfiles(manifest.as_ref(), slice::from_ref(leaf), column)
+            .instrument(select_span.clone())
+            .await?;
+        if let Some(scope) = scope {
+            let admitted: HashSet<Uuid> = scope
+                .admitted_superfiles()
+                .map(|e| e.superfile_id)
+                .collect();
+            kept.retain(|e| admitted.contains(&e.superfile_id));
+        }
+        select_span.record("survivors", kept.len());
+        trace::end(select_span);
+        Ok(kept)
+    }
+
+    /// Ranks `clauses` over the superfiles in `kept`, with idf from the
+    /// whole table: the shared core of term and prefix search.
     async fn bm25_search_clauses(
         &self,
         column: &str,
         clauses: ScoredClauses,
-        prune_leaf: PruneLeaf,
+        mut kept: Vec<Arc<SuperfileEntry>>,
         k: usize,
         bm25_params: Option<Bm25Params>,
         scope: Option<&CandidateScope>,
@@ -817,34 +853,6 @@ impl SupertableReader {
         let table_avgdl = bm25::stored_avgdl(corpus.avgdl());
 
         let phases = self.phase_spans();
-        let select_span = trace::phase(phases, || {
-            detail_span!(
-                "fts.select_superfiles",
-                manifest_superfiles = manifest.superfiles.len(),
-                survivors = tracing::field::Empty,
-            )
-        });
-        let mut kept = select_fts_superfiles(
-            manifest.as_ref(),
-            slice::from_ref(&prune_leaf),
-            &column_owned,
-        )
-        .instrument(select_span.clone())
-        .await?;
-        // A pushed-down `WHERE` narrows the search to the superfiles its
-        // scope admits — the statistics survivors that still hold a
-        // candidate row. The global-idf gather below still probes every
-        // superfile the terms may live in, so idf stays table-wide and a
-        // scoped query ranks on the same scale as an unscoped one.
-        if let Some(scope) = scope {
-            let admitted: HashSet<Uuid> = scope
-                .admitted_superfiles()
-                .map(|e| e.superfile_id)
-                .collect();
-            kept.retain(|e| admitted.contains(&e.superfile_id));
-        }
-        select_span.record("survivors", kept.len());
-        trace::end(select_span);
         if kept.is_empty() {
             return Ok(Vec::new());
         }
@@ -1539,9 +1547,10 @@ impl SupertableReader {
             column: column.to_owned(),
             prefix: prefix.to_ascii_lowercase().into_bytes(),
         };
-        let kept =
-            select_fts_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf), column).await?;
-        let shoulds = self.expand_prefix(column, &prune_leaf, kept).await?;
+        let kept = self.select_scored(column, &prune_leaf, None).await?;
+        let shoulds = self
+            .expand_prefix(column, &prune_leaf, kept.clone())
+            .await?;
         if shoulds.is_empty() {
             return Ok(Vec::new());
         }
@@ -1551,7 +1560,7 @@ impl SupertableReader {
         };
         // Prefix search takes no search options, so columns score with the
         // parameters they declared.
-        self.bm25_search_clauses(column, clauses, prune_leaf, k, None, None)
+        self.bm25_search_clauses(column, clauses, kept, k, None, None)
             .await
     }
 
