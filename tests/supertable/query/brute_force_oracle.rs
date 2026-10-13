@@ -805,6 +805,110 @@ fn prefix_skip_prunes_superfiles_without_matching_lex_range() {
     assert_eq!(hits[0].local_doc_id, 0);
 }
 
+/// Superfiles the shared-prefix corpus is split into, so each holds a
+/// different subset of a prefix's expansion.
+const PREFIX_SUPERFILES: usize = 3;
+/// Top-k that returns every prefix match.
+const PREFIX_K_ALL: usize = 64;
+/// Top-k below the broad prefix's match count, so the pruning bar is live.
+const PREFIX_K_TRUNCATED: usize = 2;
+/// Largest allowed gap between an engine score and the reference's.
+const PREFIX_SCORE_TOLERANCE: f32 = 1e-3;
+
+/// Docs with shared prefixes, so an expansion is non-trivial: `run`,
+/// `runtime`, `running`, `rust` and `rustacean` share `ru`, and `rust*` is
+/// its own sub-group. `python` and `pandas` share `p` but never `ru`.
+fn shared_prefix_corpus() -> Vec<(u64, String)> {
+    [
+        "run the loop",
+        "runtime scheduler tokio",
+        "running fast async",
+        "rust systems language",
+        "rustacean community crate",
+        "rust runtime bindings",
+        "python data pipeline",
+        "pandas dataframe numpy",
+        "go concurrency channels",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, text)| (i as u64, text.to_owned()))
+    .collect()
+}
+
+/// Distinct terms of `corpus` that start with `prefix`: what the engine's
+/// expansion must reproduce across the whole table.
+fn prefix_expansion(corpus: &[(u64, String)], prefix: &str) -> Vec<String> {
+    let terms: HashSet<&str> = corpus
+        .iter()
+        .flat_map(|(_, text)| text.split_whitespace())
+        .filter(|term| term.starts_with(prefix))
+        .collect();
+    terms.into_iter().map(str::to_owned).collect()
+}
+
+/// The engine's prefix top-`k` agrees with a brute-force `Or` over the
+/// prefix's table-wide expansion: the same docs when `k` covers every
+/// match (a subset of the reference top-`k` otherwise), each at the
+/// reference's score.
+fn assert_prefix_scores_match(
+    st: &Supertable,
+    oracles: &[FileOracle],
+    corpus: &[(u64, String)],
+    prefix: &str,
+    k: usize,
+) {
+    let chunk_size = corpus.len().div_ceil(PREFIX_SUPERFILES);
+    let hits = st
+        .reader()
+        .expect("reader")
+        .bm25_search_prefix("title", prefix, k)
+        .expect("prefix search");
+    let scores: Vec<f32> = hits.iter().map(|hit| hit.score).collect();
+    let got: Vec<(u64, f32)> = supertable_to_global_ids(st, hits, chunk_size)
+        .into_iter()
+        .zip(scores)
+        .collect();
+
+    let terms = prefix_expansion(corpus, prefix);
+    let reference: Vec<(u64, f32)> = oracles
+        .iter()
+        .flat_map(|o| o.own(o.scorer.top_k_terms(&terms, usize::MAX)))
+        .collect();
+    let reference_scores: HashMap<u64, f32> = reference.iter().copied().collect();
+    let want: HashSet<u64> = merge_global_top_k(reference, k).into_iter().collect();
+    let got_ids: HashSet<u64> = got.iter().map(|(doc, _)| *doc).collect();
+    if k >= reference_scores.len() {
+        assert_eq!(got_ids, want, "prefix {prefix:?}: match sets disagree");
+    } else {
+        assert_eq!(got.len(), k, "prefix {prefix:?}: {got:?}");
+        assert!(
+            got_ids.is_subset(&want),
+            "prefix {prefix:?}: {got:?} is not the reference top-{k} {want:?}"
+        );
+    }
+    for (doc, score) in &got {
+        let expected = reference_scores[doc];
+        assert!(
+            (score - expected).abs() <= PREFIX_SCORE_TOLERANCE,
+            "prefix {prefix:?} doc {doc}: engine={score} reference={expected}"
+        );
+    }
+}
+
+#[test]
+fn oracle_prefix_scores_match_brute_force_or() {
+    let corpus = shared_prefix_corpus();
+    let st = build_supertable(&corpus, PREFIX_SUPERFILES);
+    let oracles = build_oracles(&corpus, PREFIX_SUPERFILES);
+    // Broad (`ru*`), narrower (`rust*`), single-term (`runt*`), and one
+    // whose matches sit in a single superfile (`p*`).
+    for prefix in ["ru", "run", "rust", "runt", "p"] {
+        assert_prefix_scores_match(&st, &oracles, &corpus, prefix, PREFIX_K_ALL);
+    }
+    assert_prefix_scores_match(&st, &oracles, &corpus, "ru", PREFIX_K_TRUNCATED);
+}
+
 // ---- Tests: empty + no-match ----------------------------------------
 
 #[test]
