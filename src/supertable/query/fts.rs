@@ -3079,11 +3079,13 @@ mod tests {
             error::QueryError,
             manifest::{
                 FtsSummaryAgg, SuperfileEntry, SuperfileUri,
-                commit::{MANIFEST_PARTS_DIR, read_pointer},
+                commit::{MANIFEST_PARTS_DIR, part_uri, read_pointer},
                 list,
+                part::{self, ContentHash},
             },
             schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
         },
+        test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
     };
 
     /// Manifest entry fixture for the work-unit tests. `n_docs` is the
@@ -3751,6 +3753,98 @@ mod tests {
             every[0].0, "zeta a",
             "the short match ranks first: {every:?}"
         );
+        assert_eq!(top_k_scored(&st, "zeta", 1), every[..1]);
+    }
+
+    /// Largest allowed gap between an engine score and the brute-force
+    /// reference's.
+    const MIXED_SCORE_TOLERANCE: f32 = 1e-3;
+
+    /// A table mixing a file without a recorded build-time average and
+    /// files with one scores each as its summary says: the first at the
+    /// average it was built at, the rest at the table's. The first file's
+    /// ceilings stay as stored, which bound that scoring, so opening one
+    /// file at a time still finds the best match.
+    #[test]
+    fn a_table_mixing_recorded_and_missing_averages_scores_each_file_as_recorded() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let filler = |n: usize| vec!["f"; n].join(" ");
+        let weaker = format!("zeta zeta {}", filler(LONG_DOC_TOKENS / 2 - 2));
+        let long = filler(LONG_DOC_TOKENS);
+        let first: [&str; 2] = ["zeta zeta", "b c"];
+        let second: [&str; 3] = [&weaker, &long, &long];
+        commit_each(&storage, &[&first, &second]);
+
+        // Strip the recorded average from the first commit's file, as a
+        // file written before the summary carried one.
+        let legacy = lazy_options(&storage).legacy_names();
+        let (pointer, _) = block_on(read_pointer(storage.as_ref()))
+            .expect("read pointer")
+            .expect("pointer");
+        let (bytes, _) = block_on(storage.get(&pointer.manifest_uri)).expect("list");
+        let mut manifest_list = list::decode(&bytes, &legacy).expect("decode list");
+        let entry = &mut manifest_list.parts[0];
+        let (bytes, _) = block_on(storage.get(&entry.uri)).expect("part");
+        let mut stripped = part::decode(&bytes, &legacy).expect("decode part");
+        for superfile in &mut stripped.superfiles {
+            let mut summaries = (**superfile).clone();
+            for summary in summaries.fts_summary.values_mut() {
+                summary.baked_avgdl = None;
+            }
+            *superfile = Arc::new(summaries);
+        }
+        let encoded = part::encode(&stripped);
+        entry.content_hash = ContentHash::of(&encoded);
+        entry.uri = part_uri(&entry.content_hash);
+        entry.routing = None;
+        block_on(storage.put_overwrite(&entry.uri, Bytes::from(encoded))).expect("write part");
+        let encoded = list::encode(&manifest_list).expect("encode list");
+        block_on(storage.put_overwrite(&pointer.manifest_uri, Bytes::from(encoded)))
+            .expect("rewrite list");
+
+        let tokenizer = default_tokenizer();
+        let lengths = |titles: &[&str]| {
+            ColumnLengthStats::from_lengths(titles.iter().map(|title| {
+                let mut n = 0u32;
+                tokenizer.tokenize_each(title, &mut |_| n += 1);
+                n
+            }))
+        };
+        let corpus: Vec<(u64, &str)> = first
+            .iter()
+            .chain(second.iter())
+            .enumerate()
+            .map(|(i, title)| (i as u64, *title))
+            .collect();
+        let titles: Vec<&str> = corpus.iter().map(|(_, title)| *title).collect();
+        let reference = |titles_scored: &[&str], avgdl: f32| {
+            BruteForceBm25::index(&corpus, tokenizer.as_ref())
+                .with_avgdl(bm25::stored_avgdl(avgdl))
+                .top_k("zeta", corpus.len(), tokenizer.as_ref())
+                .into_iter()
+                .map(|(doc, score)| (corpus[doc as usize].1, score))
+                .filter(|(title, _)| titles_scored.contains(title))
+                .collect::<Vec<_>>()
+        };
+        let mut expected = reference(&first, lengths(&first).avgdl());
+        expected.extend(reference(&second, lengths(&titles).avgdl()));
+        expected.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        let st = Supertable::open(
+            eager_options(&storage).with_bound_ordered_open_window(SEQUENTIAL_OPENS),
+        )
+        .expect("open");
+        let every = all_scored(&st, "zeta");
+        assert_eq!(every.len(), expected.len(), "{every:?} vs {expected:?}");
+        for ((title, score), (want_title, want)) in every.iter().zip(&expected) {
+            assert_eq!(title, want_title, "{every:?} vs {expected:?}");
+            assert!(
+                (score - want).abs() <= MIXED_SCORE_TOLERANCE,
+                "{title}: engine {score}, reference {want}"
+            );
+        }
         assert_eq!(top_k_scored(&st, "zeta", 1), every[..1]);
     }
 
