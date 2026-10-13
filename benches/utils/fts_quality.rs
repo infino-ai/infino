@@ -1898,6 +1898,29 @@ mod tests {
             QUALITY_BATTERY,
         );
 
+        // Graded at the first commit's own average, Q misses the engine's
+        // scores, so the fixture can tell averages apart.
+        let first_commit = &oracle.doc_lengths()[..TEST_DOCS / TEST_COMMITS];
+        let first_commit_avgdl =
+            first_commit.iter().map(|&n| f64::from(n)).sum::<f64>() / first_commit.len() as f64;
+        oracle.set_layout(Layout::single(TEST_DOCS, first_commit_avgdl));
+        let at_own_average = grade(
+            &oracle,
+            &reader,
+            "title",
+            tokenizer.as_ref(),
+            QUALITY_BATTERY,
+            "test",
+        );
+        let worst = at_own_average
+            .iter()
+            .map(|r| r.max_delta)
+            .fold(0.0, f64::max);
+        assert!(
+            worst > MAX_SCORE_DELTA,
+            "scoring at one commit's own average must show in the deltas (worst {worst})"
+        );
+
         let layout = Layout::recover(&reader, "title", oracle.doc_lengths());
         assert_eq!(layout.n_commits(), TEST_COMMITS);
         assert!(
