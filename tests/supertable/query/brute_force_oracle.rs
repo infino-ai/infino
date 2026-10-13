@@ -40,6 +40,7 @@ use std::{
 use arrow_array::{LargeStringArray, RecordBatch};
 use infino::{
     Bm25SearchOptions,
+    storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::FtsConfig,
         fts::{
@@ -60,6 +61,7 @@ use infino::{
 };
 use rand::{SeedableRng, rngs::StdRng};
 use rayon::ThreadPoolBuilder;
+use tempfile::TempDir;
 
 /// Fixed planted corpus, 60 docs. Sharded into 4 superfiles of 15
 /// docs each.
@@ -1539,4 +1541,115 @@ fn running_average_with_one_file_per_commit_matches_the_reference() {
 #[test]
 fn running_average_with_two_files_per_commit_matches_the_reference() {
     run_running_average_arm(2);
+}
+
+// ---- term-index ceilings across build-time averages --------------------
+//
+// The term index stores each file's score ceilings at the average it was
+// built at. A file built while the table's average was shorter scores
+// higher once the average grows, so its ceiling must grow with it, or
+// bound-ordered opening skips a file that holds the best match.
+
+/// Tokens in a long doc of the ceiling fixture: enough to lift the table's
+/// average far above the short commit's.
+const CEILING_LONG_DOC_TOKENS: usize = 40;
+/// Superfiles open at a time: one, so the long commit sets the floor
+/// before the short commit's ceiling is checked.
+const CEILING_OPEN_WINDOW: usize = 1;
+/// Top-k of the ceiling query: the single best match.
+const CEILING_TOP_K: usize = 1;
+/// Largest allowed gap between the engine's score and the reference's.
+const CEILING_SCORE_TOLERANCE: f32 = 1e-3;
+
+/// Two commits: short docs, one of them a strong `zeta` match, then long
+/// docs holding a weaker one. The second commit's file opens first, and
+/// its match sets the floor the first file's ceiling is checked against.
+fn ceiling_commits() -> Vec<Vec<String>> {
+    let filler = |n: usize| vec!["f"; n].join(" ");
+    let weaker = format!("zeta zeta {}", filler(CEILING_LONG_DOC_TOKENS / 2 - 2));
+    let long = filler(CEILING_LONG_DOC_TOKENS);
+    vec![
+        vec!["zeta a".to_owned(), "b c".to_owned()],
+        vec![weaker, long.clone(), long],
+    ]
+}
+
+#[test]
+fn oracle_ceilings_follow_the_table_average() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(RAYON_POOL_THREADS)
+            .build()
+            .expect("pool"),
+    );
+    let opts = SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
+        .expect("opts")
+        .with_writer_pool(pool)
+        .with_storage(storage)
+        .with_bound_ordered_open_window(CEILING_OPEN_WINDOW);
+    let st = Supertable::create(opts).expect("create");
+    let commits = ceiling_commits();
+    let mut w = st.writer().expect("writer");
+    for titles in &commits {
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        w.append(&build_title_batch(&titles)).expect("append");
+        w.commit().expect("commit");
+    }
+    drop(w);
+
+    let corpus: Vec<(u64, String)> = commits
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(i, text)| (i as u64, text))
+        .collect();
+    let tok = default_tokenizer();
+    let view: Vec<(u64, &str)> = corpus.iter().map(|(i, t)| (*i, t.as_str())).collect();
+    let want = BruteForceBm25::index(&view, tok.as_ref())
+        .with_avgdl(corpus_avgdl(&corpus))
+        .top_k("zeta", CEILING_TOP_K, tok.as_ref());
+
+    let reader = st.reader().expect("reader");
+    let manifest = reader.manifest();
+    assert_eq!(manifest.superfiles.len(), 2, "one superfile per commit");
+    let first_rows: HashMap<SuperfileUri, u64> = manifest
+        .superfiles
+        .iter()
+        .scan(0u64, |next, entry| {
+            let first = *next;
+            *next += entry.n_docs;
+            Some((entry.uri, first))
+        })
+        .collect();
+    let got: Vec<(u64, f32)> = reader
+        .bm25_hits(
+            "title",
+            "zeta",
+            CEILING_TOP_K,
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
+        )
+        .expect("search")
+        .into_iter()
+        .map(|hit| {
+            (
+                first_rows[&hit.superfile] + u64::from(hit.local_doc_id),
+                hit.score,
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        got.iter().map(|(doc, _)| *doc).collect::<Vec<_>>(),
+        want.iter().map(|(doc, _)| *doc).collect::<Vec<_>>(),
+        "engine {got:?}, reference {want:?}"
+    );
+    for ((_, score), (_, expected)) in got.iter().zip(&want) {
+        assert!(
+            (score - expected).abs() <= CEILING_SCORE_TOLERANCE,
+            "engine {score}, reference {expected}"
+        );
+    }
 }
