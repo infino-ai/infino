@@ -1464,10 +1464,6 @@ impl ManifestSnapshot {
             || !entries.iter().all(|e| index.is_indexed(&e.superfile_id))
     }
 
-    /// All superfile entries, loaded through the hierarchical part loader in
-    /// manifest (time) order. Vector search fans over every entry — cell
-    /// routing (nearest global centroids) is the selection mechanism, not a
-    /// part-level prune.
     /// The superfiles among `candidates`, as `index` names them, that are
     /// live in this snapshot. Loads only the parts whose id range covers a
     /// candidate, and nothing when the resident view is the whole table.
@@ -1498,6 +1494,10 @@ impl ManifestSnapshot {
             .collect())
     }
 
+    /// All superfile entries, loaded through the hierarchical part loader in
+    /// manifest (time) order. Vector search fans over every entry — cell
+    /// routing (nearest global centroids) is the selection mechanism, not a
+    /// part-level prune.
     pub(crate) async fn get_all_superfiles_loaded(
         &self,
     ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {

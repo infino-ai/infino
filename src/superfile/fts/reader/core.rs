@@ -1065,18 +1065,18 @@ impl FtsReader {
     /// fan-out that reopens every superfile, so an array that cannot be read
     /// is an error, not a column with no tokens: a zero recorded there would
     /// skew every query's statistics for as long as the superfile lives.
-    /// The average document length `column` was built at, which its stored
-    /// bounds assume; `None` when the index has no such column.
-    pub(crate) fn column_baked_avgdl(&self, column: &str) -> Option<f32> {
-        let id = self.resolve_column_id(column).ok()?;
-        Some(self.columns[id as usize].baked_avgdl)
-    }
-
     pub fn column_length_stats(&self, column: &str) -> Result<Option<ColumnLengthStats>, FtsError> {
         let Ok(id) = self.resolve_column_id(column) else {
             return Ok(None);
         };
         self.columns[id as usize].try_length_stats().map(Some)
+    }
+
+    /// The average document length `column` was built at, which its stored
+    /// bounds assume; `None` when the index has no such column.
+    pub(crate) fn column_baked_avgdl(&self, column: &str) -> Option<f32> {
+        let id = self.resolve_column_id(column).ok()?;
+        Some(self.columns[id as usize].baked_avgdl)
     }
 
     test_visible! {

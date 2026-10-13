@@ -802,10 +802,7 @@ impl SupertableReader {
         let manifest = self.manifest();
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
-        // Idf is computed against the table-wide totals. The average
-        // document length needs no such fold: every superfile was baked at
-        // the table-wide average as of its commit and is scored at what it
-        // declares.
+        // Idf is computed against the table-wide totals.
         let corpus = manifest
             .fts_length_stats(column)
             .ok_or_else(|| QueryError::Unsupported(FTS_SUMMARY_TOO_OLD_MSG.to_owned()))?;
