@@ -172,7 +172,9 @@ use crate::{
             listed_once, options_hash,
             part::{self as part_mod, PartId},
             superfile_stem,
-            term_index::{self, Contribution as TermContribution, Root, TermIndexError},
+            term_index::{
+                self, Contribution as TermContribution, ReservedSegment, Root, TermIndexError,
+            },
         },
         mutations::{
             CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -6829,7 +6831,7 @@ fn build_prepared_from_spilled_cells(
                     .map_err(|e| BuildError::Store(format!("ids-only batch: {e}")))?;
             ScalarStatsAgg::merge(
                 &mut scalar_stats,
-                &ScalarStatsAgg::from_batch(&scalar_schema, &scalar),
+                &ScalarStatsAgg::from_batches(&scalar_schema, &[&scalar]),
             );
             builder.add_batch_ids_only(&scalar)?;
             ids_seen += take;
@@ -7360,7 +7362,6 @@ fn build_shard_parquet_and_fts(
         ordered_vectors.push(ordered);
     }
     let vector_slices: Vec<&[f32]> = ordered_vectors.iter().map(Vec::as_slice).collect();
-
     let mut builder = SuperfileBuilder::new(
         builder_options_of(manifest).with_vector_layout(VectorLayout::MultiCellIvf),
     )?;
@@ -9823,6 +9824,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             &mut Vec::new(),
             &[],
             None,
+            None,
         )
         .await
         {
@@ -11021,6 +11023,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 pending_replaces,
                 contributions,
                 None,
+                None,
             )
             .await
             {
@@ -11404,6 +11407,9 @@ pub(crate) async fn try_commit_attempt(
     pending_storage_writes: &mut Vec<(String, Bytes)>,
     pending_storage_replaces: &mut Vec<(String, Bytes)>,
     term_contributions: &[TermContribution],
+    // Set by a caller that retries: the delta is built once at a reserved
+    // ordinal and kept here across attempts (see `term_index::append_reserved`).
+    reserved_segment: Option<&mut Option<ReservedSegment>>,
     // Checked immediately before the pointer PUT; see [`CommitFence`].
     fence: Option<&mut dyn CommitFence>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
@@ -11417,18 +11423,26 @@ pub(crate) async fn try_commit_attempt(
     .await?;
 
     // 2. update the manifest for the commit.
-    let (mut new_manifest, parts_to_write) = match birth_versions {
-        NewEntryBirthVersions::StampCommit => {
-            current_manifest
-                .update(new_entries, entries_to_remove)
-                .await?
+    let (mut new_manifest, parts_to_write) = async {
+        match birth_versions {
+            NewEntryBirthVersions::StampCommit => {
+                current_manifest
+                    .update(new_entries, entries_to_remove)
+                    .await
+            }
+            NewEntryBirthVersions::Preserve => {
+                current_manifest
+                    .update_preserving_birth_versions(new_entries, entries_to_remove)
+                    .await
+            }
         }
-        NewEntryBirthVersions::Preserve => {
-            current_manifest
-                .update_preserving_birth_versions(new_entries, entries_to_remove)
-                .await?
-        }
-    };
+    }
+    .instrument(detail_span!(
+        "manifest.update",
+        added = new_entries.len(),
+        removed = entries_to_remove.len(),
+    ))
+    .await?;
 
     // 2a. Name any already-written sidecar in this same successor; a later
     //     manifest would leave its tombstones unreadable in between.
@@ -11490,7 +11504,13 @@ pub(crate) async fn try_commit_attempt(
     //    writer runs — so an absent pointer is not an initial commit but a
     //    table dropped and purged under this handle, and the read refuses
     //    rather than republishing one from stale state.
-    let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&current_manifest)).await?;
+    let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&current_manifest))
+        .await
+        .inspect_err(|e| {
+            if matches!(e, SupertableCommitError::WriteContentionExhausted) {
+                record("lost", "pointer_check");
+            }
+        })?;
 
     // 3b. The term index: this commit's superfiles publish their postings
     //     in the SAME CAS as their entries — a delta segment appended to
@@ -11498,8 +11518,9 @@ pub(crate) async fn try_commit_attempt(
     //     forward), then the new root's reference on this successor. So a
     //     visible superfile always has postings, and a crash between these
     //     writes and the CAS leaves only orphans for GC. On a lost CAS the
-    //     retry rebuilds against the winner's root; the slices are
-    //     content-addressed, so their re-PUTs are no-ops.
+    //     retry rebuilds against the winner's root, unless the caller keeps
+    //     a reserved segment: then the retry appends the segment it already
+    //     built and writes only a new root.
     //
     //     Runs after the pointer fence above so a purged table refuses the
     //     commit before any artifact is written. A prior root that cannot
@@ -11525,7 +11546,10 @@ pub(crate) async fn try_commit_attempt(
     let mut unreadable_prior: Option<RoutingRef> = None;
     let prior = match current_manifest.term_index_ref() {
         Some(reference) if !term_contributions.is_empty() => {
-            match term_index::load_root(storage.as_ref(), reference).await {
+            match term_index::load_root(storage.as_ref(), reference)
+                .instrument(detail_span!("term_index.load_root"))
+                .await
+            {
                 Ok(root) => Some(root),
                 Err(e) if e.object_is_gone_or_corrupt() => {
                     warn!(error = %e, uri = %reference.uri, "prior term-index root gone or corrupt; restarting the index from this commit");
@@ -11551,12 +11575,21 @@ pub(crate) async fn try_commit_attempt(
                 true => current_manifest.term_index_complete(),
                 false => current_manifest.holds_no_superfiles(),
             };
-        let reference = term_index::append_delta(
-            storage.as_ref(),
-            prior,
-            term_contributions,
-            &term_index::BuildPolicy::default(),
-        )
+        let policy = term_index::BuildPolicy::default();
+        let store = storage.as_ref();
+        let reference = async move {
+            match reserved_segment {
+                Some(reserved) => {
+                    term_index::append_reserved(store, prior, term_contributions, &policy, reserved)
+                        .await
+                }
+                None => term_index::append_delta(store, prior, term_contributions, &policy).await,
+            }
+        }
+        .instrument(detail_span!(
+            "term_index.append",
+            contributions = term_contributions.len(),
+        ))
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
         new_manifest = new_manifest.with_term_index_ref(reference, complete);
@@ -11581,7 +11614,11 @@ pub(crate) async fn try_commit_attempt(
     // Whatever this commit's safety rests on has to still hold here. What is left after it is the
     // manifest parts and list and then the pointer PUT — small writes, not the uploads above.
     if let Some(fence) = fence {
-        fence.check().await?;
+        fence.check().await.inspect_err(|e| {
+            if matches!(e, SupertableCommitError::InputsChanged { .. }) {
+                record("lost", "seal");
+            }
+        })?;
     }
     new_manifest
         .write(storage.as_ref(), prev_etag.as_deref(), &encoded_refs)
@@ -11676,6 +11713,19 @@ pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
     storage: &Arc<dyn StorageProvider>,
     attempted_id: u64,
 ) -> Result<u64, SupertableCommitError> {
+    refresh_inner_state_async(inner, storage).await?;
+    let refreshed_id = inner.manifest.load_full().get_manifest_id();
+    Ok(orphaned_id_floor(storage, refreshed_id, attempted_id).await)
+}
+
+/// The probe half of [`refresh_and_orphaned_id_floor`], for a caller that
+/// has already refreshed to `refreshed_id`: the first free id past an
+/// unpublished list at `attempted_id`, or 0 when there is nothing to skip.
+pub(in crate::supertable) async fn orphaned_id_floor(
+    storage: &Arc<dyn StorageProvider>,
+    refreshed_id: u64,
+    attempted_id: u64,
+) -> u64 {
     /// Cap on sequential HEAD probes per retry. A contiguous orphan run
     /// longer than this escapes in chunks — each retry's floor lands on
     /// the first unprobed id and the next collision resumes the walk from
@@ -11684,10 +11734,8 @@ pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
     /// its body, so probes are not free).
     const MAX_ORPHAN_RUN_PROBES: u64 = 32;
 
-    refresh_inner_state_async(inner, storage).await?;
-    let refreshed_id = inner.manifest.load_full().get_manifest_id();
     if refreshed_id >= attempted_id {
-        return Ok(0);
+        return 0;
     }
     // Ids above the pointer are only ever held by unpublished lists, so
     // the occupied run starting at `attempted_id` is finite; the floor
@@ -11712,11 +11760,11 @@ pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
             }
         }
     }
-    Ok(if next_free_id > attempted_id {
+    if next_free_id > attempted_id {
         next_free_id
     } else {
         0
-    })
+    }
 }
 
 /// CAS-publish a successor manifest whose tombstone seq for every
@@ -15686,5 +15734,185 @@ supertable:
              the WAL immediately, still held by {:?}",
             doc.lease
         );
+    }
+}
+
+/// Which write a lost commit attempt lost at, as its spans record it.
+#[cfg(all(test, feature = "detailed-tracing"))]
+mod lost_write_span_tests {
+    use std::{
+        fmt,
+        sync::{Arc, Mutex},
+    };
+
+    use bytes::Bytes;
+    use futures::future::BoxFuture;
+    use tempfile::TempDir;
+    use tokio::runtime::{Builder, Runtime};
+    use tracing::{
+        Instrument, Span, Subscriber,
+        callsite::rebuild_interest_cache,
+        field::{Empty, Field, Visit},
+        info_span, span,
+        subscriber::{set_global_default, with_default},
+    };
+    use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
+    use uuid::Uuid;
+
+    use super::{CommitFence, NewEntryBirthVersions, SupertableCommitError, try_commit_attempt};
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        supertable::{
+            Supertable,
+            manifest::{ManifestSnapshot, commit::manifest_uri},
+        },
+        test_helpers::{build_title_batch, default_supertable_options},
+    };
+
+    /// Stands in for a list whose writer never published it.
+    const UNPUBLISHED_LIST_BYTES: &[u8] = b"manifest list never published";
+
+    /// Every value recorded into a field named `lost`, with its span's name.
+    #[derive(Clone, Default)]
+    struct LostWrites(Arc<Mutex<Vec<(&'static str, String)>>>);
+
+    impl LostWrites {
+        fn take(&self) -> Vec<(&'static str, String)> {
+            std::mem::take(&mut *self.0.lock().expect("lost writes lock"))
+        }
+    }
+
+    struct LostValue(Option<String>);
+
+    impl Visit for LostValue {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "lost" {
+                self.0 = Some(value.to_string());
+            }
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            if field.name() == "lost" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for LostWrites {
+        fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+            let mut lost = LostValue(None);
+            values.record(&mut lost);
+            if let (Some(value), Some(span)) = (lost.0, ctx.span(id)) {
+                self.0
+                    .lock()
+                    .expect("lost writes lock")
+                    .push((span.name(), value));
+            }
+        }
+    }
+
+    /// A fence that always finds a seal taken over.
+    struct SealTakenOver;
+
+    impl CommitFence for SealTakenOver {
+        fn check(&mut self) -> BoxFuture<'_, Result<(), SupertableCommitError>> {
+            Box::pin(async {
+                Err(SupertableCommitError::InputsChanged {
+                    superfile_id: Uuid::nil(),
+                })
+            })
+        }
+    }
+
+    fn commit_titles(st: &Supertable, titles: &[&str]) {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(titles)).expect("append");
+        w.commit().expect("commit");
+    }
+
+    /// The span a caller wraps an attempt in, declaring the field the
+    /// attempt fills in.
+    fn attempt_span() -> Span {
+        info_span!("attempt", lost = Empty)
+    }
+
+    /// Run an attempt that adds and removes nothing on `base`, expecting it
+    /// to lose.
+    fn lose_attempt(
+        rt: &Runtime,
+        st: &Supertable,
+        base: Arc<ManifestSnapshot>,
+        fence: Option<&mut dyn CommitFence>,
+    ) {
+        let storage = st.inner().options.storage.clone().expect("storage");
+        let opts = Arc::clone(&st.inner().options);
+        let result = rt.block_on(
+            try_commit_attempt(
+                storage,
+                opts,
+                base,
+                &[],
+                &[],
+                NewEntryBirthVersions::StampCommit,
+                None,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &[],
+                None,
+                fence,
+            )
+            .instrument(attempt_span()),
+        );
+        assert!(result.is_err(), "the attempt loses");
+    }
+
+    #[test]
+    fn a_lost_attempt_records_which_write_it_lost() {
+        // A process-wide registry keeps every span enabled whichever test
+        // thread meets it first; without one, a span first met on a thread
+        // with no subscriber is cached as disabled for this one too. Another
+        // test may have installed it already.
+        let _ = set_global_default(tracing_subscriber::registry());
+        let lost = LostWrites::default();
+        with_default(tracing_subscriber::registry().with(lost.clone()), || {
+            rebuild_interest_cache();
+            let rt = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let dir = TempDir::new().expect("tempdir");
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+            let st =
+                Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                    .expect("create");
+            commit_titles(&st, &["first"]);
+
+            // Another commit lands after the base was read.
+            let stale = st.inner().manifest.load_full();
+            commit_titles(&st, &["second"]);
+            lose_attempt(&rt, &st, stale, None);
+            assert_eq!(lost.take(), [("attempt", "pointer_check".to_string())]);
+
+            // A seal is taken over before anything is written.
+            let base = st.inner().manifest.load_full();
+            lose_attempt(&rt, &st, Arc::clone(&base), Some(&mut SealTakenOver));
+            assert_eq!(lost.take(), [("attempt", "seal".to_string())]);
+
+            // The next id is taken by a list nobody published.
+            rt.block_on(storage.put_atomic(
+                &manifest_uri(base.get_next_manifest_id()),
+                Bytes::from_static(UNPUBLISHED_LIST_BYTES),
+            ))
+            .expect("unpublished list");
+            lose_attempt(&rt, &st, Arc::clone(&base), None);
+            assert_eq!(lost.take(), [("manifest.write", "list".to_string())]);
+
+            // The list lands, then the pointer swap finds another etag.
+            let past_taken = base.with_next_manifest_id_floor(base.get_next_manifest_id() + 1);
+            let (successor, _) = rt.block_on(past_taken.update(&[], &[])).expect("successor");
+            let result = rt.block_on(successor.write(storage.as_ref(), Some("another etag"), &[]));
+            assert!(result.is_err(), "the pointer swap loses");
+            assert_eq!(lost.take(), [("manifest.write", "pointer".to_string())]);
+        });
     }
 }

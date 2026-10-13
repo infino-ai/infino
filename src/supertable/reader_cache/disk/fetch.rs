@@ -2182,6 +2182,9 @@ mod tests {
                 0,
                 "{reopen:?}: no stray tempfiles"
             );
+            // The reopened query's block write may still be queued: its run is charged
+            // before it lands.
+            store.block_writes_settled().await;
             store.assert_budget_consistent();
 
             let fetches = store.stats().n_cold_fetches;
@@ -2230,6 +2233,7 @@ mod tests {
             .range(vec_off, vec_len)
             .await
             .expect("a query touches the vector blocks");
+        store.block_writes_settled().await;
         let blocks = source.filled_bytes_handle().load(Ordering::Acquire);
         drop(source);
         drop(reader);
@@ -2807,6 +2811,7 @@ mod tests {
                 .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
                 .await
                 .expect("promote");
+            store.block_writes_settled().await;
             assert!(
                 store.hole_path(&uri).exists() && !store.cache_path(&uri).exists(),
                 "a copy missing its vector blob is kept under its own name"

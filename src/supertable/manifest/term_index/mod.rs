@@ -42,8 +42,10 @@ use std::{
 
 #[cfg(test)]
 pub(crate) use build::build;
+use build::build_segment;
 pub(crate) use build::{BuildPolicy, Built, Contribution, ContributionWriter, build_onto};
 use bytes::Bytes;
+use format::Segment;
 pub(crate) use format::{Location, Posting, Root, Slice};
 use futures::{StreamExt, TryStreamExt, stream};
 use thiserror::Error;
@@ -64,6 +66,7 @@ use crate::{
         query::prune::PruneLeaf,
         schema::FieldId,
     },
+    utils::trace::detail_span,
 };
 
 /// Object-store directory prefix for term-index objects, sibling to the
@@ -98,6 +101,14 @@ const RESIDENT_RUNS: usize = 4096;
 /// this bounds both the requests in flight and the slice bytes held
 /// beyond the resident set while their terms decode.
 const SLICE_FETCH_CONCURRENCY: usize = 8;
+
+/// Ordinals a reserved segment leaves free past the root it was built
+/// against, for the deltas other commits append while its own commit
+/// retries. Ingest commits land a few times a second and a retrying commit
+/// gives up within a minute, so this is rarely outgrown; outgrowing it
+/// costs one rebuild of the segment, never correctness. Each unused slot
+/// is a nil entry (32 bytes) in the root until the next full rebuild.
+const RESERVED_ORDINAL_SLACK: u32 = 256;
 
 /// Errors from building, storing or reading the term index.
 #[derive(Debug, Error)]
@@ -190,6 +201,10 @@ pub(crate) async fn write_slice(
 /// Persist the root; idempotent by content hash. Call after every slice it
 /// names is written, so a manifest never references a root whose slices
 /// are not all present.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(skip_all, fields(superfiles = root.superfiles.len()))
+)]
 pub(crate) async fn write_root(
     storage: &dyn StorageProvider,
     root: &Root,
@@ -242,6 +257,72 @@ pub(crate) async fn append_delta(
     write_root(storage, &built.root).await
 }
 
+/// A delta segment built and written once, numbered from a reserved
+/// ordinal past the root it was built against. A commit that loses its race
+/// appends the same segment to the winner's root, padding up to its first
+/// ordinal, instead of building and uploading it again.
+pub(crate) struct ReservedSegment {
+    /// The ordinal its first superfile takes. Its postings name
+    /// `base + i` for the `i`-th of `superfiles`.
+    base: u32,
+    superfiles: Vec<Uuid>,
+    id_mins: Vec<i128>,
+    segment: Segment,
+}
+
+/// [`append_delta`] for a commit that may retry: the segment is built once,
+/// [`RESERVED_ORDINAL_SLACK`] ordinals past `prior`'s length, and kept in
+/// `reserved`. Each call pads `prior` with nil entries up to the reserved
+/// ordinal and appends it, writing only the root. The segment is built
+/// again only when `prior` has grown past the reserved ordinal, or the
+/// contributions are not the ones it was built from.
+///
+/// Like every delta, it names only ordinals at or past the length of the
+/// root it extends, which `splice_base` relies on. Optimize's full rebuild
+/// drops the padding.
+pub(crate) async fn append_reserved(
+    storage: &dyn StorageProvider,
+    prior: Option<Root>,
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+    reserved: &mut Option<ReservedSegment>,
+) -> Result<RoutingRef, TermIndexError> {
+    let mut root = prior.unwrap_or_default();
+    let len = root.superfiles.len();
+    let reusable = reserved.as_ref().is_some_and(|r| {
+        r.base as usize >= len
+            && r.superfiles.len() == contributions.len()
+            && r.superfiles
+                .iter()
+                .zip(contributions)
+                .all(|(id, c)| *id == c.superfile_id)
+    });
+    if !reusable {
+        let base = len as u32 + RESERVED_ORDINAL_SLACK;
+        let built = detail_span!(
+            "term_index.build_segment",
+            inputs = contributions.len(),
+            ordinal_base = base,
+        )
+        .in_scope(|| build_segment(contributions, policy, base))?;
+        write_slices(storage, built.slices).await?;
+        *reserved = Some(ReservedSegment {
+            base,
+            superfiles: built.superfiles,
+            id_mins: built.id_mins,
+            segment: built.segment,
+        });
+    }
+    let segment = reserved.as_ref().expect("reserved above");
+    let padding = segment.base as usize - len;
+    root.superfiles.extend(repeat_n(Uuid::nil(), padding));
+    root.superfiles.extend_from_slice(&segment.superfiles);
+    root.id_mins.extend(repeat_n(0, padding));
+    root.id_mins.extend_from_slice(&segment.id_mins);
+    root.segments.push(segment.segment.clone());
+    write_root(storage, &root).await
+}
+
 /// Place `base`, a rebuild of the index `prior` referenced, over `current`,
 /// keeping the delta segments committed since `prior`.
 ///
@@ -253,8 +334,9 @@ pub(crate) async fn append_delta(
 ///
 /// Relies on every segment after `prior` naming only ordinals at or past
 /// `prior`'s length. The checks below cannot see posting ordinals; it holds
-/// because `append_delta`, the only delta writer, numbers from the length of
-/// the root it extends. A new root writer must keep it.
+/// because the delta writers, `append_delta` and `append_reserved`, number
+/// from at or past the length of the root they extend. A new root writer
+/// must keep it.
 pub(crate) fn splice_base(base: &Root, prior: &Root, current: &Root) -> Option<Root> {
     if !current.superfiles.starts_with(&prior.superfiles)
         || !current.id_mins.starts_with(&prior.id_mins)
@@ -859,7 +941,11 @@ mod tests {
         CompactionSettings, OptimizeOptions,
         storage::{LocalFsStorageProvider, ObjectMeta},
         supertable::{
-            manifest::{commit::read_pointer, list, options_hash::compute_options_hash},
+            manifest::{
+                commit::{POINTER_PATH, read_pointer},
+                list,
+                options_hash::compute_options_hash,
+            },
             query::prune::select_superfiles,
             schema::{LegacyNames, TableSchema},
         },
@@ -4326,5 +4412,262 @@ mod tests {
                 "slice of {len} bytes was cut well short of the target"
             );
         }
+    }
+
+    /// The slice objects under `dir`, by name.
+    fn slice_objects(dir: &TempDir) -> HashSet<String> {
+        fs::read_dir(dir.path().join(STORAGE_PREFIX))
+            .map(|entries| {
+                entries
+                    .map(|e| {
+                        e.expect("dir entry")
+                            .file_name()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .filter(|name| name.starts_with("slice-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Superfile ids whose postings for `term` the root names, in order.
+    async fn posted_superfiles(
+        root: &Root,
+        storage: &Arc<dyn StorageProvider>,
+        term: &str,
+    ) -> Vec<Uuid> {
+        let index = TermIndex::new(root.clone(), String::new(), Arc::clone(storage), None);
+        index
+            .postings(fid("body"), term)
+            .await
+            .expect("lookup")
+            .iter()
+            .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
+            .collect()
+    }
+
+    /// A local store with one base segment over superfile 1.
+    async fn store_with_base(
+        dir: &TempDir,
+        policy: &BuildPolicy,
+    ) -> (TempDir, Arc<dyn StorageProvider>, Root) {
+        let store_dir = TempDir::new().expect("store dir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
+        let built =
+            build(&[contribution(dir, 1, &[("body", "shared", 2)])], policy).expect("build");
+        let root = built.root.clone();
+        write_built(local.as_ref(), built)
+            .await
+            .expect("write base");
+        (store_dir, local, root)
+    }
+
+    /// A retry appends the segment it already built onto the winner's root:
+    /// no slice is written again, the root is padded up to the reserved
+    /// ordinal, and every posting names the right superfile.
+    #[tokio::test]
+    async fn append_reserved_reuses_its_segment_on_a_longer_root() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy::default();
+        let (store_dir, local, prior) = store_with_base(&dir, &policy).await;
+        let merged = [contribution(
+            &dir,
+            9,
+            &[("body", "shared", 3), ("body", "merged", 1)],
+        )];
+        let mut reserved = None;
+        append_reserved(
+            local.as_ref(),
+            Some(prior.clone()),
+            &merged,
+            &policy,
+            &mut reserved,
+        )
+        .await
+        .expect("first attempt");
+
+        // Another commit publishes a delta first.
+        let winner = append_delta(
+            local.as_ref(),
+            Some(prior.clone()),
+            &[contribution(&dir, 2, &[("body", "shared", 4)])],
+            &policy,
+        )
+        .await
+        .expect("winner's delta");
+        let winner = load_root(local.as_ref(), &winner)
+            .await
+            .expect("winner root");
+        let slices_before_retry = slice_objects(&store_dir);
+
+        let reference = append_reserved(
+            local.as_ref(),
+            Some(winner.clone()),
+            &merged,
+            &policy,
+            &mut reserved,
+        )
+        .await
+        .expect("retry");
+
+        assert_eq!(
+            slice_objects(&store_dir),
+            slices_before_retry,
+            "the retry writes no slice"
+        );
+        let root = load_root(local.as_ref(), &reference).await.expect("root");
+        let base = prior.superfiles.len() + RESERVED_ORDINAL_SLACK as usize;
+        assert_eq!(root.superfiles.len(), base + 1);
+        assert_eq!(root.superfiles[base], Uuid::from_u128(9));
+        let padding = root.superfiles.iter().filter(|id| id.is_nil()).count();
+        assert_eq!(padding, base - winner.superfiles.len());
+        assert_eq!(
+            posted_superfiles(&root, &local, "shared").await,
+            [1, 2, 9].map(Uuid::from_u128),
+            "base, winner, then the reserved segment"
+        );
+        assert_eq!(
+            posted_superfiles(&root, &local, "merged").await,
+            [Uuid::from_u128(9)]
+        );
+    }
+
+    /// A root grown past the reserved ordinal, or other contributions, get
+    /// a segment built again; its postings still name the right superfile.
+    #[tokio::test]
+    async fn append_reserved_rebuilds_when_it_cannot_reuse() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy::default();
+        let (store_dir, local, prior) = store_with_base(&dir, &policy).await;
+        let merged = [contribution(&dir, 9, &[("body", "merged", 1)])];
+        let mut reserved = None;
+        append_reserved(
+            local.as_ref(),
+            Some(prior.clone()),
+            &merged,
+            &policy,
+            &mut reserved,
+        )
+        .await
+        .expect("first attempt");
+
+        // More commits than the reservation leaves room for.
+        let mut outgrown = prior.clone();
+        let extra = RESERVED_ORDINAL_SLACK as usize + 1;
+        outgrown.superfiles.extend(repeat_n(Uuid::nil(), extra));
+        outgrown.id_mins.extend(repeat_n(0, extra));
+        let slices_before = slice_objects(&store_dir);
+        let reference = append_reserved(
+            local.as_ref(),
+            Some(outgrown.clone()),
+            &merged,
+            &policy,
+            &mut reserved,
+        )
+        .await
+        .expect("outgrown");
+        assert_ne!(slice_objects(&store_dir), slices_before, "rebuilt");
+        let root = load_root(local.as_ref(), &reference).await.expect("root");
+        assert_eq!(
+            root.superfiles.len(),
+            outgrown.superfiles.len() + RESERVED_ORDINAL_SLACK as usize + 1
+        );
+        assert_eq!(
+            posted_superfiles(&root, &local, "merged").await,
+            [Uuid::from_u128(9)]
+        );
+
+        // A batch that lost a job hands over other contributions.
+        let other = [contribution(&dir, 10, &[("body", "other", 1)])];
+        let reference =
+            append_reserved(local.as_ref(), Some(prior), &other, &policy, &mut reserved)
+                .await
+                .expect("other contributions");
+        let root = load_root(local.as_ref(), &reference).await.expect("root");
+        assert_eq!(
+            posted_superfiles(&root, &local, "other").await,
+            [Uuid::from_u128(10)]
+        );
+        assert!(posted_superfiles(&root, &local, "merged").await.is_empty());
+    }
+
+    /// A compaction that loses its commit to an ingest commit appends the
+    /// term-index segment it already built: every slice on storage is one
+    /// the root names, the index stays complete, and the merged superfile's
+    /// terms route to it. Optimize's rebuild then drops the padding.
+    #[test]
+    fn a_compaction_retry_reuses_its_term_index_segment() {
+        let (dir, faults, storage, st) = fault_table();
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (before, _) = live_and_covered(&st, &storage, &rt);
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let peer = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
+        faults.before(FaultOp::PutIfMatch, POINTER_PATH, move || {
+            thread::spawn(move || commit_segment(&peer, SEGMENTS))
+                .join()
+                .expect("peer commit");
+        });
+
+        st.compact(&CompactionSettings {
+            min_fill_percent: 1,
+            min_superfiles_for_merge: 2,
+            ..CompactionSettings::default()
+        })
+        .expect("compact");
+
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        // The peer published first, so the compaction's first pointer swap
+        // lost and its commit landed on a retry.
+        assert_eq!(live.len(), 2, "the merged superfile and the peer's");
+        assert!(live.is_disjoint(&before), "every input was merged");
+        let named: HashSet<String> = root
+            .segments
+            .iter()
+            .flat_map(|s| &s.slices)
+            .map(|s| {
+                slice_uri(&s.content_hash)
+                    .trim_start_matches(STORAGE_PREFIX)
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            slice_objects(&dir),
+            named,
+            "the retry wrote no slice of its own"
+        );
+        assert!(
+            root.superfiles.iter().any(Uuid::is_nil),
+            "the root is padded up to the reserved ordinal"
+        );
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let found: HashSet<Uuid> = rt
+            .block_on(index.postings(title_id(), "shared"))
+            .expect("lookup")
+            .iter()
+            .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
+            .filter(|id| live.contains(id))
+            .collect();
+        assert_eq!(found, live, "`shared` routes to every live superfile");
+
+        maintenance_only_optimize(&st);
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(root.segments.len(), 1);
+        assert!(
+            root.superfiles.iter().all(|id| !id.is_nil()),
+            "the rebuild drops the padding"
+        );
+        assert_eq!(root.superfiles.len(), live.len());
     }
 }

@@ -70,7 +70,7 @@ pub use list::{FtsSummaryAgg, GlobalVectorIndex, RoutingRef, ScalarStatsAgg};
 use rayon::{ThreadPool, prelude::*};
 use rustc_hash::FxHashSet;
 use tokio::{sync::OnceCell, task::spawn_blocking};
-use tracing::warn;
+use tracing::{Instrument, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -112,7 +112,7 @@ use crate::{
         schema::{FieldId, LegacyNames, PhysicalKind, PhysicalSchema, TableSchema},
         slow_vector_state,
     },
-    utils::trace::record,
+    utils::trace::{detail_span, record},
 };
 
 /// Object-store / LocalFS directory prefix under which committed superfile
@@ -1285,6 +1285,18 @@ impl ManifestSnapshot {
     /// — passing them directly avoids a second encode cycle.
     /// Reused parts from the previous manifest version are not in this
     /// list — their URIs are already in `new_list.parts[i].uri`.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "manifest.write",
+            skip_all,
+            fields(
+                manifest_id = self.get_manifest_id(),
+                parts = parts_to_write.len(),
+                lost = tracing::field::Empty
+            )
+        )
+    )]
     pub async fn write(
         &self,
         storage: &dyn StorageProvider,
@@ -1311,7 +1323,11 @@ impl ManifestSnapshot {
         // into `WriteContentionExhausted` so callers (and the
         // writer's OCC retry loop) can match on one variant
         // regardless of which CAS lost the race — list or pointer.
-        let list_res = list_res.map_err(translate_contention)?;
+        let list_res = list_res.map_err(translate_contention).inspect_err(|e| {
+            if matches!(e, CommitError::WriteContentionExhausted) {
+                record("lost", "list");
+            }
+        })?;
         for part_result in part_results {
             part_result.map_err(translate_contention)?;
         }
@@ -1326,7 +1342,14 @@ impl ManifestSnapshot {
         // Step 4: conditional pointer write — the visibility
         // barrier. Until this succeeds, no reader sees the new
         // manifest version.
-        write_pointer(storage, &pointer, expected_prev_etag).await?;
+        write_pointer(storage, &pointer, expected_prev_etag)
+            .instrument(detail_span!("manifest.write_pointer"))
+            .await
+            .inspect_err(|e| {
+                if matches!(e, CommitError::WriteContentionExhausted) {
+                    record("lost", "pointer");
+                }
+            })?;
         Ok(())
     }
 
@@ -3625,6 +3648,19 @@ pub(crate) fn merge_min_max_arrays(
     }
 }
 
+/// Every non-null value across `$cols`, one column's pieces, in order. Returns
+/// `None` from the calling function if a piece is not a `$array_ty`.
+macro_rules! piece_values {
+    ($cols:expr, $array_ty:ty) => {
+        $cols
+            .iter()
+            .map(|col| col.as_any().downcast_ref::<$array_ty>())
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .flat_map(|a| a.iter().flatten())
+    };
+}
+
 /// Compute (min, max) for one Arrow array as length-1 `ArrayRef`s.
 ///
 /// Returns `None` only for unsupported types. An all-null input of a
@@ -3640,32 +3676,31 @@ pub(crate) fn merge_min_max_arrays(
 /// floats → `Float64`). `None` for non-summable types (utf8, bool,
 /// decimal) or when the exact total overflows the result type —
 /// consumers treat missing as "no statistics".
-pub(crate) fn column_sum(col: &ArrayRef) -> Option<ArrayRef> {
+///
+/// `cols` are one column's pieces, summed in order, the same as on their concat.
+pub(crate) fn column_sum(cols: &[ArrayRef]) -> Option<ArrayRef> {
     macro_rules! signed {
         ($array_ty:ty) => {{
-            let a = col.as_any().downcast_ref::<$array_ty>()?;
-            let total: i128 = a.iter().flatten().map(i128::from).sum();
+            let total: i128 = piece_values!(cols, $array_ty).map(i128::from).sum();
             let v = i64::try_from(total).ok()?;
             Some(Arc::new(Int64Array::from(vec![v])) as ArrayRef)
         }};
     }
     macro_rules! unsigned {
         ($array_ty:ty) => {{
-            let a = col.as_any().downcast_ref::<$array_ty>()?;
-            let total: u128 = a.iter().flatten().map(u128::from).sum();
+            let total: u128 = piece_values!(cols, $array_ty).map(u128::from).sum();
             let v = u64::try_from(total).ok()?;
             Some(Arc::new(UInt64Array::from(vec![v])) as ArrayRef)
         }};
     }
     macro_rules! float {
         ($array_ty:ty) => {{
-            let a = col.as_any().downcast_ref::<$array_ty>()?;
-            let total: f64 = a.iter().flatten().map(f64::from).sum();
+            let total: f64 = piece_values!(cols, $array_ty).map(f64::from).sum();
             Some(Arc::new(Float64Array::from(vec![total])) as ArrayRef)
         }};
     }
 
-    match col.data_type() {
+    match cols.first()?.data_type() {
         DataType::Int8 => signed!(Int8Array),
         DataType::Int16 => signed!(Int16Array),
         DataType::Int32 => signed!(Int32Array),
@@ -3708,17 +3743,18 @@ pub(crate) fn add_sum_arrays(a: &ArrayRef, b: &ArrayRef) -> Option<ArrayRef> {
 /// `None` for types the sketch doesn't cover. Values hash by their
 /// canonical byte representation (little-endian for numerics, raw
 /// bytes for strings, IEEE bits for floats).
-pub(crate) fn column_hll(col: &ArrayRef) -> Option<hll::HllSketch> {
+///
+/// `cols` are one column's pieces, all fed into the one sketch.
+pub(crate) fn column_hll(cols: &[ArrayRef]) -> Option<hll::HllSketch> {
     let mut sketch = hll::HllSketch::new();
     macro_rules! ints {
         ($array_ty:ty) => {{
-            let a = col.as_any().downcast_ref::<$array_ty>()?;
-            for v in a.iter().flatten() {
+            for v in piece_values!(cols, $array_ty) {
                 sketch.insert_hash(xxh3_64(&v.to_le_bytes()));
             }
         }};
     }
-    match col.data_type() {
+    match cols.first()?.data_type() {
         DataType::Int8 => ints!(Int8Array),
         DataType::Int16 => ints!(Int16Array),
         DataType::Int32 => ints!(Int32Array),
@@ -3728,26 +3764,22 @@ pub(crate) fn column_hll(col: &ArrayRef) -> Option<hll::HllSketch> {
         DataType::UInt32 => ints!(UInt32Array),
         DataType::UInt64 => ints!(UInt64Array),
         DataType::Float32 => {
-            let a = col.as_any().downcast_ref::<Float32Array>()?;
-            for v in a.iter().flatten() {
+            for v in piece_values!(cols, Float32Array) {
                 sketch.insert_hash(xxh3_64(&v.to_bits().to_le_bytes()));
             }
         }
         DataType::Float64 => {
-            let a = col.as_any().downcast_ref::<Float64Array>()?;
-            for v in a.iter().flatten() {
+            for v in piece_values!(cols, Float64Array) {
                 sketch.insert_hash(xxh3_64(&v.to_bits().to_le_bytes()));
             }
         }
         DataType::Utf8 => {
-            let a = col.as_any().downcast_ref::<StringArray>()?;
-            for v in a.iter().flatten() {
+            for v in piece_values!(cols, StringArray) {
                 sketch.insert_hash(xxh3_64(v.as_bytes()));
             }
         }
         DataType::LargeUtf8 => {
-            let a = col.as_any().downcast_ref::<LargeStringArray>()?;
-            for v in a.iter().flatten() {
+            for v in piece_values!(cols, LargeStringArray) {
                 sketch.insert_hash(xxh3_64(v.as_bytes()));
             }
         }

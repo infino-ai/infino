@@ -375,6 +375,9 @@ pub(crate) fn plan_jobs(
                 partition_key: s.partition_key.clone(),
                 inputs: vec![s.superfile_id],
                 estimated_output_bytes: s.live_bytes,
+                // A repair is not a planned compaction run, so there are no
+                // per-run settings to honour.
+                merge_memory_mb: None,
             };
             (job, repair)
         })

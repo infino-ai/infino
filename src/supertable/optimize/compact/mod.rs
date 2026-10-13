@@ -25,6 +25,7 @@ use futures::{
     future::BoxFuture,
     stream::{self, StreamExt},
 };
+use rand::random_range;
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::{
@@ -53,8 +54,10 @@ use crate::{
         error::CompactionError,
         handle::{SupertableInner, hidden_vector_index_compaction_settings},
         manifest::{
-            SuperfileUri, list::PartitionStrategy, listed_once,
-            term_index::Contribution as TermContribution,
+            SuperfileUri,
+            list::PartitionStrategy,
+            listed_once,
+            term_index::{Contribution as TermContribution, ReservedSegment},
         },
         opann::rerank_pool_hint,
         query::dispatch::open_compaction_input,
@@ -66,9 +69,10 @@ use crate::{
         },
         writer::{
             CommitFence, CommitListMetadata, NewEntryBirthVersions, PreparedSuperfile, ShardOutput,
-            backoff_delay, finalize_compaction_commit, maint_pool, persist_list_metadata_async,
-            prepare_superfile_named, recalibrate_probe_laws, refresh_slow_vector_state,
-            split_overflow_cells, try_commit_attempt, write_superfile_list,
+            backoff_delay, finalize_compaction_commit, maint_pool, orphaned_id_floor,
+            persist_list_metadata_async, prepare_superfile_named, recalibrate_probe_laws,
+            refresh_slow_vector_state, split_overflow_cells, try_commit_attempt,
+            write_superfile_list,
         },
     },
     utils::trace::{RegionUsage, detail_span, record},
@@ -76,6 +80,19 @@ use crate::{
 
 /// Number of seal/reseal/unseal requests to run in parallel at a time
 const MAX_CONCURRENT_SEAL_WRITES: usize = 64;
+
+/// How long a compaction commit keeps retrying lost races after
+/// `max_commit_retries` is used up. Its merged superfiles are already
+/// uploaded, so on a table with frequent commits it is worth waiting rather
+/// than throwing the merge away after a few quick losses.
+const COMMIT_RETRY_BUDGET: Duration = Duration::from_secs(60);
+
+/// Shortest and longest pause, in milliseconds, before a compaction commit
+/// retries. A lost race means another commit has just landed, which is the
+/// best time to try again, so the pause is short. The jitter keeps two
+/// compactors from retrying in lockstep.
+const RETRY_PAUSE_MIN_MS: u64 = 10;
+const RETRY_PAUSE_MAX_MS: u64 = 50;
 
 /// Held for as long as one process is reshaping superfiles, and released
 /// on drop. Compaction and reindex share it: both rewrite superfiles and
@@ -594,7 +611,7 @@ impl Supertable {
         superfiles: &[Arc<SuperfileEntry>],
         tombstones: &HashMap<Uuid, Arc<RoaringBitmap>>,
     ) -> Result<PreparedSuperfile, BuildError> {
-        self.merge_superfiles_with(superfiles, tombstones, Arc::new(CompactionMerge))
+        self.merge_superfiles_with(superfiles, tombstones, Arc::new(CompactionMerge), None)
             .await
     }
 
@@ -609,6 +626,7 @@ impl Supertable {
         superfiles: &[Arc<SuperfileEntry>],
         tombstones: &HashMap<Uuid, Arc<RoaringBitmap>>,
         merge: Arc<dyn SuperfileMerge>,
+        merge_memory_mb: Option<u64>,
     ) -> Result<PreparedSuperfile, BuildError> {
         debug_assert!(
             tombstones.is_empty()
@@ -710,7 +728,8 @@ impl Supertable {
         // what lets a compacted table score like an unfragmented one.
         let builder_options = manifest
             .builder_options()
-            .with_fts_corpus_stats(manifest.fts_corpus_stats(superfiles));
+            .with_fts_corpus_stats(manifest.fts_corpus_stats(superfiles))
+            .with_merge_memory_mb(merge_memory_mb);
         // The build is long, synchronous CPU work, so it runs on the
         // maintenance pool rather than the thread driving this future.
         // `run_on_pool` needs a `'static` closure, so everything it reads —
@@ -882,7 +901,12 @@ impl Supertable {
             .map(|s| (s.superfile_id, Arc::new(s.bitmap.clone())))
             .collect();
         let merged_segment = match self
-            .merge_superfiles_with(&inputs, &sealed_tombstones, Arc::clone(&merge))
+            .merge_superfiles_with(
+                &inputs,
+                &sealed_tombstones,
+                Arc::clone(&merge),
+                job.merge_memory_mb,
+            )
             .await
         {
             Ok(seg) => Some(seg),
@@ -1044,9 +1068,21 @@ impl Supertable {
             )));
         }
         let carried_sidecar = carried.first().copied();
+        // Raised when an attempt finds its manifest id taken by a list that
+        // was never published, so later attempts derive their id past it.
+        let mut next_id_floor: u64 = 0;
+        // The batch's term-index delta, built on the first attempt and
+        // appended again by any retry instead of rebuilt.
+        let mut reserved_segment: Option<ReservedSegment> = None;
+        let started = Instant::now();
 
-        for attempt in 0..max_retries {
-            let current = inner.manifest.load_full();
+        // Ends through the arms below: a commit, an error, or a lost race
+        // with neither attempts nor time left.
+        for attempt in 0.. {
+            let mut current = inner.manifest.load_full();
+            if next_id_floor > 0 {
+                current = Arc::new(current.with_next_manifest_id_floor(next_id_floor));
+            }
 
             // Another compactor already merged some job's inputs — that job has
             // nothing left to commit, so drop it and keep the rest. On a retry
@@ -1152,6 +1188,7 @@ impl Supertable {
                 wal_store: &wal_store,
                 batch: &mut batch,
             };
+            let attempted_id = current.get_next_manifest_id();
             let attempt_outcome = try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
@@ -1163,13 +1200,16 @@ impl Supertable {
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
                 &term_contributions,
+                Some(&mut reserved_segment),
                 Some(&mut fence),
             )
             .instrument(detail_span!(
                 "compaction_commit_attempt",
                 attempt = attempt,
+                attempted_id = attempted_id,
                 superfiles_added = new_entries.len(),
                 superfiles_removed = entries_to_remove.len(),
+                lost = tracing::field::Empty,
             ))
             .await;
             match attempt_outcome {
@@ -1236,7 +1276,7 @@ impl Supertable {
                 // batch and ending the pass.
                 Err(
                     e @ (CommitError::WriteContentionExhausted | CommitError::InputsChanged { .. }),
-                ) if attempt + 1 < max_retries => {
+                ) if attempt + 1 < max_retries || started.elapsed() < COMMIT_RETRY_BUDGET => {
                     warn!(
                         jobs = batch.len(),
                         attempt,
@@ -1252,13 +1292,24 @@ impl Supertable {
                     {
                         batch[owner].term_contributions.push(contribution);
                     }
+                    time::sleep(Duration::from_millis(random_range(
+                        RETRY_PAUSE_MIN_MS..=RETRY_PAUSE_MAX_MS,
+                    )))
+                    .await;
                     if let Err(e) = self.refresh().await {
                         unseal_batch(&wal_store, batch).await;
                         return Err(CompactionError::Refresh(e.to_string()));
                     }
-                    time::sleep(backoff_delay(attempt)).await;
+                    // Only a lost list or pointer write can mean a taken id;
+                    // a seal taken over loses before anything is written.
+                    if matches!(e, CommitError::WriteContentionExhausted) {
+                        let refreshed_id = inner.manifest.load().get_manifest_id();
+                        next_id_floor = next_id_floor
+                            .max(orphaned_id_floor(&storage, refreshed_id, attempted_id).await);
+                    }
                 }
                 Err(e) => {
+                    inner.note_commit_error(&e);
                     unseal_batch(&wal_store, batch).await;
                     return Err(CompactionError::Commit(e.to_string()));
                 }
@@ -2255,6 +2306,7 @@ mod tests {
         ops::Range,
         str,
         sync::{Arc, Mutex},
+        thread,
         time::Duration,
     };
 
@@ -2267,6 +2319,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Duration as ChronoDuration;
     use datafusion::prelude::{col, lit};
+    use futures::executor::block_on;
     use object_store::MultipartUpload;
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
@@ -2285,12 +2338,12 @@ mod tests {
             builder::{FtsConfig, VectorConfig},
             fts::reader::Bm25SearchOptions,
             reader::SuperfileReader,
-            vector::{distance::Metric, rerank_codec::RerankCodec},
+            vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
             Supertable, SupertableOptions,
             error::CompactionError,
-            manifest::commit::{POINTER_PATH, get_current_manifest_etag},
+            manifest::commit::{POINTER_PATH, get_current_manifest_etag, manifest_uri},
             schema::change::{FieldPatch, SchemaPatch},
             storage::{LocalFsStorageProvider, StorageProvider},
             writer::persist_commit_async,
@@ -2616,6 +2669,7 @@ mod tests {
             partition_key: Vec::new(),
             inputs: vec![bogus],
             estimated_output_bytes: 0,
+            merge_memory_mb: None,
         };
         let err = st
             .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
@@ -2691,6 +2745,7 @@ mod tests {
             partition_key: entry_a.partition_key.clone(),
             inputs: vec![entry_a.superfile_id, entry_b.superfile_id],
             estimated_output_bytes: 1,
+            merge_memory_mb: None,
         };
         let err = st
             .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
@@ -3957,6 +4012,212 @@ mod tests {
         }
     }
 
+    /// Stands in for a manifest list whose writer died before its pointer
+    /// PUT. Never parsed: no pointer names it.
+    const UNPUBLISHED_LIST_BYTES: &[u8] = b"manifest list never published";
+
+    /// A table over fault storage with mergeable superfiles, the plain
+    /// storage under it, and a second handle on that plain storage, so a
+    /// peer can commit mid-compaction without tripping the faults.
+    fn make_fault_st_with_peer(
+        dir: &TempDir,
+    ) -> (
+        Arc<FaultStorage>,
+        Arc<dyn StorageProvider>,
+        Supertable,
+        Supertable,
+    ) {
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(Arc::clone(&local));
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st = Supertable::create(default_supertable_options().with_storage(storage))
+            .expect("create supertable");
+        commit_mergeable_superfiles(&st);
+        let peer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&local)))
+            .expect("open peer");
+        (faults, local, st, peer)
+    }
+
+    /// Land `peer`'s commit just before the compaction's first pointer swap,
+    /// so that swap loses to a real winner.
+    fn peer_commits_before_the_pointer_swap(faults: &FaultStorage, peer: Supertable) {
+        faults.before(FaultOp::PutIfMatch, POINTER_PATH, move || {
+            thread::spawn(move || commit_titles(&peer, &["peer first", "peer second"]))
+                .join()
+                .expect("peer commit");
+        });
+    }
+
+    async fn put_unpublished_list(storage: &Arc<dyn StorageProvider>, manifest_id: u64) {
+        storage
+            .put_atomic(
+                &manifest_uri(manifest_id),
+                Bytes::from_static(UNPUBLISHED_LIST_BYTES),
+            )
+            .await
+            .expect("unpublished list");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_commits_past_an_unpublished_manifest_list() {
+        // A list sits at the next manifest id while the pointer stays put.
+        // Lists are create-only, so retrying that id can never publish: the
+        // commit has to derive its next id past it.
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_mergeable_superfiles(&st);
+        let rows: HashSet<i128> = listed_row_ids(&st).await.into_iter().collect();
+        let storage = st
+            .inner()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed table");
+        let taken_id = st.manifest_id() + 1;
+        put_unpublished_list(&storage, taken_id).await;
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact commits past the unpublished list");
+
+        assert_eq!(st.manifest_id(), taken_id + 1, "the first free id");
+        let listed = assert_listed_once(&st, &rows).await;
+        assert_eq!(listed.len(), 1, "one merged superfile: {listed:?}");
+        let (left, _) = storage
+            .get(&manifest_uri(taken_id))
+            .await
+            .expect("the unpublished list is left for gc");
+        assert_eq!(&left[..], UNPUBLISHED_LIST_BYTES);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_retry_after_a_real_winner_takes_the_next_id() {
+        // A peer publishes during the compaction's commit. The retry starts
+        // from the peer's manifest and takes the very next id: nothing is
+        // skipped when the pointer moved.
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, _local, st, peer) = make_fault_st_with_peer(&dir);
+        let peer_handle = peer.clone();
+        peer_commits_before_the_pointer_swap(&faults, peer);
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact commits after losing to the peer");
+
+        assert_eq!(st.manifest_id(), peer_handle.manifest_id() + 1);
+        let n_superfiles = st.reader().expect("reader").n_superfiles();
+        assert_eq!(n_superfiles, 2, "the merge and the peer's superfile");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_carries_a_floor_past_a_real_winner() {
+        // The first attempt finds the next id taken and moves its floor past
+        // it. The second loses its pointer swap to a peer that published
+        // above that floor. The floor left from the first attempt must not
+        // hold the third back: it takes the id after the peer's.
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, local, st, peer) = make_fault_st_with_peer(&dir);
+        let taken_id = st.manifest_id() + 1;
+        put_unpublished_list(&local, taken_id).await;
+        let peer_handle = peer.clone();
+        peer_commits_before_the_pointer_swap(&faults, peer);
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact commits past the taken id and the peer");
+
+        let peer_id = peer_handle.manifest_id();
+        assert!(peer_id > taken_id, "the peer also skipped the taken id");
+        assert_eq!(st.manifest_id(), peer_id + 1);
+        let n_superfiles = st.reader().expect("reader").n_superfiles();
+        assert_eq!(n_superfiles, 2, "the merge and the peer's superfile");
+    }
+
+    /// Commit retries for the time-budget test, fewer than the losses it
+    /// injects.
+    const TIGHT_COMMIT_RETRIES: u32 = 2;
+    /// Pointer swaps the time-budget test makes lose.
+    const LOST_POINTER_SWAPS: usize = 4;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_keeps_retrying_past_max_commit_retries_within_the_time_budget() {
+        // The merge is uploaded before its commit. A commit that has lost more
+        // races than `max_commit_retries` keeps retrying while time is left,
+        // rather than throwing the merge away.
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st = Supertable::create(
+            default_supertable_options()
+                .with_storage(storage)
+                .with_max_commit_retries(TIGHT_COMMIT_RETRIES),
+        )
+        .expect("create supertable");
+        commit_mergeable_superfiles(&st);
+        let rows: HashSet<i128> = listed_row_ids(&st).await.into_iter().collect();
+        faults.fail_with(
+            FaultKind::Precondition,
+            FaultOp::PutIfMatch,
+            POINTER_PATH,
+            LOST_POINTER_SWAPS,
+        );
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact commits once the swaps stop losing");
+
+        assert_eq!(faults.fired(), LOST_POINTER_SWAPS);
+        let listed = assert_listed_once(&st, &rows).await;
+        assert_eq!(listed.len(), 1, "one merged superfile: {listed:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_retry_notices_a_dropped_table() {
+        // The table is dropped and purged while the compaction's pointer swap
+        // is in flight. The retry's refresh finds no pointer: the commit stops
+        // with a refresh error and the handle is marked as gone. Driven as a
+        // single job, since a pass refreshes after every batch anyway and
+        // would hide what the retry itself does.
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, local, st, _peer) = make_fault_st_with_peer(&dir);
+        let job = CompactionJob {
+            partition_key: Vec::new(),
+            inputs: st
+                .inner()
+                .manifest
+                .load()
+                .get_all_superfiles()
+                .iter()
+                .map(|e| e.superfile_id)
+                .collect(),
+            estimated_output_bytes: 0,
+            merge_memory_mb: None,
+        };
+        faults.fail_with(
+            FaultKind::Precondition,
+            FaultOp::PutIfMatch,
+            POINTER_PATH,
+            1,
+        );
+        faults.before(FaultOp::PutIfMatch, POINTER_PATH, move || {
+            thread::spawn(move || block_on(local.delete(POINTER_PATH)))
+                .join()
+                .expect("delete thread")
+                .expect("delete pointer");
+        });
+
+        let err = st
+            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect_err("a dropped table cannot commit");
+
+        assert!(matches!(err, CompactionError::Refresh(_)), "{err:?}");
+        assert!(st.pointer_vanished(), "the handle is marked as gone");
+    }
+
     /// Vector dimension of the multi-cell fixture.
     const MULTI_CELL_DIM: usize = 16;
     /// Rows per commit in the multi-cell fixture.
@@ -4472,6 +4733,247 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(n_shared, BATCHES * PER_BATCH, "every document carries it");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multicell_hybrid_compaction_preserves_hybrid_search_after_deletion() {
+        const BATCHES: usize = 60;
+        const DOCS_PER_BATCH: usize = 80;
+        const TOTAL: usize = BATCHES * DOCS_PER_BATCH;
+        const VECTOR_DIM: usize = 16;
+        const TOP_K: usize = 256;
+
+        // Create a Isolated Storage Environment
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+        // Define some Schema for the data to ingested
+        let emb_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(Arc::clone(&emb_field), VECTOR_DIM as i32),
+                false,
+            ),
+        ]));
+
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+
+        let opts = SupertableOptions::new(
+            Arc::clone(&schema),
+            vec![FtsConfig::new("title")],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim: VECTOR_DIM,
+                rot_seed: 42,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq16,
+                provided_centroids: None,
+            }],
+        )
+        .expect("options")
+        .with_writer_pool(pool)
+        .with_storage(Arc::clone(&storage));
+
+        let st = Supertable::create(opts).expect("create");
+
+        let mut all_titles = Vec::with_capacity(TOTAL);
+        let mut deleted_titles = Vec::new();
+
+        for batch_idx in 0..BATCHES {
+            let titles: Vec<String> = (0..DOCS_PER_BATCH)
+                .map(|i| {
+                    let n = batch_idx * DOCS_PER_BATCH + i;
+                    format!("uq{n} shared t{} t{}", n % 37, n % 53)
+                })
+                .collect();
+
+            let mut flat = vec![0.0_f32; DOCS_PER_BATCH * VECTOR_DIM];
+            for i in 0..DOCS_PER_BATCH {
+                let n = batch_idx * DOCS_PER_BATCH + i;
+
+                // Deliberately repeat dimensions. Unique FTS terms, not vector
+                // tie-breaking, identify the document we expect from each query.
+                flat[i * VECTOR_DIM + n % VECTOR_DIM] = 1.0;
+
+                if n.is_multiple_of(97) {
+                    deleted_titles.push(titles[i].clone());
+                }
+            }
+
+            all_titles.extend(titles.iter().cloned());
+
+            let emb = FixedSizeListArray::try_new(
+                Arc::clone(&emb_field),
+                VECTOR_DIM as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            )
+            .expect("embeddings");
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(
+                        titles.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(emb) as ArrayRef,
+                ],
+            )
+            .expect("record batch");
+
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+
+        let before_delete = st.reader().expect("reader before delete");
+        assert_eq!(
+            before_delete.n_superfiles(),
+            BATCHES,
+            "fixture should have one superfile per commit"
+        );
+        assert!(
+            before_delete
+                .manifest()
+                .get_all_superfiles()
+                .iter()
+                .all(|sf| sf.vector_layout == VectorLayout::MultiCellIvf),
+            "fixture must use the normal multi-cell IVF layout"
+        );
+
+        // Delete rows before compaction, so the merge must apply tombstones to
+        // both the FTS postings and the vector index.
+        let predicate = col("title").in_list(
+            deleted_titles
+                .iter()
+                .map(|title| lit(title.as_str()))
+                .collect(),
+            false,
+        );
+
+        let deleted = st.delete(predicate).expect("delete rows");
+        assert_eq!(deleted.matched(), deleted_titles.len());
+
+        let is_deleted = |n: usize| n.is_multiple_of(97);
+
+        // Verify search against the un-compacted table first. These same
+        // expectations must hold after the IVF merge chooses a new FTS doc order.
+        let check_search = |phase: &str| {
+            for &n in &[0usize, 1, 97, 977, 2500, 4095, 4096, 4799] {
+                let expected = all_titles[n].clone();
+                let query = format!("uq{n}");
+
+                let bm25 = st
+                    .bm25_search(
+                        "title",
+                        &query,
+                        TOP_K,
+                        Bm25SearchOptions::new().with_mode(BoolMode::And),
+                        Some(&["title"]),
+                    )
+                    .unwrap_or_else(|e| panic!("{phase}: BM25 for {query}: {e}"));
+
+                let bm25_titles = titles_of(&bm25);
+
+                if is_deleted(n) {
+                    assert!(
+                        !bm25_titles.contains(&expected),
+                        "{phase}: deleted document {expected:?} appeared in BM25"
+                    );
+                } else {
+                    assert_eq!(
+                        bm25_titles,
+                        vec![expected.clone()],
+                        "{phase}: BM25 for {query} named the wrong row"
+                    );
+                }
+
+                let mut q_vec = vec![0.0_f32; VECTOR_DIM];
+                q_vec[n % VECTOR_DIM] = 1.0;
+
+                let hybrid = st
+                    .hybrid_search(
+                        "title",
+                        &query,
+                        BoolMode::And,
+                        "emb",
+                        &q_vec,
+                        VectorSearchOptions::new().with_nprobe(64),
+                        TOP_K,
+                        Some(&["title"]),
+                    )
+                    .unwrap_or_else(|e| panic!("{phase}: hybrid search for {query}: {e}"));
+
+                let hybrid_titles = titles_of(&hybrid);
+
+                if is_deleted(n) {
+                    assert!(
+                        !hybrid_titles.contains(&expected),
+                        "{phase}: deleted document {expected:?} appeared in hybrid search"
+                    );
+                } else {
+                    assert!(
+                        hybrid_titles.contains(&expected),
+                        "{phase}: hybrid search failed to return {expected:?}; \
+                     got {hybrid_titles:?}"
+                    );
+                }
+            }
+        };
+
+        check_search("before compaction");
+
+        let before_compact = st.manifest_id();
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+
+        let reader = st.reader().expect("reader after compaction");
+        assert!(
+            reader.manifest_id() > before_compact,
+            "compaction must have run"
+        );
+        assert_eq!(
+            reader.n_superfiles(),
+            1,
+            "the fixture should produce one merged superfile large enough to reorder"
+        );
+
+        let entry = &reader.manifest().get_all_superfiles()[0];
+        assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
+
+        let (bytes, _) = storage
+            .get(&entry.storage_path())
+            .await
+            .expect("read merged superfile");
+        let merged = SuperfileReader::open(bytes).expect("open merged superfile");
+
+        assert_eq!(
+            merged.n_docs(),
+            (TOTAL - deleted_titles.len()) as u64,
+            "compaction must remove tombstoned rows"
+        );
+        assert!(
+            merged.vec().is_some_and(|v| v.is_multi_cell()),
+            "the merged output must contain a multi-cell IVF vector index"
+        );
+        assert!(
+            merged.fts().expect("merged FTS index").has_doc_map(),
+            "the merged FTS index must use a doc map for the reordered corpus"
+        );
+
+        // Regression check: FTS results must still identify the correct Parquet
+        // rows, hybrid search must retain those results, and deleted rows must
+        // not reappear after the IVF merge.
+        check_search("after compaction");
     }
 
     /// A `WHERE` on an indexed column pushes a row-keyed allow-set into
@@ -5713,11 +6215,13 @@ mod tests {
             partition_key: Vec::new(),
             inputs: vec![Uuid::new_v4(), live[0]],
             estimated_output_bytes: 0,
+            merge_memory_mb: None,
         };
         let good = CompactionJob {
             partition_key: Vec::new(),
             inputs: vec![live[1], live[2]],
             estimated_output_bytes: 0,
+            merge_memory_mb: None,
         };
 
         let err = st
@@ -5839,6 +6343,7 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
+                        merge_memory_mb: None,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -5921,6 +6426,7 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: live.to_vec(),
                     estimated_output_bytes: 0,
+                    merge_memory_mb: None,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -5961,6 +6467,7 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
+                        merge_memory_mb: None,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -6103,6 +6610,7 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: live.clone(),
                     estimated_output_bytes: 0,
+                    merge_memory_mb: None,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -6565,6 +7073,7 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: live.clone(),
                     estimated_output_bytes: 0,
+                    merge_memory_mb: None,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -6651,6 +7160,7 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
+                        merge_memory_mb: None,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -6721,11 +7231,13 @@ mod tests {
                 partition_key: Vec::new(),
                 inputs: vec![live[0], live[1]],
                 estimated_output_bytes: 0,
+                merge_memory_mb: None,
             },
             CompactionJob {
                 partition_key: Vec::new(),
                 inputs: vec![live[2], live[3]],
                 estimated_output_bytes: 0,
+                merge_memory_mb: None,
             },
         ];
         st.run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 2)
@@ -6777,6 +7289,7 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
+                        merge_memory_mb: None,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -6841,6 +7354,7 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: vec![live[0], live[1]],
                     estimated_output_bytes: 0,
+                    merge_memory_mb: None,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -6856,6 +7370,7 @@ mod tests {
                 partition_key: Vec::new(),
                 inputs: vec![live[0], live[1]],
                 estimated_output_bytes: 0,
+                merge_memory_mb: None,
             },
             Duration::ZERO,
         )
