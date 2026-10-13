@@ -550,13 +550,25 @@ pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
 }
 
 /// What a superfile scores a query at: the query's BM25 parameters, and
-/// the table's average length `table_avgdl` for `column`, as the file labels
-/// it.
-fn table_scoring(column: &str, params: Option<Bm25Params>, table_avgdl: f32) -> ScoringView<'_> {
+/// for `column`, as the file labels it, the average length `avgdl` when it
+/// is scored at the table's.
+fn table_scoring(column: &str, params: Option<Bm25Params>, avgdl: Option<f32>) -> ScoringView<'_> {
     ScoringView {
         params,
-        avgdl: Some((column, table_avgdl)),
+        avgdl: avgdl.map(|avgdl| (column, avgdl)),
     }
+}
+
+/// The average length `entry`'s `column` was built at, as its manifest
+/// summary records it. A file whose summary records none is scored at
+/// that average rather than the table's: its stored bounds and term-index
+/// ceilings only hold there, and without the value nothing can rescale
+/// them before the file is opened.
+fn baked_avgdl(entry: &SuperfileEntry, column: FieldId) -> Option<f32> {
+    entry
+        .fts_summary
+        .get(&column)
+        .and_then(|summary| summary.baked_avgdl)
 }
 
 /// Scales each superfile's score ceiling, stored at the average length it
@@ -564,8 +576,8 @@ fn table_scoring(column: &str, params: Option<Bm25Params>, table_avgdl: f32) -> 
 /// `table_avgdl`. A file built at a smaller average scores at most
 /// `table_avgdl / baked` higher there: the length norm
 /// `1 - b + b·dl/avgdl` falls by at most that ratio, and `tf / (tf + k1·norm)`
-/// rises by no more than the norm falls. A file that records no average has
-/// no bound, so it is opened and never skipped.
+/// rises by no more than the norm falls. A file that records no average is
+/// scored at the average it was built at, where its ceiling already holds.
 fn ceilings_at_table_avgdl(
     ceilings: &mut HashMap<Uuid, f32>,
     kept: &[Arc<SuperfileEntry>],
@@ -576,17 +588,14 @@ fn ceilings_at_table_avgdl(
         let Some(ceiling) = ceilings.get_mut(&entry.superfile_id) else {
             continue;
         };
-        let baked = entry
-            .fts_summary
-            .get(&column)
-            .and_then(|summary| summary.baked_avgdl);
-        *ceiling = match baked {
-            Some(baked) if baked >= table_avgdl => *ceiling,
+        if let Some(baked) = baked_avgdl(entry, column)
+            && baked > 0.0
+            && baked < table_avgdl
+        {
             // Rounded up so the division's rounding never leaves the
             // ceiling below a score it has to cap.
-            Some(baked) if baked > 0.0 => (*ceiling * (table_avgdl / baked)).next_up(),
-            _ => f32::INFINITY,
-        };
+            *ceiling = (*ceiling * (table_avgdl / baked)).next_up();
+        }
     }
 }
 
@@ -1049,6 +1058,16 @@ impl SupertableReader {
         // tombstone-filters each unit's hits. The per-unit `params` is
         // the optional doc-id sub-range (`None` searches the whole
         // superfile) plus the superfile id for the tombstone-aware merge.
+        // The superfiles scored at the table's average: those that record
+        // the average they were built at (see `baked_avgdl`).
+        let at_table_avgdl: Arc<HashSet<Uuid>> = Arc::new(match manifest.field_id(column) {
+            Some(column_id) => kept
+                .iter()
+                .filter(|entry| baked_avgdl(entry, column_id).is_some())
+                .map(|entry| entry.superfile_id)
+                .collect(),
+            None => HashSet::new(),
+        });
         let kernel = move |r: Arc<SuperfileReader>,
                            (range, suid, uri, _ceiling): (
             Option<(u32, u32)>,
@@ -1056,6 +1075,7 @@ impl SupertableReader {
             SuperfileUri,
             f32,
         )| {
+            let avgdl = at_table_avgdl.contains(&suid).then_some(table_avgdl);
             let column_arc = Arc::clone(&column_arc);
             let must_arc = Arc::clone(&must_arc);
             let should_arc = Arc::clone(&should_arc);
@@ -1085,7 +1105,7 @@ impl SupertableReader {
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
                 let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
-                let scoring = table_scoring(&column_arc, bm25_params, table_avgdl);
+                let scoring = table_scoring(&column_arc, bm25_params, avgdl);
 
                 // This superfile's open-wave fetches (global stats): the
                 // cursor builds below serve the scored terms from the memo
@@ -1179,11 +1199,7 @@ impl SupertableReader {
                                             start,
                                             end,
                                             floor,
-                                            &table_scoring(
-                                                &kernel_column,
-                                                bm25_params,
-                                                table_avgdl,
-                                            ),
+                                            &table_scoring(&kernel_column, bm25_params, avgdl),
                                         )
                                     })
                                 },
@@ -1258,11 +1274,7 @@ impl SupertableReader {
                                         op_stats::timed_kernel(&kernel_stats, || {
                                             kernel_reader.run_prepared(
                                                 prep,
-                                                &table_scoring(
-                                                    &kernel_column,
-                                                    bm25_params,
-                                                    table_avgdl,
-                                                ),
+                                                &table_scoring(&kernel_column, bm25_params, avgdl),
                                             )
                                         })
                                     },
@@ -3051,8 +3063,8 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             error::QueryError,
-            manifest::{SuperfileEntry, SuperfileUri, commit::read_pointer, list},
-            schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+            manifest::{FtsSummaryAgg, SuperfileEntry, SuperfileUri, commit::read_pointer, list},
+            schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
         },
     };
 
@@ -3455,6 +3467,51 @@ mod tests {
         ],
         &["alpha zebra x", "gamma zest y", "delta z", "epsilon w"],
     ];
+
+    /// Averages for the ceiling-scaling test: a table average, and files
+    /// built at half and at twice it.
+    const TABLE_AVG: f32 = 4.0;
+    const SHORTER_AVG: f32 = 2.0;
+    const LONGER_AVG: f32 = 8.0;
+    /// A ceiling as the term index stores it, before any scaling.
+    const STORED_CEILING: f32 = 1.0;
+
+    /// A ceiling stored at a shorter average than the table's is scaled up
+    /// by their ratio. One stored at a longer average still holds, and so
+    /// does one from a file that records no average: that file is scored at
+    /// the average it was built at.
+    #[test]
+    fn ceilings_scale_only_for_files_built_at_a_shorter_average() {
+        let column = FieldId(0);
+        let entry = |baked: Option<f32>| {
+            let mut entry = (*manifest_entry(1)).clone();
+            entry.fts_summary.insert(
+                column,
+                FtsSummaryAgg::new_with_params(
+                    None,
+                    0,
+                    (Vec::new(), Vec::new()),
+                    ColumnLengthStats::default(),
+                    baked,
+                ),
+            );
+            Arc::new(entry)
+        };
+        let kept = vec![
+            entry(Some(SHORTER_AVG)),
+            entry(Some(LONGER_AVG)),
+            entry(None),
+        ];
+        let mut ceilings: HashMap<Uuid, f32> = kept
+            .iter()
+            .map(|e| (e.superfile_id, STORED_CEILING))
+            .collect();
+        super::ceilings_at_table_avgdl(&mut ceilings, &kept, column, TABLE_AVG);
+        let ceiling = |i: usize| ceilings[&kept[i].superfile_id];
+        assert!(ceiling(0) >= STORED_CEILING * TABLE_AVG / SHORTER_AVG);
+        assert_eq!(ceiling(1), STORED_CEILING);
+        assert_eq!(ceiling(2), STORED_CEILING);
+    }
 
     /// The `title` average length superfile `sf` declares in its footer.
     fn declared_title_avgdl(reader: &SupertableReader, sf: &SuperfileEntry) -> f32 {
