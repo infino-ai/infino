@@ -1055,11 +1055,20 @@ impl FtsReader {
                         }));
                     }
                 }
-                let rows: Vec<RowId> = body
-                    .chunks_exact(U32_BYTES)
-                    .map(|b| RowId::new(read_u32_le(b)))
-                    .collect();
-                DocMap::permuted(Arc::from(rows))
+                // Held as bytes rather than decoded. On a blob opened from a
+                // memory mapping the region is the mapping itself, so the map
+                // costs no heap at open and its pages stay evictable, where a
+                // decoded copy would sit on the heap for the life of the
+                // reader. A lazy source may answer a read this large with a
+                // window onto a bigger fetch, and keeping the window would keep
+                // that whole fetch alive for as long; the map is the one read
+                // of the open the reader holds on to, so over such a source it
+                // takes a copy of the map alone.
+                let region = match &source {
+                    Source::InMemory(_) => body,
+                    Source::Lazy(_) => Bytes::copy_from_slice(&body),
+                };
+                DocMap::permuted(region)
             }
         };
 
@@ -2819,6 +2828,98 @@ mod tests {
                 "n_docs {n_docs}: and name every row exactly once"
             );
         }
+    }
+
+    /// Smallest read the window source answers with a window onto its
+    /// whole backing fetch rather than a copy, the way the block cache
+    /// answers a read of a cache block or more.
+    const WINDOW_AT_LEAST: u64 = 1024;
+
+    /// Documents in the reordered blob: enough that its doc-id map is the
+    /// one read of a lazy open the window source answers with a window.
+    const WINDOWED_MAP_DOCS: u32 = 1024;
+
+    /// The fetch a [`WindowSource`] hands out windows onto. Each window
+    /// holds one reference to it, so the count on the inner `Arc` says who
+    /// still has one.
+    struct Backing(Arc<Vec<u8>>);
+
+    impl AsRef<[u8]> for Backing {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    /// A source that answers every read of at least [`WINDOW_AT_LEAST`]
+    /// bytes with a window onto one shared fetch, and smaller reads with a
+    /// copy, the way the block cache serves a cold read.
+    struct WindowSource {
+        backing: Arc<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for WindowSource {
+        fn size(&self) -> u64 {
+            self.backing.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let range = start as usize..(start + len) as usize;
+            Ok(if len < WINDOW_AT_LEAST {
+                Bytes::copy_from_slice(&self.backing[range])
+            } else {
+                Bytes::from_owner(Backing(Arc::clone(&self.backing))).slice(range)
+            })
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// A reader opened over a source that answers big reads with windows
+    /// onto a larger fetch keeps none of that fetch alive through its
+    /// doc-id map. The window the map arrives in can be the tail of a
+    /// fetch many times the map's size, and the reader holds the map for
+    /// its whole life, so over a lazy source it takes a copy of the map
+    /// alone.
+    #[tokio::test]
+    async fn a_lazy_reader_keeps_no_window_onto_a_fetch_through_its_doc_map() {
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let map: Vec<u32> = (0..WINDOWED_MAP_DOCS).rev().collect();
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for (id, &row) in map.iter().enumerate() {
+            b.add_doc(0, id as u32, &format!("alpha t{}", row % 7))
+                .expect("add doc");
+        }
+        b.doc_map = Some(map.clone());
+        let backing = Arc::new(b.finish().expect("finish"));
+        assert!(
+            u64::from(WINDOWED_MAP_DOCS) * (U32_BYTES as u64) >= WINDOW_AT_LEAST,
+            "the map must be big enough to arrive as a window"
+        );
+
+        let source: Arc<dyn LazyByteSource> = Arc::new(WindowSource {
+            backing: Arc::clone(&backing),
+        });
+        let reader = FtsReader::open_lazy(source, json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+
+        assert!(reader.has_doc_map(), "the map must survive a lazy open");
+        for (id, &row) in map.iter().enumerate() {
+            assert_eq!(
+                reader.row_of(FtsDocId::new(id as u32)),
+                RowId::new(row),
+                "doc id {id} must name row {row}"
+            );
+        }
+        assert_eq!(
+            Arc::strong_count(&backing),
+            2,
+            "only this test and the source hold the fetch; the reader kept a window onto it"
+        );
     }
 
     /// The ranged union kernel windows on the blob's own ids while
