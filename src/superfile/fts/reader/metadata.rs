@@ -54,13 +54,12 @@ pub struct NormTable {
     ///
     /// Owned, and deliberately so. A blob that stores its buckets hands the
     /// reader the region directly, and holding it would cost no heap at all,
-    /// but measurement says the scorer pays for that twice: the wider handle
-    /// inflates the struct it touches per document, and the mapped region
-    /// loses the page locality of a freshly written array. Together those
-    /// cost about 2.6 percent on a large scoring query. Copying the stored
-    /// bytes here keeps the shape the scorer is tuned for; what the stored
-    /// buckets save is the per-document pass that derived them, which is the
-    /// expensive part of the load.
+    /// but scoring out of the mapping measured about 1.3 percent slower on a
+    /// large union over 5M documents: the mapped region does not have the
+    /// page locality of an array just written. Copying the stored bytes here
+    /// keeps the shape the scorer is tuned for, and what the stored buckets
+    /// are for survives the copy, since the expensive part of the load was
+    /// the per-document pass that derived them, not the allocation.
     bytes: Arc<[u8]>,
     /// Bucket → `k1·(1 - b + b·dequantize_len(bucket)/avgdl)`. A fixed
     /// 256-entry table, boxed so `ColumnMeta` stays pointer-sized (it is
