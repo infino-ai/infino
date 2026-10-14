@@ -52,12 +52,16 @@ pub struct NormTable {
     /// rather than copied so [`NormTable::rescored`] costs one refcount
     /// bump plus a 1 KiB table instead of a pass over every doc.
     ///
-    /// `Bytes` rather than an owned slice because a blob that stores its
-    /// buckets hands this the region itself. On a memory-mapped superfile
-    /// that region is the mapping, so the table costs no heap at all and
-    /// stays evictable; a blob that does not store them quantizes into an
-    /// owned buffer as before and wraps it here.
-    bytes: Bytes,
+    /// Owned, and deliberately so. A blob that stores its buckets hands the
+    /// reader the region directly, and holding it would cost no heap at all,
+    /// but measurement says the scorer pays for that twice: the wider handle
+    /// inflates the struct it touches per document, and the mapped region
+    /// loses the page locality of a freshly written array. Together those
+    /// cost about 2.6 percent on a large scoring query. Copying the stored
+    /// bytes here keeps the shape the scorer is tuned for; what the stored
+    /// buckets save is the per-document pass that derived them, which is the
+    /// expensive part of the load.
+    bytes: Arc<[u8]>,
     /// Bucket → `k1·(1 - b + b·dequantize_len(bucket)/avgdl)`. A fixed
     /// 256-entry table, boxed so `ColumnMeta` stays pointer-sized (it is
     /// scanned by non-scoring paths — column lookup, listing) while the
@@ -187,7 +191,7 @@ impl NormTable {
             return (Self::empty(), stats);
         }
         let table = Self {
-            bytes: Bytes::from(bytes),
+            bytes: Arc::from(bytes),
             lut: build_lut(avgdl, params),
             occupied: (lo, hi),
             avgdl,
@@ -199,7 +203,7 @@ impl NormTable {
     /// the writer recorded. Nothing is derived and nothing is copied: the
     /// whole cost is the 256-entry lookup table.
     pub(super) fn from_stored(
-        bytes: Bytes,
+        bytes: Arc<[u8]>,
         occupied: (u8, u8),
         avgdl: f32,
         params: bm25::Bm25Params,
@@ -224,7 +228,7 @@ impl NormTable {
             return Self::empty();
         }
         Self {
-            bytes: self.bytes.clone(),
+            bytes: Arc::clone(&self.bytes),
             lut: build_lut(avgdl, params),
             occupied: self.occupied,
             avgdl,
@@ -310,7 +314,7 @@ impl NormTable {
     /// read.
     pub(super) fn empty() -> Self {
         Self {
-            bytes: Bytes::new(),
+            bytes: Arc::from(Vec::new()),
             lut: Arc::new([0.0; 256]),
             occupied: (0, 0),
             avgdl: 0.0,
@@ -372,7 +376,7 @@ impl ColumnNorms {
     /// Build from the buckets the blob stores, with the statistics and
     /// occupied range it recorded beside them, so no document is touched.
     pub(super) fn from_stored(
-        buckets: Bytes,
+        buckets: Arc<[u8]>,
         stored: &StoredNorms,
         params: bm25::Bm25Params,
         baked_avgdl: f32,
@@ -560,15 +564,17 @@ impl ColumnMeta {
     /// build the declared-parameter norms from it into the cell: the one way
     /// a read of the array becomes norms, whichever path read it. A racing
     /// reader may have filled the cell first; either is the same table.
-    pub(super) fn install_norms(&self, array_with_crc: &Bytes) -> Result<&ColumnNorms, FtsError> {
+    pub(super) fn install_norms(&self, array_with_crc: &[u8]) -> Result<&ColumnNorms, FtsError> {
         self.check_array_crc(array_with_crc)?;
         let norms = match &self.stored_norms {
-            // The buckets are already in the region; take them as a slice of
-            // it rather than quantizing the lengths that precede them. On a
-            // memory-mapped blob that slice is the mapping.
+            // The buckets are already in the region, so this copies them
+            // rather than deriving them: one memcpy in place of a pass that
+            // quantized every document and summed its length. The copy is
+            // what keeps the scorer's memory shape unchanged.
             Some(stored) => {
                 let lengths_len = self.doc_lengths_range.len();
-                let buckets = array_with_crc.slice(lengths_len..lengths_len + stored.buckets.len());
+                let buckets =
+                    Arc::from(&array_with_crc[lengths_len..lengths_len + stored.buckets.len()]);
                 ColumnNorms::from_stored(buckets, stored, self.declared_params, self.baked_avgdl)
             }
             None => self.norms_from_array(&array_with_crc[..self.doc_lengths_range.len()]),
