@@ -287,6 +287,31 @@ const PATCHED_MAX_DF: usize = 16 * 1024;
 /// u32 (bounded by column count and doc length respectively).
 pub(crate) const DOC_LENGTHS_ENTRY_SIZE: usize = 16;
 
+/// Doc-lengths directory entry for [`format::fts::VERSION_V9`], which widens
+/// the entry to carry what a reader used to derive by walking the column:
+///
+/// ```text
+///   off  0 ..  4 : column_id (u32)
+///   off  4 .. 12 : doc_lengths_offset (u64)
+///   off 12 .. 16 : avgdl_x1000 (u32)
+///   off 16 .. 24 : total_tokens (u64)   — exact sum of the column's lengths
+///   off 24 .. 32 : n_scored_docs (u64)  — documents carrying a token here
+///   off 32 .. 33 : occupied_lo (u8)     — lowest bucket any document uses
+///   off 33 .. 34 : occupied_hi (u8)     — highest, for the bound scale
+/// ```
+///
+/// Without these a reader still has to touch every document to learn the
+/// column's totals, which is the walk the stored buckets exist to remove.
+pub(crate) const DOC_LENGTHS_ENTRY_SIZE_V9: usize = 34;
+
+/// The doc-lengths directory entry width `version` uses.
+pub(crate) const fn doc_lengths_entry_size(version: u32) -> usize {
+    match format::fts::has_stored_buckets(version) {
+        true => DOC_LENGTHS_ENTRY_SIZE_V9,
+        false => DOC_LENGTHS_ENTRY_SIZE,
+    }
+}
+
 /// Default per-column in-RAM accumulator budget before a column
 /// flushes to spill files. Mirrors `VectorBuilder::spill_threshold_bytes`
 /// (also 256 MiB by default). Builds whose every column stays below
@@ -345,18 +370,19 @@ const EXTERNAL_MERGE_CHUNK_CAP_TRIPLES: usize = 1024 * 1024;
 /// per flush).
 const SORT_OUTPUT_BATCH_TRIPLES: usize = 4096;
 
-/// The version stamped on a finished blob: [`format::fts::VERSION_V8`]
-/// when the documents carry a doc-id map, [`format::fts::VERSION_V7`]
-/// otherwise.
+/// The version stamped on a finished blob, which is always
+/// [`format::fts::VERSION_CURRENT`].
+///
+/// Reordered or not, a blob gets the same version: `V9` records the doc-id
+/// map's length in its header, so one version describes a blob with a map and
+/// one without. Older blobs encoded that distinction in the version itself
+/// and are still read, never written.
 ///
 /// A column's BM25 parameters do not move the version: they are recorded
 /// in its `inf.fts.columns` entry and read back from there, so the stored
 /// per-block bound is interpreted against the pair that entry names.
-fn blob_version(doc_map: &Option<Vec<u32>>) -> u32 {
-    match doc_map {
-        Some(_) => format::fts::VERSION_V8,
-        None => format::fts::VERSION_V7,
-    }
+fn blob_version(_doc_map: &Option<Vec<u32>>) -> u32 {
+    format::fts::VERSION_CURRENT
 }
 
 /// The per-document length as the blob stores it, saturated to the
@@ -3602,11 +3628,16 @@ fn assemble_and_write_blob<W: Write>(
         Some(map) => (map.len() * format::fts::U32_BYTES + format::CRC_BYTES) as u64,
         None => 0,
     };
-    let doc_lengths_table_offset: u64 = doc_map_offset + doc_map_len;
+    // The map's length as a trailer the reader finds by stepping back from
+    // the directory, so one version describes a blob with a map and one
+    // without while the header keeps its single width.
+    let doc_map_len_trailer = format::fts::doc_map_len_trailer(fts_version) as u64;
+    let doc_lengths_table_offset: u64 = doc_map_offset + doc_map_len + doc_map_len_trailer;
+    let entry_size = doc_lengths_entry_size(fts_version);
     let mut doc_lengths_array_offset: u64 =
-        doc_lengths_table_offset + (n_columns as u64) * (DOC_LENGTHS_ENTRY_SIZE as u64) + 4 /* dir CRC */;
+        doc_lengths_table_offset + (n_columns as u64) * (entry_size as u64) + 4 /* dir CRC */;
 
-    let mut dir_buf: Vec<u8> = Vec::with_capacity(n_columns as usize * DOC_LENGTHS_ENTRY_SIZE);
+    let mut dir_buf: Vec<u8> = Vec::with_capacity(n_columns as usize * entry_size);
     let mut arrays_buf: Vec<u8> = Vec::new();
     for i in 0..n_columns as usize {
         let avgdl_x1000 = bm25::avgdl_x1000(avgdl_per_col[i]);
@@ -3623,11 +3654,38 @@ fn assemble_and_write_blob<W: Write>(
         for &dl in &col_dls {
             arrays_buf.extend_from_slice(&(dl as u16).to_le_bytes());
         }
+        // The buckets the scorer indexes by, written beside the lengths they
+        // quantize so a reader scores without deriving them. The totals and
+        // the occupied range come from the same pass and go in the entry, so
+        // nothing about this column costs a reader a walk.
+        let mut stats = ColumnLengthStats::default();
+        let mut occupied_lo = u8::MAX;
+        let mut occupied_hi = u8::MIN;
+        for &dl in &col_dls {
+            let bucket = bm25::quantize_len(dl);
+            occupied_lo = occupied_lo.min(bucket);
+            occupied_hi = occupied_hi.max(bucket);
+            arrays_buf.push(bucket);
+            stats.add(dl);
+        }
+        if col_dls.is_empty() {
+            occupied_lo = 0;
+            occupied_hi = 0;
+        }
+        dir_buf.extend_from_slice(&stats.total_tokens.to_le_bytes());
+        dir_buf.extend_from_slice(&stats.n_scored_docs.to_le_bytes());
+        dir_buf.push(occupied_lo);
+        dir_buf.push(occupied_hi);
+
+        // One CRC over both arrays: they are written together and a reader
+        // that trusts one must trust the other.
         let array_bytes = &arrays_buf[array_start..];
         let array_crc = crc32c(array_bytes);
         arrays_buf.extend_from_slice(&array_crc.to_le_bytes());
-        doc_lengths_array_offset +=
-            (col_dls.len() * format::fts::DOC_LENGTH_BYTES) as u64 + format::CRC_BYTES as u64;
+        doc_lengths_array_offset += (col_dls.len()
+            * (format::fts::DOC_LENGTH_BYTES + format::fts::DOC_LENGTH_BUCKET_BYTES))
+            as u64
+            + format::CRC_BYTES as u64;
     }
     let dir_crc = crc32c(&dir_buf);
     dir_buf.extend_from_slice(&dir_crc.to_le_bytes());
@@ -3648,16 +3706,18 @@ fn assemble_and_write_blob<W: Write>(
     header.extend_from_slice(&postings_offset.to_le_bytes()); // 8
     header.extend_from_slice(&doc_lengths_table_offset.to_le_bytes()); // 8
     header.extend_from_slice(&positions_offset.to_le_bytes()); // 8
-    // The doc-id map needs no field: it is the last region before the
-    // doc-lengths directory and its size follows from the document
-    // count, so a reader derives where it starts. That is what keeps
-    // every version's header one width, and a cold open to one read.
+    // The doc-id map needs no header field: its length is the trailer written
+    // immediately before the doc-lengths directory, which a reader already
+    // fetches. That is what keeps every version's header one width, and a
+    // cold open to one read.
     debug_assert_eq!(header.len(), header_size as usize, "header size mismatch");
     debug_assert!(
         doc_map.as_ref().is_none_or(|m| doc_lengths_table_offset
-            == doc_map_offset + (m.len() * format::fts::U32_BYTES + format::CRC_BYTES) as u64),
-        "the doc-id map must be the last region before the doc-lengths directory, \
-         or a reader cannot derive where it starts"
+            == doc_map_offset
+                + (m.len() * format::fts::U32_BYTES + format::CRC_BYTES) as u64
+                + doc_map_len_trailer),
+        "the doc-id map and its length trailer must be the last things before \
+         the doc-lengths directory, or a reader cannot find where the map starts"
     );
 
     w.write_all(&header)?;
@@ -3700,6 +3760,11 @@ fn assemble_and_write_blob<W: Write>(
         let map_crc = crc32c(&map_buf);
         w.write_all(&map_buf)?;
         w.write_all(&map_crc.to_le_bytes())?;
+    }
+    // The trailer the reader steps back to, written whether or not there is a
+    // map: zero says there is none.
+    if doc_map_len_trailer > 0 {
+        w.write_all(&doc_map_len.to_le_bytes())?;
     }
 
     w.write_all(&dir_buf)?;
@@ -4723,7 +4788,7 @@ mod tests {
         assert_eq!(&blob[0..8], format::fts::MAGIC);
         // Version — new code always writes the current version.
         let version = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]);
-        assert_eq!(version, format::fts::VERSION_V7);
+        assert_eq!(version, format::fts::VERSION_CURRENT);
         // n_columns.
         let n_cols = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]);
         assert_eq!(n_cols, 1);
@@ -5295,7 +5360,7 @@ mod tests {
         let spilled_pos = build_title_blob_spilled(&docs, true, None);
         assert_eq!(
             u32::from_le_bytes(spilled_pos[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V7
+            format::fts::VERSION_CURRENT
         );
         let inram_pos = build_title_blob(&docs, true);
         let inram_plain = build_title_blob(&docs, false);
@@ -5382,13 +5447,16 @@ mod tests {
         let version_of = |blob: &bytes::Bytes| {
             u32::from_le_bytes(blob[8..12].try_into().expect("4 header bytes"))
         };
-        assert_eq!(version_of(&plain), format::fts::VERSION_V7);
-        assert_eq!(version_of(&positional), format::fts::VERSION_V7);
+        assert_eq!(version_of(&plain), format::fts::VERSION_CURRENT);
+        assert_eq!(version_of(&positional), format::fts::VERSION_CURRENT);
 
-        // A positionless build's region is just the CRC-of-empty.
+        // A positionless build's region is just the CRC-of-empty. The
+        // doc-id map's length trailer sits between it and the directory, so
+        // the span from the positions offset to the directory covers both.
         let read_u64_plain =
             |at: usize| u64::from_le_bytes(plain[at..at + 8].try_into().expect("8 header bytes"));
-        let region_len = read_u64_plain(40) - read_u64_plain(48);
+        let trailer = format::fts::doc_map_len_trailer(version_of(&plain)) as u64;
+        let region_len = read_u64_plain(40) - read_u64_plain(48) - trailer;
         assert_eq!(region_len, 4, "positionless region = 4-byte CRC only");
 
         // The positions-region offset points between the postings region
@@ -5484,7 +5552,7 @@ mod tests {
         let blob = bytes::Bytes::from(b.finish().expect("finish"));
         assert_eq!(
             u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_V7
+            format::fts::VERSION_CURRENT
         );
         let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75},{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let r = FtsReader::open(blob, json).expect("open");

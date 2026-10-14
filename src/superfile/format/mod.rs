@@ -108,6 +108,50 @@ pub mod fts {
     /// change to the id that breaks the tie.
     pub const VERSION_V8: u32 = 8;
 
+    /// The version written when a blob stores the scorer's length buckets
+    /// rather than leaving the reader to derive them.
+    ///
+    /// A `V7` blob stores each document's length as a `u16` and the reader
+    /// quantizes it into a one-byte bucket on the column's first scored use,
+    /// walking every document to do it and keeping the result on the heap for
+    /// the life of the reader. The buckets are what the scorer actually
+    /// indexes by; the exact lengths it never reads. So `V9` writes the
+    /// bucket array too, immediately after the length array and under the
+    /// same CRC, and widens the doc-lengths directory entry to carry what
+    /// that walk also computed: the column's token total, its scored-document
+    /// count, and the lowest and highest bucket any of its documents occupy.
+    ///
+    /// The lengths stay. They are not redundant: quantizing loses
+    /// information, and a merge rebuilds a column's statistics from the exact
+    /// values. What changes is that a reader never has to derive the buckets,
+    /// so it can score straight out of the stored region and leave it where
+    /// it lies. The cost is one byte per document per column on disk.
+    ///
+    /// `V9` is also the only version this engine writes, reordered or not,
+    /// which `V7` and `V8` could not be between them: those two encode the
+    /// presence of the doc-id map in the version itself, so a writer had to
+    /// choose. `V9` writes the map's length instead, as a `u64` in the eight
+    /// bytes immediately before the doc-lengths directory
+    /// ([`DOC_MAP_LEN_TRAILER_BYTES`]), zero when there is no map.
+    ///
+    /// Before the directory rather than in the header, because the header is
+    /// one width for every version and a cold open reads it in one span: the
+    /// eight bytes that would widen it are enough to break the coalesced
+    /// group a cold query's reads form, and the same bytes then arrive as two
+    /// requests instead of one. The directory is already fetched at open and
+    /// sits immediately after this trailer, so reading it costs nothing.
+    pub const VERSION_V9: u32 = 9;
+
+    /// Whether `version` stores the scorer's length buckets and the widened
+    /// doc-lengths directory entry that describes them.
+    pub const fn has_stored_buckets(version: u32) -> bool {
+        version >= VERSION_V9
+    }
+
+    /// Bytes per stored length bucket: the `u8` the scorer indexes its
+    /// 256-entry table by.
+    pub const DOC_LENGTH_BUCKET_BYTES: usize = 1;
+
     /// The oldest blob version this crate reads. A blob below it was
     /// written before [`VERSION_MIN_RELEASE`] and is refused on open with
     /// an error that says to reindex it with [`REPAIR_RELEASE`].
@@ -123,11 +167,12 @@ pub mod fts {
     /// The blob version a file must carry to be current — what the
     /// staleness check compares against and what a migration plans from.
     ///
-    /// Not the newest version: [`VERSION_V8`] sits above it and is written
-    /// only where a compaction chooses an order, so deriving this from the
-    /// highest known version would mark every plain file stale and have a
-    /// reindex re-emit the same version forever.
-    pub const VERSION_CURRENT: u32 = VERSION_V7;
+    /// Not the newest version: the reordered versions sit above it and are
+    /// written only where a compaction chooses an order, so deriving this
+    /// from the highest known version would mark every plain file stale and
+    /// have a reindex re-emit the same version forever. It is the version a
+    /// plain build writes, which is what the builder's own test asserts.
+    pub const VERSION_CURRENT: u32 = VERSION_V9;
 
     /// Bytes per stored document length: a `u16`, saturating at
     /// [`DOC_LENGTH_STORED_MAX`]. The scorer reads a one-byte bucket of
@@ -166,8 +211,23 @@ pub mod fts {
     pub const COARSE_BLOCK_MAX_SPAN: usize = 32;
 
     /// FTS blob header size in bytes: the fields in [`hdr`]. The term
-    /// dictionary begins immediately after it.
+    /// dictionary begins immediately after it. One width for every version,
+    /// which is what keeps a cold open to a single header span.
     pub const HEADER_SIZE: usize = 56;
+
+    /// Bytes [`VERSION_V9`] writes immediately before the doc-lengths
+    /// directory: the doc-id map's length as a `u64`, zero when there is no
+    /// map. Older versions have no trailer and derive the length from the
+    /// document count, which is why they needed a version per case.
+    pub const DOC_MAP_LEN_TRAILER_BYTES: usize = 8;
+
+    /// The trailer `version` writes before its doc-lengths directory.
+    pub const fn doc_map_len_trailer(version: u32) -> usize {
+        match has_stored_buckets(version) {
+            true => DOC_MAP_LEN_TRAILER_BYTES,
+            false => 0,
+        }
+    }
 
     /// Width of the 8-byte FTS magic field.
     pub const MAGIC_BYTES: usize = 8;
@@ -690,7 +750,7 @@ mod tests {
     fn the_current_version_is_readable_and_below_the_newest() {
         const {
             assert!(fts::VERSION_MIN <= fts::VERSION_CURRENT);
-            assert!(fts::VERSION_CURRENT <= fts::VERSION_V8);
+            assert!(fts::VERSION_CURRENT <= fts::VERSION_V9);
         }
     }
 

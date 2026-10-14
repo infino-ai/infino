@@ -11,6 +11,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::{
@@ -48,9 +49,15 @@ pub(super) const LENGTH_ARRAY: &str = "fts/doc_lengths_array";
 pub struct NormTable {
     /// Per-doc quantized length bucket. Empty for a column with no docs.
     /// Parameter-free — the buckets are lengths, not norms — and shared
-    /// rather than copied so [`NormTable::rescored`] costs one `Arc`
+    /// rather than copied so [`NormTable::rescored`] costs one refcount
     /// bump plus a 1 KiB table instead of a pass over every doc.
-    bytes: Arc<[u8]>,
+    ///
+    /// `Bytes` rather than an owned slice because a blob that stores its
+    /// buckets hands this the region itself. On a memory-mapped superfile
+    /// that region is the mapping, so the table costs no heap at all and
+    /// stays evictable; a blob that does not store them quantizes into an
+    /// owned buffer as before and wraps it here.
+    bytes: Bytes,
     /// Bucket → `k1·(1 - b + b·dequantize_len(bucket)/avgdl)`. A fixed
     /// 256-entry table, boxed so `ColumnMeta` stays pointer-sized (it is
     /// scanned by non-scoring paths — column lookup, listing) while the
@@ -180,12 +187,32 @@ impl NormTable {
             return (Self::empty(), stats);
         }
         let table = Self {
-            bytes: Arc::from(bytes),
+            bytes: Bytes::from(bytes),
             lut: build_lut(avgdl, params),
             occupied: (lo, hi),
             avgdl,
         };
         (table, stats)
+    }
+
+    /// A table over buckets the blob already holds, with the occupied range
+    /// the writer recorded. Nothing is derived and nothing is copied: the
+    /// whole cost is the 256-entry lookup table.
+    pub(super) fn from_stored(
+        bytes: Bytes,
+        occupied: (u8, u8),
+        avgdl: f32,
+        params: bm25::Bm25Params,
+    ) -> Self {
+        if bytes.is_empty() {
+            return Self::empty();
+        }
+        Self {
+            bytes,
+            lut: build_lut(avgdl, params),
+            occupied,
+            avgdl,
+        }
     }
 
     /// The same per-doc buckets decoded at a different average length
@@ -197,7 +224,7 @@ impl NormTable {
             return Self::empty();
         }
         Self {
-            bytes: Arc::clone(&self.bytes),
+            bytes: self.bytes.clone(),
             lut: build_lut(avgdl, params),
             occupied: self.occupied,
             avgdl,
@@ -262,6 +289,13 @@ impl NormTable {
         self.lut[self.bytes[doc as usize] as usize]
     }
 
+    /// The buckets this table scores by. Test-only: the query path indexes
+    /// them and never needs the slice.
+    #[cfg(test)]
+    pub(super) fn buckets(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Number of docs in the table. Test-only: the query path indexes
     /// by doc id and never needs the count.
     #[cfg(test)]
@@ -276,7 +310,7 @@ impl NormTable {
     /// read.
     pub(super) fn empty() -> Self {
         Self {
-            bytes: Arc::from(Vec::new()),
+            bytes: Bytes::new(),
             lut: Arc::new([0.0; 256]),
             occupied: (0, 0),
             avgdl: 0.0,
@@ -335,6 +369,24 @@ impl ColumnNorms {
         }
     }
 
+    /// Build from the buckets the blob stores, with the statistics and
+    /// occupied range it recorded beside them, so no document is touched.
+    pub(super) fn from_stored(
+        buckets: Bytes,
+        stored: &StoredNorms,
+        params: bm25::Bm25Params,
+        baked_avgdl: f32,
+    ) -> Self {
+        if stored.stats.n_scored_docs == 0 {
+            return Self::empty();
+        }
+        Self {
+            dl_norm_k1: NormTable::from_stored(buckets, stored.occupied, baked_avgdl, params),
+            length_stats: stored.stats,
+            bound_scale: 1.0,
+        }
+    }
+
     /// The norms for a column that has none to read (a failed or empty
     /// array): every score computes against an empty table.
     fn empty() -> Self {
@@ -375,6 +427,17 @@ impl ColumnNorms {
             length_stats: self.length_stats,
         }
     }
+}
+
+/// What a [`crate::superfile::format::fts::VERSION_V9`] blob records for a
+/// column so that opening it costs no pass over its documents: where the
+/// stored bucket array lies, the column's totals, and the lowest and highest
+/// bucket its documents occupy.
+#[derive(Clone, Debug)]
+pub(super) struct StoredNorms {
+    pub(super) buckets: Range<usize>,
+    pub(super) stats: ColumnLengthStats,
+    pub(super) occupied: (u8, u8),
 }
 
 /// One FTS column as the reader sees it: its configuration, where its
@@ -419,6 +482,9 @@ pub struct ColumnMeta {
     pub(super) declared_params: bm25::Bm25Params,
     /// Whether the length array's CRC is checked when it is read.
     pub(super) verify_crc: bool,
+    /// Present when the blob stores its buckets; absent on an older blob,
+    /// which quantizes its lengths on first scored use instead.
+    pub(super) stored_norms: Option<StoredNorms>,
     /// Norms at the declared parameters, shared by every view of the reader.
     pub(super) base_norms: Arc<OnceLock<ColumnNorms>>,
     /// Norms at `params` when they differ from the declared pair, derived
@@ -494,25 +560,40 @@ impl ColumnMeta {
     /// build the declared-parameter norms from it into the cell: the one way
     /// a read of the array becomes norms, whichever path read it. A racing
     /// reader may have filled the cell first; either is the same table.
-    pub(super) fn install_norms(&self, array_with_crc: &[u8]) -> Result<&ColumnNorms, FtsError> {
+    pub(super) fn install_norms(&self, array_with_crc: &Bytes) -> Result<&ColumnNorms, FtsError> {
         self.check_array_crc(array_with_crc)?;
-        let norms = self.norms_from_array(&array_with_crc[..self.array_len()]);
+        let norms = match &self.stored_norms {
+            // The buckets are already in the region; take them as a slice of
+            // it rather than quantizing the lengths that precede them. On a
+            // memory-mapped blob that slice is the mapping.
+            Some(stored) => {
+                let lengths_len = self.doc_lengths_range.len();
+                let buckets = array_with_crc.slice(lengths_len..lengths_len + stored.buckets.len());
+                ColumnNorms::from_stored(buckets, stored, self.declared_params, self.baked_avgdl)
+            }
+            None => self.norms_from_array(&array_with_crc[..self.doc_lengths_range.len()]),
+        };
         Ok(self.base_norms.get_or_init(|| norms))
     }
 
-    /// The length array's byte length, `n_docs × DOC_LENGTH_BYTES`: the
-    /// span of [`Self::doc_lengths_range`], which the open path computed and
-    /// bounded against the blob. Read off the range rather than recomputed,
-    /// so no reader of the array carries arithmetic of its own.
+    /// The bytes a column's trailing CRC covers: its length array, and the
+    /// bucket array beside it when the blob stores one. Read off the ranges
+    /// the open path computed and bounded against the blob, so no reader of
+    /// the region carries arithmetic of its own.
     pub(super) fn array_len(&self) -> usize {
         self.doc_lengths_range.len()
+            + self
+                .stored_norms
+                .as_ref()
+                .map_or(0, |stored| stored.buckets.len())
     }
 
     /// The length array with the CRC that trails it: what a reader fetches.
     /// The open path refused a column whose array plus CRC ran past the
     /// source, so this end is within the blob, and the sum cannot overflow.
     pub(super) fn array_with_crc_range(&self) -> Range<usize> {
-        self.doc_lengths_range.start..self.doc_lengths_range.end + CRC_BYTES
+        let start = self.doc_lengths_range.start;
+        start..start + self.array_len() + CRC_BYTES
     }
 
     /// Check the CRC that trails the length array in `array_with_crc`, when

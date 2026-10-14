@@ -26,6 +26,7 @@ use infino::{
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        format::fts::VERSION_CURRENT,
         vector::distance::normalize,
     },
     test_helpers::{decimal128_ids, default_vector_config},
@@ -313,7 +314,7 @@ fn corrupt_fts_positions_region_rejected() {
             .expect("version bytes"),
     );
     assert_eq!(
-        version, 7,
+        version, VERSION_CURRENT,
         "positional superfile must embed a current FTS blob (coarse table; dense corpus ⇒ bitset blocks)"
     );
     let positions_off_rel = u64::from_le_bytes(
@@ -357,7 +358,7 @@ fn corrupt_fts_bitset_block_rejected() {
             .expect("version bytes"),
     );
     assert_eq!(
-        version, 7,
+        version, VERSION_CURRENT,
         "dense corpus must embed a current FTS blob (coarse table; bitset blocks)"
     );
     // postings_offset (relative to the blob) at FTS header bytes [+32..+40].
