@@ -14,12 +14,18 @@
 //! Slices are cut at term boundaries once the pending slice reaches its
 //! target size, so every slice is one contiguous key range and a lookup
 //! fetches exactly one.
+//!
+//! An index can also be rebuilt from its own segments
+//! ([`merge_segments`]) rather than from the superfiles: a posting depends
+//! only on its superfile, which never changes, so copying it out of an
+//! existing segment gives exactly what walking the superfile again would.
 
 use std::{
     cmp::Reverse,
-    collections::BinaryHeap,
+    collections::{BinaryHeap, VecDeque},
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Write},
+    mem,
     path::{Path, PathBuf},
 };
 
@@ -29,7 +35,7 @@ use uuid::Uuid;
 use super::{
     TermIndexError,
     format::{
-        Location, Posting, Root, Segment, SliceRef, encode_run, encode_slice, push_posting,
+        Location, Posting, Root, Segment, Slice, SliceRef, encode_run, encode_slice, push_posting,
         read_posting,
     },
 };
@@ -362,6 +368,56 @@ impl SliceBuilder {
     }
 }
 
+/// Cuts a stream of `(key, encoded run)` in key order into slices. The
+/// build and the merge both write through it, so equal input gives equal
+/// bytes.
+struct SegmentWriter {
+    current: SliceBuilder,
+    slices: Vec<SliceRef>,
+    slice_bytes: Vec<(ContentHash, Vec<u8>)>,
+    target_bytes: usize,
+}
+
+impl SegmentWriter {
+    fn new(policy: &BuildPolicy) -> Self {
+        Self {
+            current: SliceBuilder::new(),
+            slices: Vec::new(),
+            slice_bytes: Vec::new(),
+            target_bytes: policy.slice_target_bytes,
+        }
+    }
+
+    /// Append one term, first cutting the slice when the run would push it
+    /// past the target.
+    fn add(&mut self, key: &[u8], run: &[u8]) {
+        if self.current.n_terms > 0 && self.current.encoded_bytes() + run.len() > self.target_bytes
+        {
+            self.cut();
+        }
+        self.current.add(key, run);
+    }
+
+    fn cut(&mut self) {
+        if let Some((reference, bytes)) =
+            mem::replace(&mut self.current, SliceBuilder::new()).finish()
+        {
+            self.slice_bytes.push((reference.content_hash, bytes));
+            self.slices.push(reference);
+        }
+    }
+
+    fn finish(mut self) -> (Segment, Vec<(ContentHash, Vec<u8>)>) {
+        self.cut();
+        (
+            Segment {
+                slices: self.slices,
+            },
+            self.slice_bytes,
+        )
+    }
+}
+
 /// A finished build: the root and every slice, ready to be written.
 pub(crate) struct Built {
     /// The root, not yet written.
@@ -446,9 +502,7 @@ pub(crate) fn build_segment(
         readers.push(rd);
     }
 
-    let mut slices: Vec<SliceRef> = Vec::new();
-    let mut slice_bytes: Vec<(ContentHash, Vec<u8>)> = Vec::new();
-    let mut current = SliceBuilder::new();
+    let mut writer = SegmentWriter::new(policy);
     let mut run: Vec<Posting> = Vec::new();
 
     while let Some(Reverse(head)) = heap.pop() {
@@ -500,27 +554,134 @@ pub(crate) fn build_segment(
         // megabytes per superfile, per query, where the postings it wants
         // are kilobytes — so the location is worth most exactly where it
         // was once dropped.
-        let encoded = encode_run(&run);
-        if current.n_terms > 0
-            && current.encoded_bytes() + encoded.len() > policy.slice_target_bytes
-        {
-            let (reference, bytes) = std::mem::replace(&mut current, SliceBuilder::new())
-                .finish()
-                .expect("a slice with terms");
-            slice_bytes.push((reference.content_hash, bytes));
-            slices.push(reference);
-        }
-        current.add(&key, &encoded);
+        writer.add(&key, &encode_run(&run));
     }
-    if let Some((reference, bytes)) = current.finish() {
-        slice_bytes.push((reference.content_hash, bytes));
-        slices.push(reference);
-    }
+    let (segment, slices) = writer.finish();
 
     Ok(BuiltSegment {
         superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
         id_mins: contributions.iter().map(|c| c.id_min).collect(),
-        segment: Segment { slices },
-        slices: slice_bytes,
+        segment,
+        slices,
     })
+}
+
+/// Terms a merge cursor decodes from a slice at a time, so a cursor holds
+/// one slice's bytes and a batch of decoded runs rather than the whole
+/// slice decoded.
+const MERGE_BATCH_TERMS: usize = 4096;
+
+/// Reads one segment's slices, already on local disk, term by term in key
+/// order.
+struct SegmentCursor {
+    /// Slice files not opened yet, in key order.
+    files: VecDeque<PathBuf>,
+    /// The open slice's bytes; empty before the first file.
+    bytes: Vec<u8>,
+    /// Decoded terms not handed out yet.
+    batch: VecDeque<(Vec<u8>, Vec<Posting>)>,
+    /// The last key decoded from the open slice, where the next batch
+    /// resumes.
+    last_key: Option<Vec<u8>>,
+}
+
+impl SegmentCursor {
+    fn new(files: &[PathBuf]) -> Self {
+        Self {
+            files: files.iter().cloned().collect(),
+            bytes: Vec::new(),
+            batch: VecDeque::new(),
+            last_key: None,
+        }
+    }
+
+    /// The next term and its postings, `None` once every slice is read.
+    fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<Posting>)>, TermIndexError> {
+        loop {
+            if let Some(term) = self.batch.pop_front() {
+                return Ok(Some(term));
+            }
+            if !self.bytes.is_empty() {
+                let batch = Slice::open(&self.bytes)?
+                    .terms_after(self.last_key.as_deref(), MERGE_BATCH_TERMS)?;
+                if let Some((key, _)) = batch.last() {
+                    self.last_key = Some(key.clone());
+                    self.batch = batch.into();
+                    continue;
+                }
+            }
+            let Some(path) = self.files.pop_front() else {
+                return Ok(None);
+            };
+            self.bytes = fs::read(path)?;
+            self.last_key = None;
+        }
+    }
+}
+
+/// Merge segments into one, renumbering every posting through
+/// `ordinals`: a posting naming old ordinal `i` names `ordinals[i]` in the
+/// result, and is dropped when that is `None` (a superfile that is gone, or
+/// padding). `sources` holds each segment's slice files in key order.
+///
+/// Runs come out in ascending new ordinal and are cut into slices exactly
+/// as [`build_segment`] cuts them, so a merge whose ordinals follow the
+/// order a build would give its contributions writes the same bytes as that
+/// build.
+pub(crate) fn merge_segments(
+    sources: &[Vec<PathBuf>],
+    ordinals: &[Option<u32>],
+    policy: &BuildPolicy,
+) -> Result<(Segment, Vec<(ContentHash, Vec<u8>)>), TermIndexError> {
+    let mut cursors: Vec<SegmentCursor> = sources.iter().map(|s| SegmentCursor::new(s)).collect();
+    let mut pending: Vec<Option<Vec<Posting>>> = Vec::with_capacity(cursors.len());
+    let mut heap: BinaryHeap<Reverse<Head>> = BinaryHeap::new();
+    for (source, cursor) in cursors.iter_mut().enumerate() {
+        match cursor.next()? {
+            Some((key, run)) => {
+                heap.push(Reverse(Head {
+                    key,
+                    ordinal: source as u32,
+                }));
+                pending.push(Some(run));
+            }
+            None => pending.push(None),
+        }
+    }
+
+    let mut writer = SegmentWriter::new(policy);
+    let mut run: Vec<Posting> = Vec::new();
+    while let Some(Reverse(head)) = heap.pop() {
+        let key = head.key;
+        run.clear();
+        let mut next = Some(head.ordinal);
+        while let Some(source) = next {
+            let postings = pending[source as usize]
+                .take()
+                .expect("pending run for heap head");
+            run.extend(postings.into_iter().filter_map(|mut p| {
+                p.superfile = (*ordinals.get(p.superfile as usize)?)?;
+                Some(p)
+            }));
+            if let Some((key, postings)) = cursors[source as usize].next()? {
+                heap.push(Reverse(Head {
+                    key,
+                    ordinal: source,
+                }));
+                pending[source as usize] = Some(postings);
+            }
+            next = match heap.peek() {
+                Some(Reverse(peek)) if peek.key == key => {
+                    heap.pop().map(|Reverse(head)| head.ordinal)
+                }
+                _ => None,
+            };
+        }
+        if run.is_empty() {
+            continue;
+        }
+        run.sort_unstable_by_key(|p| p.superfile);
+        writer.add(&key, &encode_run(&run));
+    }
+    Ok(writer.finish())
 }

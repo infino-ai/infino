@@ -210,7 +210,7 @@ pub(crate) struct Segment {
 pub(crate) struct Root {
     /// Superfiles with postings in some segment; postings name them by
     /// ordinal. Never reordered — a delta appends. May hold nil padding,
-    /// which no posting names (see `splice_base`).
+    /// which no posting names (see `append_reserved`).
     pub(crate) superfiles: Vec<Uuid>,
     /// Each superfile's smallest doc id, parallel to `superfiles`.
     pub(crate) id_mins: Vec<i128>,
@@ -541,6 +541,38 @@ impl<'a> Slice<'a> {
         match self.dict.lookup(key) {
             None => Ok(None),
             Some(v) => self.run_at(v).map(Some),
+        }
+    }
+
+    /// Up to `limit` terms after `after` (from the first term when `None`),
+    /// in key order, with their postings. A walk resumes by passing the
+    /// last key it got back.
+    pub(crate) fn terms_after(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<Posting>)>, TermIndexError> {
+        let mut out = Vec::new();
+        let mut failed: Option<TermIndexError> = None;
+        self.dict
+            .for_each_from(b"", after.unwrap_or_default(), |key, value| {
+                if Some(key) == after {
+                    return true;
+                }
+                match self.run_at(value) {
+                    Ok(run) => {
+                        out.push((key.to_vec(), run));
+                        out.len() < limit
+                    }
+                    Err(e) => {
+                        failed = Some(e);
+                        false
+                    }
+                }
+            });
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(out),
         }
     }
 

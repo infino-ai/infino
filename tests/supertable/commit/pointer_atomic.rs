@@ -84,8 +84,10 @@ async fn commit_manifest(
     new_list: &Manifest,
     parts: &[&ManifestPart],
 ) -> Result<PointerFile, CommitError> {
-    let encoded: Vec<Vec<u8>> = parts.iter().map(|p| part_mod::encode(p)).collect();
-    let encoded_refs: Vec<&[u8]> = encoded.iter().map(|b| b.as_slice()).collect();
+    let encoded: Vec<Bytes> = parts
+        .iter()
+        .map(|p| Bytes::from(part_mod::encode(p)))
+        .collect();
 
     // Start from an empty manifest (no superfiles) carrying the
     // new list, then commit it via the production persistence
@@ -101,7 +103,7 @@ async fn commit_manifest(
         Some(new_list.clone()),
     );
     manifest
-        .write(storage.as_ref(), expected_prev_etag, &encoded_refs)
+        .write(storage.as_ref(), expected_prev_etag, &encoded)
         .await?;
 
     // Hand back the pointer the commit just published.

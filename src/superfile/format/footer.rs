@@ -27,10 +27,11 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write},
+    mem,
     sync::Arc,
 };
 
-use arrow::record_batch::RecordBatch;
+use arrow::{compute::concat_batches, record_batch::RecordBatch};
 use arrow_schema::Schema;
 use bytes::Bytes;
 use parquet::{
@@ -206,14 +207,29 @@ impl ParquetBodyEncoder {
         row_group_size: usize,
         column_page_size_limits: &[(&str, usize)],
     ) -> Result<Self, FooterError> {
-        let mut props_builder = WriterProperties::builder()
-            .set_compression(compression)
-            .set_max_row_group_row_count(Some(row_group_size));
-        for (col, limit) in column_page_size_limits {
-            props_builder = props_builder
-                .set_column_data_page_size_limit(ColumnPath::from((*col).to_string()), *limit);
-        }
-        let props = props_builder.build();
+        Self::with_plain_columns(
+            schema,
+            compression,
+            row_group_size,
+            column_page_size_limits,
+            &[],
+        )
+    }
+
+    /// [`Self::new`] with the dictionary turned off for `plain_columns`.
+    fn with_plain_columns(
+        schema: &Arc<Schema>,
+        compression: Compression,
+        row_group_size: usize,
+        column_page_size_limits: &[(&str, usize)],
+        plain_columns: &[String],
+    ) -> Result<Self, FooterError> {
+        let props = writer_properties(
+            compression,
+            row_group_size,
+            column_page_size_limits,
+            plain_columns,
+        );
 
         // Encode to a scratch temp file rather than a `Vec`, so the body —
         // multi-GB at corpus scale — never materializes whole in RAM. The
@@ -239,6 +255,241 @@ impl ParquetBodyEncoder {
         writer.close()?;
         strip_parquet_footer(body_file)
     }
+}
+
+/// Writer properties for a body: `compression` everywhere, cut every
+/// `row_group_size` rows, with the given per-column page limits and no
+/// dictionary for `plain_columns`.
+fn writer_properties(
+    compression: Compression,
+    row_group_size: usize,
+    column_page_size_limits: &[(&str, usize)],
+    plain_columns: &[String],
+) -> WriterProperties {
+    let mut props_builder = WriterProperties::builder()
+        .set_compression(compression)
+        .set_max_row_group_row_count(Some(row_group_size));
+    for (col, limit) in column_page_size_limits {
+        props_builder = props_builder
+            .set_column_data_page_size_limit(ColumnPath::from((*col).to_string()), *limit);
+    }
+    for col in plain_columns {
+        props_builder =
+            props_builder.set_column_dictionary_enabled(ColumnPath::from(col.clone()), false);
+    }
+    props_builder.build()
+}
+
+/// Compressed bytes of each top-level column of a body.
+type ColumnSizes = HashMap<String, u64>;
+
+/// How a body is written, and which of its columns may drop their
+/// dictionary. [`BodyPlan::choose`] settles that from the first row group.
+///
+/// A dictionary pays off on a column that repeats values: each row costs a
+/// few bits instead of a value. On a column of mostly distinct values the
+/// dictionary page holds nearly every value once more and zstd compresses
+/// the plain values about as well, so the column grows, and every read that
+/// touches the group decodes that whole page first, point reads included.
+/// The writer's default is a dictionary on every column, which falls back to
+/// plain values only once a chunk's dictionary page fills: a column of
+/// distinct values then still stores that full page, and still makes every
+/// read of the group decode it.
+///
+/// No fixed rule tells the two apart (a timestamp column can go either way,
+/// a long URL column usually wants its dictionary), so the choice is
+/// measured on the body's own rows:
+///
+/// ```text
+///   first row group ─┬─ encode as configured ──────┐
+///                    └─ encode candidates plain ───┴─▶ per column: plain if smaller
+/// ```
+///
+/// A column only ever moves to whichever encoding is smaller on the
+/// sample, so the choice does not grow the body it was measured on.
+#[derive(Debug, Clone)]
+pub(crate) struct BodyPlan {
+    /// The body's codec.
+    pub(crate) compression: Compression,
+    /// Rows per row group; also the rows the choice is measured on.
+    pub(crate) row_group_size: usize,
+    /// Flat top-level columns whose dictionary may be dropped.
+    pub(crate) dictionary_candidates: Vec<String>,
+    /// Per-column data-page size limits, as for [`encode_parquet_body`].
+    pub(crate) column_page_size_limits: Vec<(String, usize)>,
+}
+
+impl BodyPlan {
+    /// The candidates written without a dictionary, for a body whose first
+    /// rows are `sample`.
+    fn choose(
+        &self,
+        schema: &Arc<Schema>,
+        sample: &RecordBatch,
+    ) -> Result<Vec<String>, FooterError> {
+        if self.dictionary_candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dictionary = self.measure(schema, sample, &[])?;
+        let plain = self.measure(schema, sample, &self.dictionary_candidates)?;
+        Ok(plain_where_smaller(
+            &self.dictionary_candidates,
+            &dictionary,
+            &plain,
+        ))
+    }
+
+    fn page_size_limits(&self) -> Vec<(&str, usize)> {
+        self.column_page_size_limits
+            .iter()
+            .map(|(c, l)| (c.as_str(), *l))
+            .collect()
+    }
+
+    /// Compressed bytes of each top-level column when `sample` is encoded
+    /// with no dictionary for `plain_columns`.
+    fn measure(
+        &self,
+        schema: &Arc<Schema>,
+        sample: &RecordBatch,
+        plain_columns: &[String],
+    ) -> Result<ColumnSizes, FooterError> {
+        let props = writer_properties(
+            self.compression,
+            self.row_group_size,
+            &self.page_size_limits(),
+            plain_columns,
+        );
+        let mut writer = ArrowWriter::try_new(io::sink(), schema.clone(), Some(props))?;
+        writer.write(sample)?;
+        let meta = writer.close()?;
+        let mut sizes = ColumnSizes::new();
+        for rg in meta.row_groups() {
+            for chunk in rg.columns() {
+                let column = chunk
+                    .column_path()
+                    .parts()
+                    .first()
+                    .cloned()
+                    .unwrap_or_default();
+                *sizes.entry(column).or_default() +=
+                    u64::try_from(chunk.compressed_size()).unwrap_or(0);
+            }
+        }
+        Ok(sizes)
+    }
+}
+
+/// The `candidates`, sorted, whose plain encoding (`plain`) is smaller than
+/// with a dictionary (`dictionary`). A candidate either side did not
+/// measure keeps its dictionary.
+fn plain_where_smaller(
+    candidates: &[String],
+    dictionary: &ColumnSizes,
+    plain: &ColumnSizes,
+) -> Vec<String> {
+    let mut plain_columns: Vec<String> = candidates
+        .iter()
+        .filter(|col| match (dictionary.get(*col), plain.get(*col)) {
+            (Some(with), Some(without)) => without < with,
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    plain_columns.sort();
+    plain_columns
+}
+
+/// [`ParquetBodyEncoder`] whose dictionaries are chosen by a [`BodyPlan`]
+/// from the first rows written: it holds rows until it has one row group
+/// (or the body ends), chooses, then writes them and streams the rest
+/// straight through. The held rows are the row group the writer would
+/// buffer anyway.
+pub(crate) struct PlannedBodyEncoder {
+    schema: Arc<Schema>,
+    plan: BodyPlan,
+    held: Vec<RecordBatch>,
+    held_rows: usize,
+    encoder: Option<ParquetBodyEncoder>,
+}
+
+impl PlannedBodyEncoder {
+    pub(crate) fn new(schema: &Arc<Schema>, plan: BodyPlan) -> Self {
+        Self {
+            schema: Arc::clone(schema),
+            plan,
+            held: Vec::new(),
+            held_rows: 0,
+            encoder: None,
+        }
+    }
+
+    pub(crate) fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), FooterError> {
+        if let Some(encoder) = self.encoder.as_mut() {
+            return encoder.write_batch(batch);
+        }
+        self.held_rows += batch.num_rows();
+        self.held.push(batch.clone());
+        if self.held_rows >= self.plan.row_group_size {
+            self.start()?;
+        }
+        Ok(())
+    }
+
+    /// Choose the dictionaries from the held rows, open the encoder, and
+    /// write them.
+    ///
+    /// Only the sample (at most one row group) is copied; the held batches
+    /// are written as they came, so a merge that feeds one large input
+    /// batch never holds a second copy of it.
+    fn start(&mut self) -> Result<(), FooterError> {
+        let mut sample_parts = Vec::new();
+        let mut wanted = self.plan.row_group_size;
+        for batch in &self.held {
+            if wanted == 0 {
+                break;
+            }
+            let take = batch.num_rows().min(wanted);
+            sample_parts.push(batch.slice(0, take));
+            wanted -= take;
+        }
+        let sample = concat_batches(&self.schema, &sample_parts)?;
+        let plain_columns = self.plan.choose(&self.schema, &sample)?;
+        let mut encoder = ParquetBodyEncoder::with_plain_columns(
+            &self.schema,
+            self.plan.compression,
+            self.plan.row_group_size,
+            &self.plan.page_size_limits(),
+            &plain_columns,
+        )?;
+        for batch in mem::take(&mut self.held) {
+            encoder.write_batch(&batch)?;
+        }
+        self.encoder = Some(encoder);
+        Ok(())
+    }
+
+    /// Close the body, yielding the same [`EncodedBody`] as
+    /// [`ParquetBodyEncoder::finish`].
+    pub(crate) fn finish(mut self) -> Result<EncodedBody, FooterError> {
+        if self.encoder.is_none() {
+            self.start()?;
+        }
+        self.encoder.expect("start opened the encoder").finish()
+    }
+}
+
+/// [`encode_parquet_body`] with the dictionaries chosen by `plan`.
+pub(crate) fn encode_parquet_body_planned(
+    schema: &Arc<Schema>,
+    batches: &[RecordBatch],
+    plan: BodyPlan,
+) -> Result<EncodedBody, FooterError> {
+    let mut encoder = PlannedBodyEncoder::new(schema, plan);
+    for batch in batches {
+        encoder.write_batch(batch)?;
+    }
+    encoder.finish()
 }
 
 /// Read back the just-written Parquet footer from `body_file`, decode its
@@ -767,8 +1018,11 @@ fn with_kv_list(metadata: &ParquetMetaData, kvs: Vec<KeyValue>) -> ParquetMetaDa
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use arrow_array::{Float64Array, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field};
+    use parquet::{arrow::arrow_reader::ParquetRecordBatchReaderBuilder, basic::ZstdLevel};
 
     use super::*;
 
@@ -1296,5 +1550,221 @@ mod tests {
             "tail < footer ⇒ 1 tail GET + 1 follow-up GET",
         );
         assert_eq!(eager, lazy, "lazy + eager KV maps must agree");
+    }
+
+    // ── Dictionary choice ───────────────────────────────────────────────
+
+    /// Rows per row group in the dictionary tests.
+    const TEST_GROUP_ROWS: usize = 4_096;
+
+    /// Odd 64-bit multiplier that scatters `0..n` into distinct,
+    /// unordered values.
+    const SCATTER: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// A second odd multiplier, so the strings below share no structure
+    /// with the scattered integers.
+    const SCATTER_2: u64 = 0xD6E8_FEB8_6659_FD93;
+
+    fn plan(schema: &Schema) -> BodyPlan {
+        BodyPlan {
+            compression: Compression::ZSTD(ZstdLevel::try_new(3).expect("valid zstd level")),
+            row_group_size: TEST_GROUP_ROWS,
+            dictionary_candidates: schema.fields().iter().map(|f| f.name().clone()).collect(),
+            column_page_size_limits: Vec::new(),
+        }
+    }
+
+    fn sizes(entries: &[(&str, u64)]) -> ColumnSizes {
+        entries.iter().map(|(c, b)| (c.to_string(), *b)).collect()
+    }
+
+    /// A column of distinct values next to one of four long strings in
+    /// random order: the first is smaller plain, the second with its
+    /// dictionary (zstd finds the repeats in plain values too, but pays a
+    /// back-reference per row where the dictionary pays two bits).
+    fn unique_and_status(rows: usize) -> (Arc<Schema>, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("unique", DataType::UInt64, false),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        let rows = rows as u64;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(
+                    (0..rows)
+                        .map(|i| i.wrapping_mul(SCATTER))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    (0..rows)
+                        .map(|i| {
+                            let pick = i.wrapping_mul(SCATTER) >> 62;
+                            let value = (pick + 1).wrapping_mul(SCATTER_2);
+                            format!("{value:016x}{:016x}{value:016x}", !value)
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("build RecordBatch");
+        (schema, batch)
+    }
+
+    /// Whether each column chunk of each row group carries a dictionary page.
+    fn dictionaries(body: &EncodedBody) -> Vec<Vec<(String, bool)>> {
+        body.metadata
+            .row_groups()
+            .iter()
+            .map(|rg| {
+                rg.columns()
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.column_path().string(),
+                            c.dictionary_page_offset().is_some(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A column loses its dictionary only when plain values are smaller; a
+    /// candidate the plain encode did not measure keeps it.
+    #[test]
+    fn only_dictionaries_that_cost_bytes_are_dropped() {
+        let candidates = ["a", "b", "c"].map(String::from);
+        let with = sizes(&[("a", 100), ("b", 100), ("c", 100)]);
+        let without = sizes(&[("a", 80), ("b", 120)]);
+        assert_eq!(
+            plain_where_smaller(&candidates, &with, &without),
+            vec!["a".to_string()]
+        );
+    }
+
+    /// The unique column drops its dictionary in every row group, the
+    /// strings keep theirs, and the body is smaller for it.
+    #[test]
+    fn a_unique_column_drops_its_dictionary_and_four_strings_keep_theirs() {
+        let (schema, batch) = unique_and_status(2 * TEST_GROUP_ROWS);
+        let plan = plan(&schema);
+        assert_eq!(
+            plan.choose(&schema, &batch.slice(0, TEST_GROUP_ROWS))
+                .expect("choose"),
+            vec!["unique".to_string()]
+        );
+
+        let planned = encode_parquet_body_planned(&schema, slice::from_ref(&batch), plan.clone())
+            .expect("planned body");
+        let default = encode_parquet_body(
+            &schema,
+            slice::from_ref(&batch),
+            plan.compression,
+            TEST_GROUP_ROWS,
+            &[],
+        )
+        .expect("default body");
+        let group = vec![("unique".to_string(), false), ("status".to_string(), true)];
+        assert_eq!(dictionaries(&planned), vec![group.clone(), group]);
+        assert!(
+            planned.body_len < default.body_len,
+            "planned {} >= default {}",
+            planned.body_len,
+            default.body_len
+        );
+    }
+
+    /// A body that dropped some dictionaries is ordinary Parquet: a standard
+    /// reader returns exactly the rows written, whichever way each column
+    /// was encoded.
+    #[test]
+    fn a_body_without_some_dictionaries_reads_back_as_written() {
+        let (schema, batch) = unique_and_status(2 * TEST_GROUP_ROWS);
+        let body = encode_parquet_body_planned(&schema, slice::from_ref(&batch), plan(&schema))
+            .expect("planned body");
+        assert!(
+            dictionaries(&body).iter().flatten().any(|(_, has)| !has),
+            "the fixture must drop a dictionary"
+        );
+        let parts = splice_index_blobs(body, &[], &[], &[], &[]).expect("splice");
+        let read: Vec<RecordBatch> =
+            ParquetRecordBatchReaderBuilder::try_new(Bytes::from(parts.bytes))
+                .expect("open")
+                .build()
+                .expect("reader")
+                .collect::<Result<_, _>>()
+                .expect("read");
+        let read = concat_batches(&schema, &read).expect("concat");
+        assert_eq!(read.columns(), batch.columns());
+    }
+
+    /// With no candidates the plan changes nothing: the body is the one the
+    /// writer's defaults produce, byte for byte.
+    #[test]
+    fn a_plan_with_no_candidates_writes_the_default_body() {
+        let (schema, batch) = unique_and_status(TEST_GROUP_ROWS);
+        let plan = BodyPlan {
+            dictionary_candidates: Vec::new(),
+            ..plan(&schema)
+        };
+        let planned = encode_parquet_body_planned(&schema, slice::from_ref(&batch), plan.clone())
+            .expect("planned body");
+        let default = encode_parquet_body(
+            &schema,
+            slice::from_ref(&batch),
+            plan.compression,
+            TEST_GROUP_ROWS,
+            &[],
+        )
+        .expect("default body");
+        assert_eq!(planned.body_len, default.body_len);
+        assert_eq!(dictionaries(&planned), dictionaries(&default));
+    }
+
+    /// A body shorter than one row group is measured on all of its rows.
+    #[test]
+    fn a_body_shorter_than_one_group_still_chooses() {
+        let (schema, batch) = unique_and_status(TEST_GROUP_ROWS / 2);
+        let planned = encode_parquet_body_planned(&schema, slice::from_ref(&batch), plan(&schema))
+            .expect("planned body");
+        assert_eq!(
+            dictionaries(&planned),
+            vec![vec![
+                ("unique".to_string(), false),
+                ("status".to_string(), true)
+            ]]
+        );
+    }
+
+    /// Streaming rows in through the planned encoder chooses the same
+    /// dictionaries as handing them over at once, with the same row groups.
+    /// (Page boundaries follow the write batches, so the bytes after the
+    /// held rows may differ.)
+    #[test]
+    fn the_planned_encoder_chooses_the_same_however_rows_arrive() {
+        let (schema, batch) = unique_and_status(3 * TEST_GROUP_ROWS / 2);
+        let whole = encode_parquet_body_planned(&schema, slice::from_ref(&batch), plan(&schema))
+            .expect("whole");
+        let mut streamed = PlannedBodyEncoder::new(&schema, plan(&schema));
+        let piece = TEST_GROUP_ROWS / 3 + 1;
+        let mut start = 0;
+        while start < batch.num_rows() {
+            let len = piece.min(batch.num_rows() - start);
+            streamed
+                .write_batch(&batch.slice(start, len))
+                .expect("write piece");
+            start += len;
+        }
+        let streamed = streamed.finish().expect("streamed");
+        let rows = |body: &EncodedBody| -> Vec<i64> {
+            body.metadata
+                .row_groups()
+                .iter()
+                .map(|rg| rg.num_rows())
+                .collect()
+        };
+        assert_eq!(rows(&whole), rows(&streamed));
+        assert_eq!(dictionaries(&whole), dictionaries(&streamed));
     }
 }

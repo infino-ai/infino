@@ -282,18 +282,19 @@ pub async fn probe_pointer(
     }
 }
 
+#[derive(Clone)]
 pub struct EncodedPart {
     pub part: ManifestPart,
     /// Primary wire form: FULL (fp32 + admit slab) for user manifests —
     /// the fp32 store the first rescore hydrates from — ROUTING-only for
     /// hidden manifests, whose fp32 lives in the slow-CAS centroid
     /// section instead.
-    pub encoded: Vec<u8>,
+    pub encoded: Bytes,
     /// Routing-only sibling (counts + admit slab, no fp32) — what
     /// consumer opens fetch. `None` for hidden manifests: their primary
     /// form IS routing-shaped, so a sibling would be a byte-identical
     /// duplicate. PUT together with `encoded` in the same commit.
-    pub routing_encoded: Option<Vec<u8>>,
+    pub routing_encoded: Option<Bytes>,
 }
 
 /// Outcome of writing a manifest part — returned by
@@ -362,13 +363,10 @@ pub(crate) fn frame_content_size(compressed: &[u8], fallback: u64) -> u64 {
 /// PUT pre-encoded part bytes to storage.
 pub(crate) async fn write_part_bytes(
     storage: &dyn StorageProvider,
-    encoded: &[u8],
+    encoded: Bytes,
 ) -> Result<(), CommitError> {
-    let uri = part_uri(&ContentHash::of(encoded));
-    match storage
-        .put_atomic(&uri, Bytes::copy_from_slice(encoded))
-        .await
-    {
+    let uri = part_uri(&ContentHash::of(&encoded));
+    match storage.put_atomic(&uri, encoded).await {
         Ok(_) | Err(StorageError::PreconditionFailed { .. }) => Ok(()),
         Err(e) => Err(e.into()),
     }

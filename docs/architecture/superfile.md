@@ -75,6 +75,34 @@ flowchart TD
     inf --> infout["Columnar data + embedded<br/>full-text and vector search"]
 ```
 
+## Column encoding
+
+Row groups hold 64Ki rows, and every column chunk is compressed with
+zstd. Whether a column is dictionary-encoded is decided per superfile,
+per column, by measuring:
+
+- A **dictionary** stores each distinct value once and each row as a
+  small index into it. It pays off on a column that repeats values
+  (a status, a country, a URL): a row costs a few bits.
+- On a column of mostly distinct values (keys, prices, timestamps) the
+  dictionary holds nearly every value once more, zstd compresses the
+  plain values about as well, and the column grows. Every read that
+  touches a row group also decodes its dictionary page first, so a
+  point read pays for the whole page to return one row.
+
+The Parquet writer's default is a dictionary on every column, which
+falls back to plain values only once a chunk's dictionary page fills.
+Instead, the builder encodes the first row group of each superfile both
+ways and keeps the dictionary only for the columns where it is smaller.
+Nested columns keep the default.
+
+The choice is made wherever rows are encoded: a fresh build, a
+compaction merge (from the merged rows, so a compacted superfile is
+decided on its own data), and a bulk load. A reindex that rebuilds
+only the search indexes carries the column data over unchanged. Each
+column chunk records its own encoding, so superfiles written either way
+read the same, in infino and in any Parquet reader.
+
 ## Full-text index
 
 The full-text index is an inverted index supporting

@@ -86,7 +86,7 @@ use object_store::{MultipartUpload, PutPayload, UploadPart};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tempfile::NamedTempFile;
+use tempfile::{Builder as TempDirBuilder, NamedTempFile, TempDir};
 use tokio::{
     sync::{
         Semaphore,
@@ -161,8 +161,8 @@ use crate::{
         hidden_deleted::{self, encode_deleted_ids},
         manifest::{
             CellVectorSummary, ClusterCentroids, FtsSummaryAgg, ManifestSnapshot,
-            RabitqAdmitContext, RoutingRef, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry,
-            SuperfileUri, VectorSummary,
+            RabitqAdmitContext, RebuiltParts, RoutingRef, ScalarStatsAgg, SubsectionOffsets,
+            SuperfileEntry, SuperfileUri, VectorSummary,
             bloom::BloomBuilder,
             commit::{get_current_manifest_etag, manifest_uri},
             list::{
@@ -5461,6 +5461,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 spill,
                                 &vector_config,
                             )?;
+                            // The checkpoint below reopens these files on
+                            // resume, so they must reach disk first. Its
+                            // directory fsync makes the renames durable.
+                            let fsync_t0 = time::Instant::now();
+                            for path in [&cell.subsection_path, &cell.stable_ids_path] {
+                                File::open(path).and_then(|file| file.sync_all()).map_err(
+                                    |error| BuildError::Store(format!("cell fsync: {error}")),
+                                )?;
+                            }
+                            record("fsync_ms", fsync_t0.elapsed().as_millis() as u64);
                             let checkpoint_t0 = time::Instant::now();
                             {
                                 let mut state = checkpoint.lock().map_err(|_| {
@@ -8631,7 +8641,6 @@ pub(in crate::supertable) async fn split_repack_bulk(
                                 train_ms = tracing::field::Empty,
                                 n_cent = tracing::field::Empty,
                                 bucket_ms = tracing::field::Empty,
-                                fsync_ms = tracing::field::Empty,
                                 write_ms = tracing::field::Empty,
                                 crc_ms = tracing::field::Empty,
                             )
@@ -9825,6 +9834,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             &[],
             None,
             None,
+            None,
         )
         .await
         {
@@ -10416,17 +10426,18 @@ where
 /// membership, stamping its root reference on a successor manifest (see
 /// `manifest::term_index`). Maintenance-only: optimize calls it after
 /// compaction so the base segment describes the post-merge superfile set.
-/// Readers are opened one at a time and each superfile's terms are
-/// spilled before the next opens, so the pass costs one superfile's
-/// open-time state plus one slice, whatever the table's size.
 ///
-/// Every posting carries the term's score ceiling in that superfile, at the
-/// superfile's own statistics; the query rescales it.
+/// The index is rebuilt from its own segments ([`merge_term_index`]): a
+/// posting depends only on its superfile, which never changes, so copying
+/// it out of the segment that holds it gives what walking the superfile
+/// again would. Only superfiles no segment lists are walked. Every
+/// superfile is walked instead ([`collect_and_build_term_index`]) when the
+/// current root cannot be read or a slice it names is gone or corrupt.
 ///
 /// The full build runs once. When commits land before it publishes, a retry
-/// splices it over their delta segments (`term_index::splice_base`), or,
-/// when that cannot list every live superfile, indexes only the superfiles
-/// the last build lacks on top of it.
+/// folds their delta segments onto it ([`fold_term_index`]), or, when that
+/// cannot list every live superfile, indexes only the superfiles the last
+/// build lacks on top of it.
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
@@ -10436,7 +10447,7 @@ pub(in crate::supertable) async fn stamp_term_index(
     if inner.manifest.load().fts_configs().is_empty() {
         return Ok(());
     }
-    // The last build's root, and the root it was built to replace. A retry
+    // The last build's root, and the root it was built from. A retry
     // reuses its slices without PUTting them again: were one reclaimed in
     // between, queries would fall back to summary routing until a rebuild.
     let last_build: Mutex<Option<(Root, Option<Root>)>> = Mutex::new(None);
@@ -10453,32 +10464,52 @@ pub(in crate::supertable) async fn stamp_term_index(
             }
             let current = referenced_root(&old).await;
             let last = last_build.lock().expect("term-index build lock").clone();
-            let spliced = last
-                .as_ref()
-                .and_then(|(base, prior)| {
-                    term_index::splice_base(base, prior.as_ref()?, current.as_ref()?)
-                })
-                .filter(|root| unlisted(root, &entries).is_empty());
-            let root = match spliced {
-                Some(root) => root,
-                None => {
-                    // Everything on the first attempt; after that, only what
-                    // committed since the last build.
-                    let onto = last.map(|(base, _)| base).unwrap_or_default();
-                    let missing = unlisted(&onto, &entries);
+            let folded = match (&last, &current) {
+                (Some((base, Some(prior))), Some(current)) => {
+                    match fold_term_index(&old, base, prior, current, &entries).await {
+                        Ok(folded) => folded,
+                        Err(e) => {
+                            warn!("term index: folding new commits failed, catching up instead: {e}");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+            .filter(|built| unlisted(&built.root, &entries).is_empty());
+            let built = match (folded, last, &current) {
+                (Some(built), _, _) => built,
+                (None, Some((base, _)), _) => {
+                    // Only what committed since the last build.
+                    let missing = unlisted(&base, &entries);
                     // Already lists every live superfile: an empty segment
                     // would add nothing.
                     if missing.is_empty() {
-                        onto
+                        term_index::Built {
+                            root: base,
+                            slices: Vec::new(),
+                        }
                     } else {
-                        let built = collect_and_build_term_index(&old, &missing, onto).await?;
-                        term_index::write_slices(storage.as_ref(), built.slices).await?;
-                        *last_build.lock().expect("term-index build lock") =
-                            Some((built.root.clone(), current));
-                        built.root
+                        collect_and_build_term_index(&old, &missing, base).await?
                     }
                 }
+                (None, None, Some(current)) if !current.segments.is_empty() => {
+                    match merge_term_index(&old, current, &entries).await {
+                        Ok(built) => built,
+                        Err(e) if e.object_is_gone_or_corrupt() => {
+                            warn!("term index: cannot merge the current index, rebuilding from the superfiles: {e}");
+                            collect_and_build_term_index(&old, &entries, Root::default()).await?
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                (None, None, _) => {
+                    collect_and_build_term_index(&old, &entries, Root::default()).await?
+                }
             };
+            let root = built.root;
+            term_index::write_slices(storage.as_ref(), built.slices).await?;
+            *last_build.lock().expect("term-index build lock") = Some((root.clone(), current));
             let reference = term_index::write_root(storage.as_ref(), &root).await?;
             // The root is content-addressed, so an unchanged reference can
             // still sit beside a stale "incomplete" mark; this build covers
@@ -10514,6 +10545,151 @@ fn unlisted(root: &Root, entries: &[Arc<SuperfileEntry>]) -> Vec<Arc<SuperfileEn
         .collect()
 }
 
+/// Rebuild the index over `entries` from the segments of `current`, into
+/// one segment, reading superfiles only for the `entries` that `current`
+/// does not list.
+///
+/// Superfiles take ordinals in `entries` order, as
+/// [`collect_and_build_term_index`] gives them, and postings for superfiles
+/// no longer live, or for padding, are dropped. So the result is byte for
+/// byte the index walking every superfile would build.
+async fn merge_term_index(
+    manifest: &ManifestSnapshot,
+    current: &Root,
+    entries: &[Arc<SuperfileEntry>],
+) -> Result<term_index::Built, TermIndexError> {
+    let storage = manifest
+        .options
+        .storage
+        .as_ref()
+        .ok_or_else(|| TermIndexError::Build("term index merge needs storage".into()))?;
+    let scratch = term_index_scratch()?;
+    let mut sources =
+        term_index::download_segments(storage.as_ref(), &current.segments, scratch.path())
+            .instrument(detail_span!(
+                "term_index.download",
+                segments = current.segments.len(),
+            ))
+            .await?;
+    // Superfiles no segment lists get one segment of their own, numbered
+    // past the ones `current` lists, and merge like the rest.
+    let missing = unlisted(current, entries);
+    let mut old = Root {
+        superfiles: current.superfiles.clone(),
+        id_mins: current.id_mins.clone(),
+        segments: Vec::new(),
+    };
+    if !missing.is_empty() {
+        let contributions = collect_contributions(manifest, &missing, scratch.path()).await?;
+        let built =
+            term_index::build_onto(old, &contributions, &term_index::BuildPolicy::default())?;
+        sources.push(term_index::spill_slices(scratch.path(), built.slices)?);
+        old = built.root;
+    }
+
+    let mut root = Root::default();
+    let mut new_ordinal: HashMap<Uuid, u32> = HashMap::new();
+    for entry in entries {
+        if let Entry::Vacant(slot) = new_ordinal.entry(entry.superfile_id) {
+            slot.insert(root.superfiles.len() as u32);
+            root.superfiles.push(entry.superfile_id);
+            root.id_mins.push(entry.id_min);
+        }
+    }
+    // A superfile listed twice keeps the postings of its first listing:
+    // both are the same superfile's, so either would do.
+    let mut claimed: HashSet<Uuid> = HashSet::new();
+    let ordinals: Vec<Option<u32>> = old
+        .superfiles
+        .iter()
+        .map(|id| new_ordinal.get(id).copied().filter(|_| claimed.insert(*id)))
+        .collect();
+
+    let (segment, slices) = run_on_pool(
+        Some(&manifest.options.reader_pool),
+        "term-index merge",
+        move || {
+            term_index::merge_segments(&sources, &ordinals, &term_index::BuildPolicy::default())
+        },
+    )
+    .instrument(detail_span!(
+        "term_index.merge",
+        superfiles = root.superfiles.len(),
+        walked = missing.len(),
+    ))
+    .await
+    .map_err(|e| TermIndexError::Build(e.to_string()))??;
+    root.segments.push(segment);
+    Ok(term_index::Built { root, slices })
+}
+
+/// Fold the delta segments committed since `prior` onto `base`, the build
+/// made from `prior`, for a retry after a lost race. The deltas merge into
+/// one segment appended to `base`; their superfiles take the ordinals
+/// after `base`'s, and those no longer live are dropped, so no padding is
+/// left behind.
+///
+/// `None` when `current` was not built on `prior`. Relies on the deltas
+/// naming only ordinals at or past `prior`'s length (see
+/// `term_index::segments_since`).
+async fn fold_term_index(
+    manifest: &ManifestSnapshot,
+    base: &Root,
+    prior: &Root,
+    current: &Root,
+    entries: &[Arc<SuperfileEntry>],
+) -> Result<Option<term_index::Built>, TermIndexError> {
+    let Some(deltas) = term_index::segments_since(prior, current) else {
+        return Ok(None);
+    };
+    let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
+    let mut root = base.clone();
+    let mut ordinals: Vec<Option<u32>> = vec![None; current.superfiles.len()];
+    for (i, (id, id_min)) in current
+        .superfiles
+        .iter()
+        .zip(&current.id_mins)
+        .enumerate()
+        .skip(prior.superfiles.len())
+    {
+        if live.contains(id) {
+            ordinals[i] = Some(root.superfiles.len() as u32);
+            root.superfiles.push(*id);
+            root.id_mins.push(*id_min);
+        }
+    }
+    if root.superfiles.len() == base.superfiles.len() {
+        return Ok(Some(term_index::Built {
+            root,
+            slices: Vec::new(),
+        }));
+    }
+    let storage = manifest
+        .options
+        .storage
+        .as_ref()
+        .ok_or_else(|| TermIndexError::Build("term index fold needs storage".into()))?;
+    let scratch = term_index_scratch()?;
+    let sources = term_index::download_segments(storage.as_ref(), deltas, scratch.path()).await?;
+    let (segment, slices) = run_on_pool(
+        Some(&manifest.options.reader_pool),
+        "term-index fold",
+        move || {
+            term_index::merge_segments(&sources, &ordinals, &term_index::BuildPolicy::default())
+        },
+    )
+    .instrument(detail_span!("term_index.fold", deltas = deltas.len()))
+    .await
+    .map_err(|e| TermIndexError::Build(e.to_string()))??;
+    root.segments.push(segment);
+    Ok(Some(term_index::Built { root, slices }))
+}
+
+/// A scratch directory for one term-index build, removed when dropped.
+fn term_index_scratch() -> io::Result<TempDir> {
+    TempDirBuilder::new().prefix("infino-term-index-").tempdir()
+}
+
 /// Walk every superfile's dictionary once, spilling a contribution per
 /// superfile into one scratch directory, then merge them into one segment
 /// on top of `onto`. The scratch directory goes with the contributions when
@@ -10523,13 +10699,22 @@ async fn collect_and_build_term_index(
     entries: &[Arc<SuperfileEntry>],
     onto: Root,
 ) -> Result<term_index::Built, TermIndexError> {
+    let scratch = term_index_scratch()?;
+    let contributions = collect_contributions(manifest, entries, scratch.path()).await?;
+    term_index::build_onto(onto, &contributions, &term_index::BuildPolicy::default())
+}
+
+/// Walk each of `entries`' dictionaries, one superfile at a time, spilling
+/// its contribution under `dir`.
+async fn collect_contributions(
+    manifest: &ManifestSnapshot,
+    entries: &[Arc<SuperfileEntry>],
+    dir: &Path,
+) -> Result<Vec<TermContribution>, TermIndexError> {
     let store = &manifest.options.store;
     let disk_cache = manifest.options.disk_cache.as_ref();
     let opt_storage = manifest.options.storage.as_ref();
     let legacy = manifest.options.legacy_names();
-    let scratch = tempfile::Builder::new()
-        .prefix("infino-term-index-")
-        .tempdir()?;
     let mut contributions = Vec::with_capacity(entries.len());
     for entry in entries {
         let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)
@@ -10544,16 +10729,13 @@ async fn collect_and_build_term_index(
         {
             warn!("term index: fts prefetch failed for {}: {e}", entry.uri.0);
         }
-        let mut writer = term_index::ContributionWriter::create(
-            scratch.path(),
-            entry.superfile_id,
-            entry.id_min,
-        )?;
+        let mut writer =
+            term_index::ContributionWriter::create(dir, entry.superfile_id, entry.id_min)?;
         write_superfile_terms(&reader, &legacy, &mut writer).await?;
         contributions.push(writer.finish()?);
         drop(reader);
     }
-    term_index::build_onto(onto, &contributions, &term_index::BuildPolicy::default())
+    Ok(contributions)
 }
 
 /// Terms per batch of facts read during the term-index build.
@@ -11024,6 +11206,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 contributions,
                 None,
                 None,
+                None,
             )
             .await
             {
@@ -11410,6 +11593,9 @@ pub(crate) async fn try_commit_attempt(
     // Set by a caller that retries: the delta is built once at a reserved
     // ordinal and kept here across attempts (see `term_index::append_reserved`).
     reserved_segment: Option<&mut Option<ReservedSegment>>,
+    // Set by a caller that retries a commit with removals: parts rebuilt by
+    // an earlier attempt are reused (see `RebuiltParts`).
+    mut rebuilt_parts: Option<&mut RebuiltParts>,
     // Checked immediately before the pointer PUT; see [`CommitFence`].
     fence: Option<&mut dyn CommitFence>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
@@ -11432,7 +11618,11 @@ pub(crate) async fn try_commit_attempt(
             }
             NewEntryBirthVersions::Preserve => {
                 current_manifest
-                    .update_preserving_birth_versions(new_entries, entries_to_remove)
+                    .update_preserving_birth_versions(
+                        new_entries,
+                        entries_to_remove,
+                        rebuilt_parts.as_deref_mut(),
+                    )
                     .await
             }
         }
@@ -11606,9 +11796,9 @@ pub(crate) async fn try_commit_attempt(
     //    content-hashes) are unchanged in the new list. Each touched
     //    part ships both wire forms: full and the routing sibling the
     //    list entry references.
-    let encoded_refs: Vec<&[u8]> = parts_to_write
+    let encoded_parts: Vec<Bytes> = parts_to_write
         .iter()
-        .flat_map(|ep| [Some(ep.encoded.as_slice()), ep.routing_encoded.as_deref()])
+        .flat_map(|ep| [Some(ep.encoded.clone()), ep.routing_encoded.clone()])
         .flatten()
         .collect();
     // Whatever this commit's safety rests on has to still hold here. What is left after it is the
@@ -11621,7 +11811,7 @@ pub(crate) async fn try_commit_attempt(
         })?;
     }
     new_manifest
-        .write(storage.as_ref(), prev_etag.as_deref(), &encoded_refs)
+        .write(storage.as_ref(), prev_etag.as_deref(), &encoded_parts)
         .await?;
     // Silence the unused-import warning when no path uses
     // `PartId` / `part_mod` directly (helpers consume them
@@ -15857,6 +16047,7 @@ mod lost_write_span_tests {
                 &mut Vec::new(),
                 &mut Vec::new(),
                 &[],
+                None,
                 None,
                 fence,
             )

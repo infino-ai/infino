@@ -54,7 +54,7 @@ use crate::{
         error::CompactionError,
         handle::{SupertableInner, hidden_vector_index_compaction_settings},
         manifest::{
-            SuperfileUri,
+            RebuiltParts, SuperfileUri,
             list::PartitionStrategy,
             listed_once,
             term_index::{Contribution as TermContribution, ReservedSegment},
@@ -1074,6 +1074,8 @@ impl Supertable {
         // The batch's term-index delta, built on the first attempt and
         // appended again by any retry instead of rebuilt.
         let mut reserved_segment: Option<ReservedSegment> = None;
+        // Parts rebuilt for the batch's removals, reused by any retry.
+        let mut rebuilt_parts = RebuiltParts::default();
         let started = Instant::now();
 
         // Ends through the arms below: a commit, an error, or a lost race
@@ -1201,6 +1203,7 @@ impl Supertable {
                 &mut pending_storage_replaces,
                 &term_contributions,
                 Some(&mut reserved_segment),
+                Some(&mut rebuilt_parts),
                 Some(&mut fence),
             )
             .instrument(detail_span!(
@@ -2300,7 +2303,7 @@ async fn clear_completed_conversions(inner: &SupertableInner) -> Result<(), Comp
 mod tests {
     use std::{
         collections::HashSet,
-        env,
+        env, fs,
         io::Error as IoError,
         mem,
         ops::Range,
@@ -2343,7 +2346,9 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             error::CompactionError,
-            manifest::commit::{POINTER_PATH, get_current_manifest_etag, manifest_uri},
+            manifest::commit::{
+                MANIFEST_PARTS_DIR, POINTER_PATH, get_current_manifest_etag, manifest_uri,
+            },
             schema::change::{FieldPatch, SchemaPatch},
             storage::{LocalFsStorageProvider, StorageProvider},
             writer::persist_commit_async,
@@ -3908,9 +3913,9 @@ mod tests {
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&current))
             .await
             .expect("pointer etag");
-        let encoded: Vec<&[u8]> = parts
+        let encoded: Vec<Bytes> = parts
             .iter()
-            .flat_map(|p| [Some(p.encoded.as_slice()), p.routing_encoded.as_deref()])
+            .flat_map(|p| [Some(p.encoded.clone()), p.routing_encoded.clone()])
             .flatten()
             .collect();
         successor
@@ -4172,6 +4177,109 @@ mod tests {
         assert_eq!(faults.fired(), LOST_POINTER_SWAPS);
         let listed = assert_listed_once(&st, &rows).await;
         assert_eq!(listed.len(), 1, "one merged superfile: {listed:?}");
+    }
+
+    /// Superfiles per manifest part in the reused-parts retry test, so its
+    /// inputs sit in parts other than the one the merge is appended to.
+    const SMALL_PART_SUPERFILES: u64 = 2;
+    /// Every manifest part object in `dir`'s storage.
+    fn part_objects(dir: &TempDir) -> HashSet<String> {
+        fs::read_dir(dir.path().join(MANIFEST_PARTS_DIR))
+            .expect("parts dir")
+            .map(|e| {
+                let name = e.expect("dir entry").file_name();
+                format!("{MANIFEST_PARTS_DIR}/{}", name.to_string_lossy())
+            })
+            .collect()
+    }
+
+    /// The part objects `st`'s current manifest names, in both wire forms.
+    fn named_parts(st: &Supertable) -> HashSet<String> {
+        st.inner()
+            .manifest
+            .load()
+            .get_all_list_entries()
+            .iter()
+            .flat_map(|e| {
+                [
+                    Some(e.uri.clone()),
+                    e.routing.as_ref().map(|r| r.uri.clone()),
+                ]
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_retry_reuses_the_parts_its_first_attempt_rebuilt() {
+        // The inputs sit in two earlier parts, which the commit rebuilds. A
+        // peer publishes first, so the commit retries, and the retry reuses
+        // those two parts: the only part objects the first attempt leaves
+        // unnamed are its version of the last part.
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(Arc::clone(&local));
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let options =
+            || default_supertable_options().with_target_superfiles_per_part(SMALL_PART_SUPERFILES);
+        let st = Supertable::create(options().with_storage(storage)).expect("create supertable");
+        commit_mergeable_superfiles(&st);
+        let peer = Supertable::open(options().with_storage(Arc::clone(&local))).expect("open peer");
+        let rows: HashSet<i128> = listed_row_ids(&st).await.into_iter().collect();
+        let superfiles = st.inner().manifest.load().get_all_superfiles().to_vec();
+        // One superfile from each of the first two parts, which keep the other.
+        let job = CompactionJob {
+            partition_key: Vec::new(),
+            inputs: vec![superfiles[0].superfile_id, superfiles[2].superfile_id],
+            estimated_output_bytes: 0,
+            merge_memory_mb: None,
+        };
+        let before = part_objects(&dir);
+        let peer_handle = peer.clone();
+        // The peer publishes just before the compaction's first list PUT.
+        faults.before(FaultOp::PutAtomic, "manifest/manifest-", move || {
+            thread::spawn(move || commit_titles(&peer, &["peer first", "peer second"]))
+                .join()
+                .expect("peer commit");
+        });
+
+        st.run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("compaction commits after losing to the peer");
+
+        let listed = listed_row_ids(&st).await;
+        let distinct: HashSet<i128> = listed.iter().copied().collect();
+        assert_eq!(distinct.len(), listed.len(), "every row is listed once");
+        assert!(distinct.is_superset(&rows), "no row was lost");
+        assert_eq!(listed.len(), rows.len() + 2, "the peer's rows are kept");
+        let reopened = Supertable::open(options().with_storage(local)).expect("reopen");
+        assert_eq!(
+            listed_row_ids(&reopened).await.len(),
+            listed.len(),
+            "the table reopens with every row"
+        );
+
+        // The lost attempt leaves only its version of the last part unnamed:
+        // one object, or two when the part's routing form differs from its
+        // full form. Rebuilding the input parts again would orphan theirs too.
+        let manifest = st.inner().manifest.load();
+        let last = manifest.get_all_list_entries().last().expect("a part");
+        let objects_per_part = if last.routing.as_ref().is_some_and(|r| r.uri != last.uri) {
+            2
+        } else {
+            1
+        };
+        let created: HashSet<String> = part_objects(&dir).difference(&before).cloned().collect();
+        let named: HashSet<String> = named_parts(&st)
+            .union(&named_parts(&peer_handle))
+            .cloned()
+            .collect();
+        assert_eq!(
+            created.difference(&named).count(),
+            objects_per_part,
+            "the retry reused the parts its first attempt rebuilt"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

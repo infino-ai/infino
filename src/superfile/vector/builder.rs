@@ -2159,6 +2159,9 @@ fn sample_fp32_rows(vectors: &[f32], sample_size: usize, dim: usize, seed: u64) 
 /// to disk. The single builder behind the drain (spilled rows), the
 /// commit-time cell pack (fp32 buffer), and maintenance rebuilds (in-RAM
 /// encoded rows).
+///
+/// Nothing is fsynced: a caller that reopens the files after a crash syncs
+/// them itself.
 pub(crate) fn build_cell_subsection_from_source(
     cfg: VectorConfig,
     requested_n_cent: usize,
@@ -2316,16 +2319,13 @@ pub(crate) fn build_cell_subsection_from_source(
             min_max,
         ),
     })?;
-    end_phase("bucket_ms");
     stable_ids.flush()?;
-    stable_ids.get_ref().sync_all()?;
-    for writer in bucket_writers {
-        writer
-            .into_inner()
-            .map_err(|error| BuildError::Io(error.into_error()))?
-            .sync_all()?;
+    // Buckets are read back in this call and dropped with the temp dir, so a
+    // flush to the page cache is enough.
+    for mut writer in bucket_writers {
+        writer.flush()?;
     }
-    end_phase("fsync_ms");
+    end_phase("bucket_ms");
     let quantizers: Vec<(Vec<f32>, Vec<f32>)> = if fit_quantizer {
         (0..n_cent)
             .map(|centroid| {
@@ -2451,7 +2451,6 @@ pub(crate) fn build_cell_subsection_from_source(
     output.seek(SeekFrom::Start(layout.total_size_before_crc as u64))?;
     output.write_all(&crc.to_le_bytes())?;
     output.flush()?;
-    output.sync_all()?;
     end_phase("crc_ms");
     Ok(StreamedIvfSubsection {
         n_docs: n_docs as u32,
