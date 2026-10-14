@@ -11,7 +11,6 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::{
