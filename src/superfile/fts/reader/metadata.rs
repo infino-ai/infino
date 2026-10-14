@@ -488,7 +488,12 @@ pub struct ColumnMeta {
     pub(super) verify_crc: bool,
     /// Present when the blob stores its buckets; absent on an older blob,
     /// which quantizes its lengths on first scored use instead.
-    pub(super) stored_norms: Option<StoredNorms>,
+    ///
+    /// Boxed to keep [`ColumnMeta`] the width it was. The summary is read
+    /// once, on the column's first scored use; the struct holding it is
+    /// walked by paths that do no scoring at all, and this file already
+    /// boxes the scorer's lookup table for the same reason.
+    pub(super) stored_norms: Option<Box<StoredNorms>>,
     /// Norms at the declared parameters, shared by every view of the reader.
     pub(super) base_norms: Arc<OnceLock<ColumnNorms>>,
     /// Norms at `params` when they differ from the declared pair, derived

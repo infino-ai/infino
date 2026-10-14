@@ -963,11 +963,11 @@ impl FtsReader {
                         total_tokens: read_u64_le(&dir_bytes[entry_off + 16..entry_off + 24]),
                         n_scored_docs: read_u64_le(&dir_bytes[entry_off + 24..entry_off + 32]),
                     };
-                    Some(StoredNorms {
+                    Some(Box::new(StoredNorms {
                         buckets: buckets_start..buckets_end,
                         stats,
                         occupied: (dir_bytes[entry_off + 32], dir_bytes[entry_off + 33]),
-                    })
+                    }))
                 }
             };
             let baked_avgdl = (avgdl_x1000 as f32) / format::fts::AVGDL_FIXED_POINT_SCALE;
