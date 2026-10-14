@@ -34,6 +34,7 @@ use std::{
     sync::Arc,
 };
 
+use bytes::Bytes;
 use roaring::RoaringBitmap;
 
 /// A document's position among a superfile's Parquet rows.
@@ -166,13 +167,44 @@ pub enum DocMap {
     Identity,
     /// The row each blob position stands for, indexed by [`FtsDocId`].
     Permuted(Arc<[RowId]>),
+    /// The same mapping, left in the bytes it was read from: four
+    /// little-endian bytes per blob position.
+    ///
+    /// A blob read from a memory mapping gets its map for free this way.
+    /// Decoding it into [`Self::Permuted`] would copy four bytes per
+    /// document onto the heap at every open, where they stay pinned for
+    /// the life of the reader; held here they stay in the mapping, which
+    /// the page cache can evict and reload without the reader's help.
+    PermutedInPlace(Bytes),
 }
+
+/// Bytes per entry in a doc-id map region: one little-endian `u32` row.
+const MAP_ENTRY_BYTES: usize = 4;
 
 impl DocMap {
     /// The map a reordered blob's doc-id map region describes.
     #[inline]
     pub fn permuted(rows: Arc<[RowId]>) -> Self {
         Self::Permuted(rows)
+    }
+
+    /// The same map, reading straight out of `region`, the blob's doc-id
+    /// map bytes. Entries past the last whole one are not addressable, so
+    /// a region that is not a whole number of entries cannot be indexed
+    /// into beyond them.
+    #[inline]
+    pub fn permuted_in_place(region: Bytes) -> Self {
+        Self::PermutedInPlace(region)
+    }
+
+    /// Entries the map holds. Zero for the identity, which has no region.
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Identity => 0,
+            Self::Permuted(rows) => rows.len(),
+            Self::PermutedInPlace(region) => region.len() / MAP_ENTRY_BYTES,
+        }
     }
 
     /// The row `doc` stands for.
@@ -197,6 +229,23 @@ impl DocMap {
                     .copied()
                     .unwrap_or(RowId(doc.get()))
             }
+            Self::PermutedInPlace(region) => {
+                debug_assert!(
+                    (doc.get() as usize) < self.len(),
+                    "blob doc id {} is past the {} entries of this blob's map",
+                    doc.get(),
+                    self.len()
+                );
+                // An unaligned little-endian load, so the region is read where it
+                // lies: no alignment demand on the blob and no byte order assumed
+                // about the host.
+                let at = (doc.get() as usize) * MAP_ENTRY_BYTES;
+                region
+                    .get(at..at + MAP_ENTRY_BYTES)
+                    .and_then(|b| b.try_into().ok())
+                    .map(|b| RowId(u32::from_le_bytes(b)))
+                    .unwrap_or(RowId(doc.get()))
+            }
         }
     }
 
@@ -204,7 +253,7 @@ impl DocMap {
     /// that blob position and row are different numbers.
     #[inline]
     pub fn is_permuted(&self) -> bool {
-        matches!(self, Self::Permuted(_))
+        matches!(self, Self::Permuted(_) | Self::PermutedInPlace(_))
     }
 }
 

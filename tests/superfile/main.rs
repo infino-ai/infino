@@ -22,6 +22,7 @@
 //!   cargo test --test superfile vector::brute_force_oracle::
 //!   cargo test --test superfile format::crc_corruption::
 
+mod doc_map;
 mod format;
 mod fts;
 mod pipeline;

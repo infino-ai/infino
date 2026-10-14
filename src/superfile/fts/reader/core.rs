@@ -997,11 +997,12 @@ impl FtsReader {
                         }));
                     }
                 }
-                let rows: Vec<RowId> = body
-                    .chunks_exact(U32_BYTES)
-                    .map(|b| RowId::new(read_u32_le(b)))
-                    .collect();
-                DocMap::permuted(Arc::from(rows))
+                // Held as the bytes it was read from. On a blob opened from a
+                // memory mapping those bytes are the mapping, so the map costs
+                // nothing at open and stays evictable; decoding it here would
+                // copy four bytes per document onto the heap instead, for the
+                // life of the reader.
+                DocMap::permuted_in_place(body)
             }
         };
 
@@ -1077,6 +1078,16 @@ impl FtsReader {
     pub(crate) fn column_baked_avgdl(&self, column: &str) -> Option<f32> {
         let id = self.resolve_column_id(column).ok()?;
         Some(self.columns[id as usize].baked_avgdl)
+    }
+
+    test_visible! {
+    /// Whether this blob's doc-id map is read out of the source bytes rather
+    /// than decoded onto the heap when the blob is opened. A blob served from
+    /// a memory mapping must take this form, or every open copies four bytes
+    /// per document into heap that stays pinned for the reader's life.
+    fn doc_map_is_in_place(&self) -> bool {
+        matches!(self.doc_map, DocMap::PermutedInPlace(_))
+    }
     }
 
     test_visible! {
