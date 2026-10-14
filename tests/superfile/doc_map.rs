@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! The doc-id map read in place against the same map decoded onto the heap.
+//! The doc-id map read in place out of its region.
 //!
 //! A blob opened from a memory mapping keeps its map in the mapped bytes
 //! rather than copying four bytes per document onto the heap, where they
-//! would stay pinned for the life of the reader. The two forms have to be
-//! indistinguishable to every caller, and a region that is not a whole
+//! would stay pinned for the life of the reader. Every position has to
+//! resolve to the row the region holds, and a region that is not a whole
 //! number of entries must still serve the entries it does hold.
 
 #![deny(clippy::unwrap_used)]
-
-use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use infino::superfile::id_space::{DocMap, FtsDocId, RowId};
@@ -38,27 +36,16 @@ fn region_for(rows: &[RowId]) -> Bytes {
 }
 
 #[test]
-fn reading_the_map_in_place_matches_decoding_it() {
+fn every_position_resolves_to_the_row_its_region_holds() {
     let rows = rows_for(MAP_DOCS);
-    let owned = DocMap::permuted(Arc::from(rows.clone()));
-    let in_place = DocMap::permuted_in_place(region_for(&rows));
+    let map = DocMap::permuted(region_for(&rows));
 
-    assert!(owned.is_permuted(), "the decoded form is a permutation");
-    assert!(
-        in_place.is_permuted(),
-        "so is the one read in place; a caller that branches on this must not \
-         see the two forms differently"
-    );
+    assert!(map.is_permuted(), "a map with a region is a permutation");
 
     for d in 0..MAP_DOCS {
         let doc = FtsDocId::new(d);
         assert_eq!(
-            in_place.row_of(doc),
-            owned.row_of(doc),
-            "position {d} resolved differently in place than decoded"
-        );
-        assert_eq!(
-            in_place.row_of(doc),
+            map.row_of(doc),
             rows[d as usize],
             "position {d} did not resolve to the row the region holds"
         );
@@ -73,12 +60,12 @@ fn a_region_cut_mid_entry_still_serves_its_whole_entries() {
     // addressable: reading past them trips the map's own assertion, so this
     // checks that truncation does not disturb the entries before the cut.
     region.truncate(region.len() - 1);
-    let in_place = DocMap::permuted_in_place(region);
+    let map = DocMap::permuted(region);
 
     for d in 0..(MAP_DOCS - 1) {
         let doc = FtsDocId::new(d);
         assert_eq!(
-            in_place.row_of(doc),
+            map.row_of(doc),
             rows[d as usize],
             "position {d} stopped resolving once the region lost its last byte"
         );

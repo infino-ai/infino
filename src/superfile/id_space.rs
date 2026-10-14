@@ -154,10 +154,11 @@ impl StableId {
 /// A blob written in arrival order needs no translation and carries
 /// [`DocMap::Identity`], which costs nothing to consult. A blob a
 /// compaction reordered carries [`DocMap::Permuted`], the row each blob
-/// position stands for, read from the blob's doc-id map region.
+/// position stands for, in the bytes of the blob's doc-id map region.
 ///
-/// Cloning is cheap either way — the permuted form is one `Arc` bump —
-/// so every gate that needs to translate can hold its own handle.
+/// Cloning is cheap either way — the permuted form is one reference-count
+/// bump on the region — so every gate that needs to translate can hold
+/// its own handle.
 #[derive(Clone, Debug, Default)]
 pub enum DocMap {
     /// Blob position and row are the same number, which is every blob
@@ -165,36 +166,29 @@ pub enum DocMap {
     /// arrival order.
     #[default]
     Identity,
-    /// The row each blob position stands for, indexed by [`FtsDocId`].
-    Permuted(Arc<[RowId]>),
-    /// The same mapping, left in the bytes it was read from: four
-    /// little-endian bytes per blob position.
+    /// The row each blob position stands for, indexed by [`FtsDocId`],
+    /// left in the bytes it was read from: four little-endian bytes per
+    /// blob position.
     ///
     /// A blob read from a memory mapping gets its map for free this way.
-    /// Decoding it into [`Self::Permuted`] would copy four bytes per
-    /// document onto the heap at every open, where they stay pinned for
-    /// the life of the reader; held here they stay in the mapping, which
-    /// the page cache can evict and reload without the reader's help.
-    PermutedInPlace(Bytes),
+    /// Decoding the region onto the heap would copy four bytes per
+    /// document at every open, where they stay pinned for the life of
+    /// the reader; held here they stay in the mapping, which the page
+    /// cache can evict and reload without the reader's help.
+    Permuted(Bytes),
 }
 
 /// Bytes per entry in a doc-id map region: one little-endian `u32` row.
 const MAP_ENTRY_BYTES: usize = 4;
 
 impl DocMap {
-    /// The map a reordered blob's doc-id map region describes.
+    /// The map `region`, a reordered blob's doc-id map bytes, describes,
+    /// read straight out of those bytes. Entries past the last whole one
+    /// are not addressable, so a region that is not a whole number of
+    /// entries cannot be indexed into beyond them.
     #[inline]
-    pub fn permuted(rows: Arc<[RowId]>) -> Self {
-        Self::Permuted(rows)
-    }
-
-    /// The same map, reading straight out of `region`, the blob's doc-id
-    /// map bytes. Entries past the last whole one are not addressable, so
-    /// a region that is not a whole number of entries cannot be indexed
-    /// into beyond them.
-    #[inline]
-    pub fn permuted_in_place(region: Bytes) -> Self {
-        Self::PermutedInPlace(region)
+    pub fn permuted(region: Bytes) -> Self {
+        Self::Permuted(region)
     }
 
     /// Entries the map holds. Zero for the identity, which has no region.
@@ -202,8 +196,7 @@ impl DocMap {
     fn len(&self) -> usize {
         match self {
             Self::Identity => 0,
-            Self::Permuted(rows) => rows.len(),
-            Self::PermutedInPlace(region) => region.len() / MAP_ENTRY_BYTES,
+            Self::Permuted(region) => region.len() / MAP_ENTRY_BYTES,
         }
     }
 
@@ -218,18 +211,7 @@ impl DocMap {
     pub fn row_of(&self, doc: FtsDocId) -> RowId {
         match self {
             Self::Identity => RowId(doc.get()),
-            Self::Permuted(rows) => {
-                debug_assert!(
-                    (doc.get() as usize) < rows.len(),
-                    "blob doc id {} is past the {} entries of this blob's map",
-                    doc.get(),
-                    rows.len()
-                );
-                rows.get(doc.get() as usize)
-                    .copied()
-                    .unwrap_or(RowId(doc.get()))
-            }
-            Self::PermutedInPlace(region) => {
+            Self::Permuted(region) => {
                 debug_assert!(
                     (doc.get() as usize) < self.len(),
                     "blob doc id {} is past the {} entries of this blob's map",
@@ -253,7 +235,7 @@ impl DocMap {
     /// that blob position and row are different numbers.
     #[inline]
     pub fn is_permuted(&self) -> bool {
-        matches!(self, Self::Permuted(_) | Self::PermutedInPlace(_))
+        matches!(self, Self::Permuted(_))
     }
 }
 
@@ -302,8 +284,11 @@ mod tests {
     /// A permuted map hands back the row its region recorded.
     #[test]
     fn a_permuted_map_translates_a_blob_id_to_its_recorded_row() {
-        let rows: Arc<[RowId]> = vec![RowId::new(2), RowId::new(0), RowId::new(1)].into();
-        let map = DocMap::permuted(rows);
+        let mut region = Vec::new();
+        for row in [2u32, 0, 1] {
+            region.extend_from_slice(&row.to_le_bytes());
+        }
+        let map = DocMap::permuted(Bytes::from(region));
         assert_eq!(map.row_of(FtsDocId::new(0)), RowId::new(2));
         assert_eq!(map.row_of(FtsDocId::new(1)), RowId::new(0));
         assert_eq!(map.row_of(FtsDocId::new(2)), RowId::new(1));
