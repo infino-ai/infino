@@ -495,6 +495,11 @@ pub(crate) fn decode_value_counts(bytes: &[u8]) -> Result<ScalarValueCounts, Dec
 /// practice the schema is built from the array's own `data_type`, so the
 /// batch always matches — but failures are surfaced rather than panicked so
 /// a bad array can't abort a commit.
+///
+/// Test-only since the list carries a part's rollups as one batch: it
+/// writes the per-bound form that lists before minor 2.1 carry, so the
+/// decoder of that form stays exercised.
+#[cfg(test)]
 pub(crate) fn encode_length1_array(
     field_name: &str,
     arr: &ArrayRef,
