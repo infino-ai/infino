@@ -530,10 +530,6 @@ pub(crate) async fn load_root(
 /// and content-addressed, so the cache never goes stale. Bounding the cache
 /// is the disk-cache layer's job once slices route through it; here it is
 /// simply a map, sized by what the process has looked up.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by the routing path, which lands next")
-)]
 pub(crate) struct TermIndex {
     root: Root,
     /// The root's storage URI — the identity a manifest pins, and what a
@@ -604,10 +600,6 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone> Resident<K, V> {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by the routing path, which lands next")
-)]
 impl TermIndex {
     /// Wrap a loaded root.
     pub(crate) fn new(
