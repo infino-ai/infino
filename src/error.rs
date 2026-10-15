@@ -121,10 +121,11 @@ pub enum InfinoError {
     Config(String),
 
     /// The request is valid but uses something the engine does not support:
-    /// a SQL feature DataFusion does not implement, or a superfile the
-    /// request read whose full-text index is older than this engine reads or
-    /// was built under a removed analyzer (the message says how to bring it
-    /// forward). Retrying cannot help.
+    /// a SQL feature DataFusion does not implement, a superfile the request
+    /// read whose full-text index is older than this engine reads or was
+    /// built under a removed analyzer, or a table whose term index is in a
+    /// layout this engine no longer reads (the message says how to bring
+    /// either forward). Retrying cannot help.
     #[error("unsupported: {0}")]
     Unsupported(String),
 }
@@ -325,6 +326,12 @@ fn manifest_load_variant(e: &ManifestLoadError) -> fn(String) -> InfinoError {
         // Surface it as `Io` so a caller can retry (e.g. against another
         // copy of the data) rather than treat it as a hard backend fault.
         ManifestLoadError::Storage(_) => InfinoError::Io,
+        // A term index in a layout this engine no longer reads is fixed by
+        // rebuilding it, which the message names; a read that failed may
+        // succeed next time. A corrupt one is a fault, like a part whose
+        // hash does not match.
+        ManifestLoadError::TermIndex(t) if t.is_unsupported_version() => InfinoError::Unsupported,
+        ManifestLoadError::TermIndex(t) if !t.calls_for_rebuild() => InfinoError::Io,
         _ => InfinoError::Backend,
     }
 }
@@ -549,11 +556,50 @@ mod tests {
             error::FtsError,
             format::fts::{REPAIR_RELEASE, VERSION_MIN_RELEASE},
         },
-        supertable::wal::{
-            WalStoreError,
-            pipeline::{AppendPhaseError, TombstonePhaseError},
+        supertable::{
+            manifest::term_index::TermIndexError,
+            wal::{
+                WalStoreError,
+                pipeline::{AppendPhaseError, TombstonePhaseError},
+            },
         },
     };
+
+    /// A term index in a layout this engine no longer reads is `Unsupported`
+    /// and names its repair; one that failed to load for now is retryable
+    /// `Io`; a corrupt or vanished one is a fault, `Backend`; a refused
+    /// credential stays one.
+    #[test]
+    fn a_term_index_failure_reaches_the_caller_by_its_cause() {
+        let public = |e: TermIndexError| InfinoError::from(QueryError::from(e));
+        let old = public(TermIndexError::UnsupportedVersion {
+            what: "root",
+            found: 2,
+            expected: 3,
+        });
+        assert!(matches!(old, InfinoError::Unsupported(_)), "{old}");
+        assert!(old.to_string().contains("optimize()"), "{old}");
+        assert!(matches!(
+            public(TermIndexError::Storage(StorageError::TransientExhausted {
+                uri: "u".into(),
+                source: "timeout".into(),
+            })),
+            InfinoError::Io(_)
+        ));
+        for corrupt in [
+            TermIndexError::HashMismatch,
+            TermIndexError::Malformed("bad magic".into()),
+            TermIndexError::Storage(StorageError::NotFound { uri: "u".into() }),
+        ] {
+            assert!(matches!(public(corrupt), InfinoError::Backend(_)));
+        }
+        assert!(matches!(
+            public(TermIndexError::Storage(StorageError::PermissionDenied {
+                uri: "u".into()
+            })),
+            InfinoError::PermissionDenied(_)
+        ));
+    }
 
     #[test]
     fn display_messages_are_prefixed() {

@@ -10630,7 +10630,10 @@ where
 /// it out of the segment that holds it gives what walking the superfile
 /// again would. Only superfiles no segment lists are walked. Every
 /// superfile is walked instead ([`collect_and_build_term_index`]) when the
-/// current root cannot be read or a slice it names is gone or corrupt.
+/// current root will never load (gone, corrupt, or in a layout this engine
+/// no longer reads) or a slice it names is gone or corrupt. A root that
+/// fails to load for now fails the stamp, unless a retry holds its own
+/// earlier build to catch up from.
 ///
 /// The full build runs once. When commits land before it publishes, a retry
 /// folds their delta segments onto it ([`fold_term_index`]), or, when that
@@ -10647,7 +10650,7 @@ pub(in crate::supertable) async fn stamp_term_index(
     }
     // The last build's root, and the root it was built from. A retry
     // reuses its slices without PUTting them again: were one reclaimed in
-    // between, queries would fall back to summary routing until a rebuild.
+    // between, queries that need it would fail until a rebuild.
     let last_build: Mutex<Option<(Root, Option<Root>)>> = Mutex::new(None);
     stamp_with_retries(inner, &storage, "term-index", |old| {
         let storage = &storage;
@@ -10657,11 +10660,21 @@ pub(in crate::supertable) async fn stamp_term_index(
                 .get_all_superfiles_loaded()
                 .await
                 .map_err(|e| BuildError::Store(e.to_string()))?;
-            if !old.needs_term_index_rebuild(&entries).await {
-                return Ok(None);
-            }
-            let current = referenced_root(&old).await;
             let last = last_build.lock().expect("term-index build lock").clone();
+            // A root that failed to load for now is waited out: a rebuild
+            // reads every superfile's dictionary to repair nothing. A retry
+            // holding its own build catches up from that.
+            match old.needs_term_index_rebuild(&entries).await {
+                Ok(false) => return Ok(None),
+                Ok(true) => {}
+                Err(_) if last.is_some() => {}
+                Err(e) => return Err(e.into()),
+            }
+            let current = match referenced_root(&old).await {
+                Ok(current) => current,
+                Err(_) if last.is_some() => None,
+                Err(e) => return Err(e.into()),
+            };
             let folded = match (&last, &current) {
                 (Some((base, Some(prior))), Some(current)) => {
                     match fold_term_index(&old, base, prior, current, &entries).await {
@@ -10694,7 +10707,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                 (None, None, Some(current)) if !current.segments.is_empty() => {
                     match merge_term_index(&old, current, &entries).await {
                         Ok(built) => built,
-                        Err(e) if e.object_is_gone_or_corrupt() => {
+                        Err(e) if e.calls_for_rebuild() => {
                             warn!("term index: cannot merge the current index, rebuilding from the superfiles: {e}");
                             collect_and_build_term_index(&old, &entries, Root::default()).await?
                         }
@@ -10722,14 +10735,15 @@ pub(in crate::supertable) async fn stamp_term_index(
 }
 
 /// The root `manifest` references: empty when it has none, `None` when it
-/// cannot be read. Loaded through the snapshot, which caches it.
-async fn referenced_root(manifest: &ManifestSnapshot) -> Option<Root> {
-    match manifest.term_index_ref() {
-        Some(_) => manifest
-            .term_index()
-            .await
-            .map(|index| index.root().clone()),
-        None => Some(Root::default()),
+/// will never load and is rebuilt, an error when it failed to load for now.
+/// Loaded through the snapshot, which caches it.
+async fn referenced_root(manifest: &ManifestSnapshot) -> Result<Option<Root>, TermIndexError> {
+    match manifest.term_index().await {
+        Ok(Some(index)) => Ok(Some(index.root().clone())),
+        Ok(None) if manifest.term_index_ref().is_none() => Ok(Some(Root::default())),
+        Ok(None) => Ok(None),
+        Err(e) if e.calls_for_rebuild() => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -11939,7 +11953,7 @@ pub(crate) async fn try_commit_attempt(
                 .await
             {
                 Ok(root) => Some(root),
-                Err(e) if e.object_is_gone_or_corrupt() => {
+                Err(e) if e.calls_for_rebuild() => {
                     warn!(error = %e, uri = %reference.uri, "prior term-index root gone or corrupt; restarting the index from this commit");
                     None
                 }

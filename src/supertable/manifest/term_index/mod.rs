@@ -121,13 +121,24 @@ const RESERVED_ORDINAL_SLACK: u32 = 256;
 
 /// Errors from building, storing or reading the term index.
 #[derive(Debug, Error)]
-pub(crate) enum TermIndexError {
+pub enum TermIndexError {
     /// Object storage failed.
     #[error("term-index storage error: {0}")]
     Storage(StorageError),
     /// Bytes did not parse as the layout `format` describes.
     #[error("term-index artifact malformed: {0}")]
     Malformed(String),
+    /// The artifact was written in a layout version this engine does not
+    /// read. Maintenance rebuilds it from the superfiles.
+    #[error(
+        "the table's term index ({what}) is at layout version {found} and this engine reads \
+         version {expected}; run optimize() or reindex() on the table to rebuild it"
+    )]
+    UnsupportedVersion {
+        what: &'static str,
+        found: u32,
+        expected: u32,
+    },
     /// Fetched bytes do not hash to what the manifest references.
     #[error("term-index artifact hash mismatch")]
     HashMismatch,
@@ -164,16 +175,73 @@ impl TermIndexError {
         }
     }
 
-    /// Whether this error says the object is gone or unusable — absent,
-    /// unparseable, or not the bytes its hash promises — as opposed to a
-    /// read that failed and may well succeed next time. A commit that
-    /// cannot load the prior root restarts the index only in the first
-    /// case; in the second it keeps the reference and waits.
-    pub(crate) fn object_is_gone_or_corrupt(&self) -> bool {
-        matches!(
-            self,
-            Self::Storage(StorageError::NotFound { .. }) | Self::Malformed(_) | Self::HashMismatch
-        )
+    /// Whether the object will never load as it is: absent, unparseable,
+    /// not the bytes its hash promises, or in a layout this engine no
+    /// longer reads. Only these are repaired by rebuilding; a commit that
+    /// meets any other failure keeps the reference and waits.
+    pub(crate) fn calls_for_rebuild(&self) -> bool {
+        self.as_permanent().is_some()
+    }
+
+    /// Whether the artifact is in a layout this engine no longer reads.
+    pub(crate) fn is_unsupported_version(&self) -> bool {
+        matches!(self, Self::UnsupportedVersion { .. })
+    }
+
+    /// This error as a [`PermanentLoadFailure`], when it is one.
+    pub(crate) fn as_permanent(&self) -> Option<PermanentLoadFailure> {
+        match self {
+            Self::Storage(StorageError::NotFound { uri }) => {
+                Some(PermanentLoadFailure::NotFound(uri.clone()))
+            }
+            Self::Malformed(m) => Some(PermanentLoadFailure::Malformed(m.clone())),
+            Self::UnsupportedVersion {
+                what,
+                found,
+                expected,
+            } => Some(PermanentLoadFailure::UnsupportedVersion {
+                what,
+                found: *found,
+                expected: *expected,
+            }),
+            Self::HashMismatch => Some(PermanentLoadFailure::HashMismatch),
+            _ => None,
+        }
+    }
+}
+
+/// A load failure that every later attempt would repeat: the object is
+/// absent, unparseable, not the bytes its hash promises, or in a layout this
+/// engine no longer reads. Kept so a broken root is fetched once per
+/// handle.
+#[derive(Debug, Clone)]
+pub(crate) enum PermanentLoadFailure {
+    NotFound(String),
+    Malformed(String),
+    UnsupportedVersion {
+        what: &'static str,
+        found: u32,
+        expected: u32,
+    },
+    HashMismatch,
+}
+
+impl From<PermanentLoadFailure> for TermIndexError {
+    fn from(f: PermanentLoadFailure) -> Self {
+        match f {
+            PermanentLoadFailure::NotFound(uri) => Self::Storage(StorageError::NotFound { uri }),
+            PermanentLoadFailure::Malformed(m) => Self::Malformed(m),
+            PermanentLoadFailure::UnsupportedVersion {
+                what,
+                found,
+                expected,
+            } => Self::UnsupportedVersion {
+                what,
+                found,
+                expected,
+            },
+            PermanentLoadFailure::HashMismatch => Self::HashMismatch,
+        }
     }
 }
 
@@ -602,29 +670,36 @@ impl TermIndex {
 
     /// The superfiles a term or prefix leaf routes to, or `None` when the
     /// leaf is not one the index answers — a scalar leaf, an empty term
-    /// list, a non-UTF-8 prefix, a column the table does not have — or the
-    /// lookup failed; the caller then keeps its summary-based answer.
+    /// list, a non-UTF-8 prefix, a column the table does not have; the
+    /// caller then keeps its summary-based answer. A lookup that fails is
+    /// an error.
     pub(crate) async fn route_leaf(
         &self,
         leaf: &PruneLeaf,
         snapshot: &ManifestSnapshot,
-    ) -> Option<HashSet<Uuid>> {
+    ) -> Result<Option<HashSet<Uuid>>, TermIndexError> {
         match leaf {
             PruneLeaf::TermPresence {
                 column,
                 terms,
                 mode,
             } if !terms.is_empty() => {
-                let column = snapshot.field_id(column)?;
+                let Some(column) = snapshot.field_id(column) else {
+                    return Ok(None);
+                };
                 let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-                self.route(column, &refs, *mode).await.ok()
+                self.route(column, &refs, *mode).await.map(Some)
             }
             PruneLeaf::Prefix { column, prefix } => {
-                let column = snapshot.field_id(column)?;
-                let prefix = std::str::from_utf8(prefix).ok()?;
-                self.route_prefix(column, prefix).await.ok()
+                let Some(column) = snapshot.field_id(column) else {
+                    return Ok(None);
+                };
+                let Ok(prefix) = std::str::from_utf8(prefix) else {
+                    return Ok(None);
+                };
+                self.route_prefix(column, prefix).await.map(Some)
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 
@@ -984,13 +1059,14 @@ mod tests {
     use tokio::time::sleep;
 
     use super::{
-        format::{Segment, SliceRef},
+        format::{ROOT_MAGIC, Segment, SliceRef},
         *,
     };
     use crate::{
-        CompactionSettings, OptimizeOptions,
+        Bm25SearchOptions, CompactionSettings, InfinoError, OptimizeOptions,
         storage::{LocalFsStorageProvider, ObjectMeta},
         supertable::{
+            Supertable,
             manifest::{
                 commit::{POINTER_PATH, read_pointer},
                 list,
@@ -998,6 +1074,7 @@ mod tests {
             },
             query::prune::select_superfiles,
             schema::{LegacyNames, TableSchema},
+            writer::stamp_with_retries,
         },
         test_helpers::{
             copy_dir_recursive,
@@ -1869,7 +1946,8 @@ mod tests {
         );
         let index = reader
             .block_on(manifest.term_index())
-            .expect("the index loads");
+            .expect("the index loads")
+            .expect("the table has an index");
         let unindexed: Vec<Uuid> = reader
             .block_on(manifest.get_all_superfiles_loaded())
             .expect("entries")
@@ -2449,7 +2527,7 @@ mod tests {
         });
         maintenance_only_optimize(&st);
         // The retry loads the root twice, for the rebuild check and the
-        // fold, because a failed load is not cached.
+        // fold, because a failure that may pass is not cached.
         assert_eq!(faults.fired(), 2, "both root loads failed");
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -2519,7 +2597,7 @@ mod tests {
         assert!(optimize_rebuilds_term_index(&st, &faults));
     }
 
-    /// A root that cannot be loaded is rebuilt rather than trusted.
+    /// A root that is gone is rebuilt.
     #[test]
     fn an_unloadable_root_triggers_the_rebuild() {
         let (dir, faults, storage, st) = optimized_fault_table();
@@ -2926,7 +3004,8 @@ mod tests {
         assert_ne!(reference, first_root, "the commit published a new root");
         let index = reader
             .block_on(manifest.term_index())
-            .expect("the index loads");
+            .expect("the index loads")
+            .expect("the table has an index");
         assert_eq!(
             index.root_uri(),
             reference.uri,
@@ -3304,7 +3383,10 @@ mod tests {
         let manifest = reader.manifest();
         let entries = manifest.get_all_superfiles().to_vec();
         assert!(entries.len() > 64, "wide table: {}", entries.len());
-        let index = rt.block_on(manifest.term_index()).expect("index");
+        let index = rt
+            .block_on(manifest.term_index())
+            .expect("index")
+            .expect("indexed");
         assert_eq!(index.root().segments.len(), 1, "one folded segment");
         let run = rt
             .block_on(index.postings(title_id(), "shared"))
@@ -3315,7 +3397,9 @@ mod tests {
             "a term in every superfile keeps every location"
         );
         let terms = ["shared", "common1", "absent"];
-        let locations = rt.block_on(index_locations_for(manifest, "title", &terms, &entries));
+        let locations = rt
+            .block_on(index_locations_for(manifest, "title", &terms, &entries))
+            .expect("locations");
         for e in &entries {
             let bytes =
                 std::fs::read(dir.path().join(e.uri.storage_path())).expect("superfile bytes");
@@ -3376,7 +3460,9 @@ mod tests {
         // shows absent from a superfile recorded as resolved misses.
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
-        let locations = rt.block_on(plan_locations_for(manifest, &plan, &entries));
+        let locations = rt
+            .block_on(plan_locations_for(manifest, &plan, &entries))
+            .expect("locations");
         assert_eq!(locations.len(), 1, "one column");
         let mut total_rows = 0u64;
         for e in &entries {
@@ -3520,7 +3606,7 @@ mod tests {
         let manifest = reader.manifest();
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         assert!(
-            rt.block_on(manifest.term_index()).is_some(),
+            rt.block_on(manifest.term_index()).expect("loads").is_some(),
             "the snapshot exposes its index"
         );
         let select = |terms: &[&str], mode: BoolMode| -> HashSet<Uuid> {
@@ -4243,7 +4329,10 @@ mod tests {
                 "an upgraded table's first index is incomplete"
             );
             let rt = tokio::runtime::Runtime::new().expect("runtime");
-            let index = rt.block_on(manifest.term_index()).expect("index loads");
+            let index = rt
+                .block_on(manifest.term_index())
+                .expect("index loads")
+                .expect("indexed");
             let indexed = manifest
                 .get_all_superfiles()
                 .iter()
@@ -4861,5 +4950,201 @@ mod tests {
             "the rebuild drops the padding"
         );
         assert_eq!(root.superfiles.len(), live.len());
+    }
+
+    /// A root layout version older than the one this engine reads.
+    const OLD_ROOT_VERSION: u32 = 2;
+    /// Root GETs a test counts before it stops counting.
+    const ROOT_GET_PROBES: usize = 4;
+    /// The URI fragment every root object carries.
+    const ROOT_URI_FRAGMENT: &str = "term-index/root-";
+
+    /// Point the table at a copy of its root stamped with layout
+    /// `version`, as an engine that wrote that layout would have left it.
+    fn plant_root_at_version(st: &Supertable, storage: &Arc<dyn StorageProvider>, version: u32) {
+        let reference = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned()
+            .expect("reference");
+        let (bytes, _) = st
+            .block_on_query(storage.get(&reference.uri))
+            .expect("root bytes");
+        let mut bytes = bytes.to_vec();
+        let at = ROOT_MAGIC.len();
+        bytes[at..at + size_of::<u32>()].copy_from_slice(&version.to_le_bytes());
+        st.block_on_query(stamp_with_retries(
+            st.inner(),
+            storage,
+            "old-layout root",
+            |old| {
+                let bytes = bytes.clone();
+                async move {
+                    let reference = put_content_addressed(storage.as_ref(), "root", bytes).await?;
+                    Ok(Some(old.with_term_index(reference)))
+                }
+            },
+        ))
+        .expect("publish the old root");
+    }
+
+    /// A term leaf on `title`, as SQL pruning plans one.
+    fn title_leaf(term: &str) -> PruneLeaf {
+        PruneLeaf::TermPresence {
+            column: "title".to_owned(),
+            terms: vec![term.to_owned()],
+            mode: BoolMode::Or,
+        }
+    }
+
+    /// A root in a layout this engine no longer reads fails every read that
+    /// routes through it, naming the repair. Optimize rebuilds it and the
+    /// reads work again. Both handle kinds are covered: an eager one routes
+    /// per superfile, a lazy one also chooses manifest parts through the
+    /// index.
+    #[test]
+    fn a_root_in_an_old_layout_fails_reads_until_optimize_rebuilds_it() {
+        for eager_load_threshold in [u32::MAX, 0] {
+            let (_dir, storage, st, _) = optimized_fragmented_table();
+            plant_root_at_version(&st, &storage, OLD_ROOT_VERSION);
+            drop(st);
+            let options =
+                || fresh_options(&storage).with_eager_load_threshold(eager_load_threshold);
+            let st = Supertable::open(options()).expect("open");
+            let reader = st.reader().expect("reader");
+            let failures = [
+                reader
+                    .bm25_search("title", "alpha", 10, Bm25SearchOptions::new(), None)
+                    .err(),
+                reader.token_match("title", "alpha", BoolMode::Or).err(),
+                reader.count("title", "alpha", BoolMode::Or).err(),
+                reader.exact_match("title", "alpha").err(),
+                st.block_on_query(select_superfiles(reader.manifest(), &[title_leaf("alpha")]))
+                    .err(),
+            ];
+            for failure in failures {
+                let e = InfinoError::from(failure.expect("the read fails"));
+                assert!(matches!(e, InfinoError::Unsupported(_)), "{e}");
+                assert!(e.to_string().contains("optimize()"), "{e}");
+            }
+            assert!(
+                st.gc(Duration::ZERO).is_err(),
+                "gc cannot derive the live set either"
+            );
+
+            maintenance_only_optimize(&st);
+            let reader = st.reader().expect("reader");
+            assert!(reader.count("title", "alpha", BoolMode::Or).expect("count") > 0);
+            assert!(
+                st.block_on_query(reader.manifest().term_index())
+                    .expect("the rebuilt index loads")
+                    .is_some()
+            );
+        }
+    }
+
+    /// A root GET that fails for now fails the read as retryable I/O and is
+    /// not remembered: the next read loads the root.
+    #[test]
+    fn a_transient_root_failure_fails_the_read_and_the_next_one_loads_it() {
+        let (_dir, faults, storage, st) = optimized_fault_table();
+        drop(st);
+        let st = Supertable::open(fresh_options(&storage)).expect("open");
+        let reader = st.reader().expect("reader");
+        faults.fail(FaultOp::Get, ROOT_URI_FRAGMENT, 1);
+        let e = InfinoError::from(
+            reader
+                .count("title", "alpha", BoolMode::Or)
+                .expect_err("the read fails"),
+        );
+        assert!(matches!(e, InfinoError::Io(_)), "{e}");
+        assert_eq!(faults.fired(), 1, "the failure is the injected one");
+        assert!(reader.count("title", "alpha", BoolMode::Or).expect("count") > 0);
+    }
+
+    /// A root that can never load is fetched once per handle, not once per
+    /// query.
+    #[test]
+    fn a_root_that_never_loads_is_fetched_once() {
+        let (_dir, faults, storage, st) = optimized_fault_table();
+        plant_root_at_version(&st, &storage, OLD_ROOT_VERSION);
+        drop(st);
+        let st = Supertable::open(fresh_options(&storage)).expect("open");
+        let gets = Arc::new(AtomicUsize::new(0));
+        for _ in 0..ROOT_GET_PROBES {
+            let gets = Arc::clone(&gets);
+            faults.before(FaultOp::Get, ROOT_URI_FRAGMENT, move || {
+                gets.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        let reader = st.reader().expect("reader");
+        for _ in 0..ROOT_GET_PROBES {
+            assert!(reader.count("title", "alpha", BoolMode::Or).is_err());
+        }
+        assert_eq!(gets.load(Ordering::SeqCst), 1, "one GET for every query");
+    }
+
+    /// A root that fails to load for now fails the optimize and writes no
+    /// index object; the next optimize, with the root readable, folds the
+    /// index as usual.
+    #[test]
+    fn a_transient_root_failure_fails_optimize_without_rebuilding() {
+        let (_dir, faults, storage, st) = optimized_fault_table();
+        // An appended delta, so the next optimize has to load the root to
+        // decide whether to rebuild.
+        commit_segment(&st, SEGMENTS);
+        drop(st);
+        let st = Supertable::open(fresh_options(&storage)).expect("open");
+        faults.fail(FaultOp::Get, ROOT_URI_FRAGMENT, 1);
+        faults.fail(FaultOp::PutAtomic, STORAGE_PREFIX, 1);
+        let fired_before = faults.fired();
+        assert!(st.optimize(&maintenance_only_options()).is_err());
+        faults.clear();
+        assert_eq!(
+            faults.fired(),
+            fired_before + 1,
+            "the root GET failed and no index object was written"
+        );
+        assert!(optimize_rebuilds_term_index(&st, &faults));
+    }
+
+    /// A slice the root names that is gone fails the read.
+    #[test]
+    fn a_missing_slice_fails_the_read() {
+        let (dir, storage, st, _) = optimized_fragmented_table();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        drop(st);
+        for slice in root.segments.iter().flat_map(|s| s.slices.iter()) {
+            fs::remove_file(dir.path().join(slice_uri(&slice.content_hash))).expect("remove slice");
+        }
+        let st = Supertable::open(fresh_options(&storage)).expect("open");
+        let reader = st.reader().expect("reader");
+        let e = InfinoError::from(
+            reader
+                .token_match("title", "alpha", BoolMode::Or)
+                .expect_err("the read fails"),
+        );
+        assert!(matches!(e, InfinoError::Backend(_)), "{e}");
+    }
+
+    /// A commit on a table whose root is in an old layout succeeds: the
+    /// index restarts from the commit's own superfiles, marked incomplete,
+    /// and reads work again before any optimize.
+    #[test]
+    fn a_commit_over_an_old_layout_root_restarts_the_index() {
+        let (_dir, storage, st, _) = optimized_fragmented_table();
+        plant_root_at_version(&st, &storage, OLD_ROOT_VERSION);
+        drop(st);
+        let st = Supertable::open(fresh_options(&storage)).expect("open");
+        commit_segment(&st, SEGMENTS);
+        let reader = st.reader().expect("reader");
+        assert!(
+            !reader.manifest().term_index_complete(),
+            "the restarted index lists only the new superfiles"
+        );
+        assert!(reader.count("title", "alpha", BoolMode::Or).expect("count") > 0);
     }
 }

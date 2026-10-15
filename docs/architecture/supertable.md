@@ -297,6 +297,17 @@ superfiles — the manifest marks it incomplete, and part loading keeps
 the summary-based choice until a maintenance pass rebuilds the index
 over every superfile. Nothing requires old code to read a new manifest.
 
+A query that needs a term index the manifest names, and cannot use it,
+fails: with `Unsupported` when the root or a slice is in a layout this
+engine no longer reads (the message says to run `optimize()` or
+`reindex()`, which rebuild it), `Io` when the read failed and may
+succeed next time, and `Backend` when the object is gone or corrupt.
+Maintenance repairs the first and last kinds by rebuilding from the
+superfiles, and a commit on top of them restarts the index from its own
+superfiles, marked incomplete. A read that failed for now fails the
+optimize too. A failure that every retry would repeat is remembered per
+root, so a broken root is fetched once.
+
 ## Commit pipeline
 
 A commit turns staged record batches into new superfiles and a new

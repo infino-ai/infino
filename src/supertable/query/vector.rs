@@ -6408,7 +6408,7 @@ impl SupertableReader {
         let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
         let locations = self
             .index_locations(filter_col, &token_refs, superfiles)
-            .await;
+            .await?;
         let op_stats = self.op_stats.clone();
         self.fanout_candidate_bitmaps(superfiles, move |r, entry| {
             let filter_col_arc = Arc::clone(&filter_col_arc);
@@ -7093,7 +7093,7 @@ impl SupertableReader {
         let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
         // The index's locations for the plan's terms let each superfile
         // resolve them from its postings alone.
-        let locations = Arc::new(self.plan_locations(plan, superfiles).await);
+        let locations = Arc::new(self.plan_locations(plan, superfiles).await?);
         self.fanout_candidate_bitmaps(superfiles, move |r, entry| {
             let plan = Arc::clone(&plan_arc);
             let op_stats = op_stats.clone();

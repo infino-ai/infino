@@ -1183,7 +1183,7 @@ impl TableProvider for SupertableProvider {
         let survivor_entries: Vec<Arc<SuperfileEntry>> =
             survivors.iter().map(|e| Arc::clone(e)).collect();
         let plan_locations =
-            plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await;
+            plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await?;
         let plan_locations = &plan_locations;
 
         // Opening every survivor: the part of a scan that pays for a cache

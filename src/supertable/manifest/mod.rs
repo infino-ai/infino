@@ -35,7 +35,7 @@ pub mod part;
 pub mod partition;
 pub(crate) mod term_index;
 use arrow_schema::Schema;
-use term_index::TermIndex;
+use term_index::{PermanentLoadFailure, TermIndex, TermIndexError};
 
 use crate::{
     superfile::{
@@ -297,25 +297,28 @@ impl SuperfileList {
 /// summary-based part prune is. A leaf the index cannot answer imposes no
 /// constraint; `None` when no leaf was answered or a routed superfile has
 /// no recorded smallest id, so the caller keeps its summary-based choice.
+/// A failed index read is an error.
 async fn parts_holding_routed_superfiles(
     index: &TermIndex,
     list: &Manifest,
     leaves: &[PruneLeaf],
     snapshot: &ManifestSnapshot,
-) -> Option<HashSet<PartId>> {
+) -> Result<Option<HashSet<PartId>>, TermIndexError> {
     let mut kept: Option<HashSet<PartId>> = None;
     for leaf in leaves {
-        let Some(routed) = index.route_leaf(leaf, snapshot).await else {
+        let Some(routed) = index.route_leaf(leaf, snapshot).await? else {
             continue;
         };
-        let id_mins = sorted_id_mins(index, &routed)?;
+        let Some(id_mins) = sorted_id_mins(index, &routed) else {
+            return Ok(None);
+        };
         let parts: HashSet<PartId> = parts_covering(&list.parts, &id_mins).collect();
         kept = Some(match kept {
             None => parts,
             Some(existing) => existing.intersection(&parts).copied().collect(),
         });
     }
-    kept
+    Ok(kept)
 }
 
 /// The smallest id of each of `superfiles`, sorted, as the term index
@@ -1459,9 +1462,9 @@ impl ManifestSnapshot {
                 // holds a routed superfile's smallest id. Anything the index
                 // cannot answer leaves the summary-based choice in place.
                 if list.term_index_complete
-                    && let Some(index) = self.term_index().await
+                    && let Some(index) = self.term_index().await?
                     && let Some(routed) =
-                        parts_holding_routed_superfiles(&index, list, leaves, self).await
+                        parts_holding_routed_superfiles(&index, list, leaves, self).await?
                 {
                     kept = Some(match kept {
                         None => routed,
@@ -1492,27 +1495,33 @@ impl ManifestSnapshot {
 
     /// Whether a term-index rebuild would change anything: false when the
     /// table is empty, or when the index is complete, has one segment, and
-    /// lists exactly the live superfiles.
-    pub(crate) async fn needs_term_index_rebuild(&self, entries: &[Arc<SuperfileEntry>]) -> bool {
+    /// lists exactly the live superfiles. An index that will never load is
+    /// rebuilt; one that failed to load for now is an error.
+    pub(crate) async fn needs_term_index_rebuild(
+        &self,
+        entries: &[Arc<SuperfileEntry>],
+    ) -> Result<bool, TermIndexError> {
         if entries.is_empty() {
-            return false;
+            return Ok(false);
         }
         if !self.term_index_complete() {
-            return true;
+            return Ok(true);
         }
-        // An index that cannot be loaded is rebuilt.
-        let Some(index) = self.term_index().await else {
-            return true;
+        let index = match self.term_index().await {
+            Ok(Some(index)) => index,
+            Ok(None) => return Ok(true),
+            Err(e) if e.calls_for_rebuild() => return Ok(true),
+            Err(e) => return Err(e),
         };
         let root = index.root();
         // Every commit since the last rebuild appends a segment.
         if root.segments.len() != 1 {
-            return true;
+            return Ok(true);
         }
         // A commit that only removes superfiles appends no segment, so the
         // root can still list superfiles that are gone.
-        root.superfiles.len() != entries.len()
-            || !entries.iter().all(|e| index.is_indexed(&e.superfile_id))
+        Ok(root.superfiles.len() != entries.len()
+            || !entries.iter().all(|e| index.is_indexed(&e.superfile_id)))
     }
 
     /// The superfiles among `candidates`, as `index` names them, that are
@@ -1715,11 +1724,14 @@ impl ManifestSnapshot {
         self.list.as_ref().and_then(|l| l.term_index.as_ref())
     }
 
-    /// The loaded term index for this snapshot, or `None` when the list
-    /// carries no reference, no storage is attached, or the load failed.
-    pub(crate) async fn term_index(&self) -> Option<Arc<TermIndex>> {
-        let reference = self.term_index_ref()?;
-        self.loader.as_ref()?.term_index(reference).await
+    /// The loaded term index for this snapshot: `None` when the list
+    /// carries no reference or no storage is attached, an error when the
+    /// referenced index cannot be loaded.
+    pub(crate) async fn term_index(&self) -> Result<Option<Arc<TermIndex>>, TermIndexError> {
+        let (Some(reference), Some(loader)) = (self.term_index_ref(), self.loader.as_ref()) else {
+            return Ok(None);
+        };
+        loader.term_index(reference).await.map(Some)
     }
 
     /// This manifest with the term-index root reference replaced, id
@@ -2954,6 +2966,16 @@ where
 /// otherwise grow without limit — 19,980 such entries reached 86 GB.
 const DEFAULT_OPEN_BLOB_BUDGET_BYTES: u64 = 512 * (1 << 20);
 
+/// What a loader holds for the term index it last resolved.
+enum TermIndexSlot {
+    Loaded(Arc<TermIndex>),
+    /// The root at `uri` failed in a way every retry would repeat.
+    Unusable {
+        uri: String,
+        failure: PermanentLoadFailure,
+    },
+}
+
 pub struct ManifestPartLoader {
     storage: Arc<dyn StorageProvider>,
     /// Maps `PartId → (expected content_hash, uri, routing sibling)`.
@@ -2976,8 +2998,9 @@ pub struct ManifestPartLoader {
     /// The term index the list references, loaded once per root and kept
     /// for the loader's life. Keyed by root URI: a successor that carries
     /// the same reference reuses it; a commit that published a delta has a
-    /// new root and loads that instead.
-    term_index: tokio::sync::Mutex<Option<Arc<TermIndex>>>,
+    /// new root and loads that instead. A root that can never load is kept
+    /// as its failure.
+    term_index: tokio::sync::Mutex<Option<TermIndexSlot>>,
     /// Resolves the column names a part written before field ids used as
     /// summary keys.
     legacy: Arc<LegacyNames>,
@@ -3044,15 +3067,21 @@ impl ManifestPartLoader {
     }
 
     /// The term index `reference` names, loaded on first use and reused
-    /// while the reference is unchanged. `None` when it cannot be loaded:
-    /// the caller routes the old way, trading latency for availability,
-    /// never correctness.
-    pub(crate) async fn term_index(&self, reference: &RoutingRef) -> Option<Arc<TermIndex>> {
+    /// while the reference is unchanged. A failure every retry would repeat
+    /// is kept too, so a broken root is fetched once.
+    pub(crate) async fn term_index(
+        &self,
+        reference: &RoutingRef,
+    ) -> Result<Arc<TermIndex>, TermIndexError> {
         let mut slot = self.term_index.lock().await;
-        if let Some(index) = slot.as_ref()
-            && index.root_uri() == reference.uri
-        {
-            return Some(Arc::clone(index));
+        match slot.as_ref() {
+            Some(TermIndexSlot::Loaded(index)) if index.root_uri() == reference.uri => {
+                return Ok(Arc::clone(index));
+            }
+            Some(TermIndexSlot::Unusable { uri, failure }) if *uri == reference.uri => {
+                return Err(failure.clone().into());
+            }
+            _ => {}
         }
         match TermIndex::load(
             Arc::clone(&self.storage),
@@ -3063,12 +3092,17 @@ impl ManifestPartLoader {
         {
             Ok(index) => {
                 let index = Arc::new(index);
-                *slot = Some(Arc::clone(&index));
-                Some(index)
+                *slot = Some(TermIndexSlot::Loaded(Arc::clone(&index)));
+                Ok(index)
             }
             Err(e) => {
-                warn!(error = %e, uri = %reference.uri, "term index load failed; routing by manifest summaries instead");
-                None
+                if let Some(failure) = e.as_permanent() {
+                    *slot = Some(TermIndexSlot::Unusable {
+                        uri: reference.uri.clone(),
+                        failure,
+                    });
+                }
+                Err(e)
             }
         }
     }
@@ -3326,6 +3360,15 @@ pub enum ManifestLoadError {
     /// cycles).
     #[error("slow vector-state hydration failed: {0}")]
     SlowStateHydration(String),
+    /// The term index the list references could not be used.
+    #[error("term index: {0}")]
+    TermIndex(#[source] Box<TermIndexError>),
+}
+
+impl From<TermIndexError> for ManifestLoadError {
+    fn from(e: TermIndexError) -> Self {
+        ManifestLoadError::TermIndex(Box::new(e))
+    }
 }
 
 impl ManifestLoadError {
@@ -3333,6 +3376,7 @@ impl ManifestLoadError {
     pub(crate) fn is_permission_denied(&self) -> bool {
         match self {
             ManifestLoadError::Storage(e) => e.is_permission_denied(),
+            ManifestLoadError::TermIndex(e) => e.is_permission_denied(),
             _ => false,
         }
     }

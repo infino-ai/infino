@@ -455,25 +455,28 @@ pub(crate) type IndexLocations = Arc<LocatedTerms>;
 pub(crate) type PlanLocations = HashMap<String, IndexLocations>;
 
 /// The term index's postings locations for `terms` in every superfile of
-/// `kept` that `manifest`'s index lists; see [`IndexLocations`].
+/// `kept` that `manifest`'s index lists; see [`IndexLocations`]. Empty when
+/// the table has no index; an index that cannot be read is an error.
 pub(crate) async fn index_locations_for(
     manifest: &ManifestSnapshot,
     column: &str,
     terms: &[&str],
     kept: &[Arc<SuperfileEntry>],
-) -> IndexLocations {
+) -> Result<IndexLocations, QueryError> {
     let owned: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
-    let by_superfile = match (manifest.field_id(column), manifest.term_index().await) {
-        (Some(column), Some(index)) => match index.locations(column, terms, kept).await {
-            Ok(map) => map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
-            Err(_) => HashMap::new(),
-        },
+    let by_superfile = match (manifest.field_id(column), manifest.term_index().await?) {
+        (Some(column), Some(index)) => index
+            .locations(column, terms, kept)
+            .await?
+            .into_iter()
+            .map(|(k, v)| (k, Arc::new(v)))
+            .collect(),
         _ => HashMap::new(),
     };
-    Arc::new(LocatedTerms {
+    Ok(Arc::new(LocatedTerms {
         terms: owned,
         by_superfile,
-    })
+    }))
 }
 
 /// [`index_locations_for`] for every exact-match term of `plan`, per
@@ -482,14 +485,14 @@ pub(crate) async fn plan_locations_for(
     manifest: &ManifestSnapshot,
     plan: &CandidatePlan,
     kept: &[Arc<SuperfileEntry>],
-) -> PlanLocations {
+) -> Result<PlanLocations, QueryError> {
     let mut out = PlanLocations::new();
     for (column, terms) in plan.term_requests() {
         let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-        let located = index_locations_for(manifest, &column, &refs, kept).await;
+        let located = index_locations_for(manifest, &column, &refs, kept).await?;
         out.insert(column, located);
     }
-    out
+    Ok(out)
 }
 
 /// Build a plan's per-column memos for `superfile` from [`PlanLocations`]:
@@ -619,7 +622,7 @@ impl SupertableReader {
         &self,
         plan: &CandidatePlan,
         kept: &[Arc<SuperfileEntry>],
-    ) -> PlanLocations {
+    ) -> Result<PlanLocations, QueryError> {
         plan_locations_for(self.manifest(), plan, kept).await
     }
 
@@ -629,7 +632,7 @@ impl SupertableReader {
         column: &str,
         terms: &[&str],
         kept: &[Arc<SuperfileEntry>],
-    ) -> IndexLocations {
+    ) -> Result<IndexLocations, QueryError> {
         index_locations_for(self.manifest(), column, terms, kept).await
     }
 
@@ -925,7 +928,7 @@ impl SupertableReader {
         let term_span = trace::phase(phases, || {
             detail_span!("fts.term_index", terms = tracing::field::Empty)
         });
-        let term_index = manifest.term_index().instrument(term_span.clone()).await;
+        let term_index = manifest.term_index().instrument(term_span.clone()).await?;
         // Every scored term, phrase members included, once: what the index
         // is asked for locations.
         let mut all_terms: Vec<&str> = musts
@@ -961,15 +964,12 @@ impl SupertableReader {
                     let idf_used = move |term: &str, _local: f32| {
                         gidf.get(term).copied().unwrap_or(f32::INFINITY)
                     };
-                    index
+                    let mut ceilings = index
                         .query_ceilings(column_id, &terms, &phrases, &kept, &idf_used)
                         .instrument(term_span.clone())
-                        .await
-                        .ok()
-                        .map(|mut ceilings| {
-                            ceilings_at_table_avgdl(&mut ceilings, &kept, column_id, table_avgdl);
-                            ceilings
-                        })
+                        .await?;
+                    ceilings_at_table_avgdl(&mut ceilings, &kept, column_id, table_avgdl);
+                    Some(ceilings)
                 }
                 _ => None,
             };
@@ -984,7 +984,7 @@ impl SupertableReader {
         let index_locations = self
             .index_locations(column, &all_terms, &kept)
             .instrument(term_span.clone())
-            .await;
+            .await?;
         term_span.record("terms", all_terms.len());
         trace::end(term_span);
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
@@ -1404,13 +1404,11 @@ impl SupertableReader {
         // index's locations. An incomplete index takes the wave below, like
         // a table with no index.
         if manifest.term_index_complete()
-            && let Some(index) = manifest.term_index().await
+            && let Some(index) = manifest.term_index().await?
         {
             let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(misses.len());
             let asked: Vec<&str> = misses.iter().map(String::as_str).collect();
-            let runs = index.postings_many(column_id, &asked).await.map_err(|e| {
-                QueryError::Store(format!("term index unreadable for global stats: {e}"))
-            })?;
+            let runs = index.postings_many(column_id, &asked).await?;
             // The index keeps postings for removed superfiles, so only live
             // ones count; liveness is checked for the terms' holders alone.
             let holders: HashSet<Uuid> = runs
@@ -1811,7 +1809,7 @@ impl SupertableReader {
             .instrument(trace::phase(phases, || {
                 detail_span!("fts.term_index", terms = all_terms.len())
             }))
-            .await;
+            .await?;
         let units: Vec<(Arc<SuperfileEntry>, Uuid)> = kept
             .into_iter()
             .map(|e| {
@@ -1928,44 +1926,51 @@ impl SupertableReader {
     ///   a deleted doc is still in it.
     ///
     /// Any of those failing falls through to the fan-out, which is always
-    /// correct and merely slower.
+    /// correct and merely slower. An index that cannot be read is an error.
     async fn count_from_term_index(
         &self,
         column: &str,
         match_set: &UnrankedMatchSet,
         negatives: &UnrankedNegatives,
         kept: &[Arc<SuperfileEntry>],
-    ) -> Option<u64> {
+    ) -> Result<Option<u64>, QueryError> {
         if match_set.has_phrases() || !negatives.is_empty() || match_set.terms.len() != 1 {
-            return None;
+            return Ok(None);
         }
         let manifest = self.manifest();
-        let index = manifest.term_index().await?;
+        let Some(index) = manifest.term_index().await? else {
+            return Ok(None);
+        };
         if !kept.iter().all(|e| index.is_indexed(&e.superfile_id)) {
-            return None;
+            return Ok(None);
         }
         // A superfile listed here may hold deleted rows, which the gross df
         // would still count.
         if let Some(seqs) = manifest.get_tombstone_seqs()
             && kept.iter().any(|e| seqs.contains_key(&e.superfile_id))
         {
-            return None;
+            return Ok(None);
         }
 
-        let term = match_set.terms.first()?;
-        let postings = index
-            .postings(manifest.field_id(column)?, term)
-            .await
-            .ok()?;
+        let (Some(term), Some(column_id)) = (match_set.terms.first(), manifest.field_id(column))
+        else {
+            return Ok(None);
+        };
+        let postings = index.postings(column_id, term).await?;
         let wanted: HashSet<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
         let mut total: u64 = 0;
         for posting in postings.iter() {
-            let id = index.superfile_id(posting.superfile)?;
+            let Some(id) = index.superfile_id(posting.superfile) else {
+                return Ok(None);
+            };
             if wanted.contains(&id) {
-                total = total.checked_add(posting.df)?;
+                let Some(sum) = total.checked_add(posting.df) else {
+                    return Ok(None);
+                };
+                total = sum;
             }
         }
-        Some(total)
+        Ok(Some(total))
     }
 
     /// Count documents whose `column` matches `query`'s tokens under
@@ -2003,7 +2008,7 @@ impl SupertableReader {
 
         if let Some(total) = self
             .count_from_term_index(column, &match_set, &negatives, &kept)
-            .await
+            .await?
         {
             return Ok(total);
         }
@@ -2018,7 +2023,7 @@ impl SupertableReader {
             .chain(negatives.terms.iter())
             .map(String::as_str)
             .collect();
-        let locations = self.index_locations(column, &all_terms, &kept).await;
+        let locations = self.index_locations(column, &all_terms, &kept).await?;
         let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column.to_owned());
         let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
@@ -2229,7 +2234,7 @@ impl SupertableReader {
             .instrument(trace::phase(phases, || {
                 detail_span!("fts.term_index", terms = token_refs.len())
             }))
-            .await;
+            .await?;
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column.to_owned());
@@ -3710,7 +3715,9 @@ mod tests {
         let lazy = Supertable::open(lazy_options(&storage)).expect("open lazy");
         let reader = lazy.reader().expect("reader");
         let manifest = reader.manifest();
-        let index = block_on(manifest.term_index()).expect("term index");
+        let index = block_on(manifest.term_index())
+            .expect("term index loads")
+            .expect("term index");
 
         let one: HashSet<Uuid> = [all[0].superfile_id].into();
         let live = block_on(manifest.live_among(&index, &one)).expect("live");

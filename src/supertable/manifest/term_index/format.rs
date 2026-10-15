@@ -263,16 +263,18 @@ fn check_magic_version(
     c: &mut Cursor<'_>,
     magic: &[u8; 8],
     expected: u32,
-    what: &str,
+    what: &'static str,
 ) -> Result<(), TermIndexError> {
     if c.take(MAGIC_LEN, what)? != magic {
         return Err(malformed(&format!("{what}: bad magic")));
     }
-    let version = c.u32(what)?;
-    if version != expected {
-        return Err(TermIndexError::Malformed(format!(
-            "{what}: unsupported version {version} (expected {expected})"
-        )));
+    let found = c.u32(what)?;
+    if found != expected {
+        return Err(TermIndexError::UnsupportedVersion {
+            what,
+            found,
+            expected,
+        });
     }
     Ok(())
 }
@@ -722,9 +724,14 @@ mod tests {
         assert_eq!(Root::decode(&bytes).expect("decode").id_mins, vec![10, -20]);
         let mut wrong = bytes.clone();
         wrong[MAGIC_LEN] = 9;
-        assert!(
-            matches!(Root::decode(&wrong), Err(TermIndexError::Malformed(m)) if m.contains("unsupported version 9"))
-        );
+        assert!(matches!(
+            Root::decode(&wrong),
+            Err(TermIndexError::UnsupportedVersion {
+                what: "root",
+                found: 9,
+                expected: ROOT_FORMAT_VERSION
+            })
+        ));
         let mut magic = bytes.clone();
         magic[0] = b'X';
         assert!(
@@ -738,16 +745,18 @@ mod tests {
         // by it names its version, and is refused on that alone.
         let mut previous = bytes.clone();
         previous[MAGIC_LEN..MAGIC_LEN + U32_LEN].copy_from_slice(&1u32.to_le_bytes());
-        assert!(
-            matches!(Root::decode(&previous), Err(TermIndexError::Malformed(m)) if m.contains("unsupported version 1"))
-        );
+        assert!(matches!(
+            Root::decode(&previous),
+            Err(TermIndexError::UnsupportedVersion { found: 1, .. })
+        ));
         // The layout before this one keyed terms by column name; a root
         // written by it is refused the same way and the index rebuilt.
         let mut named = bytes.clone();
         named[MAGIC_LEN..MAGIC_LEN + U32_LEN].copy_from_slice(&2u32.to_le_bytes());
-        assert!(
-            matches!(Root::decode(&named), Err(TermIndexError::Malformed(m)) if m.contains("unsupported version 2"))
-        );
+        assert!(matches!(
+            Root::decode(&named),
+            Err(TermIndexError::UnsupportedVersion { found: 2, .. })
+        ));
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(
@@ -936,8 +945,13 @@ mod tests {
     fn slice_rejects_unknown_version_loudly_not_as_absent() {
         let mut bytes = build_slice(&[("body", "alpha", vec![])]);
         bytes[MAGIC_LEN] = 2;
-        assert!(
-            matches!(Slice::open(&bytes), Err(TermIndexError::Malformed(m)) if m.contains("unsupported version 2"))
-        );
+        assert!(matches!(
+            Slice::open(&bytes),
+            Err(TermIndexError::UnsupportedVersion {
+                what: "slice",
+                found: 2,
+                expected: SLICE_FORMAT_VERSION
+            })
+        ));
     }
 }

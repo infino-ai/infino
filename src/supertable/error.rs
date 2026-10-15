@@ -252,10 +252,14 @@ impl From<TermIndexError> for BuildError {
     /// A term-index build failure reaches the build path as `Store`, except a
     /// refused credential, which stays `PermissionDenied` so the caller fixes
     /// the credentials instead of retrying, and a superfile in a format this
-    /// engine does not read, which stays `Unsupported`.
+    /// engine does not read, or a term index in a layout it no longer reads,
+    /// which stays `Unsupported`.
     fn from(e: TermIndexError) -> Self {
         if e.is_permission_denied() {
             return BuildError::PermissionDenied(e.to_string());
+        }
+        if e.is_unsupported_version() {
+            return BuildError::Unsupported(e.to_string());
         }
         if let TermIndexError::Open(QueryError::Unsupported(m)) = e {
             return BuildError::Unsupported(m);
@@ -882,6 +886,18 @@ impl From<VectorError> for QueryError {
 impl From<FtsError> for QueryError {
     fn from(e: FtsError) -> Self {
         QueryError::from(ReadError::Fts(Box::new(e)))
+    }
+}
+
+/// A term-index read that failed during a query. It travels as a manifest
+/// load failure, whose public mapping classifies it; a failed superfile open
+/// keeps its own class.
+impl From<TermIndexError> for QueryError {
+    fn from(e: TermIndexError) -> Self {
+        match e {
+            TermIndexError::Open(inner) => inner,
+            other => QueryError::ManifestLoad(other.into()),
+        }
     }
 }
 

@@ -40,7 +40,7 @@ use crate::{
             list::Manifest,
             list_prune::{prune_parts_for_fts_prefix, prune_parts_for_fts_terms},
             part::PartId,
-            term_index::TermIndex,
+            term_index::{TermIndex, TermIndexError},
         },
         query::skip::{
             ColumnTypeGuard, ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip,
@@ -262,21 +262,21 @@ fn scalar_value_set_keep_parts(
 /// Per-superfile keep mask for a term or prefix leaf: the index's exact
 /// answer where the superfile is indexed, the manifest-summary answer
 /// (`fallback`) where it is not, or everywhere when there is no index or
-/// it could not answer the leaf.
+/// the leaf is not one it answers. A failed index read is an error.
 async fn with_routing(
     superfiles: &[Arc<SuperfileEntry>],
     index: Option<&TermIndex>,
     leaf: &PruneLeaf,
     manifest: &ManifestSnapshot,
     fallback: Vec<bool>,
-) -> Vec<bool> {
+) -> Result<Vec<bool>, TermIndexError> {
     let Some(index) = index else {
-        return fallback;
+        return Ok(fallback);
     };
-    let Some(routed) = index.route_leaf(leaf, manifest).await else {
-        return fallback;
+    let Some(routed) = index.route_leaf(leaf, manifest).await? else {
+        return Ok(fallback);
     };
-    superfiles
+    Ok(superfiles
         .iter()
         .zip(fallback)
         .map(
@@ -285,7 +285,7 @@ async fn with_routing(
                 false => keep,
             },
         )
-        .collect()
+        .collect())
 }
 
 /// Select the superfiles a predicate could match, newest-first in
@@ -333,7 +333,7 @@ pub(crate) async fn select_superfiles(
     // for every superfile it lists. A live superfile it does not list was
     // committed before the index existed; it keeps the manifest-summary
     // answer. With no index at all, every superfile does.
-    let term_index = manifest.term_index().await;
+    let term_index = manifest.term_index().await?;
     for leaf in leaves {
         match leaf {
             PruneLeaf::TermPresence {
@@ -355,7 +355,7 @@ pub(crate) async fn select_superfiles(
                         manifest,
                         summaries,
                     )
-                    .await,
+                    .await?,
                 );
             }
             PruneLeaf::Prefix { column, prefix } => {
@@ -372,7 +372,7 @@ pub(crate) async fn select_superfiles(
                         manifest,
                         summaries,
                     )
-                    .await,
+                    .await?,
                 );
             }
             PruneLeaf::ScalarValueSet { column, values } => {
