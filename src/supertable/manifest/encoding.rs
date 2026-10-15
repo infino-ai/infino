@@ -38,8 +38,11 @@
 
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 
-use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
-use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array};
+use arrow::{
+    compute::take,
+    ipc::{reader::StreamReader, writer::StreamWriter},
+};
+use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::scalar::ScalarValue;
 use thiserror::Error;
@@ -329,13 +332,24 @@ pub fn decode_scalar_stats(
             maxes.len()
         )));
     }
+    // The IPC reader decodes the batch into one body buffer and hands each
+    // column out as a slice of it, so any one surviving bound would keep
+    // the whole body alive for as long as its entry lives: 7 MiB per
+    // superfile at four thousand columns. Each stat is copied into a
+    // buffer of its own and the body goes with the batch.
+    let first_row = UInt32Array::from(vec![0u32]);
+    let own = |array: &ArrayRef| -> Result<ArrayRef, DecodeError> {
+        take(array.as_ref(), &first_row, None).map_err(|e| DecodeError::ArrowIpc(e.to_string()))
+    };
     let mut stats: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
     for (base, min) in mins {
         let max = maxes.remove(&base).ok_or_else(|| {
             DecodeError::ArrowIpc(format!("column {base} has __min but no __max"))
         })?;
+        let min = own(&min)?;
+        let max = own(&max)?;
         let null_count = null_counts.remove(&base);
-        let sum = sums.remove(&base);
+        let sum = sums.remove(&base).map(|sum| own(&sum)).transpose()?;
         let hll = hlls.remove(&base);
         let value_counts = value_counts.remove(&base);
         // A key the table cannot resolve (an older artifact's name for a
@@ -1169,6 +1183,46 @@ mod decode_error_tests {
             decode_value_counts(&with_null),
             Err(DecodeError::ArrowIpc(msg)) if msg.contains("null")
         ));
+    }
+
+    /// Columns in the batch whose decoded bounds must not share a body.
+    const PINNED_BODY_COLUMNS: u32 = 400;
+    /// Values per column, enough that each column is sketched and the batch
+    /// body runs to hundreds of kilobytes.
+    const PINNED_BODY_VALUES: i64 = 300;
+    /// What a bound's array may report once it owns its bytes: its own
+    /// buffers and nothing of the batch it came from.
+    const OWNED_BOUND_CEILING_BYTES: usize = 1024;
+
+    /// Decoded bounds own their bytes: a bound's array reports its own
+    /// buffer, not the decoded body of the whole batch it was sliced from.
+    #[test]
+    fn decoded_bounds_do_not_pin_the_ipc_body() {
+        let mut stats = HashMap::new();
+        for i in 0..PINNED_BODY_COLUMNS {
+            let column: ArrayRef = Arc::new(Int64Array::from_iter_values(0..PINNED_BODY_VALUES));
+            stats.insert(
+                FieldId(i),
+                ScalarStatsAgg::from_column(&column).expect("stats"),
+            );
+        }
+        let bytes = encode_scalar_stats(&stats);
+        assert!(
+            bytes.len() > PINNED_BODY_COLUMNS as usize * OWNED_BOUND_CEILING_BYTES,
+            "the body is large: {} bytes",
+            bytes.len()
+        );
+        let decoded = decode_scalar_stats(&bytes, None).expect("decode");
+        assert_eq!(decoded.len(), PINNED_BODY_COLUMNS as usize);
+        for agg in decoded.values() {
+            for bound in [&agg.min, &agg.max] {
+                assert!(
+                    bound.get_array_memory_size() < OWNED_BOUND_CEILING_BYTES,
+                    "a bound reports {} bytes",
+                    bound.get_array_memory_size()
+                );
+            }
+        }
     }
 
     /// `decode_length1_array` rejects corrupt / wrong-shaped bytes with a typed

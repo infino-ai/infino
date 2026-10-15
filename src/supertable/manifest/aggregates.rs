@@ -134,15 +134,29 @@ pub fn fts_length_totals(
 // ---------------------------------------------------------
 
 fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<FieldId, ScalarStatsAgg> {
-    // Fold each superfile's per-column aggregate table together. `merge_tables`
+    // Fold each superfile's per-column aggregate table together. `merge`
     // keeps the min/max extremes (column union) and combines the additive
-    // stats (null count / sum / HLL) only when every contributor carries them
-    // — the same part-level semantics, sharing one code path with the
-    // per-column merge instead of a hand-rolled fold + a duplicate min/max
-    // helper.
+    // stats (null count / sum / HLL / value counts) only when every
+    // contributor carries them — sharing one code path with the per-column
+    // merge instead of a hand-rolled fold + a duplicate min/max helper.
     let mut out: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
     for seg in superfiles {
         ScalarStatsAgg::merge(&mut out, &seg.scalar_stats);
+    }
+    // The list reads a part's rollup for its bounds and its null count: the
+    // list-level pruner compares a filter against min/max, the IS NULL prune
+    // asks whether the part can hold a null, and the drain reads the birth
+    // version range. The sum, the HLL sketch and the value table are read
+    // from the superfiles' own entries, never from a part's rollup, yet
+    // carrying them here put a 1 KiB sketch and a value table for every
+    // field of every part into the list: a table of 3,882 fields had a
+    // 247 MB JSON list at 46 parts, rewritten at every commit and parsed
+    // whole by every handle. The rollup keeps the bounds and the null count
+    // and drops the rest.
+    for agg in out.values_mut() {
+        agg.sum = None;
+        agg.hll = None;
+        agg.value_counts = None;
     }
     out
 }
@@ -314,7 +328,8 @@ mod tests {
     }
 
     /// Build a superfile carrying full per-column stats for one Int64 column
-    /// (min/max + null count + exact sum + HLL), via `from_column`.
+    /// (min/max, null count, exact sum, and the value table a column of a
+    /// few values gets in place of a sketch), via `from_column`.
     fn seg_with_i64(col: &str, vals: Vec<i64>) -> Arc<SuperfileEntry> {
         let arr: ArrayRef = Arc::new(Int64Array::from(vals));
         let mut cols = HashMap::new();
@@ -349,20 +364,25 @@ mod tests {
     }
 
     #[test]
-    fn scalar_stats_agg_folds_additive_stats_across_superfiles() {
-        // Two superfiles, same column: min/max take the extremes; null_count
-        // and sum fold additively; HLL merges.
+    fn scalar_stats_agg_folds_null_counts_and_drops_sum_sketch_and_table() {
+        // Two superfiles, same column: min/max take the extremes and the
+        // null count folds; the sum, the sketch and the value table are
+        // read from the superfiles' own entries, so the rollup drops them.
         let segs = vec![
-            seg_with_i64("n", vec![10, 50]), // sum 60
-            seg_with_i64("n", vec![5, 30]),  // sum 35
+            seg_with_i64("n", vec![10, 50]),
+            seg_with_i64("n", vec![5, 30]),
         ];
         let aggs = scalar_stats_agg(&segs);
         let agg = aggs.get(&fid("n")).expect("n agg present");
         assert_eq!(i64_val(&agg.min), 5);
         assert_eq!(i64_val(&agg.max), 50);
         assert_eq!(agg.null_count, Some(0)); // no nulls in either
-        assert_eq!(i64_val(agg.sum.as_ref().expect("summed")), 95); // 60 + 35
-        assert!(agg.hll.is_some(), "HLL sketches fold across superfiles");
+        assert!(agg.sum.is_none(), "the rollup carries no sum");
+        assert!(agg.hll.is_none(), "the rollup carries no sketch");
+        assert!(
+            agg.value_counts.is_none(),
+            "the rollup carries no value table"
+        );
     }
 
     #[test]

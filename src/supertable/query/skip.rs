@@ -427,15 +427,8 @@ pub(crate) fn null_check_may_match(agg: &ScalarStatsAgg, want_null: bool) -> boo
     if want_null {
         agg.null_count != Some(0)
     } else {
-        !agg_all_null(agg)
+        !agg.all_null()
     }
-}
-
-/// All values are null iff the min stat is null — no non-null value fed it.
-fn agg_all_null(agg: &ScalarStatsAgg) -> bool {
-    ScalarValue::try_from_array(agg.min.as_ref(), 0)
-        .map(|v| v.is_null())
-        .unwrap_or(false)
 }
 
 /// Whether `entry` *could* contain a row satisfying `pred`, judged

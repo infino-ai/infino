@@ -911,6 +911,14 @@ impl PartialEq for ScalarStatsAgg {
 }
 
 impl ScalarStatsAgg {
+    /// Whether the column had no non-null value: the min bound is null
+    /// only when nothing fed it.
+    pub(crate) fn all_null(&self) -> bool {
+        ScalarValue::try_from_array(self.min.as_ref(), 0)
+            .map(|value| value.is_null())
+            .unwrap_or(false)
+    }
+
     /// Build the aggregate for one column from a resident Arrow array.
     ///
     /// Returns `None` for types without a well-defined ordering (anything
@@ -943,14 +951,34 @@ impl ScalarStatsAgg {
         let null_count = pieces.iter().try_fold(0u64, |total, piece| {
             total.checked_add(u64::try_from(piece.null_count()).ok()?)
         });
+        // A column whose distinct values fit the exact table is counted by
+        // the table; a sketch beside it would say the same thing less
+        // precisely for a kilobyte per column per superfile. On a table of
+        // thousands of flag and attribute columns the sketches alone were
+        // 4 MiB per superfile. A column null throughout has nothing to
+        // count and gets no sketch either: its null bounds and null count
+        // say it all, and on that table two columns in three are null in
+        // any one superfile, each carrying an empty kilobyte. The planner's
+        // distinct estimate reads a table where there is one, a sketch
+        // where there is not (`values_hll`), and nothing from a null column.
+        let value_counts = ScalarValueCounts::from_pieces(pieces);
+        let non_null: usize = pieces
+            .iter()
+            .map(|piece| piece.len() - piece.null_count())
+            .sum();
+        let hll = if value_counts.is_some() || non_null == 0 {
+            None
+        } else {
+            column_hll(pieces).map(|s| s.as_bytes().to_vec())
+        };
 
         Some(ScalarStatsAgg {
             min,
             max,
             null_count,
             sum: column_sum(pieces),
-            hll: column_hll(pieces).map(|s| s.as_bytes().to_vec()),
-            value_counts: ScalarValueCounts::from_pieces(pieces),
+            hll,
+            value_counts,
         })
     }
 
@@ -2358,7 +2386,10 @@ mod tests {
         assert_eq!(i64_at0(&agg.max), 7);
         assert_eq!(agg.null_count, Some(1));
         assert_eq!(i64_at0(agg.sum.as_ref().expect("sum")), 11); // 3 + 7 + 1
-        assert!(agg.hll.is_some());
+        assert!(
+            agg.hll.is_none(),
+            "counted exactly by the value table, so no sketch beside it"
+        );
         assert_eq!(
             agg.value_counts
                 .as_ref()
@@ -2463,7 +2494,7 @@ mod tests {
         assert_eq!(i64_at0(&a.max), 50);
         assert_eq!(i64_at0(a.sum.as_ref().expect("sum")), 95); // 60 + 35
         assert_eq!(a.null_count, Some(0));
-        assert!(a.hll.is_some());
+        assert!(a.hll.is_none(), "both sides are counted exactly");
         assert_eq!(
             a.value_counts
                 .as_ref()
@@ -2562,13 +2593,43 @@ mod tests {
     #[test]
     fn scalar_agg_from_column_utf8_has_minmax_and_hll_but_no_sum() {
         // Utf8 is orderable (min/max) and hashable (HLL) but not summable.
-        let arr: ArrayRef = Arc::new(StringArray::from(vec!["alpha", "delta", "bravo"]));
+        // Over the value-table cap the column is sketched, not counted.
+        let values: Vec<String> = (0..=MAX_EXACT_VALUE_COUNTS)
+            .map(|i| format!("value{i:04}"))
+            .collect();
+        let arr: ArrayRef = Arc::new(StringArray::from(values));
         let agg = ScalarStatsAgg::from_column(&arr).expect("utf8 is orderable");
         assert_eq!(agg.min.len(), 1);
         assert_eq!(agg.max.len(), 1);
         assert!(agg.sum.is_none(), "utf8 is not summable");
         assert!(agg.hll.is_some(), "utf8 supports HLL");
+        assert!(agg.value_counts.is_none(), "over the cap");
         assert_eq!(agg.null_count, Some(0));
+    }
+
+    #[test]
+    fn scalar_agg_from_column_null_throughout_has_bounds_and_null_count_only() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>, None, None]));
+        let agg = ScalarStatsAgg::from_column(&arr).expect("utf8 stats");
+        assert!(agg.all_null());
+        assert_eq!(agg.null_count, Some(3));
+        assert!(agg.hll.is_none(), "nothing to sketch");
+        assert!(agg.value_counts.is_none(), "nothing to count");
+    }
+
+    #[test]
+    fn scalar_agg_from_column_under_the_cap_is_counted_not_sketched() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["alpha", "delta", "bravo"]));
+        let agg = ScalarStatsAgg::from_column(&arr).expect("utf8 is orderable");
+        assert_eq!(
+            agg.value_counts
+                .as_ref()
+                .expect("under the cap")
+                .entries()
+                .len(),
+            3
+        );
+        assert!(agg.hll.is_none(), "the table counts the column exactly");
     }
 
     #[test]
@@ -2695,8 +2756,11 @@ mod tests {
 
     #[test]
     fn scalar_agg_merge_invalid_hll_bytes_drops_hll() {
-        let mut a = agg_i64(vec![1, 2]); // valid HLL
-        let mut b = agg_i64(vec![3, 4]);
+        // Columns over the value-table cap, so both sides carry a sketch.
+        let over_the_cap = |from: i64| (from..from + MAX_EXACT_VALUE_COUNTS as i64 + 1).collect();
+        let mut a = agg_i64(over_the_cap(0)); // valid HLL
+        let mut b = agg_i64(over_the_cap(1_000));
+        assert!(a.hll.is_some() && b.hll.is_some(), "sketched, not counted");
         b.hll = Some(vec![1, 2, 3]); // not a valid sketch
         a.merge_with(&b).expect("same type merges");
         assert!(a.hll.is_none(), "unparseable HLL bytes → None");

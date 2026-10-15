@@ -35,6 +35,7 @@ pub mod part;
 pub mod partition;
 pub(crate) mod term_index;
 use arrow_schema::Schema;
+use datafusion::scalar::ScalarValue;
 use term_index::{PermanentLoadFailure, TermIndex, TermIndexError};
 
 use crate::{
@@ -4026,6 +4027,34 @@ pub(crate) fn column_hll(cols: &[ArrayRef]) -> Option<hll::HllSketch> {
     Some(sketch)
 }
 
+/// [`column_hll`] over scalar values: the sketch an exact value table
+/// stands in for, hashed exactly as the column sketch hashes the same
+/// values, so a table's sketch and a column's merge into one estimate.
+/// `None` for a value type the column sketch does not cover.
+pub(crate) fn values_hll<'a>(
+    values: impl IntoIterator<Item = &'a ScalarValue>,
+) -> Option<hll::HllSketch> {
+    let mut sketch = hll::HllSketch::new();
+    for value in values {
+        let hash = match value {
+            ScalarValue::Int8(Some(v)) => xxh3_64(&v.to_le_bytes()),
+            ScalarValue::Int16(Some(v)) => xxh3_64(&v.to_le_bytes()),
+            ScalarValue::Int32(Some(v)) => xxh3_64(&v.to_le_bytes()),
+            ScalarValue::Int64(Some(v)) => xxh3_64(&v.to_le_bytes()),
+            ScalarValue::UInt8(Some(v)) => xxh3_64(&v.to_le_bytes()),
+            ScalarValue::UInt16(Some(v)) => xxh3_64(&v.to_le_bytes()),
+            ScalarValue::UInt32(Some(v)) => xxh3_64(&v.to_le_bytes()),
+            ScalarValue::UInt64(Some(v)) => xxh3_64(&v.to_le_bytes()),
+            ScalarValue::Float32(Some(v)) => xxh3_64(&v.to_bits().to_le_bytes()),
+            ScalarValue::Float64(Some(v)) => xxh3_64(&v.to_bits().to_le_bytes()),
+            ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => xxh3_64(v.as_bytes()),
+            _ => return None,
+        };
+        sketch.insert_hash(hash);
+    }
+    Some(sketch)
+}
+
 pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
     // An all-null column yields *null* min/max (not no-stat), so its null
     // count is still recorded for `IS [NOT] NULL` pruning — hence the
@@ -4852,7 +4881,17 @@ impl ClusterCentroids {
 
 #[cfg(test)]
 mod tests {
-    use std::{hint::black_box, slice::from_ref, sync::Arc, time::Instant};
+    use std::{
+        cmp::Reverse,
+        env::var_os,
+        fs::{read_dir, read_to_string},
+        hint::black_box,
+        mem::size_of,
+        path::{Path, PathBuf},
+        slice::from_ref,
+        sync::Arc,
+        time::Instant,
+    };
 
     use arrow_array::{
         Array, Date32Array, Date64Array, Int64Array, Time64MicrosecondArray,
@@ -4866,6 +4905,8 @@ mod tests {
 
     use super::*;
     use crate::{
+        IndexSpec, connect,
+        runtime_metrics::rss::purge_allocator,
         storage::LocalFsStorageProvider,
         superfile::{builder::FtsConfig, vector::distance::distance},
         supertable::{
@@ -6845,11 +6886,445 @@ mod tests {
         assert_eq!(total_docs, 300);
     }
 
+    /// A column counted exactly carries no sketch; the sketch the planner
+    /// derives from its value table is the one the column would have had,
+    /// register for register, so a table's estimate merges with a sketch's.
+    #[test]
+    fn a_value_table_s_sketch_is_the_column_s() {
+        let strings: ArrayRef = Arc::new(StringArray::from(vec![
+            "alpha", "bravo", "alpha", "charlie", "bravo", "alpha",
+        ]));
+        let integers: ArrayRef = Arc::new(Int64Array::from(vec![7, 7, 9, 11, 9]));
+        for column in [strings, integers] {
+            let stats = ScalarStatsAgg::from_column(&column).expect("stats");
+            assert!(
+                stats.hll.is_none(),
+                "counted exactly, so no sketch is stored"
+            );
+            let table = stats.value_counts.as_ref().expect("under the cap");
+            let from_table = values_hll(table.entries().iter().map(|(value, _)| value))
+                .expect("a sketchable type");
+            let from_column = column_hll(from_ref(&column)).expect("a sketchable type");
+            assert_eq!(from_table.as_bytes(), from_column.as_bytes());
+        }
+    }
+
     fn local_storage() -> (TempDir, Arc<dyn StorageProvider>) {
         let dir = TempDir::new().expect("tempdir");
         let store: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
         (dir, store)
+    }
+
+    /// The variables of the handle measurement: a `file://` catalog root and
+    /// a table in it.
+    const MEASURE_CATALOG_ENV: &str = "INFINO_MEASURE_CATALOG";
+    const MEASURE_TABLE_ENV: &str = "INFINO_MEASURE_TABLE";
+    /// Bytes an HLL sketch holds ([`hll::HLL_REGISTERS`] one-byte registers).
+    const HLL_BYTES: usize = hll::HLL_REGISTERS;
+    /// Kibibytes in a mebibyte, for the kernel's memory lines.
+    const KIB_PER_MIB: u64 = 1024;
+    /// Bytes in a mebibyte, for the tallies.
+    const BYTES_PER_MIB: usize = 1024 * 1024;
+
+    /// This process's resident set in MiB, as the kernel reports it.
+    fn resident_mib() -> u64 {
+        let status = read_to_string("/proc/self/status").unwrap_or_default();
+        status
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|kib| kib.parse::<u64>().ok())
+            .unwrap_or(0)
+            / KIB_PER_MIB
+    }
+
+    /// The resident set after a handle opened: as it stands, and once the
+    /// allocator has returned the pages it freed, which is what the handle
+    /// itself holds.
+    fn report_resident(what: &str, before: u64) {
+        let opened = resident_mib();
+        purge_allocator();
+        let settled = resident_mib();
+        eprintln!(
+            "{what}: resident {before} MiB before, {opened} MiB after opening, {settled} MiB \
+             once free pages are returned"
+        );
+    }
+
+    /// Bytes a scalar value holds beyond its enum slot: its string or
+    /// binary payload.
+    fn scalar_payload(value: &ScalarValue) -> usize {
+        match value {
+            ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.len(),
+            ScalarValue::Binary(Some(b)) | ScalarValue::LargeBinary(Some(b)) => b.len(),
+            _ => 0,
+        }
+    }
+
+    /// Bytes a bound holds as a value: the scalar read out of its
+    /// length-one array, with its payload.
+    fn bound_value_bytes(array: &ArrayRef) -> usize {
+        ScalarValue::try_from_array(array.as_ref(), 0)
+            .map(|value| value.size())
+            .unwrap_or(0)
+    }
+
+    /// What one per-column aggregate holds: bounds (as values, and as the
+    /// arrays report themselves, which counts a shared decoded body once
+    /// per array sliced from it), sketch, value table (entries and bytes),
+    /// as resident bytes.
+    #[derive(Default)]
+    struct StatsTally {
+        columns: usize,
+        all_null: usize,
+        bounds_value_bytes: usize,
+        bounds_array_bytes: usize,
+        sketches: usize,
+        sketches_on_null_columns: usize,
+        tables: usize,
+        table_entries: usize,
+        table_bytes: usize,
+        sums: usize,
+    }
+
+    impl StatsTally {
+        fn add(&mut self, stats: &HashMap<FieldId, ScalarStatsAgg>) {
+            for agg in stats.values() {
+                self.columns += 1;
+                let all_null = agg.all_null();
+                if all_null {
+                    self.all_null += 1;
+                }
+                self.bounds_value_bytes +=
+                    bound_value_bytes(&agg.min) + bound_value_bytes(&agg.max);
+                self.bounds_array_bytes +=
+                    agg.min.get_array_memory_size() + agg.max.get_array_memory_size();
+                if agg.hll.is_some() {
+                    self.sketches += 1;
+                    if all_null {
+                        self.sketches_on_null_columns += 1;
+                    }
+                }
+                if agg.sum.is_some() {
+                    self.sums += 1;
+                }
+                if let Some(table) = &agg.value_counts {
+                    self.tables += 1;
+                    for (value, _) in table.entries() {
+                        self.table_entries += 1;
+                        self.table_bytes += size_of::<(ScalarValue, u64)>() + scalar_payload(value);
+                    }
+                }
+            }
+        }
+
+        fn report(&self, what: &str) {
+            eprintln!(
+                "{what}: {} column stats ({} null throughout); bounds {} KiB as values, {} MiB as \
+                 the arrays report; {} sketches ({} MiB, {} on null columns); {} value tables, \
+                 {} entries ({} MiB); {} sums",
+                self.columns,
+                self.all_null,
+                self.bounds_value_bytes / 1024,
+                self.bounds_array_bytes / BYTES_PER_MIB,
+                self.sketches,
+                self.sketches * HLL_BYTES / BYTES_PER_MIB,
+                self.sketches_on_null_columns,
+                self.tables,
+                self.table_entries,
+                self.table_bytes / BYTES_PER_MIB,
+                self.sums,
+            );
+        }
+    }
+
+    /// What a handle's manifest holds, per superfile and per part: the
+    /// column stats, sketches, value tables, blooms and physical schemas, as
+    /// counts and bytes. Never a value.
+    fn report_handle_components(manifest: &ManifestSnapshot) {
+        let entries = &manifest.superfiles;
+        eprintln!("{} superfiles in the flat view", entries.len());
+        let mut per_superfile = StatsTally::default();
+        let mut blooms = 0usize;
+        let mut bloom_bytes = 0usize;
+        let mut range_bytes = 0usize;
+        let mut schemas: HashSet<usize> = HashSet::new();
+        let mut schema_fields = 0usize;
+        for entry in entries.iter() {
+            per_superfile.add(&entry.scalar_stats);
+            for summary in entry.fts_summary.values() {
+                if let Some(bloom) = &summary.term_bloom {
+                    blooms += 1;
+                    bloom_bytes += bloom.to_bytes().len();
+                }
+                if let Some((lo, hi)) = &summary.term_range {
+                    range_bytes += lo.len() + hi.len();
+                }
+            }
+            if let Some(schema) = &entry.physical_schema
+                && schemas.insert(Arc::as_ptr(schema) as usize)
+            {
+                schema_fields += schema.columns().len();
+            }
+        }
+        per_superfile.report("flat view, all superfiles");
+        eprintln!(
+            "flat view: {blooms} blooms ({} MiB), term ranges {} KiB, {} distinct physical \
+             schemas holding {schema_fields} fields",
+            bloom_bytes / BYTES_PER_MIB,
+            range_bytes / 1024,
+            schemas.len()
+        );
+
+        if let Some(list) = &manifest.list {
+            let mut per_part = StatsTally::default();
+            let mut part_blooms = 0usize;
+            let mut part_bloom_bytes = 0usize;
+            for part in &list.parts {
+                per_part.add(&part.scalar_stats_agg);
+                for summary in part.fts_summary_agg.values() {
+                    if let Some(bloom) = &summary.term_bloom {
+                        part_blooms += 1;
+                        part_bloom_bytes += bloom.to_bytes().len();
+                    }
+                }
+            }
+            eprintln!("list: {} parts", list.parts.len());
+            per_part.report("list rollups, all parts");
+            eprintln!(
+                "list rollups: {part_blooms} blooms ({} MiB)",
+                part_bloom_bytes / BYTES_PER_MIB
+            );
+        }
+    }
+
+    /// When `INFINO_MEASURE_CATALOG` names a `file://` catalog and
+    /// `INFINO_MEASURE_TABLE` a table in it, opens the table and prints the
+    /// resident set before and after, then what the handle holds by
+    /// component. Without the variables it does nothing.
+    #[test]
+    fn a_handle_s_manifest_memory_by_component() {
+        let (Some(catalog), Some(table)) = (var_os(MEASURE_CATALOG_ENV), var_os(MEASURE_TABLE_ENV))
+        else {
+            return;
+        };
+        let catalog = catalog.to_string_lossy().to_string();
+        let table = table.to_string_lossy().to_string();
+        let before = resident_mib();
+        let connection = connect(&catalog).expect("connect");
+        let handle = connection.open_table_handle(&table).expect("open");
+        report_resident(&table, before);
+        report_handle_components(&handle.manifest_snapshot());
+    }
+
+    /// The synthetic wide table: the column mix of an event log with a few
+    /// thousand flag and attribute columns, mostly null in any one commit,
+    /// and a handful of prose columns, so a handle's resident cost can be
+    /// measured per superfile with no data from outside the test.
+    const WIDE_TABLE: &str = "wide";
+    const WIDE_FLAG_COLUMNS: usize = 2_700;
+    const WIDE_ATTRIBUTE_COLUMNS: usize = 1_200;
+    const WIDE_PROSE_COLUMNS: usize = 14;
+    /// Rows in each commit.
+    const WIDE_ROWS_PER_COMMIT: usize = 1_100;
+    /// One flag or attribute column in this many is set in a given commit;
+    /// the rest are null throughout that superfile.
+    const WIDE_ACTIVE_ONE_IN: usize = 3;
+    /// Distinct attribute values, under the exact value-table cap.
+    const WIDE_ATTRIBUTE_VALUES: usize = 32;
+    /// Distinct prose words, and words in a prose cell.
+    const WIDE_VOCABULARY: usize = 2_000;
+    const WIDE_WORDS_PER_CELL: usize = 12;
+    /// Fibonacci hashing multiplier: spreads a row and column index over the
+    /// value space deterministically.
+    const WIDE_MIX: usize = 2_654_435_761;
+    /// Commits the wide-table measurement runs; unset, it does not run.
+    const MEASURE_WIDE_COMMITS_ENV: &str = "INFINO_MEASURE_WIDE_COMMITS";
+    /// Largest files the wide-table measurement lists.
+    const WIDE_LARGEST_FILES: usize = 6;
+
+    fn wide_mix(a: usize, b: usize) -> usize {
+        a.wrapping_mul(WIDE_MIX).wrapping_add(b)
+    }
+
+    fn wide_schema() -> Arc<Schema> {
+        let mut fields =
+            Vec::with_capacity(WIDE_FLAG_COLUMNS + WIDE_ATTRIBUTE_COLUMNS + WIDE_PROSE_COLUMNS);
+        for i in 0..WIDE_FLAG_COLUMNS {
+            fields.push(Field::new(format!("flag_{i}"), DataType::Boolean, true));
+        }
+        for i in 0..WIDE_ATTRIBUTE_COLUMNS {
+            fields.push(Field::new(format!("attr_{i}"), DataType::Utf8, true));
+        }
+        for i in 0..WIDE_PROSE_COLUMNS {
+            fields.push(Field::new(format!("prose_{i}"), DataType::LargeUtf8, true));
+        }
+        Arc::new(Schema::new(fields))
+    }
+
+    /// The batch of one commit: a third of the flag and attribute columns
+    /// set, the rest null throughout, and every prose cell a dozen words.
+    fn wide_batch(schema: &Arc<Schema>, commit: usize) -> RecordBatch {
+        let rows = WIDE_ROWS_PER_COMMIT;
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+        for c in 0..WIDE_FLAG_COLUMNS {
+            let active = (c + commit).is_multiple_of(WIDE_ACTIVE_ONE_IN);
+            let values: Vec<Option<bool>> = (0..rows)
+                .map(|row| active.then(|| wide_mix(row, c).is_multiple_of(2)))
+                .collect();
+            columns.push(Arc::new(BooleanArray::from(values)));
+        }
+        for c in 0..WIDE_ATTRIBUTE_COLUMNS {
+            let active = (c + commit).is_multiple_of(WIDE_ACTIVE_ONE_IN);
+            let values: Vec<Option<String>> = (0..rows)
+                .map(|row| {
+                    active.then(|| format!("value_{}", wide_mix(row, c) % WIDE_ATTRIBUTE_VALUES))
+                })
+                .collect();
+            columns.push(Arc::new(StringArray::from(values)));
+        }
+        for c in 0..WIDE_PROSE_COLUMNS {
+            let values: Vec<String> = (0..rows)
+                .map(|row| {
+                    (0..WIDE_WORDS_PER_CELL)
+                        .map(|j| {
+                            format!(
+                                "word{}",
+                                wide_mix(wide_mix(row, c), j + commit) % WIDE_VOCABULARY
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect();
+            columns.push(Arc::new(LargeStringArray::from(values)));
+        }
+        RecordBatch::try_new(Arc::clone(schema), columns).expect("batch")
+    }
+
+    /// Every file under `root` with its size.
+    fn files_under(root: &Path, out: &mut Vec<(PathBuf, u64)>) {
+        let Ok(entries) = read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files_under(&path, out);
+            } else if let Ok(meta) = entry.metadata() {
+                out.push((path, meta.len()));
+            }
+        }
+    }
+
+    fn is_manifest_list(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("manifest-") && name.ends_with(".json"))
+    }
+
+    /// Bytes of the newest manifest list under `root`.
+    fn newest_manifest_list_bytes(root: &Path) -> u64 {
+        let mut files = Vec::new();
+        files_under(root, &mut files);
+        files
+            .into_iter()
+            .filter(|(path, _)| is_manifest_list(path))
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .map(|(_, bytes)| bytes)
+            .unwrap_or(0)
+    }
+
+    /// What the table is on disk: bytes per kind of file, and the largest
+    /// files.
+    fn report_table_files(root: &Path) {
+        let mut files = Vec::new();
+        files_under(root, &mut files);
+        let (mut lists, mut superfiles, mut other) = (0u64, 0u64, 0u64);
+        let (mut n_lists, mut n_superfiles, mut n_other) = (0usize, 0usize, 0usize);
+        for (path, bytes) in &files {
+            let name = path.to_string_lossy();
+            if is_manifest_list(path) {
+                lists += bytes;
+                n_lists += 1;
+            } else if name.ends_with(".sf.parquet") {
+                superfiles += bytes;
+                n_superfiles += 1;
+            } else {
+                other += bytes;
+                n_other += 1;
+            }
+        }
+        eprintln!(
+            "on disk: {n_lists} manifest lists {} MiB; {n_superfiles} superfiles {} MiB; \
+             {n_other} other files {} MiB",
+            lists / BYTES_PER_MIB as u64,
+            superfiles / BYTES_PER_MIB as u64,
+            other / BYTES_PER_MIB as u64
+        );
+        files.sort_by_key(|file| Reverse(file.1));
+        for (path, bytes) in files.iter().take(WIDE_LARGEST_FILES) {
+            let name = path.strip_prefix(root).unwrap_or(path);
+            eprintln!("  {} KiB  {}", bytes / 1024, name.display());
+        }
+    }
+
+    /// With `INFINO_MEASURE_WIDE_COMMITS=<n>`, builds the synthetic wide
+    /// table in a temporary `file://` catalog with `n` commits and prints
+    /// the resident set after each commit and the size of the manifest list
+    /// it wrote, then what a fresh handle on the table holds, by component,
+    /// and what the table is on disk. Without the variable it does nothing.
+    #[test]
+    fn a_wide_table_s_resident_cost_per_superfile() {
+        let Some(commits) = var_os(MEASURE_WIDE_COMMITS_ENV) else {
+            return;
+        };
+        let commits: usize = commits
+            .to_string_lossy()
+            .parse()
+            .expect("a number of commits");
+        let dir = TempDir::new().expect("tempdir");
+        let uri = format!("file://{}", dir.path().display());
+        let schema = wide_schema();
+        let mut indexes = IndexSpec::new();
+        for i in 0..WIDE_PROSE_COLUMNS {
+            indexes = indexes.fts(format!("prose_{i}"));
+        }
+        let before = resident_mib();
+        let connection = connect(&uri).expect("connect");
+        let table = connection
+            .create_table(WIDE_TABLE, Arc::clone(&schema), indexes)
+            .expect("create");
+        eprintln!(
+            "wide table: {} columns, {WIDE_ROWS_PER_COMMIT} rows a commit; resident {before} MiB \
+             before",
+            schema.fields().len()
+        );
+        for commit in 0..commits {
+            let batch = wide_batch(&schema, commit);
+            let built = resident_mib();
+            let started = Instant::now();
+            table.append(&batch).expect("append");
+            drop(batch);
+            let seconds = started.elapsed().as_secs_f64();
+            eprintln!(
+                "commit {}: {seconds:.1} s; resident {built} MiB with the batch built, {} MiB \
+                 after; list {} KiB",
+                commit + 1,
+                resident_mib(),
+                newest_manifest_list_bytes(dir.path()) / 1024
+            );
+        }
+        drop(table);
+        drop(connection);
+        purge_allocator();
+        let closed = resident_mib();
+        let connection = connect(&uri).expect("connect");
+        let handle = connection.open_table_handle(WIDE_TABLE).expect("open");
+        report_resident("fresh handle", closed);
+        report_handle_components(&handle.manifest_snapshot());
+        report_table_files(dir.path());
     }
 
     /// Number of parts whose `OnceCell` actually holds decoded bytes —

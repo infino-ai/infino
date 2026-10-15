@@ -114,7 +114,9 @@ use crate::{
     supertable::{
         SuperfileEntry,
         error::QueryError,
-        manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
+        manifest::{
+            ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts, values_hll,
+        },
         query::{
             candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
             df_object_store::SuperfileObjectStore,
@@ -804,12 +806,22 @@ fn scalar_sum(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<Scalar
 }
 
 /// HLL distinct-count estimate for column `name` across `entries`;
-/// `None` unless every entry carries a sketch. Sketch unions are
-/// exact, so the merged estimate has single-sketch accuracy.
+/// `None` unless every entry carries a sketch, an exact value table (a
+/// column counted exactly carries no sketch; its table's values are
+/// sketched here, hashed as the column sketch hashes them) or no value at
+/// all. Sketch unions are exact, so the merged estimate has single-sketch
+/// accuracy.
 fn scalar_distinct(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<usize> {
     let mut merged: Option<HllSketch> = None;
     for entry in entries {
-        let sketch = HllSketch::from_bytes(entry.scalar_stats.get(&column)?.hll.as_ref()?)?;
+        let stats = entry.scalar_stats.get(&column)?;
+        let sketch = match (&stats.hll, &stats.value_counts) {
+            (Some(bytes), _) => HllSketch::from_bytes(bytes)?,
+            (None, Some(table)) => values_hll(table.entries().iter().map(|(value, _)| value))?,
+            // Null throughout the superfile: nothing to add to the estimate.
+            (None, None) if stats.all_null() => continue,
+            (None, None) => return None,
+        };
         merged = Some(match merged {
             None => sketch,
             Some(mut acc) => {
@@ -2140,7 +2152,7 @@ fn flip_op(op: ScalarOp) -> ScalarOp {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, slice::from_ref};
 
     use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
@@ -2164,7 +2176,7 @@ mod tests {
         },
         supertable::{
             Supertable, SupertableOptions,
-            manifest::{ScalarStatsAgg, SuperfileUri},
+            manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
         },
         test_helpers::{default_tokenizer, fid},
     };
@@ -3164,13 +3176,9 @@ mod tests {
         }
     }
 
-    /// A superfile entry carrying only min/max for `col` (no null count,
-    /// sum, or HLL) — the shape a non-summable column (e.g. Utf8) produces.
-    fn entry_minmax_only(col: &str, min: &str, max: &str) -> Arc<SuperfileEntry> {
-        let mn: ArrayRef = Arc::new(LargeStringArray::from(vec![min]));
-        let mx: ArrayRef = Arc::new(LargeStringArray::from(vec![max]));
-        let mut scalar_stats = HashMap::new();
-        scalar_stats.insert(fid(col), ScalarStatsAgg::from_min_max(mn, mx));
+    /// A one-document superfile entry carrying `scalar_stats` and nothing
+    /// else.
+    fn entry_with_stats(scalar_stats: HashMap<FieldId, ScalarStatsAgg>) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
             physical_schema: None,
             stem: None,
@@ -3188,6 +3196,70 @@ mod tests {
             vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
+    }
+
+    /// A superfile entry carrying only min/max for `col` (no null count,
+    /// sum, or HLL) — the shape a non-summable column (e.g. Utf8) produces.
+    fn entry_minmax_only(col: &str, min: &str, max: &str) -> Arc<SuperfileEntry> {
+        let mn: ArrayRef = Arc::new(LargeStringArray::from(vec![min]));
+        let mx: ArrayRef = Arc::new(LargeStringArray::from(vec![max]));
+        let mut scalar_stats = HashMap::new();
+        scalar_stats.insert(fid(col), ScalarStatsAgg::from_min_max(mn, mx));
+        entry_with_stats(scalar_stats)
+    }
+
+    /// A superfile entry carrying the statistics `from_column` computes for
+    /// `col` over `column`.
+    fn entry_from_column(col: &str, column: &ArrayRef) -> Arc<SuperfileEntry> {
+        let mut scalar_stats = HashMap::new();
+        scalar_stats.insert(
+            fid(col),
+            ScalarStatsAgg::from_column(column).expect("a column with statistics"),
+        );
+        entry_with_stats(scalar_stats)
+    }
+
+    /// A column counted exactly by its value table carries no sketch; the
+    /// distinct estimate sketches the table's values in its place and
+    /// merges them across superfiles as it merges sketches, so the estimate
+    /// is the one a sketch over the same values gives.
+    #[test]
+    fn scalar_distinct_counts_a_column_through_its_value_table() {
+        let first: ArrayRef = Arc::new(Int64Array::from(vec![10, 50, 10]));
+        let second: ArrayRef = Arc::new(Int64Array::from(vec![5, 30, 50]));
+        let entries = vec![
+            entry_from_column("n", &first),
+            entry_from_column("n", &second),
+        ];
+        for entry in &entries {
+            let stats = &entry.scalar_stats[&fid("n")];
+            assert!(stats.hll.is_none(), "counted exactly, so no sketch");
+            assert!(stats.value_counts.is_some());
+        }
+        let all: ArrayRef = Arc::new(Int64Array::from(vec![10, 50, 10, 5, 30, 50]));
+        let want = column_hll(from_ref(&all))
+            .expect("sketchable")
+            .estimate()
+            .round() as usize;
+        assert_eq!(scalar_distinct(&entries, fid("n")), Some(want));
+    }
+
+    /// A superfile in which the column is null throughout carries neither
+    /// sketch nor table; it adds nothing to the estimate and withholds
+    /// nothing.
+    #[test]
+    fn scalar_distinct_skips_a_superfile_where_the_column_is_null_throughout() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![10, 50, 10]));
+        let nulls: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>, None]));
+        let entries = vec![
+            entry_from_column("n", &values),
+            entry_from_column("n", &nulls),
+        ];
+        let want = column_hll(from_ref(&values))
+            .expect("sketchable")
+            .estimate()
+            .round() as usize;
+        assert_eq!(scalar_distinct(&entries, fid("n")), Some(want));
     }
 
     /// The statistics fold helpers return `None` when a column carries no
