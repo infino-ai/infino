@@ -2626,9 +2626,10 @@ mod tests {
         reordered.doc_map = Some(map.clone());
         let reordered_blob = Bytes::from(reordered.finish().expect("finish"));
 
-        // The map no longer moves the version: it is a header field, so one
-        // version covers a blob with a map and one without. What still has
-        // to differ is whether the reader finds a map at all.
+        // The map no longer moves the version: its length is recorded in the
+        // trailer before the doc-lengths directory, so one version covers a
+        // blob with a map and one without. What still has to differ is
+        // whether the reader finds a map at all.
         assert_eq!(
             read_u32_le(&reordered_blob[VERSION_FIELD]),
             format::fts::VERSION_CURRENT,

@@ -374,14 +374,14 @@ const SORT_OUTPUT_BATCH_TRIPLES: usize = 4096;
 /// [`format::fts::VERSION_CURRENT`].
 ///
 /// Reordered or not, a blob gets the same version: `V9` records the doc-id
-/// map's length in its header, so one version describes a blob with a map and
-/// one without. Older blobs encoded that distinction in the version itself
-/// and are still read, never written.
+/// map's length in the eight bytes before the doc-lengths directory, so one
+/// version describes a blob with a map and one without. Older blobs encoded
+/// that distinction in the version itself and are still read, never written.
 ///
 /// A column's BM25 parameters do not move the version: they are recorded
 /// in its `inf.fts.columns` entry and read back from there, so the stored
 /// per-block bound is interpreted against the pair that entry names.
-fn blob_version(_doc_map: &Option<Vec<u32>>) -> u32 {
+const fn blob_version() -> u32 {
     format::fts::VERSION_CURRENT
 }
 
@@ -1386,9 +1386,11 @@ pub struct FtsBuilder {
     /// The Parquet row each doc id stands for, when the caller fed
     /// documents in an order of its own rather than in row order.
     ///
-    /// `Some` makes the blob [`format::fts::VERSION_V8`]: the map is
-    /// written as its own region and the reader translates hits through
-    /// it. `None`, the default, writes [`format::fts::VERSION_V7`].
+    /// `Some` writes the map as its own region before the doc-lengths
+    /// directory, with its length in the trailer just before the
+    /// directory, and the reader translates hits through it. `None`, the
+    /// default, writes no map and a zero trailer. The version is the same
+    /// either way.
     pub(crate) doc_map: Option<Vec<u32>>,
     /// Prebuilt inputs whose postings the finish merges term by term
     /// instead of reading the accumulator (the compaction merge). Empty
@@ -3614,7 +3616,7 @@ fn assemble_and_write_blob<W: Write>(
         DictSource::InRam(bytes) => bytes.len() as u64,
         DictSource::Streamed { len, .. } => *len,
     };
-    let fts_version = blob_version(&doc_map);
+    let fts_version = blob_version();
     let header_size = format::fts::HEADER_SIZE as u64;
     let dict_offset: u64 = header_size;
     let postings_offset: u64 = dict_offset + dict_total_len;
@@ -4773,7 +4775,7 @@ mod tests {
     /// still considered stale. This fails first instead.
     #[test]
     fn current_version_matches_the_written_version() {
-        assert_eq!(blob_version(&None), format::fts::VERSION_CURRENT);
+        assert_eq!(blob_version(), format::fts::VERSION_CURRENT);
     }
 
     #[test]
