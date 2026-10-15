@@ -198,8 +198,9 @@ impl NormTable {
     }
 
     /// A table over buckets the blob already holds, with the occupied range
-    /// the writer recorded. Nothing is derived and nothing is copied: the
-    /// whole cost is the 256-entry lookup table.
+    /// the writer recorded. Nothing is derived: the caller hands over the
+    /// bucket array it copied out of the region, and the only work here is
+    /// the 256-entry lookup table.
     pub(super) fn from_stored(
         bytes: Arc<[u8]>,
         occupied: (u8, u8),

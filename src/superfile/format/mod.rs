@@ -123,9 +123,10 @@ pub mod fts {
     ///
     /// The lengths stay. They are not redundant: quantizing loses
     /// information, and a merge rebuilds a column's statistics from the exact
-    /// values. What changes is that a reader never has to derive the buckets,
-    /// so it can score straight out of the stored region and leave it where
-    /// it lies. The cost is one byte per document per column on disk.
+    /// values. What changes is that a reader never has to derive the buckets:
+    /// it copies the stored array on a column's first scored use, which is
+    /// a copy rather than a walk over every document. The cost is one byte
+    /// per document per column on disk.
     ///
     /// `V9` is also the only version this engine writes, reordered or not,
     /// which `V7` and `V8` could not be between them: those two encode the
