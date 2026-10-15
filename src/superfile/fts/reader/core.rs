@@ -765,12 +765,27 @@ impl FtsReader {
                 }
                 let at = doc_lengths_table_offset - n;
                 let bytes = fetch_source_range(&source, at..at + n, "fts/doc-map len")?;
-                read_u64_le(&bytes) as usize
+                let stored = read_u64_le(&bytes);
+                // The trailer sits between the map's CRC and the directory's,
+                // covered by neither, so it is held to the document count
+                // instead: a map is one id per document plus its CRC, or
+                // there is no map. Anything else is a corrupt trailer. Taken
+                // at its word, a length past the blob would overflow the
+                // arithmetic that places the map, and one a few bytes short
+                // would open cleanly without CRC checks and shift every row
+                // the map resolves by one.
+                if stored != 0 && stored != derived_map_len as u64 {
+                    return Err(FtsError::Read(ReadError::Malformed(format!(
+                        "fts doc-id map length {stored} is neither 0 nor the \
+                         {derived_map_len} bytes a map over {n_docs} docs takes"
+                    ))));
+                }
+                stored as usize
             }
         };
         let doc_map_offset: Option<usize> = match doc_map_len {
             0 => None,
-            len => Some(doc_lengths_table_offset.saturating_sub(trailer + len)),
+            len => Some(doc_lengths_table_offset.saturating_sub(trailer.saturating_add(len))),
         };
 
         // Bounds-check every offset against the blob length before
@@ -1031,10 +1046,12 @@ impl FtsReader {
                 let body_end = doc_lengths_table_offset
                     .saturating_sub(format::fts::doc_map_len_trailer(version))
                     .saturating_sub(format::CRC_BYTES);
-                // The map's start is derived, so it cannot disagree with
-                // its length; what a corrupt header can still do is put
-                // the directory too early for a map of this many
-                // documents to fit between it and the regions before it.
+                // The map's length is the document count's, derived from it
+                // on an older blob and checked against it where a blob
+                // stores it, so the start cannot disagree with the length;
+                // what a corrupt header can still do is put the directory
+                // too early for a map of this many documents to fit between
+                // it and the regions before it.
                 if doc_lengths_table_offset < doc_map_len {
                     return Err(FtsError::Read(ReadError::Malformed(format!(
                         "fts doc-map of {doc_map_len} bytes for {n_docs} docs does not fit \
@@ -4051,6 +4068,72 @@ mod tests {
         fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
             None
         }
+    }
+
+    /// The doc-id map's length trailer is the one field between the map and
+    /// the directory that no CRC covers, so it is held to the document
+    /// count: a map is one id per document plus its CRC, or there is none.
+    /// Both ways a corrupt trailer could lie are refused, eager and lazy,
+    /// with CRC checks on and off: a length past the blob, which would
+    /// overflow the arithmetic placing the map, and one a few bytes short,
+    /// which would open and shift every row the map resolves by one.
+    #[tokio::test]
+    async fn a_doc_map_length_that_disagrees_with_the_document_count_is_refused() {
+        const N_DOCS: u32 = 64;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let map: Vec<u32> = (0..N_DOCS).rev().collect();
+        for (id, &row) in map.iter().enumerate() {
+            b.add_doc(0, id as u32, &format!("alpha uq{row}"))
+                .expect("add doc");
+        }
+        b.doc_map = Some(map);
+        let blob = Bytes::from(b.finish().expect("finish"));
+        assert!(
+            format::fts::has_stored_buckets(read_u32_le(&blob[VERSION_FIELD])),
+            "fixture must store its map length"
+        );
+
+        let dir_off =
+            read_u64_le(&blob[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
+                as usize;
+        let trailer = dir_off - format::fts::DOC_MAP_LEN_TRAILER_BYTES..dir_off;
+        let map_len = N_DOCS as u64 * U32_BYTES as u64 + format::CRC_BYTES as u64;
+        assert_eq!(read_u64_le(&blob[trailer.clone()]), map_len);
+        let stamp = |len: u64| {
+            let mut bytes = blob.to_vec();
+            bytes[trailer.clone()].copy_from_slice(&len.to_le_bytes());
+            Bytes::from(bytes)
+        };
+
+        for (bad, what) in [(u64::MAX, "past the blob"), (map_len - 4, "one id short")] {
+            let err = FtsReader::open(stamp(bad), json).expect_err(what);
+            assert!(
+                matches!(err, FtsError::Read(ReadError::Malformed(_))),
+                "{what}, eager: {err:?}"
+            );
+            for opts in [OpenOptions::default(), OpenOptions::for_object_store()] {
+                let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(stamp(bad)));
+                let err = FtsReader::open_lazy(src, json, opts).await.expect_err(what);
+                assert!(
+                    matches!(err, FtsError::Read(ReadError::Malformed(_))),
+                    "{what}, lazy: {err:?}"
+                );
+            }
+        }
+
+        // The honest value still opens, and resolves the rows it names.
+        let r = FtsReader::open(stamp(map_len), json).expect("the written length");
+        assert!(r.has_doc_map());
+        let hits = r
+            .search("body", &["uq7"], 10, BoolMode::Or)
+            .await
+            .expect("search");
+        assert_eq!(
+            hits.iter().map(|(d, _)| d.get()).collect::<Vec<_>>(),
+            vec![7]
+        );
     }
 
     /// Opening a blob that stores its documents in an order of its own
