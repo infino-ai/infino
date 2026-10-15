@@ -40,7 +40,11 @@ use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use arrow::{
     compute::take,
-    ipc::{reader::StreamReader, writer::StreamWriter},
+    ipc::{
+        MetadataVersion,
+        reader::StreamReader,
+        writer::{IpcWriteOptions, StreamWriter},
+    },
 };
 use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -167,6 +171,20 @@ pub enum EncodeError {
 // itself. Decoding tolerates absent optional stats (segments
 // written before they existed), never inventing values.
 
+/// Buffer alignment of the per-column statistics batches: the IPC
+/// format's minimum. The writer's default pads every buffer to 64 bytes,
+/// and a batch of length-one arrays, one per column, is then mostly
+/// padding: at four thousand columns the padding alone was over a
+/// megabyte per superfile.
+const STATS_IPC_ALIGNMENT: usize = 8;
+
+/// The IPC writer options every per-column statistics batch is written
+/// with (see [`STATS_IPC_ALIGNMENT`]).
+fn stats_ipc_options() -> IpcWriteOptions {
+    IpcWriteOptions::try_new(STATS_IPC_ALIGNMENT, false, MetadataVersion::V5)
+        .expect("the IPC minimum alignment is accepted")
+}
+
 const MIN_SUFFIX: &str = "__min";
 const MAX_SUFFIX: &str = "__max";
 const NULLS_SUFFIX: &str = "__nulls";
@@ -246,7 +264,8 @@ pub fn encode_scalar_stats(stats: &HashMap<FieldId, ScalarStatsAgg>) -> Vec<u8> 
 
     let mut out = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut out, &schema).expect("ipc writer init");
+        let mut writer = StreamWriter::try_new_with_options(&mut out, &schema, stats_ipc_options())
+            .expect("ipc writer init");
         writer.write(&batch).expect("ipc write");
         writer.finish().expect("ipc finish");
     }
@@ -409,8 +428,9 @@ pub(crate) fn encode_value_counts(
         .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
     let mut bytes = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut bytes, &schema)
-            .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+        let mut writer =
+            StreamWriter::try_new_with_options(&mut bytes, &schema, stats_ipc_options())
+                .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
         writer
             .write(&batch)
             .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
@@ -479,12 +499,7 @@ pub(crate) fn encode_length1_array(
     field_name: &str,
     arr: &ArrayRef,
 ) -> Result<Vec<u8>, EncodeError> {
-    // Enforce the single-value contract before writing — fail fast here
-    // rather than persisting a manifest that `decode_length1_array` would
-    // later reject.
-    if arr.len() != 1 {
-        return Err(EncodeError::WrongRowCount(arr.len()));
-    }
+    require_single_row(arr)?;
     let field = Field::new(field_name, arr.data_type().clone(), true);
     let schema = Arc::new(Schema::new(vec![field]));
     let batch = RecordBatch::try_new(schema.clone(), vec![arr.clone()])
@@ -501,6 +516,16 @@ pub(crate) fn encode_length1_array(
             .map_err(|e| EncodeError::ArrowIpc(e.to_string()))?;
     }
     Ok(out)
+}
+
+/// The single-value contract of an aggregate array, checked before a
+/// manifest is written rather than when a reader rejects it: an aggregate
+/// is one row, and a commit must fail on a bad array, never panic.
+pub(crate) fn require_single_row(arr: &ArrayRef) -> Result<(), EncodeError> {
+    if arr.len() != 1 {
+        return Err(EncodeError::WrongRowCount(arr.len()));
+    }
+    Ok(())
 }
 
 /// Decode the bytes produced by [`encode_length1_array`] back into the

@@ -51,8 +51,8 @@ use crate::{
             column_hll, column_min_max, column_sum,
             encoding::{
                 DecodeError, EncodeError, decode_cluster_centroids, decode_length1_array,
-                decode_value_counts, encode_cluster_centroids, encode_length1_array,
-                encode_value_counts,
+                decode_scalar_stats, decode_value_counts, encode_cluster_centroids,
+                encode_scalar_stats, require_single_row,
             },
             hll::HllSketch,
             merge_min_max_arrays,
@@ -69,8 +69,11 @@ use crate::{
 /// Major must match at decode time; minor differences are
 /// accepted (deny-unknown-major / allow-unknown-minor — same
 /// shape as the [`super::part::FORMAT_VERSION`] policy for
-/// manifest parts).
-pub const FORMAT_VERSION: &str = "2.0";
+/// manifest parts). Minor 1 carries a part's rollups as one
+/// Arrow IPC batch (`scalar_stats_agg_ipc`) in place of one IPC
+/// stream per bound; a reader of minor 0 finds the per-column
+/// map empty and keeps every part, which is correct.
+pub const FORMAT_VERSION: &str = "2.1";
 
 /// The major this engine wrote before summary keys became field ids. Lists
 /// at this major key their aggregates by column name, which
@@ -1605,7 +1608,15 @@ struct ManifestPartEntryDto {
     // (`echo '...' | jq '.parts[0].id_range'` shows real
     // values) and avoid base64 ambiguity.
     id_range: (String, String),
+    /// Per-column rollups, one IPC stream per bound: how lists before
+    /// minor 1 carry them. Written empty since; read when present.
     scalar_stats_agg: BTreeMap<String, ScalarStatsAggDto>,
+    /// The rollups as one Arrow IPC batch (base64), the wire form the
+    /// parts use per superfile (`encode_scalar_stats`): at four thousand
+    /// columns a part's rollups went from 5.3 MB to well under one, and
+    /// the list was rewritten whole at every commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scalar_stats_agg_ipc: Option<String>,
     fts_summary_agg: BTreeMap<String, FtsSummaryAggDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fts_length_totals: Option<BTreeMap<String, ColumnLengthStatsDto>>,
@@ -1691,45 +1702,20 @@ fn decode_b64(s: &str, field: &'static str) -> Result<Vec<u8>, ListParseError> {
         .map_err(|source| ListParseError::Base64 { field, source })
 }
 
-fn encode_scalar_array(
-    column: &str,
-    field: &'static str,
-    arr: &ArrayRef,
-) -> Result<String, ListEncodeError> {
-    let bytes = encode_length1_array(column, arr)
-        .map_err(|source| ListEncodeError::ScalarStats { field, source })?;
-    Ok(encode_b64(&bytes))
-}
-
 fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncodeError> {
-    let mut scalar_stats_agg = BTreeMap::new();
-    for (id, v) in &e.scalar_stats_agg {
-        let k = wire_key(*id);
-        let sum = match &v.sum {
-            None => None,
-            Some(s) => Some(encode_scalar_array(&k, "scalar_stats_agg.sum", s)?),
-        };
-        scalar_stats_agg.insert(
-            k.clone(),
-            ScalarStatsAggDto {
-                min: encode_scalar_array(&k, "scalar_stats_agg.min", &v.min)?,
-                max: encode_scalar_array(&k, "scalar_stats_agg.max", &v.max)?,
-                null_count: v.null_count,
-                sum,
-                hll: v.hll.as_deref().map(encode_b64),
-                value_counts: v
-                    .value_counts
-                    .as_ref()
-                    .map(encode_value_counts)
-                    .transpose()
-                    .map_err(|source| ListEncodeError::ScalarStats {
-                        field: "scalar_stats_agg.value_counts",
-                        source,
-                    })?
-                    .as_deref()
-                    .map(encode_b64),
-            },
-        );
+    // The batch encoder takes the arrays as they are; a bound that is not
+    // one row is refused here, as a typed error, before anything is written.
+    for agg in e.scalar_stats_agg.values() {
+        for (field, array) in [
+            ("scalar_stats_agg.min", Some(&agg.min)),
+            ("scalar_stats_agg.max", Some(&agg.max)),
+            ("scalar_stats_agg.sum", agg.sum.as_ref()),
+        ] {
+            if let Some(array) = array {
+                require_single_row(array)
+                    .map_err(|source| ListEncodeError::ScalarStats { field, source })?;
+            }
+        }
     }
     Ok(ManifestPartEntryDto {
         part_id: e.part_id.0.to_string(),
@@ -1741,7 +1727,8 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
         routing_uri: e.routing.as_ref().map(|r| r.uri.clone()),
         routing_content_hash: e.routing.as_ref().map(|r| encode_hash(&r.content_hash)),
         id_range: (e.id_range.0.to_string(), e.id_range.1.to_string()),
-        scalar_stats_agg,
+        scalar_stats_agg: BTreeMap::new(),
+        scalar_stats_agg_ipc: Some(encode_b64(&encode_scalar_stats(&e.scalar_stats_agg))),
         fts_summary_agg: e
             .fts_summary_agg
             .iter()
@@ -1791,7 +1778,14 @@ fn entry_from_dto(
     let part_id =
         PartId(Uuid::parse_str(&d.part_id).map_err(|e| ListParseError::BadPartId(e.to_string()))?);
     let content_hash = decode_hash(&d.content_hash)?;
-    let mut scalar_stats_agg = HashMap::new();
+    let mut scalar_stats_agg = match d.scalar_stats_agg_ipc.as_deref() {
+        Some(encoded) => decode_scalar_stats(&decode_b64(encoded, "scalar_stats_agg_ipc")?, legacy)
+            .map_err(|source| ListParseError::ScalarStats {
+                field: "scalar_stats_agg_ipc",
+                source,
+            })?,
+        None => HashMap::new(),
+    };
     for (k, v) in d.scalar_stats_agg {
         let min = decode_length1_array(&decode_b64(&v.min, "scalar_stats_agg.min")?).map_err(
             |source| ListParseError::ScalarStats {
@@ -2299,6 +2293,7 @@ mod tests {
         super::{
             ClusterCentroids,
             bloom::BloomBuilder,
+            encoding::{encode_length1_array, encode_value_counts},
             part::{ContentHash, PartId},
         },
         *,
@@ -2350,6 +2345,49 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("int64 array")
             .value(0)
+    }
+
+    /// A part's rollups travel as one Arrow IPC batch: the per-bound map
+    /// is written empty, the batch round-trips every field.
+    #[test]
+    fn a_part_s_rollups_travel_as_one_batch() {
+        let entry = rich_entry(1);
+        let dto = entry_to_dto(&entry).expect("encode");
+        assert!(dto.scalar_stats_agg.is_empty(), "no per-bound streams");
+        assert!(dto.scalar_stats_agg_ipc.is_some(), "one batch");
+        let back = entry_from_dto(dto, None).expect("decode");
+        assert_eq!(back.scalar_stats_agg, entry.scalar_stats_agg);
+    }
+
+    /// A list written before the batch form, one IPC stream per bound,
+    /// decodes to the same rollups.
+    #[test]
+    fn rollups_in_the_per_bound_form_still_decode() {
+        let entry = rich_entry(2);
+        let mut dto = entry_to_dto(&entry).expect("encode");
+        dto.scalar_stats_agg_ipc = None;
+        for (id, agg) in &entry.scalar_stats_agg {
+            let key = wire_key(*id);
+            let bound = |array: &ArrayRef| {
+                encode_b64(&encode_length1_array(&key, array).expect("a length-one array"))
+            };
+            dto.scalar_stats_agg.insert(
+                key.clone(),
+                ScalarStatsAggDto {
+                    min: bound(&agg.min),
+                    max: bound(&agg.max),
+                    null_count: agg.null_count,
+                    sum: agg.sum.as_ref().map(bound),
+                    hll: agg.hll.as_deref().map(encode_b64),
+                    value_counts: agg
+                        .value_counts
+                        .as_ref()
+                        .map(|counts| encode_b64(&encode_value_counts(counts).expect("encode"))),
+                },
+            );
+        }
+        let back = entry_from_dto(dto, None).expect("decode");
+        assert_eq!(back.scalar_stats_agg, entry.scalar_stats_agg);
     }
 
     /// `birth_version_range` reads the UInt64 min/max of the birth-version
@@ -2879,30 +2917,23 @@ mod tests {
     }
 
     #[test]
-    fn decode_surfaces_scalar_stats_error_on_corrupt_min() {
-        // Encode a valid list, then replace one column's `min` base64 with
-        // valid base64 of non-IPC bytes; decode must surface a typed error.
+    fn decode_surfaces_scalar_stats_error_on_corrupt_rollups() {
+        // Encode a valid list, then replace a part's rollup batch with valid
+        // base64 of non-IPC bytes; decode must surface a typed error.
         let list = rich_list(1);
         let bytes = encode(&list).expect("encode");
         let mut v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        let cols: Vec<String> = v["parts"][0]["scalar_stats_agg"]
-            .as_object()
-            .expect("scalar_stats_agg object")
-            .keys()
-            .cloned()
-            .collect();
-        let key = cols.first().expect("at least one scalar column");
+        assert!(v["parts"][0]["scalar_stats_agg_ipc"].is_string());
         let garbage_b64 = BASE64.encode(b"not arrow ipc");
-        v["parts"][0]["scalar_stats_agg"][key.as_str()]["min"] =
-            serde_json::Value::String(garbage_b64);
+        v["parts"][0]["scalar_stats_agg_ipc"] = serde_json::Value::String(garbage_b64);
         let tampered = serde_json::to_vec(&v).expect("reserialize");
         let err =
-            decode(&tampered, &LegacyNames::none()).expect_err("corrupt min must fail decode");
+            decode(&tampered, &LegacyNames::none()).expect_err("corrupt rollups must fail decode");
         assert!(
             matches!(
                 err,
                 ListParseError::ScalarStats {
-                    field: "scalar_stats_agg.min",
+                    field: "scalar_stats_agg_ipc",
                     ..
                 }
             ),
