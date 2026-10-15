@@ -112,20 +112,33 @@ def test_the_plan_names_exactly_what_the_run_repairs(tmp_path):
 
 
 def test_a_rewrite_leaves_analysis_stale_superfiles_reported(tmp_path):
-    # The fixture's layout is current and its terms are not, so a layout-only
-    # run has nothing it can repair and must say so rather than rewrite.
+    # Every fixture superfile holds terms an older analysis produced, which
+    # a layout-only run cannot repair: it rewrites whatever is behind on
+    # layout, says what it left, and leaves the table stale.
     table = _old_format_table(tmp_path)
     rewriting = infino.ReindexOptions(mode="rewrite")
 
     staleness = table.index_staleness(rewriting)
-    assert staleness.needing_rewrite == 0
-    assert staleness.bytes_to_rewrite == 0
+    assert not staleness.is_current
     assert staleness.awaiting_reanalysis == OLD_FORMAT_SUPERFILES
 
-    assert table.reindex_plan(rewriting) == []
+    # The plan names the layout-stale superfiles and nothing for the terms.
+    plan = table.reindex_plan(rewriting)
+    assert len(plan) == staleness.needing_rewrite
+    assert all(p.mode == "rewrite" for p in plan)
+
     report = table.reindex(rewriting)
-    assert report.rewritten == 0
+    assert report.rewritten == staleness.needing_rewrite
     assert report.awaiting_reanalysis == OLD_FORMAT_SUPERFILES
+
+    # The rewrite brought the layout current and could not clear the
+    # terms, so a second layout-only run has nothing to do and the table
+    # is still behind.
+    after = table.index_staleness(rewriting)
+    assert after.needing_rewrite == 0
+    assert after.bytes_to_rewrite == 0
+    assert after.awaiting_reanalysis == OLD_FORMAT_SUPERFILES
+    assert table.reindex_plan(rewriting) == []
     assert not table.index_staleness().is_current
 
 

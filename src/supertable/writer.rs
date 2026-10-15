@@ -118,7 +118,7 @@ use crate::{
         format::{
             CRC_BYTES,
             footer::read_kv_metadata,
-            fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr},
+            fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, doc_map_len_trailer, hdr},
             kv,
             vec::{
                 CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE,
@@ -126,7 +126,7 @@ use crate::{
                 sub_hdr,
             },
         },
-        fts::builder::DOC_LENGTHS_ENTRY_SIZE,
+        fts::builder::doc_lengths_entry_size,
         reader::vector_layout_from_kv,
         vector::{
             builder::{
@@ -3174,12 +3174,20 @@ fn vector_open_ranges_multi_cell(blob: &[u8], off: u64, dim: usize) -> Option<Ve
 }
 
 /// The byte ranges an FTS reader reads to open: the fixed header and the
-/// doc-lengths directory (one small entry per column). Both are tiny, so
+/// doc-lengths directory (one small entry per column), with the doc-id
+/// map's length trailer where the version writes one. Both are tiny, so
 /// the manifest carries them inline and a cold open costs no read against
 /// the superfile. The dictionary and the per-document length arrays are
 /// deliberately left out: a query the table-level term index resolves
 /// never reads the dictionary, a match-only query never reads the lengths,
 /// and either is fetched on first use by the query that needs it.
+///
+/// The directory's span is the version's, read from the header: its entry
+/// width and the trailer before it both moved when a blob began storing
+/// its length buckets. The reader's open fetches that span exactly, and the
+/// overlay the manifest seeds does not stitch, so a range recorded a few
+/// bytes short of it serves nothing and the open pays a GET for the whole
+/// directory anyway.
 fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
     let start = off as usize;
     let end = start.checked_add(len as usize)?;
@@ -3187,6 +3195,7 @@ fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>>
     if blob.len() < FTS_HEADER_SIZE {
         return None;
     }
+    let version = read_u32_le(blob.get(hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES)?);
     let n_columns =
         read_u32_le(blob.get(hdr::N_COLUMNS_OFF..hdr::N_COLUMNS_OFF + U32_BYTES)?) as usize;
     let doc_lengths_offset =
@@ -3194,14 +3203,16 @@ fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>>
             as usize;
     // Entries plus the directory's CRC.
     let dir_len = n_columns
-        .checked_mul(DOC_LENGTHS_ENTRY_SIZE)?
+        .checked_mul(doc_lengths_entry_size(version))?
         .checked_add(4)?;
     if doc_lengths_offset.checked_add(dir_len)? > blob.len() {
         return None;
     }
+    let trailer = doc_map_len_trailer(version);
+    let dir_start = doc_lengths_offset.checked_sub(trailer)?;
     Some(merge_ranges(vec![
         (off, FTS_HEADER_SIZE as u64),
-        (off + doc_lengths_offset as u64, dir_len as u64),
+        (off + dir_start as u64, (trailer + dir_len) as u64),
     ]))
 }
 
@@ -12339,6 +12350,7 @@ mod tests {
     use crate::{
         config::Config,
         superfile::{
+            BytesLazyByteSource, LazyByteSource, LazyByteSourceError, PrefetchedSource,
             builder::{FtsConfig, VectorConfig},
             fts::reader::{Bm25SearchOptions, BoolMode},
             vector::{distance::Metric, rerank_codec::RerankCodec},
@@ -12357,7 +12369,7 @@ mod tests {
             wal::{recovery::scan_and_recover, state_doc::SupertableHandleId},
         },
         test_helpers::{
-            build_title_batch, default_supertable_options, distinct_unit_vectors,
+            build_title_batch, decimal128_ids, default_supertable_options, distinct_unit_vectors,
             fault_storage::{FaultKind, FaultOp, FaultStorage},
         },
     };
@@ -15175,6 +15187,150 @@ supertable:
         );
         // n_docs sanity via the reader, ensuring the bytes parse.
         assert_eq!(reader.n_docs(), 8);
+    }
+
+    /// A lazy byte source that records the reads reaching it, so a test can
+    /// see which bytes an overlay seeded from the manifest did not cover.
+    struct RecordingSource {
+        inner: BytesLazyByteSource,
+        reads: std::sync::Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl RecordingSource {
+        fn note(&self, start: u64, len: u64) {
+            self.reads.lock().expect("reads").push((start, len));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LazyByteSource for RecordingSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.note(start, len);
+            self.inner.range(start, len).await
+        }
+        fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
+            self.note(start, len);
+            self.inner.try_get_range_sync(start, len)
+        }
+    }
+
+    /// Documents in [`fts_superfile_bytes`].
+    const OPEN_RANGE_DOCS: u64 = 4_000;
+
+    /// An FTS superfile as this engine builds it: the blob version the open
+    /// ranges are computed for.
+    fn fts_superfile_bytes() -> Bytes {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "doc_id",
+                DataType::Decimal128(
+                    crate::supertable::schema::DECIMAL128_PRECISION,
+                    crate::supertable::schema::DECIMAL128_SCALE,
+                ),
+                false,
+            ),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(
+            Arc::clone(&schema),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let mut builder = SuperfileBuilder::new(opts).expect("builder");
+        let ids = decimal128_ids(1..=OPEN_RANGE_DOCS);
+        let titles = LargeStringArray::from(
+            (1..=OPEN_RANGE_DOCS)
+                .map(|d| format!("shared term{d} other{} word{}", d * 7, d * 13))
+                .collect::<Vec<_>>(),
+        );
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+        builder.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(builder.finish().expect("finish"))
+    }
+
+    /// What the manifest carries for an FTS open is what the open reads.
+    ///
+    /// The disk cache seeds a lazy open from the recorded open blob, and the
+    /// overlay does not stitch: a recorded range that stops short of the
+    /// span the reader asks for — by a directory entry's width, or by the
+    /// trailer a newer blob version writes before the directory — serves
+    /// nothing, and every cold open then pays the GET the blob was carried
+    /// to avoid. So the ranges are checked against the reader rather than
+    /// against the constants they were computed from.
+    ///
+    /// Only the FTS entries of the open blob are installed. The parquet tail
+    /// it also carries reaches back from the end of the file, and on a small
+    /// superfile that covers the FTS directory too, which would serve the
+    /// open whatever the FTS ranges said; a table of real size has megabytes
+    /// of length arrays between the two.
+    #[tokio::test]
+    async fn the_recorded_fts_open_ranges_serve_the_whole_lazy_open() {
+        let bytes = fts_superfile_bytes();
+        let offsets = build_subsection_offsets(&bytes).expect("offsets");
+        let (fts_off, fts_len) = offsets.fts.expect("an FTS subsection");
+        let fts_blob = fts_off..fts_off + fts_len;
+        assert!(
+            !offsets.fts_open_ranges.is_empty(),
+            "an FTS superfile records open ranges"
+        );
+        let recording = Arc::new(RecordingSource {
+            inner: BytesLazyByteSource::new(bytes),
+            reads: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut overlay = PrefetchedSource::new(Arc::clone(&recording) as Arc<dyn LazyByteSource>);
+        let mut installed = 0;
+        for (off, carried) in &offsets.open_blob {
+            let is_fts_range = offsets
+                .fts_open_ranges
+                .contains(&(*off, carried.len() as u64));
+            if is_fts_range {
+                overlay.install(*off, Bytes::copy_from_slice(carried));
+                installed += 1;
+            }
+        }
+        assert_eq!(
+            installed,
+            offsets.fts_open_ranges.len(),
+            "every FTS open range rides in the open blob; ranges {:?}, blob {:?}",
+            offsets.fts_open_ranges,
+            offsets
+                .open_blob
+                .iter()
+                .map(|(off, b)| (off, b.len()))
+                .collect::<Vec<_>>()
+        );
+
+        let reader = SuperfileReader::open_lazy_with(
+            Arc::new(overlay),
+            crate::superfile::reader::OpenOptions { verify_crc: false },
+        )
+        .await
+        .expect("lazy open over the carried open blob");
+        assert!(
+            reader.fts().is_some(),
+            "the lazy open opened the FTS reader"
+        );
+
+        // The parquet footer's speculative tail read reaches the file end,
+        // and on a small superfile that overlaps the FTS blob; every other
+        // read inside the blob is the FTS reader's.
+        let reads = recording.reads.lock().expect("reads").clone();
+        let inside_fts: Vec<(u64, u64)> = reads
+            .into_iter()
+            .filter(|&(start, len)| start + len != offsets.total_size)
+            .filter(|&(start, len)| start < fts_blob.end && start + len > fts_blob.start)
+            .collect();
+        assert!(
+            inside_fts.is_empty(),
+            "the carried FTS open ranges must cover every byte the FTS open reads, but \
+             these reached the superfile: {inside_fts:?} (recorded FTS open ranges: {:?})",
+            offsets.fts_open_ranges
+        );
     }
 
     #[test]

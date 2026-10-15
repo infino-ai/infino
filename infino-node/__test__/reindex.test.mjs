@@ -118,20 +118,33 @@ test("the plan names exactly what the run repairs", () => {
 });
 
 test("a rewrite leaves analysis-stale superfiles reported", () => {
-  // The fixture's layout is current and its terms are not, so a layout-only
-  // run has nothing it can repair and must say so rather than rewrite.
+  // Every fixture superfile holds terms an older analysis produced, which
+  // a layout-only run cannot repair: it rewrites whatever is behind on
+  // layout, says what it left, and leaves the table stale.
   const table = oldFormatTable(tempRoot());
   const rewriting = { mode: "rewrite" };
 
   const staleness = table.indexStaleness(rewriting);
-  assert.equal(staleness.needingRewrite, 0);
-  assert.equal(staleness.bytesToRewrite, 0);
+  assert.equal(staleness.isCurrent, false);
   assert.equal(staleness.awaitingReanalysis, OLD_FORMAT_SUPERFILES);
 
-  assert.deepEqual(table.reindexPlan(rewriting), []);
+  // The plan names the layout-stale superfiles and nothing for the terms.
+  const plan = table.reindexPlan(rewriting);
+  assert.equal(plan.length, staleness.needingRewrite);
+  assert.ok(plan.every((p) => p.mode === "rewrite"));
+
   const report = table.reindex(rewriting);
-  assert.equal(report.rewritten, 0);
+  assert.equal(report.rewritten, staleness.needingRewrite);
   assert.equal(report.awaitingReanalysis, OLD_FORMAT_SUPERFILES);
+
+  // The rewrite brought the layout current and could not clear the terms,
+  // so a second layout-only run has nothing to do and the table is still
+  // behind.
+  const after = table.indexStaleness(rewriting);
+  assert.equal(after.needingRewrite, 0);
+  assert.equal(after.bytesToRewrite, 0);
+  assert.equal(after.awaitingReanalysis, OLD_FORMAT_SUPERFILES);
+  assert.deepEqual(table.reindexPlan(rewriting), []);
   assert.equal(table.indexStaleness().isCurrent, false);
 });
 
