@@ -307,6 +307,10 @@ impl Supertable {
     }
 
     /// Update rows matching `predicate` with values from `batch`.
+    ///
+    /// Waits for appends already in flight on this table to commit, so it
+    /// can block the calling thread; from async code, call it off the
+    /// runtime's workers.
     pub fn update(
         &self,
         predicate: Expr,
@@ -327,7 +331,8 @@ impl Supertable {
         self.inner.update_rows(predicate, rows)
     }
 
-    /// Delete rows matching `predicate`.
+    /// Delete rows matching `predicate`. Like [`Self::update`], it waits for
+    /// appends already in flight, so it can block the calling thread.
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
         ensure_expr_within_connective_cap(&predicate)?;
         self.inner.delete(predicate)
@@ -539,8 +544,10 @@ impl Supertable {
     ///   vector search.
     /// - Columns are matched by name, like `append`. Unlike `append`, a column the
     ///   table doesn't have is refused: hydrate doesn't grow the schema.
-    /// - Takes the table's writer slot for the whole load; a concurrent writer
-    ///   gets [`InfinoError::Conflict`].
+    /// - Takes the table's writer slot for the whole load. It first waits for
+    ///   appends already in flight to commit, turning new ones away; another
+    ///   update, delete or hydrate holding the slot fails it with
+    ///   [`InfinoError::Conflict`], as does any write while it holds it.
     /// - Not atomic: superfiles commit in waves to bound memory, so an error part
     ///   way leaves the waves already committed. Don't retry on the same table
     ///   (that adds those rows again); drop it and hydrate again.

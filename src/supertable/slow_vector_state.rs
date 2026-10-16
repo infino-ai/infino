@@ -954,7 +954,9 @@ mod tests {
     use crate::{
         storage::LocalFsStorageProvider,
         superfile::vector::{layout::VectorLayout, quant::BitQuantizer, rotation::RandomRotation},
-        supertable::manifest::{CellVectorSummary, ClusterCentroids, SuperfileUri, VectorSummary},
+        supertable::manifest::{
+            CellVectorSummary, ClusterCentroids, ScalarStats, SuperfileUri, VectorSummary,
+        },
         test_helpers::fid,
     };
 
@@ -975,7 +977,7 @@ mod tests {
             n_docs,
             id_min: 10,
             id_max: 10 + n_docs.saturating_sub(1) as i128,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: cell.to_le_bytes().to_vec(),

@@ -348,6 +348,41 @@ pub(crate) struct ReservedSegment {
     superfiles: Vec<Uuid>,
     id_mins: Vec<i128>,
     segment: Segment,
+    /// Appended only at exactly the root's length, and rebuilt there
+    /// otherwise, so the root is never padded on its account.
+    exact: bool,
+}
+
+impl ReservedSegment {
+    /// The ordinal just past the segment's last superfile.
+    pub(crate) fn end(&self) -> u32 {
+        self.base + self.superfiles.len() as u32
+    }
+}
+
+/// Build `contributions` into a segment numbered from `base` and write its
+/// slices, for a later [`append_reserved`].
+pub(crate) async fn reserve_segment(
+    storage: &dyn StorageProvider,
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+    base: u32,
+    exact: bool,
+) -> Result<ReservedSegment, TermIndexError> {
+    let built = detail_span!(
+        "term_index.build_segment",
+        inputs = contributions.len(),
+        ordinal_base = base,
+    )
+    .in_scope(|| build_segment(contributions, policy, base))?;
+    write_slices(storage, built.slices).await?;
+    Ok(ReservedSegment {
+        base,
+        superfiles: built.superfiles,
+        id_mins: built.id_mins,
+        segment: built.segment,
+        exact,
+    })
 }
 
 /// [`append_delta`] for a commit that may retry: the segment is built once,
@@ -355,7 +390,9 @@ pub(crate) struct ReservedSegment {
 /// `reserved`. Each call pads `prior` with nil entries up to the reserved
 /// ordinal and appends it, writing only the root. The segment is built
 /// again only when `prior` has grown past the reserved ordinal, or the
-/// contributions are not the ones it was built from.
+/// contributions are not the ones it was built from. An `exact` segment is
+/// never padded: it is reused only at `prior`'s exact length and otherwise
+/// rebuilt there, without the slack.
 ///
 /// Like every delta, it names only ordinals at or past the length of the
 /// root it extends, which `segments_since` relies on. Optimize's rebuild
@@ -369,8 +406,9 @@ pub(crate) async fn append_reserved(
 ) -> Result<RoutingRef, TermIndexError> {
     let mut root = prior.unwrap_or_default();
     let len = root.superfiles.len();
+    let exact = reserved.as_ref().is_some_and(|r| r.exact);
     let reusable = reserved.as_ref().is_some_and(|r| {
-        r.base as usize >= len
+        (r.base as usize == len || (!exact && r.base as usize > len))
             && r.superfiles.len() == contributions.len()
             && r.superfiles
                 .iter()
@@ -378,20 +416,9 @@ pub(crate) async fn append_reserved(
                 .all(|(id, c)| *id == c.superfile_id)
     });
     if !reusable {
-        let base = len as u32 + RESERVED_ORDINAL_SLACK;
-        let built = detail_span!(
-            "term_index.build_segment",
-            inputs = contributions.len(),
-            ordinal_base = base,
-        )
-        .in_scope(|| build_segment(contributions, policy, base))?;
-        write_slices(storage, built.slices).await?;
-        *reserved = Some(ReservedSegment {
-            base,
-            superfiles: built.superfiles,
-            id_mins: built.id_mins,
-            segment: built.segment,
-        });
+        let slack = if exact { 0 } else { RESERVED_ORDINAL_SLACK };
+        let base = len as u32 + slack;
+        *reserved = Some(reserve_segment(storage, contributions, policy, base, exact).await?);
     }
     let segment = reserved.as_ref().expect("reserved above");
     let padding = segment.base as usize - len;
@@ -4106,11 +4133,7 @@ mod tests {
         commit_segment(&st, 3);
 
         let after = current_list(&storage, &legacy, &rt);
-        assert!(
-            after.format_version.starts_with("2."),
-            "{}",
-            after.format_version
-        );
+        assert_eq!(after.format_version, list::FORMAT_VERSION);
         let schema = after
             .schema
             .as_ref()

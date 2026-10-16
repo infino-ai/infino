@@ -33,6 +33,7 @@ pub mod list_prune;
 pub mod options_hash;
 pub mod part;
 pub mod partition;
+pub mod summaries;
 pub(crate) mod term_index;
 use arrow_schema::Schema;
 use term_index::{PermanentLoadFailure, TermIndex, TermIndexError};
@@ -49,6 +50,7 @@ use crate::{
 pub mod term_range;
 
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     f32::consts::PI,
@@ -69,7 +71,10 @@ use futures::{future, stream, stream::StreamExt};
 pub use list::{FtsSummaryAgg, GlobalVectorIndex, RoutingRef, ScalarStatsAgg};
 use rayon::{ThreadPool, prelude::*};
 use rustc_hash::FxHashSet;
-use tokio::{sync::OnceCell, task::spawn_blocking};
+/// One column's statistics read in place, from a decoded map or a section
+/// row: the one access path the pruner, the planner and the commit share.
+pub use summaries::ColumnStats;
+use tokio::{join, sync::OnceCell, task::spawn_blocking};
 use tracing::{Instrument, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
@@ -97,7 +102,7 @@ use crate::{
         manifest::{
             commit::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
-                translate_contention, write_manifest, write_part_bytes, write_pointer,
+                translate_contention, write_manifest, write_object_bytes, write_pointer,
             },
             disk_cache::ManifestDiskCache,
             encoding::SummaryWireMode,
@@ -105,8 +110,11 @@ use crate::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
                 PartitionStrategy,
             },
-            part::{ContentHash, ManifestPart, OpenBlobBudget, PartId},
+            part::{ContentHash, ManifestPart, OpenBlobBudget, PartId, share_physical_schemas},
             partition::{assign_partition, encode_partition_key},
+            summaries::{
+                SummariesError, SummariesRef, SummariesSection, rows_from_entries, summaries_uri,
+            },
         },
         query::{hierarchical_iter, prune::PruneLeaf},
         schema::{FieldId, LegacyNames, PhysicalKind, PhysicalSchema, TableSchema},
@@ -183,9 +191,10 @@ pub struct SuperfileList {
     /// derives `manifest_id = old.next_manifest_id()` — normally
     /// `old.manifest_id + 1`, past that when a crash-orphaned list
     /// occupies an id (ids may gap; readers follow the pointer, never
-    /// id arithmetic). With a single writer at a time, no separate
-    /// counter or atomic is needed — the read-then-store sequence is
-    /// exclusive by construction.
+    /// id arithmetic). No separate counter or atomic is needed: within
+    /// a process, commits publish one at a time (an exclusive writer,
+    /// or a shared append on its turn in the append queue), and across
+    /// processes the pointer compare-and-swap refuses all but one.
     pub manifest_id: u64,
     /// Pointer back to the immutable per-supertable configuration.
     /// Same Arc across all manifests of one supertable.
@@ -1355,12 +1364,15 @@ impl ManifestSnapshot {
         &self,
         storage: &dyn StorageProvider,
         expected_prev_etag: Option<&str>,
-        parts_to_write: &[Bytes],
+        parts_to_write: &[(String, Bytes)],
     ) -> Result<(), CommitError> {
         let Some(list_to_write) = self.list.as_ref() else {
             return Ok(());
         };
-        // Step 1+2: parallel write of (list, parts).
+        // Step 1+2: parallel write of (list, parts). `parts_to_write` is
+        // every object the touched parts publish, by key: the parts, their
+        // routing siblings and their summaries sections
+        // (`EncodedPart::objects`).
         //
         // Both futures are independent — the list's references to
         // each part's URI are content-addressable from the
@@ -1369,7 +1381,7 @@ impl ManifestSnapshot {
         let list_fut = write_manifest(storage, list_to_write);
         let part_futs = parts_to_write
             .iter()
-            .map(|encoded| write_part_bytes(storage, encoded.clone()));
+            .map(|(uri, encoded)| write_object_bytes(storage, uri, encoded.clone()));
         let part_join = future::join_all(part_futs);
 
         let (list_res, part_results) = tokio::join!(list_fut, part_join);
@@ -2435,37 +2447,70 @@ impl ManifestSnapshot {
             // which is the point of the part scheme. Size matters independently
             // of count for vector tables: cell-packed entries carry fine
             // centroids, so a handful of entries can outweigh thousands of
-            // scalar-only ones.
-            let latest_at_size_cap = entry.size_bytes_compressed
+            // scalar-only ones. The part's summaries section counts with it:
+            // a rewrite re-encodes the section whole, and on a wide table the
+            // section is most of the part's weight.
+            let section_bytes = entry
+                .summaries
+                .as_ref()
+                .map_or(0, |section| section.size_bytes);
+            let latest_at_size_cap = entry.size_bytes_compressed.saturating_add(section_bytes)
                 >= self.superfile_list.options.part_size_threshold_bytes;
-            if combined_n > self.superfile_list.options.target_superfiles_per_part
-                || latest_at_size_cap
-            {
-                // Split: keep the existing part, emit a fresh part for the new
-                // superfiles.
-                out_list_entries.push(entry.clone());
-                let (fresh_entry, fresh_encoded_part) =
-                    rebuild_part_and_entry(vec![], new_for_part, None, hidden_table);
-                out_list_entries.push(fresh_entry);
-                parts_to_write.push(fresh_encoded_part);
+            let at_cap = combined_n > self.superfile_list.options.target_superfiles_per_part
+                || latest_at_size_cap;
+            // A part whose summaries section this handle could not read is
+            // not rewritten either: its rebuilt section would record its
+            // superfiles as having no statistics, for good. It is kept as it
+            // is, section reference and all, and the new superfiles go to
+            // a part of their own.
+            let existing_part = if at_cap {
+                None
             } else {
-                // Rewrite the latest part = its existing superfiles + the new.
-                let existing_part = self.get_part_by_id(entry.part_id).await?;
-                let (rebuilt_entry, rebuilt_encoded_part) = rebuild_part_and_entry(
-                    existing_part.superfiles.clone(),
-                    new_for_part,
-                    Some(entry),
-                    hidden_table,
-                );
-                out_list_entries.push(rebuilt_entry);
-                parts_to_write.push(rebuilt_encoded_part);
+                Some(self.get_part_by_id(entry.part_id).await?)
+            };
+            let existing_part = existing_part.filter(|part| {
+                let readable = !part
+                    .superfiles
+                    .iter()
+                    .any(|superfile| superfile.scalar_stats.is_unavailable());
+                if !readable {
+                    warn!(
+                        part_id = %entry.part_id,
+                        "the latest part's summaries section could not be read; the new \
+                         superfiles go to a part of their own"
+                    );
+                }
+                readable
+            });
+            match existing_part {
+                None => {
+                    // Split: keep the existing part, emit a fresh part for the
+                    // new superfiles.
+                    out_list_entries.push(entry.clone());
+                    let (fresh_entry, fresh_encoded_part) =
+                        rebuild_part_and_entry(vec![], new_for_part, None, hidden_table)?;
+                    out_list_entries.push(fresh_entry);
+                    parts_to_write.push(fresh_encoded_part);
+                }
+                Some(existing_part) => {
+                    // Rewrite the latest part = its existing superfiles + the
+                    // new.
+                    let (rebuilt_entry, rebuilt_encoded_part) = rebuild_part_and_entry(
+                        existing_part.superfiles.clone(),
+                        new_for_part,
+                        Some(entry),
+                        hidden_table,
+                    )?;
+                    out_list_entries.push(rebuilt_entry);
+                    parts_to_write.push(rebuilt_encoded_part);
+                }
             }
         }
 
         // Cold start: no prior parts, so the new entries form the first part.
         if !pending_new.is_empty() {
             let (fresh_entry, fresh_encoded_part) =
-                rebuild_part_and_entry(vec![], pending_new, None, hidden_table);
+                rebuild_part_and_entry(vec![], pending_new, None, hidden_table)?;
             out_list_entries.push(fresh_entry);
             parts_to_write.push(fresh_encoded_part);
         }
@@ -2565,7 +2610,7 @@ impl ManifestSnapshot {
                 }
 
                 let (fresh_entry, fresh_encoded_part) =
-                    rebuild_part_and_entry(vec![], final_superfile_entries, None, hidden_table);
+                    rebuild_part_and_entry(vec![], final_superfile_entries, None, hidden_table)?;
                 if from_base {
                     remember(RebuiltPart::Rebuilt(Box::new((
                         fresh_entry.clone(),
@@ -2685,11 +2730,25 @@ impl ManifestSnapshot {
                 })
                 .collect(),
         };
+        // The flat view carries each entry as its part holds it: a rebuilt
+        // user part moves its entries' statistics into its summaries
+        // section, and a handle that kept the entries as they arrived
+        // would hold every column's statistics again.
+        let sectioned: HashMap<Uuid, Arc<SuperfileEntry>> = parts_to_write
+            .iter()
+            .flat_map(|encoded| {
+                encoded
+                    .part
+                    .superfiles
+                    .iter()
+                    .map(|entry| (entry.superfile_id, Arc::clone(entry)))
+            })
+            .collect();
         let mut new_superfile_list = self
             .get_all_superfiles()
             .iter()
             .chain(stamped_new_entries.iter())
-            .map(Arc::clone)
+            .map(|entry| Arc::clone(sectioned.get(&entry.superfile_id).unwrap_or(entry)))
             .collect::<Vec<_>>();
         new_superfile_list.retain(|e| !ids_to_remove.contains(&e.superfile_id));
 
@@ -2826,7 +2885,9 @@ impl RebuiltPart {
         match self {
             Self::Rebuilt(rebuilt) => {
                 let part = &rebuilt.1;
-                part.encoded.len() + part.routing_encoded.as_ref().map_or(0, Bytes::len)
+                part.encoded.len()
+                    + part.routing_encoded.as_ref().map_or(0, Bytes::len)
+                    + part.summaries.as_ref().map_or(0, |(bytes, _)| bytes.len())
             }
             Self::Unchanged | Self::Dropped => 0,
         }
@@ -2841,12 +2902,19 @@ impl RebuiltPart {
 /// [`EncodedPart`] so the commit PUTs them together; the entry carries
 /// the sibling ref consumer opens select on.
 /// If base_part is Some, the superfiles MUST only include the new superfiles to be added.
+///
+/// A user part's entries have their per-column statistics moved into the
+/// part's summaries section (`section_entries`), so the part, and every
+/// handle's flat view, carry one row reference per entry instead of a
+/// map per column. Hidden manifests keep their statistics inline: they
+/// hold few scalar columns and persist membership in the slow-state blob,
+/// which is a part encoding with no section.
 fn rebuild_part_and_entry(
     old_superfiles: Vec<Arc<SuperfileEntry>>,
     new_superfiles: Vec<Arc<SuperfileEntry>>,
     base_part: Option<&ManifestPartEntry>,
     hidden: bool,
-) -> (ManifestPartEntry, EncodedPart) {
+) -> Result<(ManifestPartEntry, EncodedPart), ManifestError> {
     // Hidden (VectorCell) manifests write parts in ROUTING wire form and
     // skip the sibling: their fp32 is stored once per generation in the
     // slow-CAS centroid section, and their entries hydrate stripped for
@@ -2863,9 +2931,17 @@ fn rebuild_part_and_entry(
         .into_iter()
         .chain(new_superfiles)
         .collect::<Vec<_>>();
+    // The part's id goes into its section too, so no rebuild writes a
+    // section byte-identical to one an earlier rebuild wrote.
+    let part_id = PartId::new_v4();
+    let (superfiles, summaries) = if hidden {
+        (superfiles, None)
+    } else {
+        section_entries(superfiles, part_id)?
+    };
     let part = ManifestPart {
         format_version: part::FORMAT_VERSION.into(),
-        part_id: PartId::new_v4(),
+        part_id,
         superfiles,
     };
     let primary_mode = if hidden {
@@ -2899,15 +2975,91 @@ fn rebuild_part_and_entry(
         scalar_stats_agg: aggregates.scalar_stats_agg,
         fts_summary_agg: aggregates.fts_summary_agg,
         fts_length_totals: aggregates::fts_length_totals(&part.superfiles),
+        summaries: summaries.as_ref().map(|(bytes, hash)| SummariesRef {
+            uri: summaries_uri(hash),
+            content_hash: *hash,
+            size_bytes: bytes.len() as u64,
+        }),
     };
-    (
+    Ok((
         entry,
         EncodedPart {
             part,
             encoded: Bytes::from(compressed),
             routing_encoded: routing.map(|(bytes, _)| Bytes::from(bytes)),
+            summaries,
         },
-    )
+    ))
+}
+
+/// Move `entries`' per-column statistics into one summaries section for
+/// part `part_id`: the section's bytes with their content hash, and the
+/// entries rebuilt to read their row of it. The row order is the entries'
+/// order, which is the part's. An entry that reads an earlier section
+/// hands its rows over as they are; nothing is decoded to be encoded
+/// again.
+///
+/// An entry whose statistics this handle could not read
+/// ([`ScalarStats::Unavailable`]) is refused: a section written from what
+/// the handle sees would record the superfile as having none, for good.
+/// The commit fails instead, and a fresh handle reads the section again.
+///
+/// A section the encoder cannot write at all leaves the entries'
+/// statistics inline in the part, with a warning, so no statistic can
+/// stop a commit.
+fn section_entries(
+    entries: Vec<Arc<SuperfileEntry>>,
+    part_id: PartId,
+) -> Result<(Vec<Arc<SuperfileEntry>>, Option<(Bytes, ContentHash)>), ManifestError> {
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.scalar_stats.is_unavailable())
+    {
+        return Err(ManifestError::StatisticsUnavailable {
+            superfile_id: entry.superfile_id,
+        });
+    }
+    let ids: Vec<Uuid> = entries.iter().map(|entry| entry.superfile_id).collect();
+    let bytes = match SummariesSection::encode(part_id, &ids, rows_from_entries(&entries)) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(error) => {
+            warn!(
+                %part_id,
+                %error,
+                "summaries section could not be written; the part carries its statistics inline"
+            );
+            let mut entries: Vec<Arc<SuperfileEntry>> = entries
+                .iter()
+                .map(|entry| {
+                    Arc::new(SuperfileEntry {
+                        scalar_stats: ScalarStats::Inline(entry.scalar_stats.map().into_owned()),
+                        ..(**entry).clone()
+                    })
+                })
+                .collect();
+            share_physical_schemas(&mut entries);
+            return Ok((entries, None));
+        }
+    };
+    let hash = ContentHash::of(&bytes);
+    let section = Arc::new(SummariesSection::parse(bytes.clone())?);
+    let mut entries: Vec<Arc<SuperfileEntry>> = entries
+        .into_iter()
+        .enumerate()
+        .map(|(row, entry)| {
+            Arc::new(SuperfileEntry {
+                scalar_stats: ScalarStats::Section {
+                    section: Arc::clone(&section),
+                    row: row as u32,
+                },
+                ..(*entry).clone()
+            })
+        })
+        .collect();
+    // New entries each arrive with a schema of their own; the ones that
+    // agree, which is all of a commit's, share one copy from here on.
+    share_physical_schemas(&mut entries);
+    Ok((entries, Some((bytes, hash))))
 }
 
 /// Pulls manifest parts through a [`StorageProvider`] and verifies
@@ -2976,12 +3128,20 @@ enum TermIndexSlot {
     },
 }
 
+/// What the list says about one part: where its objects are and what
+/// they must hash to.
+struct PartRefs {
+    content_hash: ContentHash,
+    uri: String,
+    routing: Option<RoutingRef>,
+    summaries: Option<SummariesRef>,
+}
+
 pub struct ManifestPartLoader {
     storage: Arc<dyn StorageProvider>,
-    /// Maps `PartId → (expected content_hash, uri, routing sibling)`.
-    /// Built from the manifest list at construction; immutable
-    /// per-`ManifestSnapshot`.
-    parts_index: HashMap<PartId, (ContentHash, String, Option<RoutingRef>)>,
+    /// Each part's objects, read off the manifest list at construction;
+    /// immutable per-`ManifestSnapshot`.
+    parts_index: HashMap<PartId, PartRefs>,
     /// On-disk cache for compressed part bytes. `None` disables the
     /// cache (in-process-only supertables, tests, or storage attached
     /// without a `disk_cache_root` configured).
@@ -3052,7 +3212,12 @@ impl ManifestPartLoader {
         for entry in &list.parts {
             idx.insert(
                 entry.part_id,
-                (entry.content_hash, entry.uri.clone(), entry.routing.clone()),
+                PartRefs {
+                    content_hash: entry.content_hash,
+                    uri: entry.uri.clone(),
+                    routing: entry.routing.clone(),
+                    summaries: entry.summaries.clone(),
+                },
             );
         }
         Self {
@@ -3143,17 +3308,40 @@ impl ManifestPartLoader {
         part_id: PartId,
         prefer_routing: bool,
     ) -> Result<Arc<ManifestPart>, ManifestLoadError> {
-        let (full_hash, full_uri, routing) = self
+        let refs = self
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
         // Routing decode lands in the stripped in-memory shape; both forms
         // are content-addressed, so the disk cache can never mix them.
-        let (expected_hash, uri) = match (prefer_routing, routing) {
+        let (expected_hash, uri) = match (prefer_routing, &refs.routing) {
             (true, Some(routing)) => (&routing.content_hash, &routing.uri),
-            _ => (full_hash, full_uri),
+            _ => (&refs.content_hash, &refs.uri),
         };
 
+        // The part and its summaries section are fetched together: the
+        // list entry names both, so the section's round trip overlaps the
+        // part's instead of following its decode.
+        let section = async {
+            match refs.summaries.as_ref() {
+                Some(reference) => self.load_summaries(reference).await.map(Some),
+                None => Ok(None),
+            }
+        };
+        let (parsed, section) = join!(self.load_part_bytes(expected_hash, uri), section);
+        Ok(Arc::new(attach_summaries(
+            parsed?,
+            refs.summaries.as_ref(),
+            section,
+        )?))
+    }
+
+    /// Fetch, verify and decode one part's bytes, through the disk cache.
+    async fn load_part_bytes(
+        &self,
+        expected_hash: &ContentHash,
+        uri: &str,
+    ) -> Result<ManifestPart, ManifestLoadError> {
         // Disk-cache hit: bytes are verified against `expected_hash`
         // inside `get`, so they're known-good here.
         if let Some(cache) = &self.manifest_disk_cache
@@ -3161,13 +3349,12 @@ impl ManifestPartLoader {
         {
             record("cache_hit", true);
             record("bytes", bytes.len() as u64);
-            let parsed = decode_part_off_thread(
+            return decode_part_off_thread(
                 Bytes::from(bytes),
                 Arc::clone(&self.open_blob_budget),
                 Arc::clone(&self.legacy),
             )
-            .await?;
-            return Ok(Arc::new(parsed));
+            .await;
         }
         record("cache_hit", false);
 
@@ -3193,7 +3380,172 @@ impl ManifestPartLoader {
         if let Some(cache) = &self.manifest_disk_cache {
             cache.put(*expected_hash, &bytes).await;
         }
-        Ok(Arc::new(parsed))
+        Ok(parsed)
+    }
+
+    /// Fetch, verify and parse a summaries section: from the disk cache
+    /// when it holds the bytes, else from storage and into the cache. The
+    /// hash and the parse run off the runtime, as a part's do.
+    async fn load_summaries(
+        &self,
+        reference: &SummariesRef,
+    ) -> Result<Arc<SummariesSection>, ManifestLoadError> {
+        if let Some(cache) = &self.manifest_disk_cache
+            && let Some(bytes) = cache.get(&reference.content_hash).await
+        {
+            let section = parse_summaries_off_thread(Bytes::from(bytes), None).await?;
+            return Ok(Arc::new(section));
+        }
+        let (bytes, _) = self
+            .storage
+            .get(&reference.uri)
+            .await
+            .map_err(ManifestLoadError::Storage)?;
+        let section =
+            parse_summaries_off_thread(bytes.clone(), Some(reference.content_hash)).await?;
+        if let Some(cache) = &self.manifest_disk_cache {
+            cache.put(reference.content_hash, &bytes).await;
+        }
+        Ok(Arc::new(section))
+    }
+}
+
+/// Give a sectioned part's entries their rows of its summaries section,
+/// `section` being what the loader fetched for `reference`. A part written
+/// without a section keeps its inline statistics.
+///
+/// A section that could not be read, or that does not match the part,
+/// leaves the part's entries without statistics, after a warning: the
+/// statistics only prune, and a reader that keeps every superfile is
+/// still right, while a table that cannot be opened is not. The one
+/// error that still fails the load is a credential refusal, which is
+/// not about the section.
+fn attach_summaries(
+    mut part: ManifestPart,
+    reference: Option<&SummariesRef>,
+    section: Result<Option<Arc<SummariesSection>>, ManifestLoadError>,
+) -> Result<ManifestPart, ManifestLoadError> {
+    let Some(reference) = reference else {
+        return Ok(part);
+    };
+    let section = match section {
+        Ok(Some(section)) => section,
+        Ok(None) => return Ok(part),
+        Err(error) if error.is_permission_denied() => return Err(error),
+        Err(error) => {
+            warn!(
+                part_id = %part.part_id,
+                uri = %reference.uri,
+                %error,
+                "summaries section unreadable; the part's superfiles read as having no statistics"
+            );
+            mark_statistics_unavailable(&mut part);
+            return Ok(part);
+        }
+    };
+    if let Err(error) = section_matches_part(&section, &part) {
+        warn!(
+            part_id = %part.part_id,
+            uri = %reference.uri,
+            %error,
+            "summaries section does not match its part; its superfiles read as having no statistics"
+        );
+        mark_statistics_unavailable(&mut part);
+        return Ok(part);
+    }
+    for (row, entry) in part.superfiles.iter_mut().enumerate() {
+        let stats = ScalarStats::Section {
+            section: Arc::clone(&section),
+            row: row as u32,
+        };
+        match Arc::get_mut(entry) {
+            Some(entry) => entry.scalar_stats = stats,
+            None => {
+                *entry = Arc::new(SuperfileEntry {
+                    scalar_stats: stats,
+                    ..(**entry).clone()
+                })
+            }
+        }
+    }
+    Ok(part)
+}
+
+/// Mark every entry of `part` as reading a section this handle could not:
+/// no statistics for the readers, and a commit that will not write the
+/// entries into a new section from that nothing.
+fn mark_statistics_unavailable(part: &mut ManifestPart) {
+    for entry in part.superfiles.iter_mut() {
+        match Arc::get_mut(entry) {
+            Some(entry) => entry.scalar_stats = ScalarStats::Unavailable,
+            None => {
+                *entry = Arc::new(SuperfileEntry {
+                    scalar_stats: ScalarStats::Unavailable,
+                    ..(**entry).clone()
+                })
+            }
+        }
+    }
+}
+
+/// Whether `section` is `part`'s: written for its id (when the section
+/// carries one) and holding its superfiles, row for row.
+fn section_matches_part(
+    section: &SummariesSection,
+    part: &ManifestPart,
+) -> Result<(), SummariesError> {
+    if let Some(written_for) = section.part_id()
+        && written_for != part.part_id
+    {
+        return Err(SummariesError::Malformed(format!(
+            "section written for part {written_for}, this part is {}",
+            part.part_id
+        )));
+    }
+    if section.superfile_ids().len() != part.superfiles.len() {
+        return Err(SummariesError::Malformed(format!(
+            "section holds {} superfiles, the part {}",
+            section.superfile_ids().len(),
+            part.superfiles.len()
+        )));
+    }
+    for (row, entry) in part.superfiles.iter().enumerate() {
+        if section.superfile_ids()[row] != entry.superfile_id {
+            return Err(SummariesError::Malformed(format!(
+                "section row {row} is superfile {}, the part's is {}",
+                section.superfile_ids()[row],
+                entry.superfile_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a summaries section off the runtime, first checking its bytes
+/// against `expected_hash` when they came from storage rather than the
+/// verified disk cache: blake3 over a section of thousands of columns is
+/// CPU the polling task must not absorb.
+async fn parse_summaries_off_thread(
+    bytes: Bytes,
+    expected_hash: Option<ContentHash>,
+) -> Result<SummariesSection, ManifestLoadError> {
+    let verify_then_parse = move || {
+        if let Some(expected) = expected_hash {
+            let actual = ContentHash::of(&bytes);
+            if actual != expected {
+                return Err(ManifestLoadError::ContentHashMismatch {
+                    expected: expected.to_hex(),
+                    actual: actual.to_hex(),
+                });
+            }
+        }
+        SummariesSection::parse(bytes).map_err(ManifestLoadError::from)
+    };
+    match spawn_blocking(carry_span(verify_then_parse)).await {
+        Ok(result) => result,
+        Err(join_error) => Err(ManifestLoadError::Summaries(SummariesError::Malformed(
+            format!("section parse task failed: {join_error}"),
+        ))),
     }
 }
 
@@ -3363,6 +3715,11 @@ pub enum ManifestLoadError {
     /// The term index the list references could not be used.
     #[error("term index: {0}")]
     TermIndex(#[source] Box<TermIndexError>),
+    /// A part's summaries section did not parse. Loads do not fail on
+    /// it: the part's superfiles read as having no statistics instead
+    /// (see `attach_summaries`), with the error in the log.
+    #[error("summaries section: {0}")]
+    Summaries(#[from] SummariesError),
 }
 
 impl From<TermIndexError> for ManifestLoadError {
@@ -3379,6 +3736,148 @@ impl ManifestLoadError {
             ManifestLoadError::TermIndex(e) => e.is_permission_denied(),
             _ => false,
         }
+    }
+}
+
+/// Where a superfile's per-column scalar statistics live.
+///
+/// Every reader asks for one column at a time ([`Self::column`]); the
+/// commit reads every column in place ([`Self::columns`]); the tallies in
+/// tests take the whole map ([`Self::map`]).
+#[derive(Debug, Clone)]
+pub enum ScalarStats {
+    /// Decoded, one aggregate per column: the hidden table's entries, parts
+    /// written before summaries sections existed, in-memory tables, and a
+    /// writer's new entries until the commit sections them.
+    Inline(HashMap<FieldId, ScalarStatsAgg>),
+    /// A row of a part's summaries section, decoded per column on request
+    /// (see [`summaries`]): what every entry of a persisted user table
+    /// holds, so a handle's cost per superfile does not grow with the
+    /// column count.
+    Section {
+        section: Arc<SummariesSection>,
+        row: u32,
+    },
+    /// A row of a section the loader could not read, or could not match
+    /// to its part. Reads see no statistics, as they would of an empty
+    /// map, and keep the superfile. A commit, though, refuses to write
+    /// such an entry into a new section (`section_entries`) and appends
+    /// beside its part rather than into it, so a failure to read the
+    /// statistics never becomes their loss; a fresh handle reads the
+    /// section again.
+    Unavailable,
+}
+
+impl Default for ScalarStats {
+    fn default() -> Self {
+        Self::Inline(HashMap::new())
+    }
+}
+
+impl From<HashMap<FieldId, ScalarStatsAgg>> for ScalarStats {
+    fn from(map: HashMap<FieldId, ScalarStatsAgg>) -> Self {
+        Self::Inline(map)
+    }
+}
+
+impl ScalarStats {
+    /// The statistics of `column`, read in place, or `None` when the
+    /// superfile carries none for it: the pruner then keeps the superfile.
+    pub fn column(&self, column: FieldId) -> Option<ColumnStats<'_>> {
+        match self {
+            Self::Inline(map) => map.get(&column).map(ColumnStats::Inline),
+            Self::Section { section, row } => {
+                section.column(*row, column).map(ColumnStats::Section)
+            }
+            Self::Unavailable => None,
+        }
+    }
+
+    /// [`Self::column`] in the decoded shape, every statistic built,
+    /// the value table included.
+    pub fn get(&self, column: FieldId) -> Option<ScalarStatsAgg> {
+        self.column(column).map(|found| found.stats())
+    }
+
+    /// Every column the superfile carries statistics for, each read in
+    /// place.
+    pub fn columns(&self) -> Vec<(FieldId, ColumnStats<'_>)> {
+        match self {
+            Self::Inline(map) => map
+                .iter()
+                .map(|(column, agg)| (*column, ColumnStats::Inline(agg)))
+                .collect(),
+            Self::Section { section, row } => section
+                .row_columns(*row)
+                .into_iter()
+                .map(|(column, found)| (column, ColumnStats::Section(found)))
+                .collect(),
+            Self::Unavailable => Vec::new(),
+        }
+    }
+
+    /// Every column's statistics: borrowed when decoded, built when they
+    /// live in a section.
+    pub fn map(&self) -> Cow<'_, HashMap<FieldId, ScalarStatsAgg>> {
+        match self {
+            Self::Inline(map) => Cow::Borrowed(map),
+            Self::Section { section, row } => Cow::Owned(section.row_map(*row)),
+            Self::Unavailable => Cow::Owned(HashMap::new()),
+        }
+    }
+
+    /// Whether no column has statistics.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Inline(map) => map.is_empty(),
+            Self::Section { section, row } => !section.row_has_statistics(*row),
+            Self::Unavailable => true,
+        }
+    }
+
+    /// Whether the statistics live in a section this handle could not
+    /// read, so that no commit may write them anew from what it sees.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
+}
+
+/// The map's own shape for tests that build and inspect decoded entries.
+#[cfg(test)]
+impl ScalarStats {
+    /// The section a row lives in, if any.
+    pub(crate) fn section(&self) -> Option<&Arc<SummariesSection>> {
+        match self {
+            Self::Section { section, .. } => Some(section),
+            Self::Inline(_) | Self::Unavailable => None,
+        }
+    }
+
+    /// Add one column's statistics to decoded entries.
+    pub(crate) fn insert(&mut self, column: FieldId, stats: ScalarStatsAgg) {
+        match self {
+            Self::Inline(map) => {
+                map.insert(column, stats);
+            }
+            Self::Section { .. } | Self::Unavailable => {
+                panic!("only decoded statistics are edited")
+            }
+        }
+    }
+
+    /// How many columns have statistics.
+    pub(crate) fn len(&self) -> usize {
+        self.map().len()
+    }
+
+    /// The columns with statistics.
+    pub(crate) fn keys(&self) -> Vec<FieldId> {
+        self.map().keys().copied().collect()
+    }
+
+    /// Whether `column` has statistics.
+    pub(crate) fn contains_key(&self, column: &FieldId) -> bool {
+        self.get(*column).is_some()
     }
 }
 
@@ -3423,10 +3922,12 @@ pub struct SuperfileEntry {
     /// stays 0 for any plausible current-era timestamp.
     pub id_min: i128,
     pub id_max: i128,
-    /// Per-scalar-column aggregate (min/max + null count, exact sum, HLL),
-    /// keyed by column name, for skip pruning of SQL filters. An absent
-    /// column means "no usable stats" (the pruner keeps the superfile).
-    pub scalar_stats: HashMap<FieldId, ScalarStatsAgg>,
+    /// Per-scalar-column aggregate (min/max + null count, exact sum, HLL,
+    /// value table), for skip pruning of SQL filters and the planner's
+    /// statistics. An absent column means "no usable stats" (the pruner
+    /// keeps the superfile). Decoded inline, or a row of the part's
+    /// summaries section read per column on request.
+    pub scalar_stats: ScalarStats,
     /// Per-FTS-column term-presence bloom + lex range. The bloom
     /// drives exact-term skip; the term-range drives prefix-query
     /// skip via `[prefix, prefix_upper_bound)` overlap. Keyed by
@@ -4852,7 +5353,17 @@ impl ClusterCentroids {
 
 #[cfg(test)]
 mod tests {
-    use std::{hint::black_box, slice::from_ref, sync::Arc, time::Instant};
+    use std::{
+        cmp::Reverse,
+        env::var_os,
+        fs::{read_dir, read_to_string},
+        hint::black_box,
+        mem::size_of,
+        path::{Path, PathBuf},
+        slice::from_ref,
+        sync::Arc,
+        time::Instant,
+    };
 
     use arrow_array::{
         Array, Date32Array, Date64Array, Int64Array, Time64MicrosecondArray,
@@ -4866,13 +5377,16 @@ mod tests {
 
     use super::*;
     use crate::{
+        IndexSpec, connect,
+        runtime_metrics::rss::purge_allocator,
         storage::LocalFsStorageProvider,
         superfile::{builder::FtsConfig, vector::distance::distance},
         supertable::{
             Supertable,
             manifest::{
-                commit::{PartWriteResult, write_manifest_part},
+                commit::{PartWriteResult, write_manifest_part, write_part_bytes},
                 list::{Manifest, PartitionStrategy},
+                summaries::SummaryRow,
             },
             schema::LegacyNames,
         },
@@ -5257,7 +5771,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -5483,7 +5997,7 @@ mod tests {
             n_docs,
             id_min: 0,
             id_max: n_docs.saturating_sub(1) as i128,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -5834,6 +6348,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 });
             }
             (objects, entries)
@@ -6384,6 +6899,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             }],
         };
         let m = ManifestSnapshot {
@@ -6674,6 +7190,7 @@ mod tests {
             scalar_stats_agg: Default::default(),
             fts_summary_agg: Default::default(),
             fts_length_totals: None,
+            summaries: None,
         };
 
         let list = Manifest {
@@ -6845,11 +7362,489 @@ mod tests {
         assert_eq!(total_docs, 300);
     }
 
+    /// A column counted exactly carries no sketch; the sketch the planner
+    /// derives from its value table is the one the column would have had,
+    /// register for register, so a table's estimate merges with a sketch's.
+    /// The same whether the table is decoded or read from a section.
+    #[test]
+    fn a_value_table_s_sketch_is_the_column_s() {
+        let strings: ArrayRef = Arc::new(StringArray::from(vec![
+            "alpha", "bravo", "alpha", "charlie", "bravo", "alpha",
+        ]));
+        let integers: ArrayRef = Arc::new(Int64Array::from(vec![7, 7, 9, 11, 9]));
+        let column_id = fid("counted");
+        for column in [strings, integers] {
+            let stats = ScalarStatsAgg::from_column(&column).expect("stats");
+            assert!(
+                stats.hll.is_none(),
+                "counted exactly, so no sketch is stored"
+            );
+            let from_column = column_hll(from_ref(&column)).expect("a sketchable type");
+            let decoded = ColumnStats::Inline(&stats)
+                .values_sketch()
+                .expect("a sketchable type");
+            assert_eq!(decoded.as_bytes(), from_column.as_bytes());
+
+            let bytes = SummariesSection::encode(
+                PartId::new_v4(),
+                &[Uuid::nil()],
+                vec![SummaryRow {
+                    column: column_id,
+                    superfile: 0,
+                    stats: ColumnStats::Inline(&stats),
+                }],
+            )
+            .expect("encode");
+            let section = SummariesSection::parse(Bytes::from(bytes)).expect("parse");
+            let sectioned = ColumnStats::Section(section.column(0, column_id).expect("the row"))
+                .values_sketch()
+                .expect("a sketchable type");
+            assert_eq!(sectioned.as_bytes(), from_column.as_bytes());
+        }
+    }
+
     fn local_storage() -> (TempDir, Arc<dyn StorageProvider>) {
         let dir = TempDir::new().expect("tempdir");
         let store: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
         (dir, store)
+    }
+
+    /// The variables of the handle measurement: a `file://` catalog root and
+    /// a table in it.
+    const MEASURE_CATALOG_ENV: &str = "INFINO_MEASURE_CATALOG";
+    const MEASURE_TABLE_ENV: &str = "INFINO_MEASURE_TABLE";
+    /// Bytes an HLL sketch holds ([`hll::HLL_REGISTERS`] one-byte registers).
+    const HLL_BYTES: usize = hll::HLL_REGISTERS;
+    /// Kibibytes in a mebibyte, for the kernel's memory lines.
+    const KIB_PER_MIB: u64 = 1024;
+    /// Bytes in a mebibyte, for the tallies.
+    const BYTES_PER_MIB: usize = 1024 * 1024;
+
+    /// This process's resident set in MiB, as the kernel reports it.
+    fn resident_mib() -> u64 {
+        let status = read_to_string("/proc/self/status").unwrap_or_default();
+        status
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|kib| kib.parse::<u64>().ok())
+            .unwrap_or(0)
+            / KIB_PER_MIB
+    }
+
+    /// The resident set after a handle opened: as it stands, and once the
+    /// allocator has returned the pages it freed, which is what the handle
+    /// itself holds.
+    fn report_resident(what: &str, before: u64) {
+        let opened = resident_mib();
+        purge_allocator();
+        let settled = resident_mib();
+        eprintln!(
+            "{what}: resident {before} MiB before, {opened} MiB after opening, {settled} MiB \
+             once free pages are returned"
+        );
+    }
+
+    /// Bytes a scalar value holds beyond its enum slot: its string or
+    /// binary payload.
+    fn scalar_payload(value: &ScalarValue) -> usize {
+        match value {
+            ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.len(),
+            ScalarValue::Binary(Some(b)) | ScalarValue::LargeBinary(Some(b)) => b.len(),
+            _ => 0,
+        }
+    }
+
+    /// Bytes a bound holds as a value: the scalar read out of its
+    /// length-one array, with its payload.
+    fn bound_value_bytes(array: &ArrayRef) -> usize {
+        ScalarValue::try_from_array(array.as_ref(), 0)
+            .map(|value| value.size())
+            .unwrap_or(0)
+    }
+
+    /// What one per-column aggregate holds: bounds (as values, and as the
+    /// arrays report themselves, which counts a shared decoded body once
+    /// per array sliced from it), sketch, value table (entries and bytes),
+    /// as resident bytes.
+    #[derive(Default)]
+    struct StatsTally {
+        columns: usize,
+        all_null: usize,
+        bounds_value_bytes: usize,
+        bounds_array_bytes: usize,
+        sketches: usize,
+        sketches_on_null_columns: usize,
+        tables: usize,
+        table_entries: usize,
+        table_bytes: usize,
+        sums: usize,
+    }
+
+    impl StatsTally {
+        fn add(&mut self, stats: &HashMap<FieldId, ScalarStatsAgg>) {
+            for agg in stats.values() {
+                self.columns += 1;
+                let all_null = agg.all_null();
+                if all_null {
+                    self.all_null += 1;
+                }
+                self.bounds_value_bytes +=
+                    bound_value_bytes(&agg.min) + bound_value_bytes(&agg.max);
+                self.bounds_array_bytes +=
+                    agg.min.get_array_memory_size() + agg.max.get_array_memory_size();
+                if agg.hll.is_some() {
+                    self.sketches += 1;
+                    if all_null {
+                        self.sketches_on_null_columns += 1;
+                    }
+                }
+                if agg.sum.is_some() {
+                    self.sums += 1;
+                }
+                if let Some(table) = &agg.value_counts {
+                    self.tables += 1;
+                    for (value, _) in table.entries() {
+                        self.table_entries += 1;
+                        self.table_bytes += size_of::<(ScalarValue, u64)>() + scalar_payload(value);
+                    }
+                }
+            }
+        }
+
+        fn report(&self, what: &str) {
+            eprintln!(
+                "{what}: {} column stats ({} null throughout); bounds {} KiB as values, {} MiB as \
+                 the arrays report; {} sketches ({} MiB, {} on null columns); {} value tables, \
+                 {} entries ({} MiB); {} sums",
+                self.columns,
+                self.all_null,
+                self.bounds_value_bytes / 1024,
+                self.bounds_array_bytes / BYTES_PER_MIB,
+                self.sketches,
+                self.sketches * HLL_BYTES / BYTES_PER_MIB,
+                self.sketches_on_null_columns,
+                self.tables,
+                self.table_entries,
+                self.table_bytes / BYTES_PER_MIB,
+                self.sums,
+            );
+        }
+    }
+
+    /// What a handle's manifest holds, per superfile and per part: the
+    /// column stats, sketches, value tables, blooms and physical schemas, as
+    /// counts and bytes. Never a value.
+    fn report_handle_components(manifest: &ManifestSnapshot) {
+        let entries = &manifest.superfiles;
+        eprintln!("{} superfiles in the flat view", entries.len());
+        // The sections the entries read from, each once, as they stand
+        // before the tally below decodes every group of them.
+        let mut sections: HashMap<usize, usize> = HashMap::new();
+        for entry in entries.iter() {
+            if let Some(section) = entry.scalar_stats.section() {
+                sections
+                    .entry(Arc::as_ptr(section) as usize)
+                    .or_insert_with(|| section.resident_bytes());
+            }
+        }
+        eprintln!(
+            "summaries sections: {} distinct, {} MiB resident before the tally",
+            sections.len(),
+            sections.values().sum::<usize>() / BYTES_PER_MIB
+        );
+        let mut per_superfile = StatsTally::default();
+        let mut blooms = 0usize;
+        let mut bloom_bytes = 0usize;
+        let mut range_bytes = 0usize;
+        let mut schemas: HashSet<usize> = HashSet::new();
+        let mut schema_fields = 0usize;
+        for entry in entries.iter() {
+            per_superfile.add(&entry.scalar_stats.map());
+            for summary in entry.fts_summary.values() {
+                if let Some(bloom) = &summary.term_bloom {
+                    blooms += 1;
+                    bloom_bytes += bloom.to_bytes().len();
+                }
+                if let Some((lo, hi)) = &summary.term_range {
+                    range_bytes += lo.len() + hi.len();
+                }
+            }
+            if let Some(schema) = &entry.physical_schema
+                && schemas.insert(Arc::as_ptr(schema) as usize)
+            {
+                schema_fields += schema.columns().len();
+            }
+        }
+        per_superfile.report("flat view, all superfiles");
+        let decoded: usize = entries
+            .iter()
+            .filter_map(|entry| entry.scalar_stats.section())
+            .map(|section| (Arc::as_ptr(section) as usize, section.resident_bytes()))
+            .collect::<HashMap<_, _>>()
+            .values()
+            .sum();
+        eprintln!(
+            "summaries sections: {} MiB resident with every group decoded",
+            decoded / BYTES_PER_MIB
+        );
+        eprintln!(
+            "flat view: {blooms} blooms ({} MiB), term ranges {} KiB, {} distinct physical \
+             schemas holding {schema_fields} fields",
+            bloom_bytes / BYTES_PER_MIB,
+            range_bytes / 1024,
+            schemas.len()
+        );
+
+        if let Some(list) = &manifest.list {
+            let mut per_part = StatsTally::default();
+            let mut part_blooms = 0usize;
+            let mut part_bloom_bytes = 0usize;
+            for part in &list.parts {
+                per_part.add(&part.scalar_stats_agg);
+                for summary in part.fts_summary_agg.values() {
+                    if let Some(bloom) = &summary.term_bloom {
+                        part_blooms += 1;
+                        part_bloom_bytes += bloom.to_bytes().len();
+                    }
+                }
+            }
+            eprintln!("list: {} parts", list.parts.len());
+            per_part.report("list rollups, all parts");
+            eprintln!(
+                "list rollups: {part_blooms} blooms ({} MiB)",
+                part_bloom_bytes / BYTES_PER_MIB
+            );
+        }
+    }
+
+    /// When `INFINO_MEASURE_CATALOG` names a `file://` catalog and
+    /// `INFINO_MEASURE_TABLE` a table in it, opens the table and prints the
+    /// resident set before and after, then what the handle holds by
+    /// component. Without the variables it does nothing.
+    #[test]
+    fn a_handle_s_manifest_memory_by_component() {
+        let (Some(catalog), Some(table)) = (var_os(MEASURE_CATALOG_ENV), var_os(MEASURE_TABLE_ENV))
+        else {
+            return;
+        };
+        let catalog = catalog.to_string_lossy().to_string();
+        let table = table.to_string_lossy().to_string();
+        let before = resident_mib();
+        let connection = connect(&catalog).expect("connect");
+        let handle = connection.open_table_handle(&table).expect("open");
+        report_resident(&table, before);
+        report_handle_components(&handle.manifest_snapshot());
+    }
+
+    /// The synthetic wide table: the column mix of an event log with a few
+    /// thousand flag and attribute columns, mostly null in any one commit,
+    /// and a handful of prose columns, so a handle's resident cost can be
+    /// measured per superfile with no data from outside the test.
+    const WIDE_TABLE: &str = "wide";
+    const WIDE_FLAG_COLUMNS: usize = 2_700;
+    const WIDE_ATTRIBUTE_COLUMNS: usize = 1_200;
+    const WIDE_PROSE_COLUMNS: usize = 14;
+    /// Rows in each commit.
+    const WIDE_ROWS_PER_COMMIT: usize = 1_100;
+    /// One flag or attribute column in this many is set in a given commit;
+    /// the rest are null throughout that superfile.
+    const WIDE_ACTIVE_ONE_IN: usize = 3;
+    /// Distinct attribute values, under the exact value-table cap.
+    const WIDE_ATTRIBUTE_VALUES: usize = 32;
+    /// Distinct prose words, and words in a prose cell.
+    const WIDE_VOCABULARY: usize = 2_000;
+    const WIDE_WORDS_PER_CELL: usize = 12;
+    /// Fibonacci hashing multiplier: spreads a row and column index over the
+    /// value space deterministically.
+    const WIDE_MIX: usize = 2_654_435_761;
+    /// Commits the wide-table measurement runs; unset, it does not run.
+    const MEASURE_WIDE_COMMITS_ENV: &str = "INFINO_MEASURE_WIDE_COMMITS";
+    /// Largest files the wide-table measurement lists.
+    const WIDE_LARGEST_FILES: usize = 6;
+
+    fn wide_mix(a: usize, b: usize) -> usize {
+        a.wrapping_mul(WIDE_MIX).wrapping_add(b)
+    }
+
+    fn wide_schema() -> Arc<Schema> {
+        let mut fields =
+            Vec::with_capacity(WIDE_FLAG_COLUMNS + WIDE_ATTRIBUTE_COLUMNS + WIDE_PROSE_COLUMNS);
+        for i in 0..WIDE_FLAG_COLUMNS {
+            fields.push(Field::new(format!("flag_{i}"), DataType::Boolean, true));
+        }
+        for i in 0..WIDE_ATTRIBUTE_COLUMNS {
+            fields.push(Field::new(format!("attr_{i}"), DataType::Utf8, true));
+        }
+        for i in 0..WIDE_PROSE_COLUMNS {
+            fields.push(Field::new(format!("prose_{i}"), DataType::LargeUtf8, true));
+        }
+        Arc::new(Schema::new(fields))
+    }
+
+    /// The batch of one commit: a third of the flag and attribute columns
+    /// set, the rest null throughout, and every prose cell a dozen words.
+    fn wide_batch(schema: &Arc<Schema>, commit: usize) -> RecordBatch {
+        let rows = WIDE_ROWS_PER_COMMIT;
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+        for c in 0..WIDE_FLAG_COLUMNS {
+            let active = (c + commit).is_multiple_of(WIDE_ACTIVE_ONE_IN);
+            let values: Vec<Option<bool>> = (0..rows)
+                .map(|row| active.then(|| wide_mix(row, c).is_multiple_of(2)))
+                .collect();
+            columns.push(Arc::new(BooleanArray::from(values)));
+        }
+        for c in 0..WIDE_ATTRIBUTE_COLUMNS {
+            let active = (c + commit).is_multiple_of(WIDE_ACTIVE_ONE_IN);
+            let values: Vec<Option<String>> = (0..rows)
+                .map(|row| {
+                    active.then(|| format!("value_{}", wide_mix(row, c) % WIDE_ATTRIBUTE_VALUES))
+                })
+                .collect();
+            columns.push(Arc::new(StringArray::from(values)));
+        }
+        for c in 0..WIDE_PROSE_COLUMNS {
+            let values: Vec<String> = (0..rows)
+                .map(|row| {
+                    (0..WIDE_WORDS_PER_CELL)
+                        .map(|j| {
+                            format!(
+                                "word{}",
+                                wide_mix(wide_mix(row, c), j + commit) % WIDE_VOCABULARY
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect();
+            columns.push(Arc::new(LargeStringArray::from(values)));
+        }
+        RecordBatch::try_new(Arc::clone(schema), columns).expect("batch")
+    }
+
+    /// Every file under `root` with its size.
+    fn files_under(root: &Path, out: &mut Vec<(PathBuf, u64)>) {
+        let Ok(entries) = read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files_under(&path, out);
+            } else if let Ok(meta) = entry.metadata() {
+                out.push((path, meta.len()));
+            }
+        }
+    }
+
+    fn is_manifest_list(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("manifest-") && name.ends_with(".json"))
+    }
+
+    /// Bytes of the newest manifest list under `root`.
+    fn newest_manifest_list_bytes(root: &Path) -> u64 {
+        let mut files = Vec::new();
+        files_under(root, &mut files);
+        files
+            .into_iter()
+            .filter(|(path, _)| is_manifest_list(path))
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .map(|(_, bytes)| bytes)
+            .unwrap_or(0)
+    }
+
+    /// What the table is on disk: bytes per kind of file, and the largest
+    /// files.
+    fn report_table_files(root: &Path) {
+        let mut files = Vec::new();
+        files_under(root, &mut files);
+        let (mut lists, mut superfiles, mut other) = (0u64, 0u64, 0u64);
+        let (mut n_lists, mut n_superfiles, mut n_other) = (0usize, 0usize, 0usize);
+        for (path, bytes) in &files {
+            let name = path.to_string_lossy();
+            if is_manifest_list(path) {
+                lists += bytes;
+                n_lists += 1;
+            } else if name.ends_with(".sf.parquet") {
+                superfiles += bytes;
+                n_superfiles += 1;
+            } else {
+                other += bytes;
+                n_other += 1;
+            }
+        }
+        eprintln!(
+            "on disk: {n_lists} manifest lists {} MiB; {n_superfiles} superfiles {} MiB; \
+             {n_other} other files {} MiB",
+            lists / BYTES_PER_MIB as u64,
+            superfiles / BYTES_PER_MIB as u64,
+            other / BYTES_PER_MIB as u64
+        );
+        files.sort_by_key(|file| Reverse(file.1));
+        for (path, bytes) in files.iter().take(WIDE_LARGEST_FILES) {
+            let name = path.strip_prefix(root).unwrap_or(path);
+            eprintln!("  {} KiB  {}", bytes / 1024, name.display());
+        }
+    }
+
+    /// With `INFINO_MEASURE_WIDE_COMMITS=<n>`, builds the synthetic wide
+    /// table in a temporary `file://` catalog with `n` commits and prints
+    /// the resident set after each commit and the size of the manifest list
+    /// it wrote, then what a fresh handle on the table holds, by component,
+    /// and what the table is on disk. Without the variable it does nothing.
+    #[test]
+    fn a_wide_table_s_resident_cost_per_superfile() {
+        let Some(commits) = var_os(MEASURE_WIDE_COMMITS_ENV) else {
+            return;
+        };
+        let commits: usize = commits
+            .to_string_lossy()
+            .parse()
+            .expect("a number of commits");
+        let dir = TempDir::new().expect("tempdir");
+        let uri = format!("file://{}", dir.path().display());
+        let schema = wide_schema();
+        let mut indexes = IndexSpec::new();
+        for i in 0..WIDE_PROSE_COLUMNS {
+            indexes = indexes.fts(format!("prose_{i}"));
+        }
+        let before = resident_mib();
+        let connection = connect(&uri).expect("connect");
+        let table = connection
+            .create_table(WIDE_TABLE, Arc::clone(&schema), indexes)
+            .expect("create");
+        eprintln!(
+            "wide table: {} columns, {WIDE_ROWS_PER_COMMIT} rows a commit; resident {before} MiB \
+             before",
+            schema.fields().len()
+        );
+        for commit in 0..commits {
+            let batch = wide_batch(&schema, commit);
+            let built = resident_mib();
+            let started = Instant::now();
+            table.append(&batch).expect("append");
+            drop(batch);
+            let seconds = started.elapsed().as_secs_f64();
+            eprintln!(
+                "commit {}: {seconds:.1} s; resident {built} MiB with the batch built, {} MiB \
+                 after; list {} KiB",
+                commit + 1,
+                resident_mib(),
+                newest_manifest_list_bytes(dir.path()) / 1024
+            );
+        }
+        drop(table);
+        drop(connection);
+        purge_allocator();
+        let closed = resident_mib();
+        let connection = connect(&uri).expect("connect");
+        let handle = connection.open_table_handle(WIDE_TABLE).expect("open");
+        report_resident("fresh handle", closed);
+        report_handle_components(&handle.manifest_snapshot());
+        report_table_files(dir.path());
     }
 
     /// Number of parts whose `OnceCell` actually holds decoded bytes —
@@ -6922,6 +7917,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             }],
         };
         let lw = write_manifest(storage.as_ref(), &list)
@@ -7139,6 +8135,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             }],
         };
         let lw = write_manifest(storage.as_ref(), &list)
@@ -7233,7 +8230,8 @@ mod tests {
     #[tokio::test]
     async fn rebuild_part_and_entry_stamps_routing_sibling() {
         let (entry, encoded_part) =
-            rebuild_part_and_entry(vec![], vec![make_summary_entry(10)], None, false);
+            rebuild_part_and_entry(vec![], vec![make_summary_entry(10)], None, false)
+                .expect("rebuild");
         let routing = entry.routing.expect("sibling stamped");
         let routing_encoded = encoded_part
             .routing_encoded
@@ -7252,7 +8250,8 @@ mod tests {
         );
 
         let (hidden_entry, hidden_encoded) =
-            rebuild_part_and_entry(vec![], vec![make_summary_entry(10)], None, true);
+            rebuild_part_and_entry(vec![], vec![make_summary_entry(10)], None, true)
+                .expect("rebuild");
         assert!(
             hidden_entry.routing.is_none(),
             "hidden part must not stamp a sibling — its primary is routing-shaped"
@@ -7267,6 +8266,440 @@ mod tests {
             hidden_encoded.encoded.len(),
             encoded_part.encoded.len()
         );
+
+        // A user part sections its statistics; a hidden part keeps them
+        // inline, in the part and in its entries.
+        assert!(entry.summaries.is_some() && encoded_part.summaries.is_some());
+        assert!(
+            encoded_part.part.superfiles[0]
+                .scalar_stats
+                .section()
+                .is_some()
+        );
+        assert!(hidden_entry.summaries.is_none() && hidden_encoded.summaries.is_none());
+        assert!(
+            hidden_encoded.part.superfiles[0]
+                .scalar_stats
+                .section()
+                .is_none()
+        );
+    }
+
+    /// A column's statistics for the sectioning tests: a few integers.
+    fn sectioned_stats(values: Vec<i64>) -> ScalarStatsAgg {
+        let column: ArrayRef = Arc::new(Int64Array::from(values));
+        ScalarStatsAgg::from_column(&column).expect("integer statistics")
+    }
+
+    /// A commit moves its entries' per-column statistics into the part's
+    /// summaries section: the part carries none, the handle's entries
+    /// read their row of the section, and a fresh load does the same.
+    #[tokio::test]
+    async fn a_commit_sections_its_entries_statistics_and_a_load_reads_them() {
+        let opts = make_opts();
+        let (_dir, storage) = local_storage();
+        let amount = fid("amount");
+        let first_stats = sectioned_stats(vec![3, 9, 4]);
+        let second_stats = sectioned_stats(vec![10, 20]);
+        let mut first = (*make_new_entry(3)).clone();
+        first.scalar_stats = ScalarStats::Inline(HashMap::from([(amount, first_stats.clone())]));
+        let mut second = (*make_new_entry(2)).clone();
+        second.scalar_stats = ScalarStats::Inline(HashMap::from([(amount, second_stats.clone())]));
+        let entries = vec![Arc::new(first), Arc::new(second)];
+
+        let (committed, parts) = ManifestSnapshot::empty(Arc::clone(&opts))
+            .update(&entries, &[])
+            .await
+            .expect("update");
+        assert_eq!(parts.len(), 1);
+        let (section_bytes, section_hash) = parts[0]
+            .summaries
+            .clone()
+            .expect("a user part has a section");
+        assert_eq!(section_hash, ContentHash::of(&section_bytes));
+        let listed = &committed.get_all_list_entries()[0];
+        let reference = listed
+            .summaries
+            .clone()
+            .expect("the list names the section");
+        assert_eq!(reference.uri, summaries_uri(&section_hash));
+        assert_eq!(reference.content_hash, section_hash);
+
+        // The part carries no statistics; the entries read the section.
+        let decoded = part::decode(&parts[0].encoded, &LegacyNames::none()).expect("decode part");
+        for entry in &decoded.superfiles {
+            assert!(
+                entry.scalar_stats.is_empty(),
+                "the part holds no statistics"
+            );
+        }
+        let in_memory = committed.get_all_superfiles();
+        assert!(
+            in_memory
+                .iter()
+                .all(|entry| entry.scalar_stats.section().is_some())
+        );
+        assert_eq!(
+            in_memory[0].scalar_stats.get(amount),
+            Some(first_stats.clone())
+        );
+        assert_eq!(
+            in_memory[1].scalar_stats.get(amount),
+            Some(second_stats.clone())
+        );
+
+        // Published and loaded fresh, the same.
+        let objects: Vec<(String, Bytes)> = parts.iter().flat_map(|p| p.objects()).collect();
+        committed
+            .write(storage.as_ref(), None, &objects)
+            .await
+            .expect("write");
+        let (stored, _) = storage
+            .get(&reference.uri)
+            .await
+            .expect("the section is in storage");
+        assert_eq!(ContentHash::of(&stored), section_hash);
+        let loaded = ManifestSnapshot::load(None, Arc::clone(&storage), Some(opts))
+            .await
+            .expect("load");
+        let loaded_entries = loaded.get_all_superfiles();
+        assert_eq!(loaded_entries.len(), 2);
+        assert!(
+            loaded_entries
+                .iter()
+                .all(|entry| entry.scalar_stats.section().is_some())
+        );
+        assert_eq!(
+            loaded_entries[0].scalar_stats.get(amount),
+            Some(first_stats)
+        );
+        assert_eq!(
+            loaded_entries[1].scalar_stats.get(amount),
+            Some(second_stats)
+        );
+        assert!(loaded_entries[0].scalar_stats.get(fid("absent")).is_none());
+    }
+
+    /// Commit two entries with statistics and publish them, as the
+    /// sectioning tests do: the storage, the options and the section the
+    /// list names.
+    async fn published_sectioned_table() -> (
+        TempDir,
+        Arc<dyn StorageProvider>,
+        Arc<SupertableOptions>,
+        SummariesRef,
+    ) {
+        let opts = make_opts();
+        let (dir, storage) = local_storage();
+        let amount = fid("amount");
+        let mut first = (*make_new_entry(3)).clone();
+        first.scalar_stats =
+            ScalarStats::Inline(HashMap::from([(amount, sectioned_stats(vec![3, 9, 4]))]));
+        let mut second = (*make_new_entry(2)).clone();
+        second.scalar_stats =
+            ScalarStats::Inline(HashMap::from([(amount, sectioned_stats(vec![10, 20]))]));
+        let entries = vec![Arc::new(first), Arc::new(second)];
+        let (committed, parts) = ManifestSnapshot::empty(Arc::clone(&opts))
+            .update(&entries, &[])
+            .await
+            .expect("update");
+        let objects: Vec<(String, Bytes)> = parts.iter().flat_map(|p| p.objects()).collect();
+        committed
+            .write(storage.as_ref(), None, &objects)
+            .await
+            .expect("write");
+        let reference = committed.get_all_list_entries()[0]
+            .summaries
+            .clone()
+            .expect("the list names the section");
+        (dir, storage, opts, reference)
+    }
+
+    /// A section that cannot be read — corrupted, or gone — does not keep
+    /// the table from opening: the part's superfiles read as having no
+    /// statistics, which every prune keeps.
+    #[tokio::test]
+    async fn a_section_that_cannot_be_read_leaves_the_part_without_statistics() {
+        let (_dir, storage, opts, reference) = published_sectioned_table().await;
+        let amount = fid("amount");
+
+        storage
+            .put_overwrite(&reference.uri, Bytes::from_static(b"not a section"))
+            .await
+            .expect("corrupt the section");
+        let loaded = ManifestSnapshot::load(None, Arc::clone(&storage), Some(Arc::clone(&opts)))
+            .await
+            .expect("a corrupt section does not fail the load");
+        let entries = loaded.get_all_superfiles();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            assert!(entry.scalar_stats.section().is_none());
+            assert!(entry.scalar_stats.get(amount).is_none());
+        }
+
+        storage
+            .delete(&reference.uri)
+            .await
+            .expect("delete the section");
+        let loaded = ManifestSnapshot::load(None, Arc::clone(&storage), Some(opts))
+            .await
+            .expect("a missing section does not fail the load");
+        assert!(
+            loaded
+                .get_all_superfiles()
+                .iter()
+                .all(|entry| entry.scalar_stats.get(amount).is_none())
+        );
+    }
+
+    /// A part whose section this handle could not read is never rewritten
+    /// from what the handle sees: an append goes to a part of its own,
+    /// the old part keeps its section reference, and a commit that would
+    /// section the unreadable entries is refused. The statistics are
+    /// still there for a handle that reads the section.
+    #[tokio::test]
+    async fn a_part_whose_section_could_not_be_read_is_not_rewritten() {
+        let (_dir, storage, opts, reference) = published_sectioned_table().await;
+        let amount = fid("amount");
+        let (section_bytes, _) = storage
+            .get(&reference.uri)
+            .await
+            .expect("the section is in storage");
+        storage
+            .put_overwrite(&reference.uri, Bytes::from_static(b"not a section"))
+            .await
+            .expect("corrupt the section");
+        let loaded = ManifestSnapshot::load(None, Arc::clone(&storage), Some(Arc::clone(&opts)))
+            .await
+            .expect("a corrupt section does not fail the load");
+        let entries = loaded.get_all_superfiles();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.scalar_stats.is_unavailable())
+        );
+        let before = loaded.get_all_list_entries().to_vec();
+        assert_eq!(before.len(), 1);
+
+        // A commit over the unreadable entries themselves is refused.
+        assert!(matches!(
+            section_entries(entries.to_vec(), PartId::new_v4()),
+            Err(ManifestError::StatisticsUnavailable { .. })
+        ));
+
+        // An append goes beside the part, which carries over untouched.
+        let mut third = (*make_new_entry(4)).clone();
+        third.scalar_stats =
+            ScalarStats::Inline(HashMap::from([(amount, sectioned_stats(vec![30, 40]))]));
+        let (committed, parts) = loaded
+            .update(&[Arc::new(third)], &[])
+            .await
+            .expect("the append is not refused");
+        let after = committed.get_all_list_entries();
+        assert_eq!(after.len(), 2, "a part of its own for the new superfile");
+        assert_eq!(after[0].part_id, before[0].part_id);
+        assert_eq!(after[0].summaries, before[0].summaries);
+        assert_eq!(after[1].n_superfiles, 1);
+        assert!(after[1].summaries.is_some());
+        assert_eq!(parts.len(), 1);
+
+        // With the section back in storage, a fresh handle reads every
+        // statistic the table ever had.
+        storage
+            .put_overwrite(&reference.uri, section_bytes)
+            .await
+            .expect("restore the section");
+        let objects: Vec<(String, Bytes)> = parts.iter().flat_map(|p| p.objects()).collect();
+        let (_, meta) = read_pointer(storage.as_ref())
+            .await
+            .expect("read pointer")
+            .expect("pointer present");
+        let etag = meta.etag.expect("localfs pointer etag");
+        committed
+            .write(storage.as_ref(), Some(etag.as_str()), &objects)
+            .await
+            .expect("write");
+        let fresh = ManifestSnapshot::load(None, Arc::clone(&storage), Some(opts))
+            .await
+            .expect("load");
+        let fresh_entries = fresh.get_all_superfiles();
+        assert_eq!(fresh_entries.len(), 3);
+        assert!(
+            fresh_entries
+                .iter()
+                .all(|entry| entry.scalar_stats.get(amount).is_some())
+        );
+    }
+
+    /// The section a part reads must be its own: written for its id, and
+    /// holding its superfiles row for row.
+    #[test]
+    fn a_section_is_checked_against_its_part() {
+        let entries = vec![make_summary_entry(10), make_summary_entry(20)];
+        let own = PartId::new_v4();
+        let (sectioned, bytes) = section_entries(entries.clone(), own).expect("section");
+        let (bytes, _) = bytes.expect("a section");
+        let section = SummariesSection::parse(bytes).expect("parse");
+        let part = ManifestPart {
+            format_version: part::FORMAT_VERSION.into(),
+            part_id: own,
+            superfiles: sectioned.clone(),
+        };
+        assert!(section_matches_part(&section, &part).is_ok());
+
+        let other = ManifestPart {
+            part_id: PartId::new_v4(),
+            ..part.clone()
+        };
+        assert!(matches!(
+            section_matches_part(&section, &other),
+            Err(SummariesError::Malformed(_))
+        ));
+        let fewer = ManifestPart {
+            superfiles: sectioned[..1].to_vec(),
+            ..part.clone()
+        };
+        assert!(section_matches_part(&section, &fewer).is_err());
+        let reordered = ManifestPart {
+            superfiles: vec![Arc::clone(&sectioned[1]), Arc::clone(&sectioned[0])],
+            ..part
+        };
+        assert!(section_matches_part(&section, &reordered).is_err());
+    }
+
+    /// Two rebuilds of the same superfiles write two sections: the part's
+    /// id is in the bytes, so the content hashes differ and a rebuild never
+    /// names a section an earlier version wrote, which a sweep may be about
+    /// to delete. The list entry records the section's size.
+    #[test]
+    fn a_rebuild_of_the_same_superfiles_writes_a_new_section() {
+        let entry = make_summary_entry(10);
+        let (first, first_encoded) =
+            rebuild_part_and_entry(vec![], vec![Arc::clone(&entry)], None, false).expect("rebuild");
+        let (second, _) =
+            rebuild_part_and_entry(vec![], vec![entry], None, false).expect("rebuild again");
+        let first_section = first.summaries.expect("a section");
+        let second_section = second.summaries.expect("a section");
+        assert_ne!(first_section.content_hash, second_section.content_hash);
+        assert_ne!(first_section.uri, second_section.uri);
+        let (bytes, hash) = first_encoded.summaries.expect("section bytes");
+        assert_eq!(first_section.content_hash, hash);
+        assert_eq!(first_section.size_bytes, bytes.len() as u64);
+        assert_eq!(
+            SummariesSection::parse(bytes).expect("parse").part_id(),
+            Some(first.part_id)
+        );
+    }
+
+    /// The latest part's section counts toward the split cap with the
+    /// part's own bytes: a commit to the part rewrites both, and on a wide
+    /// table the section is most of the weight. Here the part alone is
+    /// under the cap and the section tips it, so the appended superfile
+    /// goes to a fresh part.
+    #[tokio::test]
+    async fn the_latest_part_splits_when_its_section_reaches_the_size_cap() {
+        let (_dir, storage) = local_storage();
+        let sf1 = make_superfile_entry(100, hash_bucket_0_pk());
+        let sf2 = make_superfile_entry(150, hash_bucket_0_pk());
+        let existing_part = ManifestPart {
+            format_version: part::FORMAT_VERSION.into(),
+            part_id: PartId::new_v4(),
+            superfiles: vec![sf1.clone(), sf2.clone()],
+        };
+        let pw = write_manifest_part(storage.as_ref(), &existing_part)
+            .await
+            .expect("write part");
+
+        let mut base_opts =
+            SupertableOptions::new(simple_schema(), vec![], vec![]).expect("valid options");
+        base_opts.target_superfiles_per_part = 10_000;
+        // One byte past the part's own size: the part alone stays under
+        // the cap, the part with its section does not.
+        base_opts.part_size_threshold_bytes = pw.size_bytes_compressed + 1;
+        let opts = Arc::new(base_opts);
+
+        let list = Manifest {
+            drained_ranges: Default::default(),
+            global_vector_index: None,
+            tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
+            split_checks: Default::default(),
+            format_version: list::FORMAT_VERSION.into(),
+            manifest_id: 0,
+            options_hash: ContentHash([0u8; 32]),
+            schema: None,
+            id_column: "_id".into(),
+            commit_token: Uuid::nil(),
+            partition_strategy: PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 1,
+            },
+            vector_index_storage_prefix: None,
+            deleted_user_ids_inline: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
+            slow_vector_state_centroid_graph: None,
+            term_index: None,
+            term_index_complete: false,
+            parts: vec![ManifestPartEntry {
+                part_id: pw.part_id,
+                uri: pw.uri.clone(),
+                content_hash: pw.content_hash,
+                routing: None,
+                size_bytes_compressed: pw.size_bytes_compressed,
+                size_bytes_uncompressed: pw.size_bytes_uncompressed,
+                n_superfiles: 2,
+                id_range: (0, 149),
+                scalar_stats_agg: Default::default(),
+                fts_summary_agg: Default::default(),
+                fts_length_totals: None,
+                summaries: Some(SummariesRef {
+                    uri: summaries_uri(&ContentHash([7u8; 32])),
+                    content_hash: ContentHash([7u8; 32]),
+                    size_bytes: 1,
+                }),
+            }],
+        };
+        let frozen_part_id = pw.part_id;
+        let loader = ManifestPartLoader::new(storage, &list);
+        let parts = DashMap::new();
+        parts.insert(
+            pw.part_id,
+            Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
+        );
+        let old_manifest = Arc::new(ManifestSnapshot {
+            superfile_list: SuperfileList {
+                manifest_id: 0,
+                options: opts.clone(),
+                superfiles: vec![sf1, sf2],
+                vector_index_storage_prefix: None,
+                next_manifest_id_floor: 0,
+            },
+            list: Some(list),
+            parts,
+            loader: Some(Arc::new(loader)),
+            stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
+            stamped_schema: None,
+            derived_length_totals: Default::default(),
+        });
+
+        let (new_manifest, parts) = old_manifest
+            .update(&[make_new_entry(75)], &[])
+            .await
+            .expect("update");
+        let list_entries = new_manifest.get_all_list_entries();
+        assert_eq!(
+            list_entries.len(),
+            2,
+            "the section's bytes put the latest part at its cap; the new superfile goes to a fresh part"
+        );
+        assert_eq!(parts.len(), 1);
+        assert_eq!(list_entries[0].part_id, frozen_part_id);
+        assert_eq!(list_entries[1].n_superfiles, 1);
     }
 
     /// Residency invariant: a refresh whose slow-state ref is unchanged
@@ -7400,6 +8833,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -7517,6 +8951,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             }
         };
 
@@ -7776,6 +9211,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -7885,6 +9321,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -8021,6 +9458,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             }],
         };
         let frozen_part_id = pw.part_id;
@@ -8148,6 +9586,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_latest.part_id,
@@ -8161,6 +9600,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
             ],
         };
@@ -8291,6 +9731,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_b.part_id,
@@ -8304,6 +9745,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
             ],
         };
@@ -8444,6 +9886,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_b.part_id,
@@ -8457,6 +9900,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
             ],
         };
@@ -8611,6 +10055,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_a_latest.part_id,
@@ -8624,6 +10069,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_b_old.part_id,
@@ -8637,6 +10083,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_b_latest.part_id,
@@ -8650,6 +10097,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
             ],
         };
@@ -8841,6 +10289,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -8947,6 +10396,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -9070,6 +10520,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_b.part_id,
@@ -9083,6 +10534,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
             ],
         };
@@ -9216,6 +10668,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_a_latest.part_id,
@@ -9229,6 +10682,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
             ],
         };
@@ -9358,6 +10812,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -9454,6 +10909,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -9570,6 +11026,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_a_latest.part_id,
@@ -9583,6 +11040,7 @@ mod tests {
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries: None,
                 },
             ],
         };
@@ -9670,6 +11128,7 @@ mod tests {
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
                 fts_length_totals: None,
+                summaries: None,
             })
             .collect();
         Manifest {
@@ -9807,7 +11266,7 @@ mod tests {
             n_docs: 3,
             id_min: -5,
             id_max: 7,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

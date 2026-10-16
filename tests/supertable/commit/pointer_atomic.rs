@@ -84,9 +84,12 @@ async fn commit_manifest(
     new_list: &Manifest,
     parts: &[&ManifestPart],
 ) -> Result<PointerFile, CommitError> {
-    let encoded: Vec<Bytes> = parts
+    let encoded: Vec<(String, Bytes)> = parts
         .iter()
-        .map(|p| Bytes::from(part_mod::encode(p)))
+        .map(|p| {
+            let bytes = Bytes::from(part_mod::encode(p));
+            (part_uri(&ContentHash::of(&bytes)), bytes)
+        })
         .collect();
 
     // Start from an empty manifest (no superfiles) carrying the
@@ -216,6 +219,7 @@ fn entry_for(part: &ManifestPart) -> ManifestPartEntry {
         scalar_stats_agg: Default::default(),
         fts_summary_agg: Default::default(),
         fts_length_totals: None,
+        summaries: None,
     }
 }
 

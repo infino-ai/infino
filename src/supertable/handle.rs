@@ -10,9 +10,9 @@
 //! reader captured before a commit keeps seeing pre-commit state
 //! even after the writer has swapped in a new manifest.
 //!
-//! `SupertableInner.writer_outstanding: AtomicBool` is the
-//! single-writer slot — the writer flips it true on acquisition
-//! and (via `Drop`) flips it false on release.
+//! `SupertableInner.writer_slot` is the writer slot — held by one
+//! exclusive writer, or shared by any number of same-schema append
+//! writers, and released via `Drop`.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -72,7 +72,7 @@ use crate::{
             lease::DEFAULT_LEASE_DURATION,
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
         },
-        writer::builder_options_of,
+        writer::{AppendQueue, WriterSlot, builder_options_of},
     },
     utils::trace::{CloseOut, TableRole, record},
 };
@@ -93,11 +93,19 @@ pub struct Supertable {
     inner: Arc<SupertableInner>,
 }
 
+#[cfg(test)]
+impl Supertable {
+    /// The manifest this handle serves from now, for tests that measure what
+    /// a handle holds.
+    pub(crate) fn manifest_snapshot(&self) -> Arc<ManifestSnapshot> {
+        self.inner.manifest.load_full()
+    }
+}
+
 /// Internal shared state. Every `Supertable` clone holds one Arc
 /// pointing at the same `SupertableInner`. The writer module
 /// reaches in to mutate `manifest` (via `ArcSwap::store`) on
-/// commit and to manipulate `writer_outstanding` for the
-/// single-writer slot enforcement.
+/// commit and to acquire `writer_slot`.
 pub(super) struct SupertableInner {
     /// Which of the two tables this handle drives — the user's own rows,
     /// or the derived vector index. Both run the same code, so without
@@ -118,26 +126,21 @@ pub(super) struct SupertableInner {
     /// readers do ArcSwap::load_full at construction to pin a
     /// snapshot for the duration of their queries.
     pub(super) manifest: ArcSwap<ManifestSnapshot>,
-    /// Single-writer slot: the writer flips this true on
-    /// acquisition (via compare-exchange) and (via Drop) flips
-    /// it false on release. Atomic flag, not a lock — never
-    /// blocks; never starves; the slot simply rejects a second
-    /// concurrent `Supertable::writer()` call until the first
-    /// writer is dropped.
-    pub(super) writer_outstanding: AtomicBool,
-    /// Single-compaction slot. Same acquire/release pattern as
-    /// `writer_outstanding`. Prevents concurrent `compact()` calls
+    /// Held by one exclusive writer, or shared by same-schema appends.
+    pub(super) writer_slot: WriterSlot,
+    /// Orders the publishes of shared append writers.
+    pub(super) append_queue: AppendQueue,
+    /// Single-compaction slot. Acquired by compare-exchange and
+    /// released on drop. Prevents concurrent `compact()` calls
     /// within the same process from racing on seals and manifest
     /// writes. Cross-process coordination happens at the sidecar-seal
     /// level.
     pub(super) compaction_outstanding: AtomicBool,
     /// Generator for the supertable-injected `_id` column.
     /// Each `append()` locks the mutex once, mints
-    /// `batch.num_rows()` ids, and unlocks. The
-    /// writer-slot lock already serializes `append()` per
-    /// supertable handle, so this mutex is uncontended in
-    /// practice; it's present only because ferroid's
-    /// `BasicSnowflakeGenerator` is `!Sync` by design (it
+    /// `batch.num_rows()` ids, and unlocks. The mutex is
+    /// required: shared append writers mint concurrently, and
+    /// ferroid's `BasicSnowflakeGenerator` is `!Sync` by design (it
     /// uses interior-mutable `Cell`). One generator per
     /// supertable, constructed fresh on `create()` /
     /// `open()` with a 40-bit random worker_id.
@@ -1823,7 +1826,8 @@ async fn build_handle(
         options,
         role,
         manifest: ArcSwap::new(manifest),
-        writer_outstanding: AtomicBool::new(false),
+        writer_slot: WriterSlot::default(),
+        append_queue: AppendQueue::default(),
         compaction_outstanding: AtomicBool::new(false),
         id_generator: Mutex::new(id_generator),
         sql_session_cache: Mutex::new(None),
@@ -2349,7 +2353,7 @@ mod tests {
         },
         supertable::{
             manifest::{
-                SuperfileEntry, SuperfileUri,
+                ScalarStats, SuperfileEntry, SuperfileUri,
                 commit::{POINTER_PATH, get_current_manifest_etag},
                 list::PartitionStrategy,
             },
@@ -2415,7 +2419,7 @@ mod tests {
             n_docs,
             id_min: 0,
             id_max: n_docs.saturating_sub(1) as i128,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

@@ -619,7 +619,7 @@ async fn append_replacement_rows(
         n_docs: flat_ids.len() as u64,
         id_min,
         id_max,
-        scalar_stats,
+        scalar_stats: scalar_stats.into(),
         fts_summary,
         vector_summary,
         // Unpartitioned default: the supertable's partition

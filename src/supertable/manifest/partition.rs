@@ -296,8 +296,8 @@ fn scalar_i64_minmax(
     column: &str,
     column_id: Option<FieldId>,
 ) -> Result<(i64, i64), ManifestError> {
-    let agg = column_id
-        .and_then(|id| seg.scalar_stats.get(&id))
+    let stats = column_id
+        .and_then(|id| seg.scalar_stats.column(id))
         .ok_or_else(|| ManifestError::SuperfileSpansPartition {
             detail: format!(
                 "TimeRange strategy: superfile {} has no scalar_stats \
@@ -305,8 +305,8 @@ fn scalar_i64_minmax(
                 seg.uri.0
             ),
         })?;
-    let min = downcast_i64(agg.min.as_ref(), column, seg)?;
-    let max = downcast_i64(agg.max.as_ref(), column, seg)?;
+    let min = downcast_i64(stats.min().as_ref(), column, seg)?;
+    let max = downcast_i64(stats.max().as_ref(), column, seg)?;
     Ok((min, max))
 }
 
@@ -371,7 +371,7 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema};
 
-    use crate::supertable::{options::SupertableOptions, schema::FieldId};
+    use crate::supertable::{manifest::ScalarStats, options::SupertableOptions, schema::FieldId};
 
     /// The table these tests partition: one `ts` column, so `ts` resolves
     /// to its id and any other name to a stable id no entry carries.
@@ -413,7 +413,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

@@ -24,7 +24,7 @@
 
 use std::{
     cmp::{max, min},
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -35,6 +35,7 @@ use crate::{
     supertable::{
         manifest::{
             SuperfileEntry,
+            encoding::detach_bound,
             list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg},
         },
         schema::FieldId,
@@ -73,7 +74,10 @@ pub fn compute(
 
     let mut id_min = superfiles.iter().map(|s| s.id_min).min().unwrap_or(0);
     let mut id_max = superfiles.iter().map(|s| s.id_max).max().unwrap_or(0);
-    let mut scalar_stats_agg = scalar_stats_agg(superfiles);
+    let ScalarRollup {
+        mut scalar_stats_agg,
+        conflicted,
+    } = scalar_stats_agg(superfiles);
     let birth_min = superfiles
         .iter()
         .map(|entry| entry.birth_version)
@@ -101,6 +105,11 @@ pub fn compute(
         id_min = min(id_min, base_part.id_range.0);
         id_max = max(id_max, base_part.id_range.1);
         ScalarStatsAgg::merge(&mut scalar_stats_agg, &base_part.scalar_stats_agg);
+        // A column the new superfiles disagree on the type of stays out:
+        // the base part's bounds alone would describe only its superfiles.
+        for column in &conflicted {
+            scalar_stats_agg.remove(column);
+        }
         FtsSummaryAgg::merge(&mut fts_summary_agg, &base_part.fts_summary_agg);
     }
 
@@ -133,18 +142,73 @@ pub fn fts_length_totals(
 // Scalar stats: per column, fold the superfiles' aggregates.
 // ---------------------------------------------------------
 
-fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<FieldId, ScalarStatsAgg> {
-    // Fold each superfile's per-column aggregate table together. `merge_tables`
-    // keeps the min/max extremes (column union) and combines the additive
-    // stats (null count / sum / HLL) only when every contributor carries them
-    // — the same part-level semantics, sharing one code path with the
-    // per-column merge instead of a hand-rolled fold + a duplicate min/max
-    // helper.
+/// A part's per-column rollup, with the columns the fold could not roll up.
+struct ScalarRollup {
+    scalar_stats_agg: HashMap<FieldId, ScalarStatsAgg>,
+    /// Columns whose bounds differ in type between superfiles. Once
+    /// conflicted a column stays out of the rollup: bounds folded from the
+    /// superfiles after the conflict alone would describe only those, and
+    /// the part-level pruner would act on them.
+    conflicted: HashSet<FieldId>,
+}
+
+fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> ScalarRollup {
+    // The list reads a part's rollup for its bounds and its null count: the
+    // list-level pruner compares a filter against min/max, the IS NULL prune
+    // asks whether the part can hold a null, and the drain reads the birth
+    // version range. The sum, the HLL sketch and the value table are read
+    // from the superfiles' own entries, never from a part's rollup, yet
+    // carrying them here put a 1 KiB sketch and a value table for every
+    // field of every part into the list: a table of 3,882 fields had a
+    // 247 MB JSON list at 46 parts, rewritten at every commit and parsed
+    // whole by every handle. So the fold reads each superfile's bounds and
+    // null count in place and never builds the rest: a rebuild over a big
+    // part otherwise decoded every value table only to drop it. Per column
+    // the fold is `merge_with`'s: min/max take the extremes and the null
+    // count folds while every contributor carries it. A column whose types
+    // disagree between superfiles is dropped from the rollup, for the rest
+    // of the fold (no info, so the pruner keeps the part), rather than kept
+    // with bounds that cover only some of the superfiles.
     let mut out: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
+    let mut conflicted: HashSet<FieldId> = HashSet::new();
     for seg in superfiles {
-        ScalarStatsAgg::merge(&mut out, &seg.scalar_stats);
+        for (column, stats) in seg.scalar_stats.columns() {
+            if conflicted.contains(&column) {
+                continue;
+            }
+            // A section row's bound is a slice of its group's column; the
+            // rollup outlives the section's residency, so it takes a copy.
+            let (Ok(min), Ok(max)) = (detach_bound(&stats.min()), detach_bound(&stats.max()))
+            else {
+                conflicted.insert(column);
+                out.remove(&column);
+                continue;
+            };
+            let bounds = ScalarStatsAgg {
+                min,
+                max,
+                null_count: stats.null_count(),
+                sum: None,
+                hll: None,
+                value_counts: None,
+            };
+            match out.get_mut(&column) {
+                Some(existing) => {
+                    if existing.merge_with(&bounds).is_err() {
+                        out.remove(&column);
+                        conflicted.insert(column);
+                    }
+                }
+                None => {
+                    out.insert(column, bounds);
+                }
+            }
+        }
     }
-    out
+    ScalarRollup {
+        scalar_stats_agg: out,
+        conflicted,
+    }
 }
 
 // ---------------------------------------------------------
@@ -172,15 +236,18 @@ fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<FieldId, FtsS
 mod tests {
     use std::collections::HashMap;
 
-    use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
+    use arrow_array::{ArrayRef, Int32Array, Int64Array, LargeStringArray, StringArray};
+    use bytes::Bytes;
+    use uuid::Uuid;
 
     use super::*;
     use crate::{
         superfile::vector::layout::VectorLayout,
         supertable::{
             manifest::{
-                FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+                FtsSummaryAgg, ScalarStats, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
                 part::{ContentHash, PartId},
+                summaries::{SummariesSection, rows_from_entries},
             },
             schema::FieldId,
         },
@@ -205,6 +272,7 @@ mod tests {
             scalar_stats_agg,
             fts_summary_agg: BTreeMap::new(),
             fts_length_totals: None,
+            summaries: None,
         }
     }
 
@@ -266,7 +334,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: cols,
+            scalar_stats: cols.into(),
             fts_summary: HashMap::<FieldId, FtsSummaryAgg>::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -295,7 +363,7 @@ mod tests {
             seg_with_string_minmax("title", "alpha", "delta", false),
             seg_with_string_minmax("title", "bravo", "echo", false),
         ];
-        let aggs = scalar_stats_agg(&segs);
+        let aggs = scalar_stats_agg(&segs).scalar_stats_agg;
         let agg = aggs.get(&fid("title")).expect("title agg present");
         assert_eq!(string_val(&agg.min), "alpha");
         assert_eq!(string_val(&agg.max), "echo");
@@ -307,14 +375,15 @@ mod tests {
             seg_with_string_minmax("body", "mango", "papaya", true),
             seg_with_string_minmax("body", "apple", "orange", true),
         ];
-        let aggs = scalar_stats_agg(&segs);
+        let aggs = scalar_stats_agg(&segs).scalar_stats_agg;
         let agg = aggs.get(&fid("body")).expect("body agg present");
         assert_eq!(string_val(&agg.min), "apple");
         assert_eq!(string_val(&agg.max), "papaya");
     }
 
     /// Build a superfile carrying full per-column stats for one Int64 column
-    /// (min/max + null count + exact sum + HLL), via `from_column`.
+    /// (min/max, null count, exact sum, and the value table a column of a
+    /// few values gets in place of a sketch), via `from_column`.
     fn seg_with_i64(col: &str, vals: Vec<i64>) -> Arc<SuperfileEntry> {
         let arr: ArrayRef = Arc::new(Int64Array::from(vals));
         let mut cols = HashMap::new();
@@ -331,7 +400,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: cols,
+            scalar_stats: cols.into(),
             fts_summary: HashMap::<FieldId, FtsSummaryAgg>::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -349,20 +418,102 @@ mod tests {
     }
 
     #[test]
-    fn scalar_stats_agg_folds_additive_stats_across_superfiles() {
-        // Two superfiles, same column: min/max take the extremes; null_count
-        // and sum fold additively; HLL merges.
+    fn scalar_stats_agg_folds_null_counts_and_drops_sum_sketch_and_table() {
+        // Two superfiles, same column: min/max take the extremes and the
+        // null count folds; the sum, the sketch and the value table are
+        // read from the superfiles' own entries, so the rollup drops them.
         let segs = vec![
-            seg_with_i64("n", vec![10, 50]), // sum 60
-            seg_with_i64("n", vec![5, 30]),  // sum 35
+            seg_with_i64("n", vec![10, 50]),
+            seg_with_i64("n", vec![5, 30]),
         ];
-        let aggs = scalar_stats_agg(&segs);
+        let aggs = scalar_stats_agg(&segs).scalar_stats_agg;
         let agg = aggs.get(&fid("n")).expect("n agg present");
         assert_eq!(i64_val(&agg.min), 5);
         assert_eq!(i64_val(&agg.max), 50);
         assert_eq!(agg.null_count, Some(0)); // no nulls in either
-        assert_eq!(i64_val(agg.sum.as_ref().expect("summed")), 95); // 60 + 35
-        assert!(agg.hll.is_some(), "HLL sketches fold across superfiles");
+        assert!(agg.sum.is_none(), "the rollup carries no sum");
+        assert!(agg.hll.is_none(), "the rollup carries no sketch");
+        assert!(
+            agg.value_counts.is_none(),
+            "the rollup carries no value table"
+        );
+    }
+
+    /// The fold reads a sectioned superfile's bounds and null count in
+    /// place and comes to the same rollup as over the decoded statistics.
+    #[test]
+    fn scalar_stats_agg_folds_sectioned_entries_as_it_folds_decoded_ones() {
+        let decoded = vec![
+            seg_with_i64("n", vec![10, 50]),
+            seg_with_i64("n", vec![5, 30]),
+        ];
+        let ids: Vec<Uuid> = decoded.iter().map(|seg| seg.superfile_id).collect();
+        let bytes = SummariesSection::encode(PartId::new_v4(), &ids, rows_from_entries(&decoded))
+            .expect("encode");
+        let section = Arc::new(SummariesSection::parse(Bytes::from(bytes)).expect("parse"));
+        let sectioned: Vec<Arc<SuperfileEntry>> = decoded
+            .iter()
+            .enumerate()
+            .map(|(row, seg)| {
+                Arc::new(SuperfileEntry {
+                    scalar_stats: ScalarStats::Section {
+                        section: Arc::clone(&section),
+                        row: row as u32,
+                    },
+                    ..(**seg).clone()
+                })
+            })
+            .collect();
+        let from_decoded = scalar_stats_agg(&decoded).scalar_stats_agg;
+        let from_sectioned = scalar_stats_agg(&sectioned).scalar_stats_agg;
+        assert_eq!(from_decoded, from_sectioned);
+        let agg = from_sectioned.get(&fid("n")).expect("n agg present");
+        assert_eq!((i64_val(&agg.min), i64_val(&agg.max)), (5, 50));
+        assert_eq!(agg.null_count, Some(0));
+        assert!(agg.sum.is_none() && agg.hll.is_none() && agg.value_counts.is_none());
+    }
+
+    /// A column whose bounds change type between superfiles stays out of
+    /// the rollup for the rest of the fold and out of the merge with the
+    /// base part: bounds from the superfiles after the conflict alone
+    /// would cover only those, and the part-level pruner would drop the
+    /// part for a value the earlier superfiles hold.
+    #[test]
+    fn a_column_conflicted_between_superfiles_never_re_enters_the_rollup() {
+        let narrow = |col: &str, lo: i32, hi: i32| -> Arc<SuperfileEntry> {
+            let arr: ArrayRef = Arc::new(Int32Array::from(vec![lo, hi]));
+            let mut cols = HashMap::new();
+            cols.insert(
+                fid(col),
+                ScalarStatsAgg::from_column(&arr).expect("i32 is orderable"),
+            );
+            let mut entry = (*seg_with_i64("other", vec![1])).clone();
+            entry.scalar_stats = cols.into();
+            Arc::new(entry)
+        };
+        // Int32, then Int64, then Int32 again: the last superfile must not
+        // re-enter the column as if it were the first.
+        let segs = vec![
+            narrow("n", 1, 10),
+            seg_with_i64("n", vec![100, 200]),
+            narrow("n", 5, 6),
+        ];
+        let rollup = scalar_stats_agg(&segs);
+        assert!(!rollup.scalar_stats_agg.contains_key(&fid("n")));
+        assert!(rollup.conflicted.contains(&fid("n")));
+
+        // Nor through the base part's rollup, which covers other superfiles.
+        let base = base_entry((0, 9), scalar_i64("n", vec![50, 60]));
+        let aggregate = compute(&segs, Some(&base));
+        assert!(
+            !aggregate.scalar_stats_agg.contains_key(&fid("n")),
+            "the base's bounds alone would describe only its superfiles"
+        );
+        assert!(
+            aggregate
+                .scalar_stats_agg
+                .contains_key(&FieldId::BIRTH_VERSION)
+        );
     }
 
     #[test]
@@ -384,7 +535,7 @@ mod tests {
                 n_docs: 1,
                 id_min: 0,
                 id_max: 0,
-                scalar_stats: cols,
+                scalar_stats: cols.into(),
                 fts_summary: HashMap::<FieldId, FtsSummaryAgg>::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
@@ -394,7 +545,7 @@ mod tests {
             })
         };
         let segs = vec![seg_with_i64("n", vec![1, 100]), bounds_only];
-        let aggs = scalar_stats_agg(&segs);
+        let aggs = scalar_stats_agg(&segs).scalar_stats_agg;
         let agg = aggs.get(&fid("n")).expect("n agg present");
         // min/max union across both.
         assert_eq!(i64_val(&agg.min), 1);

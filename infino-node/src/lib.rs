@@ -1292,6 +1292,9 @@ impl Table {
     /// Delete every row matching a SQL `predicate` (e.g. `"status = 'spam'"`),
     /// returning the mutation counts. Requires durable storage — a `memory://`
     /// table surfaces a clear error.
+    ///
+    /// Waits for appends already in flight on the table to commit, which
+    /// blocks the JS thread for that long.
     #[napi]
     pub fn delete(&self, predicate: String) -> Result<MutationStats> {
         let expr = self.parse_predicate(&predicate)?;
@@ -1301,6 +1304,9 @@ impl Table {
     /// Replace every row matching a SQL `predicate` with `rows` (an Arrow IPC
     /// `Buffer`, like `append`), 1:1 — the matched count must equal the
     /// replacement-row count or the engine errors. Requires durable storage.
+    ///
+    /// Waits for appends already in flight on the table to commit, which
+    /// blocks the JS thread for that long.
     #[napi]
     pub fn update(&self, predicate: String, rows: Buffer) -> Result<MutationStats> {
         let expr = self.parse_predicate(&predicate)?;

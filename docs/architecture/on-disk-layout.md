@@ -28,16 +28,33 @@ mydb/                                     database root (the connect() path)
 │   │
 │   ├── manifest/
 │   │   └── manifest-000004.json          JSON · immutable manifest version
-│   │       ├ stores : parts[] (each: uri + content_hash), schema, fts/vector
-│   │       │          column specs, partition strategy
-│   │       └ used   : one written per commit (NNNNNN bumps); names the live parts
+│   │       ├ stores : parts[] (each: uri + content_hash, and the summaries
+│   │       │          section's uri + hash + size), schema, fts/vector
+│   │       │          column specs, partition strategy; format 3.0 since the
+│   │       │          summaries section (majors 1 and 2 still read)
+│   │       └ used   : one written per commit (NNNNNN bumps); names the live parts.
+│   │                  The first commit by an engine that writes sections, a
+│   │                  no-data maintenance publish or the hidden index's sibling
+│   │                  included, writes 3.0, which an engine from before refuses:
+│   │                  a deployment that has committed cannot roll back past it
 │   │
 │   ├── manifest-parts/
 │   │   └── part-<blake3>.avro.zst        Avro+zstd · immutable, content-addressed
 │   │       ├ stores : superfiles[] entries, each with uri, n_docs, id_min/max,
-│   │       │          min/max summaries, term range + BM25 length statistics
-│   │       │          (a term bloom only on a table with no storage attached)
-│   │       └ used   : skip-pruning; reject superfiles before reading their bytes
+│   │       │          term range + BM25 length statistics (a term bloom only
+│   │       │          on a table with no storage attached); per-column
+│   │       │          statistics inline only in parts written before the
+│   │       │          summaries section, and in the hidden vector index's
+│   │       └ used   : the superfiles a version holds; what a handle keeps resident
+│   │
+│   ├── manifest-summaries/
+│   │   └── summ-<blake3>.bin             binary · magic "ISUM", immutable, content-addressed;
+│   │                                     one per part, named by the part's list entry
+│   │       ├ stores : every superfile's per-column scalar statistics (min/max,
+│   │       │          null count, sum, sketch, value table) as Arrow IPC batches,
+│   │       │          one per column type, with a directory from column to its rows
+│   │       └ used   : skip-pruning and planner statistics; a column is decoded
+│   │                  on request, so a handle's cost does not grow with the column count
 │   │
 │   ├── term-index/                       written by every commit that adds a superfile
 │   │   ├── root-<blake3>.bin             binary · magic "INFTIDX1", immutable,
@@ -144,6 +161,7 @@ Anchored by symbol so they survive line moves:
 | `data/seg-<uuid>.sf.parquet` name | `SuperfileUri::storage_path` | [src/supertable/manifest/mod.rs](../../src/supertable/manifest/mod.rs) |
 | `data/<stem>-<uuid>.sf.parquet` name (source-named) | `SuperfileEntry::storage_path`, `superfile_stem` | [src/supertable/manifest/mod.rs](../../src/supertable/manifest/mod.rs) |
 | manifest-part Avro schema (`superfiles[].uri`, summaries) | `SuperfileEntry` schema | [src/supertable/manifest/part.rs](../../src/supertable/manifest/part.rs) |
+| `manifest-summaries/summ-<hash>.bin` name and layout: header with the part's id, superfile ids, directory, one IPC batch per column type | `MANIFEST_SUMMARIES_DIR`, `summaries_uri`, `SummariesSection` | [src/supertable/manifest/summaries.rs](../../src/supertable/manifest/summaries.rs) |
 | `wal/mutations/` state-doc + `.arrow` sidecar | `WAL_DIR`, `WalStore` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | `superfiles/<id>.tombstones` sidecar paths | `SUPERFILES_DIR`, `tombstones_path` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | tombstone binary format (`INFTOMB\0` + RoaringBitmap) | `MAGIC`, layout doc | [src/supertable/wal/tombstones_codec.rs](../../src/supertable/wal/tombstones_codec.rs) |

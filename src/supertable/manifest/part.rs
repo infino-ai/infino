@@ -32,7 +32,7 @@ use crate::{
     superfile::vector::layout::VectorLayout,
     supertable::{
         manifest::{
-            SubsectionOffsets, SuperfileEntry, SuperfileUri,
+            ScalarStats, SubsectionOffsets, SuperfileEntry, SuperfileUri,
             encoding::{
                 DecodeError, SummaryWireMode, decode_fts_summary_map, decode_scalar_stats,
                 decode_vector_summary_map, encode_fts_summary_map, encode_scalar_stats,
@@ -415,7 +415,15 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
         .superfiles
         .iter()
         .map(|seg| {
-            let scalar_bytes = encode_scalar_stats(&seg.scalar_stats);
+            // Statistics that live in the part's summaries section are not
+            // written into the part as well: a reader of the part alone
+            // finds none and keeps every superfile, which is correct. (An
+            // entry whose section this handle could not read never reaches
+            // a part write: `section_entries` refuses it.)
+            let scalar_bytes = match &seg.scalar_stats {
+                ScalarStats::Inline(map) => encode_scalar_stats(map),
+                ScalarStats::Section { .. } | ScalarStats::Unavailable => Vec::new(),
+            };
             let fts_bytes = encode_fts_summary_map(&seg.fts_summary);
             let vector_bytes = encode_vector_summary_map(&seg.vector_summary, mode);
 
@@ -644,12 +652,42 @@ pub fn decode_with_blob_budget(
     for seg_val in segs {
         superfiles.push(Arc::new(decode_superfile(seg_val, budget, legacy)?));
     }
+    share_physical_schemas(&mut superfiles);
 
     Ok(ManifestPart {
         format_version,
         part_id,
         superfiles,
     })
+}
+
+/// Entries that declare the same physical schema share one copy of it.
+/// Every file of a commit is built against the table's schema of the
+/// day, so a part's entries mostly agree, and a schema of thousands of
+/// columns costs more resident than the entry it describes.
+pub(crate) fn share_physical_schemas(entries: &mut [Arc<SuperfileEntry>]) {
+    let mut distinct: Vec<Arc<PhysicalSchema>> = Vec::new();
+    for entry in entries.iter_mut() {
+        let Some(schema) = entry.physical_schema.as_ref() else {
+            continue;
+        };
+        match distinct.iter().find(|seen| *seen == schema) {
+            Some(seen) if Arc::ptr_eq(seen, schema) => {}
+            Some(seen) => {
+                let shared = Some(Arc::clone(seen));
+                match Arc::get_mut(entry) {
+                    Some(entry) => entry.physical_schema = shared,
+                    None => {
+                        *entry = Arc::new(SuperfileEntry {
+                            physical_schema: shared,
+                            ..(**entry).clone()
+                        })
+                    }
+                }
+            }
+            None => distinct.push(Arc::clone(schema)),
+        }
+    }
 }
 
 /// Read `format_version` straight off the datum bytes. It is the record's
@@ -749,7 +787,7 @@ fn decode_superfile(
         n_docs,
         id_min,
         id_max,
-        scalar_stats: decode_scalar_stats(&scalar_bytes, legacy)?,
+        scalar_stats: decode_scalar_stats(&scalar_bytes, legacy)?.into(),
         fts_summary: decode_fts_summary_map(&fts_bytes, legacy)?,
         vector_summary: decode_vector_summary_map(&vector_bytes, legacy)?,
         partition_key,
@@ -1145,7 +1183,7 @@ mod tests {
             n_docs,
             id_min: 0,
             id_max: n_docs.saturating_sub(1) as i128,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1246,7 +1284,7 @@ mod tests {
             n_docs: 12_345,
             id_min: 1_000,
             id_max: 13_344,
-            scalar_stats: make_scalar_stats(),
+            scalar_stats: make_scalar_stats().into(),
             fts_summary: fts,
             vector_summary: vec_summary,
             partition_key: vec![0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
@@ -1372,11 +1410,11 @@ mod tests {
             b.scalar_stats.len(),
             "scalar_stats column count"
         );
-        for (k, a_agg) in &a.scalar_stats {
+        for (k, a_agg) in a.scalar_stats.map().iter() {
             let (a_min, a_max) = (&a_agg.min, &a_agg.max);
             let b_agg = b
                 .scalar_stats
-                .get(k)
+                .get(*k)
                 .unwrap_or_else(|| panic!("missing scalar col {k}"));
             let (b_min, b_max) = (&b_agg.min, &b_agg.max);
             assert_eq!(a_min.data_type(), b_min.data_type(), "scalar {k} min type");
@@ -1508,7 +1546,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: vec![0xab, 0xcd],
@@ -1526,7 +1564,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1686,7 +1724,7 @@ mod tests {
             n_docs: 3,
             id_min: -5,
             id_max: 7,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1718,7 +1756,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1756,7 +1794,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -2156,15 +2194,15 @@ mod tests {
             "_id",
         );
         entry.physical_schema = Some(Arc::new(PhysicalSchema::of_stored_schema(&stored)));
-        entry.scalar_stats = make_scalar_stats();
-        let keys: Vec<FieldId> = entry.scalar_stats.keys().copied().collect();
+        entry.scalar_stats = make_scalar_stats().into();
+        let keys: Vec<FieldId> = entry.scalar_stats.keys();
         assert!(!keys.is_empty(), "the fixture entry carries scalar stats");
 
         let part = fresh_part(vec![Arc::new(entry.clone())]);
         // A resolver that knows nothing: an id-keyed part never consults it.
         let decoded = decode(&encode(&part), &LegacyNames::none()).expect("decode");
         let back = &decoded.superfiles[0];
-        let mut back_keys: Vec<FieldId> = back.scalar_stats.keys().copied().collect();
+        let mut back_keys: Vec<FieldId> = back.scalar_stats.keys();
         let mut want = keys.clone();
         back_keys.sort();
         want.sort();
@@ -2415,7 +2453,7 @@ mod tests {
             n_docs: 78_000,
             id_min: 0,
             id_max: 77_999,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: vec_summary,
             partition_key: Vec::new(),

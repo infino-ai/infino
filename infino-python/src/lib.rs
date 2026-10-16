@@ -1269,7 +1269,8 @@ impl Table {
     }
 
     /// Delete rows matching a SQL predicate string, e.g. `"status = 'spam'"`.
-    /// Needs durable storage — a `memory://` table raises.
+    /// Needs durable storage — a `memory://` table raises. Waits for appends
+    /// already in flight on the table to commit.
     fn delete(&self, py: Python<'_>, predicate: &str) -> PyResult<MutationStats> {
         // Parse and mutate both off the GIL — neither touches Python.
         let stats = py.detach(|| {
@@ -1281,7 +1282,8 @@ impl Table {
 
     /// Replace rows matching a SQL predicate with `new_rows` (same shapes as
     /// `append`). Replacement is 1:1 — the match count must equal the number
-    /// of rows supplied. Needs durable storage.
+    /// of rows supplied. Needs durable storage. Waits for appends already in
+    /// flight on the table to commit.
     fn update(
         &self,
         py: Python<'_>,

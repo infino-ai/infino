@@ -27,7 +27,7 @@ use crate::{
     },
     supertable::{
         ManifestLoadError,
-        manifest::{part, term_index::TermIndexError},
+        manifest::{part, summaries, term_index::TermIndexError},
         schema::error::SchemaError,
     },
 };
@@ -429,6 +429,18 @@ pub enum ManifestError {
     /// Unknown part id
     #[error("unknown part id: {0}")]
     UnknownPartId(part::PartId),
+    /// A part's summaries section could not be built from its entries'
+    /// statistics.
+    #[error("summaries section: {0}")]
+    Summaries(#[from] summaries::SummariesError),
+    /// A commit would write a superfile's statistics from a section this
+    /// handle could not read, and so would record it as having none. The
+    /// commit is refused instead; a fresh handle reads the section again.
+    #[error(
+        "the statistics of superfile {superfile_id} are in a summaries section this handle could \
+         not read; the commit is refused rather than written without them"
+    )]
+    StatisticsUnavailable { superfile_id: uuid::Uuid },
 }
 
 /// Errors raised by [`crate::supertable::Supertable::open`] and

@@ -181,7 +181,7 @@ mod tests {
         supertable::{
             FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
             manifest::{
-                aggregates,
+                ScalarStats, aggregates,
                 bloom::BloomBuilder,
                 list::{FORMAT_VERSION, PartitionStrategy},
                 part::ContentHash,
@@ -248,7 +248,7 @@ mod tests {
             n_docs: ((id_max - id_min) + 1) as u64,
             id_min,
             id_max,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: fts,
             vector_summary: vec_summary,
             partition_key: Vec::new(),
@@ -272,6 +272,7 @@ mod tests {
             scalar_stats_agg: aggs.scalar_stats_agg,
             fts_summary_agg: aggs.fts_summary_agg,
             fts_length_totals: None,
+            summaries: None,
         }
     }
 
@@ -351,7 +352,7 @@ mod tests {
             n_docs: 5,
             id_min: 21,
             id_max: 25,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: empty_fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -390,7 +391,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: empty_fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -431,7 +432,7 @@ mod tests {
                 n_docs: 1,
                 id_min,
                 id_max: id_min,
-                scalar_stats: cols,
+                scalar_stats: cols.into(),
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
@@ -480,7 +481,7 @@ mod tests {
                 n_docs: 1,
                 id_min: id_lo,
                 id_max: id_hi,
-                scalar_stats: cols,
+                scalar_stats: cols.into(),
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),

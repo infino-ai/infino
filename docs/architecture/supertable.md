@@ -200,8 +200,37 @@ reading the superfile bytes:
 - **Location.** A storage-backend identifier for the superfile's bytes.
 - **Row range.** The superfile's document count and the range of primary
 identifiers it covers.
-- **Scalar statistics.** Per-column minimum and maximum values for the
-scalar columns, used to skip superfiles for predicate queries.
+- **Scalar statistics.** Per-column minimum and maximum values, null
+count, exact sum, and either an exact table of the column's values (at
+most a few hundred distinct) or a distinct-count sketch, used to skip
+superfiles for predicate queries and to feed the SQL planner. On a
+persisted table these do not sit in the entry: each manifest part has a
+summaries section beside it (one content-addressed object holding every
+superfile's statistics, one Arrow batch per column type, with a
+directory from column to its rows), and an entry holds its row of that
+section. A query decodes the columns it asks about: reading one column
+decodes the type group it sits in, every same-typed column's rows with
+it, once per handle for as long as the part is cached, so a handle's
+statistics cost grows with the column types its queries touch and stops
+at twice the section's bytes. A table of thousands of columns costs a
+handle no more per superfile than a table of ten. A
+section that cannot be read, or that is not its part's, leaves the
+part's superfiles without statistics for that handle: every prune keeps
+them, which is correct, and the load goes on. Such a handle never
+writes those statistics anew from the nothing it sees: an append goes
+to a part of its own, and a commit that would rewrite the part is
+refused, so the statistics wait in the section for a handle that reads
+it. The section's size counts with the part's toward the split cap,
+since a commit to the part rewrites both; the rewrite carries the old
+section's rows over as they are.
+
+The list's major version moved with the section. The first commit by
+this engine on any table, including a maintenance publish that adds no
+data and the hidden vector index's sibling, writes the list at the new
+major, and an engine from before the section refuses it rather than
+fold a part's rollups from its own appends alone. So a deployment that
+has committed cannot be rolled back to an engine from before the
+section; it reads nothing of that table.
 - **Full-text summary.** Per text column, the lexicographic range of
 its terms and the length statistics BM25 scores with. Which superfiles
 hold a given term is not recorded here: that is the table-level term
@@ -517,7 +546,9 @@ other. A reader holds an immutable manifest snapshot; a writer builds
 new superfiles and a new manifest independently.
 - **Atomic publication.** A reader sees either the manifest before a
 commit or the manifest after it, never an intermediate state.
-- **Single writer.** One writer is active per table at a time.
+- **Writers.** Appends that keep the table's schema build in parallel and
+publish one at a time; updates, deletes and schema changes take the table's
+writer exclusively, waiting for appends in flight to finish.
 - **Separate pools.** Query fan-out and superfile builds use separate
 worker pools, so background writes do not starve foreground reads.
 
@@ -525,6 +556,7 @@ worker pools, so background writes do not starve foreground reads.
 
 - Superfiles are immutable; updates are expressed by publishing a new
 manifest over different superfiles.
-- One writer is active per table at a time.
+- Within one process, commits to a table publish one at a time;
+appends that keep the schema build in parallel before publishing.
 - Full-text and vector search are distinct query paths; combined
 relevance scoring is left to the caller.

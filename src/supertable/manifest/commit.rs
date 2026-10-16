@@ -57,6 +57,7 @@ use crate::{
                 self as part_mod, BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, ManifestPart,
                 PartId,
             },
+            summaries::summaries_uri,
         },
     },
     utils::trace::record,
@@ -295,6 +296,28 @@ pub struct EncodedPart {
     /// form IS routing-shaped, so a sibling would be a byte-identical
     /// duplicate. PUT together with `encoded` in the same commit.
     pub routing_encoded: Option<Bytes>,
+    /// The part's summaries section and its content hash: every entry's
+    /// per-column statistics, which the part itself then omits. `None` for
+    /// hidden manifests, whose entries keep their statistics inline.
+    pub summaries: Option<(Bytes, ContentHash)>,
+}
+
+impl EncodedPart {
+    /// Every object this part publishes, by storage key: the part, its
+    /// routing sibling and its summaries section. All content-addressed.
+    pub fn objects(&self) -> Vec<(String, Bytes)> {
+        let mut out = vec![(
+            part_uri(&ContentHash::of(&self.encoded)),
+            self.encoded.clone(),
+        )];
+        if let Some(routing) = &self.routing_encoded {
+            out.push((part_uri(&ContentHash::of(routing)), routing.clone()));
+        }
+        if let Some((bytes, hash)) = &self.summaries {
+            out.push((summaries_uri(hash), bytes.clone()));
+        }
+        out
+    }
 }
 
 /// Outcome of writing a manifest part — returned by
@@ -360,13 +383,26 @@ pub(crate) fn frame_content_size(compressed: &[u8], fallback: u64) -> u64 {
         .unwrap_or(fallback)
 }
 
-/// PUT pre-encoded part bytes to storage.
+/// PUT pre-encoded part bytes to storage. The commit publishes a part's
+/// objects through [`EncodedPart::objects`] and [`write_object_bytes`];
+/// this stays for the tests that write one part on its own.
+#[cfg(test)]
 pub(crate) async fn write_part_bytes(
     storage: &dyn StorageProvider,
     encoded: Bytes,
 ) -> Result<(), CommitError> {
     let uri = part_uri(&ContentHash::of(&encoded));
-    match storage.put_atomic(&uri, encoded).await {
+    write_object_bytes(storage, &uri, encoded).await
+}
+
+/// PUT content-addressed bytes at `uri`. An object already there holds
+/// the same bytes (same hash, same content), so that is success.
+pub(crate) async fn write_object_bytes(
+    storage: &dyn StorageProvider,
+    uri: &str,
+    bytes: Bytes,
+) -> Result<(), CommitError> {
+    match storage.put_atomic(uri, bytes).await {
         Ok(_) | Err(StorageError::PreconditionFailed { .. }) => Ok(()),
         Err(e) => Err(e.into()),
     }

@@ -105,10 +105,9 @@ impl IdGenerator {
     /// **Single-threaded contract.** Calling this from
     /// multiple threads concurrently is a logic error — the
     /// underlying ferroid generator is `!Sync` and the
-    /// borrow checker will refuse. The supertable's
-    /// writer-slot lock already serializes `append()` per
-    /// supertable handle; mint at append time and you'll
-    /// never violate this.
+    /// borrow checker will refuse. Appends on one handle
+    /// run concurrently, so the supertable keeps its
+    /// generator behind a mutex; that mutex is required.
     ///
     /// **Clock skew.** On a backward wall-clock step, ferroid
     /// spins via the closure passed to `next_id` until the

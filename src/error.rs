@@ -100,7 +100,8 @@ pub enum InfinoError {
     /// A concurrent writer won the race: an optimistic-concurrency
     /// (compare-and-set) precondition failed and the operation's own retry
     /// budget was exhausted, or another writer in this process holds the
-    /// table's single writer slot.
+    /// table's writer slot exclusively (an update, delete, schema change or
+    /// hydrate), or has claimed it and is waiting for appends to drain.
     ///
     /// **Retryable.** Nothing partial is left visible — the losing writer's
     /// manifest swap never published, and a mutation whose WAL did become

@@ -154,11 +154,22 @@ fn repair_carrying_body_to(
     carried_doc_count(source, entry)?;
     builder.set_carried_doc_count(entry.n_docs);
     builder.finish_carrying_body_to(source, output)?;
+    // The carried statistics are the entry's. An entry whose statistics
+    // sit in a section this handle could not read has none to carry, and
+    // a repair that wrote the superfile without them would lose them for
+    // good; it refuses instead, and a fresh handle reads the section.
+    if entry.scalar_stats.is_unavailable() {
+        return Err(BuildError::Store(format!(
+            "the statistics of superfile {} are in a summaries section this handle could not read; \
+             the repair is refused rather than written without them",
+            entry.superfile_id
+        )));
+    }
     Ok(SuperfileStats {
         n_docs: entry.n_docs,
         id_min: entry.id_min,
         id_max: entry.id_max,
-        scalar_stats: entry.scalar_stats.clone(),
+        scalar_stats: entry.scalar_stats.map().into_owned(),
     })
 }
 
@@ -223,7 +234,7 @@ mod tests {
             reader::SuperfileReader,
             vector::layout::VectorLayout,
         },
-        supertable::manifest::SuperfileUri,
+        supertable::manifest::{ScalarStats, SuperfileUri},
         test_helpers::{
             decimal128_id_field, decimal128_ids, default_vector_config, distinct_unit_vectors,
         },
@@ -274,7 +285,7 @@ mod tests {
             n_docs: source.n_docs(),
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

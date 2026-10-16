@@ -318,10 +318,9 @@ pub fn null_check_skip(
         .iter()
         .map(|entry| {
             guard.stats_are_stale(entry)
-                || entry
-                    .scalar_stats
-                    .get(&column)
-                    .is_none_or(|agg| null_check_may_match(agg, want_null))
+                || entry.scalar_stats.column(column).is_none_or(|stats| {
+                    null_check_may_match_counts(stats.null_count(), stats.all_null(), want_null)
+                })
         })
         .collect()
 }
@@ -424,18 +423,21 @@ impl ColumnTypeGuard {
 ///  - `IS NULL` (`want_null`): keep unless the stats prove zero nulls.
 ///  - `IS NOT NULL`: keep unless the column is entirely null.
 pub(crate) fn null_check_may_match(agg: &ScalarStatsAgg, want_null: bool) -> bool {
-    if want_null {
-        agg.null_count != Some(0)
-    } else {
-        !agg_all_null(agg)
-    }
+    null_check_may_match_counts(agg.null_count, agg.all_null(), want_null)
 }
 
-/// All values are null iff the min stat is null — no non-null value fed it.
-fn agg_all_null(agg: &ScalarStatsAgg) -> bool {
-    ScalarValue::try_from_array(agg.min.as_ref(), 0)
-        .map(|v| v.is_null())
-        .unwrap_or(false)
+/// [`null_check_may_match`] on the two statistics it reads, for a caller
+/// that has them without the whole aggregate.
+pub(crate) fn null_check_may_match_counts(
+    null_count: Option<u64>,
+    all_null: bool,
+    want_null: bool,
+) -> bool {
+    if want_null {
+        null_count != Some(0)
+    } else {
+        !all_null
+    }
 }
 
 /// Whether `entry` *could* contain a row satisfying `pred`, judged
@@ -451,14 +453,7 @@ fn superfile_may_match(entry: &SuperfileEntry, column: FieldId, pred: &ScalarPre
 /// The superfile's persisted min/max for `column`, or `None` when the
 /// column has no stats or the bounds don't decode (caller keeps).
 fn superfile_minmax(entry: &SuperfileEntry, column: FieldId) -> Option<(ScalarValue, ScalarValue)> {
-    let agg = entry.scalar_stats.get(&column)?;
-    match (
-        ScalarValue::try_from_array(agg.min.as_ref(), 0),
-        ScalarValue::try_from_array(agg.max.as_ref(), 0),
-    ) {
-        (Ok(min), Ok(max)) => Some((min, max)),
-        _ => None,
-    }
+    entry.scalar_stats.column(column)?.min_max_values()
 }
 
 /// Conservative `min`/`max`-vs-`value` comparison core, shared by the
@@ -598,7 +593,10 @@ const DECIMAL256_MAX_PRECISION: u8 = 76;
 
 #[cfg(test)]
 mod tests {
-    use crate::{supertable::schema::FieldId, test_helpers::fid};
+    use crate::{
+        supertable::{manifest::ScalarStats, schema::FieldId},
+        test_helpers::fid,
+    };
 
     /// Pair each predicate with the id of its column, as the pruner does.
     fn pairs(preds: &[ScalarPredicate]) -> Vec<(Option<FieldId>, &ScalarPredicate)> {
@@ -709,7 +707,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

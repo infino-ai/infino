@@ -488,7 +488,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: cols,
+            scalar_stats: cols.into(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -512,6 +512,7 @@ mod tests {
             scalar_stats_agg: aggs.scalar_stats_agg,
             fts_summary_agg: aggs.fts_summary_agg,
             fts_length_totals: None,
+            summaries: None,
         }
     }
 
@@ -729,7 +730,7 @@ mod tests {
             n_docs: titles.len() as u64,
             id_min: 0,
             id_max: 0,
-            scalar_stats: cols,
+            scalar_stats: cols.into(),
             fts_summary: fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -845,7 +846,7 @@ mod tests {
             n_docs: bloom_tokens.len().max(1) as u64,
             id_min: 0,
             id_max: 0,
-            scalar_stats: cols,
+            scalar_stats: cols.into(),
             fts_summary: fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

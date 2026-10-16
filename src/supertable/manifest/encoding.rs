@@ -38,9 +38,16 @@
 
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 
-use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
-use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow::{
+    compute::take,
+    ipc::{
+        MetadataVersion,
+        reader::StreamReader,
+        writer::{IpcWriteOptions, StreamWriter},
+    },
+};
+use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
 use datafusion::scalar::ScalarValue;
 use thiserror::Error;
 
@@ -164,6 +171,20 @@ pub enum EncodeError {
 // itself. Decoding tolerates absent optional stats (segments
 // written before they existed), never inventing values.
 
+/// Buffer alignment of the per-column statistics batches: the IPC
+/// format's minimum. The writer's default pads every buffer to 64 bytes,
+/// and a batch of length-one arrays, one per column, is then mostly
+/// padding: at four thousand columns the padding alone was over a
+/// megabyte per superfile.
+const STATS_IPC_ALIGNMENT: usize = 8;
+
+/// The IPC writer options every per-column statistics batch is written
+/// with (see [`STATS_IPC_ALIGNMENT`]), in parts and in summaries sections.
+pub(crate) fn stats_ipc_options() -> IpcWriteOptions {
+    IpcWriteOptions::try_new(STATS_IPC_ALIGNMENT, false, MetadataVersion::V5)
+        .expect("the IPC minimum alignment is accepted")
+}
+
 const MIN_SUFFIX: &str = "__min";
 const MAX_SUFFIX: &str = "__max";
 const NULLS_SUFFIX: &str = "__nulls";
@@ -243,11 +264,20 @@ pub fn encode_scalar_stats(stats: &HashMap<FieldId, ScalarStatsAgg>) -> Vec<u8> 
 
     let mut out = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut out, &schema).expect("ipc writer init");
+        let mut writer = StreamWriter::try_new_with_options(&mut out, &schema, stats_ipc_options())
+            .expect("ipc writer init");
         writer.write(&batch).expect("ipc write");
         writer.finish().expect("ipc finish");
     }
     out
+}
+
+/// A one-row array's first row copied into a buffer of its own, so a
+/// bound kept for long (an entry's, a part rollup's) does not pin the
+/// buffer it was sliced from: an IPC body, or a section group's column.
+pub(crate) fn detach_bound(array: &ArrayRef) -> Result<ArrayRef, ArrowError> {
+    let first_row = UInt32Array::from(vec![0u32]);
+    take(array.as_ref(), &first_row, None)
 }
 
 pub fn decode_scalar_stats(
@@ -329,13 +359,23 @@ pub fn decode_scalar_stats(
             maxes.len()
         )));
     }
+    // The IPC reader decodes the batch into one body buffer and hands each
+    // column out as a slice of it, so any one surviving bound would keep
+    // the whole body alive for as long as its entry lives: 7 MiB per
+    // superfile at four thousand columns. Each stat is copied into a
+    // buffer of its own and the body goes with the batch.
+    let own = |array: &ArrayRef| -> Result<ArrayRef, DecodeError> {
+        detach_bound(array).map_err(|e| DecodeError::ArrowIpc(e.to_string()))
+    };
     let mut stats: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
     for (base, min) in mins {
         let max = maxes.remove(&base).ok_or_else(|| {
             DecodeError::ArrowIpc(format!("column {base} has __min but no __max"))
         })?;
+        let min = own(&min)?;
+        let max = own(&max)?;
         let null_count = null_counts.remove(&base);
-        let sum = sums.remove(&base);
+        let sum = sums.remove(&base).map(|sum| own(&sum)).transpose()?;
         let hll = hlls.remove(&base);
         let value_counts = value_counts.remove(&base);
         // A key the table cannot resolve (an older artifact's name for a
@@ -395,8 +435,9 @@ pub(crate) fn encode_value_counts(
         .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
     let mut bytes = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut bytes, &schema)
-            .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+        let mut writer =
+            StreamWriter::try_new_with_options(&mut bytes, &schema, stats_ipc_options())
+                .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
         writer
             .write(&batch)
             .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
@@ -461,16 +502,16 @@ pub(crate) fn decode_value_counts(bytes: &[u8]) -> Result<ScalarValueCounts, Dec
 /// practice the schema is built from the array's own `data_type`, so the
 /// batch always matches — but failures are surfaced rather than panicked so
 /// a bad array can't abort a commit.
+///
+/// Test-only since the list carries a part's rollups as one batch: it
+/// writes the per-bound form that lists before minor 2.1 carry, so the
+/// decoder of that form stays exercised.
+#[cfg(test)]
 pub(crate) fn encode_length1_array(
     field_name: &str,
     arr: &ArrayRef,
 ) -> Result<Vec<u8>, EncodeError> {
-    // Enforce the single-value contract before writing — fail fast here
-    // rather than persisting a manifest that `decode_length1_array` would
-    // later reject.
-    if arr.len() != 1 {
-        return Err(EncodeError::WrongRowCount(arr.len()));
-    }
+    require_single_row(arr)?;
     let field = Field::new(field_name, arr.data_type().clone(), true);
     let schema = Arc::new(Schema::new(vec![field]));
     let batch = RecordBatch::try_new(schema.clone(), vec![arr.clone()])
@@ -487,6 +528,16 @@ pub(crate) fn encode_length1_array(
             .map_err(|e| EncodeError::ArrowIpc(e.to_string()))?;
     }
     Ok(out)
+}
+
+/// The single-value contract of an aggregate array, checked before a
+/// manifest is written rather than when a reader rejects it: an aggregate
+/// is one row, and a commit must fail on a bad array, never panic.
+pub(crate) fn require_single_row(arr: &ArrayRef) -> Result<(), EncodeError> {
+    if arr.len() != 1 {
+        return Err(EncodeError::WrongRowCount(arr.len()));
+    }
+    Ok(())
 }
 
 /// Decode the bytes produced by [`encode_length1_array`] back into the
@@ -1169,6 +1220,46 @@ mod decode_error_tests {
             decode_value_counts(&with_null),
             Err(DecodeError::ArrowIpc(msg)) if msg.contains("null")
         ));
+    }
+
+    /// Columns in the batch whose decoded bounds must not share a body.
+    const PINNED_BODY_COLUMNS: u32 = 400;
+    /// Values per column, enough that each column is sketched and the batch
+    /// body runs to hundreds of kilobytes.
+    const PINNED_BODY_VALUES: i64 = 300;
+    /// What a bound's array may report once it owns its bytes: its own
+    /// buffers and nothing of the batch it came from.
+    const OWNED_BOUND_CEILING_BYTES: usize = 1024;
+
+    /// Decoded bounds own their bytes: a bound's array reports its own
+    /// buffer, not the decoded body of the whole batch it was sliced from.
+    #[test]
+    fn decoded_bounds_do_not_pin_the_ipc_body() {
+        let mut stats = HashMap::new();
+        for i in 0..PINNED_BODY_COLUMNS {
+            let column: ArrayRef = Arc::new(Int64Array::from_iter_values(0..PINNED_BODY_VALUES));
+            stats.insert(
+                FieldId(i),
+                ScalarStatsAgg::from_column(&column).expect("stats"),
+            );
+        }
+        let bytes = encode_scalar_stats(&stats);
+        assert!(
+            bytes.len() > PINNED_BODY_COLUMNS as usize * OWNED_BOUND_CEILING_BYTES,
+            "the body is large: {} bytes",
+            bytes.len()
+        );
+        let decoded = decode_scalar_stats(&bytes, None).expect("decode");
+        assert_eq!(decoded.len(), PINNED_BODY_COLUMNS as usize);
+        for agg in decoded.values() {
+            for bound in [&agg.min, &agg.max] {
+                assert!(
+                    bound.get_array_memory_size() < OWNED_BOUND_CEILING_BYTES,
+                    "a bound reports {} bytes",
+                    bound.get_array_memory_size()
+                );
+            }
+        }
     }
 
     /// `decode_length1_array` rejects corrupt / wrong-shaped bytes with a typed

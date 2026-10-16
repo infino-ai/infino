@@ -177,7 +177,7 @@ fn hydrate_with_budget(
         }
         let output_stats = op_stats.as_ref().map(|_| commit_output_stats(&batch));
         bridge_on_runtime(
-            persist_superfile_publish_batch_async(inner, batch, CommitListMetadata::empty()),
+            persist_superfile_publish_batch_async(inner, batch, CommitListMetadata::empty(), None),
             &inner.query_runtime(),
         )?;
         // Counted only once the commit lands, as in `append`.
@@ -696,7 +696,7 @@ mod tests {
         let manifest = table.inner().manifest.load();
         let mut stats = HashMap::new();
         for entry in manifest.get_all_superfiles() {
-            ScalarStatsAgg::merge(&mut stats, &entry.scalar_stats);
+            ScalarStatsAgg::merge(&mut stats, &entry.scalar_stats.map());
         }
         stats.remove(&FieldId::ID_COLUMN);
         stats
@@ -758,7 +758,7 @@ mod tests {
         // `_id`, `n` and `s`.
         assert_eq!(want.len(), 3);
         for entry in manifest.get_all_superfiles() {
-            let got: HashSet<FieldId> = entry.scalar_stats.keys().copied().collect();
+            let got: HashSet<FieldId> = entry.scalar_stats.keys().into_iter().collect();
             assert_eq!(got, want);
         }
     }
