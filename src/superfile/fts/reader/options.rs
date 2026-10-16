@@ -74,15 +74,16 @@ pub struct Bm25SearchOptions {
     /// returned carries its true score and the error is confined to documents
     /// in superfiles that went unread.
     ///
-    /// It buys less than it appears to. The decision compares against the
-    /// largest ceiling among unread superfiles, and where those sit close
-    /// together, as on a table whose superfiles hold similar documents, that
-    /// figure stays near the global maximum until almost nothing is left.
-    /// Measured over a 962-query benchmark at a billion documents, one percent
-    /// read exactly as many superfiles as exact scoring; five percent cut the
-    /// median read six-fold, left the ninetieth percentile untouched, and cost
-    /// about 1.8 percent of real error. Measure your own corpus before
-    /// reaching for it.
+    /// It buys less than it appears to, and costs more. The decision compares
+    /// against the largest ceiling among unread superfiles, and where those
+    /// sit close together, as on a table whose superfiles hold similar
+    /// documents, that figure stays near the global maximum until almost
+    /// nothing is left. So a tolerance small enough to leave the top k intact
+    /// tends to skip nothing at all, while one large enough to skip a useful
+    /// number of superfiles tends to lose most of the true top k rather than
+    /// trim its edge. The fraction is a bound on score, not on how much of
+    /// the ranking survives. Measure both on your own corpus before reaching
+    /// for it.
     ///
     /// It also does nothing on a small table. A ranked query opens its first
     /// [`bound_ordered_open_window`] candidates at once, 64 by default, so
