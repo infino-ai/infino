@@ -47,7 +47,7 @@ use arrow::{
     },
 };
 use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
 use datafusion::scalar::ScalarValue;
 use thiserror::Error;
 
@@ -272,6 +272,14 @@ pub fn encode_scalar_stats(stats: &HashMap<FieldId, ScalarStatsAgg>) -> Vec<u8> 
     out
 }
 
+/// A one-row array's first row copied into a buffer of its own, so a
+/// bound kept for long (an entry's, a part rollup's) does not pin the
+/// buffer it was sliced from: an IPC body, or a section group's column.
+pub(crate) fn detach_bound(array: &ArrayRef) -> Result<ArrayRef, ArrowError> {
+    let first_row = UInt32Array::from(vec![0u32]);
+    take(array.as_ref(), &first_row, None)
+}
+
 pub fn decode_scalar_stats(
     bytes: &[u8],
     legacy: Option<&LegacyNames>,
@@ -356,9 +364,8 @@ pub fn decode_scalar_stats(
     // the whole body alive for as long as its entry lives: 7 MiB per
     // superfile at four thousand columns. Each stat is copied into a
     // buffer of its own and the body goes with the batch.
-    let first_row = UInt32Array::from(vec![0u32]);
     let own = |array: &ArrayRef| -> Result<ArrayRef, DecodeError> {
-        take(array.as_ref(), &first_row, None).map_err(|e| DecodeError::ArrowIpc(e.to_string()))
+        detach_bound(array).map_err(|e| DecodeError::ArrowIpc(e.to_string()))
     };
     let mut stats: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
     for (base, min) in mins {

@@ -45,7 +45,6 @@
 //! superfiles has a run in each type's group.
 
 use std::{
-    borrow::Cow,
     collections::HashMap,
     fmt,
     io::Cursor,
@@ -70,7 +69,7 @@ use uuid::Uuid;
 
 use crate::supertable::{
     manifest::{
-        column_hll,
+        SuperfileEntry, column_hll,
         encoding::stats_ipc_options,
         hll::HllSketch,
         list::{ScalarStatsAgg, ScalarValueCounts},
@@ -256,14 +255,23 @@ impl ColumnRow<'_> {
         column_hll(&[Arc::clone(item.column(0))])
     }
 
-    /// The exact value table, built from its row, when the superfile
-    /// carries one.
-    pub(crate) fn value_counts(&self) -> Option<ScalarValueCounts> {
+    /// The exact value table as it sits in the section: one list item, a
+    /// struct of values and counts, when the superfile carries a table.
+    /// What a re-encode of this row carries over, bytes for bytes, in
+    /// place of a rebuild.
+    fn value_table_array(&self) -> Option<ArrayRef> {
         self.group
             .value_counts
             .as_ref()
             .filter(|list| list.is_valid(self.index))
-            .and_then(|list| value_counts_of(&list.value(self.index)))
+            .map(|list| list.value(self.index))
+    }
+
+    /// The exact value table, built from its row, when the superfile
+    /// carries one.
+    pub(crate) fn value_counts(&self) -> Option<ScalarValueCounts> {
+        self.value_table_array()
+            .and_then(|item| value_counts_of(&item))
     }
 
     /// Every statistic, in the decoded shape.
@@ -277,6 +285,162 @@ impl ColumnRow<'_> {
             value_counts: self.value_counts(),
         }
     }
+}
+
+/// One column's statistics for one superfile, wherever they live, read
+/// one statistic at a time. Decoded statistics are borrowed; a section's
+/// are read from the decoded group's arrays. Only [`Self::value_counts`]
+/// builds anything, so the pruner, the planner's statistics and the
+/// rollup fold, which read bounds, counts, sums and sketches, cost one
+/// array read each per superfile and column.
+#[derive(Clone, Copy)]
+pub enum ColumnStats<'a> {
+    Inline(&'a ScalarStatsAgg),
+    Section(ColumnRow<'a>),
+}
+
+impl ColumnStats<'_> {
+    /// The lower bound as a one-row array; null when the column is null
+    /// throughout the superfile.
+    pub fn min(&self) -> ArrayRef {
+        match self {
+            Self::Inline(agg) => Arc::clone(&agg.min),
+            Self::Section(row) => row.min(),
+        }
+    }
+
+    /// The upper bound as a one-row array.
+    pub fn max(&self) -> ArrayRef {
+        match self {
+            Self::Inline(agg) => Arc::clone(&agg.max),
+            Self::Section(row) => row.max(),
+        }
+    }
+
+    /// Both bounds as values, when they convert.
+    pub fn min_max_values(&self) -> Option<(ScalarValue, ScalarValue)> {
+        match self {
+            Self::Inline(agg) => {
+                let min = ScalarValue::try_from_array(agg.min.as_ref(), 0).ok()?;
+                let max = ScalarValue::try_from_array(agg.max.as_ref(), 0).ok()?;
+                Some((min, max))
+            }
+            Self::Section(row) => row.min_max_values(),
+        }
+    }
+
+    /// Whether the column had no non-null value in the superfile.
+    pub fn all_null(&self) -> bool {
+        match self {
+            Self::Inline(agg) => agg.all_null(),
+            Self::Section(row) => row.all_null(),
+        }
+    }
+
+    /// The null count, when the superfile carries it.
+    pub fn null_count(&self) -> Option<u64> {
+        match self {
+            Self::Inline(agg) => agg.null_count,
+            Self::Section(row) => row.null_count(),
+        }
+    }
+
+    /// The exact sum as a one-row array, when the superfile carries it.
+    pub fn sum(&self) -> Option<ArrayRef> {
+        match self {
+            Self::Inline(agg) => agg.sum.clone(),
+            Self::Section(row) => row.sum(),
+        }
+    }
+
+    /// The distinct-count sketch's bytes, when the superfile carries one.
+    pub fn sketch(&self) -> Option<&[u8]> {
+        match self {
+            Self::Inline(agg) => agg.hll.as_deref(),
+            Self::Section(row) => row.sketch(),
+        }
+    }
+
+    /// The sketch that stands in for the exact value table of a column
+    /// counted exactly, when the superfile carries a table: the table's
+    /// values hashed as the column sketch hashes them, so a table's
+    /// estimate and a sketch's merge into one.
+    pub fn values_sketch(&self) -> Option<HllSketch> {
+        match self {
+            Self::Inline(agg) => agg.value_counts.as_ref().and_then(table_sketch),
+            Self::Section(row) => row.values_sketch(),
+        }
+    }
+
+    /// Whether the superfile carries an exact value table for the column.
+    fn has_value_table(&self) -> bool {
+        match self {
+            Self::Inline(agg) => agg.value_counts.is_some(),
+            Self::Section(row) => row.value_table_array().is_some(),
+        }
+    }
+
+    /// The exact value table as a struct array of values and counts, for
+    /// the encoder: a section's row is carried over as it is, a decoded
+    /// table is built into one. `None` when the superfile carries no
+    /// table, or the table's values are not of `data_type`.
+    fn value_table_array(&self, data_type: &DataType) -> Option<ArrayRef> {
+        let item = match self {
+            Self::Inline(agg) => {
+                let table = agg.value_counts.as_ref()?;
+                let values = ScalarValue::iter_to_array(
+                    table.entries().iter().map(|(value, _)| value.clone()),
+                )
+                .ok()?;
+                let counts: ArrayRef = Arc::new(UInt64Array::from_iter_values(
+                    table.entries().iter().map(|(_, n)| *n),
+                ));
+                let item =
+                    StructArray::try_new(value_table_fields(data_type), vec![values, counts], None)
+                        .ok()?;
+                Arc::new(item) as ArrayRef
+            }
+            Self::Section(row) => row.value_table_array()?,
+        };
+        let fields = match item.data_type() {
+            DataType::Struct(fields) => fields,
+            _ => return None,
+        };
+        (fields.len() == 2 && fields[0].data_type() == data_type).then_some(item)
+    }
+
+    /// The exact value table, when the superfile carries one.
+    pub(crate) fn value_counts(&self) -> Option<ScalarValueCounts> {
+        match self {
+            Self::Inline(agg) => agg.value_counts.clone(),
+            Self::Section(row) => row.value_counts(),
+        }
+    }
+
+    /// Every statistic, in the decoded shape.
+    pub fn stats(&self) -> ScalarStatsAgg {
+        match self {
+            Self::Inline(agg) => (*agg).clone(),
+            Self::Section(row) => row.stats(),
+        }
+    }
+}
+
+/// The sketch of an exact value table's values, hashed as the column
+/// sketch hashes them: `None` for a value type the sketch does not cover.
+pub(crate) fn table_sketch(table: &ScalarValueCounts) -> Option<HllSketch> {
+    let values =
+        ScalarValue::iter_to_array(table.entries().iter().map(|(value, _)| value.clone())).ok()?;
+    column_hll(&[values])
+}
+
+/// The struct fields of a value table item: the values, of the group's
+/// type, and their counts.
+fn value_table_fields(data_type: &DataType) -> Fields {
+    Fields::from(vec![
+        Field::new(VALUE_FIELD, data_type.clone(), false),
+        Field::new(COUNT_FIELD, DataType::UInt64, false),
+    ])
 }
 
 /// The exact value table stored as one list item: a struct of values and
@@ -322,48 +486,50 @@ impl fmt::Debug for SummariesSection {
     }
 }
 
-/// One row of the section as it is given to the encoder.
-pub struct SummaryRow {
+/// One row of the section as it is given to the encoder: a column's
+/// statistics for one superfile, read from wherever they live. A row
+/// read from an earlier section is carried into the new one array for
+/// array; only a decoded row is built.
+pub struct SummaryRow<'a> {
     pub column: FieldId,
     /// Index into the superfile ids the section is written for.
     pub superfile: u32,
-    pub stats: ScalarStatsAgg,
+    pub stats: ColumnStats<'a>,
 }
 
 impl SummariesSection {
     /// Encode the section of part `part_id` for the superfiles `ids`, in
-    /// row order, from `rows`. A row's bounds must be one-row arrays of
-    /// one type; a value table's values must be of that type.
+    /// row order, from `rows`.
+    ///
+    /// A statistic that cannot be written is left out rather than failing
+    /// the commit that writes the section: a row whose bounds are not one
+    /// row of one type, or whose superfile is not among `ids`, is dropped
+    /// with a warning, and the superfile then reads as having no
+    /// statistics for that column, which keeps it in every prune. The
+    /// errors left are the ones that mean the encoder itself is broken.
     pub fn encode(
         part_id: PartId,
         ids: &[Uuid],
-        rows: Vec<SummaryRow>,
+        rows: Vec<SummaryRow<'_>>,
     ) -> Result<Vec<u8>, SummariesError> {
         // Group by the bounds' type, in a fixed order so equal input gives
         // equal bytes, which content addressing relies on.
-        let mut by_type: Vec<(DataType, Vec<SummaryRow>)> = Vec::new();
+        let mut by_type: Vec<(DataType, Vec<SummaryRow<'_>>)> = Vec::new();
         for row in rows {
-            if row.stats.min.len() != 1 || row.stats.max.len() != 1 {
-                return Err(SummariesError::Malformed(format!(
-                    "column {:?}: a bound is not one row",
-                    row.column
-                )));
+            let (min, max) = (row.stats.min(), row.stats.max());
+            if min.len() != 1 || max.len() != 1 {
+                warn!(column = ?row.column, superfile = row.superfile, "a bound is not one row; the statistic is left out of the section");
+                continue;
             }
-            if row.stats.min.data_type() != row.stats.max.data_type() {
-                return Err(SummariesError::Malformed(format!(
-                    "column {:?}: min and max differ in type",
-                    row.column
-                )));
+            if min.data_type() != max.data_type() {
+                warn!(column = ?row.column, superfile = row.superfile, "min and max differ in type; the statistic is left out of the section");
+                continue;
             }
             if row.superfile as usize >= ids.len() {
-                return Err(SummariesError::Malformed(format!(
-                    "column {:?}: superfile row {} of {}",
-                    row.column,
-                    row.superfile,
-                    ids.len()
-                )));
+                warn!(column = ?row.column, superfile = row.superfile, superfiles = ids.len(), "a statistic names a superfile the section has no row for; left out");
+                continue;
             }
-            let data_type = row.stats.min.data_type().clone();
+            let data_type = min.data_type().clone();
             match by_type.iter_mut().find(|(t, _)| *t == data_type) {
                 Some((_, rows)) => rows.push(row),
                 None => by_type.push((data_type, vec![row])),
@@ -529,24 +695,30 @@ impl SummariesSection {
     /// than dropping one.
     pub fn column(&self, row: u32, column: FieldId) -> Option<ColumnRow<'_>> {
         let first = self.directory.partition_point(|entry| entry.field < column);
-        for entry in self.directory[first..]
+        self.directory[first..]
             .iter()
             .take_while(|entry| entry.field == column)
-        {
-            let group = self.group(entry.group as usize)?;
-            let start = entry.row_start as usize;
-            let end = start + entry.row_count as usize;
-            let within = group.superfile.values()[start..end]
-                .binary_search(&row)
-                .ok();
-            if let Some(i) = within {
-                return Some(ColumnRow {
-                    group,
-                    index: start + i,
-                });
-            }
-        }
-        None
+            .find_map(|entry| self.row_in_run(entry, row))
+    }
+
+    /// The row of superfile `row` inside the directory run `entry`, when
+    /// the run's group decodes and holds it. The run was checked against
+    /// the group's length when the group decoded, so the slice is in
+    /// bounds; `get` keeps a defect from reaching a panic regardless.
+    fn row_in_run(&self, entry: &DirectoryEntry, row: u32) -> Option<ColumnRow<'_>> {
+        let group = self.group(entry.group as usize)?;
+        let start = entry.row_start as usize;
+        let end = start.checked_add(entry.row_count as usize)?;
+        let i = group
+            .superfile
+            .values()
+            .get(start..end)?
+            .binary_search(&row)
+            .ok()?;
+        Some(ColumnRow {
+            group,
+            index: start + i,
+        })
     }
 
     /// [`Self::column`] in the decoded shape, every statistic built.
@@ -556,24 +728,19 @@ impl SummariesSection {
 
     /// Every column the superfile at `row` carries, each read in place.
     pub fn row_columns(&self, row: u32) -> Vec<(FieldId, ColumnRow<'_>)> {
-        let mut out = Vec::new();
-        for entry in &self.directory {
-            let Some(group) = self.group(entry.group as usize) else {
-                continue;
-            };
-            let start = entry.row_start as usize;
-            let end = start + entry.row_count as usize;
-            if let Ok(i) = group.superfile.values()[start..end].binary_search(&row) {
-                out.push((
-                    entry.field,
-                    ColumnRow {
-                        group,
-                        index: start + i,
-                    },
-                ));
-            }
-        }
-        out
+        self.directory
+            .iter()
+            .filter_map(|entry| Some((entry.field, self.row_in_run(entry, row)?)))
+            .collect()
+    }
+
+    /// Whether the superfile at `row` carries statistics for any column:
+    /// the directory is walked until a run holds the row, decoding only
+    /// the groups walked.
+    pub fn row_has_statistics(&self, row: u32) -> bool {
+        self.directory
+            .iter()
+            .any(|entry| self.row_in_run(entry, row).is_some())
     }
 
     /// Every column's statistics for the superfile at `row`, every
@@ -613,11 +780,31 @@ impl SummariesSection {
                 .sum::<usize>()
     }
 
+    /// Group `index`, decoded on first use and checked against the
+    /// directory: a run that reaches past the group's rows makes the whole
+    /// group read as no statistics, since the directory and the group
+    /// disagree and neither can be trusted.
     fn group(&self, index: usize) -> Option<&Group> {
         let cell = self.decoded.get(index)?;
         let decoded = cell.get_or_init(|| {
             let (offset, length) = self.groups[index];
-            decode_group(&self.bytes[offset..offset + length])
+            let group = decode_group(&self.bytes[offset..offset + length])?;
+            let rows = group.superfile.len();
+            let run_past_the_group = self
+                .directory
+                .iter()
+                .filter(|entry| entry.group as usize == index)
+                .any(|entry| {
+                    (entry.row_start as usize)
+                        .checked_add(entry.row_count as usize)
+                        .is_none_or(|end| end > rows)
+                });
+            if run_past_the_group {
+                return Err(SummariesError::Malformed(format!(
+                    "a directory run reaches past group {index}'s {rows} rows"
+                )));
+            }
+            Ok(group)
         });
         match decoded {
             Ok(group) => Some(group),
@@ -667,16 +854,21 @@ impl<'a> Reader<'a> {
 
 /// One group's batch as an IPC stream. `rows` are sorted by (column,
 /// superfile) and share `data_type` as their bounds' type.
-fn encode_group(data_type: &DataType, rows: &[SummaryRow]) -> Result<Vec<u8>, SummariesError> {
+///
+/// The bounds and the null counts are the group; the sums, the sketches
+/// and the value tables are carried when they fit the group's 32-bit
+/// offsets and left out, with a warning, when they do not: a group that
+/// big has lost those statistics, not its bounds, and the commit goes on.
+fn encode_group(data_type: &DataType, rows: &[SummaryRow<'_>]) -> Result<Vec<u8>, SummariesError> {
     let column = UInt32Array::from(rows.iter().map(|row| row.column.0).collect::<Vec<_>>());
     let superfile = UInt32Array::from(rows.iter().map(|row| row.superfile).collect::<Vec<_>>());
-    let mins: Vec<&dyn Array> = rows.iter().map(|row| row.stats.min.as_ref()).collect();
-    let maxes: Vec<&dyn Array> = rows.iter().map(|row| row.stats.max.as_ref()).collect();
-    let min = concat(&mins).map_err(SummariesError::arrow)?;
-    let max = concat(&maxes).map_err(SummariesError::arrow)?;
+    let mins: Vec<ArrayRef> = rows.iter().map(|row| row.stats.min()).collect();
+    let maxes: Vec<ArrayRef> = rows.iter().map(|row| row.stats.max()).collect();
+    let min = concat(&as_dyn(&mins)).map_err(SummariesError::arrow)?;
+    let max = concat(&as_dyn(&maxes)).map_err(SummariesError::arrow)?;
     let null_count = UInt64Array::from(
         rows.iter()
-            .map(|row| row.stats.null_count)
+            .map(|row| row.stats.null_count())
             .collect::<Vec<_>>(),
     );
 
@@ -695,58 +887,55 @@ fn encode_group(data_type: &DataType, rows: &[SummaryRow]) -> Result<Vec<u8>, Su
         Arc::new(null_count),
     ];
 
-    if let Some(sum_type) = rows
+    let sums: Vec<Option<ArrayRef>> = rows.iter().map(|row| row.stats.sum()).collect();
+    if let Some(sum_type) = sums
         .iter()
-        .find_map(|row| row.stats.sum.as_ref().map(|sum| sum.data_type().clone()))
+        .flatten()
+        .map(|sum| sum.data_type().clone())
+        .next()
     {
         let null_sum = new_null_array(&sum_type, 1);
-        let sums: Vec<ArrayRef> = rows
+        let sums: Vec<ArrayRef> = sums
             .iter()
-            .map(|row| match &row.stats.sum {
+            .map(|sum| match sum {
                 Some(sum) if sum.data_type() == &sum_type && sum.len() == 1 => Arc::clone(sum),
                 _ => Arc::clone(&null_sum),
             })
             .collect();
-        let sums: Vec<&dyn Array> = sums.iter().map(AsRef::as_ref).collect();
-        fields.push(Field::new(SUM_FIELD, sum_type, true));
-        arrays.push(concat(&sums).map_err(SummariesError::arrow)?);
+        match concat(&as_dyn(&sums)) {
+            Ok(array) => {
+                fields.push(Field::new(SUM_FIELD, sum_type, true));
+                arrays.push(array);
+            }
+            Err(error) => {
+                warn!(%error, group = %data_type, "the group's sums do not encode; left out of the section");
+            }
+        }
     }
 
-    if rows.iter().any(|row| row.stats.hll.is_some()) {
-        let sketches: Vec<Option<&[u8]>> =
-            rows.iter().map(|row| row.stats.hll.as_deref()).collect();
+    let sketches: Vec<Option<&[u8]>> = rows.iter().map(|row| row.stats.sketch()).collect();
+    if sketches.iter().any(Option::is_some) {
         let total: usize = sketches.iter().flatten().map(|bytes| bytes.len()).sum();
         if total > MAX_GROUP_OFFSET {
-            return Err(SummariesError::Malformed(format!(
-                "a group of type {data_type} holds {total} sketch bytes, past the 32-bit offsets"
-            )));
+            warn!(group = %data_type, bytes = total, "the group's sketches pass the 32-bit offsets; left out of the section");
+        } else {
+            fields.push(Field::new(HLL_FIELD, DataType::Binary, true));
+            arrays.push(Arc::new(BinaryArray::from(sketches)));
         }
-        fields.push(Field::new(HLL_FIELD, DataType::Binary, true));
-        arrays.push(Arc::new(BinaryArray::from(sketches)));
     }
 
-    if rows.iter().any(|row| row.stats.value_counts.is_some()) {
-        let mut values: Vec<ScalarValue> = Vec::new();
-        let mut counts: Vec<u64> = Vec::new();
+    if rows.iter().any(|row| row.stats.has_value_table()) {
+        let mut items: Vec<ArrayRef> = Vec::new();
         let mut lengths: Vec<usize> = Vec::with_capacity(rows.len());
         let mut present: Vec<bool> = Vec::with_capacity(rows.len());
+        let mut entries = 0usize;
         for row in rows {
-            match &row.stats.value_counts {
-                Some(table) => {
-                    for (value, count) in table.entries() {
-                        if value.data_type() != *data_type {
-                            return Err(SummariesError::Malformed(format!(
-                                "column {:?}: a value table of type {} in a group of type {}",
-                                row.column,
-                                value.data_type(),
-                                data_type
-                            )));
-                        }
-                        values.push(value.clone());
-                        counts.push(*count);
-                    }
-                    lengths.push(table.entries().len());
+            match row.stats.value_table_array(data_type) {
+                Some(item) => {
+                    entries = entries.saturating_add(item.len());
+                    lengths.push(item.len());
                     present.push(true);
+                    items.push(item);
                 }
                 None => {
                     lengths.push(0);
@@ -754,38 +943,22 @@ fn encode_group(data_type: &DataType, rows: &[SummaryRow]) -> Result<Vec<u8>, Su
                 }
             }
         }
-        if values.len() > MAX_GROUP_OFFSET {
-            return Err(SummariesError::Malformed(format!(
-                "a group of type {data_type} holds {} value-table entries, past the 32-bit offsets",
-                values.len()
-            )));
+        let list = if entries > MAX_GROUP_OFFSET {
+            warn!(group = %data_type, entries, "the group's value tables pass the 32-bit offsets; left out of the section");
+            None
+        } else if items.is_empty() {
+            None
+        } else {
+            value_table_list(data_type, &items, lengths, present)
+                .map_err(|error| {
+                    warn!(%error, group = %data_type, "the group's value tables do not encode; left out of the section");
+                })
+                .ok()
+        };
+        if let Some((field, list)) = list {
+            fields.push(field);
+            arrays.push(list);
         }
-        let values = ScalarValue::iter_to_array(values).map_err(SummariesError::arrow)?;
-        let counts: ArrayRef = Arc::new(UInt64Array::from(counts));
-        let struct_fields = Fields::from(vec![
-            Field::new(VALUE_FIELD, data_type.clone(), false),
-            Field::new(COUNT_FIELD, DataType::UInt64, false),
-        ]);
-        let items = StructArray::try_new(struct_fields.clone(), vec![values, counts], None)
-            .map_err(SummariesError::arrow)?;
-        let item_field = Arc::new(Field::new(
-            ITEM_FIELD,
-            DataType::Struct(struct_fields),
-            false,
-        ));
-        let list = ListArray::try_new(
-            Arc::clone(&item_field),
-            OffsetBuffer::<i32>::from_lengths(lengths),
-            Arc::new(items),
-            Some(NullBuffer::from(present)),
-        )
-        .map_err(SummariesError::arrow)?;
-        fields.push(Field::new(
-            VALUE_COUNTS_FIELD,
-            DataType::List(item_field),
-            true,
-        ));
-        arrays.push(Arc::new(list));
     }
 
     let schema = Arc::new(Schema::new(fields));
@@ -798,6 +971,38 @@ fn encode_group(data_type: &DataType, rows: &[SummaryRow]) -> Result<Vec<u8>, Su
         writer.finish().map_err(SummariesError::arrow)?;
     }
     Ok(out)
+}
+
+/// The value-table column of a group: one list item per row, each a
+/// struct of values and counts, from the per-row items.
+fn value_table_list(
+    data_type: &DataType,
+    items: &[ArrayRef],
+    lengths: Vec<usize>,
+    present: Vec<bool>,
+) -> Result<(Field, ArrayRef), SummariesError> {
+    let items = concat(&as_dyn(items)).map_err(SummariesError::arrow)?;
+    let item_field = Arc::new(Field::new(
+        ITEM_FIELD,
+        DataType::Struct(value_table_fields(data_type)),
+        false,
+    ));
+    let list = ListArray::try_new(
+        Arc::clone(&item_field),
+        OffsetBuffer::<i32>::from_lengths(lengths),
+        items,
+        Some(NullBuffer::from(present)),
+    )
+    .map_err(SummariesError::arrow)?;
+    Ok((
+        Field::new(VALUE_COUNTS_FIELD, DataType::List(item_field), true),
+        Arc::new(list),
+    ))
+}
+
+/// The arrays as `concat` takes them.
+fn as_dyn(arrays: &[ArrayRef]) -> Vec<&dyn Array> {
+    arrays.iter().map(AsRef::as_ref).collect()
 }
 
 /// A group's IPC stream back to its arrays.
@@ -870,18 +1075,19 @@ fn decode_group(bytes: &[u8]) -> Result<Group, SummariesError> {
     })
 }
 
-/// Rows for the encoder from entries' decoded statistics: every column of
-/// every map, with the map's position as the superfile row.
-pub fn rows_from_maps<'a>(
-    maps: impl IntoIterator<Item = Cow<'a, HashMap<FieldId, ScalarStatsAgg>>>,
-) -> Vec<SummaryRow> {
+/// Rows for the encoder from entries' statistics, read in place: every
+/// column of every entry, with the entry's position as the superfile
+/// row. An entry that reads its statistics from an earlier section hands
+/// the encoder that section's rows, which it carries over array for
+/// array; nothing is decoded to be encoded again.
+pub fn rows_from_entries(entries: &[Arc<SuperfileEntry>]) -> Vec<SummaryRow<'_>> {
     let mut rows = Vec::new();
-    for (superfile, map) in maps.into_iter().enumerate() {
-        for (column, stats) in map.iter() {
+    for (superfile, entry) in entries.iter().enumerate() {
+        for (column, stats) in entry.scalar_stats.columns() {
             rows.push(SummaryRow {
-                column: *column,
+                column,
                 superfile: superfile as u32,
-                stats: stats.clone(),
+                stats,
             });
         }
     }
@@ -916,8 +1122,26 @@ mod tests {
     const EMPTY: FieldId = FieldId(12);
     const ONLY_SECOND: FieldId = FieldId(20);
 
+    /// Statistics the test rows borrow from: `(column, superfile, stats)`.
+    #[derive(Clone)]
+    struct Owned(Vec<(FieldId, u32, ScalarStatsAgg)>);
+
+    impl Owned {
+        /// The rows for the encoder, each borrowing its statistics here.
+        fn rows(&self) -> Vec<SummaryRow<'_>> {
+            self.0
+                .iter()
+                .map(|(column, superfile, stats)| SummaryRow {
+                    column: *column,
+                    superfile: *superfile,
+                    stats: ColumnStats::Inline(stats),
+                })
+                .collect()
+        }
+    }
+
     /// Two superfiles of mixed columns, one column only in the second.
-    fn two_superfiles() -> (Vec<Uuid>, Vec<SummaryRow>) {
+    fn two_superfiles() -> (Vec<Uuid>, Owned) {
         let first: Vec<(FieldId, ScalarStatsAgg)> = vec![
             (
                 AMOUNT,
@@ -949,27 +1173,20 @@ mod tests {
                 stats_of(Arc::new(Int64Array::from(vec![1, 2, 3]))),
             ),
         ];
-        let mut rows = Vec::new();
+        let mut owned = Vec::new();
         for (superfile, columns) in [first, second].into_iter().enumerate() {
             for (column, stats) in columns {
-                rows.push(SummaryRow {
-                    column,
-                    superfile: superfile as u32,
-                    stats,
-                });
+                owned.push((column, superfile as u32, stats));
             }
         }
-        (ids(2), rows)
+        (ids(2), Owned(owned))
     }
 
     #[test]
     fn a_section_round_trips_every_statistic_by_column() {
-        let (ids, rows) = two_superfiles();
-        let expected: Vec<(FieldId, u32, ScalarStatsAgg)> = rows
-            .iter()
-            .map(|row| (row.column, row.superfile, row.stats.clone()))
-            .collect();
-        let bytes = SummariesSection::encode(part(), &ids, rows).expect("encode");
+        let (ids, owned) = two_superfiles();
+        let expected = owned.0.clone();
+        let bytes = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
         let section = SummariesSection::parse(Bytes::from(bytes)).expect("parse");
         assert_eq!(section.superfile_ids(), ids.as_slice());
         assert_eq!(section.part_id(), Some(part()));
@@ -991,8 +1208,8 @@ mod tests {
 
     #[test]
     fn a_column_row_reads_each_statistic_in_place() {
-        let (ids, rows) = two_superfiles();
-        let bytes = SummariesSection::encode(part(), &ids, rows).expect("encode");
+        let (ids, owned) = two_superfiles();
+        let bytes = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
         let section = SummariesSection::parse(Bytes::from(bytes)).expect("parse");
         let amount = section.column(0, AMOUNT).expect("amount of the first");
         assert_eq!(
@@ -1033,11 +1250,10 @@ mod tests {
 
     #[test]
     fn a_section_names_its_part_and_a_rebuild_differs_by_it() {
-        let (ids, rows) = two_superfiles();
-        let first = SummariesSection::encode(part(), &ids, rows).expect("encode");
-        let (ids, rows) = two_superfiles();
+        let (ids, owned) = two_superfiles();
+        let first = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
         let rebuilt = PartId(Uuid::from_u128(0xdef));
-        let second = SummariesSection::encode(rebuilt, &ids, rows).expect("encode");
+        let second = SummariesSection::encode(rebuilt, &ids, owned.rows()).expect("encode");
         assert_ne!(ContentHash::of(&first), ContentHash::of(&second));
         assert_eq!(
             SummariesSection::parse(Bytes::from(second))
@@ -1052,12 +1268,9 @@ mod tests {
     /// group table's offsets moved up by its width.
     #[test]
     fn a_section_from_before_the_part_id_still_reads() {
-        let (ids, rows) = two_superfiles();
-        let expected: Vec<(FieldId, u32, ScalarStatsAgg)> = rows
-            .iter()
-            .map(|row| (row.column, row.superfile, row.stats.clone()))
-            .collect();
-        let current = SummariesSection::encode(part(), &ids, rows).expect("encode");
+        let (ids, owned) = two_superfiles();
+        let expected = owned.0.clone();
+        let current = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
         let counts_at = MAGIC.len() + U32_BYTES + ID_BYTES;
         let n_superfiles = u32::from_le_bytes(
             current[counts_at..counts_at + U32_BYTES]
@@ -1099,8 +1312,8 @@ mod tests {
 
     #[test]
     fn a_row_map_holds_every_column_of_its_superfile() {
-        let (ids, rows) = two_superfiles();
-        let bytes = SummariesSection::encode(part(), &ids, rows).expect("encode");
+        let (ids, owned) = two_superfiles();
+        let bytes = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
         let section = SummariesSection::parse(Bytes::from(bytes)).expect("parse");
         let first = section.row_map(0);
         assert_eq!(first.len(), 5);
@@ -1111,24 +1324,22 @@ mod tests {
         assert!(second.contains_key(&ONLY_SECOND));
         assert_eq!(section.row_of(ids[1]), Some(1));
         assert_eq!(section.row_of(Uuid::nil()), None);
+        assert!(section.row_has_statistics(0) && section.row_has_statistics(1));
+        assert!(!section.row_has_statistics(2), "no such row");
     }
 
     #[test]
     fn a_column_retyped_between_superfiles_reads_from_both_groups() {
         let ids = ids(2);
-        let rows = vec![
-            SummaryRow {
-                column: AMOUNT,
-                superfile: 0,
-                stats: stats_of(Arc::new(Int64Array::from(vec![1, 2]))),
-            },
-            SummaryRow {
-                column: AMOUNT,
-                superfile: 1,
-                stats: stats_of(Arc::new(StringArray::from(vec!["1", "2"]))),
-            },
-        ];
-        let bytes = SummariesSection::encode(part(), &ids, rows).expect("encode");
+        let owned = Owned(vec![
+            (AMOUNT, 0, stats_of(Arc::new(Int64Array::from(vec![1, 2])))),
+            (
+                AMOUNT,
+                1,
+                stats_of(Arc::new(StringArray::from(vec!["1", "2"]))),
+            ),
+        ]);
+        let bytes = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
         let section = SummariesSection::parse(Bytes::from(bytes)).expect("parse");
         assert_eq!(
             section.stat(0, AMOUNT).expect("int").min.data_type(),
@@ -1162,8 +1373,8 @@ mod tests {
             SummariesSection::parse(Bytes::from_static(b"XXXX\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0")),
             Err(SummariesError::BadMagic)
         ));
-        let (ids, rows) = two_superfiles();
-        let mut bytes = SummariesSection::encode(part(), &ids, rows).expect("encode");
+        let (ids, owned) = two_superfiles();
+        let mut bytes = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
         bytes.truncate(bytes.len() / 2);
         assert!(matches!(
             SummariesSection::parse(Bytes::from(bytes)),
@@ -1171,13 +1382,107 @@ mod tests {
         ));
     }
 
+    /// A section written by a later layout than this engine reads is
+    /// refused by its version, which the loader turns into no statistics.
+    #[test]
+    fn a_section_from_a_newer_layout_is_refused_by_its_version() {
+        let (ids, owned) = two_superfiles();
+        let mut bytes = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
+        let newer = VERSION + 1;
+        bytes[MAGIC.len()..MAGIC.len() + U32_BYTES].copy_from_slice(&newer.to_le_bytes());
+        assert!(matches!(
+            SummariesSection::parse(Bytes::from(bytes)),
+            Err(SummariesError::Version(version)) if version == newer
+        ));
+    }
+
+    /// A directory run that reaches past its group's rows is bad bytes;
+    /// the group reads as no statistics, and nothing panics.
+    #[test]
+    fn a_directory_run_past_its_group_reads_as_no_statistics() {
+        let (ids, owned) = two_superfiles();
+        let mut bytes = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
+        // The first directory entry's row count, past the end of any group.
+        let row_count_at = HEADER_BYTES + ids.len() * ID_BYTES + 3 * U32_BYTES;
+        bytes[row_count_at..row_count_at + U32_BYTES].copy_from_slice(&u32::MAX.to_le_bytes());
+        let section = SummariesSection::parse(Bytes::from(bytes)).expect("the head parses");
+        let first_column = section.columns().next().expect("a column");
+        assert!(section.column(0, first_column).is_none());
+        assert!(section.stat(1, first_column).is_none());
+        // Columns of other groups are untouched.
+        assert!(section.column(0, KIND).is_some());
+    }
+
+    /// A row the encoder cannot write is left out, not fatal: the
+    /// superfile reads as having no statistics for that column.
+    #[test]
+    fn a_row_that_cannot_be_written_is_left_out() {
+        let (ids, mut owned) = two_superfiles();
+        let first = owned.0[0].2.clone();
+        let mismatched = ScalarStatsAgg {
+            max: Arc::new(StringArray::from(vec!["z"])) as ArrayRef,
+            ..first.clone()
+        };
+        owned.0.push((FieldId(40), 0, mismatched));
+        owned.0.push((FieldId(41), 7, first));
+        let bytes = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
+        let section = SummariesSection::parse(Bytes::from(bytes)).expect("parse");
+        assert!(
+            section.column(0, FieldId(40)).is_none(),
+            "min and max differ in type"
+        );
+        assert!(
+            section.column(0, FieldId(41)).is_none(),
+            "no such superfile row"
+        );
+        assert!(
+            section.column(0, AMOUNT).is_some(),
+            "the other rows are written"
+        );
+    }
+
+    /// Rows read from an earlier section are carried into a new one as
+    /// they are, beside freshly decoded rows, and read back the same.
+    #[test]
+    fn rows_from_a_section_carry_into_the_next_one() {
+        let (superfile_ids, owned) = two_superfiles();
+        let earlier =
+            SummariesSection::encode(part(), &superfile_ids, owned.rows()).expect("encode");
+        let earlier = SummariesSection::parse(Bytes::from(earlier)).expect("parse");
+        let third = stats_of(Arc::new(Int64Array::from(vec![Some(100), None])));
+        let mut rows: Vec<SummaryRow<'_>> = Vec::new();
+        for (column, superfile, _) in &owned.0 {
+            rows.push(SummaryRow {
+                column: *column,
+                superfile: *superfile,
+                stats: ColumnStats::Section(
+                    earlier
+                        .column(*superfile, *column)
+                        .expect("the earlier section holds the row"),
+                ),
+            });
+        }
+        rows.push(SummaryRow {
+            column: AMOUNT,
+            superfile: 2,
+            stats: ColumnStats::Inline(&third),
+        });
+        let next = SummariesSection::encode(PartId(Uuid::from_u128(0xdef)), &ids(3), rows)
+            .expect("encode");
+        let next = SummariesSection::parse(Bytes::from(next)).expect("parse");
+        for (column, superfile, stats) in &owned.0 {
+            assert_eq!(next.stat(*superfile, *column).as_ref(), Some(stats));
+        }
+        assert_eq!(next.stat(2, AMOUNT).as_ref(), Some(&third));
+    }
+
     #[test]
     fn equal_rows_encode_to_equal_bytes() {
-        let (ids, rows) = two_superfiles();
-        let once = SummariesSection::encode(part(), &ids, rows).expect("encode");
-        let (ids, mut rows) = two_superfiles();
-        rows.reverse();
-        let again = SummariesSection::encode(part(), &ids, rows).expect("encode");
+        let (ids, owned) = two_superfiles();
+        let once = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
+        let mut reversed = owned.clone();
+        reversed.0.reverse();
+        let again = SummariesSection::encode(part(), &ids, reversed.rows()).expect("encode");
         assert_eq!(once, again, "row order does not change the bytes");
     }
 }

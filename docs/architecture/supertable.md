@@ -208,15 +208,29 @@ persisted table these do not sit in the entry: each manifest part has a
 summaries section beside it (one content-addressed object holding every
 superfile's statistics, one Arrow batch per column type, with a
 directory from column to its rows), and an entry holds its row of that
-section. A query decodes the columns it asks about; a table of thousands
-of columns costs a handle no more per superfile than a table of ten. A
+section. A query decodes the columns it asks about: reading one column
+decodes the type group it sits in, every same-typed column's rows with
+it, once per handle for as long as the part is cached, so a handle's
+statistics cost grows with the column types its queries touch and stops
+at twice the section's bytes. A table of thousands of columns costs a
+handle no more per superfile than a table of ten. A
 section that cannot be read, or that is not its part's, leaves the
-part's superfiles without statistics: every prune keeps them, which is
-correct, and the load goes on. The section's size counts with the
-part's toward the split cap, since a commit to the part rewrites both.
-Engines from before the section refuse a list that names one (the
-list's major version moved), rather than fold a part's rollups from
-their own appends alone.
+part's superfiles without statistics for that handle: every prune keeps
+them, which is correct, and the load goes on. Such a handle never
+writes those statistics anew from the nothing it sees: an append goes
+to a part of its own, and a commit that would rewrite the part is
+refused, so the statistics wait in the section for a handle that reads
+it. The section's size counts with the part's toward the split cap,
+since a commit to the part rewrites both; the rewrite carries the old
+section's rows over as they are.
+
+The list's major version moved with the section. The first commit by
+this engine on any table, including a maintenance publish that adds no
+data and the hidden vector index's sibling, writes the list at the new
+major, and an engine from before the section refuses it rather than
+fold a part's rollups from its own appends alone. So a deployment that
+has committed cannot be rolled back to an engine from before the
+section; it reads nothing of that table.
 - **Full-text summary.** Per text column, the lexicographic range of
 its terms and the length statistics BM25 scores with. Which superfiles
 hold a given term is not recorded here: that is the table-level term

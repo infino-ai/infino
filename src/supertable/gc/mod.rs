@@ -632,7 +632,7 @@ mod tests {
                     FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy, RoutingRef,
                 },
                 part::{ContentHash, PartId},
-                summaries::SummariesRef,
+                summaries::{SummariesRef, summaries_uri},
             },
             slow_vector_state,
         },
@@ -828,6 +828,32 @@ mod tests {
 
         let (live, _) = build_live_set(&manifest);
         assert!(live.contains(&section.uri));
+    }
+
+    /// A section no list names is swept, and the one the list names stays.
+    #[test]
+    fn a_sweep_deletes_an_orphaned_summaries_section_and_keeps_the_live_one() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = table_with_superfiles(&storage, &["alphatoken marker"]);
+        let live = st
+            .inner()
+            .manifest
+            .load()
+            .get_all_list_entries()
+            .iter()
+            .filter_map(|entry| entry.summaries.as_ref().map(|section| section.uri.clone()))
+            .next()
+            .expect("a user part names its section");
+        let orphan = summaries_uri(&ContentHash::of(b"an orphaned section"));
+        std::fs::write(dir.path().join(&orphan), b"an orphaned section").expect("write orphan");
+        assert!(dir.path().join(&live).exists());
+
+        let (report, _) = sweep_logging(&st);
+
+        assert!(!dir.path().join(&orphan).exists(), "{report:?}");
+        assert!(dir.path().join(&live).exists(), "{report:?}");
     }
 
     #[test]

@@ -57,7 +57,7 @@ use crate::{
             hll::HllSketch,
             merge_min_max_arrays,
             part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
-            summaries::SummariesRef,
+            summaries::{SummariesRef, table_sketch},
             term_range::prefix_overlaps_range,
         },
         opann::RERANK_LAW_POOL_CELLS,
@@ -1100,24 +1100,38 @@ impl ScalarStatsAgg {
             (Some(a), Some(b)) => add_sum_arrays(a, b),
             _ => None,
         };
-        self.hll = match (&self.hll, &other.hll) {
-            (Some(a), Some(b)) => match (HllSketch::from_bytes(a), HllSketch::from_bytes(b)) {
-                (Some(mut merged), Some(other_sketch)) => {
-                    merged.merge(&other_sketch);
-                    Some(merged.as_bytes().to_vec())
-                }
-                _ => None,
-            },
-            _ => None,
-        };
         // A side with no non-null values has no counts to give, and adds
         // nothing to the other side's.
-        self.value_counts = match (&self.value_counts, &other.value_counts) {
+        let merged_table = match (&self.value_counts, &other.value_counts) {
             (Some(left), Some(right)) => left.merged_with(right),
             (counts, None) if !other_has_values => counts.clone(),
             (None, counts) if !self_has_values => counts.clone(),
             _ => None,
         };
+        // Where no table survives, the sketch stands in: each side's own,
+        // or its table's values sketched as the column sketch hashes them,
+        // so two tables whose union passes the cap, or a table beside a
+        // sketch, still give a distinct estimate. A side with no values
+        // adds nothing; a side with values and neither sketch nor table
+        // leaves the estimate unknown.
+        self.hll = if merged_table.is_some() {
+            None
+        } else {
+            match (
+                distinct_sketch(self, self_has_values),
+                distinct_sketch(other, other_has_values),
+            ) {
+                (Ok(Some(mut merged)), Ok(Some(other_sketch))) => {
+                    merged.merge(&other_sketch);
+                    Some(merged.as_bytes().to_vec())
+                }
+                (Ok(Some(sketch)), Ok(None)) | (Ok(None), Ok(Some(sketch))) => {
+                    Some(sketch.as_bytes().to_vec())
+                }
+                _ => None,
+            }
+        };
+        self.value_counts = merged_table;
         Ok(())
     }
 
@@ -1167,6 +1181,21 @@ impl ScalarStatsAgg {
             hll: None,
             value_counts: None,
         }
+    }
+}
+
+/// One side's contribution to a merged distinct estimate: its sketch, or
+/// its table's values sketched; `Ok(None)` for a side with no values,
+/// which adds nothing; `Err(())` for a side with values whose distinct
+/// count is unknown, which makes the merged estimate unknown too.
+fn distinct_sketch(agg: &ScalarStatsAgg, has_values: bool) -> Result<Option<HllSketch>, ()> {
+    if !has_values {
+        return Ok(None);
+    }
+    match (&agg.hll, &agg.value_counts) {
+        (Some(bytes), _) => HllSketch::from_bytes(bytes).map(Some).ok_or(()),
+        (None, Some(table)) => table_sketch(table).map(Some).ok_or(()),
+        (None, None) => Err(()),
     }
 }
 
@@ -1925,13 +1954,32 @@ fn entry_from_dto(
             }),
             _ => None,
         },
-        summaries: match (d.summaries_uri, d.summaries_content_hash.as_deref()) {
-            (Some(uri), Some(hash)) => Some(SummariesRef {
+        // The three fields are written together; a part carrying some of
+        // them is a list something has damaged, not a part without a
+        // section, and it is refused rather than read as one (which would
+        // also drop the section from the keep-set GC sweeps by).
+        summaries: match (
+            d.summaries_uri,
+            d.summaries_content_hash.as_deref(),
+            d.summaries_size_bytes,
+        ) {
+            (Some(uri), Some(hash), Some(size_bytes)) => Some(SummariesRef {
                 uri,
                 content_hash: decode_hash(hash)?,
-                size_bytes: d.summaries_size_bytes.unwrap_or(0),
+                size_bytes,
             }),
-            _ => None,
+            (None, None, None) => None,
+            (uri, hash, size) => {
+                return Err(ListParseError::BadFieldValue(
+                    "summaries",
+                    format!(
+                        "uri {}, hash {}, size {}: a section is named by all three or none",
+                        uri.as_deref().unwrap_or("absent"),
+                        hash.unwrap_or("absent"),
+                        size.map_or("absent".to_string(), |size| size.to_string())
+                    ),
+                ));
+            }
         },
         id_range: {
             let lo =
@@ -2319,6 +2367,7 @@ mod tests {
     //! jq-friendly.
     use std::{
         collections::{BTreeMap, HashMap},
+        slice::from_ref,
         str::from_utf8,
         sync::Arc,
     };
@@ -2503,16 +2552,30 @@ mod tests {
             ]
         );
 
+        let at_the_cap: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            0..MAX_EXACT_VALUE_COUNTS as i64,
+        ));
+        let at_the_cap = ScalarStatsAgg::from_column(&at_the_cap).expect("int stats");
+        assert_eq!(
+            at_the_cap
+                .value_counts
+                .as_ref()
+                .expect("exactly the cap's distinct values keep the table")
+                .entries()
+                .len(),
+            MAX_EXACT_VALUE_COUNTS
+        );
+        assert!(at_the_cap.hll.is_none(), "counted exactly, so no sketch");
+
         let high_cardinality: ArrayRef = Arc::new(Int64Array::from_iter_values(
             0..=MAX_EXACT_VALUE_COUNTS as i64,
         ));
+        let past_the_cap = ScalarStatsAgg::from_column(&high_cardinality).expect("int stats");
         assert!(
-            ScalarStatsAgg::from_column(&high_cardinality)
-                .expect("int stats")
-                .value_counts
-                .is_none(),
+            past_the_cap.value_counts.is_none(),
             "the 257th distinct value must drop the exact table"
         );
+        assert!(past_the_cap.hll.is_some(), "and the sketch takes its place");
     }
 
     #[test]
@@ -2585,6 +2648,10 @@ mod tests {
         );
     }
 
+    /// Two tables whose union passes the cap drop the table, and the
+    /// sketch of their values takes its place: the sketch the whole
+    /// column would have had, register for register. A table beside a
+    /// sketch merges the same way.
     #[test]
     fn scalar_agg_merge_drops_value_counts_above_cap() {
         let left: ArrayRef = Arc::new(Int64Array::from_iter_values(
@@ -2593,10 +2660,35 @@ mod tests {
         let right: ArrayRef = Arc::new(Int64Array::from_iter_values(
             (MAX_EXACT_VALUE_COUNTS / 2 + 1) as i64..=MAX_EXACT_VALUE_COUNTS as i64,
         ));
-        let mut left = ScalarStatsAgg::from_column(&left).expect("left stats");
+        let whole: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            0..=MAX_EXACT_VALUE_COUNTS as i64,
+        ));
+        let want = column_hll(from_ref(&whole)).expect("sketchable");
+        let mut merged = ScalarStatsAgg::from_column(&left).expect("left stats");
         let right = ScalarStatsAgg::from_column(&right).expect("right stats");
-        left.merge_with(&right).expect("same type");
-        assert!(left.value_counts.is_none());
+        assert!(
+            merged.hll.is_none() && right.hll.is_none(),
+            "both counted exactly"
+        );
+        merged.merge_with(&right).expect("same type");
+        assert!(merged.value_counts.is_none());
+        assert_eq!(merged.hll.as_deref(), Some(want.as_bytes()));
+
+        // A table beside a sketch: the sketch of the whole column too.
+        let mut sketched = ScalarStatsAgg::from_column(&whole).expect("whole stats");
+        assert!(sketched.hll.is_some() && sketched.value_counts.is_none());
+        let doubled: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            0..=(2 * MAX_EXACT_VALUE_COUNTS) as i64,
+        ));
+        let want = column_hll(from_ref(&doubled)).expect("sketchable");
+        let upper: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            (MAX_EXACT_VALUE_COUNTS + 1) as i64..=(2 * MAX_EXACT_VALUE_COUNTS) as i64,
+        ));
+        let upper = ScalarStatsAgg::from_column(&upper).expect("upper stats");
+        assert!(upper.value_counts.is_some());
+        sketched.merge_with(&upper).expect("same type");
+        assert_eq!(sketched.hll.as_deref(), Some(want.as_bytes()));
+        assert!(sketched.value_counts.is_none());
     }
 
     #[test]
@@ -4087,24 +4179,74 @@ mod tests {
         );
     }
 
-    /// The major before summaries sections still decodes: its entries
-    /// carry their statistics inline in the parts, and a list of it that
-    /// names sections (written by an engine of this major's last minor)
-    /// reads them through the same fields.
+    /// A list of the major before summaries sections, in the shape that
+    /// major wrote: rollups as one IPC stream per bound in the per-column
+    /// map, no batch and no section fields. It decodes to the same rollups
+    /// and to parts without sections, whose entries carry their statistics
+    /// inline. The shape is built by hand, since this engine's encoder
+    /// never writes it.
     #[test]
-    fn the_inline_major_decodes() {
-        for version in ["2.0", "2.1"] {
-            let bytes = restamped(&rich_list(2), version);
-            let decoded = decode(&bytes, &LegacyNames::none())
-                .unwrap_or_else(|e| panic!("major 2 ({version}) must decode: {e:?}"));
-            assert_eq!(decoded.format_version, version);
-            assert_eq!(decoded.parts.len(), 2);
-            assert!(decoded.parts.iter().all(|part| part.summaries.is_some()));
+    fn a_list_of_the_major_before_sections_decodes_from_its_own_shape() {
+        let list = rich_list(2);
+        let mut dto = list_to_dto(&list).expect("encode");
+        dto.format_version = "2.0".into();
+        for (part, entry) in dto.parts.iter_mut().zip(&list.parts) {
+            part.scalar_stats_agg_ipc = None;
+            part.summaries_uri = None;
+            part.summaries_content_hash = None;
+            part.summaries_size_bytes = None;
+            part.scalar_stats_agg = BTreeMap::new();
+            for (id, agg) in &entry.scalar_stats_agg {
+                let key = wire_key(*id);
+                let bound = |array: &ArrayRef| {
+                    encode_b64(&encode_length1_array(&key, array).expect("a length-one array"))
+                };
+                part.scalar_stats_agg.insert(
+                    key.clone(),
+                    ScalarStatsAggDto {
+                        min: bound(&agg.min),
+                        max: bound(&agg.max),
+                        null_count: agg.null_count,
+                        sum: agg.sum.as_ref().map(bound),
+                        hll: agg.hll.as_deref().map(encode_b64),
+                        value_counts: agg.value_counts.as_ref().map(|counts| {
+                            encode_b64(&encode_value_counts(counts).expect("encode"))
+                        }),
+                    },
+                );
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&dto).expect("json");
+        let text = from_utf8(&bytes).expect("utf8");
+        assert!(
+            !text.contains("scalar_stats_agg_ipc") && !text.contains("summaries_"),
+            "the shape a major 2 engine wrote: no batch, no section fields"
+        );
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("major 2 decodes");
+        assert_eq!(decoded.format_version, "2.0");
+        assert_eq!(decoded.parts.len(), 2);
+        for (back, original) in decoded.parts.iter().zip(&list.parts) {
+            assert!(back.summaries.is_none(), "no section before major 3");
+            assert_eq!(back.scalar_stats_agg, original.scalar_stats_agg);
         }
         assert!(
             FORMAT_VERSION.starts_with("3."),
             "this engine writes major 3"
         );
+    }
+
+    /// A part naming a section by some of its three fields is a damaged
+    /// list, refused, not a part without a section.
+    #[test]
+    fn a_part_naming_half_a_section_is_refused() {
+        let list = rich_list(1);
+        let mut dto = list_to_dto(&list).expect("encode");
+        dto.parts[0].summaries_size_bytes = None;
+        let bytes = serde_json::to_vec(&dto).expect("json");
+        assert!(matches!(
+            decode(&bytes, &LegacyNames::none()),
+            Err(ListParseError::BadFieldValue("summaries", _))
+        ));
     }
 
     #[test]

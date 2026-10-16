@@ -36,7 +36,6 @@ pub mod partition;
 pub mod summaries;
 pub(crate) mod term_index;
 use arrow_schema::Schema;
-use datafusion::scalar::ScalarValue;
 use term_index::{PermanentLoadFailure, TermIndex, TermIndexError};
 
 use crate::{
@@ -66,13 +65,15 @@ use arrow_schema::{DataType, TimeUnit};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{future, stream, stream::StreamExt};
-use list::ScalarValueCounts;
 /// Re-export the per-column skip aggregates so callers can refer to them as
 /// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
 pub use list::{FtsSummaryAgg, GlobalVectorIndex, RoutingRef, ScalarStatsAgg};
 use rayon::{ThreadPool, prelude::*};
 use rustc_hash::FxHashSet;
+/// One column's statistics read in place, from a decoded map or a section
+/// row: the one access path the pruner, the planner and the commit share.
+pub use summaries::ColumnStats;
 use tokio::{join, sync::OnceCell, task::spawn_blocking};
 use tracing::{Instrument, warn};
 use uuid::Uuid;
@@ -112,8 +113,7 @@ use crate::{
             part::{ContentHash, ManifestPart, OpenBlobBudget, PartId, share_physical_schemas},
             partition::{assign_partition, encode_partition_key},
             summaries::{
-                ColumnRow, SummariesError, SummariesRef, SummariesSection, rows_from_maps,
-                summaries_uri,
+                SummariesError, SummariesRef, SummariesSection, rows_from_entries, summaries_uri,
             },
         },
         query::{hierarchical_iter, prune::PruneLeaf},
@@ -2455,27 +2455,54 @@ impl ManifestSnapshot {
                 .map_or(0, |section| section.size_bytes);
             let latest_at_size_cap = entry.size_bytes_compressed.saturating_add(section_bytes)
                 >= self.superfile_list.options.part_size_threshold_bytes;
-            if combined_n > self.superfile_list.options.target_superfiles_per_part
-                || latest_at_size_cap
-            {
-                // Split: keep the existing part, emit a fresh part for the new
-                // superfiles.
-                out_list_entries.push(entry.clone());
-                let (fresh_entry, fresh_encoded_part) =
-                    rebuild_part_and_entry(vec![], new_for_part, None, hidden_table)?;
-                out_list_entries.push(fresh_entry);
-                parts_to_write.push(fresh_encoded_part);
+            let at_cap = combined_n > self.superfile_list.options.target_superfiles_per_part
+                || latest_at_size_cap;
+            // A part whose summaries section this handle could not read is
+            // not rewritten either: its rebuilt section would record its
+            // superfiles as having no statistics, for good. It is kept as it
+            // is, section reference and all, and the new superfiles go to
+            // a part of their own.
+            let existing_part = if at_cap {
+                None
             } else {
-                // Rewrite the latest part = its existing superfiles + the new.
-                let existing_part = self.get_part_by_id(entry.part_id).await?;
-                let (rebuilt_entry, rebuilt_encoded_part) = rebuild_part_and_entry(
-                    existing_part.superfiles.clone(),
-                    new_for_part,
-                    Some(entry),
-                    hidden_table,
-                )?;
-                out_list_entries.push(rebuilt_entry);
-                parts_to_write.push(rebuilt_encoded_part);
+                Some(self.get_part_by_id(entry.part_id).await?)
+            };
+            let existing_part = existing_part.filter(|part| {
+                let readable = !part
+                    .superfiles
+                    .iter()
+                    .any(|superfile| superfile.scalar_stats.is_unavailable());
+                if !readable {
+                    warn!(
+                        part_id = %entry.part_id,
+                        "the latest part's summaries section could not be read; the new \
+                         superfiles go to a part of their own"
+                    );
+                }
+                readable
+            });
+            match existing_part {
+                None => {
+                    // Split: keep the existing part, emit a fresh part for the
+                    // new superfiles.
+                    out_list_entries.push(entry.clone());
+                    let (fresh_entry, fresh_encoded_part) =
+                        rebuild_part_and_entry(vec![], new_for_part, None, hidden_table)?;
+                    out_list_entries.push(fresh_entry);
+                    parts_to_write.push(fresh_encoded_part);
+                }
+                Some(existing_part) => {
+                    // Rewrite the latest part = its existing superfiles + the
+                    // new.
+                    let (rebuilt_entry, rebuilt_encoded_part) = rebuild_part_and_entry(
+                        existing_part.superfiles.clone(),
+                        new_for_part,
+                        Some(entry),
+                        hidden_table,
+                    )?;
+                    out_list_entries.push(rebuilt_entry);
+                    parts_to_write.push(rebuilt_encoded_part);
+                }
             }
         }
 
@@ -2967,14 +2994,52 @@ fn rebuild_part_and_entry(
 /// Move `entries`' per-column statistics into one summaries section for
 /// part `part_id`: the section's bytes with their content hash, and the
 /// entries rebuilt to read their row of it. The row order is the entries'
-/// order, which is the part's.
+/// order, which is the part's. An entry that reads an earlier section
+/// hands its rows over as they are; nothing is decoded to be encoded
+/// again.
+///
+/// An entry whose statistics this handle could not read
+/// ([`ScalarStats::Unavailable`]) is refused: a section written from what
+/// the handle sees would record the superfile as having none, for good.
+/// The commit fails instead, and a fresh handle reads the section again.
+///
+/// A section the encoder cannot write at all leaves the entries'
+/// statistics inline in the part, with a warning, so no statistic can
+/// stop a commit.
 fn section_entries(
     entries: Vec<Arc<SuperfileEntry>>,
     part_id: PartId,
 ) -> Result<(Vec<Arc<SuperfileEntry>>, Option<(Bytes, ContentHash)>), ManifestError> {
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.scalar_stats.is_unavailable())
+    {
+        return Err(ManifestError::StatisticsUnavailable {
+            superfile_id: entry.superfile_id,
+        });
+    }
     let ids: Vec<Uuid> = entries.iter().map(|entry| entry.superfile_id).collect();
-    let rows = rows_from_maps(entries.iter().map(|entry| entry.scalar_stats.map()));
-    let bytes = Bytes::from(SummariesSection::encode(part_id, &ids, rows)?);
+    let bytes = match SummariesSection::encode(part_id, &ids, rows_from_entries(&entries)) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(error) => {
+            warn!(
+                %part_id,
+                %error,
+                "summaries section could not be written; the part carries its statistics inline"
+            );
+            let mut entries: Vec<Arc<SuperfileEntry>> = entries
+                .iter()
+                .map(|entry| {
+                    Arc::new(SuperfileEntry {
+                        scalar_stats: ScalarStats::Inline(entry.scalar_stats.map().into_owned()),
+                        ..(**entry).clone()
+                    })
+                })
+                .collect();
+            share_physical_schemas(&mut entries);
+            return Ok((entries, None));
+        }
+    };
     let hash = ContentHash::of(&bytes);
     let section = Arc::new(SummariesSection::parse(bytes.clone())?);
     let mut entries: Vec<Arc<SuperfileEntry>> = entries
@@ -3373,6 +3438,7 @@ fn attach_summaries(
                 %error,
                 "summaries section unreadable; the part's superfiles read as having no statistics"
             );
+            mark_statistics_unavailable(&mut part);
             return Ok(part);
         }
     };
@@ -3383,6 +3449,7 @@ fn attach_summaries(
             %error,
             "summaries section does not match its part; its superfiles read as having no statistics"
         );
+        mark_statistics_unavailable(&mut part);
         return Ok(part);
     }
     for (row, entry) in part.superfiles.iter_mut().enumerate() {
@@ -3401,6 +3468,23 @@ fn attach_summaries(
         }
     }
     Ok(part)
+}
+
+/// Mark every entry of `part` as reading a section this handle could not:
+/// no statistics for the readers, and a commit that will not write the
+/// entries into a new section from that nothing.
+fn mark_statistics_unavailable(part: &mut ManifestPart) {
+    for entry in part.superfiles.iter_mut() {
+        match Arc::get_mut(entry) {
+            Some(entry) => entry.scalar_stats = ScalarStats::Unavailable,
+            None => {
+                *entry = Arc::new(SuperfileEntry {
+                    scalar_stats: ScalarStats::Unavailable,
+                    ..(**entry).clone()
+                })
+            }
+        }
+    }
 }
 
 /// Whether `section` is `part`'s: written for its id (when the section
@@ -3656,8 +3740,9 @@ impl ManifestLoadError {
 
 /// Where a superfile's per-column scalar statistics live.
 ///
-/// Every reader asks for one column at a time ([`Self::get`]); the fold at
-/// commit and the tallies in tests take the whole map ([`Self::map`]).
+/// Every reader asks for one column at a time ([`Self::column`]); the
+/// commit reads every column in place ([`Self::columns`]); the tallies in
+/// tests take the whole map ([`Self::map`]).
 #[derive(Debug, Clone)]
 pub enum ScalarStats {
     /// Decoded, one aggregate per column: the hidden table's entries, parts
@@ -3672,6 +3757,14 @@ pub enum ScalarStats {
         section: Arc<SummariesSection>,
         row: u32,
     },
+    /// A row of a section the loader could not read, or could not match
+    /// to its part. Reads see no statistics, as they would of an empty
+    /// map, and keep the superfile. A commit, though, refuses to write
+    /// such an entry into a new section (`section_entries`) and appends
+    /// beside its part rather than into it, so a failure to read the
+    /// statistics never becomes their loss; a fresh handle reads the
+    /// section again.
+    Unavailable,
 }
 
 impl Default for ScalarStats {
@@ -3695,6 +3788,7 @@ impl ScalarStats {
             Self::Section { section, row } => {
                 section.column(*row, column).map(ColumnStats::Section)
             }
+            Self::Unavailable => None,
         }
     }
 
@@ -3717,6 +3811,7 @@ impl ScalarStats {
                 .into_iter()
                 .map(|(column, found)| (column, ColumnStats::Section(found)))
                 .collect(),
+            Self::Unavailable => Vec::new(),
         }
     }
 
@@ -3726,6 +3821,7 @@ impl ScalarStats {
         match self {
             Self::Inline(map) => Cow::Borrowed(map),
             Self::Section { section, row } => Cow::Owned(section.row_map(*row)),
+            Self::Unavailable => Cow::Owned(HashMap::new()),
         }
     }
 
@@ -3733,118 +3829,15 @@ impl ScalarStats {
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Inline(map) => map.is_empty(),
-            Self::Section { section, row } => section.row_map(*row).is_empty(),
-        }
-    }
-}
-
-/// One column's statistics for one superfile, wherever they live, read
-/// one statistic at a time. Decoded statistics are borrowed; a section's
-/// are read from the decoded group's arrays. Only [`Self::value_counts`]
-/// builds anything, so the pruner and the planner's statistics, which
-/// read bounds, counts, sums and sketches, cost one array read each per
-/// superfile and column.
-#[derive(Clone, Copy)]
-pub enum ColumnStats<'a> {
-    Inline(&'a ScalarStatsAgg),
-    Section(ColumnRow<'a>),
-}
-
-impl ColumnStats<'_> {
-    /// The lower bound as a one-row array; null when the column is null
-    /// throughout the superfile.
-    pub fn min(&self) -> ArrayRef {
-        match self {
-            Self::Inline(agg) => Arc::clone(&agg.min),
-            Self::Section(row) => row.min(),
+            Self::Section { section, row } => !section.row_has_statistics(*row),
+            Self::Unavailable => true,
         }
     }
 
-    /// The upper bound as a one-row array.
-    pub fn max(&self) -> ArrayRef {
-        match self {
-            Self::Inline(agg) => Arc::clone(&agg.max),
-            Self::Section(row) => row.max(),
-        }
-    }
-
-    /// Both bounds as values, when they convert.
-    pub fn min_max_values(&self) -> Option<(ScalarValue, ScalarValue)> {
-        match self {
-            Self::Inline(agg) => {
-                let min = ScalarValue::try_from_array(agg.min.as_ref(), 0).ok()?;
-                let max = ScalarValue::try_from_array(agg.max.as_ref(), 0).ok()?;
-                Some((min, max))
-            }
-            Self::Section(row) => row.min_max_values(),
-        }
-    }
-
-    /// Whether the column had no non-null value in the superfile.
-    pub fn all_null(&self) -> bool {
-        match self {
-            Self::Inline(agg) => agg.all_null(),
-            Self::Section(row) => row.all_null(),
-        }
-    }
-
-    /// The null count, when the superfile carries it.
-    pub fn null_count(&self) -> Option<u64> {
-        match self {
-            Self::Inline(agg) => agg.null_count,
-            Self::Section(row) => row.null_count(),
-        }
-    }
-
-    /// The exact sum as a one-row array, when the superfile carries it.
-    pub fn sum(&self) -> Option<ArrayRef> {
-        match self {
-            Self::Inline(agg) => agg.sum.clone(),
-            Self::Section(row) => row.sum(),
-        }
-    }
-
-    /// The distinct-count sketch's bytes, when the superfile carries one.
-    pub fn sketch(&self) -> Option<&[u8]> {
-        match self {
-            Self::Inline(agg) => agg.hll.as_deref(),
-            Self::Section(row) => row.sketch(),
-        }
-    }
-
-    /// The sketch that stands in for the exact value table of a column
-    /// counted exactly, when the superfile carries a table: the table's
-    /// values hashed as the column sketch hashes them, so a table's
-    /// estimate and a sketch's merge into one.
-    pub fn values_sketch(&self) -> Option<hll::HllSketch> {
-        match self {
-            Self::Inline(agg) => {
-                let values = agg
-                    .value_counts
-                    .as_ref()?
-                    .entries()
-                    .iter()
-                    .map(|(value, _)| value.clone());
-                column_hll(&[ScalarValue::iter_to_array(values).ok()?])
-            }
-            Self::Section(row) => row.values_sketch(),
-        }
-    }
-
-    /// The exact value table, when the superfile carries one.
-    pub(crate) fn value_counts(&self) -> Option<ScalarValueCounts> {
-        match self {
-            Self::Inline(agg) => agg.value_counts.clone(),
-            Self::Section(row) => row.value_counts(),
-        }
-    }
-
-    /// Every statistic, in the decoded shape.
-    pub fn stats(&self) -> ScalarStatsAgg {
-        match self {
-            Self::Inline(agg) => (*agg).clone(),
-            Self::Section(row) => row.stats(),
-        }
+    /// Whether the statistics live in a section this handle could not
+    /// read, so that no commit may write them anew from what it sees.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable)
     }
 }
 
@@ -3855,7 +3848,7 @@ impl ScalarStats {
     pub(crate) fn section(&self) -> Option<&Arc<SummariesSection>> {
         match self {
             Self::Section { section, .. } => Some(section),
-            Self::Inline(_) => None,
+            Self::Inline(_) | Self::Unavailable => None,
         }
     }
 
@@ -3865,7 +3858,9 @@ impl ScalarStats {
             Self::Inline(map) => {
                 map.insert(column, stats);
             }
-            Self::Section { .. } => panic!("a sectioned entry's statistics are not edited"),
+            Self::Section { .. } | Self::Unavailable => {
+                panic!("only decoded statistics are edited")
+            }
         }
     }
 
@@ -7395,7 +7390,7 @@ mod tests {
                 vec![SummaryRow {
                     column: column_id,
                     superfile: 0,
-                    stats,
+                    stats: ColumnStats::Inline(&stats),
                 }],
             )
             .expect("encode");
@@ -8453,6 +8448,85 @@ mod tests {
                 .get_all_superfiles()
                 .iter()
                 .all(|entry| entry.scalar_stats.get(amount).is_none())
+        );
+    }
+
+    /// A part whose section this handle could not read is never rewritten
+    /// from what the handle sees: an append goes to a part of its own,
+    /// the old part keeps its section reference, and a commit that would
+    /// section the unreadable entries is refused. The statistics are
+    /// still there for a handle that reads the section.
+    #[tokio::test]
+    async fn a_part_whose_section_could_not_be_read_is_not_rewritten() {
+        let (_dir, storage, opts, reference) = published_sectioned_table().await;
+        let amount = fid("amount");
+        let (section_bytes, _) = storage
+            .get(&reference.uri)
+            .await
+            .expect("the section is in storage");
+        storage
+            .put_overwrite(&reference.uri, Bytes::from_static(b"not a section"))
+            .await
+            .expect("corrupt the section");
+        let loaded = ManifestSnapshot::load(None, Arc::clone(&storage), Some(Arc::clone(&opts)))
+            .await
+            .expect("a corrupt section does not fail the load");
+        let entries = loaded.get_all_superfiles();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.scalar_stats.is_unavailable())
+        );
+        let before = loaded.get_all_list_entries().to_vec();
+        assert_eq!(before.len(), 1);
+
+        // A commit over the unreadable entries themselves is refused.
+        assert!(matches!(
+            section_entries(entries.to_vec(), PartId::new_v4()),
+            Err(ManifestError::StatisticsUnavailable { .. })
+        ));
+
+        // An append goes beside the part, which carries over untouched.
+        let mut third = (*make_new_entry(4)).clone();
+        third.scalar_stats =
+            ScalarStats::Inline(HashMap::from([(amount, sectioned_stats(vec![30, 40]))]));
+        let (committed, parts) = loaded
+            .update(&[Arc::new(third)], &[])
+            .await
+            .expect("the append is not refused");
+        let after = committed.get_all_list_entries();
+        assert_eq!(after.len(), 2, "a part of its own for the new superfile");
+        assert_eq!(after[0].part_id, before[0].part_id);
+        assert_eq!(after[0].summaries, before[0].summaries);
+        assert_eq!(after[1].n_superfiles, 1);
+        assert!(after[1].summaries.is_some());
+        assert_eq!(parts.len(), 1);
+
+        // With the section back in storage, a fresh handle reads every
+        // statistic the table ever had.
+        storage
+            .put_overwrite(&reference.uri, section_bytes)
+            .await
+            .expect("restore the section");
+        let objects: Vec<(String, Bytes)> = parts.iter().flat_map(|p| p.objects()).collect();
+        let (_, meta) = read_pointer(storage.as_ref())
+            .await
+            .expect("read pointer")
+            .expect("pointer present");
+        let etag = meta.etag.expect("localfs pointer etag");
+        committed
+            .write(storage.as_ref(), Some(etag.as_str()), &objects)
+            .await
+            .expect("write");
+        let fresh = ManifestSnapshot::load(None, Arc::clone(&storage), Some(opts))
+            .await
+            .expect("load");
+        let fresh_entries = fresh.get_all_superfiles();
+        assert_eq!(fresh_entries.len(), 3);
+        assert!(
+            fresh_entries
+                .iter()
+                .all(|entry| entry.scalar_stats.get(amount).is_some())
         );
     }
 

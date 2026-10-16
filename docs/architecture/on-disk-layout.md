@@ -28,9 +28,15 @@ mydb/                                     database root (the connect() path)
 │   │
 │   ├── manifest/
 │   │   └── manifest-000004.json          JSON · immutable manifest version
-│   │       ├ stores : parts[] (each: uri + content_hash), schema, fts/vector
-│   │       │          column specs, partition strategy
-│   │       └ used   : one written per commit (NNNNNN bumps); names the live parts
+│   │       ├ stores : parts[] (each: uri + content_hash, and the summaries
+│   │       │          section's uri + hash + size), schema, fts/vector
+│   │       │          column specs, partition strategy; format 3.0 since the
+│   │       │          summaries section (majors 1 and 2 still read)
+│   │       └ used   : one written per commit (NNNNNN bumps); names the live parts.
+│   │                  The first commit by an engine that writes sections, a
+│   │                  no-data maintenance publish or the hidden index's sibling
+│   │                  included, writes 3.0, which an engine from before refuses:
+│   │                  a deployment that has committed cannot roll back past it
 │   │
 │   ├── manifest-parts/
 │   │   └── part-<blake3>.avro.zst        Avro+zstd · immutable, content-addressed

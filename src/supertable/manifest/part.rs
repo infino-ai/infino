@@ -416,11 +416,13 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
         .iter()
         .map(|seg| {
             // Statistics that live in the part's summaries section are not
-            // written into the part as well: an older reader finds none and
-            // keeps every superfile, which is correct.
+            // written into the part as well: a reader of the part alone
+            // finds none and keeps every superfile, which is correct. (An
+            // entry whose section this handle could not read never reaches
+            // a part write: `section_entries` refuses it.)
             let scalar_bytes = match &seg.scalar_stats {
                 ScalarStats::Inline(map) => encode_scalar_stats(map),
-                ScalarStats::Section { .. } => Vec::new(),
+                ScalarStats::Section { .. } | ScalarStats::Unavailable => Vec::new(),
             };
             let fts_bytes = encode_fts_summary_map(&seg.fts_summary);
             let vector_bytes = encode_vector_summary_map(&seg.vector_summary, mode);
