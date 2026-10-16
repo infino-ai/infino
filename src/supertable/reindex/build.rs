@@ -158,7 +158,7 @@ fn repair_carrying_body_to(
         n_docs: entry.n_docs,
         id_min: entry.id_min,
         id_max: entry.id_max,
-        scalar_stats: entry.scalar_stats.clone(),
+        scalar_stats: entry.scalar_stats.map().into_owned(),
     })
 }
 
@@ -223,7 +223,7 @@ mod tests {
             reader::SuperfileReader,
             vector::layout::VectorLayout,
         },
-        supertable::manifest::SuperfileUri,
+        supertable::manifest::{ScalarStats, SuperfileUri},
         test_helpers::{
             decimal128_id_field, decimal128_ids, default_vector_config, distinct_unit_vectors,
         },
@@ -274,7 +274,7 @@ mod tests {
             n_docs: source.n_docs(),
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

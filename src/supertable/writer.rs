@@ -3621,7 +3621,7 @@ pub(super) fn prepare_superfile_named(
         n_docs: shard.n_docs,
         id_min: shard.id_min,
         id_max: shard.id_max,
-        scalar_stats: shard.scalar_stats,
+        scalar_stats: shard.scalar_stats.into(),
         fts_summary,
         vector_summary,
         // Partition assignment populated by the per-shard
@@ -12006,13 +12006,10 @@ pub(crate) async fn try_commit_attempt(
     //    conditional pointer PUT (the visibility barrier).
     //    Untouched parts are NOT re-PUT — their URIs (and
     //    content-hashes) are unchanged in the new list. Each touched
-    //    part ships both wire forms: full and the routing sibling the
-    //    list entry references.
-    let encoded_parts: Vec<Bytes> = parts_to_write
-        .iter()
-        .flat_map(|ep| [Some(ep.encoded.clone()), ep.routing_encoded.clone()])
-        .flatten()
-        .collect();
+    //    part ships both wire forms, full and the routing sibling the
+    //    list entry references, and its summaries section.
+    let encoded_parts: Vec<(String, Bytes)> =
+        parts_to_write.iter().flat_map(|ep| ep.objects()).collect();
     // Whatever this commit's safety rests on has to still hold here. What is left after it is the
     // manifest parts and list and then the pointer PUT — small writes, not the uploads above.
     if let Some(fence) = fence {
@@ -12492,6 +12489,7 @@ pub(crate) fn read_vector_layout_from_bytes(bytes: &Bytes) -> VectorLayout {
 
 #[cfg(test)]
 mod tests {
+    use crate::supertable::manifest::ScalarStats;
     #[test]
     fn open_blob_inlines_each_open_range_only_while_it_is_small() {
         // A 16 MiB "superfile": the parquet tail is the last 64 KiB; an
@@ -12987,7 +12985,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -13018,7 +13016,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

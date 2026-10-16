@@ -399,10 +399,10 @@ impl SupertableProvider {
                 let mut merged: Option<ScalarValueCounts> = None;
                 let id = self.manifest.field_id(column)?;
                 for entry in entries {
-                    let counts = entry.scalar_stats.get(&id)?.value_counts.as_ref()?;
+                    let counts = entry.scalar_stats.get(id)?.value_counts?;
                     merged = Some(match merged {
-                        None => counts.clone(),
-                        Some(current) => current.merged_with(counts)?,
+                        None => counts,
+                        Some(current) => current.merged_with(&counts)?,
                     });
                 }
                 merged.map(Arc::new)
@@ -662,7 +662,16 @@ impl SupertableProvider {
     /// Exact statistics let DataFusion's `AggregateStatistics` rule
     /// fold `COUNT(*)` / `MIN` / `MAX` into literals, eliminating the
     /// scan entirely; Inexact ones still feed planner estimates.
-    fn statistics_for(&self, entries: &[Arc<SuperfileEntry>]) -> Statistics {
+    ///
+    /// Column statistics are assembled for the columns `wanted` names;
+    /// the rest read as unknown. Every column's statistics cost a read per
+    /// column per superfile, and a table of thousands of columns is asked
+    /// about a few of them.
+    fn statistics_for(
+        &self,
+        entries: &[Arc<SuperfileEntry>],
+        wanted: &dyn Fn(&str) -> bool,
+    ) -> Statistics {
         let total_rows: u64 = entries.iter().map(|e| e.n_docs).sum();
         let now = Instant::now();
 
@@ -707,6 +716,9 @@ impl SupertableProvider {
             .iter()
             .map(|field| {
                 let name = field.name().as_str();
+                if !wanted(name) {
+                    return ColumnStatistics::new_unknown();
+                }
                 if name == id_column {
                     // `_id` is engine-injected: non-null and unique by
                     // construction, range tracked in the manifest.
@@ -787,7 +799,7 @@ fn id_min_max(entries: &[Arc<SuperfileEntry>]) -> Option<(ScalarValue, ScalarVal
 /// unknowable).
 fn scalar_null_count(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<u64> {
     entries.iter().try_fold(0u64, |acc, entry| {
-        acc.checked_add(entry.scalar_stats.get(&column)?.null_count?)
+        acc.checked_add(entry.scalar_stats.get(column)?.null_count?)
     })
 }
 
@@ -796,10 +808,10 @@ fn scalar_null_count(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option
 fn scalar_sum(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<ScalarValue> {
     let mut acc: Option<ArrayRef> = None;
     for entry in entries {
-        let part = entry.scalar_stats.get(&column)?.sum.as_ref()?;
+        let part = entry.scalar_stats.get(column)?.sum?;
         acc = Some(match acc {
-            None => Arc::clone(part),
-            Some(total) => add_sum_arrays(&total, part)?,
+            None => part,
+            Some(total) => add_sum_arrays(&total, &part)?,
         });
     }
     ScalarValue::try_from_array(&acc?, 0).ok()
@@ -814,7 +826,7 @@ fn scalar_sum(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<Scalar
 fn scalar_distinct(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<usize> {
     let mut merged: Option<HllSketch> = None;
     for entry in entries {
-        let stats = entry.scalar_stats.get(&column)?;
+        let stats = entry.scalar_stats.get(column)?;
         let sketch = match (&stats.hll, &stats.value_counts) {
             (Some(bytes), _) => HllSketch::from_bytes(bytes)?,
             (None, Some(table)) => values_hll(table.entries().iter().map(|(value, _)| value))?,
@@ -839,7 +851,7 @@ fn scalar_min_max(
 ) -> Option<(ScalarValue, ScalarValue)> {
     let mut acc: Option<(ScalarValue, ScalarValue)> = None;
     for entry in entries {
-        let agg = entry.scalar_stats.get(&column)?;
+        let agg = entry.scalar_stats.get(column)?;
         let min = ScalarValue::try_from_array(&agg.min, 0).ok()?;
         let max = ScalarValue::try_from_array(&agg.max, 0).ok()?;
         if min.is_null() || max.is_null() {
@@ -1087,16 +1099,19 @@ impl TableProvider for SupertableProvider {
 
     /// Whole-table statistics from a complete resident manifest view (no I/O)
     /// — feeds logical planning; the physical fold reads the scan node's
-    /// statistics, attached in [`scan`](Self::scan).
+    /// statistics, attached in [`scan`](Self::scan). The row count and the
+    /// id column's range only: the planner asks before any column is
+    /// chosen, and the scan node carries the projected columns' statistics.
     fn statistics(&self) -> Option<Statistics> {
         // A persisted table often has already hydrated every part at open.
         // Expose exact stats in that case so DataFusion can fold unfiltered
-        // COUNT/MIN/MAX before it invokes `scan`. A genuinely lazy partial
-        // view still returns `None`; claiming whole-table stats there would
+        // COUNT before it invokes `scan`. A genuinely lazy partial view
+        // still returns `None`; claiming whole-table stats there would
         // silently under-count.
+        let id_column = self.manifest.options.id_column.as_str();
         self.manifest
             .complete_flat_superfiles()
-            .map(|entries| self.statistics_for(entries))
+            .map(|entries| self.statistics_for(entries, &|name| name == id_column))
     }
 
     async fn scan(
@@ -1479,7 +1494,16 @@ impl TableProvider for SupertableProvider {
         // may emit fewer rows than the manifest totals, so everything
         // degrades to inexact estimates.
         let scan_stats = {
-            let stats = self.statistics_for(&survivor_entries);
+            // The projected columns, or every column when nothing is projected.
+            let projected: Option<HashSet<&str>> = projection.map(|indices| {
+                indices
+                    .iter()
+                    .filter_map(|i| self.schema.fields().get(*i))
+                    .map(|field| field.name().as_str())
+                    .collect()
+            });
+            let wanted = |name: &str| projected.as_ref().is_none_or(|set| set.contains(name));
+            let stats = self.statistics_for(&survivor_entries, &wanted);
             if filters.is_empty() {
                 stats
             } else {
@@ -3114,6 +3138,16 @@ mod tests {
         // 6 rows total across both superfiles, clean view → Exact.
         assert!(matches!(stats.num_rows, Precision::Exact(6)));
 
+        // The planner-level call stops at the row count and the id column;
+        // the scan node carries the projected columns' statistics, from the
+        // same fold over the entries.
+        let entries = reader
+            .manifest()
+            .complete_flat_superfiles()
+            .expect("complete");
+        let stats = provider.statistics_for(entries, &|_| true);
+        assert!(matches!(stats.num_rows, Precision::Exact(6)));
+
         // Find the `n` column's statistics and assert aggregated min/max.
         let sch = provider.schema();
         let n_idx = sch.index_of("n").expect("n column");
@@ -3188,7 +3222,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats,
+            scalar_stats: scalar_stats.into(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -3232,7 +3266,7 @@ mod tests {
             entry_from_column("n", &second),
         ];
         for entry in &entries {
-            let stats = &entry.scalar_stats[&fid("n")];
+            let stats = entry.scalar_stats.get(fid("n")).expect("stats");
             assert!(stats.hll.is_none(), "counted exactly, so no sketch");
             assert!(stats.value_counts.is_some());
         }

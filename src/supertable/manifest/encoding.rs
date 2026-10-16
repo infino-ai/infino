@@ -179,8 +179,8 @@ pub enum EncodeError {
 const STATS_IPC_ALIGNMENT: usize = 8;
 
 /// The IPC writer options every per-column statistics batch is written
-/// with (see [`STATS_IPC_ALIGNMENT`]).
-fn stats_ipc_options() -> IpcWriteOptions {
+/// with (see [`STATS_IPC_ALIGNMENT`]), in parts and in summaries sections.
+pub(crate) fn stats_ipc_options() -> IpcWriteOptions {
     IpcWriteOptions::try_new(STATS_IPC_ALIGNMENT, false, MetadataVersion::V5)
         .expect("the IPC minimum alignment is accepted")
 }

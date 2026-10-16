@@ -2953,6 +2953,8 @@ mod tests {
         },
     };
 
+    use crate::supertable::manifest::ScalarStats;
+
     /// A phrase's members are conjunctive, so a quoted phrase on its own
     /// prunes on all of them.
     ///
@@ -3106,7 +3108,7 @@ mod tests {
             n_docs,
             id_min: 0,
             id_max: n_docs.saturating_sub(1) as i128,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -5728,7 +5730,7 @@ mod tests {
             n_docs: 200_000,
             id_min: 0,
             id_max: 199_999,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

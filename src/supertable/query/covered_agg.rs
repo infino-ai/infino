@@ -415,7 +415,7 @@ fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Op
             && provider
                 .manifest()
                 .field_id(&group_column.name)
-                .and_then(|id| entry.scalar_stats.get(&id))
+                .and_then(|id| entry.scalar_stats.get(id))
                 .is_some_and(|stats| stats.null_count == Some(0))
     }) {
         return Ok(None);
@@ -514,7 +514,7 @@ fn accumulate_partial(
             let sum = fold_sums(covered, col)?;
             let mut count: i64 = 0;
             for entry in covered {
-                let nulls = entry.scalar_stats.get(&col)?.null_count?;
+                let nulls = entry.scalar_stats.get(col)?.null_count?;
                 let non_null = entry.n_docs.checked_sub(nulls)?;
                 count = count.checked_add(i64::try_from(non_null).ok()?)?;
             }
@@ -531,10 +531,10 @@ fn accumulate_partial(
 fn fold_sums(covered: &[&Arc<SuperfileEntry>], col: FieldId) -> Option<ScalarValue> {
     let mut acc: Option<ArrayRef> = None;
     for entry in covered {
-        let part = entry.scalar_stats.get(&col)?.sum.as_ref()?;
+        let part = entry.scalar_stats.get(col)?.sum?;
         acc = Some(match acc {
-            None => Arc::clone(part),
-            Some(total) => add_sum_arrays(&total, part)?,
+            None => part,
+            Some(total) => add_sum_arrays(&total, &part)?,
         });
     }
     ScalarValue::try_from_array(&acc?, 0).ok()
@@ -546,7 +546,7 @@ fn fold_bounds(
 ) -> Option<(ScalarValue, ScalarValue)> {
     let mut acc: Option<(ScalarValue, ScalarValue)> = None;
     for entry in covered {
-        let agg = entry.scalar_stats.get(&col)?;
+        let agg = entry.scalar_stats.get(col)?;
         let min = ScalarValue::try_from_array(&agg.min, 0).ok()?;
         let max = ScalarValue::try_from_array(&agg.max, 0).ok()?;
         if min.is_null() || max.is_null() {
@@ -803,7 +803,7 @@ fn classify(
     } else {
         manifest
             .field_id(&range.column)
-            .and_then(|id| entry.scalar_stats.get(&id))
+            .and_then(|id| entry.scalar_stats.get(id))
             .and_then(|agg| {
                 let mn = ScalarValue::try_from_array(&agg.min, 0).ok()?;
                 let mx = ScalarValue::try_from_array(&agg.max, 0).ok()?;
@@ -907,7 +907,7 @@ fn has_required_stats(
         if guard.aggregates_mix_types() || guard.stats_are_stale(entry) {
             return None;
         }
-        entry.scalar_stats.get(&id)
+        entry.scalar_stats.get(id)
     };
     kinds.iter().all(|kind| match kind {
         AggKind::CountStar => true,
@@ -920,6 +920,7 @@ fn has_required_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supertable::manifest::ScalarStats;
 
     /// The rule opts into the `rewrite` entry point (rather than the
     /// legacy `try_optimize`), and carries its registered name. Neither
@@ -944,7 +945,7 @@ mod tests {
             n_docs: 1,
             id_min: 10,
             id_max: 20,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

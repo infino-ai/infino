@@ -2,7 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! [`ManifestDiskCache`] — a content-addressed on-disk cache for the
-//! compressed (Avro+zstd) bytes of manifest parts.
+//! compressed (Avro+zstd) bytes of manifest parts, and for the summaries
+//! sections beside them (see [`crate::supertable::manifest::summaries`]),
+//! under the same hash-named files.
 //!
 //! Manifest parts are immutable and addressed by the blake3 hash of
 //! their compressed bytes (see [`crate::supertable::manifest::part`]).

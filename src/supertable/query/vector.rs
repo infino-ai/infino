@@ -7896,7 +7896,10 @@ mod tests {
     use bytes::Bytes;
 
     use super::IndexOutcome;
-    use crate::{superfile::fts::reader::Bm25SearchOptions, test_helpers::fid};
+    use crate::{
+        superfile::fts::reader::Bm25SearchOptions, supertable::manifest::ScalarStats,
+        test_helpers::fid,
+    };
 
     /// Cosine columns normalize the query; every other metric passes the
     /// caller's slice through untouched, by reference (no copy, no scale).
@@ -9007,7 +9010,7 @@ mod tests {
             n_docs: ids.len() as u64,
             id_min: *ids.iter().min().expect("nonempty ids"),
             id_max: *ids.iter().max().expect("nonempty ids"),
-            scalar_stats: std::collections::HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: std::collections::HashMap::new(),
             vector_summary: std::collections::HashMap::new(),
             partition_key: Vec::new(),
@@ -9031,7 +9034,7 @@ mod tests {
             n_docs,
             id_min,
             id_max: id_min + n_docs as i128 - 1,
-            scalar_stats: std::collections::HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: std::collections::HashMap::new(),
             vector_summary: std::collections::HashMap::new(),
             partition_key: Vec::new(),
@@ -9564,7 +9567,7 @@ mod tests {
             n_docs: 100,
             id_min: 0,
             id_max: 99,
-            scalar_stats: std::collections::HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: std::collections::HashMap::new(),
             vector_summary: std::collections::HashMap::new(),
             partition_key: Vec::new(),

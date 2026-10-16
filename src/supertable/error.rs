@@ -27,7 +27,7 @@ use crate::{
     },
     supertable::{
         ManifestLoadError,
-        manifest::{part, term_index::TermIndexError},
+        manifest::{part, summaries, term_index::TermIndexError},
         schema::error::SchemaError,
     },
 };
@@ -429,6 +429,10 @@ pub enum ManifestError {
     /// Unknown part id
     #[error("unknown part id: {0}")]
     UnknownPartId(part::PartId),
+    /// A part's summaries section could not be built from its entries'
+    /// statistics.
+    #[error("summaries section: {0}")]
+    Summaries(#[from] summaries::SummariesError),
 }
 
 /// Errors raised by [`crate::supertable::Supertable::open`] and

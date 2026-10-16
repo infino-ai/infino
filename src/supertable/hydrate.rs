@@ -696,7 +696,7 @@ mod tests {
         let manifest = table.inner().manifest.load();
         let mut stats = HashMap::new();
         for entry in manifest.get_all_superfiles() {
-            ScalarStatsAgg::merge(&mut stats, &entry.scalar_stats);
+            ScalarStatsAgg::merge(&mut stats, &entry.scalar_stats.map());
         }
         stats.remove(&FieldId::ID_COLUMN);
         stats
@@ -758,7 +758,7 @@ mod tests {
         // `_id`, `n` and `s`.
         assert_eq!(want.len(), 3);
         for entry in manifest.get_all_superfiles() {
-            let got: HashSet<FieldId> = entry.scalar_stats.keys().copied().collect();
+            let got: HashSet<FieldId> = entry.scalar_stats.keys().into_iter().collect();
             assert_eq!(got, want);
         }
     }

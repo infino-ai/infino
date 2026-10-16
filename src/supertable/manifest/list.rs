@@ -57,6 +57,7 @@ use crate::{
             hll::HllSketch,
             merge_min_max_arrays,
             part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
+            summaries::SummariesRef,
             term_range::prefix_overlaps_range,
         },
         opann::RERANK_LAW_POOL_CELLS,
@@ -701,6 +702,11 @@ pub struct ManifestPartEntry {
     /// query or commit derives them from the part, and that commit
     /// persists them.
     pub fts_length_totals: Option<BTreeMap<FieldId, ColumnLengthStats>>,
+    /// The summaries section holding every superfile's per-column scalar
+    /// statistics, when the part was written with one (see
+    /// [`crate::supertable::manifest::summaries`]). `None` on parts from
+    /// before, whose entries carry their statistics inline.
+    pub summaries: Option<SummariesRef>,
 }
 
 impl ManifestPartEntry {
@@ -1620,6 +1626,11 @@ struct ManifestPartEntryDto {
     fts_summary_agg: BTreeMap<String, FtsSummaryAggDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fts_length_totals: Option<BTreeMap<String, ColumnLengthStatsDto>>,
+    /// The part's summaries section: both halves, or neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summaries_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summaries_content_hash: Option<String>, // "blake3:<hex>"
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1726,6 +1737,8 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
         content_hash: encode_hash(&e.content_hash),
         routing_uri: e.routing.as_ref().map(|r| r.uri.clone()),
         routing_content_hash: e.routing.as_ref().map(|r| encode_hash(&r.content_hash)),
+        summaries_uri: e.summaries.as_ref().map(|s| s.uri.clone()),
+        summaries_content_hash: e.summaries.as_ref().map(|s| encode_hash(&s.content_hash)),
         id_range: (e.id_range.0.to_string(), e.id_range.1.to_string()),
         scalar_stats_agg: BTreeMap::new(),
         scalar_stats_agg_ipc: Some(encode_b64(&encode_scalar_stats(&e.scalar_stats_agg))),
@@ -1889,6 +1902,13 @@ fn entry_from_dto(
         // part carrying only one is treated as having no sibling.
         routing: match (d.routing_uri, d.routing_content_hash.as_deref()) {
             (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
+        summaries: match (d.summaries_uri, d.summaries_content_hash.as_deref()) {
+            (Some(uri), Some(hash)) => Some(SummariesRef {
                 uri,
                 content_hash: decode_hash(hash)?,
             }),
@@ -3039,6 +3059,10 @@ mod tests {
             scalar_stats_agg: scalar,
             fts_summary_agg: fts,
             fts_length_totals: None,
+            summaries: Some(SummariesRef {
+                uri: format!("manifest-summaries/summ-{seed:02x}.bin"),
+                content_hash: ContentHash([seed; 32]),
+            }),
         }
     }
 
@@ -3073,6 +3097,7 @@ mod tests {
         );
         assert_eq!(a.content_hash, b.content_hash, "content_hash");
         assert_eq!(a.routing, b.routing, "routing");
+        assert_eq!(a.summaries, b.summaries, "summaries");
         assert_eq!(a.id_range, b.id_range, "id_range");
         assert_eq!(a.scalar_stats_agg, b.scalar_stats_agg, "scalar_stats_agg");
         assert_eq!(a.fts_summary_agg, b.fts_summary_agg, "fts_summary_agg");

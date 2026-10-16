@@ -3122,7 +3122,7 @@ mod tests {
             .entry
             .scalar_stats
             .get(
-                &st.reader()
+                st.reader()
                     .expect("reader")
                     .manifest()
                     .field_id("title")
@@ -3913,11 +3913,7 @@ mod tests {
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&current))
             .await
             .expect("pointer etag");
-        let encoded: Vec<Bytes> = parts
-            .iter()
-            .flat_map(|p| [Some(p.encoded.clone()), p.routing_encoded.clone()])
-            .flatten()
-            .collect();
+        let encoded: Vec<(String, Bytes)> = parts.iter().flat_map(|p| p.objects()).collect();
         successor
             .write(storage.as_ref(), prev_etag.as_deref(), &encoded)
             .await

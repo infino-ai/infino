@@ -200,8 +200,16 @@ reading the superfile bytes:
 - **Location.** A storage-backend identifier for the superfile's bytes.
 - **Row range.** The superfile's document count and the range of primary
 identifiers it covers.
-- **Scalar statistics.** Per-column minimum and maximum values for the
-scalar columns, used to skip superfiles for predicate queries.
+- **Scalar statistics.** Per-column minimum and maximum values, null
+count, exact sum, and either an exact table of the column's values (at
+most a few hundred distinct) or a distinct-count sketch, used to skip
+superfiles for predicate queries and to feed the SQL planner. On a
+persisted table these do not sit in the entry: each manifest part has a
+summaries section beside it (one content-addressed object holding every
+superfile's statistics, one Arrow batch per column type, with a
+directory from column to its rows), and an entry holds its row of that
+section. A query decodes the columns it asks about; a table of thousands
+of columns costs a handle no more per superfile than a table of ten.
 - **Full-text summary.** Per text column, the lexicographic range of
 its terms and the length statistics BM25 scores with. Which superfiles
 hold a given term is not recorded here: that is the table-level term

@@ -25,6 +25,7 @@ use crate::{
             SUPERFILE_DATA_DIR, SUPERFILE_KEY_SUFFIX, SuperfileUri,
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
             list::RoutingRef,
+            summaries::MANIFEST_SUMMARIES_DIR,
             term_index::{self, STORAGE_PREFIX as TERM_INDEX_STORAGE_PREFIX},
         },
         slow_vector_state::{self, STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX},
@@ -116,6 +117,7 @@ fn list_refs(manifest: &ManifestSnapshot) -> impl Iterator<Item = &str> {
     let parts = manifest.get_all_list_entries().iter().flat_map(|entry| {
         iter::once(entry.uri.as_str())
             .chain(entry.routing.as_ref().map(|routing| routing.uri.as_str()))
+            .chain(entry.summaries.as_ref().map(|section| section.uri.as_str()))
     });
 
     let blobs = [
@@ -368,6 +370,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
     let mut prefixes = vec![
         MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
+        MANIFEST_SUMMARIES_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
         TERM_INDEX_STORAGE_PREFIX,
         // Tombstone sidecars under `superfiles/` (live set includes the
@@ -624,11 +627,12 @@ mod tests {
         supertable::{
             SupertableOptions,
             manifest::{
-                ManifestSnapshot, SuperfileEntry, SuperfileUri,
+                ManifestSnapshot, ScalarStats, SuperfileEntry, SuperfileUri,
                 list::{
                     FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy, RoutingRef,
                 },
                 part::{ContentHash, PartId},
+                summaries::SummariesRef,
             },
             slow_vector_state,
         },
@@ -686,7 +690,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: vec![],
@@ -742,13 +746,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_live_set_marks_lazy_part_membership_incomplete() {
-        let dir = tempdir().expect("tempdir");
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    /// A manifest whose one part is listed but not loaded, naming
+    /// `summaries` as the part's section.
+    fn lazy_part_manifest(
+        storage: Arc<dyn StorageProvider>,
+        summaries: Option<SummariesRef>,
+    ) -> ManifestSnapshot {
         let part_id = PartId::new_v4();
-        let manifest = ManifestSnapshot::new(
+        ManifestSnapshot::new(
             TEST_MANIFEST_ID,
             opts(),
             Vec::new(),
@@ -790,12 +795,38 @@ mod tests {
                     scalar_stats_agg: HashMap::new(),
                     fts_summary_agg: Default::default(),
                     fts_length_totals: None,
+                    summaries,
                 }],
             }),
-        );
+        )
+    }
+
+    #[test]
+    fn build_live_set_marks_lazy_part_membership_incomplete() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let manifest = lazy_part_manifest(storage, None);
 
         let (_, superfiles_complete) = build_live_set(&manifest);
         assert!(!superfiles_complete);
+    }
+
+    /// A part's summaries section is live while the list names it: the
+    /// sweep lists its prefix, so a section not in the keep-set is deleted.
+    #[test]
+    fn build_live_set_contains_a_part_s_summaries_section() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let section = SummariesRef {
+            uri: "manifest-summaries/summ-abc.bin".into(),
+            content_hash: ContentHash::of(b"section"),
+        };
+        let manifest = lazy_part_manifest(storage, Some(section.clone()));
+
+        let (live, _) = build_live_set(&manifest);
+        assert!(live.contains(&section.uri));
     }
 
     #[test]

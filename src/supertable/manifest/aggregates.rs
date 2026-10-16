@@ -141,7 +141,7 @@ fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<FieldId, Scal
     // merge instead of a hand-rolled fold + a duplicate min/max helper.
     let mut out: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
     for seg in superfiles {
-        ScalarStatsAgg::merge(&mut out, &seg.scalar_stats);
+        ScalarStatsAgg::merge(&mut out, &seg.scalar_stats.map());
     }
     // The list reads a part's rollup for its bounds and its null count: the
     // list-level pruner compares a filter against min/max, the IS NULL prune
@@ -219,6 +219,7 @@ mod tests {
             scalar_stats_agg,
             fts_summary_agg: BTreeMap::new(),
             fts_length_totals: None,
+            summaries: None,
         }
     }
 
@@ -280,7 +281,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: cols,
+            scalar_stats: cols.into(),
             fts_summary: HashMap::<FieldId, FtsSummaryAgg>::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -346,7 +347,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: cols,
+            scalar_stats: cols.into(),
             fts_summary: HashMap::<FieldId, FtsSummaryAgg>::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -404,7 +405,7 @@ mod tests {
                 n_docs: 1,
                 id_min: 0,
                 id_max: 0,
-                scalar_stats: cols,
+                scalar_stats: cols.into(),
                 fts_summary: HashMap::<FieldId, FtsSummaryAgg>::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),

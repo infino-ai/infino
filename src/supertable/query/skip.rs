@@ -320,8 +320,8 @@ pub fn null_check_skip(
             guard.stats_are_stale(entry)
                 || entry
                     .scalar_stats
-                    .get(&column)
-                    .is_none_or(|agg| null_check_may_match(agg, want_null))
+                    .get(column)
+                    .is_none_or(|agg| null_check_may_match(&agg, want_null))
         })
         .collect()
 }
@@ -444,7 +444,7 @@ fn superfile_may_match(entry: &SuperfileEntry, column: FieldId, pred: &ScalarPre
 /// The superfile's persisted min/max for `column`, or `None` when the
 /// column has no stats or the bounds don't decode (caller keeps).
 fn superfile_minmax(entry: &SuperfileEntry, column: FieldId) -> Option<(ScalarValue, ScalarValue)> {
-    let agg = entry.scalar_stats.get(&column)?;
+    let agg = entry.scalar_stats.get(column)?;
     match (
         ScalarValue::try_from_array(agg.min.as_ref(), 0),
         ScalarValue::try_from_array(agg.max.as_ref(), 0),
@@ -591,7 +591,10 @@ const DECIMAL256_MAX_PRECISION: u8 = 76;
 
 #[cfg(test)]
 mod tests {
-    use crate::{supertable::schema::FieldId, test_helpers::fid};
+    use crate::{
+        supertable::{manifest::ScalarStats, schema::FieldId},
+        test_helpers::fid,
+    };
 
     /// Pair each predicate with the id of its column, as the pruner does.
     fn pairs(preds: &[ScalarPredicate]) -> Vec<(Option<FieldId>, &ScalarPredicate)> {
@@ -702,7 +705,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
