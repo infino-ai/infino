@@ -64,6 +64,30 @@ pub struct Bm25SearchOptions {
     /// traded. A column whose declared pair already equals the override
     /// pays nothing either.
     pub bm25: Option<Bm25Params>,
+    /// How far below the running k-th score a superfile's score ceiling may
+    /// sit and still be skipped, as a fraction of that score. `0.0`, the
+    /// default, is exact: a superfile is skipped only when it provably cannot
+    /// place a document in the top k. `0.01` allows a one percent shortfall.
+    ///
+    /// The engine opens superfiles in descending ceiling order and stops when
+    /// the best unread ceiling cannot compete, so raising this stops sooner
+    /// and reads fewer superfiles, at the cost of possibly missing a document
+    /// whose score is within the tolerance of the k-th.
+    ///
+    /// It buys less than it looks like it should. The decision compares
+    /// against the largest ceiling among unread superfiles, and when those
+    /// ceilings sit close together, as they do on a table whose superfiles
+    /// hold similar documents, that figure stays near the global maximum
+    /// until almost nothing is left to read. Measured over a 962-query
+    /// benchmark at a billion documents, a one percent tolerance read exactly
+    /// as many superfiles as exact scoring; five percent cut the median read
+    /// six-fold but left the ninetieth percentile untouched, and cost about
+    /// 1.8 percent of real error with recall@10 at 0.30. Treat it as a knob
+    /// for a caller who has measured their own corpus, not as a default to
+    /// reach for.
+    ///
+    /// A negative or non-finite value is treated as `0.0`.
+    pub score_tolerance: f32,
 }
 
 impl Bm25SearchOptions {
@@ -90,6 +114,18 @@ impl Bm25SearchOptions {
     /// are built with it and the correction disappears.
     pub fn with_bm25(mut self, k1: f32, b: f32) -> Self {
         self.bm25 = Some(Bm25Params::new(k1, b));
+        self
+    }
+
+    /// Allow a superfile to be skipped when its score ceiling falls short of
+    /// the running k-th score by up to `fraction` of that score, rather than
+    /// only when it provably cannot compete. See
+    /// [`Bm25SearchOptions::score_tolerance`], which the field documents in
+    /// full, including why it buys less than it appears to.
+    ///
+    /// `0.0` restores exact scoring, which is the default.
+    pub fn with_score_tolerance(mut self, fraction: f32) -> Self {
+        self.score_tolerance = fraction;
         self
     }
 }

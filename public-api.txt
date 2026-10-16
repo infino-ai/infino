@@ -496,10 +496,12 @@ impl core::panic::unwind_safe::UnwindSafe for infino::Bm25Params
 #[non_exhaustive] pub struct infino::Bm25SearchOptions
 pub infino::Bm25SearchOptions::bm25: core::option::Option<infino::Bm25Params>
 pub infino::Bm25SearchOptions::mode: infino::BoolMode
+pub infino::Bm25SearchOptions::score_tolerance: f32
 impl infino::Bm25SearchOptions
 pub fn infino::Bm25SearchOptions::new() -> Self
 pub fn infino::Bm25SearchOptions::with_bm25(self, f32, f32) -> Self
 pub fn infino::Bm25SearchOptions::with_mode(self, infino::BoolMode) -> Self
+pub fn infino::Bm25SearchOptions::with_score_tolerance(self, f32) -> Self
 impl core::clone::Clone for infino::Bm25SearchOptions
 pub fn infino::Bm25SearchOptions::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::Bm25SearchOptions

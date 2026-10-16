@@ -547,6 +547,23 @@ pub(crate) async fn memo_from_locations(
 /// on its own; a ceiling that rounding put an ulp below a real score is
 /// protected by the widening the term index applies to every ceiling
 /// (`CEILING_SLACK`), not by this test.
+/// The score a superfile's ceiling is actually tested against: the running
+/// k-th score, raised by the caller's tolerance.
+///
+/// At the default tolerance of zero this returns `floor` bit for bit, because
+/// multiplying by `1.0` is exact, so exact scoring keeps precisely the
+/// comparison it had before tolerance existed. A negative or non-finite
+/// tolerance is treated as zero rather than rejected: the worst such a value
+/// could do is lower the bar and open superfiles that need not be opened,
+/// which is slow and still correct, but defining it away is cheaper than
+/// reasoning about it at every call site.
+pub(crate) fn competitive_floor(floor: f32, tolerance: f32) -> f32 {
+    match tolerance.is_finite() && tolerance > 0.0 {
+        true => floor * (1.0 + tolerance),
+        false => floor,
+    }
+}
+
 pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
     // Written as "not strictly less" rather than `>=` so an incomparable
     // ceiling (a NaN from a degenerate rescale) is opened, never skipped.
@@ -707,6 +724,7 @@ impl SupertableReader {
         let Bm25SearchOptions {
             mode,
             bm25: bm25_params,
+            score_tolerance,
         } = opts;
         if let Some(p) = bm25_params {
             Self::validate_bm25_params(p)?;
@@ -787,6 +805,7 @@ impl SupertableReader {
             kept,
             k,
             bm25_params,
+            score_tolerance,
             scope,
         )
         .await
@@ -836,6 +855,7 @@ impl SupertableReader {
         mut kept: Vec<Arc<SuperfileEntry>>,
         k: usize,
         bm25_params: Option<Bm25Params>,
+        score_tolerance: f32,
         scope: Option<&CandidateScope>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let ScoredClauses {
@@ -1323,7 +1343,10 @@ impl SupertableReader {
                     units,
                     window,
                     move |(_, _, _, ceiling): &(Option<(u32, u32)>, Uuid, SuperfileUri, f32)| {
-                        !ceiling_can_compete(*ceiling, floor_handle.floor())
+                        !ceiling_can_compete(
+                            *ceiling,
+                            competitive_floor(floor_handle.floor(), score_tolerance),
+                        )
                     },
                     kernel,
                 )
@@ -1575,7 +1598,7 @@ impl SupertableReader {
         };
         // Prefix search takes no search options, so columns score with the
         // parameters they declared.
-        self.bm25_search_clauses(column, clauses, kept, k, None, None)
+        self.bm25_search_clauses(column, clauses, kept, k, None, 0.0, None)
             .await
     }
 
@@ -3050,6 +3073,95 @@ mod tests {
         assert!(super::ceiling_can_compete(floor.next_up(), floor));
         assert!(super::ceiling_can_compete(0.0, f32::NEG_INFINITY));
         assert!(super::ceiling_can_compete(f32::INFINITY, f32::MAX));
+    }
+
+    /// Exact scoring must keep the comparison it had before a tolerance
+    /// existed, not something that merely rounds to it. The floor is the
+    /// right-hand side of a float comparison, so "close enough" is not a
+    /// property: one ulp decides whether a superfile is read.
+    #[test]
+    fn a_zero_tolerance_leaves_the_floor_bit_for_bit() {
+        let floors = [
+            0.0f32,
+            -0.0,
+            f32::MIN_POSITIVE,
+            1.0e-30,
+            0.20840901,
+            1.0,
+            12345.678,
+            f32::MAX,
+            f32::MIN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for floor in floors {
+            assert_eq!(
+                super::competitive_floor(floor, 0.0).to_bits(),
+                floor.to_bits(),
+                "a zero tolerance changed the floor {floor}"
+            );
+        }
+    }
+
+    /// A tolerance raises the bar a superfile's ceiling has to clear, which
+    /// is the whole mechanism: a ceiling that would have been read because it
+    /// ties the k-th score is skipped once the caller accepts a shortfall.
+    #[test]
+    fn a_tolerance_raises_the_bar() {
+        let floor = 100.0f32;
+        assert!(
+            super::ceiling_can_compete(floor, floor),
+            "exact reads a tie"
+        );
+
+        let raised = super::competitive_floor(floor, 0.01);
+        assert!(raised > floor, "one percent must raise a positive floor");
+        assert!(
+            !super::ceiling_can_compete(floor, raised),
+            "the tie is now skipped"
+        );
+        assert!(
+            super::ceiling_can_compete(floor * 1.02, raised),
+            "a ceiling clearing the tolerance is still read"
+        );
+    }
+
+    /// A tolerance that means nothing falls back to exact rather than
+    /// propagating into the comparison. The failure it prevents is silent:
+    /// a NaN threshold makes every comparison incomparable, and the
+    /// surrounding predicate opens on incomparable, so the query would stay
+    /// correct while reading every superfile for no stated reason.
+    #[test]
+    fn a_meaningless_tolerance_is_exact() {
+        let floor = 7.5f32;
+        for tolerance in [-0.0f32, -0.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                super::competitive_floor(floor, tolerance).to_bits(),
+                floor.to_bits(),
+                "tolerance {tolerance} should have been treated as exact"
+            );
+        }
+    }
+
+    /// Below zero the tolerance widens instead of tightening, and that is the
+    /// safe direction: a lower bar opens superfiles that need not be opened,
+    /// which costs reads and never results. Pinned so the asymmetry is a
+    /// recorded decision rather than a surprise, since the running floor
+    /// starts at negative infinity and a scorer may yield negative scores.
+    #[test]
+    fn a_negative_floor_widens_rather_than_tightens() {
+        assert_eq!(
+            super::competitive_floor(f32::NEG_INFINITY, 0.05),
+            f32::NEG_INFINITY,
+            "the starting floor admits everything, tolerance or not"
+        );
+        let floor = -4.0f32;
+        let widened = super::competitive_floor(floor, 0.05);
+        assert!(widened < floor, "a negative floor moves down, not up");
+        assert!(
+            super::ceiling_can_compete(floor, widened),
+            "so a ceiling at the floor is still read"
+        );
     }
 
     use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
