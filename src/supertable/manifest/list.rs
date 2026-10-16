@@ -67,14 +67,26 @@ use crate::{
 
 /// Wire format version for the manifest list.
 ///
-/// Major must match at decode time; minor differences are
-/// accepted (deny-unknown-major / allow-unknown-minor — same
-/// shape as the [`super::part::FORMAT_VERSION`] policy for
-/// manifest parts). Minor 1 carries a part's rollups as one
-/// Arrow IPC batch (`scalar_stats_agg_ipc`) in place of one IPC
-/// stream per bound; a reader of minor 0 finds the per-column
-/// map empty and keeps every part, which is correct.
-pub const FORMAT_VERSION: &str = "2.1";
+/// The major this engine writes; it reads this one and the two before
+/// it ([`FORMAT_MAJOR_INLINE`], [`FORMAT_MAJOR_NAMED`]), and refuses any
+/// other, as the [`super::part::FORMAT_VERSION`] policy does for parts.
+/// Minor differences are accepted.
+///
+/// Major 3 moves a part's per-column statistics into a summaries section
+/// the list entry names, and carries the part's rollups as one Arrow IPC
+/// batch (`scalar_stats_agg_ipc`) in place of one IPC stream per bound.
+/// A reader of major 2 knows neither: it finds every sectioned superfile
+/// without statistics and the rollups empty, which reads correctly, but
+/// writing, it folds the latest part's rollup from its own appends alone
+/// and rewrites the list without the section references. The part-level
+/// pruner then drops superfiles that match, and the sections are lost.
+/// So a major 2 engine must refuse the list rather than open it, which
+/// the major bump makes it do.
+pub const FORMAT_VERSION: &str = "3.0";
+
+/// The major before summaries sections: statistics inline in the parts,
+/// rollups as one IPC stream per bound. Read, never written.
+const FORMAT_MAJOR_INLINE: &str = "2";
 
 /// The major this engine wrote before summary keys became field ids. Lists
 /// at this major key their aggregates by column name, which
@@ -1615,7 +1627,7 @@ struct ManifestPartEntryDto {
     // values) and avoid base64 ambiguity.
     id_range: (String, String),
     /// Per-column rollups, one IPC stream per bound: how lists before
-    /// minor 1 carry them. Written empty since; read when present.
+    /// major 3 carry them. Written empty since; read when present.
     scalar_stats_agg: BTreeMap<String, ScalarStatsAggDto>,
     /// The rollups as one Arrow IPC batch (base64), the wire form the
     /// parts use per superfile (`encode_scalar_stats`): at four thousand
@@ -1626,11 +1638,15 @@ struct ManifestPartEntryDto {
     fts_summary_agg: BTreeMap<String, FtsSummaryAggDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fts_length_totals: Option<BTreeMap<String, ColumnLengthStatsDto>>,
-    /// The part's summaries section: both halves, or neither.
+    /// The part's summaries section: the address halves both or neither,
+    /// the size beside them (absent on an entry written before the size
+    /// was recorded, which then counts no section bytes toward its cap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     summaries_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     summaries_content_hash: Option<String>, // "blake3:<hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summaries_size_bytes: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1739,6 +1755,7 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
         routing_content_hash: e.routing.as_ref().map(|r| encode_hash(&r.content_hash)),
         summaries_uri: e.summaries.as_ref().map(|s| s.uri.clone()),
         summaries_content_hash: e.summaries.as_ref().map(|s| encode_hash(&s.content_hash)),
+        summaries_size_bytes: e.summaries.as_ref().map(|s| s.size_bytes),
         id_range: (e.id_range.0.to_string(), e.id_range.1.to_string()),
         scalar_stats_agg: BTreeMap::new(),
         scalar_stats_agg_ipc: Some(encode_b64(&encode_scalar_stats(&e.scalar_stats_agg))),
@@ -1911,6 +1928,7 @@ fn entry_from_dto(
             (Some(uri), Some(hash)) => Some(SummariesRef {
                 uri,
                 content_hash: decode_hash(hash)?,
+                size_bytes: d.summaries_size_bytes.unwrap_or(0),
             }),
             _ => None,
         },
@@ -2272,7 +2290,10 @@ fn check_major(fv: &str) -> Result<(), ListParseError> {
         .next()
         .expect("constant has a dot");
     let got_major = fv.split('.').next().unwrap_or("");
-    if got_major != supported_major && got_major != FORMAT_MAJOR_NAMED {
+    if got_major != supported_major
+        && got_major != FORMAT_MAJOR_INLINE
+        && got_major != FORMAT_MAJOR_NAMED
+    {
         return Err(ListParseError::IncompatibleMajorVersion {
             got: fv.to_string(),
             supported: FORMAT_VERSION.to_string(),
@@ -3062,6 +3083,7 @@ mod tests {
             summaries: Some(SummariesRef {
                 uri: format!("manifest-summaries/summ-{seed:02x}.bin"),
                 content_hash: ContentHash([seed; 32]),
+                size_bytes: 4_096 * seed as u64,
             }),
         }
     }
@@ -4056,11 +4078,31 @@ mod tests {
 
     #[test]
     fn incompatible_major_version_rejected() {
-        let bytes = restamped(&empty_list(), "3.0");
-        let err = decode(&bytes, &LegacyNames::none()).expect_err("major 3 must reject");
+        let bytes = restamped(&empty_list(), "4.0");
+        let err = decode(&bytes, &LegacyNames::none()).expect_err("major 4 must reject");
         assert!(
             matches!(err, ListParseError::IncompatibleMajorVersion { .. }),
             "expected IncompatibleMajorVersion, got {err:?}"
+        );
+    }
+
+    /// The major before summaries sections still decodes: its entries
+    /// carry their statistics inline in the parts, and a list of it that
+    /// names sections (written by an engine of this major's last minor)
+    /// reads them through the same fields.
+    #[test]
+    fn the_inline_major_decodes() {
+        for version in ["2.0", "2.1"] {
+            let bytes = restamped(&rich_list(2), version);
+            let decoded = decode(&bytes, &LegacyNames::none())
+                .unwrap_or_else(|e| panic!("major 2 ({version}) must decode: {e:?}"));
+            assert_eq!(decoded.format_version, version);
+            assert_eq!(decoded.parts.len(), 2);
+            assert!(decoded.parts.iter().all(|part| part.summaries.is_some()));
+        }
+        assert!(
+            FORMAT_VERSION.starts_with("3."),
+            "this engine writes major 3"
         );
     }
 

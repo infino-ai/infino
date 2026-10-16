@@ -209,7 +209,14 @@ summaries section beside it (one content-addressed object holding every
 superfile's statistics, one Arrow batch per column type, with a
 directory from column to its rows), and an entry holds its row of that
 section. A query decodes the columns it asks about; a table of thousands
-of columns costs a handle no more per superfile than a table of ten.
+of columns costs a handle no more per superfile than a table of ten. A
+section that cannot be read, or that is not its part's, leaves the
+part's superfiles without statistics: every prune keeps them, which is
+correct, and the load goes on. The section's size counts with the
+part's toward the split cap, since a commit to the part rewrites both.
+Engines from before the section refuse a list that names one (the
+list's major version moved), rather than fold a part's rollups from
+their own appends alone.
 - **Full-text summary.** Per text column, the lexicographic range of
 its terms and the length statistics BM25 scores with. Which superfiles
 hold a given term is not recorded here: that is the table-level term

@@ -115,7 +115,7 @@ use crate::{
         SuperfileEntry,
         error::QueryError,
         manifest::{
-            ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts, values_hll,
+            ColumnStats, ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts,
         },
         query::{
             candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
@@ -399,7 +399,7 @@ impl SupertableProvider {
                 let mut merged: Option<ScalarValueCounts> = None;
                 let id = self.manifest.field_id(column)?;
                 for entry in entries {
-                    let counts = entry.scalar_stats.get(id)?.value_counts?;
+                    let counts = entry.scalar_stats.column(id)?.value_counts()?;
                     merged = Some(match merged {
                         None => counts,
                         Some(current) => current.merged_with(&counts)?,
@@ -749,25 +749,28 @@ impl SupertableProvider {
                 {
                     return stats;
                 }
+                // One read of the column's statistics per superfile; the
+                // four folds below share it.
+                let reads = read_column(entries, column);
                 // A range covering the column type's whole domain is
                 // withheld rather than reported — see `spans_full_domain`.
-                if let Some((min, max)) = scalar_min_max(entries, column)
+                if let Some((min, max)) = scalar_min_max(&reads)
                     && !spans_full_domain(&min, &max)
                 {
                     stats.min_value = wrap(min);
                     stats.max_value = wrap(max);
                 }
-                if let Some(nulls) = scalar_null_count(entries, column) {
+                if let Some(nulls) = scalar_null_count(&reads) {
                     stats.null_count = if clean {
                         Precision::Exact(nulls as usize)
                     } else {
                         Precision::Inexact(nulls as usize)
                     };
                 }
-                if let Some(sum) = scalar_sum(entries, column) {
+                if let Some(sum) = scalar_sum(&reads) {
                     stats.sum_value = wrap(sum);
                 }
-                if let Some(distinct) = scalar_distinct(entries, column) {
+                if let Some(distinct) = scalar_distinct(&reads) {
                     // A sketch estimate — never exact.
                     stats.distinct_count = Precision::Inexact(distinct);
                 }
@@ -794,21 +797,31 @@ fn id_min_max(entries: &[Arc<SuperfileEntry>]) -> Option<(ScalarValue, ScalarVal
     ))
 }
 
-/// Total null count of column `name` across `entries`; `None` unless
-/// every entry carries the stat (a missing side makes the total
-/// unknowable).
-fn scalar_null_count(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<u64> {
-    entries.iter().try_fold(0u64, |acc, entry| {
-        acc.checked_add(entry.scalar_stats.get(column)?.null_count?)
+/// One column's statistics across `entries`, read once per superfile:
+/// what the folds below share, so a column costs one read per superfile
+/// however many statistics the planner asks for. `None` where a
+/// superfile carries nothing for the column.
+fn read_column(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Vec<Option<ColumnStats<'_>>> {
+    entries
+        .iter()
+        .map(|entry| entry.scalar_stats.column(column))
+        .collect()
+}
+
+/// Total null count across the superfiles read; `None` unless every one
+/// carries the stat (a missing side makes the total unknowable).
+fn scalar_null_count(reads: &[Option<ColumnStats<'_>>]) -> Option<u64> {
+    reads.iter().try_fold(0u64, |acc, stats| {
+        acc.checked_add(stats.as_ref()?.null_count()?)
     })
 }
 
-/// Exact sum of column `name` across `entries`; `None` unless every
-/// entry carries it and the fold doesn't overflow.
-fn scalar_sum(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<ScalarValue> {
+/// Exact sum across the superfiles read; `None` unless every one carries
+/// it and the fold doesn't overflow.
+fn scalar_sum(reads: &[Option<ColumnStats<'_>>]) -> Option<ScalarValue> {
     let mut acc: Option<ArrayRef> = None;
-    for entry in entries {
-        let part = entry.scalar_stats.get(column)?.sum?;
+    for stats in reads {
+        let part = stats.as_ref()?.sum()?;
         acc = Some(match acc {
             None => part,
             Some(total) => add_sum_arrays(&total, &part)?,
@@ -817,22 +830,25 @@ fn scalar_sum(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<Scalar
     ScalarValue::try_from_array(&acc?, 0).ok()
 }
 
-/// HLL distinct-count estimate for column `name` across `entries`;
-/// `None` unless every entry carries a sketch, an exact value table (a
-/// column counted exactly carries no sketch; its table's values are
-/// sketched here, hashed as the column sketch hashes them) or no value at
-/// all. Sketch unions are exact, so the merged estimate has single-sketch
+/// HLL distinct-count estimate across the superfiles read; `None` unless
+/// every one carries a sketch, an exact value table (a column counted
+/// exactly carries no sketch; its table's values are sketched in its
+/// place, hashed as the column sketch hashes them) or no value at all.
+/// Sketch unions are exact, so the merged estimate has single-sketch
 /// accuracy.
-fn scalar_distinct(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<usize> {
+fn scalar_distinct(reads: &[Option<ColumnStats<'_>>]) -> Option<usize> {
     let mut merged: Option<HllSketch> = None;
-    for entry in entries {
-        let stats = entry.scalar_stats.get(column)?;
-        let sketch = match (&stats.hll, &stats.value_counts) {
-            (Some(bytes), _) => HllSketch::from_bytes(bytes)?,
-            (None, Some(table)) => values_hll(table.entries().iter().map(|(value, _)| value))?,
-            // Null throughout the superfile: nothing to add to the estimate.
-            (None, None) if stats.all_null() => continue,
-            (None, None) => return None,
+    for stats in reads {
+        let stats = stats.as_ref()?;
+        let sketch = match stats.sketch() {
+            Some(bytes) => HllSketch::from_bytes(bytes)?,
+            None => match stats.values_sketch() {
+                Some(sketch) => sketch,
+                // Null throughout the superfile: nothing to add to the
+                // estimate.
+                None if stats.all_null() => continue,
+                None => return None,
+            },
         };
         merged = Some(match merged {
             None => sketch,
@@ -845,15 +861,10 @@ fn scalar_distinct(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Option<u
     Some(merged?.estimate().round() as usize)
 }
 
-fn scalar_min_max(
-    entries: &[Arc<SuperfileEntry>],
-    column: FieldId,
-) -> Option<(ScalarValue, ScalarValue)> {
+fn scalar_min_max(reads: &[Option<ColumnStats<'_>>]) -> Option<(ScalarValue, ScalarValue)> {
     let mut acc: Option<(ScalarValue, ScalarValue)> = None;
-    for entry in entries {
-        let agg = entry.scalar_stats.get(column)?;
-        let min = ScalarValue::try_from_array(&agg.min, 0).ok()?;
-        let max = ScalarValue::try_from_array(&agg.max, 0).ok()?;
+    for stats in reads {
+        let (min, max) = stats.as_ref()?.min_max_values()?;
         if min.is_null() || max.is_null() {
             return None;
         }
@@ -3275,7 +3286,10 @@ mod tests {
             .expect("sketchable")
             .estimate()
             .round() as usize;
-        assert_eq!(scalar_distinct(&entries, fid("n")), Some(want));
+        assert_eq!(
+            scalar_distinct(&read_column(&entries, fid("n"))),
+            Some(want)
+        );
     }
 
     /// A superfile in which the column is null throughout carries neither
@@ -3293,35 +3307,34 @@ mod tests {
             .expect("sketchable")
             .estimate()
             .round() as usize;
-        assert_eq!(scalar_distinct(&entries, fid("n")), Some(want));
+        assert_eq!(
+            scalar_distinct(&read_column(&entries, fid("n"))),
+            Some(want)
+        );
     }
 
     /// The statistics fold helpers return `None` when a column carries no
     /// usable stat — both when the column has min/max only (no additive
-    /// stat) and when it's absent entirely. Exercises the `get(col)?` and
-    /// `.<stat>.as_ref()?` short-circuit branches of the new map-based access.
+    /// stat) and when it's absent entirely. Exercises the `?` short-circuit
+    /// branches of each fold over the one read per superfile.
     #[test]
     fn scalar_statistics_helpers_return_none_when_stat_absent() {
         let entries = vec![entry_minmax_only("s", "alpha", "omega")];
+        let present = read_column(&entries, fid("s"));
         // Column present, but the additive stats are absent → None.
+        assert!(scalar_sum(&present).is_none(), "no sum stat → None");
+        assert!(scalar_distinct(&present).is_none(), "no hll stat → None");
         assert!(
-            scalar_sum(&entries, fid("s")).is_none(),
-            "no sum stat → None"
-        );
-        assert!(
-            scalar_distinct(&entries, fid("s")).is_none(),
-            "no hll stat → None"
-        );
-        assert!(
-            scalar_null_count(&entries, fid("s")).is_none(),
+            scalar_null_count(&present).is_none(),
             "no null_count stat → None"
         );
         // min/max IS present for the column.
-        assert!(scalar_min_max(&entries, fid("s")).is_some());
+        assert!(scalar_min_max(&present).is_some());
         // A column absent from every entry yields None for all helpers.
-        assert!(scalar_sum(&entries, fid("missing")).is_none());
-        assert!(scalar_min_max(&entries, fid("missing")).is_none());
-        assert!(scalar_null_count(&entries, fid("missing")).is_none());
+        let missing = read_column(&entries, fid("missing"));
+        assert!(scalar_sum(&missing).is_none());
+        assert!(scalar_min_max(&missing).is_none());
+        assert!(scalar_null_count(&missing).is_none());
     }
 
     /// `CachedMetadataReaderFactory`'s `Debug` reports the superfile

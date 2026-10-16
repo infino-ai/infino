@@ -822,6 +822,7 @@ mod tests {
         let section = SummariesRef {
             uri: "manifest-summaries/summ-abc.bin".into(),
             content_hash: ContentHash::of(b"section"),
+            size_bytes: 7,
         };
         let manifest = lazy_part_manifest(storage, Some(section.clone()));
 

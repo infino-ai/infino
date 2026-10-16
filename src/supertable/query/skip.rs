@@ -318,10 +318,9 @@ pub fn null_check_skip(
         .iter()
         .map(|entry| {
             guard.stats_are_stale(entry)
-                || entry
-                    .scalar_stats
-                    .get(column)
-                    .is_none_or(|agg| null_check_may_match(&agg, want_null))
+                || entry.scalar_stats.column(column).is_none_or(|stats| {
+                    null_check_may_match_counts(stats.null_count(), stats.all_null(), want_null)
+                })
         })
         .collect()
 }
@@ -424,10 +423,20 @@ impl ColumnTypeGuard {
 ///  - `IS NULL` (`want_null`): keep unless the stats prove zero nulls.
 ///  - `IS NOT NULL`: keep unless the column is entirely null.
 pub(crate) fn null_check_may_match(agg: &ScalarStatsAgg, want_null: bool) -> bool {
+    null_check_may_match_counts(agg.null_count, agg.all_null(), want_null)
+}
+
+/// [`null_check_may_match`] on the two statistics it reads, for a caller
+/// that has them without the whole aggregate.
+pub(crate) fn null_check_may_match_counts(
+    null_count: Option<u64>,
+    all_null: bool,
+    want_null: bool,
+) -> bool {
     if want_null {
-        agg.null_count != Some(0)
+        null_count != Some(0)
     } else {
-        !agg.all_null()
+        !all_null
     }
 }
 
@@ -444,14 +453,7 @@ fn superfile_may_match(entry: &SuperfileEntry, column: FieldId, pred: &ScalarPre
 /// The superfile's persisted min/max for `column`, or `None` when the
 /// column has no stats or the bounds don't decode (caller keeps).
 fn superfile_minmax(entry: &SuperfileEntry, column: FieldId) -> Option<(ScalarValue, ScalarValue)> {
-    let agg = entry.scalar_stats.get(column)?;
-    match (
-        ScalarValue::try_from_array(agg.min.as_ref(), 0),
-        ScalarValue::try_from_array(agg.max.as_ref(), 0),
-    ) {
-        (Ok(min), Ok(max)) => Some((min, max)),
-        _ => None,
-    }
+    entry.scalar_stats.column(column)?.min_max_values()
 }
 
 /// Conservative `min`/`max`-vs-`value` comparison core, shared by the

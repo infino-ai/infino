@@ -18,13 +18,21 @@
 //! Layout, little-endian:
 //!
 //! ```text
-//! "ISUM" | u32 version | u32 n_superfiles | u32 n_entries | u32 n_groups
+//! "ISUM" | u32 version | 16 bytes part id
+//! u32 n_superfiles | u32 n_entries | u32 n_groups
 //! n_superfiles x 16 bytes   superfile ids, in row order
 //! n_entries x 16 bytes      the directory: u32 field id, u32 group,
 //!                           u32 row start, u32 row count; by field id
 //! n_groups x 16 bytes       each group's IPC stream: u64 offset, u64 length
 //! the IPC streams
 //! ```
+//!
+//! The part id is the part's own random id, so a rebuild of the same
+//! superfiles never writes a section byte-identical to an earlier one: a
+//! section's name is its content hash, a PUT of a name that exists is
+//! skipped, and the earlier section may already be queued for deletion.
+//! Version 1 sections, written before the id was carried, have no id
+//! bytes and are read without the check.
 //!
 //! A group's batch has `column: UInt32`, `superfile: UInt32`, `min` and
 //! `max` of the group's type, `null_count: UInt64`, and, where the type
@@ -62,9 +70,11 @@ use uuid::Uuid;
 
 use crate::supertable::{
     manifest::{
+        column_hll,
         encoding::stats_ipc_options,
+        hll::HllSketch,
         list::{ScalarStatsAgg, ScalarValueCounts},
-        part::ContentHash,
+        part::{ContentHash, PartId},
     },
     schema::FieldId,
 };
@@ -79,20 +89,26 @@ pub fn summaries_uri(hash: &ContentHash) -> String {
 
 /// The first four bytes of a section.
 const MAGIC: &[u8; 4] = b"ISUM";
-/// The layout version this engine writes and reads.
-const VERSION: u32 = 1;
-/// Magic plus four `u32` counts.
-const HEADER_BYTES: usize = MAGIC.len() + 4 * U32_BYTES;
+/// The layout version this engine writes: the part id follows the version.
+const VERSION: u32 = 2;
+/// The first layout, without the part id; still read.
+const VERSION_WITHOUT_PART_ID: u32 = 1;
+/// Magic, the version, the part id and three `u32` counts.
+const HEADER_BYTES: usize = MAGIC.len() + U32_BYTES + ID_BYTES + 3 * U32_BYTES;
 /// Width of a little-endian `u32`.
 const U32_BYTES: usize = 4;
 /// Width of a little-endian `u64`.
 const U64_BYTES: usize = 8;
-/// A superfile id on the wire.
+/// A superfile id, or the part id, on the wire.
 const ID_BYTES: usize = 16;
 /// A directory entry: four `u32`s.
 const DIRECTORY_ENTRY_BYTES: usize = 4 * U32_BYTES;
 /// A group table entry: two `u64`s.
 const GROUP_ENTRY_BYTES: usize = 2 * U64_BYTES;
+/// The most bytes a group's variable-width array may address: Arrow's
+/// 32-bit offsets. A group past it is refused as an error rather than
+/// left to the array builders, which panic on the overflow.
+const MAX_GROUP_OFFSET: usize = i32::MAX as usize;
 
 /// The group batch's column names.
 const COLUMN_FIELD: &str = "column";
@@ -108,11 +124,14 @@ const VALUE_FIELD: &str = "value";
 const COUNT_FIELD: &str = "count";
 const ITEM_FIELD: &str = "item";
 
-/// A section's address: the content-addressed object a list entry names.
+/// A section's address: the content-addressed object a list entry names,
+/// with its size, which counts toward the part's split cap beside the
+/// part's own bytes (a commit re-encodes the latest part's section whole).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SummariesRef {
     pub uri: String,
     pub content_hash: ContentHash,
+    pub size_bytes: u64,
 }
 
 /// Why a section could not be encoded or read.
@@ -162,32 +181,100 @@ struct Group {
     value_counts: Option<ListArray>,
 }
 
-impl Group {
-    /// The statistics at row `i` of this group.
-    fn stat(&self, i: usize) -> ScalarStatsAgg {
-        let value_counts = self
+/// One column's statistics for one superfile, read in place from the
+/// decoded group: each accessor reads the one array it needs. The value
+/// table alone is built on request, since building it converts every
+/// value, and the pruner and the planner's statistics never need it.
+#[derive(Clone, Copy)]
+pub struct ColumnRow<'a> {
+    group: &'a Group,
+    index: usize,
+}
+
+impl ColumnRow<'_> {
+    /// The lower bound as a one-row array; null when the column is null
+    /// throughout the superfile.
+    pub fn min(&self) -> ArrayRef {
+        self.group.min.slice(self.index, 1)
+    }
+
+    /// The upper bound as a one-row array.
+    pub fn max(&self) -> ArrayRef {
+        self.group.max.slice(self.index, 1)
+    }
+
+    /// Both bounds as values, when they convert.
+    pub fn min_max_values(&self) -> Option<(ScalarValue, ScalarValue)> {
+        let min = ScalarValue::try_from_array(&self.group.min, self.index).ok()?;
+        let max = ScalarValue::try_from_array(&self.group.max, self.index).ok()?;
+        Some((min, max))
+    }
+
+    /// Whether the column had no non-null value in the superfile.
+    pub fn all_null(&self) -> bool {
+        self.group.min.is_null(self.index)
+    }
+
+    /// The null count, when the superfile carries it.
+    pub fn null_count(&self) -> Option<u64> {
+        self.group
+            .null_count
+            .is_valid(self.index)
+            .then(|| self.group.null_count.value(self.index))
+    }
+
+    /// The exact sum as a one-row array, when the superfile carries it.
+    pub fn sum(&self) -> Option<ArrayRef> {
+        self.group
+            .sum
+            .as_ref()
+            .filter(|sum| sum.is_valid(self.index))
+            .map(|sum| sum.slice(self.index, 1))
+    }
+
+    /// The distinct-count sketch's bytes, borrowed, when the superfile
+    /// carries one.
+    pub fn sketch(&self) -> Option<&[u8]> {
+        self.group
+            .hll
+            .as_ref()
+            .filter(|hll| hll.is_valid(self.index))
+            .map(|hll| hll.value(self.index))
+    }
+
+    /// The sketch of the exact value table's values, hashed as the column
+    /// sketch hashes them, when the superfile carries a table: the
+    /// distinct estimate of a column counted exactly, taken from the
+    /// table's value array without converting a value.
+    pub fn values_sketch(&self) -> Option<HllSketch> {
+        let list = self.group.value_counts.as_ref()?;
+        if !list.is_valid(self.index) {
+            return None;
+        }
+        let item = list.value(self.index);
+        let item = item.as_any().downcast_ref::<StructArray>()?;
+        column_hll(&[Arc::clone(item.column(0))])
+    }
+
+    /// The exact value table, built from its row, when the superfile
+    /// carries one.
+    pub(crate) fn value_counts(&self) -> Option<ScalarValueCounts> {
+        self.group
             .value_counts
             .as_ref()
-            .filter(|list| list.is_valid(i))
-            .and_then(|list| value_counts_of(&list.value(i)));
+            .filter(|list| list.is_valid(self.index))
+            .and_then(|list| value_counts_of(&list.value(self.index)))
+    }
+
+    /// Every statistic, in the decoded shape.
+    pub fn stats(&self) -> ScalarStatsAgg {
         ScalarStatsAgg {
-            min: self.min.slice(i, 1),
-            max: self.max.slice(i, 1),
-            null_count: self
-                .null_count
-                .is_valid(i)
-                .then(|| self.null_count.value(i)),
-            sum: self
-                .sum
-                .as_ref()
-                .filter(|sum| sum.is_valid(i))
-                .map(|sum| sum.slice(i, 1)),
-            hll: self
-                .hll
-                .as_ref()
-                .filter(|hll| hll.is_valid(i))
-                .map(|hll| hll.value(i).to_vec()),
-            value_counts,
+            min: self.min(),
+            max: self.max(),
+            null_count: self.null_count(),
+            sum: self.sum(),
+            hll: self.sketch().map(<[u8]>::to_vec),
+            value_counts: self.value_counts(),
         }
     }
 }
@@ -212,6 +299,9 @@ fn value_counts_of(item: &ArrayRef) -> Option<ScalarValueCounts> {
 /// A section, parsed to its directory; groups decode on first use.
 pub struct SummariesSection {
     bytes: Bytes,
+    /// The part the section was written for; `None` on a version 1
+    /// section, from before the id was carried.
+    part_id: Option<PartId>,
     superfile_ids: Vec<Uuid>,
     /// Sorted by field id, then group.
     directory: Vec<DirectoryEntry>,
@@ -224,6 +314,7 @@ impl fmt::Debug for SummariesSection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SummariesSection")
             .field("bytes", &self.bytes.len())
+            .field("part_id", &self.part_id)
             .field("superfiles", &self.superfile_ids.len())
             .field("directory_entries", &self.directory.len())
             .field("groups", &self.groups.len())
@@ -240,10 +331,14 @@ pub struct SummaryRow {
 }
 
 impl SummariesSection {
-    /// Encode a section for the superfiles `ids`, in row order, from
-    /// `rows`. A row's bounds must be one-row arrays of one type; a value
-    /// table's values must be of that type.
-    pub fn encode(ids: &[Uuid], rows: Vec<SummaryRow>) -> Result<Vec<u8>, SummariesError> {
+    /// Encode the section of part `part_id` for the superfiles `ids`, in
+    /// row order, from `rows`. A row's bounds must be one-row arrays of
+    /// one type; a value table's values must be of that type.
+    pub fn encode(
+        part_id: PartId,
+        ids: &[Uuid],
+        rows: Vec<SummaryRow>,
+    ) -> Result<Vec<u8>, SummariesError> {
         // Group by the bounds' type, in a fixed order so equal input gives
         // equal bytes, which content addressing relies on.
         let mut by_type: Vec<(DataType, Vec<SummaryRow>)> = Vec::new();
@@ -306,6 +401,7 @@ impl SummariesSection {
         let mut out = Vec::with_capacity(tables_end + payloads.iter().map(Vec::len).sum::<usize>());
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(part_id.0.as_bytes());
         out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
         out.extend_from_slice(&(directory.len() as u32).to_le_bytes());
         out.extend_from_slice(&(payloads.len() as u32).to_le_bytes());
@@ -344,6 +440,14 @@ impl SummariesSection {
         if version > VERSION {
             return Err(SummariesError::Version(version));
         }
+        let part_id = if version == VERSION_WITHOUT_PART_ID {
+            None
+        } else {
+            let id = reader.take(ID_BYTES, "part id")?;
+            Some(PartId(Uuid::from_slice(id).map_err(|e| {
+                SummariesError::Malformed(format!("part id: {e}"))
+            })?))
+        };
         let n_superfiles = reader.u32("superfile count")? as usize;
         let n_entries = reader.u32("directory size")? as usize;
         let n_groups = reader.u32("group count")? as usize;
@@ -390,11 +494,18 @@ impl SummariesSection {
         let decoded = (0..n_groups).map(|_| OnceLock::new()).collect();
         Ok(Self {
             bytes,
+            part_id,
             superfile_ids,
             directory,
             groups,
             decoded,
         })
+    }
+
+    /// The part this section was written for; `None` on a version 1
+    /// section.
+    pub fn part_id(&self) -> Option<PartId> {
+        self.part_id
     }
 
     /// The superfiles this section holds rows for, in row order.
@@ -410,12 +521,13 @@ impl SummariesSection {
             .map(|row| row as u32)
     }
 
-    /// The statistics of `column` for the superfile at `row`, or `None`
-    /// when that superfile carries no row for the column. A group that
-    /// does not decode reads as no statistics, after a warning: the bytes
-    /// were hash-verified when loaded, so that is a defect, and reading no
-    /// statistics keeps every superfile rather than dropping one.
-    pub fn stat(&self, row: u32, column: FieldId) -> Option<ScalarStatsAgg> {
+    /// The statistics of `column` for the superfile at `row`, read in
+    /// place, or `None` when that superfile carries no row for the
+    /// column. A group that does not decode reads as no statistics, after
+    /// a warning: the bytes were hash-verified when loaded, so that is a
+    /// defect, and reading no statistics keeps every superfile rather
+    /// than dropping one.
+    pub fn column(&self, row: u32, column: FieldId) -> Option<ColumnRow<'_>> {
         let first = self.directory.partition_point(|entry| entry.field < column);
         for entry in self.directory[first..]
             .iter()
@@ -428,10 +540,18 @@ impl SummariesSection {
                 .binary_search(&row)
                 .ok();
             if let Some(i) = within {
-                return Some(group.stat(start + i));
+                return Some(ColumnRow {
+                    group,
+                    index: start + i,
+                });
             }
         }
         None
+    }
+
+    /// [`Self::column`] in the decoded shape, every statistic built.
+    pub fn stat(&self, row: u32, column: FieldId) -> Option<ScalarStatsAgg> {
+        self.column(row, column).map(|found| found.stats())
     }
 
     /// Every column's statistics for the superfile at `row`.
@@ -444,7 +564,11 @@ impl SummariesSection {
             let start = entry.row_start as usize;
             let end = start + entry.row_count as usize;
             if let Ok(i) = group.superfile.values()[start..end].binary_search(&row) {
-                out.insert(entry.field, group.stat(start + i));
+                let found = ColumnRow {
+                    group,
+                    index: start + i,
+                };
+                out.insert(entry.field, found.stats());
             }
         }
         out
@@ -580,6 +704,12 @@ fn encode_group(data_type: &DataType, rows: &[SummaryRow]) -> Result<Vec<u8>, Su
     if rows.iter().any(|row| row.stats.hll.is_some()) {
         let sketches: Vec<Option<&[u8]>> =
             rows.iter().map(|row| row.stats.hll.as_deref()).collect();
+        let total: usize = sketches.iter().flatten().map(|bytes| bytes.len()).sum();
+        if total > MAX_GROUP_OFFSET {
+            return Err(SummariesError::Malformed(format!(
+                "a group of type {data_type} holds {total} sketch bytes, past the 32-bit offsets"
+            )));
+        }
         fields.push(Field::new(HLL_FIELD, DataType::Binary, true));
         arrays.push(Arc::new(BinaryArray::from(sketches)));
     }
@@ -612,6 +742,12 @@ fn encode_group(data_type: &DataType, rows: &[SummaryRow]) -> Result<Vec<u8>, Su
                     present.push(false);
                 }
             }
+        }
+        if values.len() > MAX_GROUP_OFFSET {
+            return Err(SummariesError::Malformed(format!(
+                "a group of type {data_type} holds {} value-table entries, past the 32-bit offsets",
+                values.len()
+            )));
         }
         let values = ScalarValue::iter_to_array(values).map_err(SummariesError::arrow)?;
         let counts: ArrayRef = Arc::new(UInt64Array::from(counts));
@@ -746,6 +882,7 @@ mod tests {
     use arrow_array::{BooleanArray, Float64Array, Int64Array, StringArray};
 
     use super::*;
+    use crate::supertable::manifest::values_hll;
 
     /// Build the statistics of one column from an array, as the writer
     /// does.
@@ -755,6 +892,11 @@ mod tests {
 
     fn ids(n: usize) -> Vec<Uuid> {
         (0..n).map(|i| Uuid::from_u128(i as u128 + 1)).collect()
+    }
+
+    /// The part the test sections are written for.
+    fn part() -> PartId {
+        PartId(Uuid::from_u128(0xabc))
     }
 
     const AMOUNT: FieldId = FieldId(3);
@@ -817,9 +959,10 @@ mod tests {
             .iter()
             .map(|row| (row.column, row.superfile, row.stats.clone()))
             .collect();
-        let bytes = SummariesSection::encode(&ids, rows).expect("encode");
+        let bytes = SummariesSection::encode(part(), &ids, rows).expect("encode");
         let section = SummariesSection::parse(Bytes::from(bytes)).expect("parse");
         assert_eq!(section.superfile_ids(), ids.as_slice());
+        assert_eq!(section.part_id(), Some(part()));
         for (column, superfile, stats) in &expected {
             let back = section
                 .stat(*superfile, *column)
@@ -837,9 +980,111 @@ mod tests {
     }
 
     #[test]
+    fn a_column_row_reads_each_statistic_in_place() {
+        let (ids, rows) = two_superfiles();
+        let bytes = SummariesSection::encode(part(), &ids, rows).expect("encode");
+        let section = SummariesSection::parse(Bytes::from(bytes)).expect("parse");
+        let amount = section.column(0, AMOUNT).expect("amount of the first");
+        assert_eq!(
+            amount.min_max_values(),
+            Some((ScalarValue::Int64(Some(3)), ScalarValue::Int64(Some(9))))
+        );
+        assert_eq!(amount.null_count(), Some(1));
+        assert!(!amount.all_null());
+        let sum = amount.sum().expect("integers sum");
+        assert_eq!(
+            ScalarValue::try_from_array(&sum, 0).expect("one row"),
+            ScalarValue::Int64(Some(12))
+        );
+        // Two distinct values: counted exactly, so no sketch, and the
+        // table's own sketch is the column's register for register.
+        assert!(amount.sketch().is_none());
+        let table = amount.value_counts().expect("a value table");
+        assert_eq!(table.entries().len(), 2);
+        let from_table = amount.values_sketch().expect("the table sketches");
+        let from_values =
+            values_hll(table.entries().iter().map(|(value, _)| value)).expect("values sketch");
+        assert_eq!(from_table.as_bytes(), from_values.as_bytes());
+        assert_eq!(amount.stats(), section.row_map(0)[&AMOUNT]);
+
+        let empty = section.column(0, EMPTY).expect("the null column");
+        assert!(empty.all_null());
+        assert_eq!(empty.null_count(), Some(2));
+        assert!(empty.sketch().is_none() && empty.values_sketch().is_none());
+        assert!(empty.value_counts().is_none());
+        assert!(section.column(0, ONLY_SECOND).is_none());
+    }
+
+    #[test]
+    fn a_section_names_its_part_and_a_rebuild_differs_by_it() {
+        let (ids, rows) = two_superfiles();
+        let first = SummariesSection::encode(part(), &ids, rows).expect("encode");
+        let (ids, rows) = two_superfiles();
+        let rebuilt = PartId(Uuid::from_u128(0xdef));
+        let second = SummariesSection::encode(rebuilt, &ids, rows).expect("encode");
+        assert_ne!(ContentHash::of(&first), ContentHash::of(&second));
+        assert_eq!(
+            SummariesSection::parse(Bytes::from(second))
+                .expect("parse")
+                .part_id(),
+            Some(rebuilt)
+        );
+    }
+
+    /// A version 1 section, from before the part id was carried, reads
+    /// as one with no part id: the same bytes less the id, with the
+    /// group table's offsets moved up by its width.
+    #[test]
+    fn a_section_from_before_the_part_id_still_reads() {
+        let (ids, rows) = two_superfiles();
+        let expected: Vec<(FieldId, u32, ScalarStatsAgg)> = rows
+            .iter()
+            .map(|row| (row.column, row.superfile, row.stats.clone()))
+            .collect();
+        let current = SummariesSection::encode(part(), &ids, rows).expect("encode");
+        let counts_at = MAGIC.len() + U32_BYTES + ID_BYTES;
+        let n_superfiles = u32::from_le_bytes(
+            current[counts_at..counts_at + U32_BYTES]
+                .try_into()
+                .expect("four bytes"),
+        ) as usize;
+        let n_entries = u32::from_le_bytes(
+            current[counts_at + U32_BYTES..counts_at + 2 * U32_BYTES]
+                .try_into()
+                .expect("four bytes"),
+        ) as usize;
+        let n_groups = u32::from_le_bytes(
+            current[counts_at + 2 * U32_BYTES..counts_at + 3 * U32_BYTES]
+                .try_into()
+                .expect("four bytes"),
+        ) as usize;
+        let mut legacy = Vec::with_capacity(current.len() - ID_BYTES);
+        legacy.extend_from_slice(MAGIC);
+        legacy.extend_from_slice(&VERSION_WITHOUT_PART_ID.to_le_bytes());
+        legacy.extend_from_slice(&current[counts_at..]);
+        let group_table_at = MAGIC.len()
+            + 4 * U32_BYTES
+            + n_superfiles * ID_BYTES
+            + n_entries * DIRECTORY_ENTRY_BYTES;
+        for group in 0..n_groups {
+            let at = group_table_at + group * GROUP_ENTRY_BYTES;
+            let offset =
+                u64::from_le_bytes(legacy[at..at + U64_BYTES].try_into().expect("eight bytes"))
+                    - ID_BYTES as u64;
+            legacy[at..at + U64_BYTES].copy_from_slice(&offset.to_le_bytes());
+        }
+        let section = SummariesSection::parse(Bytes::from(legacy)).expect("parse");
+        assert_eq!(section.part_id(), None);
+        assert_eq!(section.superfile_ids(), ids.as_slice());
+        for (column, superfile, stats) in &expected {
+            assert_eq!(section.stat(*superfile, *column).as_ref(), Some(stats));
+        }
+    }
+
+    #[test]
     fn a_row_map_holds_every_column_of_its_superfile() {
         let (ids, rows) = two_superfiles();
-        let bytes = SummariesSection::encode(&ids, rows).expect("encode");
+        let bytes = SummariesSection::encode(part(), &ids, rows).expect("encode");
         let section = SummariesSection::parse(Bytes::from(bytes)).expect("parse");
         let first = section.row_map(0);
         assert_eq!(first.len(), 5);
@@ -867,7 +1112,7 @@ mod tests {
                 stats: stats_of(Arc::new(StringArray::from(vec!["1", "2"]))),
             },
         ];
-        let bytes = SummariesSection::encode(&ids, rows).expect("encode");
+        let bytes = SummariesSection::encode(part(), &ids, rows).expect("encode");
         let section = SummariesSection::parse(Bytes::from(bytes)).expect("parse");
         assert_eq!(
             section.stat(0, AMOUNT).expect("int").min.data_type(),
@@ -881,7 +1126,7 @@ mod tests {
 
     #[test]
     fn an_empty_section_holds_nothing() {
-        let bytes = SummariesSection::encode(&ids(1), Vec::new()).expect("encode");
+        let bytes = SummariesSection::encode(part(), &ids(1), Vec::new()).expect("encode");
         let section = SummariesSection::parse(Bytes::from(bytes)).expect("parse");
         assert!(section.stat(0, AMOUNT).is_none());
         assert!(section.row_map(0).is_empty());
@@ -902,7 +1147,7 @@ mod tests {
             Err(SummariesError::BadMagic)
         ));
         let (ids, rows) = two_superfiles();
-        let mut bytes = SummariesSection::encode(&ids, rows).expect("encode");
+        let mut bytes = SummariesSection::encode(part(), &ids, rows).expect("encode");
         bytes.truncate(bytes.len() / 2);
         assert!(matches!(
             SummariesSection::parse(Bytes::from(bytes)),
@@ -913,10 +1158,10 @@ mod tests {
     #[test]
     fn equal_rows_encode_to_equal_bytes() {
         let (ids, rows) = two_superfiles();
-        let once = SummariesSection::encode(&ids, rows).expect("encode");
+        let once = SummariesSection::encode(part(), &ids, rows).expect("encode");
         let (ids, mut rows) = two_superfiles();
         rows.reverse();
-        let again = SummariesSection::encode(&ids, rows).expect("encode");
+        let again = SummariesSection::encode(part(), &ids, rows).expect("encode");
         assert_eq!(once, again, "row order does not change the bytes");
     }
 }

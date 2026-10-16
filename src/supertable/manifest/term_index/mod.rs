@@ -4106,11 +4106,7 @@ mod tests {
         commit_segment(&st, 3);
 
         let after = current_list(&storage, &legacy, &rt);
-        assert!(
-            after.format_version.starts_with("2."),
-            "{}",
-            after.format_version
-        );
+        assert_eq!(after.format_version, list::FORMAT_VERSION);
         let schema = after
             .schema
             .as_ref()

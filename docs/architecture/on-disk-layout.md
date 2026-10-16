@@ -155,7 +155,7 @@ Anchored by symbol so they survive line moves:
 | `data/seg-<uuid>.sf.parquet` name | `SuperfileUri::storage_path` | [src/supertable/manifest/mod.rs](../../src/supertable/manifest/mod.rs) |
 | `data/<stem>-<uuid>.sf.parquet` name (source-named) | `SuperfileEntry::storage_path`, `superfile_stem` | [src/supertable/manifest/mod.rs](../../src/supertable/manifest/mod.rs) |
 | manifest-part Avro schema (`superfiles[].uri`, summaries) | `SuperfileEntry` schema | [src/supertable/manifest/part.rs](../../src/supertable/manifest/part.rs) |
-| `manifest-summaries/summ-<hash>.bin` name and layout: header, superfile ids, directory, one IPC batch per column type | `MANIFEST_SUMMARIES_DIR`, `summaries_uri`, `SummariesSection` | [src/supertable/manifest/summaries.rs](../../src/supertable/manifest/summaries.rs) |
+| `manifest-summaries/summ-<hash>.bin` name and layout: header with the part's id, superfile ids, directory, one IPC batch per column type | `MANIFEST_SUMMARIES_DIR`, `summaries_uri`, `SummariesSection` | [src/supertable/manifest/summaries.rs](../../src/supertable/manifest/summaries.rs) |
 | `wal/mutations/` state-doc + `.arrow` sidecar | `WAL_DIR`, `WalStore` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | `superfiles/<id>.tombstones` sidecar paths | `SUPERFILES_DIR`, `tombstones_path` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | tombstone binary format (`INFTOMB\0` + RoaringBitmap) | `MAGIC`, layout doc | [src/supertable/wal/tombstones_codec.rs](../../src/supertable/wal/tombstones_codec.rs) |
