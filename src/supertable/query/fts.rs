@@ -547,6 +547,12 @@ pub(crate) async fn memo_from_locations(
 /// on its own; a ceiling that rounding put an ulp below a real score is
 /// protected by the widening the term index applies to every ceiling
 /// (`CEILING_SLACK`), not by this test.
+pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
+    // Written as "not strictly less" rather than `>=` so an incomparable
+    // ceiling (a NaN from a degenerate rescale) is opened, never skipped.
+    ceiling.partial_cmp(&floor) != Some(std::cmp::Ordering::Less)
+}
+
 /// The score a superfile's ceiling is actually tested against: the running
 /// k-th score, raised by the caller's tolerance.
 ///
@@ -562,12 +568,6 @@ pub(crate) fn competitive_floor(floor: f32, tolerance: f32) -> f32 {
         true => floor * (1.0 + tolerance),
         false => floor,
     }
-}
-
-pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
-    // Written as "not strictly less" rather than `>=` so an incomparable
-    // ceiling (a NaN from a degenerate rescale) is opened, never skipped.
-    ceiling.partial_cmp(&floor) != Some(std::cmp::Ordering::Less)
 }
 
 /// What a superfile scores a query at: the query's BM25 parameters, and
