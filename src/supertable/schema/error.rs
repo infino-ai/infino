@@ -28,6 +28,22 @@ pub enum SchemaError {
         /// The type the batch carries.
         offered: DataType,
     },
+    /// A batch names a live column, or a column another batch of the same
+    /// commit adds, with an identity (the `infino:identity` field metadata)
+    /// other than the one the column was added with: another writer gave
+    /// the name to another thing first.
+    #[error(
+        "column `{column}` holds `{held}`, and the batch carries `{offered}` under that name; \
+         another writer gave the name to another thing first, so give this one another name"
+    )]
+    IdentityMismatch {
+        /// The column's name.
+        column: String,
+        /// The identity the column was added with.
+        held: String,
+        /// The identity the batch carries for it.
+        offered: String,
+    },
     /// A batch lacks a column the table requires a value for.
     #[error("column `{column}` is not nullable and the batch does not carry it")]
     MissingColumn {
@@ -270,6 +286,7 @@ impl SchemaError {
     pub fn kind(&self) -> &'static str {
         match self {
             SchemaError::TypeMismatch { .. } => "TypeMismatch",
+            SchemaError::IdentityMismatch { .. } => "IdentityMismatch",
             SchemaError::MissingColumn { .. } => "MissingColumn",
             SchemaError::NullInNonNullable { .. } => "NullInNonNullable",
             SchemaError::ValueOutOfRange { .. } => "ValueOutOfRange",
@@ -313,6 +330,11 @@ mod tests {
                 column: column(),
                 frozen: DataType::Int64,
                 offered: DataType::Utf8,
+            },
+            SchemaError::IdentityMismatch {
+                column: column(),
+                held: "a".into(),
+                offered: "b".into(),
             },
             SchemaError::MissingColumn { column: column() },
             SchemaError::NullInNonNullable { column: column() },
@@ -391,6 +413,7 @@ mod tests {
     fn _every_variant_has_a_sample(error: &SchemaError) {
         match error {
             SchemaError::TypeMismatch { .. }
+            | SchemaError::IdentityMismatch { .. }
             | SchemaError::MissingColumn { .. }
             | SchemaError::NullInNonNullable { .. }
             | SchemaError::ValueOutOfRange { .. }
@@ -432,7 +455,7 @@ mod tests {
             .to_owned()
     }
 
-    /// Every variant's kind is its own name. `kind()` is 26 hand-written
+    /// Every variant's kind is its own name. `kind()` is 27 hand-written
     /// arms and the contract is that the names never change once shipped, so
     /// a typo in any one of them would otherwise ship: the arms a reader
     /// happens to spot-check are the only ones a list of expected strings
