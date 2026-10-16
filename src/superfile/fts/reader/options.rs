@@ -84,9 +84,17 @@ pub struct Bm25SearchOptions {
     /// about 1.8 percent of real error. Measure your own corpus before
     /// reaching for it.
     ///
+    /// It also does nothing on a small table. A ranked query opens its first
+    /// [`bound_ordered_open_window`] candidates at once, 64 by default, so
+    /// until that many have been read there is no k-th score to fall short of
+    /// and nothing to skip. A table with no more candidate superfiles than
+    /// that behaves identically at every tolerance.
+    ///
     /// A negative or non-finite value is exact. A table reached over the
     /// network ignores this field, as it ignores [`Self::bm25`], because the
     /// request carries neither: the result is exact rather than wrong.
+    ///
+    /// [`bound_ordered_open_window`]: crate::supertable::SupertableOptions::bound_ordered_open_window
     pub score_tolerance: f32,
 }
 
