@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+use arrow_array::{ArrayRef, Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
 use infino::{
     Bm25SearchOptions,
     runtime_metrics::op_stats::with_op_stats,
@@ -106,6 +106,70 @@ fn hits_and_opens(st: &Supertable, tolerance: f32) -> (usize, u64) {
     });
     let hits = rows.iter().map(RecordBatch::num_rows).sum();
     (hits, stats.score_pruning_survived)
+}
+
+/// The `(id, score)` pairs a search returns, in rank order.
+fn ranked(st: &Supertable, k: usize, tolerance: f32) -> Vec<(i128, f32)> {
+    let rows = st
+        .bm25_search(
+            "title",
+            "alpha",
+            k,
+            Bm25SearchOptions::new().with_score_tolerance(tolerance),
+            None,
+        )
+        .expect("search");
+    let mut out = Vec::new();
+    for b in &rows {
+        let ids = b
+            .column(b.schema().index_of("_id").expect("id column"))
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal id column")
+            .clone();
+        let scores = b
+            .column(b.schema().index_of("score").expect("score column"))
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("f32 score column")
+            .clone();
+        for i in 0..b.num_rows() {
+            out.push((ids.value(i), scores.value(i)));
+        }
+    }
+    out
+}
+
+/// A tolerance decides which superfiles go unread. It must not touch how the
+/// documents that are returned get scored: within a superfile the engine has
+/// opened, the kernel still prunes against the exact k-th. So every document a
+/// tolerant search returns has to carry the score exact scoring gives it, bit
+/// for bit, and the only difference between the two is which documents appear.
+///
+/// This is the property that makes the knob safe to expose. A tolerance that
+/// also loosened scoring would return numbers no exact run agrees with, and a
+/// caller comparing scores across queries would be silently misled.
+#[test]
+fn a_tolerant_search_returns_true_scores() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = table(&dir);
+
+    let exact: std::collections::HashMap<i128, f32> =
+        ranked(&st, N_SUPERFILES * DOCS_PER_SUPERFILE, 0.0)
+            .into_iter()
+            .collect();
+    assert!(!exact.is_empty(), "the fixture must match something");
+
+    for (id, score) in ranked(&st, TOP_K, WIDE_TOLERANCE) {
+        let truth = exact.get(&id).unwrap_or_else(|| {
+            panic!("tolerant search returned id {id}, which exact scoring never did")
+        });
+        assert_eq!(
+            score.to_bits(),
+            truth.to_bits(),
+            "id {id} scored {score} under tolerance but {truth} exactly"
+        );
+    }
 }
 
 #[test]

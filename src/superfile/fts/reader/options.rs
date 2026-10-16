@@ -69,24 +69,24 @@ pub struct Bm25SearchOptions {
     /// default, is exact: a superfile is skipped only when it provably cannot
     /// place a document in the top k. `0.01` allows a one percent shortfall.
     ///
-    /// The engine opens superfiles in descending ceiling order and stops when
-    /// the best unread ceiling cannot compete, so raising this stops sooner
-    /// and reads fewer superfiles, at the cost of possibly missing a document
-    /// whose score is within the tolerance of the k-th.
+    /// Only the decision to read a superfile at all is relaxed. Inside one the
+    /// engine has opened, scoring and pruning stay exact, so every document
+    /// returned carries its true score and the error is confined to documents
+    /// in superfiles that went unread.
     ///
-    /// It buys less than it looks like it should. The decision compares
-    /// against the largest ceiling among unread superfiles, and when those
-    /// ceilings sit close together, as they do on a table whose superfiles
-    /// hold similar documents, that figure stays near the global maximum
-    /// until almost nothing is left to read. Measured over a 962-query
-    /// benchmark at a billion documents, a one percent tolerance read exactly
-    /// as many superfiles as exact scoring; five percent cut the median read
-    /// six-fold but left the ninetieth percentile untouched, and cost about
-    /// 1.8 percent of real error with recall@10 at 0.30. Treat it as a knob
-    /// for a caller who has measured their own corpus, not as a default to
-    /// reach for.
+    /// It buys less than it appears to. The decision compares against the
+    /// largest ceiling among unread superfiles, and where those sit close
+    /// together, as on a table whose superfiles hold similar documents, that
+    /// figure stays near the global maximum until almost nothing is left.
+    /// Measured over a 962-query benchmark at a billion documents, one percent
+    /// read exactly as many superfiles as exact scoring; five percent cut the
+    /// median read six-fold, left the ninetieth percentile untouched, and cost
+    /// about 1.8 percent of real error. Measure your own corpus before
+    /// reaching for it.
     ///
-    /// A negative or non-finite value is treated as `0.0`.
+    /// A negative or non-finite value is exact. A table reached over the
+    /// network ignores this field, as it ignores [`Self::bm25`], because the
+    /// request carries neither: the result is exact rather than wrong.
     pub score_tolerance: f32,
 }
 
