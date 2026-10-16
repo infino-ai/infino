@@ -835,9 +835,11 @@ fn scalar_sum(reads: &[Option<ColumnStats<'_>>]) -> Option<ScalarValue> {
 /// exactly carries no sketch; its table's values are sketched in its
 /// place, hashed as the column sketch hashes them) or no value at all.
 /// Sketch unions are exact, so the merged estimate has single-sketch
-/// accuracy.
+/// accuracy. A column null throughout every superfile has no distinct
+/// value: zero, not unknown.
 fn scalar_distinct(reads: &[Option<ColumnStats<'_>>]) -> Option<usize> {
     let mut merged: Option<HllSketch> = None;
+    let mut null_throughout = false;
     for stats in reads {
         let stats = stats.as_ref()?;
         let sketch = match stats.sketch() {
@@ -846,7 +848,10 @@ fn scalar_distinct(reads: &[Option<ColumnStats<'_>>]) -> Option<usize> {
                 Some(sketch) => sketch,
                 // Null throughout the superfile: nothing to add to the
                 // estimate.
-                None if stats.all_null() => continue,
+                None if stats.all_null() => {
+                    null_throughout = true;
+                    continue;
+                }
                 None => return None,
             },
         };
@@ -858,7 +863,11 @@ fn scalar_distinct(reads: &[Option<ColumnStats<'_>>]) -> Option<usize> {
             }
         });
     }
-    Some(merged?.estimate().round() as usize)
+    match merged {
+        Some(sketch) => Some(sketch.estimate().round() as usize),
+        None if null_throughout => Some(0),
+        None => None,
+    }
 }
 
 fn scalar_min_max(reads: &[Option<ColumnStats<'_>>]) -> Option<(ScalarValue, ScalarValue)> {
@@ -3294,7 +3303,8 @@ mod tests {
 
     /// A superfile in which the column is null throughout carries neither
     /// sketch nor table; it adds nothing to the estimate and withholds
-    /// nothing.
+    /// nothing. Null throughout every superfile, the column has no
+    /// distinct value at all.
     #[test]
     fn scalar_distinct_skips_a_superfile_where_the_column_is_null_throughout() {
         let values: ArrayRef = Arc::new(Int64Array::from(vec![10, 50, 10]));
@@ -3310,6 +3320,15 @@ mod tests {
         assert_eq!(
             scalar_distinct(&read_column(&entries, fid("n"))),
             Some(want)
+        );
+
+        let only_nulls = vec![
+            entry_from_column("n", &nulls),
+            entry_from_column("n", &nulls),
+        ];
+        assert_eq!(
+            scalar_distinct(&read_column(&only_nulls, fid("n"))),
+            Some(0)
         );
     }
 

@@ -980,8 +980,9 @@ impl ScalarStatsAgg {
         // count and gets no sketch either: its null bounds and null count
         // say it all, and on that table two columns in three are null in
         // any one superfile, each carrying an empty kilobyte. The planner's
-        // distinct estimate reads a table where there is one, a sketch
-        // where there is not (`values_hll`), and nothing from a null column.
+        // distinct estimate sketches a table's values where there is one,
+        // reads the sketch where there is not, and nothing from a null
+        // column.
         let value_counts = ScalarValueCounts::from_pieces(pieces);
         let non_null: usize = pieces
             .iter()

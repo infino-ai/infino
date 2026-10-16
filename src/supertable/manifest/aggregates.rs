@@ -134,15 +134,6 @@ pub fn fts_length_totals(
 // ---------------------------------------------------------
 
 fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<FieldId, ScalarStatsAgg> {
-    // Fold each superfile's per-column aggregate table together. `merge`
-    // keeps the min/max extremes (column union) and combines the additive
-    // stats (null count / sum / HLL / value counts) only when every
-    // contributor carries them — sharing one code path with the per-column
-    // merge instead of a hand-rolled fold + a duplicate min/max helper.
-    let mut out: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
-    for seg in superfiles {
-        ScalarStatsAgg::merge(&mut out, &seg.scalar_stats.map());
-    }
     // The list reads a part's rollup for its bounds and its null count: the
     // list-level pruner compares a filter against min/max, the IS NULL prune
     // asks whether the part can hold a null, and the drain reads the birth
@@ -151,12 +142,35 @@ fn scalar_stats_agg(superfiles: &[Arc<SuperfileEntry>]) -> HashMap<FieldId, Scal
     // carrying them here put a 1 KiB sketch and a value table for every
     // field of every part into the list: a table of 3,882 fields had a
     // 247 MB JSON list at 46 parts, rewritten at every commit and parsed
-    // whole by every handle. The rollup keeps the bounds and the null count
-    // and drops the rest.
-    for agg in out.values_mut() {
-        agg.sum = None;
-        agg.hll = None;
-        agg.value_counts = None;
+    // whole by every handle. So the fold reads each superfile's bounds and
+    // null count in place and never builds the rest: a rebuild over a big
+    // part otherwise decoded every value table only to drop it. Per column
+    // the fold is `merge_with`'s: min/max take the extremes, the null count
+    // folds while every contributor carries it, and a column whose types
+    // disagree between superfiles is dropped from the rollup (no info, so
+    // the pruner keeps the part) rather than kept with unsound bounds.
+    let mut out: HashMap<FieldId, ScalarStatsAgg> = HashMap::new();
+    for seg in superfiles {
+        for (column, stats) in seg.scalar_stats.columns() {
+            let bounds = ScalarStatsAgg {
+                min: stats.min(),
+                max: stats.max(),
+                null_count: stats.null_count(),
+                sum: None,
+                hll: None,
+                value_counts: None,
+            };
+            match out.get_mut(&column) {
+                Some(existing) => {
+                    if existing.merge_with(&bounds).is_err() {
+                        out.remove(&column);
+                    }
+                }
+                None => {
+                    out.insert(column, bounds);
+                }
+            }
+        }
     }
     out
 }
@@ -187,14 +201,17 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
+    use bytes::Bytes;
+    use uuid::Uuid;
 
     use super::*;
     use crate::{
         superfile::vector::layout::VectorLayout,
         supertable::{
             manifest::{
-                FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+                FtsSummaryAgg, ScalarStats, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
                 part::{ContentHash, PartId},
+                summaries::{SummariesSection, rows_from_maps},
             },
             schema::FieldId,
         },
@@ -384,6 +401,40 @@ mod tests {
             agg.value_counts.is_none(),
             "the rollup carries no value table"
         );
+    }
+
+    /// The fold reads a sectioned superfile's bounds and null count in
+    /// place and comes to the same rollup as over the decoded statistics.
+    #[test]
+    fn scalar_stats_agg_folds_sectioned_entries_as_it_folds_decoded_ones() {
+        let decoded = vec![
+            seg_with_i64("n", vec![10, 50]),
+            seg_with_i64("n", vec![5, 30]),
+        ];
+        let ids: Vec<Uuid> = decoded.iter().map(|seg| seg.superfile_id).collect();
+        let rows = rows_from_maps(decoded.iter().map(|seg| seg.scalar_stats.map()));
+        let bytes = SummariesSection::encode(PartId::new_v4(), &ids, rows).expect("encode");
+        let section = Arc::new(SummariesSection::parse(Bytes::from(bytes)).expect("parse"));
+        let sectioned: Vec<Arc<SuperfileEntry>> = decoded
+            .iter()
+            .enumerate()
+            .map(|(row, seg)| {
+                Arc::new(SuperfileEntry {
+                    scalar_stats: ScalarStats::Section {
+                        section: Arc::clone(&section),
+                        row: row as u32,
+                    },
+                    ..(**seg).clone()
+                })
+            })
+            .collect();
+        let from_decoded = scalar_stats_agg(&decoded);
+        let from_sectioned = scalar_stats_agg(&sectioned);
+        assert_eq!(from_decoded, from_sectioned);
+        let agg = from_sectioned.get(&fid("n")).expect("n agg present");
+        assert_eq!((i64_val(&agg.min), i64_val(&agg.max)), (5, 50));
+        assert_eq!(agg.null_count, Some(0));
+        assert!(agg.sum.is_none() && agg.hll.is_none() && agg.value_counts.is_none());
     }
 
     #[test]

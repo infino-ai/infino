@@ -554,9 +554,9 @@ impl SummariesSection {
         self.column(row, column).map(|found| found.stats())
     }
 
-    /// Every column's statistics for the superfile at `row`.
-    pub fn row_map(&self, row: u32) -> HashMap<FieldId, ScalarStatsAgg> {
-        let mut out = HashMap::new();
+    /// Every column the superfile at `row` carries, each read in place.
+    pub fn row_columns(&self, row: u32) -> Vec<(FieldId, ColumnRow<'_>)> {
+        let mut out = Vec::new();
         for entry in &self.directory {
             let Some(group) = self.group(entry.group as usize) else {
                 continue;
@@ -564,14 +564,25 @@ impl SummariesSection {
             let start = entry.row_start as usize;
             let end = start + entry.row_count as usize;
             if let Ok(i) = group.superfile.values()[start..end].binary_search(&row) {
-                let found = ColumnRow {
-                    group,
-                    index: start + i,
-                };
-                out.insert(entry.field, found.stats());
+                out.push((
+                    entry.field,
+                    ColumnRow {
+                        group,
+                        index: start + i,
+                    },
+                ));
             }
         }
         out
+    }
+
+    /// Every column's statistics for the superfile at `row`, every
+    /// statistic built.
+    pub fn row_map(&self, row: u32) -> HashMap<FieldId, ScalarStatsAgg> {
+        self.row_columns(row)
+            .into_iter()
+            .map(|(column, found)| (column, found.stats()))
+            .collect()
     }
 
     /// The columns the section holds, each once.
@@ -882,7 +893,6 @@ mod tests {
     use arrow_array::{BooleanArray, Float64Array, Int64Array, StringArray};
 
     use super::*;
-    use crate::supertable::manifest::values_hll;
 
     /// Build the statistics of one column from an array, as the writer
     /// does.
@@ -1002,10 +1012,16 @@ mod tests {
         let table = amount.value_counts().expect("a value table");
         assert_eq!(table.entries().len(), 2);
         let from_table = amount.values_sketch().expect("the table sketches");
-        let from_values =
-            values_hll(table.entries().iter().map(|(value, _)| value)).expect("values sketch");
+        let from_values: ArrayRef = Arc::new(Int64Array::from(vec![3, 9]));
+        let from_values = column_hll(&[from_values]).expect("values sketch");
         assert_eq!(from_table.as_bytes(), from_values.as_bytes());
         assert_eq!(amount.stats(), section.row_map(0)[&AMOUNT]);
+        let columns: Vec<FieldId> = section
+            .row_columns(0)
+            .into_iter()
+            .map(|(column, _)| column)
+            .collect();
+        assert_eq!(columns, vec![AMOUNT, KIND, FLAG, RATIO, EMPTY]);
 
         let empty = section.column(0, EMPTY).expect("the null column");
         assert!(empty.all_null());

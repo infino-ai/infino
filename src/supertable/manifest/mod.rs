@@ -3704,6 +3704,22 @@ impl ScalarStats {
         self.column(column).map(|found| found.stats())
     }
 
+    /// Every column the superfile carries statistics for, each read in
+    /// place.
+    pub fn columns(&self) -> Vec<(FieldId, ColumnStats<'_>)> {
+        match self {
+            Self::Inline(map) => map
+                .iter()
+                .map(|(column, agg)| (*column, ColumnStats::Inline(agg)))
+                .collect(),
+            Self::Section { section, row } => section
+                .row_columns(*row)
+                .into_iter()
+                .map(|(column, found)| (column, ColumnStats::Section(found)))
+                .collect(),
+        }
+    }
+
     /// Every column's statistics: borrowed when decoded, built when they
     /// live in a section.
     pub fn map(&self) -> Cow<'_, HashMap<FieldId, ScalarStatsAgg>> {
@@ -3797,16 +3813,20 @@ impl ColumnStats<'_> {
     }
 
     /// The sketch that stands in for the exact value table of a column
-    /// counted exactly, when the superfile carries a table.
+    /// counted exactly, when the superfile carries a table: the table's
+    /// values hashed as the column sketch hashes them, so a table's
+    /// estimate and a sketch's merge into one.
     pub fn values_sketch(&self) -> Option<hll::HllSketch> {
         match self {
-            Self::Inline(agg) => values_hll(
-                agg.value_counts
+            Self::Inline(agg) => {
+                let values = agg
+                    .value_counts
                     .as_ref()?
                     .entries()
                     .iter()
-                    .map(|(value, _)| value),
-            ),
+                    .map(|(value, _)| value.clone());
+                column_hll(&[ScalarValue::iter_to_array(values).ok()?])
+            }
             Self::Section(row) => row.values_sketch(),
         }
     }
@@ -4507,34 +4527,6 @@ pub(crate) fn column_hll(cols: &[ArrayRef]) -> Option<hll::HllSketch> {
             }
         }
         _ => return None,
-    }
-    Some(sketch)
-}
-
-/// [`column_hll`] over scalar values: the sketch an exact value table
-/// stands in for, hashed exactly as the column sketch hashes the same
-/// values, so a table's sketch and a column's merge into one estimate.
-/// `None` for a value type the column sketch does not cover.
-pub(crate) fn values_hll<'a>(
-    values: impl IntoIterator<Item = &'a ScalarValue>,
-) -> Option<hll::HllSketch> {
-    let mut sketch = hll::HllSketch::new();
-    for value in values {
-        let hash = match value {
-            ScalarValue::Int8(Some(v)) => xxh3_64(&v.to_le_bytes()),
-            ScalarValue::Int16(Some(v)) => xxh3_64(&v.to_le_bytes()),
-            ScalarValue::Int32(Some(v)) => xxh3_64(&v.to_le_bytes()),
-            ScalarValue::Int64(Some(v)) => xxh3_64(&v.to_le_bytes()),
-            ScalarValue::UInt8(Some(v)) => xxh3_64(&v.to_le_bytes()),
-            ScalarValue::UInt16(Some(v)) => xxh3_64(&v.to_le_bytes()),
-            ScalarValue::UInt32(Some(v)) => xxh3_64(&v.to_le_bytes()),
-            ScalarValue::UInt64(Some(v)) => xxh3_64(&v.to_le_bytes()),
-            ScalarValue::Float32(Some(v)) => xxh3_64(&v.to_bits().to_le_bytes()),
-            ScalarValue::Float64(Some(v)) => xxh3_64(&v.to_bits().to_le_bytes()),
-            ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => xxh3_64(v.as_bytes()),
-            _ => return None,
-        };
-        sketch.insert_hash(hash);
     }
     Some(sketch)
 }
@@ -5398,6 +5390,7 @@ mod tests {
             manifest::{
                 commit::{PartWriteResult, write_manifest_part, write_part_bytes},
                 list::{Manifest, PartitionStrategy},
+                summaries::SummaryRow,
             },
             schema::LegacyNames,
         },
@@ -7376,23 +7369,41 @@ mod tests {
     /// A column counted exactly carries no sketch; the sketch the planner
     /// derives from its value table is the one the column would have had,
     /// register for register, so a table's estimate merges with a sketch's.
+    /// The same whether the table is decoded or read from a section.
     #[test]
     fn a_value_table_s_sketch_is_the_column_s() {
         let strings: ArrayRef = Arc::new(StringArray::from(vec![
             "alpha", "bravo", "alpha", "charlie", "bravo", "alpha",
         ]));
         let integers: ArrayRef = Arc::new(Int64Array::from(vec![7, 7, 9, 11, 9]));
+        let column_id = fid("counted");
         for column in [strings, integers] {
             let stats = ScalarStatsAgg::from_column(&column).expect("stats");
             assert!(
                 stats.hll.is_none(),
                 "counted exactly, so no sketch is stored"
             );
-            let table = stats.value_counts.as_ref().expect("under the cap");
-            let from_table = values_hll(table.entries().iter().map(|(value, _)| value))
-                .expect("a sketchable type");
             let from_column = column_hll(from_ref(&column)).expect("a sketchable type");
-            assert_eq!(from_table.as_bytes(), from_column.as_bytes());
+            let decoded = ColumnStats::Inline(&stats)
+                .values_sketch()
+                .expect("a sketchable type");
+            assert_eq!(decoded.as_bytes(), from_column.as_bytes());
+
+            let bytes = SummariesSection::encode(
+                PartId::new_v4(),
+                &[Uuid::nil()],
+                vec![SummaryRow {
+                    column: column_id,
+                    superfile: 0,
+                    stats,
+                }],
+            )
+            .expect("encode");
+            let section = SummariesSection::parse(Bytes::from(bytes)).expect("parse");
+            let sectioned = ColumnStats::Section(section.column(0, column_id).expect("the row"))
+                .values_sketch()
+                .expect("a sketchable type");
+            assert_eq!(sectioned.as_bytes(), from_column.as_bytes());
         }
     }
 
