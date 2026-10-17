@@ -415,6 +415,18 @@ impl CarryScope {
     }
 }
 
+/// How a merge input's posting lists reach the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FtsCarry {
+    /// The input indexes the output's columns under the output's
+    /// analysis: its postings are copied across.
+    Copy,
+    /// The input indexes another column set — a column's index was added
+    /// or dropped since the file was written — so its text is analyzed
+    /// afresh from its rows.
+    Reanalyze,
+}
+
 /// Per-column FTS configuration. The `column` must exist in
 /// `BuilderOptions.schema` and be `LargeUtf8` (an unstored column may
 /// be absent — the merge-source shape).
@@ -1053,6 +1065,68 @@ impl BuilderOptions {
         self
     }
 
+    /// Whether `reader`'s posting lists can be carried into a file built
+    /// with these options: the same full-text columns under the same
+    /// analysis. A file written before a column's index was added or
+    /// after it was dropped, or whose column has since been renamed, fails
+    /// this and is re-encoded from its rows instead.
+    pub(crate) fn fts_carry_compatible(&self, reader: &SuperfileReader) -> bool {
+        matches!(self.fts_carry_of(reader), Ok(FtsCarry::Copy))
+    }
+
+    /// How `reader`'s posting lists reach a file built with these options.
+    ///
+    /// A column both sides index must agree on its analysis, positions
+    /// and storage: postings carried across a disagreement would sit
+    /// under an analyzer whose queries cannot reach them, so that is
+    /// refused, as [`Self::check_fts_carry_compat`] refuses it. Inputs
+    /// from one table come to hold another column set once a column's
+    /// index is added or dropped while the table is being written — a
+    /// file from before the change — and that is answered by re-analysis
+    /// rather than an error: the merge tokenizes the file's text afresh
+    /// under the output's columns.
+    pub(crate) fn fts_carry_of(&self, reader: &SuperfileReader) -> Result<FtsCarry, BuildError> {
+        let remote: Vec<&ColumnMeta> = reader
+            .fts()
+            .map(|f| f.fts_columns_config().collect())
+            .unwrap_or_default();
+        let mut matched = 0usize;
+        for own in &self.fts_columns {
+            let Some(other) = remote.iter().find(|other| self.same_fts_column(own, other)) else {
+                continue;
+            };
+            check_fts_column_pair(own, other)?;
+            matched += 1;
+        }
+        if matched == self.fts_columns.len() && matched == remote.len() {
+            Ok(FtsCarry::Copy)
+        } else {
+            Ok(FtsCarry::Reanalyze)
+        }
+    }
+
+    /// Whether `other`, a column of an input file, is `own`.
+    ///
+    /// Columns are the same column when their ids agree; a label change
+    /// is not a change of terms, so a renamed column's postings still
+    /// carry. Files written before ids compare by name, which is what
+    /// identified a column then.
+    ///
+    /// That name is matched against the table's live columns, so it
+    /// carries the limitation `LegacyNames` documents: a name the table
+    /// has since given to a different column matches here, and the
+    /// retired column's postings carry into the new one. It is confined
+    /// to files that predate ids and clears once compaction rewrites
+    /// them. The scalar path next door decides by id for exactly this
+    /// reason; this one cannot, because a file that predates ids has no
+    /// id to decide with.
+    fn same_fts_column(&self, own: &FtsConfig, other: &ColumnMeta) -> bool {
+        match (self.field_id_of_column(&own.column), other.field_id) {
+            (Some(own_id), Some(other_id)) => own_id == other_id,
+            _ => own.column == other.name,
+        }
+    }
+
     /// Verify a merge input's per-column FTS configuration is
     /// carry-compatible with this builder's. Merges carry each input's
     /// prebuilt postings across without re-tokenizing, so the inputs'
@@ -1071,24 +1145,12 @@ impl BuilderOptions {
     ///   unstored column is absent from the Parquet schema), but the
     ///   explicit check names the actual disagreement.
     ///
-    /// Inputs from one table disagree once a column's index was added or
-    /// dropped while the table was being written: a file from before the
-    /// change holds another column set. Every merge decides what to do
-    /// with such an input before it carries anything (`merge_rows_to` and
-    /// `build_from_readers_to` re-analyze the text instead), so an error
-    /// from here reaches a caller only as a misuse of the carry.
-    /// Whether `reader`'s posting lists can be carried into a file built
-    /// with these options: the same full-text columns under the same
-    /// analysis. A file written before a column's index was added or
-    /// after it was dropped, or whose column has since been renamed, fails
-    /// this and is re-encoded from its rows instead.
-    pub(crate) fn fts_carry_compatible(&self, reader: &SuperfileReader) -> bool {
-        let remote = reader
-            .fts()
-            .map(|f| f.fts_columns_config().collect::<Vec<_>>());
-        self.check_fts_carry_compat(remote.as_deref()).is_ok()
-    }
-
+    /// Every merge decides what to do with an input whose column set is
+    /// not the output's before it carries anything
+    /// ([`Self::fts_carry_of`]: `merge_rows_to` and `build_from_readers_to`
+    /// re-analyze the text instead), so an error from here reaches a
+    /// caller only for a disagreement on a column both sides index, or as
+    /// a misuse of the carry.
     fn check_fts_carry_compat(&self, remote: Option<&[&ColumnMeta]>) -> Result<(), BuildError> {
         let remote = remote.unwrap_or(&[]);
         if self.fts_columns.len() != remote.len() {
@@ -1099,56 +1161,46 @@ impl BuilderOptions {
             )));
         }
         for (own, other) in self.fts_columns.iter().zip(remote.iter()) {
-            // Columns are the same column when their ids agree; a label
-            // change is not a change of terms, so a renamed column's
-            // postings still carry. Files written before ids compare by
-            // name, which is what identified a column then.
-            //
-            // That name is matched against the table's live columns, so it
-            // carries the limitation `LegacyNames` documents: a name the
-            // table has since given to a different column matches here, and
-            // the retired column's postings carry into the new one. It is
-            // confined to files that predate ids and clears once compaction
-            // rewrites them. The scalar path next door decides by id for
-            // exactly this reason; this one cannot, because a file that
-            // predates ids has no id to decide with.
-            let same_column = match (self.field_id_of_column(&own.column), other.field_id) {
-                (Some(own_id), Some(other_id)) => own_id == other_id,
-                _ => own.column == other.name,
-            };
-            if !same_column {
+            if !self.same_fts_column(own, other) {
                 return Err(BuildError::FTSSchemaMismatch(format!(
                     "mismatched column. self {} vs other {}",
                     own.column, other.name
                 )));
             }
-            // Compare the whole analysis, not the base name: two columns
-            // sharing a base but differing in a filter hold different
-            // terms, so carrying one's postings into the other silently
-            // mixes two tokenizations.
-            let own_analysis = own.chain_name();
-            let other_analysis = other.tokenizer.name();
-            if own_analysis != other_analysis {
-                return Err(BuildError::FTSSchemaMismatch(format!(
-                    "column {}: mismatched analyzer. self {} vs other {}",
-                    own.column, own_analysis, other_analysis
-                )));
-            }
-            if own.positions != other.positions {
-                return Err(BuildError::FTSSchemaMismatch(format!(
-                    "column {}: mismatched positions flag. self {} vs other {}",
-                    own.column, own.positions, other.positions
-                )));
-            }
-            if own.stored != other.stored {
-                return Err(BuildError::FTSSchemaMismatch(format!(
-                    "column {}: mismatched stored flag. self {} vs other {}",
-                    own.column, own.stored, other.stored
-                )));
-            }
+            check_fts_column_pair(own, other)?;
         }
         Ok(())
     }
+}
+
+/// One column's analysis, positions and storage, as the output declares
+/// them and as an input file recorded them, must agree for the input's
+/// postings to carry. Compare the whole analysis, not the base name: two
+/// columns sharing a base but differing in a filter hold different terms,
+/// so carrying one's postings into the other silently mixes two
+/// tokenizations.
+fn check_fts_column_pair(own: &FtsConfig, other: &ColumnMeta) -> Result<(), BuildError> {
+    let own_analysis = own.chain_name();
+    let other_analysis = other.tokenizer.name();
+    if own_analysis != other_analysis {
+        return Err(BuildError::FTSSchemaMismatch(format!(
+            "column {}: mismatched analyzer. self {} vs other {}",
+            own.column, own_analysis, other_analysis
+        )));
+    }
+    if own.positions != other.positions {
+        return Err(BuildError::FTSSchemaMismatch(format!(
+            "column {}: mismatched positions flag. self {} vs other {}",
+            own.column, own.positions, other.positions
+        )));
+    }
+    if own.stored != other.stored {
+        return Err(BuildError::FTSSchemaMismatch(format!(
+            "column {}: mismatched stored flag. self {} vs other {}",
+            own.column, own.stored, other.stored
+        )));
+    }
+    Ok(())
 }
 
 impl fmt::Debug for SuperfileBuilder {
@@ -2854,11 +2906,16 @@ impl SuperfileBuilder {
         // the adapter has already brought to the table's shape — as the
         // re-index build does, at the cost of tokenizing the corpus once.
         // The file it writes carries the table's index, so the next merge
-        // over it copies again.
-        let reanalyze = superfile_builder.fts_builder.is_some()
-            && !inputs
-                .iter()
-                .all(|input| superfile_builder.opts.fts_carry_compatible(&input.reader));
+        // over it copies again. A file that indexes a column the output
+        // indexes under another analysis is refused here as everywhere.
+        let mut reanalyze = false;
+        if superfile_builder.fts_builder.is_some() {
+            for input in inputs {
+                if superfile_builder.opts.fts_carry_of(&input.reader)? == FtsCarry::Reanalyze {
+                    reanalyze = true;
+                }
+            }
+        }
         if reanalyze {
             for input in inputs {
                 superfile_builder.check_rebuildable(&input.reader)?;
@@ -8509,6 +8566,50 @@ mod tests {
             .expect("vector search on merged Sq8 superfile");
         assert!(!hits.is_empty(), "search should return at least one result");
         assert_eq!(hits[0].0, 0, "top hit for axis-0 query must be doc 0");
+    }
+
+    /// A column both inputs index under different analyzers is still
+    /// refused on the vector merge, as it is on every carry: re-analysis
+    /// answers a column set that differs, not postings that disagree.
+    #[test]
+    fn sq8_merge_still_refuses_an_input_under_another_analyzer() {
+        const DIM: usize = 16;
+        let make_file = |fts: FtsConfig, id0: u64, axis0: usize| {
+            let opts = BuilderOptions::new(
+                schema_with_fts(),
+                "doc_id",
+                vec![fts],
+                vec![default_vector_config("emb", 7).with_rerank_codec(RerankCodec::Sq8Residual)],
+            );
+            let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+            let batch = RecordBatch::try_new(
+                b.opts.schema.clone(),
+                vec![
+                    Arc::new(decimal128_ids(vec![id0, id0 + 1])),
+                    Arc::new(LargeStringArray::from(vec!["a", "b"])),
+                    Arc::new(LargeStringArray::from(vec!["c", "d"])),
+                ],
+            )
+            .expect("batch");
+            let mut v = vec![0.0f32; 2 * DIM];
+            v[axis0] = 1.0;
+            v[DIM + axis0 + 1] = 1.0;
+            b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+            Arc::new(SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"))
+        };
+        let stemmed = make_file(FtsConfig::new("body").stemmer(Stemmer::English), 10, 0);
+        let plain = make_file(FtsConfig::new("body"), 20, 2);
+        let base = BuilderOptions::new_from_reader(&stemmed);
+        let err = SuperfileBuilder::build_from_sq8_ivf_readers_to(
+            &same_shape_inputs(&[(stemmed, None), (plain, None)]),
+            base,
+            &mut Vec::new(),
+        )
+        .expect_err("an input under another analyzer must be refused");
+        assert!(
+            err.to_string().contains("analyzer"),
+            "error names the disagreement: {err}"
+        );
     }
 
     /// A merge whose inputs disagree on which columns are indexed: the
