@@ -76,6 +76,20 @@ pub const MAX_MAX_DEPTH: u32 = 100;
 /// the column joins the schema; ignored for a column the table has.
 pub const INDEX_META_KEY: &str = "infino:index";
 
+/// Arrow field-metadata key under which a batch says what a column it
+/// carries is: the thing the column holds, in the writer's own terms (a
+/// loader promoting a document's fields to columns says which field). Two
+/// writers can add a column of one name for two different things in the
+/// same moment - two fields whose names make the same column name - and
+/// neither sees the other's column before its own commit; the identity is
+/// what tells them apart. A column keeps the identity it was added with
+/// (it is part of its metadata, so the schema document carries it), and a
+/// batch that names the column with another identity is refused whole
+/// ([`error::SchemaError::IdentityMismatch`]), so its rows never land in a
+/// column holding something else. A column or a batch without one is held
+/// to nothing.
+pub const IDENTITY_META_KEY: &str = "infino:identity";
+
 /// Precision of the id column's `Decimal128`: the most a `Decimal128` can
 /// carry, so every 128-bit id fits without truncation, Parquet annotates
 /// the column as `DECIMAL(38, 0)`, and sort order matches the `i128`.

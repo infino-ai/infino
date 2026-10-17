@@ -6,9 +6,11 @@
 //! A batch that matches the table — the same column names and types, in
 //! any order — passes through with its arrays untouched. Otherwise the
 //! schema grows from the data: a column the table does not have is added
-//! with the batch's type, a nullable column the batch does not carry is
-//! filled with nulls, and anything else is refused as a whole. A type
-//! never changes from a batch; that takes a schema write.
+//! with the batch's type (and with what the batch says it is, when it
+//! says: [`IDENTITY_META_KEY`]), a nullable column the batch does not carry
+//! is filled with nulls, and anything else is refused as a whole — a column
+//! in another type, or one named for another thing than the one it was
+//! added for. A type never changes from a batch; that takes a schema write.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -19,8 +21,8 @@ use arrow_array::{ArrayRef, RecordBatch, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
 
 use super::{
-    ColumnIndex, INDEX_META_KEY, TableSchema, change::SchemaChange, error::SchemaError,
-    index_from_json, user_metadata,
+    ColumnIndex, IDENTITY_META_KEY, INDEX_META_KEY, TableSchema, change::SchemaChange,
+    error::SchemaError, index_from_json, user_metadata,
 };
 
 /// A column a batch adds to the table.
@@ -49,6 +51,24 @@ fn requested_index(field: &Field) -> Result<Option<ColumnIndex>, SchemaError> {
             column: field.name().clone(),
             reason,
         })
+}
+
+/// Refuse `field` when it names the column it matched with an identity
+/// other than `held`, the one the column was added with
+/// ([`IDENTITY_META_KEY`]): another writer gave the name to another thing
+/// first, and the batch's rows must not land in that column. A column or a
+/// batch without an identity is held to nothing.
+fn check_identity(field: &Field, held: Option<&String>) -> Result<(), SchemaError> {
+    if let (Some(held), Some(offered)) = (held, field.metadata().get(IDENTITY_META_KEY))
+        && held != offered
+    {
+        return Err(SchemaError::IdentityMismatch {
+            column: field.name().clone(),
+            held: held.clone(),
+            offered: offered.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// A batch brought to the table's shape.
@@ -91,6 +111,7 @@ pub fn resolve_batch(
                         column: field.name.clone(),
                     });
                 }
+                check_identity(input.field(i), field.metadata.get(IDENTITY_META_KEY))?;
                 columns.push(Arc::clone(array));
             }
             Err(_) if field.nullable => {
@@ -144,9 +165,10 @@ pub fn resolve_batch(
 ///
 /// Each batch was resolved against the schema of its own append, so by the
 /// time they commit together the table may have moved: a column one batch
-/// adds may now exist (same type: it is stored; another type: refused),
-/// and two batches may add the same column (same type, or refused). The
-/// id column is the batch's first column and is not a table field.
+/// adds may now exist (same type and identity: it is stored; another type,
+/// or an identity other than the one it was added with: refused), and two
+/// batches may add the same column (same type and identity, or refused).
+/// The id column is the batch's first column and is not a table field.
 pub fn union_schema<'a>(
     current: &TableSchema,
     batches: impl IntoIterator<Item = &'a RecordBatch>,
@@ -161,22 +183,26 @@ pub fn union_schema<'a>(
             }
             // The table's own lookup by name, which is a hash; `added`
             // carries the columns this commit is adding, which no schema
-            // knows about yet.
-            let frozen = match current.field_named(field.name()) {
-                Some(f) => Some(&f.data_type),
-                None => added_at
-                    .get(field.name().as_str())
-                    .map(|&i| &added[i].data_type),
+            // knows about yet. Either way the column's type and the
+            // identity it was added with.
+            let held = match current.field_named(field.name()) {
+                Some(f) => Some((&f.data_type, f.metadata.get(IDENTITY_META_KEY))),
+                None => added_at.get(field.name().as_str()).map(|&i| {
+                    (
+                        &added[i].data_type,
+                        added[i].metadata.get(IDENTITY_META_KEY),
+                    )
+                }),
             };
-            match frozen {
-                Some(frozen) if frozen != field.data_type() => {
+            match held {
+                Some((frozen, _)) if frozen != field.data_type() => {
                     return Err(SchemaError::TypeMismatch {
                         column: field.name().clone(),
                         frozen: frozen.clone(),
                         offered: field.data_type().clone(),
                     });
                 }
-                Some(_) => {}
+                Some((_, identity)) => check_identity(field, identity)?,
                 None => {
                     added_at.insert(field.name().clone(), added.len());
                     added.push(AddColumn {
@@ -467,5 +493,106 @@ mod tests {
         assert_eq!(shaped.column(3).null_count(), 2, "tag is null-filled");
         assert_eq!(shaped.column(2).null_count(), 2, "score is null-filled");
         assert_eq!(shaped.column(1).null_count(), 0, "title is the batch's");
+    }
+
+    /// A field called `name`, nullable, of `array`'s type, saying it is
+    /// `identity`.
+    fn identified(name: &str, identity: &str, array: &ArrayRef) -> Field {
+        Field::new(name, array.data_type().clone(), true).with_metadata(HashMap::from([(
+            IDENTITY_META_KEY.to_string(),
+            identity.to_string(),
+        )]))
+    }
+
+    /// A batch of `fields`, each with its array.
+    fn batch_of(fields: Vec<(Field, ArrayRef)>) -> RecordBatch {
+        let schema = Schema::new(fields.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>());
+        RecordBatch::try_new(
+            Arc::new(schema),
+            fields.into_iter().map(|(_, a)| a).collect(),
+        )
+        .expect("batch")
+    }
+
+    /// Two writers adding a column of one name for two different things are
+    /// told apart by the identity each stamps on it. A column keeps the
+    /// identity it was added with; a batch naming it with the same one, or
+    /// with none, passes, and one naming it with another is refused whole,
+    /// whether the column is the table's or another batch of the same
+    /// commit adds it.
+    #[test]
+    fn a_column_named_for_another_thing_is_refused_by_its_identity() {
+        let tags = titles();
+        let title = || (Field::new("title", DataType::LargeUtf8, true), titles());
+        let same = batch_of(vec![
+            (identified("tag", "a.tag", &tags), Arc::clone(&tags)),
+            title(),
+        ]);
+        let plain = batch_of(vec![
+            (
+                Field::new("tag", DataType::LargeUtf8, true),
+                Arc::clone(&tags),
+            ),
+            title(),
+        ]);
+        let other = batch_of(vec![
+            (identified("tag", "b.tag", &tags), Arc::clone(&tags)),
+            title(),
+        ]);
+
+        // A table whose `tag` column was added for `a.tag`.
+        let t = TableSchema::from_user_schema(&Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            identified("tag", "a.tag", &tags),
+        ]));
+        assert!(resolve_batch(&same, &t, "_id").is_ok());
+        assert!(resolve_batch(&plain, &t, "_id").is_ok());
+        assert!(matches!(
+            resolve_batch(&other, &t, "_id"),
+            Err(SchemaError::IdentityMismatch { column, held, offered })
+                if column == "tag" && held == "a.tag" && offered == "b.tag"
+        ));
+        assert!(
+            union_schema(&t, [&same, &plain], "_id")
+                .expect("nothing new")
+                .is_none()
+        );
+        assert!(matches!(
+            union_schema(&t, [&other], "_id"),
+            Err(SchemaError::IdentityMismatch { column, .. }) if column == "tag"
+        ));
+
+        // A column added by a batch keeps the identity the batch gave it,
+        // and the next batch is held to it.
+        let bare = table();
+        let resolved = resolve_batch(&same, &bare, "_id").expect("resolve");
+        assert_eq!(
+            resolved.added[0]
+                .metadata
+                .get(IDENTITY_META_KEY)
+                .map(String::as_str),
+            Some("a.tag")
+        );
+        let grown = union_schema(&bare, [&same], "_id")
+            .expect("union")
+            .expect("tag is new");
+        assert_eq!(
+            grown
+                .field_named("tag")
+                .and_then(|f| f.metadata.get(IDENTITY_META_KEY))
+                .map(String::as_str),
+            Some("a.tag")
+        );
+        assert!(matches!(
+            resolve_batch(&other, &grown, "_id"),
+            Err(SchemaError::IdentityMismatch { .. })
+        ));
+        // Two batches of one commit adding the name for two things: the
+        // second is refused by the first's identity.
+        assert!(matches!(
+            union_schema(&bare, [&same, &other], "_id"),
+            Err(SchemaError::IdentityMismatch { column, held, offered })
+                if column == "tag" && held == "a.tag" && offered == "b.tag"
+        ));
     }
 }
