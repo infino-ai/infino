@@ -610,6 +610,13 @@ impl DiskCacheStore {
     ///
     /// If `offsets` is absent, the source starts with unknown size and
     /// discovers it through the first suffix-tail fetch.
+    ///
+    /// A Warm open (`allow_background_fill`) reserves the whole file for its
+    /// background download. When the budget cannot hold it, the open goes on
+    /// as a Stream open does: the entry stays lazy, charges only the blocks
+    /// it reads, and later reads of the file find it in the cache. Opening
+    /// the file again for each read would cost every read the footer and
+    /// column metadata over again, hundreds of small range reads a file.
     pub(crate) async fn cold_fetch_lazy(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -620,8 +627,11 @@ impl DiskCacheStore {
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = storage_key.to_owned();
         let block_source_arc: Arc<BlockCachedSource>;
-        let (lazy_reader, size) = if let Some(offsets) = offsets {
+        // Whether the whole file is reserved for a background download, so the entry is charged
+        // its full size up front; otherwise the block source charges what it fills.
+        let (lazy_reader, size, eager) = if let Some(offsets) = offsets {
             let total_size = offsets.total_size;
+            let eager = allow_background_fill && self.reserve_whole_file(total_size).await;
 
             // Match `SuperfileReader::open_lazy_with`'s parquet tail
             // speculation length so the overlay covers the entire
@@ -665,7 +675,7 @@ impl DiskCacheStore {
                 Arc::downgrade(self),
                 *uri,
                 self.blocks_path(uri),
-                !allow_background_fill,
+                !eager,
                 // FTS subsection reads bypass block rounding (exact ranges);
                 // see the `passthrough` field docs.
                 offsets.fts,
@@ -731,51 +741,54 @@ impl DiskCacheStore {
             // whole-superfile range reads, defeating the lazy/open-batch
             // path. Eager cache promotion can still verify when it
             // materializes the full superfile.
-            let lazy_reader = SuperfileReader::open_lazy_with(
+            let lazy_reader = match SuperfileReader::open_lazy_with(
                 Arc::clone(&source),
                 OpenOptions { verify_crc: false },
             )
-            .await?;
-            (lazy_reader, total_size)
+            .await
+            {
+                Ok(reader) => reader,
+                Err(e) => {
+                    // Nothing holds the reservation now; give it back.
+                    if eager {
+                        self.release_block_bytes(total_size);
+                    }
+                    return Err(e.into());
+                }
+            };
+            (lazy_reader, total_size, eager)
         } else {
             // Unknown-size path: avoid the cold-open HEAD round-trip.
             // The first `tail()` inside `open_lazy_with` is a native
             // suffix-range GET that returns both footer bytes and total
-            // object size, then patches the source's size atomic.
-            let range_src: Arc<dyn LazyByteSource> =
-                Arc::new(StorageRangeSource::with_unknown_size(
-                    Arc::clone(&fetch_storage),
-                    storage_uri.clone(),
-                ));
-            let block_source = BlockCachedSource::new_with_accounting(
-                range_src,
-                Arc::downgrade(self),
-                *uri,
-                self.blocks_path(uri),
-                !allow_background_fill,
-                // No manifest hints here, so the FTS subsection is unknown.
-                None,
-            );
-            block_source_arc = Arc::clone(&block_source);
-            let source: Arc<dyn LazyByteSource> = block_source;
-            let lazy_reader = SuperfileReader::open_lazy_with(
-                Arc::clone(&source),
-                OpenOptions { verify_crc: false },
-            )
-            .await?;
-            let size = source.size();
-            (lazy_reader, size)
+            // object size, then patches the source's size atomic. The size
+            // is known only after the open, so a Warm open reserves after
+            // it; when the budget cannot hold the file, the source built to
+            // ride on that reservation is dropped and the file is opened
+            // once more as a Stream open, charging its own blocks (the
+            // blocks the first open wrote are adopted when their index has
+            // landed, fetched again otherwise).
+            let opened = self
+                .open_lazy_unknown_size(uri, &storage_uri, &fetch_storage, !allow_background_fill)
+                .await?;
+            let eager = allow_background_fill && self.reserve_whole_file(opened.1).await;
+            let (lazy_reader, size, block_source) = if allow_background_fill && !eager {
+                drop(opened);
+                self.open_lazy_unknown_size(uri, &storage_uri, &fetch_storage, true)
+                    .await?
+            } else {
+                opened
+            };
+            block_source_arc = block_source;
+            (lazy_reader, size, eager)
         };
 
-        // A Stream open charges only the blocks it fills (SourceOwned), so a fanout over many
-        // superfiles does not reserve them all in full and evict live peers. A Warm open will
-        // download the whole file, so it reserves the full size now.
-        if allow_background_fill {
-            self.reserve_manual(size).await?;
-        }
-
+        // A Stream open, or a Warm open the budget could not hold whole, charges only the blocks
+        // it fills (SourceOwned), so a fanout over many superfiles does not reserve them all in
+        // full and evict live peers. A Warm open the budget holds will download the whole file,
+        // and has reserved the full size above.
         let lazy_reader = Arc::new(lazy_reader);
-        let (size_bytes, accounting) = if allow_background_fill {
+        let (size_bytes, accounting) = if eager {
             (Arc::new(AtomicU64::new(size)), EntryAccounting::Eager)
         } else {
             (
@@ -797,6 +810,39 @@ impl DiskCacheStore {
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
         // Admission may return an existing whole file instead; serve what it returns.
         Ok(self.admit_entry(*uri, entry))
+    }
+
+    /// A lazy open of `storage_uri` whose size is not known up front: the first `tail()` inside
+    /// `open_lazy_with` is a suffix-range GET that returns the footer bytes and the object's size.
+    /// `owns_accounting` is the block source's (see [`BlockCachedSource::new_with_accounting`]).
+    /// Returns the reader, the size the open discovered and the block source it reads through.
+    async fn open_lazy_unknown_size(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        storage_uri: &str,
+        fetch_storage: &Arc<dyn StorageProvider>,
+        owns_accounting: bool,
+    ) -> Result<(SuperfileReader, u64, Arc<BlockCachedSource>), DiskCacheError> {
+        let range_src: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_unknown_size(
+            Arc::clone(fetch_storage),
+            storage_uri.to_owned(),
+        ));
+        let block_source = BlockCachedSource::new_with_accounting(
+            range_src,
+            Arc::downgrade(self),
+            *uri,
+            self.blocks_path(uri),
+            owns_accounting,
+            // No manifest hints here, so the FTS subsection is unknown.
+            None,
+        );
+        let shared = Arc::clone(&block_source);
+        let source: Arc<dyn LazyByteSource> = shared;
+        let lazy_reader =
+            SuperfileReader::open_lazy_with(Arc::clone(&source), OpenOptions { verify_crc: false })
+                .await?;
+        let size = source.size();
+        Ok((lazy_reader, size, block_source))
     }
 
     /// Download the whole file to local disk and admit it as a mapped entry. What a `Load` miss
@@ -1617,6 +1663,7 @@ mod tests {
             StorageRangeSource,
             manifest::{SubsectionOffsets, SuperfileUri},
             reader_cache::{
+                OpenTier,
                 block_source::{BlockCachedSource, CACHE_BLOCK_BYTES},
                 config::{ColdFetchMode, DiskCacheConfig},
                 disk::{fetch::*, sources::mmap_readonly_with_handle, test_support::*},
@@ -2703,6 +2750,67 @@ mod tests {
         assert_eq!(store.stats().n_cold_fetches, 1);
         assert!(store.is_mmap_promoted(&uri));
         assert!(r2.parquet_bytes().is_some());
+    }
+
+    /// A Warm open of a file the budget cannot hold whole stays a cache entry: lazy, charging
+    /// only the blocks it reads, and served to the next open without a second cold fetch. Both
+    /// open paths: the size known before the open from the manifest's offsets, and not.
+    #[tokio::test]
+    async fn a_warm_open_past_the_budget_keeps_a_lazy_entry_for_the_next_open() {
+        let bytes = tiny_superfile_bytes();
+        let hinted = SubsectionOffsets {
+            total_size: bytes.len() as u64,
+            vec: None,
+            fts: None,
+            vec_open_ranges: Vec::new(),
+            fts_open_ranges: Vec::new(),
+            open_blob: Vec::new(),
+        };
+        for (path, offsets) in [("unknown size", None), ("known size", Some(&hinted))] {
+            let (_dir, store) = test_store_with(|cfg| {
+                cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+                cfg.disk_budget_bytes = TEST_TINY_BUDGET_BYTES;
+            });
+            let uri = SuperfileUri::new_v4();
+            put_superfile(&store, &uri, bytes.clone()).await;
+
+            let (first, tier) = store
+                .open_for_query_tiered(&uri, &uri.storage_path(), offsets, None, ReadIntent::Warm)
+                .await
+                .expect("served past the budget");
+            assert_eq!(first.n_docs(), 1, "{path}");
+            assert_eq!(
+                tier,
+                OpenTier::Source,
+                "{path}: opened against the object store"
+            );
+            assert!(store.is_cached(&uri), "{path}: kept as a lazy entry");
+            assert!(
+                !store.is_mmap_promoted(&uri),
+                "{path}: nothing downloaded whole"
+            );
+
+            let (second, tier) = store
+                .open_for_query_tiered(&uri, &uri.storage_path(), offsets, None, ReadIntent::Warm)
+                .await
+                .expect("served again");
+            assert_eq!(
+                tier,
+                OpenTier::Lazy,
+                "{path}: the next open rides the entry"
+            );
+            assert!(Arc::ptr_eq(&first, &second), "{path}: the same reader");
+            assert_eq!(
+                store.stats().n_cold_fetches,
+                1,
+                "{path}: one open for both reads"
+            );
+            assert!(
+                store.stats().current_bytes <= TEST_TINY_BUDGET_BYTES,
+                "{path}: the budget still holds"
+            );
+            store.assert_budget_consistent();
+        }
     }
 
     #[tokio::test]

@@ -152,8 +152,9 @@ pub enum DiskCacheError {
     #[error("superfile reader failed to open bytes: {0}")]
     SuperfileOpenRead(#[from] crate::superfile::ReadError),
     /// Eviction could not free enough space: every cached entry is pinned, or the incoming
-    /// superfile alone exceeds the budget. [`DiskCacheStore::open_for_query`] degrades to an
-    /// uncached range-only reader on this; whole-file reads surface it.
+    /// superfile alone exceeds the budget. Raised by whole-file reads (a `Load`, the hybrid
+    /// fetch); [`DiskCacheStore::open_for_query`] degrades to an uncached range-only reader on it.
+    /// A lazy open never raises it: past the budget it stays a lazy entry.
     #[error("disk cache budget exceeded with no eligible victims")]
     BudgetExceeded,
     /// An invalid or conflicting configuration was supplied.
@@ -193,7 +194,8 @@ pub enum OpenTier {
     Source,
     /// Another caller's walk for the same file was in flight, and this open waited on it.
     Coalesced,
-    /// The file could not be admitted to the cache, so it is read uncached, range by range.
+    /// The file could not be admitted to the cache (the hybrid fetch's whole-file download), so
+    /// it is read uncached, range by range.
     Streamed,
 }
 
@@ -205,7 +207,8 @@ pub enum ReadIntent {
     /// Read ranges on demand through the block cache and never download the whole file. A whole
     /// file already on local disk is still used, since it costs no GETs. Vector search.
     Stream,
-    /// Serve now from ranges, and download the whole file in the background toward a local mmap.
+    /// Serve now from ranges, and download the whole file in the background toward a local mmap
+    /// when the budget can hold it; otherwise the entry stays lazy, as a `Stream` read's does.
     /// FTS and SQL queries, and other non-vector reads.
     Warm,
     /// Download the whole file and mmap it before serving; a lazy entry is never enough. Every
