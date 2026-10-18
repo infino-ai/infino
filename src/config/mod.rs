@@ -2525,10 +2525,9 @@ supertable:
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Auto);
     }
 
-    /// The shipped configuration must name a policy the loader understands,
-    /// and it must be the one this work is introducing. Asserted against the
-    /// embedded default rather than a literal so the file and the type cannot
-    /// drift apart silently.
+    /// What a deployment that says nothing gets. The shipped file leaves the
+    /// key commented out, so this is the engine's own default arriving
+    /// through the loader rather than the file echoing itself back.
     #[test]
     fn the_shipped_default_is_auto() {
         let cfg = Config::defaults().expect("embedded default must parse");
@@ -2578,10 +2577,42 @@ supertable:
         assert_eq!(settings.crc_policy(), CrcVerification::Auto);
     }
 
+    /// A user file naming only the deprecated boolean, layered over the
+    /// shipped defaults the way a real deployment loads.
+    ///
+    /// This is the shape that matters, and the one a `Serialized` built from
+    /// scratch cannot reproduce: whatever the shipped file sets is already
+    /// present underneath, so a test that hands the loader a bare map proves
+    /// nothing about what an operator's own config does.
+    #[test]
+    fn a_user_file_naming_only_the_deprecated_boolean_is_honoured() {
+        for (set, expected) in [
+            (true, CrcVerification::Always),
+            (false, CrcVerification::Never),
+        ] {
+            let user_file = format!("supertable:\n  verify_crc_on_open: {set}\n");
+            let cfg = Config::from_figment(
+                Figment::new()
+                    .merge(Yaml::string(EMBEDDED_DEFAULT))
+                    .merge(Yaml::string(&user_file)),
+            )
+            .expect("a config naming only the deprecated field loads");
+            assert_eq!(
+                cfg.supertable.crc_policy(),
+                expected,
+                "verify_crc_on_open: {set} in a user file must still mean {expected:?}"
+            );
+        }
+    }
+
     /// The deprecated boolean still decides the policy when it is the only
     /// thing set. The loader drops unknown fields silently, so dropping this
     /// field instead of honouring it would turn an operator's explicit choice
     /// into a default without any diagnostic.
+    ///
+    /// Nothing here sets `crc_verification`, not even to null: setting it is
+    /// what hid this path in the first place, and a test that does it grades
+    /// a configuration no operator writes.
     #[test]
     fn the_deprecated_boolean_is_still_honoured() {
         for (set, expected) in [
@@ -2591,7 +2622,7 @@ supertable:
             let cfg =
                 Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
                     Serialized::defaults(json!({
-                        "supertable": { "verify_crc_on_open": set, "crc_verification": null }
+                        "supertable": { "verify_crc_on_open": set }
                     })),
                 ))
                 .expect("config with the deprecated field loads");

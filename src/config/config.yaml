@@ -68,7 +68,12 @@ supertable:
   #            strictest and by far the most expensive setting.
   #   never  - never verify; appropriate only where the storage beneath
   #            already guarantees integrity end to end.
-  crc_verification: auto
+  #
+  # Left commented deliberately. This file is merged underneath an
+  # operator's own, so setting the key here would make it present in every
+  # configuration, and the deprecated `verify_crc_on_open` below could then
+  # never be reached. Unset, the default comes from the engine instead.
+  # crc_verification: auto
 
   # Deprecated, still honoured so a configuration naming it keeps the
   # behaviour it asked for: true means `always`, false means `never`.
