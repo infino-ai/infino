@@ -346,9 +346,12 @@ fn always_rejects_every_region_that_auto_opens() {
 /// path's bounds checks reject it before any CRC is consulted. So `auto` is
 /// not blind: it gives up the checksums, not the structural validation.
 ///
-/// This is also the signal discard-and-refetch keys on. A malformed
-/// structure is a corrupt cached copy announcing itself, which is exactly
-/// when refetching the authoritative bytes is the right response.
+/// That matters beyond the open itself, because the disk cache already acts
+/// on it: a cached copy that fails to open is unlinked and the read falls
+/// through to object storage for a clean one, which
+/// `unusable_cache_files_fall_through_to_source` covers. So under `auto` the
+/// structural check is not only the validation that remains, it is the one
+/// wired to a recovery rather than to an error.
 #[test]
 fn a_corrupt_structural_field_is_refused_under_every_policy() {
     for policy in [
