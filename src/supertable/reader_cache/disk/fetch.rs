@@ -1855,7 +1855,7 @@ mod tests {
         let uri = SuperfileUri::new_v4();
         seed_cache_file(&store, &uri, &tiny_superfile_bytes());
         let stranger = store
-            .fetch_from_disk_cache(&uri, &uri.storage_path(), None, None)
+            .fetch_from_disk_cache(&uri, &uri.storage_path(), None, ReadIntent::Warm, None)
             .await
             .expect("disk probe")
             .expect("whole file admitted");
@@ -2041,7 +2041,7 @@ mod tests {
         let size = bytes.len() as u64;
         seed_cache_file(&store, &uri, &bytes);
         let stranger = store
-            .fetch_from_disk_cache(&uri, &uri.storage_path(), None, None)
+            .fetch_from_disk_cache(&uri, &uri.storage_path(), None, ReadIntent::Warm, None)
             .await
             .expect("disk probe")
             .expect("whole file admitted");

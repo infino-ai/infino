@@ -279,7 +279,13 @@ impl DiskCacheStore {
         // Tier 2, disk: the whole file is on local disk (a prior run, or a finished fill). Mmap
         // it, no GETs.
         if let Some(entry) = self
-            .fetch_from_disk_cache(uri, storage_key, offsets.map(|o| o.total_size), storage)
+            .fetch_from_disk_cache(
+                uri,
+                storage_key,
+                offsets.map(|o| o.total_size),
+                intent,
+                storage,
+            )
             .await?
         {
             return Ok((entry, OpenTier::Disk));

@@ -23,6 +23,30 @@ use crate::{
     },
 };
 
+/// Whether adopting an on-disk cache file verifies its checksums.
+///
+/// A query does not: the file was verified by whichever fill wrote it, nothing
+/// is being written now, and checking it would mean reading every byte of
+/// every cached superfile at process start — the scan this policy exists to
+/// remove, and one the engines this matches default to off.
+///
+/// A [`ReadIntent::Load`] does, because a Load is a compaction or reindex
+/// input. Those read every byte of the file anyway, so the checksum is
+/// marginal, and what they do with it is the reason: the merge writes a *new*
+/// superfile with fresh, valid checksums over whatever it read, and once the
+/// inputs are reclaimed that output is the only copy left. A bad input
+/// adopted here is therefore not a wrong answer that a refetch repairs, it is
+/// the good copy being replaced by a bad one — which is the one failure the
+/// "recovery is a refetch" argument cannot survive.
+///
+/// `never` still means never, at every boundary.
+fn adoption_verifies(config: &DiskCacheConfig, intent: ReadIntent) -> bool {
+    match intent {
+        ReadIntent::Load => config.crc_verification.verifies_on_landing(),
+        ReadIntent::Warm | ReadIntent::Stream => config.crc_verification.verifies_on_open(),
+    }
+}
+
 impl DiskCacheStore {
     /// Insert already-in-hand bytes into the cache without
     /// round-tripping through storage. Used by the writer to
@@ -78,26 +102,27 @@ impl DiskCacheStore {
             let tmp = self.tmp_path(uri);
             let final_path = self.cache_path(uri);
 
-            // Write the bytes to a tmp file, then atomically rename into place.
-            // No fsync: the disk cache is a reconstructible mirror of bytes that
-            // are already durable in object storage, so a crash losing an
-            // unflushed cache file just cold-fetches on the next open — and
-            // `restore_from_cache_root` CRC-verifies on-disk files at open,
-            // dropping any torn one. Skipping the fsync keeps the committer's
-            // warm-fill off the synchronous disk-flush path.
+            // Write the bytes to a tmp file, fsync, then atomically rename into
+            // place. The fsync is what makes the file on disk match the bytes
+            // written: nothing reads it back to check. An earlier version
+            // skipped it and leaned on a later run re-verifying every cache
+            // file at open to drop a torn one, but the default policy no
+            // longer does that scan, so a crash between the write and the
+            // flush would leave a torn file that the next run adopts. The
+            // other two fill paths already `sync_all` for the same reason.
             {
                 let mut file = tokio::fs::File::create(&tmp).await?;
                 file.write_all(&bytes).await?;
                 file.flush().await?;
+                file.sync_all().await?;
             }
             tokio::fs::rename(&tmp, &final_path).await?;
 
             // mmap the freshly-written file + open it as a superfile reader.
             // Skip CRC: the committer just built these bytes in memory and they
             // are known-valid (CRC'd at build, already opened as a reader for
-            // summary extraction) — re-scanning here is redundant. Files read
-            // back from a PRIOR run take the verifying path via
-            // `restore_from_cache_root`.
+            // summary extraction) — re-scanning here is redundant, and the
+            // fsync above is what carries that validity to disk.
             self.open_cached_entry(&final_path, size, false)
         }
         .await;
@@ -275,6 +300,7 @@ impl DiskCacheStore {
         uri: &SuperfileUri,
         storage_key: &str,
         expected_size: Option<u64>,
+        intent: ReadIntent,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<Option<Arc<CachedEntry>>, DiskCacheError> {
         let found = [(self.cache_path(uri), false), (self.hole_path(uri), true)]
@@ -316,14 +342,7 @@ impl DiskCacheStore {
             self.open_holed_entry(uri, size, storage_key, self.resolve_storage(storage))
                 .await
         } else {
-            // Not a landing: nothing is being written here. The file was
-            // written by an earlier run, which verified it as it landed, and
-            // adopting it only reads the header. Checking it would mean
-            // reading every byte of every cached superfile at process start,
-            // which is the scan this policy exists to remove and which the
-            // engines we are matching default to off. An operator who wants
-            // that pass has `always`, which gets it here.
-            self.open_cached_entry(&path, size, self.config.crc_verification.verifies_on_open())
+            self.open_cached_entry(&path, size, adoption_verifies(&self.config, intent))
         };
 
         match opened {
@@ -596,7 +615,7 @@ mod landing_tests {
     /// start, which is the scan the policy removes. The engines this matches
     /// default that scan to off and carry the same exposure.
     #[tokio::test]
-    async fn a_copy_left_by_a_previous_run_is_adopted_unread() {
+    async fn a_query_adopts_a_copy_left_by_a_previous_run_unread() {
         let (_dir, store) = test_store_with(|cfg| {
             cfg.crc_verification = CrcVerification::Auto;
         });
@@ -616,12 +635,96 @@ mod landing_tests {
         restarted.scan_cache_root();
 
         let before = restarted.stats();
+        // A query's intent, not a compaction's: this is the read whose cost
+        // the policy is protecting.
+        let _ = restarted.reader(&uri).await;
+        let after = restarted.stats();
+        assert_eq!(
+            after.n_cold_fetches - before.n_cold_fetches,
+            0,
+            "auto does not look on the query path, and so must not refetch"
+        );
+    }
+
+    /// A compaction input is verified even where a query would not be, and a
+    /// corrupt copy is refetched instead of merged.
+    ///
+    /// This is the one failure the rest of the design cannot absorb.
+    /// Compaction reads its inputs from this cache and writes a new superfile
+    /// with fresh, valid checksums over whatever it read; once the inputs are
+    /// reclaimed, that output is the only copy. A bad input adopted here is
+    /// therefore not a wrong answer a refetch repairs, it is the good copy in
+    /// the object store being replaced by a bad one.
+    #[tokio::test]
+    async fn a_compaction_input_is_verified_where_a_query_would_not_be() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("a Load read lands the whole file on disk");
+
+        corrupt_the_cached_copy(&store.cache_path(&uri));
+
+        let restarted = reopen_store(&store, |cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        drop(store);
+        restarted.scan_cache_root();
+
+        let before = restarted.stats();
+        let reader = restarted
+            .reader_synchronous(&uri)
+            .await
+            .expect("a corrupt input must not fail the compaction, it must be refetched");
+        let after = restarted.stats();
+
+        assert_eq!(
+            after.n_disk_reuses - before.n_disk_reuses,
+            0,
+            "the corrupt copy must not be handed to a merge"
+        );
+        assert_eq!(
+            after.n_cold_fetches - before.n_cold_fetches,
+            1,
+            "it must come from the authoritative copy instead"
+        );
+        drop(reader);
+    }
+
+    /// `never` still means never, including for a compaction input. An
+    /// operator who turned verification off must not have it reappear on a
+    /// path this change touched.
+    #[tokio::test]
+    async fn never_does_not_verify_a_compaction_input_either() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Never;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("a Load read lands the whole file on disk");
+
+        corrupt_the_cached_copy(&store.cache_path(&uri));
+
+        let restarted = reopen_store(&store, |cfg| {
+            cfg.crc_verification = CrcVerification::Never;
+        });
+        drop(store);
+        restarted.scan_cache_root();
+
+        let before = restarted.stats();
         let _ = restarted.reader_synchronous(&uri).await;
         let after = restarted.stats();
         assert_eq!(
             after.n_cold_fetches - before.n_cold_fetches,
             0,
-            "auto does not look, and so must not refetch"
+            "never must not look, on any path"
         );
     }
 
@@ -1392,7 +1495,13 @@ mod tests {
 
         let wrong = bytes.len() as u64 + 1;
         let reused = store
-            .fetch_from_disk_cache(&uri, &uri.storage_path(), Some(wrong), None)
+            .fetch_from_disk_cache(
+                &uri,
+                &uri.storage_path(),
+                Some(wrong),
+                ReadIntent::Warm,
+                None,
+            )
             .await
             .expect("reuse probe");
         assert!(reused.is_none(), "size mismatch is a miss, not a serve");
