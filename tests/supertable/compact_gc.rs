@@ -14,7 +14,12 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
@@ -24,7 +29,11 @@ use chrono::{Duration as ChronoDuration, Utc};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
     Bm25SearchOptions, CompactionSettings, GcSettings, OptimizeOptions,
-    superfile::{builder::FtsConfig, fts::reader::BoolMode, vector::rerank_codec::RerankCodec},
+    config::CrcVerification,
+    superfile::{
+        builder::FtsConfig, format::footer::read_kv_metadata, fts::reader::BoolMode,
+        vector::rerank_codec::RerankCodec,
+    },
     supertable::{
         Supertable, SupertableOptions,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
@@ -737,5 +746,166 @@ fn optimize_after_update_on_a_drained_vector_table_succeeds() {
     assert!(
         titles.iter().all(|t| t != "hidden doc 0 3"),
         "replaced row gone after optimize"
+    );
+}
+
+/// Bytes back from the vector blob's end to flip, in a region the superfile's
+/// own checksums cover.
+const CORRUPT_AT_VEC_TAIL: usize = 16;
+
+/// Superfiles in a storage root, by path.
+fn superfile_paths_under(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(".sf.parquet"))
+            {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Flip one byte of a superfile's vector blob in place, in a region the
+/// superfile's own checksums cover. Returns false for a file with no vector
+/// blob to corrupt.
+fn corrupt_vector_blob_at(path: &Path) -> bool {
+    let mut bytes = std::fs::read(path).expect("read superfile");
+    let Ok(kv) = read_kv_metadata(&bytes) else {
+        return false;
+    };
+    let at = |key: &str| -> Option<usize> { kv.get(key)?.parse().ok() };
+    let (Some(off), Some(len)) = (at("inf.vec.offset"), at("inf.vec.length")) else {
+        return false;
+    };
+    if len < CORRUPT_AT_VEC_TAIL {
+        return false;
+    }
+    bytes[off + len - CORRUPT_AT_VEC_TAIL] ^= 0xFF;
+    std::fs::write(path, &bytes).expect("write the corrupted superfile back");
+    true
+}
+
+/// Build a vector table through a disk cache, restart, optionally corrupt the
+/// **cached** copies, then merge under `policy`. Returns how many cold fetches
+/// the merge issued.
+///
+/// Only cache copies are touched; storage keeps a good copy throughout, which
+/// is what makes refetch-and-recover available to the merge.
+fn cold_fetches_during_merge(policy: CrcVerification, corrupt_cached_inputs: bool) -> u64 {
+    let store_dir = TempDir::new().expect("tempdir");
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("provider"));
+
+    let (st, cache) = table_with_disk_cache(
+        hidden_vector_options(),
+        Arc::clone(&storage),
+        cache_dir.path(),
+    );
+    let schema = st.options().schema.clone();
+    for round in 0..2 {
+        let mut w = st.writer().expect("writer");
+        w.append(&hidden_batch(Arc::clone(&schema), round))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    assert!(
+        superfile_paths_under(store_dir.path()).len() >= 2,
+        "the fixture must leave inputs to merge"
+    );
+
+    // Restart: drop the handle and its cache, leaving the files on disk the
+    // way a new process finds them.
+    drop(st);
+    drop(cache);
+
+    if corrupt_cached_inputs {
+        let corrupted = superfile_paths_under(cache_dir.path())
+            .iter()
+            .filter(|p| corrupt_vector_blob_at(p))
+            .count();
+        assert!(
+            corrupted > 0,
+            "the cache must hold a copy to corrupt, or the merge reads storage \
+             and this is not the scenario under test"
+        );
+    }
+
+    let cfg = DiskCacheConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        disk_budget_bytes: CACHE_BUDGET_BYTES,
+        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
+        mmap_cold_threshold_secs: 0,
+        mmap_sweep_interval_secs: 0,
+        eviction: Box::new(LruPolicy::new()),
+        crc_verification: policy,
+        ..Default::default()
+    };
+    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
+    let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned).expect("cache");
+    let st = Supertable::open(
+        hidden_vector_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(Arc::clone(&cache)),
+    )
+    .expect("reopen the table over the existing cache");
+
+    let before = cache.stats().n_cold_fetches;
+    st.optimize(&small_optimize_opts()).expect("optimize");
+    cache.stats().n_cold_fetches - before
+}
+
+/// A corrupt cached input is refetched rather than merged, end to end through
+/// `optimize`.
+///
+/// The failure this guards is the one nothing downstream can detect. The merge
+/// reads its inputs from the disk cache, re-encodes their stored vector bytes
+/// into a new superfile and stamps fresh, entirely valid checksums over the
+/// result, so a corrupt input yields an output that opens cleanly under every
+/// policy — and once the inputs are reclaimed, it is the only copy left. No
+/// checksum can catch that afterwards, so the input has to be checked before
+/// the merge reads it.
+///
+/// Asserted on whether the merge went back to storage, not by comparing output
+/// bytes: a merged superfile carries identifiers minted per run, so two clean
+/// merges of identical input do not agree byte for byte and the comparison is
+/// not available. Refetching is the whole of the property anyway — the copy in
+/// storage is good throughout, so a merge that reads from there cannot launder
+/// anything.
+#[test]
+fn optimize_refetches_a_corrupt_cached_input_instead_of_merging_it() {
+    let clean = cold_fetches_during_merge(CrcVerification::Auto, false);
+    assert_eq!(
+        clean, 0,
+        "a healthy cache must serve the merge without going back to storage, \
+         or the comparison below measures nothing"
+    );
+
+    let corrupt = cold_fetches_during_merge(CrcVerification::Auto, true);
+    assert!(
+        corrupt > 0,
+        "a corrupt cached input must be refused and refetched before the merge \
+         reads it"
+    );
+
+    // The control. Without it this test could pass because something other
+    // than the policy sent the merge back to storage.
+    let unchecked = cold_fetches_during_merge(CrcVerification::Never, true);
+    assert_eq!(
+        unchecked, 0,
+        "never does not look, so the same corrupt copy must be merged straight \
+         in: that is the behaviour the default no longer has"
     );
 }
